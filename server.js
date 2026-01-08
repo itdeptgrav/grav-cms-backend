@@ -162,11 +162,6 @@ app.get("/api/health", (req, res) => {
     database:
       mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
     timestamp: new Date().toISOString(),
-    departments: {
-      hr: true,
-      project_manager: true,
-      sales: true
-    }
   });
 });
 
