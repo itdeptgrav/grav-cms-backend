@@ -85,7 +85,7 @@ app.use('/api/customer', customerQuotationRoutes);
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
 
-const operatorsRoutes = require("./routes/CMS_routes/Inventory/Configurations/operators");
+const operatorsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/operators");
 app.use("/api/cms/employees/operators", operatorsRoutes);
 
 const machinesRoutes = require("./routes/CMS_Routes/Inventory/Configurations/machines");
