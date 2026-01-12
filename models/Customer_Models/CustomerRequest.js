@@ -745,8 +745,15 @@ customerRequestSchema.virtual('unreadNotifications').get(function () {
 });
 
 // Virtual for getting total order value
+// In your CustomerRequest schema (models/Customer_Models/CustomerRequest.js)
+// Update the totalOrderValue virtual property:
+
 customerRequestSchema.virtual('totalOrderValue').get(function () {
   if (this.finalOrderPrice) return this.finalOrderPrice;
+  
+  // Safely handle items array
+  if (!this.items || !Array.isArray(this.items)) return 0;
+  
   return this.items.reduce((total, item) => total + (item.totalEstimatedPrice || 0), 0);
 });
 
@@ -824,25 +831,4 @@ module.exports = mongoose.model('CustomerRequest', customerRequestSchema);
 
 
 
-
-
-// Basically now it's the time to do next task
-
-// Ok let's move to next means activating the feature for "assign-edit" page of the work-order means in that page the machine's/raw-item's will goona assigned for that wo ok.. So let's do it. and basically in that page both assign and edit will happen ok means the admin can also edit the existing planned wo ok.
-
-// - so here as you know that 3 steps need to keep , first is for showcasing the corresponding raw-item needed and with availability in order to represent ki that corresponding raw-item is going to book for that wo ok. 
-
-// - 2nd step is for showcasing the operations that needed for that wo(means upon considering that stock item registered operations) , so that the admin is goona assign the machine's to each and every operations ok.(basically keep the feature for assign new machine because sometimes one operations needs multiple machine ok).
-
-// -3rd step is for just showcasing the timeline's means for that work-order, the corresponding operations time need to sum and showcase it total ok so that he can see the total time required, and also keep the feature so that he can edit that ok. (or also he can also change the individual operations time also ok).
-
-// so keep the button for "Create Planning" so that after click on that it will goona move for planning means we can consider ki that corresponding order goona move to planning means the formalities for assigning the machine's raw-items like things need to book means basically after click on the button the corresponding raw-items quantity, machine's assigned , final timeline for that wo need to set ok.. 
-
-// so let's do that feature ok. btw as this is now the concept of work-order so now let's create an another api route page ok. 
-
-// so for the timing just do that assign-edit page of work order ok, after that we will activate the view-wo page ok.
-
-// -btw don't want to create the new workorder schema ok, if you want to modify then modify the mo schema ok
-
-// for your help, am providing you the raw-item schema once again because there is feature present in order to keep the history transaction ok means for the credit/debit of raw-item quantity ok..
 

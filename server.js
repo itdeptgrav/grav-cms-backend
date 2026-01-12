@@ -10,6 +10,8 @@ const app = express();
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:3001",
+  "https://grav-cms.vercel.app",
+  "https://cms.grav.in"
 ];
 
 app.use(
@@ -133,6 +135,18 @@ app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 const ProductionTracking = require("./routes/CMS_Routes/Production/Tracking/trackingRoutes.js")
 app.use("/api/cms/production/tracking", ProductionTracking);
 
+
+// In your main server.js or app.js
+const workOrderProgressRoutes = require('./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes');
+app.use('/api/cms/manufacturing/work-orders/production-tracking', workOrderProgressRoutes);
+
+// In your main server.js or app.js
+const workFlowTrackRoutes = require('./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js');
+app.use('/api/cms/manufacturing/production-tracking', workFlowTrackRoutes);
+
+
+const ProductionSchedule = require("./routes/CMS_Routes/Production/ProductionSchedule/productionScheduleRoutes.js")
+app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
 
 
 // Sales Routes
