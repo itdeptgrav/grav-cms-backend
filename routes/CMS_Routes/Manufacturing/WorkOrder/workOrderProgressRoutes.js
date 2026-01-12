@@ -327,7 +327,7 @@ router.get("/:id/progress", async (req, res) => {
                 example: "Scan Op2 → Op2 starts, Scan Op4 → Op2 completes & Op4 starts"
             }
         });
-
+//
     } catch (error) {
         console.error("Error getting work order progress:", error);
         res.status(500).json({
