@@ -1,4 +1,4 @@
-// routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes.js
+// routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes.js - FINAL CORRECTED
 
 const express = require("express");
 const router = express.Router();
@@ -8,160 +8,38 @@ const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/
 
 router.use(EmployeeAuthMiddleware);
 
-// Helper function to generate barcode ID
-function generateBarcodeId(workOrderNumber, unit, operation, totalOperations) {
-    // Format: [WorkOrderNumber]-[Unit3]-[Operation2]-[Checksum4]
-    const unitStr = unit.toString().padStart(3, '0');
-    const operationStr = operation.toString().padStart(2, '0');
-    const baseId = `${workOrderNumber}-${unitStr}-${operationStr}`;
-    
-    // Simple checksum
-    let hash = 0;
-    for (let i = 0; i < baseId.length; i++) {
-        const char = baseId.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash;
+// Helper function to parse barcode
+function parseBarcodeId(barcodeId) {
+    try {
+        // Format: [WorkOrderNumber]-[Unit3]-[Operation2]-[Checksum4]
+        const pattern = /^([A-Z0-9-]+)-(\d{3})-(\d{2})-([A-F0-9]{4})$/;
+        const match = barcodeId.match(pattern);
+        
+        if (!match) {
+            return { valid: false, error: "Invalid barcode format" };
+        }
+
+        const [, workOrderNumber, unitStr, operationStr, checksum] = match;
+        const unit = parseInt(unitStr);
+        const operation = parseInt(operationStr);
+        
+        if (isNaN(unit) || isNaN(operation)) {
+            return { valid: false, error: "Invalid unit or operation number" };
+        }
+
+        return {
+            valid: true,
+            workOrderNumber: workOrderNumber,
+            unit: unit,
+            operation: operation,
+            checksum: checksum
+        };
+    } catch (error) {
+        return { valid: false, error: error.message };
     }
-    const checksum = Math.abs(hash).toString(16).toUpperCase().substring(0, 4).padStart(4, '0');
-    
-    return `${baseId}-${checksum}`;
 }
 
-// Generate barcodes for work order
-router.get("/:id/barcodes/generate", async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        const workOrder = await WorkOrder.findById(id);
-        if (!workOrder) {
-            return res.status(404).json({
-                success: false,
-                message: "Work order not found"
-            });
-        }
-
-        const totalOperations = workOrder.operations.length;
-        const barcodes = [];
-
-        // Generate barcode for each unit and operation
-        for (let unit = 1; unit <= workOrder.quantity; unit++) {
-            for (let operation = 1; operation <= totalOperations; operation++) {
-                const barcodeId = generateBarcodeId(
-                    workOrder.workOrderNumber,
-                    unit,
-                    operation,
-                    totalOperations
-                );
-
-                barcodes.push({
-                    barcodeId,
-                    unitNumber: unit,
-                    operationNumber: operation,
-                    operationType: workOrder.operations[operation - 1]?.operationType || 'Unknown',
-                    machineAssigned: workOrder.operations[operation - 1]?.assignedMachineName || 'Not assigned',
-                    status: 'pending' // Initial status
-                });
-            }
-        }
-
-        res.json({
-            success: true,
-            barcodes: barcodes,
-            summary: {
-                workOrderNumber: workOrder.workOrderNumber,
-                totalUnits: workOrder.quantity,
-                totalOperations: totalOperations,
-                totalBarcodes: barcodes.length,
-                generatedAt: new Date()
-            }
-        });
-
-    } catch (error) {
-        console.error("Error generating barcodes:", error);
-        res.status(500).json({
-            success: false,
-            message: "Server error while generating barcodes"
-        });
-    }
-});
-
-
-// GET production summary for manufacturing order
-router.get("/manufacturing-order/:moId/summary", async (req, res) => {
-    try {
-        const { moId } = req.params;
-
-        // First get the manufacturing order to get all work orders
-        const manufacturingOrder = await CustomerRequest.findById(moId)
-            .populate({
-                path: 'workOrders',
-                model: 'WorkOrder'
-            })
-            .lean();
-
-        if (!manufacturingOrder) {
-            return res.status(404).json({
-                success: false,
-                message: "Manufacturing order not found"
-            });
-        }
-
-        const workOrderIds = manufacturingOrder.workOrders.map(wo => wo._id);
-        const summary = {
-            totalWorkOrders: workOrderIds.length,
-            totalUnitsInMO: manufacturingOrder.workOrders.reduce((sum, wo) => sum + (wo.quantity || 0), 0),
-            workOrderStats: []
-        };
-
-        // Get progress for each work order
-        for (const woId of workOrderIds) {
-            const progress = await calculateWorkOrderProgress(woId);
-            if (progress) {
-                summary.workOrderStats.push({
-                    workOrderId: woId,
-                    workOrderNumber: progress.workOrderNumber,
-                    ...progress.progress
-                });
-            }
-        }
-
-        // Calculate aggregated stats
-        summary.totalUnitsCompleted = summary.workOrderStats.reduce((sum, stat) => 
-            sum + (stat.completedUnits || 0), 0);
-        summary.totalUnitsInProgress = summary.workOrderStats.reduce((sum, stat) => 
-            sum + (stat.partiallyCompletedUnits || 0), 0);
-        summary.totalScans = summary.workOrderStats.reduce((sum, stat) => 
-            sum + (stat.completedBarcodes || 0), 0);
-        
-        // Calculate average completion percentage
-        const validStats = summary.workOrderStats.filter(stat => stat.overallCompletionPercentage !== undefined);
-        summary.avgCompletionPercentage = validStats.length > 0 ?
-            Math.round(validStats.reduce((sum, stat) => sum + stat.overallCompletionPercentage, 0) / validStats.length) : 0;
-
-        // Calculate efficiency
-        const totalEstimatedTime = summary.workOrderStats.reduce((sum, stat) => 
-            sum + (stat.estimatedTotalTime || 0), 0);
-        const totalActualTime = summary.workOrderStats.reduce((sum, stat) => 
-            sum + (stat.actualTotalTime || 0), 0);
-        
-        summary.efficiency = totalEstimatedTime > 0 && totalActualTime > 0 ?
-            Math.round((totalEstimatedTime / totalActualTime) * 100) : 0;
-
-        res.json({
-            success: true,
-            summary
-        });
-
-    } catch (error) {
-        console.error("Error getting manufacturing order summary:", error);
-        res.status(500).json({
-            success: false,
-            message: "Server error while getting manufacturing order summary"
-        });
-    }
-});
-
-// Get work order progress
+// Get work order progress with FINAL CORRECT logic
 router.get("/:id/progress", async (req, res) => {
     try {
         const { id } = req.params;
@@ -174,21 +52,12 @@ router.get("/:id/progress", async (req, res) => {
             });
         }
 
-        // Get today's production tracking
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const tomorrow = new Date(today);
-        tomorrow.setDate(tomorrow.getDate() + 1);
-
-        // Get all scans for this work order in the last 30 days
-        const thirtyDaysAgo = new Date();
-        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
+        // Get all production tracking records
         const productionRecords = await ProductionTracking.find({
-            date: { $gte: thirtyDaysAgo }
+            date: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } // Last 30 days
         });
 
-        // Extract all barcode scans for this work order
+        // Extract and parse all barcode scans
         const allScans = [];
         productionRecords.forEach(record => {
             record.machines.forEach(machine => {
@@ -205,81 +74,138 @@ router.get("/:id/progress", async (req, res) => {
             });
         });
 
-        // Filter scans for this work order and parse barcodes
-        const workOrderScans = allScans.filter(scan => 
-            scan.barcodeId.includes(workOrder.workOrderNumber)
-        );
+        // Filter and parse scans for this work order
+        const workOrderScans = allScans
+            .filter(scan => scan.barcodeId.includes(workOrder.workOrderNumber))
+            .map(scan => {
+                const parsed = parseBarcodeId(scan.barcodeId);
+                if (parsed.valid) {
+                    return {
+                        ...scan,
+                        unit: parsed.unit,
+                        operation: parsed.operation,
+                        workOrderNumber: parsed.workOrderNumber
+                    };
+                }
+                return null;
+            })
+            .filter(scan => scan !== null);
 
-        // Parse barcode IDs to get unit and operation info
-        const parsedScans = workOrderScans.map(scan => {
-            const parts = scan.barcodeId.split('-');
-            // Format: [WorkOrderNumber]-[Unit3]-[Operation2]-[Checksum4]
-            if (parts.length >= 4) {
-                const unit = parseInt(parts[parts.length - 3]); // Second last part before checksum
-                const operation = parseInt(parts[parts.length - 2]); // Third last part before checksum
-                return {
-                    ...scan,
-                    unit,
-                    operation,
-                    isValid: !isNaN(unit) && !isNaN(operation)
-                };
-            }
-            return { ...scan, unit: 0, operation: 0, isValid: false };
-        }).filter(scan => scan.isValid);
-
-        // Calculate progress by unit
         const totalUnits = workOrder.quantity;
         const totalOperations = workOrder.operations.length;
-        
-        // Track completed operations per unit
-        const unitProgress = {};
-        for (let unit = 1; unit <= totalUnits; unit++) {
-            unitProgress[unit] = {
-                completedOperations: new Set(),
-                operationTimes: {}
-            };
-        }
 
-        // Group scans by unit and operation
-        parsedScans.forEach(scan => {
-            if (scan.unit >= 1 && scan.unit <= totalUnits && 
-                scan.operation >= 1 && scan.operation <= totalOperations) {
-                unitProgress[scan.unit].completedOperations.add(scan.operation);
-                unitProgress[scan.unit].operationTimes[scan.operation] = scan.timestamp;
+        // Group scans by unit and sort by timestamp
+        const unitScans = {};
+        workOrderScans.forEach(scan => {
+            if (!unitScans[scan.unit]) {
+                unitScans[scan.unit] = [];
             }
+            unitScans[scan.unit].push(scan);
         });
 
-        // Calculate completion statistics
-        let completedUnits = 0;
-        let partiallyCompletedUnits = 0;
-        let pendingUnits = 0;
+        // Sort scans within each unit by timestamp
+        Object.keys(unitScans).forEach(unit => {
+            unitScans[unit].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+        });
+
+        // Calculate unit progress - FINAL CORRECT LOGIC
+        const unitProgress = {};
+        const completedUnits = new Set();
+        const inProgressUnits = new Set();
+        const pendingUnits = new Set();
         
         const unitDetails = [];
         
         for (let unit = 1; unit <= totalUnits; unit++) {
-            const completedOps = unitProgress[unit].completedOperations.size;
-            const isCompleted = completedOps === totalOperations;
-            const hasProgress = completedOps > 0 && completedOps < totalOperations;
+            const scans = unitScans[unit] || [];
             
-            if (isCompleted) completedUnits++;
-            else if (hasProgress) partiallyCompletedUnits++;
-            else pendingUnits++;
-
-            // Find first and last operation times for this unit
-            const operationTimes = Object.values(unitProgress[unit].operationTimes);
-            const firstScanTime = operationTimes.length > 0 ? 
-                new Date(Math.min(...operationTimes.map(t => new Date(t).getTime()))) : null;
-            const lastScanTime = operationTimes.length > 0 ? 
-                new Date(Math.max(...operationTimes.map(t => new Date(t).getTime()))) : null;
-
+            // Track operation status based on scan sequence
+            const operationStatus = {};
+            const operationScanTimes = {};
+            
+            // Initialize all operations as pending
+            for (let op = 1; op <= totalOperations; op++) {
+                operationStatus[op] = 'pending';
+                operationScanTimes[op] = null;
+            }
+            
+            // Process scans in chronological order
+            let lastScannedOperation = null;
+            
+            scans.forEach((scan, index) => {
+                const currentOp = scan.operation;
+                operationScanTimes[currentOp] = scan.timestamp;
+                
+                if (index === 0) {
+                    // First scan: mark this operation as in progress
+                    operationStatus[currentOp] = 'in_progress';
+                    lastScannedOperation = currentOp;
+                } else {
+                    // Not first scan: complete the previous operation, start current
+                    if (lastScannedOperation !== null) {
+                        operationStatus[lastScannedOperation] = 'completed';
+                    }
+                    operationStatus[currentOp] = 'in_progress';
+                    lastScannedOperation = currentOp;
+                }
+                
+                // If this is the last scan and it's the last operation, mark it as completed
+                if (index === scans.length - 1 && currentOp === totalOperations) {
+                    operationStatus[currentOp] = 'completed';
+                }
+            });
+            
+            // Count completed operations
+            let completedOps = 0;
+            for (let op = 1; op <= totalOperations; op++) {
+                if (operationStatus[op] === 'completed') {
+                    completedOps++;
+                }
+            }
+            
+            // Determine unit status
+            let unitStatus = 'pending';
+            if (completedOps === totalOperations) {
+                unitStatus = 'completed';
+                completedUnits.add(unit);
+            } else if (scans.length > 0) {
+                unitStatus = 'in_progress';
+                inProgressUnits.add(unit);
+            } else {
+                unitStatus = 'pending';
+                pendingUnits.add(unit);
+            }
+            
+            // Find current operation (operation that is in_progress)
+            let currentOperation = 0;
+            for (let op = 1; op <= totalOperations; op++) {
+                if (operationStatus[op] === 'in_progress') {
+                    currentOperation = op;
+                    break;
+                }
+            }
+            
+            unitProgress[unit] = {
+                status: unitStatus,
+                completedOperations: completedOps,
+                currentOperation: currentOperation,
+                operationStatus: operationStatus,
+                lastScan: scans.length > 0 ? scans[scans.length - 1].timestamp : null,
+                firstScan: scans.length > 0 ? scans[0].timestamp : null,
+                totalScans: scans.length
+            };
+            
             unitDetails.push({
                 unitNumber: unit,
+                currentOperation: currentOperation,
                 completedOperations: completedOps,
                 totalOperations: totalOperations,
                 completionPercentage: Math.round((completedOps / totalOperations) * 100),
-                status: isCompleted ? 'completed' : (hasProgress ? 'in_progress' : 'pending'),
-                firstOperationTime: firstScanTime,
-                lastOperationTime: lastScanTime
+                status: unitStatus,
+                lastActivity: scans.length > 0 ? scans[scans.length - 1].timestamp : null,
+                firstActivity: scans.length > 0 ? scans[0].timestamp : null,
+                scanCount: scans.length,
+                lastScannedOperation: scans.length > 0 ? scans[scans.length - 1].operation : null
             });
         }
 
@@ -287,64 +213,86 @@ router.get("/:id/progress", async (req, res) => {
         const operationCompletion = [];
         for (let op = 1; op <= totalOperations; op++) {
             const operation = workOrder.operations[op - 1];
-            let completedUnitsForOp = 0;
+            
+            let unitsCompleted = 0;
+            let unitsInProgress = 0;
+            let unitsPending = 0;
             
             for (let unit = 1; unit <= totalUnits; unit++) {
-                if (unitProgress[unit].completedOperations.has(op)) {
-                    completedUnitsForOp++;
+                const status = unitProgress[unit]?.operationStatus?.[op] || 'pending';
+                if (status === 'completed') {
+                    unitsCompleted++;
+                } else if (status === 'in_progress') {
+                    unitsInProgress++;
+                } else {
+                    unitsPending++;
                 }
             }
-
+            
+            const completionPercentage = Math.round((unitsCompleted / totalUnits) * 100);
+            
+            let opStatus = 'pending';
+            if (unitsCompleted === totalUnits) {
+                opStatus = 'completed';
+            } else if (unitsInProgress > 0) {
+                opStatus = 'in_progress';
+            } else if (unitsCompleted > 0) {
+                opStatus = 'partially_completed';
+            }
+            
             operationCompletion.push({
                 operationNumber: op,
                 operationType: operation?.operationType || 'Unknown',
                 machineName: operation?.assignedMachineName || 'Not assigned',
-                completedUnits: completedUnitsForOp,
+                unitsCompleted: unitsCompleted,
+                unitsInProgress: unitsInProgress,
+                unitsPending: unitsPending,
                 totalUnits: totalUnits,
-                completionPercentage: Math.round((completedUnitsForOp / totalUnits) * 100),
-                status: completedUnitsForOp === totalUnits ? 'completed' : 
-                       completedUnitsForOp > 0 ? 'in_progress' : 'pending'
+                completionPercentage: completionPercentage,
+                status: opStatus
             });
         }
 
         // Calculate overall progress
         const totalBarcodes = totalUnits * totalOperations;
-        const completedBarcodes = parsedScans.length;
-        const overallCompletionPercentage = Math.round((completedBarcodes / totalBarcodes) * 100);
-
-        // Calculate efficiency (if we have time data)
-        let estimatedTotalTime = 0;
-        let actualTotalTime = 0;
+        const totalScans = workOrderScans.length;
         
-        if (workOrder.timeline?.totalPlannedSeconds) {
-            estimatedTotalTime = workOrder.timeline.totalPlannedSeconds * totalUnits;
-            
-            // Calculate actual time based on scan timestamps
-            const unitTimeRanges = {};
-            parsedScans.forEach(scan => {
-                if (!unitTimeRanges[scan.unit]) {
-                    unitTimeRanges[scan.unit] = {
-                        start: new Date(scan.timestamp),
-                        end: new Date(scan.timestamp)
-                    };
-                } else {
-                    unitTimeRanges[scan.unit].start = new Date(
-                        Math.min(unitTimeRanges[scan.unit].start.getTime(), new Date(scan.timestamp).getTime())
-                    );
-                    unitTimeRanges[scan.unit].end = new Date(
-                        Math.max(unitTimeRanges[scan.unit].end.getTime(), new Date(scan.timestamp).getTime())
-                    );
-                }
-            });
-
-            // Sum up actual times for units with multiple scans
-            Object.values(unitTimeRanges).forEach(range => {
-                actualTotalTime += (range.end.getTime() - range.start.getTime()) / 1000;
-            });
+        // Count total completed operations across all units
+        let totalCompletedOperations = 0;
+        for (let unit = 1; unit <= totalUnits; unit++) {
+            totalCompletedOperations += unitProgress[unit]?.completedOperations || 0;
         }
+        
+        const maxPossibleCompletedOps = totalUnits * totalOperations;
+        const overallCompletionPercentage = totalUnits > 0 && totalOperations > 0 ? 
+            Math.round((totalCompletedOperations / maxPossibleCompletedOps) * 100) : 0;
+        
+        // Ensure percentage doesn't exceed 100%
+        const safeCompletionPercentage = Math.min(100, Math.max(0, overallCompletionPercentage));
 
-        const efficiency = estimatedTotalTime > 0 ? 
-            Math.round((estimatedTotalTime / actualTotalTime) * 100) : 0;
+        // Get recent scans (last 10)
+        const recentScans = workOrderScans
+            .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+            .slice(0, 10)
+            .map((scan, index, array) => {
+                let meaning = '';
+                if (index === array.length - 1) {
+                    // First in list (most recent)
+                    meaning = `Started Operation ${scan.operation}`;
+                } else {
+                    const prevScan = array[index + 1]; // Next in chronological order
+                    meaning = `Completed Operation ${prevScan.operation}, Started Operation ${scan.operation}`;
+                }
+                
+                return {
+                    barcodeId: scan.barcodeId,
+                    unit: scan.unit,
+                    operation: scan.operation,
+                    timestamp: scan.timestamp,
+                    operationType: workOrder.operations[scan.operation - 1]?.operationType || 'Unknown',
+                    meaning: meaning
+                };
+            });
 
         res.json({
             success: true,
@@ -355,43 +303,29 @@ router.get("/:id/progress", async (req, res) => {
                 totalUnits: totalUnits,
                 totalOperations: totalOperations,
                 totalBarcodes: totalBarcodes,
-                completedBarcodes: completedBarcodes,
+                totalScans: totalScans,
+                totalCompletedOperations: totalCompletedOperations,
                 
                 // Unit progress
-                completedUnits,
-                partiallyCompletedUnits,
-                pendingUnits,
-                unitCompletionPercentage: Math.round((completedUnits / totalUnits) * 100),
+                completedUnits: completedUnits.size,
+                inProgressUnits: inProgressUnits.size,
+                pendingUnits: pendingUnits.size,
+                unitCompletionPercentage: totalUnits > 0 ? Math.round((completedUnits.size / totalUnits) * 100) : 0,
                 
                 // Overall progress
-                overallCompletionPercentage,
-                
-                // Time and efficiency
-                estimatedTotalTime: workOrder.timeline?.totalPlannedSeconds || 0,
-                actualTotalTime,
-                efficiency: Math.min(efficiency, 100), // Cap at 100%
-                
-                // Scan statistics
-                totalScans: parsedScans.length,
-                firstScan: parsedScans.length > 0 ? 
-                    new Date(Math.min(...parsedScans.map(s => new Date(s.timestamp).getTime()))) : null,
-                lastScan: parsedScans.length > 0 ? 
-                    new Date(Math.max(...parsedScans.map(s => new Date(s.timestamp).getTime()))) : null,
+                overallCompletionPercentage: safeCompletionPercentage,
                 
                 // Status
                 currentStatus: workOrder.status,
-                canStartProduction: workOrder.status === 'scheduled' || workOrder.status === 'planned',
-                canComplete: workOrder.status === 'in_progress' && completedUnits === totalUnits
+                canComplete: workOrder.status === 'in_progress' && completedUnits.size === totalUnits
             },
-            unitDetails,
+            unitDetails: unitDetails.slice(0, 10), // Show first 10 units
             operationCompletion,
-            recentScans: parsedScans.slice(-10).map(scan => ({
-                barcodeId: scan.barcodeId,
-                unit: scan.unit,
-                operation: scan.operation,
-                timestamp: scan.timestamp,
-                operationType: workOrder.operations[scan.operation - 1]?.operationType || 'Unknown'
-            }))
+            recentScans,
+            scanningLogic: {
+                explanation: "Scan Logic: Each scan starts a new operation and completes the previous one",
+                example: "Scan Op2 → Op2 starts, Scan Op4 → Op2 completes & Op4 starts"
+            }
         });
 
     } catch (error) {
@@ -403,10 +337,11 @@ router.get("/:id/progress", async (req, res) => {
     }
 });
 
-// Get real-time production updates
-router.get("/:id/progress/realtime", async (req, res) => {
+// Get detailed unit timeline
+router.get("/:id/unit/:unitNumber/timeline", async (req, res) => {
     try {
-        const { id } = req.params;
+        const { id, unitNumber } = req.params;
+        const unit = parseInt(unitNumber);
 
         const workOrder = await WorkOrder.findById(id);
         if (!workOrder) {
@@ -416,88 +351,159 @@ router.get("/:id/progress/realtime", async (req, res) => {
             });
         }
 
-        // Get scans from the last hour
-        const oneHourAgo = new Date();
-        oneHourAgo.setHours(oneHourAgo.getHours() - 1);
+        if (unit < 1 || unit > workOrder.quantity) {
+            return res.status(400).json({
+                success: false,
+                message: `Invalid unit number. Must be between 1 and ${workOrder.quantity}`
+            });
+        }
 
+        // Get production tracking records
         const productionRecords = await ProductionTracking.find({
-            date: { $gte: oneHourAgo }
+            date: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) }
         });
 
-        // Extract recent scans
-        const recentScans = [];
+        // Extract scans for this unit
+        const scans = [];
         productionRecords.forEach(record => {
             record.machines.forEach(machine => {
                 machine.operators.forEach(operator => {
                     operator.barcodeScans.forEach(scan => {
-                        if (scan.barcodeId.includes(workOrder.workOrderNumber) && 
-                            new Date(scan.timeStamp) >= oneHourAgo) {
-                            recentScans.push({
-                                barcodeId: scan.barcodeId,
-                                timestamp: scan.timeStamp,
-                                machineId: machine.machineId,
-                                operatorId: operator.operatorId
-                            });
+                        if (scan.barcodeId.includes(workOrder.workOrderNumber)) {
+                            const parsed = parseBarcodeId(scan.barcodeId);
+                            if (parsed.valid && parsed.unit === unit) {
+                                scans.push({
+                                    ...scan,
+                                    operation: parsed.operation,
+                                    operatorId: operator.operatorId,
+                                    machineId: machine.machineId
+                                });
+                            }
                         }
                     });
                 });
             });
         });
 
-        // Parse and summarize
-        const parsedRecentScans = recentScans.map(scan => {
-            const parts = scan.barcodeId.split('-');
-            if (parts.length >= 4) {
-                const unit = parseInt(parts[parts.length - 3]);
-                const operation = parseInt(parts[parts.length - 2]);
-                return {
-                    ...scan,
-                    unit,
-                    operation,
-                    operationType: workOrder.operations[operation - 1]?.operationType || 'Unknown'
-                };
+        // Sort scans by timestamp
+        scans.sort((a, b) => new Date(a.timeStamp) - new Date(b.timeStamp));
+
+        const totalOperations = workOrder.operations.length;
+        
+        // Build timeline based on scan sequence
+        const timeline = [];
+        let previousOperation = null;
+        
+        scans.forEach((scan, index) => {
+            const currentOp = scan.operation;
+            const operation = workOrder.operations[currentOp - 1];
+            
+            if (index === 0) {
+                // First scan
+                timeline.push({
+                    type: 'start',
+                    operation: currentOp,
+                    operationType: operation?.operationType || 'Unknown',
+                    timestamp: scan.timeStamp,
+                    description: `Started Operation ${currentOp}`
+                });
+            } else {
+                // Not first scan: complete previous, start current
+                timeline.push({
+                    type: 'complete',
+                    operation: previousOperation,
+                    operationType: workOrder.operations[previousOperation - 1]?.operationType || 'Unknown',
+                    timestamp: scan.timeStamp,
+                    description: `Completed Operation ${previousOperation}`
+                });
+                
+                timeline.push({
+                    type: 'start',
+                    operation: currentOp,
+                    operationType: operation?.operationType || 'Unknown',
+                    timestamp: scan.timeStamp,
+                    description: `Started Operation ${currentOp}`
+                });
             }
-            return scan;
-        }).filter(scan => scan.unit && scan.operation);
+            
+            previousOperation = currentOp;
+            
+            // If this is the last scan and it's the last operation, add completion
+            if (index === scans.length - 1 && currentOp === totalOperations) {
+                timeline.push({
+                    type: 'complete',
+                    operation: currentOp,
+                    operationType: operation?.operationType || 'Unknown',
+                    timestamp: new Date(new Date(scan.timeStamp).getTime() + 60000), // 1 minute after
+                    description: `Completed Operation ${currentOp} (Final)`
+                });
+            }
+        });
+
+        // Calculate current status
+        let currentOperation = 0;
+        let completedOperations = 0;
+        const operationStatus = {};
+        
+        for (let op = 1; op <= totalOperations; op++) {
+            operationStatus[op] = 'pending';
+        }
+        
+        if (scans.length > 0) {
+            // Process to determine current status
+            let lastScanned = scans[scans.length - 1].operation;
+            
+            // Mark all scanned except last as completed
+            scans.forEach((scan, index) => {
+                if (index < scans.length - 1) {
+                    operationStatus[scan.operation] = 'completed';
+                }
+            });
+            
+            // Last scanned is in progress (unless it's the last operation)
+            if (lastScanned === totalOperations) {
+                operationStatus[lastScanned] = 'completed';
+                currentOperation = 0; // All done
+            } else {
+                operationStatus[lastScanned] = 'in_progress';
+                currentOperation = lastScanned;
+            }
+            
+            // Count completed
+            completedOperations = Object.values(operationStatus).filter(s => s === 'completed').length;
+        }
 
         res.json({
             success: true,
-            realtimeUpdates: {
-                totalScansLastHour: parsedRecentScans.length,
-                scansByMinute: groupScansByMinute(parsedRecentScans),
-                recentScans: parsedRecentScans.slice(-5),
-                currentRate: calculateProductionRate(parsedRecentScans)
-            }
+            unitProgress: {
+                unitNumber: unit,
+                workOrderNumber: workOrder.workOrderNumber,
+                currentOperation: currentOperation,
+                completedOperations: completedOperations,
+                totalOperations: totalOperations,
+                completionPercentage: Math.round((completedOperations / totalOperations) * 100),
+                status: completedOperations === totalOperations ? 'completed' : 
+                       scans.length > 0 ? 'in_progress' : 'pending',
+                firstScan: scans.length > 0 ? scans[0].timeStamp : null,
+                lastScan: scans.length > 0 ? scans[scans.length - 1].timeStamp : null,
+                totalScans: scans.length
+            },
+            timeline,
+            operationStatus,
+            scans: scans.map(scan => ({
+                operation: scan.operation,
+                timestamp: scan.timeStamp,
+                operationType: workOrder.operations[scan.operation - 1]?.operationType || 'Unknown'
+            }))
         });
 
     } catch (error) {
-        console.error("Error getting realtime progress:", error);
+        console.error("Error getting unit timeline:", error);
         res.status(500).json({
             success: false,
-            message: "Server error while getting realtime progress"
+            message: "Server error while getting unit timeline"
         });
     }
 });
-
-// Helper functions
-function groupScansByMinute(scans) {
-    const groups = {};
-    scans.forEach(scan => {
-        const minute = new Date(scan.timestamp).toISOString().slice(0, 16); // YYYY-MM-DDTHH:mm
-        if (!groups[minute]) groups[minute] = 0;
-        groups[minute]++;
-    });
-    return groups;
-}
-
-function calculateProductionRate(scans) {
-    if (scans.length < 2) return 0;
-    
-    const times = scans.map(s => new Date(s.timestamp).getTime()).sort((a, b) => a - b);
-    const totalTime = (times[times.length - 1] - times[0]) / 1000; // in seconds
-    const totalScans = scans.length;
-    
-    return totalTime > 0 ? Math.round((totalScans / totalTime) * 3600) : 0; // scans per hour
-}
 
 module.exports = router;

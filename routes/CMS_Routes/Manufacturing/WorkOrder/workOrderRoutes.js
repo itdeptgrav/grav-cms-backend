@@ -455,7 +455,7 @@ router.post("/:id/complete-planning", async (req, res) => {
     }
 
     // Update work order status
-    workOrder.status = "planned";
+    workOrder.status = "scheduled";
     workOrder.plannedBy = req.user.id;
     workOrder.plannedAt = new Date();
     workOrder.planningNotes = planningNotes || workOrder.planningNotes;
