@@ -23,11 +23,6 @@ const customerSchema = new mongoose.Schema({
     unique: true,
     trim: true
   },
-  password: {
-    type: String,
-    required: [true, 'Password is required'],
-    minlength: [8, 'Password must be at least 8 characters long']
-  },
   isPhoneVerified: {
     type: Boolean,
     default: true // Set to true since we verify with OTP
@@ -145,13 +140,7 @@ const customerSchema = new mongoose.Schema({
   timestamps: true
 });
 
-
-// Method to compare password
-customerSchema.methods.comparePassword = async function(candidatePassword) {
-  return await bcrypt.compare(candidatePassword, this.password);
-};
-
-// Method to generate JWT token
+// Remove password comparison method since we don't have password anymore
 customerSchema.methods.generateAuthToken = function() {
   const token = jwt.sign(
     {
@@ -168,10 +157,9 @@ customerSchema.methods.generateAuthToken = function() {
   return token;
 };
 
-// Method to get profile without sensitive data
+// Method to get profile
 customerSchema.methods.getProfile = function() {
   const profile = this.toObject();
-  delete profile.password;
   delete profile.__v;
   delete profile.cart;
   delete profile.orders;

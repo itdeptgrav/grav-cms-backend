@@ -3,8 +3,7 @@ const express = require('express');
 const router = express.Router();
 const Customer = require('../../models/Customer_Models/Customer');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const CustomerEmailService = require('../../services/CustomerEmailService'); // Import the service
+const CustomerEmailService = require('../../services/CustomerEmailService');
 
 // Check if phone exists
 router.post('/check-phone', async (req, res) => {
@@ -38,16 +37,67 @@ router.post('/check-phone', async (req, res) => {
   }
 });
 
+// Check authentication status (for auto signin)
+router.get('/check-auth', async (req, res) => {
+  try {
+    const token = req.cookies.customerToken;
+
+    if (!token) {
+      return res.status(200).json({
+        success: false,
+        isAuthenticated: false,
+        message: 'No authentication token found'
+      });
+    }
+
+    // Verify token
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET || 'grav_clothing_secret_key_2024'
+    );
+
+    // Find customer
+    const customer = await Customer.findById(decoded.id);
+
+    if (!customer) {
+      return res.status(200).json({
+        success: false,
+        isAuthenticated: false,
+        message: 'Customer not found'
+      });
+    }
+
+    // Return customer data without sensitive info
+    const customerResponse = customer.toObject();
+    delete customerResponse.__v;
+
+    res.status(200).json({
+      success: true,
+      isAuthenticated: true,
+      customer: customerResponse,
+      message: 'User is authenticated'
+    });
+
+  } catch (error) {
+    console.error('Auth check error:', error);
+    res.status(200).json({
+      success: false,
+      isAuthenticated: false,
+      message: 'Authentication failed'
+    });
+  }
+});
+
 // Customer Signup
 router.post('/signup', async (req, res) => {
   try {
-    const { name, email, phone, password } = req.body;
+    const { name, email, phone } = req.body;
 
     // Validate required fields
-    if (!name || !email || !phone || !password) {
+    if (!name || !email || !phone) {
       return res.status(400).json({
         success: false,
-        message: 'All fields are required'
+        message: 'Name, email and phone are required'
       });
     }
 
@@ -71,8 +121,7 @@ router.post('/signup', async (req, res) => {
       name,
       email: email.toLowerCase(),
       phone: formattedPhone,
-      password,
-      isPhoneVerified: true // Since we verified with OTP
+      isPhoneVerified: true
     });
 
     await customer.save();
@@ -114,7 +163,6 @@ router.post('/signup', async (req, res) => {
 
     // Remove sensitive data from response
     const customerResponse = customer.toObject();
-    delete customerResponse.password;
     delete customerResponse.__v;
 
     res.status(201).json({
@@ -193,7 +241,6 @@ router.post('/signin', async (req, res) => {
 
     // Remove sensitive data from response
     const customerResponse = customer.toObject();
-    delete customerResponse.password;
     delete customerResponse.__v;
 
     res.status(200).json({
