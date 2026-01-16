@@ -50,28 +50,28 @@ const OPERATION_TYPES = [
 // Helper function to calculate total cost of a stock item
 const calculateStockItemCost = (stockItem) => {
   let totalCost = stockItem.cost || 0;
-  
+
   // Add raw items cost
   if (stockItem.rawItems && Array.isArray(stockItem.rawItems)) {
     stockItem.rawItems.forEach(item => {
       totalCost += (item.unitCost || 0) * (item.quantity || 0);
     });
   }
-  
+
   // Add operations cost
   if (stockItem.operations && Array.isArray(stockItem.operations)) {
     stockItem.operations.forEach(op => {
       totalCost += parseFloat(op.operatorCost) || 0;
     });
   }
-  
+
   // Add miscellaneous costs
   if (stockItem.miscellaneousCosts && Array.isArray(stockItem.miscellaneousCosts)) {
     stockItem.miscellaneousCosts.forEach(cost => {
       totalCost += parseFloat(cost.amount) || 0;
     });
   }
-  
+
   return totalCost;
 };
 
@@ -151,25 +151,25 @@ router.get("/:id", async (req, res) => {
     const stockItem = await StockItem.findById(req.params.id)
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email");
-      // Removed vendorCosts population since it doesn't exist anymore
-    
+    // Removed vendorCosts population since it doesn't exist anymore
+
     if (!stockItem) {
       return res.status(404).json({
         success: false,
         message: "Stock item not found"
       });
     }
-    
+
     // If raw items have rawItemId references, populate them separately
     if (stockItem.rawItems && stockItem.rawItems.length > 0) {
       const rawItemIds = stockItem.rawItems
         .filter(item => item.rawItemId)
         .map(item => item.rawItemId);
-      
+
       if (rawItemIds.length > 0) {
         const rawItemsData = await RawItem.find({ _id: { $in: rawItemIds } })
           .select("name sku customUnit unit sellingPrice customCategory category");
-        
+
         // Map the raw item data back
         stockItem.rawItems = stockItem.rawItems.map(item => {
           const rawItemData = rawItemsData.find(ri => ri._id.toString() === item.rawItemId?.toString());
@@ -189,14 +189,14 @@ router.get("/:id", async (req, res) => {
         });
       }
     }
-    
+
     res.json({ success: true, stockItem });
-    
+
   } catch (error) {
     console.error("Error fetching stock item:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error while fetching stock item" 
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching stock item"
     });
   }
 });
@@ -205,9 +205,9 @@ router.get("/:id", async (req, res) => {
 router.get("/search/raw-items", async (req, res) => {
   try {
     const { search = "", limit = 20 } = req.query;
-    
+
     let filter = {};
-    
+
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: "i" } },
@@ -216,12 +216,12 @@ router.get("/search/raw-items", async (req, res) => {
         { customCategory: { $regex: search, $options: "i" } }
       ];
     }
-    
+
     const rawItems = await RawItem.find(filter)
       .select("name sku category customCategory unit customUnit quantity sellingPrice stockTransactions")
       .limit(parseInt(limit))
       .sort({ name: 1 });
-    
+
     // Process raw items to get latest cost from transactions
     const processedRawItems = rawItems.map(item => {
       // Get latest cost from stock transactions
@@ -231,17 +231,17 @@ router.get("/search/raw-items", async (req, res) => {
         const purchaseTransactions = item.stockTransactions
           .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
           .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-        
+
         if (purchaseTransactions.length > 0) {
           latestCost = purchaseTransactions[0].unitPrice || 0;
         }
       }
-      
+
       // If no transaction cost, use selling price as fallback
       if (latestCost === 0 && item.sellingPrice) {
         latestCost = item.sellingPrice * 0.8; // 20% discount as estimated cost
       }
-      
+
       return {
         id: item._id,
         name: item.name,
@@ -254,18 +254,18 @@ router.get("/search/raw-items", async (req, res) => {
         currentStock: item.quantity || 0
       };
     });
-    
+
     res.json({
       success: true,
       rawItems: processedRawItems,
       count: processedRawItems.length
     });
-    
+
   } catch (error) {
     console.error("Error searching raw items:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error while searching raw items" 
+    res.status(500).json({
+      success: false,
+      message: "Server error while searching raw items"
     });
   }
 });
@@ -374,6 +374,8 @@ router.post("/", async (req, res) => {
       maxStock,
       attributes,
       variants,
+      measurements,
+      numberOfPanels,
       rawItems,
       operations,
       miscellaneousCosts,
@@ -531,6 +533,16 @@ router.post("/", async (req, res) => {
       });
     }
 
+    // Process measurements
+    const processedMeasurements = [];
+    if (measurements && Array.isArray(measurements)) {
+      measurements.forEach(measurement => {
+        if (measurement && measurement.trim()) {
+          processedMeasurements.push(measurement.trim());
+        }
+      });
+    }
+
     // Process variants
     const processedVariants = [];
     if (variants && Array.isArray(variants)) {
@@ -571,6 +583,8 @@ router.post("/", async (req, res) => {
       minStock: parseFloat(minStock),
       maxStock: parseFloat(maxStock),
       attributes: processedAttributes,
+      measurements: processedMeasurements,
+      numberOfPanels: parseInt(numberOfPanels) || 0,
       variants: processedVariants,
       rawItems: processedRawItems,
       operations: processedOperations,
@@ -639,12 +653,14 @@ router.put("/:id", async (req, res) => {
       maxStock,
       attributes,
       variants,
+      measurements,
+      numberOfPanels,
       rawItems,
       operations,
       miscellaneousCosts,
       images
     } = req.body;
-    
+
     const stockItem = await StockItem.findById(req.params.id);
     if (!stockItem) {
       return res.status(404).json({
@@ -652,7 +668,7 @@ router.put("/:id", async (req, res) => {
         message: "Stock item not found"
       });
     }
-    
+
     // Update basic fields if provided
     if (name !== undefined) stockItem.name = name.trim();
     if (productType !== undefined) stockItem.productType = productType;
@@ -669,7 +685,7 @@ router.put("/:id", async (req, res) => {
     if (quantityOnHand !== undefined) stockItem.quantityOnHand = parseFloat(quantityOnHand) || 0;
     if (minStock !== undefined) stockItem.minStock = parseFloat(minStock);
     if (maxStock !== undefined) stockItem.maxStock = parseFloat(maxStock);
-    
+
     // Update raw items
     if (rawItems !== undefined) {
       const processedRawItems = [];
@@ -678,7 +694,7 @@ router.put("/:id", async (req, res) => {
           if (rawItem.rawItemId && rawItem.quantity && rawItem.quantity > 0) {
             const rawItemData = await RawItem.findById(rawItem.rawItemId)
               .select("name sku customUnit unit stockTransactions sellingPrice customCategory category");
-            
+
             if (rawItemData) {
               // Get latest cost from stock transactions
               let unitCost = 0;
@@ -687,17 +703,17 @@ router.put("/:id", async (req, res) => {
                 const purchaseTransactions = rawItemData.stockTransactions
                   .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
                   .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-                
+
                 if (purchaseTransactions.length > 0) {
                   unitCost = purchaseTransactions[0].unitPrice || 0;
                 }
               }
-              
+
               // If no transaction cost, use selling price as fallback
               if (unitCost === 0 && rawItemData.sellingPrice) {
                 unitCost = rawItemData.sellingPrice * 0.8; // 20% discount as estimated cost
               }
-              
+
               processedRawItems.push({
                 rawItemId: rawItem.rawItemId,
                 name: rawItemData.name,
@@ -713,7 +729,7 @@ router.put("/:id", async (req, res) => {
       }
       stockItem.rawItems = processedRawItems;
     }
-    
+
     // Update operations
     if (operations !== undefined) {
       const processedOperations = [];
@@ -722,7 +738,7 @@ router.put("/:id", async (req, res) => {
           const minutes = parseFloat(op.minutes) || 0;
           const seconds = parseFloat(op.seconds) || 0;
           const totalSeconds = (minutes * 60) + seconds;
-          
+
           processedOperations.push({
             type: op.type || "",
             machine: op.machine || "",
@@ -737,7 +753,7 @@ router.put("/:id", async (req, res) => {
       }
       stockItem.operations = processedOperations;
     }
-    
+
     // Update miscellaneous costs
     if (miscellaneousCosts !== undefined) {
       const processedMiscellaneousCosts = [];
@@ -754,7 +770,7 @@ router.put("/:id", async (req, res) => {
       }
       stockItem.miscellaneousCosts = processedMiscellaneousCosts;
     }
-    
+
     // Update attributes
     if (attributes !== undefined) {
       const processedAttributes = [];
@@ -770,14 +786,29 @@ router.put("/:id", async (req, res) => {
       }
       stockItem.attributes = processedAttributes;
     }
-    
+
+    // Update measurements
+    if (measurements !== undefined) {
+      const processedMeasurements = [];
+      if (Array.isArray(measurements)) {
+        measurements.forEach(measurement => {
+          if (measurement && measurement.trim()) {
+            processedMeasurements.push(measurement.trim());
+          }
+        });
+      }
+      stockItem.measurements = processedMeasurements;
+    }
+
+    if (numberOfPanels !== undefined) stockItem.numberOfPanels = parseInt(numberOfPanels) || 0;
+
     // Update variants
     if (variants !== undefined) {
       const processedVariants = [];
       if (Array.isArray(variants)) {
         variants.forEach((variant, index) => {
           const variantSku = variant.sku || `${stockItem.reference}-V${(index + 1).toString().padStart(2, '0')}`;
-          
+
           processedVariants.push({
             sku: variantSku,
             attributes: variant.attributes || [],
@@ -793,42 +824,42 @@ router.put("/:id", async (req, res) => {
       }
       stockItem.variants = processedVariants;
     }
-    
+
     // Update images
     if (images !== undefined) {
       stockItem.images = images || [];
     }
-    
+
     stockItem.updatedBy = req.user.id;
-    
+
     // Calculate and update totals
     const totalCost = calculateStockItemCost(stockItem);
     const profitMargin = ((stockItem.salesPrice - totalCost) / totalCost * 100) || 0;
     const inventoryValue = stockItem.quantityOnHand * totalCost;
     const potentialRevenue = stockItem.quantityOnHand * stockItem.salesPrice;
-    
+
     stockItem.totalCost = totalCost;
     stockItem.profitMargin = profitMargin;
     stockItem.inventoryValue = inventoryValue;
     stockItem.potentialRevenue = potentialRevenue;
-    
+
     await stockItem.save();
-    
+
     const updatedStockItem = await StockItem.findById(stockItem._id)
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email");
-    
+
     res.json({
       success: true,
       message: "Stock item updated successfully",
       stockItem: updatedStockItem
     });
-    
+
   } catch (error) {
     console.error("Error updating stock item:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error while updating stock item" 
+    res.status(500).json({
+      success: false,
+      message: "Server error while updating stock item"
     });
   }
 });

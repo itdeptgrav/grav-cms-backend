@@ -40,7 +40,7 @@ function parseBarcodeId(barcodeId) {
 }
 
 // Get work order progress with CORRECT scan logic
-router.get("/production-tracking/:id/progress", async (req, res) => {
+router.get("/:id/progress", async (req, res) => {
     try {
         const { id } = req.params;
 
@@ -395,7 +395,7 @@ router.get("/production-tracking/:id/progress", async (req, res) => {
 });
 
 // Get machine-wise scan sequence
-router.get("/production-tracking/:id/machine/:machineId/sequence", async (req, res) => {
+router.get("/:id/machine/:machineId/sequence", async (req, res) => {
     try {
         const { id, machineId } = req.params;
 

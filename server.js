@@ -79,6 +79,10 @@ app.use('/api/customer/edit-requests', customerEditRequestRoutes);
 const customerQuotationRoutes = require('./routes/Customer_Routes/QuotationRoutes');
 app.use('/api/customer', customerQuotationRoutes);
 
+const employeeMpcRoutes = require('./routes/Customer_Routes/Employee_Mpc');
+// Use the routes
+app.use('/api/customer/employees', employeeMpcRoutes);
+
 
 /* =====================
   CMS ROUTES
@@ -117,6 +121,13 @@ app.use("/api/cms/inventory/operations/deliveries", deliveryRoutes);
 // Overview Section
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
+
+const RegisteredDepartments = require("./routes/CMS_Routes/Sales/Configuration/OrganizationDepartment/organizationDepartmentRoutes");
+app.use("/api/cms/configuration/organization-departments", RegisteredDepartments);
+
+// Measurement Routes
+const measurementRoutes = require('./routes/CMS_Routes/Measurement/measurementRoutes');
+app.use('/api/cms/measurements', measurementRoutes);
 
 
 // Manufacturing Routes
