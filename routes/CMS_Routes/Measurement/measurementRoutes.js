@@ -635,16 +635,17 @@ router.get('/:measurementId', async (req, res) => {
     }
 });
 
-// UPDATE measurement (updated)
-// UPDATE measurement (simpler approach)
-// UPDATE measurement - SIMPLE FIX
-// UPDATE measurement - COMPLETE REPLACEMENT METHOD
-router.put('/:measurementId', async (req, res) => {
+
+// ADD NEW EMPLOYEES to existing measurement (NEW ROUTE)
+router.put('/:measurementId/add-employees', async (req, res) => {
     try {
         const { measurementId } = req.params;
-        const { name, description, measurementData, registeredEmployeeIds } = req.body;
+        const { measurementData, newEmployeeIds, updatedRegisteredEmployeeIds } = req.body;
 
-        console.log('UPDATE REQUEST - Complete Replacement Method');
+        console.log('ADD EMPLOYEES REQUEST:', {
+            newEmployeeCount: newEmployeeIds?.length || 0,
+            measurementDataCount: measurementData?.length || 0
+        });
 
         // Find measurement
         const measurement = await Measurement.findById(measurementId);
@@ -655,14 +656,135 @@ router.put('/:measurementId', async (req, res) => {
             });
         }
 
-        // Store original for reference
-        const originalMeasurement = {
-            employeeMeasurements: [...measurement.employeeMeasurements.map(emp => emp.toObject ? emp.toObject() : emp)],
-            registeredEmployeeIds: [...measurement.registeredEmployeeIds]
-        };
+        // Update registered employees list
+        if (updatedRegisteredEmployeeIds && Array.isArray(updatedRegisteredEmployeeIds)) {
+            measurement.registeredEmployeeIds = [...new Set(updatedRegisteredEmployeeIds)];
+        }
 
-        console.log('Original has', originalMeasurement.employeeMeasurements.length, 'employees');
-        console.log('Original registered employees:', originalMeasurement.registeredEmployeeIds.length);
+        // Process new employee data
+        if (measurementData && Array.isArray(measurementData)) {
+            // Create a map of existing employees for quick lookup
+            const existingEmployeeMap = new Map();
+            measurement.employeeMeasurements.forEach(emp => {
+                existingEmployeeMap.set(emp.employeeId.toString(), emp);
+            });
+
+            // Group incoming data by employee
+            const newEmployeesMap = new Map();
+
+            measurementData.forEach(data => {
+                if (!data.employeeId || !data.stockItemId) {
+                    console.log('Skipping invalid data:', data);
+                    return;
+                }
+
+                const employeeId = data.employeeId.toString();
+
+                // Convert measurements to array format
+                const measurementsArray = [];
+                if (data.measurements && Array.isArray(data.measurements)) {
+                    measurementsArray.push(...data.measurements);
+                } else if (data.measurements && typeof data.measurements === 'object') {
+                    Object.entries(data.measurements).forEach(([measurementName, value]) => {
+                        measurementsArray.push({
+                            measurementName,
+                            value: value || '',
+                            unit: ''
+                        });
+                    });
+                }
+
+                if (!newEmployeesMap.has(employeeId)) {
+                    newEmployeesMap.set(employeeId, {
+                        employeeId: data.employeeId,
+                        employeeName: data.employeeName,
+                        employeeUIN: data.employeeUIN,
+                        department: data.department,
+                        designation: data.designation,
+                        stockItems: []
+                    });
+                }
+
+                const employeeData = newEmployeesMap.get(employeeId);
+
+                // Add stock item for this employee
+                employeeData.stockItems.push({
+                    stockItemId: data.stockItemId,
+                    stockItemName: data.stockItemName,
+                    measurements: measurementsArray,
+                    measuredAt: new Date()
+                });
+            });
+
+            // Add new employees to the measurement
+            newEmployeesMap.forEach((newEmployeeData, employeeId) => {
+                // Check if employee already exists (should not happen, but just in case)
+                if (!existingEmployeeMap.has(employeeId)) {
+                    const isCompleted = newEmployeeData.stockItems.length > 0 &&
+                        newEmployeeData.stockItems.every(stockItem =>
+                            stockItem.measurements.length > 0 &&
+                            stockItem.measurements.every(m => m.value && m.value.trim() !== '')
+                        );
+
+                    // Add new employee with their measurements
+                    measurement.employeeMeasurements.push({
+                        employeeId: newEmployeeData.employeeId,
+                        employeeName: newEmployeeData.employeeName,
+                        employeeUIN: newEmployeeData.employeeUIN,
+                        department: newEmployeeData.department,
+                        designation: newEmployeeData.designation,
+                        stockItems: newEmployeeData.stockItems,
+                        isCompleted: isCompleted,
+                        completedAt: isCompleted ? new Date() : null
+                    });
+                } else {
+                    console.log(`Employee ${employeeId} already exists in measurement, skipping...`);
+                }
+            });
+        }
+
+        measurement.updatedBy = req.user.id;
+        measurement.updatedAt = new Date();
+
+        const savedMeasurement = await measurement.save();
+        console.log(`Successfully added ${newEmployeeIds?.length || 0} new employees`);
+
+        res.status(200).json({
+            success: true,
+            message: `Added ${newEmployeeIds?.length || 0} new employees to measurement`,
+            measurement: savedMeasurement
+        });
+
+    } catch (error) {
+        console.error('Error adding employees to measurement:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while adding employees',
+            error: error.message
+        });
+    }
+});
+
+// UPDATE measurement (updated)
+// UPDATE measurement (simpler approach)
+// UPDATE measurement - SIMPLE FIX
+// UPDATE measurement - EDIT EXISTING EMPLOYEES ONLY
+router.put('/:measurementId', async (req, res) => {
+    try {
+        const { measurementId } = req.params;
+        const { name, description, measurementData, registeredEmployeeIds } = req.body;
+
+        console.log('EDIT REQUEST - Existing employees only');
+        console.log('Measurement data count:', measurementData?.length);
+
+        // Find measurement
+        const measurement = await Measurement.findById(measurementId);
+        if (!measurement) {
+            return res.status(404).json({
+                success: false,
+                message: 'Measurement not found'
+            });
+        }
 
         // Update basic fields
         if (name !== undefined) measurement.name = name.trim();
@@ -671,151 +793,109 @@ router.put('/:measurementId', async (req, res) => {
             measurement.registeredEmployeeIds = registeredEmployeeIds;
         }
 
-        // If no measurementData, keep existing measurements
-        if (!measurementData || !Array.isArray(measurementData)) {
-            measurement.updatedBy = req.user.id;
-            measurement.updatedAt = new Date();
-            await measurement.save();
-            
-            return res.status(200).json({
-                success: true,
-                message: 'Basic info updated, measurements unchanged',
-                measurement
-            });
-        }
+        // If measurementData is provided, update measurements for EXISTING employees only
+        if (measurementData && Array.isArray(measurementData)) {
+            console.log('Processing', measurementData.length, 'measurement records for existing employees');
 
-        // COMPLETE REPLACEMENT APPROACH
-        // 1. Group ALL incoming data by employee
-        const allEmployeeData = new Map();
-        
-        measurementData.forEach(data => {
-            if (!data.employeeId || !data.stockItemId) return;
-            
-            const employeeId = data.employeeId.toString();
-            const stockItemId = data.stockItemId.toString();
-            
-            if (!allEmployeeData.has(employeeId)) {
-                allEmployeeData.set(employeeId, {
+            // Create a map of existing employees for quick lookup
+            const existingEmployeeMap = new Map();
+            measurement.employeeMeasurements.forEach(emp => {
+                existingEmployeeMap.set(emp.employeeId.toString(), emp);
+            });
+
+            // Group incoming data by employee and stock item
+            const incomingUpdates = new Map();
+
+            measurementData.forEach(data => {
+                if (!data.employeeId || !data.stockItemId) {
+                    console.log('Skipping invalid data:', data);
+                    return;
+                }
+
+                const employeeId = data.employeeId.toString();
+                const stockItemId = data.stockItemId.toString();
+                const key = `${employeeId}_${stockItemId}`;
+
+                // Convert measurements
+                const measurementsArray = [];
+                if (data.measurements && Array.isArray(data.measurements)) {
+                    measurementsArray.push(...data.measurements);
+                } else if (data.measurements && typeof data.measurements === 'object') {
+                    Object.entries(data.measurements).forEach(([measurementName, value]) => {
+                        measurementsArray.push({
+                            measurementName,
+                            value: value || '',
+                            unit: ''
+                        });
+                    });
+                }
+
+                incomingUpdates.set(key, {
                     employeeId: data.employeeId,
-                    employeeName: data.employeeName,
-                    employeeUIN: data.employeeUIN,
-                    department: data.department,
-                    designation: data.designation,
-                    stockItems: new Map()
+                    stockItemId: data.stockItemId,
+                    measurements: measurementsArray
                 });
-            }
-            
-            const empData = allEmployeeData.get(employeeId);
-            
-            // Convert measurements
-            const measurementsArray = [];
-            if (data.measurements && Array.isArray(data.measurements)) {
-                measurementsArray.push(...data.measurements);
-            } else if (data.measurements && typeof data.measurements === 'object') {
-                Object.entries(data.measurements).forEach(([name, value]) => {
-                    measurementsArray.push({
-                        measurementName: name,
-                        value: value || '',
-                        unit: ''
-                    });
-                });
-            }
-            
-            empData.stockItems.set(stockItemId, {
-                stockItemId: data.stockItemId,
-                stockItemName: data.stockItemName,
-                measurements: measurementsArray,
-                measuredAt: new Date()
             });
-        });
 
-        // 2. For employees NOT in incoming data, check if we should keep their existing data
-        originalMeasurement.employeeMeasurements.forEach(originalEmp => {
-            const empId = originalEmp.employeeId.toString();
-            
-            if (!allEmployeeData.has(empId)) {
-                // This employee is NOT in incoming data
-                // We need to decide: keep existing or remove?
-                // Let's keep them (preserve existing measurements)
-                
-                const stockItemMap = new Map();
-                originalEmp.stockItems.forEach(item => {
-                    stockItemMap.set(item.stockItemId.toString(), {
-                        stockItemId: item.stockItemId,
-                        stockItemName: item.stockItemName,
-                        measurements: item.measurements,
-                        measuredAt: item.measuredAt || new Date()
-                    });
-                });
-                
-                allEmployeeData.set(empId, {
-                    employeeId: originalEmp.employeeId,
-                    employeeName: originalEmp.employeeName,
-                    employeeUIN: originalEmp.employeeUIN,
-                    department: originalEmp.department,
-                    designation: originalEmp.designation,
-                    stockItems: stockItemMap,
-                    isCompleted: originalEmp.isCompleted,
-                    completedAt: originalEmp.completedAt
-                });
-                
-                console.log(`Preserving existing employee ${originalEmp.employeeName}`);
-            }
-        });
+            // Update only existing employees' measurements
+            measurement.employeeMeasurements = measurement.employeeMeasurements.map(emp => {
+                const employeeId = emp.employeeId.toString();
 
-        // 3. Build COMPLETELY NEW employeeMeasurements array
-        const newEmployeeMeasurements = [];
-        
-        allEmployeeData.forEach((empData, empId) => {
-            const stockItemsArray = Array.from(empData.stockItems.values());
-            
-            // Check if this is an existing employee with preserved data
-            const existingEmp = originalMeasurement.employeeMeasurements.find(e => 
-                e.employeeId.toString() === empId
-            );
-            
-            const isCompleted = stockItemsArray.length > 0 && 
-                stockItemsArray.every(item =>
-                    item.measurements && Array.isArray(item.measurements) &&
-                    item.measurements.every(m => m && m.value && m.value.trim() !== '')
-                );
-            
-            newEmployeeMeasurements.push({
-                employeeId: empData.employeeId,
-                employeeName: empData.employeeName,
-                employeeUIN: empData.employeeUIN,
-                department: empData.department,
-                designation: empData.designation,
-                stockItems: stockItemsArray,
-                isCompleted: isCompleted,
-                completedAt: isCompleted ? new Date() : (empData.completedAt || null)
+                // Update stock items for this employee
+                const updatedStockItems = emp.stockItems.map(stockItem => {
+                    const stockItemId = stockItem.stockItemId.toString();
+                    const key = `${employeeId}_${stockItemId}`;
+
+                    if (incomingUpdates.has(key)) {
+                        // Update this stock item's measurements
+                        return {
+                            ...stockItem.toObject ? stockItem.toObject() : stockItem,
+                            measurements: incomingUpdates.get(key).measurements,
+                            measuredAt: new Date()
+                        };
+                    }
+
+                    // Keep existing stock item unchanged
+                    return stockItem;
+                });
+
+                // Calculate completion for this employee
+                const isCompleted = updatedStockItems.length > 0 &&
+                    updatedStockItems.every(stockItem =>
+                        stockItem.measurements && Array.isArray(stockItem.measurements) &&
+                        stockItem.measurements.length > 0 &&
+                        stockItem.measurements.every(m =>
+                            m && m.value && typeof m.value === 'string' && m.value.trim() !== ''
+                        )
+                    );
+
+                return {
+                    ...emp.toObject ? emp.toObject() : emp,
+                    stockItems: updatedStockItems,
+                    isCompleted: isCompleted,
+                    completedAt: isCompleted ? new Date() : emp.completedAt
+                };
             });
-        });
 
-        // 4. REPLACE the entire array
-        measurement.employeeMeasurements = newEmployeeMeasurements;
-        
-        console.log('Final employee count:', measurement.employeeMeasurements.length);
-        measurement.employeeMeasurements.forEach((emp, idx) => {
-            console.log(`Employee ${idx + 1}: ${emp.employeeName}, Items: ${emp.stockItems.length}`);
-        });
+            console.log('Updated existing employee measurements');
+        }
 
         measurement.updatedBy = req.user.id;
         measurement.updatedAt = new Date();
-        
+
         const savedMeasurement = await measurement.save();
-        
+
         res.status(200).json({
             success: true,
-            message: 'Measurement completely rebuilt and saved',
+            message: 'Measurement updated successfully',
             measurement: savedMeasurement
         });
 
     } catch (error) {
-        console.error('Error in complete replacement:', error);
+        console.error('Error updating measurement:', error);
         res.status(500).json({
             success: false,
-            message: 'Server error',
+            message: 'Server error while updating measurement',
             error: error.message
         });
     }
