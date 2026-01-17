@@ -38,7 +38,8 @@ const connectDB = async () => {
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing"
     );
     console.log("✅ MongoDB connected successfully");
-    
+    createDefaultHR();
+
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -46,6 +47,41 @@ const connectDB = async () => {
 };
 
 connectDB();
+
+const HRDepartment = require("./models/HRDepartment");
+
+const createDefaultHR = async () => {
+  try {
+    const existingHR = await HRDepartment.findOne({
+      role: "hr_manager",
+      department: "Human Resources"
+    });
+
+    if (existingHR) {
+      console.log("ℹ️ HR Department already exists");
+      return;
+    }
+
+    const defaultHR = new HRDepartment({
+      name: "HR Admin",
+      email: "hr@grav.in",
+      password: "Hr@12345", // will be hashed automatically
+      employeeId: "HR001",
+      phone: "9999999999",
+      department: "Human Resources",
+      role: "hr_manager",
+      isActive: true
+    });
+
+    await defaultHR.save();
+
+    console.log("✅ Default HR Department created successfully");
+  } catch (error) {
+    console.error("❌ Error creating default HR:", error.message);
+  }
+};
+
+
 
 
 
