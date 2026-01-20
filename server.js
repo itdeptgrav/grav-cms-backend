@@ -12,7 +12,7 @@ const allowedOrigins = [
   "http://localhost:3001",
   "https://grav-cms.vercel.app",
   "https://cms.grav.in",
-  "https://customer.grav.in"
+  "https://customer.grav.in",
 ];
 
 app.use(
@@ -24,8 +24,8 @@ app.use(
         callback(new Error("Not allowed by CORS"));
       }
     },
-    credentials: true
-  })
+    credentials: true,
+  }),
 );
 
 app.use(express.json());
@@ -35,11 +35,10 @@ app.use(cookieParser());
 const connectDB = async () => {
   try {
     await mongoose.connect(
-      process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing"
+      process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
     );
     console.log("✅ MongoDB connected successfully");
     createDefaultHR();
-
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -54,7 +53,7 @@ const createDefaultHR = async () => {
   try {
     const existingHR = await HRDepartment.findOne({
       role: "hr_manager",
-      department: "Human Resources"
+      department: "Human Resources",
     });
 
     if (existingHR) {
@@ -70,7 +69,7 @@ const createDefaultHR = async () => {
       phone: "9999999999",
       department: "Human Resources",
       role: "hr_manager",
-      isActive: true
+      isActive: true,
     });
 
     await defaultHR.save();
@@ -81,45 +80,44 @@ const createDefaultHR = async () => {
   }
 };
 
-
-
-
-
 /* =====================
   Normal Employees ROUTES
 ===================== */
 const authRoutes = require("./routes/login");
 const employeeRoutes = require("./routes/HrRoutes/Employee-Section");
 
+// HR Profile Routes
+const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-section");
+
+app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
 
 /* =====================
   Customer ROUTES
 ===================== */
-const customerRoutes = require('./routes/Customer_Routes/auth');
-app.use('/api/customer', customerRoutes);
+const customerRoutes = require("./routes/Customer_Routes/auth");
+app.use("/api/customer", customerRoutes);
 
-const customerRequestsRoutes = require('./routes/Customer_Routes/CustomerRequests.js');
-app.use('/api/customer/requests', customerRequestsRoutes);
+const customerRequestsRoutes = require("./routes/Customer_Routes/CustomerRequests.js");
+app.use("/api/customer/requests", customerRequestsRoutes);
 
-const customerProfileRoutes = require('./routes/Customer_Routes/Profile.js');
-app.use('/api/customer/profile', customerProfileRoutes);
+const customerProfileRoutes = require("./routes/Customer_Routes/Profile.js");
+app.use("/api/customer/profile", customerProfileRoutes);
 
 // Add this to your server.js in the CMS ROUTES section
-const customerStockItemsRoutes = require('./routes/Customer_Routes/StockItems');
-app.use('/api/customer/stock-items', customerStockItemsRoutes);
+const customerStockItemsRoutes = require("./routes/Customer_Routes/StockItems");
+app.use("/api/customer/stock-items", customerStockItemsRoutes);
 
-const customerEditRequestRoutes = require('./routes/Customer_Routes/EditRequests.js');
-app.use('/api/customer/edit-requests', customerEditRequestRoutes);
+const customerEditRequestRoutes = require("./routes/Customer_Routes/EditRequests.js");
+app.use("/api/customer/edit-requests", customerEditRequestRoutes);
 
-const customerQuotationRoutes = require('./routes/Customer_Routes/QuotationRoutes');
-app.use('/api/customer', customerQuotationRoutes);
+const customerQuotationRoutes = require("./routes/Customer_Routes/QuotationRoutes");
+app.use("/api/customer", customerQuotationRoutes);
 
-const employeeMpcRoutes = require('./routes/Customer_Routes/Employee_Mpc');
+const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
-app.use('/api/customer/employees', employeeMpcRoutes);
-
+app.use("/api/customer/employees", employeeMpcRoutes);
 
 /* =====================
   CMS ROUTES
@@ -160,42 +158,44 @@ const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview"
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
 const RegisteredDepartments = require("./routes/CMS_Routes/Sales/Configuration/OrganizationDepartment/organizationDepartmentRoutes");
-app.use("/api/cms/configuration/organization-departments", RegisteredDepartments);
+app.use(
+  "/api/cms/configuration/organization-departments",
+  RegisteredDepartments,
+);
 
 // Measurement Routes
-const measurementRoutes = require('./routes/CMS_Routes/Measurement/measurementRoutes');
-app.use('/api/cms/measurements', measurementRoutes);
-
+const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
+app.use("/api/cms/measurements", measurementRoutes);
 
 // Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
-app.use("/api/cms/manufacturing/manufacturing-orders", manufacturingOrderRoutes);
+app.use(
+  "/api/cms/manufacturing/manufacturing-orders",
+  manufacturingOrderRoutes,
+);
 
-
-const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes")
+const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes");
 app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 
-
-const BarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/barcodeRoutes.js")
+const BarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/barcodeRoutes.js");
 app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 
-
-const ProductionTracking = require("./routes/CMS_Routes/Production/Tracking/trackingRoutes.js")
+const ProductionTracking = require("./routes/CMS_Routes/Production/Tracking/trackingRoutes.js");
 app.use("/api/cms/production/tracking", ProductionTracking);
 
+// In your main server.js or app.js
+const workOrderProgressRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes");
+app.use(
+  "/api/cms/manufacturing/work-orders/production-tracking",
+  workOrderProgressRoutes,
+);
 
 // In your main server.js or app.js
-const workOrderProgressRoutes = require('./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes');
-app.use('/api/cms/manufacturing/work-orders/production-tracking', workOrderProgressRoutes);
+const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
+app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
 
-// In your main server.js or app.js
-const workFlowTrackRoutes = require('./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js');
-app.use('/api/cms/manufacturing/production-tracking', workFlowTrackRoutes);
-
-
-const ProductionSchedule = require("./routes/CMS_Routes/Production/ProductionSchedule/productionScheduleRoutes.js")
+const ProductionSchedule = require("./routes/CMS_Routes/Production/ProductionSchedule/productionScheduleRoutes.js");
 app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
-
 
 // Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
@@ -204,15 +204,12 @@ app.use("/api/cms/sales", salesRoutes);
 const salesOverview = require("./routes/CMS_Routes/Sales/dashboard");
 app.use("/api/cms/sales/overview", salesOverview);
 
-const quotationRoutes = require('./routes/CMS_Routes/Sales/quotationRoutes');
-app.use('/api/cms/sales', quotationRoutes);
+const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
+app.use("/api/cms/sales", quotationRoutes);
 
-
-
-
-
-
-
+// HR Department Routes
+const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
+app.use("/api/hr/departments", hrDepartmentRoutes);
 
 /* =====================
    HEALTH CHECK
@@ -235,12 +232,11 @@ app.get("/", (req, res) => {
     success: true,
     message: "Welcome to GRAV Clothing Backend API",
     version: "1.0.0",
-    departments: ["HR", "Project Management", "Sales"]
+    departments: ["HR", "Project Management", "Sales"],
   });
 });
 
 // In your server.js, add this after the other route imports:
-
 
 const PORT = process.env.PORT || 5000;
 

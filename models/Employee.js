@@ -13,36 +13,77 @@ const employeeSchema = new mongoose.Schema({
   alternatePhone: { type: String },
   dateOfBirth: { type: Date },
   gender: { type: String, enum: ["male", "female", "other"] },
-  maritalStatus: { type: String, enum: ["single", "married", "divorced", "widowed"] },
+  maritalStatus: {
+    type: String,
+    enum: ["single", "married", "divorced", "widowed"],
+  },
 
   // Work Information
   employeeId: { type: String, unique: true },
-  department: { 
+  department: {
     type: String,
-    enum: ["Administration","House-Keeping","IT","Corporate","Production","Sales","Marketing","Finance","HR","Operator"]
+    enum: [
+      "Administration",
+      "House-Keeping",
+      "IT",
+      "Corporate",
+      "Production",
+      "Sales",
+      "Marketing",
+      "Finance",
+      "HR",
+      "Operator",
+    ],
   },
   jobPosition: { type: String },
   jobTitle: { type: String },
-    // Add managerId field
+  // Add managerId field
   managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
-  manager: { type: String },
+  primaryManager: {
+    managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
+    managerName: { type: String },
+  },
+
+  secondaryManager: {
+    managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
+    managerName: { type: String },
+  },
   dateOfJoining: { type: Date },
-  employmentType: { type: String, enum: ["full_time","part_time","contract","intern"] },
+  employmentType: {
+    type: String,
+    enum: ["full_time", "part_time", "contract", "intern"],
+  },
   workLocation: { type: String, default: "GRAV Clothing" },
+  departmentId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Department",
+  },
+  designation: {
+    type: String,
+    trim: true,
+  },
 
   // Salary Information
   salary: {
     basic: { type: Number, min: [0, "Salary cannot be negative"] },
-    allowances: { type: Number, default: 0, min: [0, "Allowances cannot be negative"] },
-    deductions: { type: Number, default: 0, min: [0, "Deductions cannot be negative"] },
-    netSalary: { type: Number, default: 0 }
+    allowances: {
+      type: Number,
+      default: 0,
+      min: [0, "Allowances cannot be negative"],
+    },
+    deductions: {
+      type: Number,
+      default: 0,
+      min: [0, "Deductions cannot be negative"],
+    },
+    netSalary: { type: Number, default: 0 },
   },
 
   // Bank Details
   bankDetails: {
     bankName: { type: String },
     accountNumber: { type: String },
-    ifscCode: { type: String }
+    ifscCode: { type: String },
   },
 
   // Documents
@@ -52,27 +93,43 @@ const employeeSchema = new mongoose.Schema({
     uanNumber: { type: String, sparse: true },
     aadharFile: { url: String, publicId: String },
     panFile: { url: String, publicId: String },
-    resumeFile: { url: String, publicId: String }
+    resumeFile: { url: String, publicId: String },
   },
 
   // Address Information
   address: {
-    current: { street: String, city: String, state: String, pincode: String, country: { type: String, default: "India" } },
-    permanent: { street: String, city: String, state: String, pincode: String, country: { type: String, default: "India" } }
+    current: {
+      street: String,
+      city: String,
+      state: String,
+      pincode: String,
+      country: { type: String, default: "India" },
+    },
+    permanent: {
+      street: String,
+      city: String,
+      state: String,
+      pincode: String,
+      country: { type: String, default: "India" },
+    },
   },
 
   // Status
-  status: { type: String, enum: ["draft","active","inactive","on_leave"], default: "draft" },
+  status: {
+    type: String,
+    enum: ["draft", "active", "inactive", "on_leave"],
+    default: "draft",
+  },
   isActive: { type: Boolean, default: false },
 
   // System Fields
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+  updatedAt: { type: Date, default: Date.now },
 });
 
 // Single pre-save hook
-employeeSchema.pre("save", async function() {
+employeeSchema.pre("save", async function () {
   // Ensure email lowercase
   if (this.email) this.email = this.email.toLowerCase();
 
@@ -84,14 +141,17 @@ employeeSchema.pre("save", async function() {
 
   // Calculate net salary
   if (this.salary && this.salary.basic !== undefined) {
-    this.salary.netSalary = (this.salary.basic || 0) + (this.salary.allowances || 0) - (this.salary.deductions || 0);
+    this.salary.netSalary =
+      (this.salary.basic || 0) +
+      (this.salary.allowances || 0) -
+      (this.salary.deductions || 0);
   }
 
   this.updatedAt = Date.now();
 });
 
 // Virtual for full name
-employeeSchema.virtual("fullName").get(function() {
+employeeSchema.virtual("fullName").get(function () {
   return `${this.firstName} ${this.lastName}`;
 });
 
