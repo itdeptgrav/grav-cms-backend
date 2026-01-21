@@ -167,28 +167,23 @@ const employeeSchema = new mongoose.Schema({
 });
 
 // Calculate net salary before saving
-employeeSchema.pre("save", function (next) {
+employeeSchema.pre("save", async function () {
   if (this.salary && this.salary.basic !== undefined) {
     this.salary.netSalary =
       (this.salary.basic || 0) +
       (this.salary.allowances || 0) -
       (this.salary.deductions || 0);
   }
+
   this.updatedAt = Date.now();
-  next();
 });
 
 // Hash password before saving
-employeeSchema.pre("save", async function (next) {
-  if (!this.isModified("password")) return next();
+employeeSchema.pre("save", async function () {
+  if (!this.isModified("password")) return;
 
-  try {
-    const salt = await bcrypt.genSalt(10);
-    this.password = await bcrypt.hash(this.password, salt);
-    next();
-  } catch (error) {
-    next(error);
-  }
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(this.password, salt);
 });
 
 // Virtual for full name

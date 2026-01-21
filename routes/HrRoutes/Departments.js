@@ -31,6 +31,54 @@ router.get("/with-designations", EmployeeAuthMiddleware, async (req, res) => {
   }
 });
 
+// ✅ GET designations by department ID
+router.get(
+  "/:id/designations-list",
+  EmployeeAuthMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const department = await Department.findById(id)
+        .select("name designations")
+        .lean();
+
+      if (!department) {
+        return res.status(404).json({
+          success: false,
+          message: "Department not found",
+        });
+      }
+
+      const activeDesignations = department.designations
+        .filter((des) => des.isActive)
+        .map((des) => des.name);
+
+      res.status(200).json({
+        success: true,
+        data: {
+          departmentName: department.name,
+          designations: activeDesignations,
+        },
+      });
+    } catch (error) {
+      console.error("Get designations list error:", error);
+
+      if (error.name === "CastError") {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid department ID",
+        });
+      }
+
+      res.status(500).json({
+        success: false,
+        message: "Error fetching designations",
+      });
+    }
+  },
+);
+
 // The GET single department route to include employee data
 router.get("/:id/with-employees", EmployeeAuthMiddleware, async (req, res) => {
   try {
