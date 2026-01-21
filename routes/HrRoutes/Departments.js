@@ -31,53 +31,72 @@ router.get("/with-designations", EmployeeAuthMiddleware, async (req, res) => {
   }
 });
 
-// ✅ GET designations by department ID
-router.get(
-  "/:id/designations-list",
-  EmployeeAuthMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
+// The GET single department route to include employee data
+router.get("/:id/with-employees", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-      const department = await Department.findById(id)
-        .select("name designations")
-        .lean();
+    const department = await Department.findById(id).select("-__v").lean();
 
-      if (!department) {
-        return res.status(404).json({
-          success: false,
-          message: "Department not found",
-        });
-      }
-
-      const activeDesignations = department.designations
-        .filter((des) => des.isActive)
-        .map((des) => des.name);
-
-      res.status(200).json({
-        success: true,
-        data: {
-          departmentName: department.name,
-          designations: activeDesignations,
-        },
-      });
-    } catch (error) {
-      console.error("Get designations list error:", error);
-
-      if (error.name === "CastError") {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid department ID",
-        });
-      }
-
-      res.status(500).json({
+    if (!department) {
+      return res.status(404).json({
         success: false,
-        message: "Error fetching designations",
+        message: "Department not found",
       });
     }
-  },
-);
+
+    // Fetch employees for each designation
+    const designationsWithEmployees = await Promise.all(
+      department.designations.map(async (designation) => {
+        // Find employees with this department and designation
+        const employees = await Employee.find({
+          departmentId: id,
+          designation: designation.name,
+          status: "active",
+          isActive: true,
+        })
+          .select("firstName lastName employeeId email department designation")
+          .lean();
+
+        return {
+          ...designation,
+          employees: employees.map((emp) => ({
+            id: emp._id,
+            employeeId: emp.employeeId,
+            name: `${emp.firstName} ${emp.lastName}`,
+            email: emp.email,
+            department: emp.department,
+            designation: emp.designation,
+          })),
+        };
+      }),
+    );
+
+    const departmentWithEmployees = {
+      ...department,
+      designations: designationsWithEmployees,
+    };
+
+    res.status(200).json({
+      success: true,
+      data: departmentWithEmployees,
+    });
+  } catch (error) {
+    console.error("Get department with employees error:", error);
+
+    if (error.name === "CastError") {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid department ID",
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: "Error fetching department with employees",
+    });
+  }
+});
 
 router.post("/", EmployeeAuthMiddleware, async (req, res) => {
   try {
