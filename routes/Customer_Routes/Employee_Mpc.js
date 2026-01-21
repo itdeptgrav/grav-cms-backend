@@ -435,13 +435,14 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
 });
 
 // GET organization departments with stock item details
+// Update the GET organization departments route to include variant images
 router.get('/organization-departments', verifyCustomerToken, async (req, res) => {
   try {
     const orgDept = await OrganizationDepartment.findOne({
       customerId: req.customerId,
       status: 'active'
     })
-    .populate("departments.designations.assignedStockItems.stockItemId", "name reference category images")
+    .populate("departments.designations.assignedStockItems.stockItemId", "name reference category images variants")
     .lean();
     
     if (!orgDept) {
@@ -451,9 +452,69 @@ router.get('/organization-departments', verifyCustomerToken, async (req, res) =>
       });
     }
     
+    // Process the organization departments to get variant images
+    const processedOrgDept = {
+      ...orgDept,
+      departments: orgDept.departments?.map(dept => ({
+        ...dept,
+        designations: dept.designations?.map(designation => ({
+          ...designation,
+          assignedStockItems: designation.assignedStockItems?.map(item => {
+            const stockItem = item.stockItemId;
+            if (!stockItem) {
+              return item;
+            }
+            
+            let variantImages = [];
+            let variantInfo = null;
+            
+            // If variantId exists, get variant-specific images
+            if (item.variantId && stockItem.variants) {
+              const variant = stockItem.variants.find(v => 
+                v._id && v._id.toString() === item.variantId.toString()
+              );
+              
+              if (variant && variant.images && variant.images.length > 0) {
+                variantImages = variant.images;
+                variantInfo = {
+                  variantId: variant._id,
+                  variantName: variant.attributes?.map(a => a.value).join(" • ") || "Default",
+                  sku: variant.sku
+                };
+              } else if (stockItem.images && stockItem.images.length > 0) {
+                // Fallback to stock item images if variant has no images
+                variantImages = stockItem.images;
+                variantInfo = {
+                  variantId: item.variantId,
+                  variantName: item.variantName || "Default",
+                  note: "Using stock item images"
+                };
+              }
+            } else if (stockItem.images && stockItem.images.length > 0) {
+              // No variant selected, use stock item images
+              variantImages = stockItem.images;
+              variantInfo = {
+                variantName: "Default",
+                note: "No variant selected"
+              };
+            }
+            
+            return {
+              ...item,
+              stockItemId: stockItem._id,
+              stockItemName: stockItem.name,
+              stockItemImages: stockItem.images || [],
+              variantImages: variantImages,
+              variantInfo: variantInfo
+            };
+          })
+        }))
+      }))
+    };
+    
     res.status(200).json({
       success: true,
-      organizationDepartment: orgDept
+      organizationDepartment: processedOrgDept
     });
     
   } catch (error) {
@@ -690,6 +751,60 @@ router.patch('/:id/status', verifyCustomerToken, async (req, res) => {
       message: 'Server error while updating employee status'
     });
   }
+});
+
+// Add this new route to your backend API
+
+// GET specific stock item with variants
+router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
+    try {
+        const stockItem = await StockItem.findById(req.params.id)
+            .select('name reference images variants')
+            .lean();
+        
+        if (!stockItem) {
+            return res.status(404).json({
+                success: false,
+                message: 'Stock item not found'
+            });
+        }
+        
+        // If a specific variant ID is requested via query parameter
+        const { variantId } = req.query;
+        if (variantId && stockItem.variants) {
+            const variant = stockItem.variants.find(v => v._id.toString() === variantId);
+            if (variant) {
+                // Return variant-specific images if available
+                const variantData = {
+                    ...stockItem,
+                    variantImages: variant.images || stockItem.images,
+                    variantDetails: {
+                        variantId: variant._id,
+                        attributes: variant.attributes,
+                        sku: variant.sku,
+                        variantName: variant.attributes?.map(a => a.value).join(" • ") || "Default"
+                    }
+                };
+                
+                return res.status(200).json({
+                    success: true,
+                    stockItem: variantData
+                });
+            }
+        }
+        
+        res.status(200).json({
+            success: true,
+            stockItem
+        });
+        
+    } catch (error) {
+        console.error('Error fetching stock item:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while fetching stock item'
+        });
+    }
 });
 
 // Export employees to CSV

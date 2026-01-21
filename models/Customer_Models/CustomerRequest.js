@@ -300,7 +300,6 @@ const paymentSubmissionSchema = new mongoose.Schema({
 const quotationSchema = new mongoose.Schema({
   quotationNumber: {
     type: String,
-
     sparse: true
   },
   date: {

@@ -8,6 +8,14 @@ const designationStockItemSchema = new mongoose.Schema({
     ref: "StockItem",
     required: true
   },
+  variantId: {
+    type: mongoose.Schema.Types.ObjectId,
+    default: null
+  },
+  variantName: {
+    type: String,
+    default: "Default"
+  },
   quantity: {
     type: Number,
     required: true,

@@ -1,24 +1,66 @@
-// models/CMS_Models/Inventory/Products/StockItem.js
-
 const mongoose = require("mongoose");
 
 const attributeValueSchema = new mongoose.Schema({
   name: {
     type: String,
-
+    required: true,
     trim: true
   },
   value: {
     type: String,
-
+    required: true,
     trim: true
+  }
+}, { _id: false });
+
+const variantRawItemSchema = new mongoose.Schema({
+  rawItemId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "RawItem",
+    required: true
+  },
+  rawItemName: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  rawItemSku: {
+    type: String,
+    trim: true
+  },
+  variantId: { // New: To store which variant of raw item is used
+    type: mongoose.Schema.Types.ObjectId
+  },
+  variantCombination: [{ // New: Which variant combination of raw item
+    type: String,
+    trim: true
+  }],
+  quantity: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  unit: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  unitCost: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  totalCost: {
+    type: Number,
+    required: true,
+    min: 0
   }
 }, { _id: false });
 
 const variantSchema = new mongoose.Schema({
   sku: {
     type: String,
-
+    required: true,
     unique: true,
     uppercase: true,
     trim: true
@@ -26,79 +68,51 @@ const variantSchema = new mongoose.Schema({
   attributes: [attributeValueSchema],
   quantityOnHand: {
     type: Number,
-
+    required: true,
     min: 0,
     default: 0
   },
   minStock: {
     type: Number,
-
-    min: 0
+    required: true,
+    min: 0,
+    default: 10
   },
   maxStock: {
     type: Number,
-
-    min: 0
+    required: true,
+    min: 0,
+    default: 100
   },
   cost: {
     type: Number,
-
+    required: true,
     min: 0
   },
   salesPrice: {
     type: Number,
-
+    required: true,
     min: 0
   },
   barcode: {
     type: String,
     trim: true
   },
-  images: [String]
-}, { timestamps: true });
-
-const rawItemComponentSchema = new mongoose.Schema({
-  rawItemId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "RawItem",
-    required: true
-  },
-  name: {
+  images: [String],
+  // NEW: Raw items specific to this variant
+  rawItems: [variantRawItemSchema],
+  // Status for this specific variant
+  status: {
     type: String,
-
-    trim: true
-  },
-  sku: {
-    type: String,
-
-    trim: true
-  },
-  quantity: {
-    type: Number,
-
-    min: 0
-  },
-  unit: {
-    type: String,
-
-    trim: true
-  },
-  unitCost: {
-    type: Number,
-
-    min: 0
-  },
-  totalCost: {
-    type: Number,
-
-    min: 0
+    enum: ["In Stock", "Low Stock", "Out of Stock"],
+    default: "In Stock"
   }
-}, { _id: false });
+}, { timestamps: true });
 
 const operationSchema = new mongoose.Schema({
   type: {
     type: String,
-
+    required: true,
     trim: true
   },
   machine: {
@@ -136,12 +150,12 @@ const stockItemSchema = new mongoose.Schema({
   // Basic Information
   name: {
     type: String,
-
+    required: true,
     trim: true
   },
   reference: {
     type: String,
-
+    required: true,
     unique: true,
     uppercase: true,
     trim: true
@@ -164,7 +178,7 @@ const stockItemSchema = new mongoose.Schema({
   // Category
   category: {
     type: String,
-
+    required: true,
     trim: true
   },
 
@@ -184,52 +198,34 @@ const stockItemSchema = new mongoose.Schema({
     trim: true
   },
 
-  // General Pricing
+  // General Pricing (Base prices - can be overridden by variants)
   unit: {
     type: String,
-
+    required: true,
     default: "Units"
   },
-  salesPrice: {
+  baseSalesPrice: {
     type: Number,
-
     min: 0
   },
   salesTax: {
     type: String,
     trim: true
   },
-  cost: {
+  baseCost: {
     type: Number,
-
     min: 0
   },
   purchaseTax: {
     type: String,
     trim: true
   },
-  quantityOnHand: {
-    type: Number,
 
-    min: 0,
-    default: 0
-  },
-  minStock: {
-    type: Number,
-
-    min: 0
-  },
-  maxStock: {
-    type: Number,
-
-    min: 0
-  },
-
-  // Attributes
+  // Attributes for variants
   attributes: [{
     name: {
       type: String,
-
+      required: true,
       trim: true
     },
     values: [{
@@ -243,27 +239,28 @@ const stockItemSchema = new mongoose.Schema({
     trim: true
   }],
   
-  numberOfPanels: {  // Add this field
+  numberOfPanels: {
     type: Number,
     min: 0,
     default: 0
   },
 
-  // Variants
+  // Variants (REQUIRED - at least one variant)
   variants: [variantSchema],
 
-  // Components
-  rawItems: [rawItemComponentSchema],
+  // Operations (common for all variants)
   operations: [operationSchema],
+  
+  // Miscellaneous costs (common for all variants)
   miscellaneousCosts: [{
     name: {
       type: String,
-
+      required: true,
       trim: true
     },
     amount: {
       type: Number,
-
+      required: true,
       min: 0
     },
     unit: {
@@ -273,17 +270,22 @@ const stockItemSchema = new mongoose.Schema({
     }
   }],
 
-  // Images
+  // Images (common for all variants)
   images: [String],
 
-  // Status
+  // Overall Status (calculated from variants)
   status: {
     type: String,
     enum: ["In Stock", "Low Stock", "Out of Stock"],
     default: "In Stock"
   },
 
-  // Calculated Fields
+  // Calculated Fields (from all variants)
+  totalQuantityOnHand: {
+    type: Number,
+    min: 0,
+    default: 0
+  },
   totalRawItemsCost: {
     type: Number,
     min: 0,
@@ -299,7 +301,12 @@ const stockItemSchema = new mongoose.Schema({
     min: 0,
     default: 0
   },
-  totalCost: {
+  averageCost: {
+    type: Number,
+    min: 0,
+    default: 0
+  },
+  averageSalesPrice: {
     type: Number,
     min: 0,
     default: 0
@@ -331,49 +338,4 @@ const stockItemSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
-// Pre-save middleware for calculations
-stockItemSchema.pre("save", function (next) {
-  // Calculate total raw items cost
-  this.totalRawItemsCost = this.rawItems.reduce((total, item) => {
-    return total + (item.totalCost || 0);
-  }, 0);
-
-  // Calculate total operations cost
-  this.totalOperationsCost = this.operations.reduce((total, op) => {
-    return total + (op.operatorCost || 0);
-  }, 0);
-
-  // Calculate total miscellaneous cost
-  this.totalMiscellaneousCost = this.miscellaneousCosts.reduce((total, cost) => {
-    return total + (cost.amount || 0);
-  }, 0);
-
-  // Calculate total cost
-  this.totalCost = this.cost + this.totalRawItemsCost + this.totalOperationsCost + this.totalMiscellaneousCost;
-
-  // Calculate profit margin
-  if (this.salesPrice > 0 && this.totalCost > 0) {
-    this.profitMargin = ((this.salesPrice - this.totalCost) / this.totalCost) * 100;
-  }
-
-  // Calculate inventory value
-  this.inventoryValue = this.quantityOnHand * this.totalCost;
-
-  // Calculate potential revenue
-  this.potentialRevenue = this.quantityOnHand * this.salesPrice;
-
-  // Auto-update status based on quantity
-  if (this.quantityOnHand === 0) {
-    this.status = "Out of Stock";
-  } else if (this.quantityOnHand <= this.minStock) {
-    this.status = "Low Stock";
-  } else {
-    this.status = "In Stock";
-  }
-
-});
-
 module.exports = mongoose.model("StockItem", stockItemSchema);
-
-
-

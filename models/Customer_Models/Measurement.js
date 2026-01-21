@@ -157,48 +157,6 @@ measurementSchema.index({ organizationId: 1, createdAt: -1 });
 measurementSchema.index({ organizationId: 1, completionRate: 1 });
 measurementSchema.index({ "employeeMeasurements.employeeId": 1 });
 
-// Pre-save middleware to calculate stats
-measurementSchema.pre("save", function (next) {
-    // Calculate employee stats
-    const uniqueEmployeeIds = new Set();
-    this.employeeMeasurements.forEach(emp => {
-        uniqueEmployeeIds.add(emp.employeeId.toString());
-    });
-    
-    this.totalRegisteredEmployees = this.registeredEmployeeIds.length;
-    this.measuredEmployees = uniqueEmployeeIds.size;
-    this.pendingEmployees = this.totalRegisteredEmployees - this.measuredEmployees;
 
-    // Calculate measurement completion
-    let totalMeasurementFields = 0;
-    let completedMeasurementFields = 0;
-
-    this.employeeMeasurements.forEach(emp => {
-        emp.stockItems.forEach(stockItem => {
-            const itemFields = stockItem.measurements.length;
-            totalMeasurementFields += itemFields;
-            
-            const completedFields = stockItem.measurements.filter(m => 
-                m.value && m.value.trim() !== ""
-            ).length;
-            completedMeasurementFields += completedFields;
-        });
-    });
-
-    this.totalMeasurements = totalMeasurementFields;
-    this.completedMeasurements = completedMeasurementFields;
-    this.pendingMeasurements = totalMeasurementFields - completedMeasurementFields;
-
-    // Calculate completion rates
-    if (this.totalRegisteredEmployees > 0) {
-        const employeeCompletionRate = Math.round((this.measuredEmployees / this.totalRegisteredEmployees) * 100);
-        const measurementCompletionRate = totalMeasurementFields > 0 
-            ? Math.round((completedMeasurementFields / totalMeasurementFields) * 100) 
-            : 0;
-        
-        this.completionRate = Math.round((employeeCompletionRate + measurementCompletionRate) / 2);
-    }
-
-});
 
 module.exports = mongoose.model("Measurement", measurementSchema);

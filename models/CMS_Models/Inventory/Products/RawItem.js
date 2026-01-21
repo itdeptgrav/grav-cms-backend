@@ -5,30 +5,86 @@ const mongoose = require("mongoose");
 const discountSchema = new mongoose.Schema({
   minQuantity: {
     type: Number,
-    
+    required: true,
+    min: 1
   },
   price: {
     type: Number,
-    
+    required: true,
+    min: 0
   }
 }, { _id: false });
+
+const attributeSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    trim: true,
+    required: true
+  },
+  values: [{
+    type: String,
+    trim: true,
+    required: true
+  }]
+}, { _id: false });
+
+const variantSchema = new mongoose.Schema({
+  combination: [{
+    type: String,
+    trim: true,
+    required: true
+  }],
+  quantity: {
+    type: Number,
+    required: true,
+    default: 0,
+    min: 0
+  },
+  minStock: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  maxStock: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  sku: {
+    type: String,
+    trim: true
+  },
+  status: {
+    type: String,
+    enum: ["In Stock", "Low Stock", "Out of Stock"],
+    default: "In Stock"
+  }
+}, { _id: true });
 
 const stockTransactionSchema = new mongoose.Schema({
   type: {
     type: String,
-    enum: ["ADD", "REDUCE", "CONSUME", "ADJUST", "PURCHASE_ORDER"],
+    enum: ["ADD", "REDUCE", "CONSUME", "ADJUST", "PURCHASE_ORDER", "VARIANT_ADD", "VARIANT_REDUCE"],
+    required: true
   },
   quantity: {
     type: Number,
-    
+    required: true
+  },
+  variantCombination: [{
+    type: String,
+    trim: true
+  }],
+  variantId: {
+    type: mongoose.Schema.Types.ObjectId
   },
   previousQuantity: {
     type: Number,
-    
+    required: true
   },
   newQuantity: {
     type: Number,
-    
+    required: true
   },
   reason: {
     type: String,
@@ -43,8 +99,7 @@ const stockTransactionSchema = new mongoose.Schema({
     ref: "Vendor"
   },
   unitPrice: {
-    type: Number,
-    
+    type: Number
   },
   purchaseOrder: {
     type: String,
@@ -65,6 +120,7 @@ const stockTransactionSchema = new mongoose.Schema({
   performedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "ProjectManager",
+    required: true
   }
 }, { timestamps: true });
 
@@ -73,12 +129,13 @@ const rawItemSchema = new mongoose.Schema({
   name: {
     type: String,
     trim: true,
-    
+    required: true
   },
   sku: {
     type: String,
     trim: true,
-    unique: true
+    unique: true,
+    required: true
   },
   category: {
     type: String,
@@ -93,37 +150,36 @@ const rawItemSchema = new mongoose.Schema({
   unit: {
     type: String,
     trim: true,
-    
+    required: true
   },
   customUnit: {
     type: String,
     trim: true
   },
   
-  // Stock Information
+  // Attributes & Variants
+  attributes: [attributeSchema],
+  variants: [variantSchema],
+  
+  // Stock Information (total quantity - sum of all variants)
   quantity: {
     type: Number,
-    
-    default: 0
+    required: true,
+    default: 0,
+    min: 0
   },
   minStock: {
     type: Number,
-    
-    
+    required: true,
+    min: 0
   },
   maxStock: {
     type: Number,
-    
-    
+    required: true,
+    min: 0
   },
   
-  // Pricing
-  sellingPrice: {
-    type: Number,
-    
-  },
-  
-  // Bulk Discounts (no vendor costs at registration)
+  // Bulk Discounts
   discounts: [discountSchema],
   
   // Stock Transactions History
@@ -146,7 +202,7 @@ const rawItemSchema = new mongoose.Schema({
     trim: true
   },
   
-  // Vendor associations (updated via purchase orders)
+  // Vendor associations
   primaryVendor: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Vendor"
@@ -160,45 +216,12 @@ const rawItemSchema = new mongoose.Schema({
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "ProjectManager",
+    required: true
   },
   updatedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "ProjectManager"
   }
 }, { timestamps: true });
-
-// Auto-calculate status based on quantity
-rawItemSchema.pre("save", function(next) {
-  if (this.quantity === 0) {
-    this.status = "Out of Stock";
-  } else if (this.quantity <= this.minStock) {
-    this.status = "Low Stock";
-  } else {
-    this.status = "In Stock";
-  }
-
-});
-
-// Virtual for vendor costs (calculated from recent transactions)
-rawItemSchema.virtual('currentVendorCosts').get(function() {
-  // Get the most recent purchase prices from each vendor
-  const vendorMap = new Map();
-  
-  this.stockTransactions
-    .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .forEach(tx => {
-      if (tx.supplier && tx.unitPrice && !vendorMap.has(tx.supplier)) {
-        vendorMap.set(tx.supplier, {
-          supplier: tx.supplier,
-          supplierId: tx.supplierId,
-          cost: tx.unitPrice,
-          lastPurchaseDate: tx.createdAt
-        });
-      }
-    });
-  
-  return Array.from(vendorMap.values());
-});
 
 module.exports = mongoose.model("RawItem", rawItemSchema);
