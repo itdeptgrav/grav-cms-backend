@@ -37,8 +37,11 @@ const employeeSchema = new mongoose.Schema({
     enum: ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"],
   },
 
-  // Work Information
-  employeeId: { type: String, unique: true, required: true },
+  // Work Information - UPDATED: REMOVED employeeId, added new IDs
+  biometricId: { type: String, unique: true, required: true }, // REPLACES employeeId
+  identityId: { type: String, unique: true, sparse: true }, // NEW FIELD
+  needsToOperate: { type: Boolean, default: false }, // NEW FIELD
+
   department: {
     type: String,
     enum: [
@@ -114,8 +117,6 @@ const employeeSchema = new mongoose.Schema({
   },
 
   // Documents
-
-  // Update documents field to include additional documents
   documents: {
     aadharNumber: { type: String, sparse: true },
     panNumber: { type: String, sparse: true },
@@ -123,7 +124,6 @@ const employeeSchema = new mongoose.Schema({
     aadharFile: { url: String, publicId: String },
     panFile: { url: String, publicId: String },
     resumeFile: { url: String, publicId: String },
-    // Additional documents array
     additionalDocuments: [
       {
         title: String,
@@ -189,6 +189,11 @@ employeeSchema.pre("save", async function () {
 // Virtual for full name
 employeeSchema.virtual("fullName").get(function () {
   return `${this.firstName} ${this.lastName}`;
+});
+
+// Virtual for backward compatibility (if needed for existing code)
+employeeSchema.virtual("employeeId").get(function () {
+  return this.biometricId; // Map biometricId to employeeId for backward compatibility
 });
 
 module.exports = mongoose.model("Employee", employeeSchema);

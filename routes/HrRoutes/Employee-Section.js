@@ -13,96 +13,24 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     const { user } = req;
     const employeeData = req.body;
 
-    console.log("Received employee data with Cloudinary URLs:", {
-      hasProfilePhoto: !!employeeData.profilePhoto,
-      profilePhotoType: employeeData.profilePhoto?.url
-        ? "Cloudinary URL"
-        : "Other",
-      hasDocuments: !!employeeData.documents,
-      additionalDocsCount:
-        employeeData.documents?.additionalDocuments?.length || 0,
-    });
-
-    // Clean up profile photo data if it's a base64 string (from older clients)
-    if (
-      employeeData.profilePhoto &&
-      typeof employeeData.profilePhoto === "string" &&
-      employeeData.profilePhoto.startsWith("data:image")
-    ) {
-      console.log(
-        "Warning: Received base64 profile photo. Frontend should upload to Cloudinary.",
-      );
-      delete employeeData.profilePhoto; // Remove base64 data
-    }
-
-    // Clean up document URLs if they contain base64 data
-    if (employeeData.documents) {
-      // Clean Aadhar file
-      if (
-        employeeData.documents.aadharFile &&
-        typeof employeeData.documents.aadharFile === "string" &&
-        employeeData.documents.aadharFile.startsWith("data:image")
-      ) {
-        console.log(
-          "Warning: Received base64 Aadhar file. Frontend should upload to Cloudinary.",
-        );
-        delete employeeData.documents.aadharFile;
-      }
-
-      // Clean PAN file
-      if (
-        employeeData.documents.panFile &&
-        typeof employeeData.documents.panFile === "string" &&
-        employeeData.documents.panFile.startsWith("data:image")
-      ) {
-        console.log(
-          "Warning: Received base64 PAN file. Frontend should upload to Cloudinary.",
-        );
-        delete employeeData.documents.panFile;
-      }
-
-      // Clean resume file
-      if (
-        employeeData.documents.resumeFile &&
-        typeof employeeData.documents.resumeFile === "string" &&
-        employeeData.documents.resumeFile.startsWith("data:image")
-      ) {
-        console.log(
-          "Warning: Received base64 resume file. Frontend should upload to Cloudinary.",
-        );
-        delete employeeData.documents.resumeFile;
-      }
-
-      // Clean additional documents
-      if (employeeData.documents.additionalDocuments) {
-        employeeData.documents.additionalDocuments =
-          employeeData.documents.additionalDocuments.filter((doc) => {
-            if (
-              doc.url &&
-              typeof doc.url === "string" &&
-              doc.url.startsWith("data:image")
-            ) {
-              console.log(
-                "Warning: Filtered out base64 additional document:",
-                doc.title,
-              );
-              return false; // Remove base64 documents
-            }
-            return true; // Keep valid documents with Cloudinary URLs
-          });
-      }
-    }
-
     // Generate a temporary password for the employee
     const temporaryPassword = Math.random().toString(36).slice(-8);
     const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
+
+    // Validate required IDs
+    if (!employeeData.biometricId) {
+      return res.status(400).json({
+        success: false,
+        message: "Biometric ID is required",
+      });
+    }
 
     // Create employee with the new fields
     const newEmployee = new Employee({
       ...employeeData,
       // Add password for login
       password: hashedPassword,
-      temporaryPassword: temporaryPassword, // Store temporary password for email
+      temporaryPassword: temporaryPassword,
 
       // Ensure all fields are properly structured
       departmentId: employeeData.departmentId,
@@ -697,7 +625,8 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
       // Basic Information
       basicInfo: {
         id: employee._id,
-        employeeId: employee.employeeId,
+        biometricId: employee.biometricId, // CHANGED from employeeId to biometricId
+        identityId: employee.identityId, // NEW
         firstName: employee.firstName,
         lastName: employee.lastName,
         fullName: `${employee.firstName} ${employee.lastName}`,
@@ -724,7 +653,9 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
         departmentId: employee.departmentId,
         designation: employee.designation || employee.jobPosition,
         jobTitle: employee.jobTitle,
-        employeeId: employee.employeeId,
+        biometricId: employee.biometricId, // CHANGED
+        identityId: employee.identityId, // NEW
+        needsToOperate: employee.needsToOperate || false, // NEW
         dateOfJoining: employee.dateOfJoining
           ? new Date(employee.dateOfJoining).toLocaleDateString()
           : "Not Provided",
