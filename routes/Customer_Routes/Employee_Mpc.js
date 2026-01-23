@@ -258,7 +258,7 @@ router.post('/', verifyCustomerToken, async (req, res) => {
       uin: uin.trim().toUpperCase(),
       department: formattedDepartment,
       designation: formattedDesignation,
-      gender: gender,  // <-- Just pass the gender as-is, schema will format it
+      gender: emp.gender,  // <-- Just pass the gender as-is, schema will format it
       status: status || 'active',
       createdBy: req.customerId
     });
@@ -374,7 +374,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         uin: formattedUin,
         department: emp.department.trim(),
         designation: emp.designation.trim(),
-        gender: gender,
+        gender: emp.gender,
         status: 'active',
         createdBy: req.customerId
       });
