@@ -15,7 +15,6 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
 
     // Generate a temporary password for the employee
     const temporaryPassword = Math.random().toString(36).slice(-8);
-    const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
 
     // Validate required IDs
     if (!employeeData.biometricId) {
@@ -28,30 +27,16 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     // Create employee with the new fields
     const newEmployee = new Employee({
       ...employeeData,
-      // Add password for login
-      password: hashedPassword,
+
+      // ✅ send plain password here (schema will hash automatically)
+      password: temporaryPassword,
       temporaryPassword: temporaryPassword,
 
-      // Ensure all fields are properly structured
-      departmentId: employeeData.departmentId,
-      designation: employeeData.designation || employeeData.jobPosition,
-
-      // Handle managers properly
-      primaryManager: employeeData.primaryManager || undefined,
-      secondaryManager: employeeData.secondaryManager || undefined,
-
-      // Set default values
-      status: employeeData.status || "active",
-      isActive:
-        employeeData.isActive !== undefined ? employeeData.isActive : true,
-
-      // Track creator
       createdBy: user.id,
       createdAt: new Date(),
     });
 
     await newEmployee.save();
-
     // Send welcome email asynchronously (only if email service is enabled)
     if (process.env.ENABLE_EMAILS === "true" && employeeData.email) {
       try {

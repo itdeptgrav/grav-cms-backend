@@ -13,6 +13,7 @@ const employeeSchema = new mongoose.Schema({
     unique: true,
   },
   password: { type: String },
+  temporaryPassword: { type: String, select: false },
   phone: { type: String, required: true },
   alternatePhone: { type: String },
   dateOfBirth: { type: Date },
@@ -179,11 +180,17 @@ employeeSchema.pre("save", async function () {
 });
 
 // Hash password before saving
-employeeSchema.pre("save", async function () {
-  if (!this.isModified("password")) return;
+employeeSchema.pre("save", async function (next) {
+  try {
+    if (!this.isModified("password")) return next();
 
-  const salt = await bcrypt.genSalt(10);
-  this.password = await bcrypt.hash(this.password, salt);
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+
+    next();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Virtual for full name

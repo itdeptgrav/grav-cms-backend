@@ -4,7 +4,7 @@ const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
-const EmployeeAuthMiddleware = require("../../middleware/EmployeeAuthMiddleware");
+const EmployeeAuthMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
 
 // Get employee profile
 router.get("/profile", EmployeeAuthMiddleware, async (req, res) => {
@@ -102,6 +102,7 @@ router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
     const { user } = req;
     const { currentPassword, newPassword } = req.body;
 
+    // Validation
     if (!currentPassword || !newPassword) {
       return res.status(400).json({
         success: false,
@@ -109,15 +110,27 @@ router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
       });
     }
 
-    // Get employee with password
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "New password must be at least 6 characters long",
+      });
+    }
+
+    // Find employee with password
     const employee = await Employee.findById(user.id).select("+password");
+    if (!employee) {
+      return res.status(404).json({
+        success: false,
+        message: "Employee not found",
+      });
+    }
 
     // Verify current password
     const isPasswordValid = await bcrypt.compare(
       currentPassword,
       employee.password,
     );
-
     if (!isPasswordValid) {
       return res.status(401).json({
         success: false,
@@ -129,9 +142,11 @@ router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    // Update password
-    employee.password = hashedPassword;
-    await employee.save();
+    // Update password in database
+    await Employee.findByIdAndUpdate(user.id, {
+      password: hashedPassword,
+      updatedAt: Date.now(),
+    });
 
     res.status(200).json({
       success: true,
@@ -142,37 +157,6 @@ router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error changing password",
-    });
-  }
-});
-
-// Get team members (for managers)
-router.get("/team", EmployeeAuthMiddleware, async (req, res) => {
-  try {
-    const { user } = req;
-
-    const teamMembers = await Employee.find({
-      $or: [
-        { "primaryManager.managerId": user.id },
-        { "secondaryManager.managerId": user.id },
-      ],
-      isActive: true,
-    })
-      .select(
-        "firstName lastName email employeeId department jobTitle profilePhoto",
-      )
-      .sort({ firstName: 1 });
-
-    res.status(200).json({
-      success: true,
-      data: teamMembers,
-      count: teamMembers.length,
-    });
-  } catch (error) {
-    console.error("Get team error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error fetching team members",
     });
   }
 });

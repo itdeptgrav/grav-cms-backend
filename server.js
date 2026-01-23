@@ -13,6 +13,7 @@ const allowedOrigins = [
   "https://grav-cms.vercel.app",
   "https://cms.grav.in",
   "https://customer.grav.in",
+  "http://192.168.1.30:3000", // ngrok example
 ];
 
 app.use(
@@ -212,6 +213,9 @@ const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
 
 // Employee Routes
+const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
+app.use("/api/employee/auth", employeeLoginRoutes);
+
 const employeeAuthRoutes = require("./routes/Employee_Routes/employeeAuth");
 app.use("/api/employee", employeeAuthRoutes);
 /* =====================
