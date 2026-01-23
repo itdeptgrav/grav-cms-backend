@@ -556,6 +556,22 @@ const customerRequestSchema = new mongoose.Schema({
 
   },
 
+
+  requestType: {
+    type: String,
+    enum: ["customer_request", "measurement_conversion"],
+    default: "customer_request"
+  },
+  measurementId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Measurement",
+    default: null
+  },
+  measurementName: {
+    type: String,
+    trim: true
+  },
+
   // Customer Information
   customerInfo: {
     name: {
@@ -719,112 +735,6 @@ const customerRequestSchema = new mongoose.Schema({
   toObject: { virtuals: true }
 });
 
-// Virtual for checking if quotation is expired
-customerRequestSchema.virtual('isQuotationExpired').get(function () {
-  if (!this.quotationValidUntil) return false;
-  return new Date(this.quotationValidUntil) < new Date();
-});
-
-// Virtual for getting quotation (only one allowed)
-customerRequestSchema.virtual('quotation').get(function () {
-  if (!this.quotations || this.quotations.length === 0) return null;
-  return this.quotations[0];
-});
-
-// Virtual for getting pending edit requests
-customerRequestSchema.virtual('pendingEditRequests').get(function () {
-  if (!this.editRequests) return [];
-  return this.editRequests.filter(req => req.status === 'pending_approval');
-});
-
-// Virtual for getting unread notifications
-customerRequestSchema.virtual('unreadNotifications').get(function () {
-  if (!this.quotationNotifications) return [];
-  return this.quotationNotifications.filter(notif => !notif.read);
-});
-
-// Virtual for getting total order value
-// In your CustomerRequest schema (models/Customer_Models/CustomerRequest.js)
-// Update the totalOrderValue virtual property:
-
-customerRequestSchema.virtual('totalOrderValue').get(function () {
-  if (this.finalOrderPrice) return this.finalOrderPrice;
-  
-  // Safely handle items array
-  if (!this.items || !Array.isArray(this.items)) return 0;
-  
-  return this.items.reduce((total, item) => total + (item.totalEstimatedPrice || 0), 0);
-});
-
-// Virtual for payment completion percentage
-customerRequestSchema.virtual('paymentCompletionPercentage').get(function () {
-  if (!this.finalOrderPrice || this.finalOrderPrice === 0) return 0;
-  return Math.round((this.totalPaidAmount / this.finalOrderPrice) * 100);
-});
-
-// REMOVED: Complex pre-save middleware - handle calculations in API routes
-// Only keep basic timestamp updates
-customerRequestSchema.pre('save', function (next) {
-  this.updatedAt = Date.now();
-
-  // Only calculate request item totals (simple calculation)
-  if (this.items && this.items.length > 0) {
-    this.items.forEach(item => {
-      item.totalQuantity = item.variants.reduce((sum, variant) => sum + variant.quantity, 0);
-      item.totalEstimatedPrice = item.variants.reduce((sum, variant) => sum + variant.estimatedPrice, 0);
-    });
-  }
-
-});
-
-// SIMPLIFIED: Post-save hook (optional)
-customerRequestSchema.post('save', async function (doc, next) {
-  try {
-    // Only update customer stats if needed
-    const Customer = mongoose.model('Customer');
-    await Customer.findByIdAndUpdate(doc.customerId, {
-      $set: { lastOrderDate: new Date() }
-    });
-  } catch (error) {
-    console.error('Error updating customer stats:', error);
-  }
-
-});
-
-// SIMPLIFIED: Instance methods (keep only essential ones)
-customerRequestSchema.methods.addNote = function (text, addedBy, addedByModel, relatedTo = null, relatedId = null) {
-  this.notes.push({
-    text,
-    addedBy,
-    addedByModel,
-    relatedTo,
-    relatedId
-  });
-};
-
-customerRequestSchema.methods.addNotification = function (type, message, relatedId = null, metadata = null, actionRequired = false) {
-  this.quotationNotifications.push({
-    type,
-    message,
-    relatedId,
-    metadata,
-    actionRequired,
-    read: false
-  });
-};
-
-// SIMPLIFIED: Query helpers (keep only essential ones)
-customerRequestSchema.query.byCustomerId = function (customerId) {
-  return this.where({ customerId });
-};
-
-customerRequestSchema.query.byStatus = function (status) {
-  return this.where({ status });
-};
-
-customerRequestSchema.query.bySalesPerson = function (salesPersonId) {
-  return this.where({ salesPersonAssigned: salesPersonId });
-};
 
 module.exports = mongoose.model('CustomerRequest', customerRequestSchema);
 

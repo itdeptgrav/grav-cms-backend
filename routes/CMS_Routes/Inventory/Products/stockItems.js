@@ -105,6 +105,47 @@ router.get("/", async (req, res) => {
   }
 });
 
+
+// routes/CMS_Routes/Inventory/Products/stockItemRoutes.js (or create new)
+router.get('/:stockItemId/variant/:variantId', async (req, res) => {
+    try {
+        const { stockItemId, variantId } = req.params;
+        
+        const stockItem = await StockItem.findById(stockItemId);
+        if (!stockItem) {
+            return res.status(404).json({
+                success: false,
+                message: 'Stock item not found'
+            });
+        }
+
+        const variant = stockItem.variants.find(v => v._id.toString() === variantId.toString());
+        if (!variant) {
+            return res.status(404).json({
+                success: false,
+                message: 'Variant not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            variant: {
+                _id: variant._id,
+                attributes: variant.attributes || [],
+                salesPrice: variant.salesPrice,
+                quantityOnHand: variant.quantityOnHand
+            }
+        });
+
+    } catch (error) {
+        console.error('Error fetching variant:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while fetching variant'
+        });
+    }
+});
+
 // ✅ GET stock item by ID with variants
 router.get("/:id", async (req, res) => {
   try {

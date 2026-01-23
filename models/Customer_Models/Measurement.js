@@ -1,3 +1,4 @@
+// models/Customer_Models/Measurement.js
 const mongoose = require("mongoose");
 
 const measurementValueSchema = new mongoose.Schema({
@@ -18,6 +19,20 @@ const measurementValueSchema = new mongoose.Schema({
     }
 }, { _id: false });
 
+// Add this schema for attributes
+const attributeSchema = new mongoose.Schema({
+    name: {
+        type: String,
+        required: true,
+        trim: true
+    },
+    value: {
+        type: String,
+        required: true,
+        trim: true
+    }
+}, { _id: false });
+
 const stockItemMeasurementSchema = new mongoose.Schema({
     stockItemId: {
         type: mongoose.Schema.Types.ObjectId,
@@ -29,6 +44,16 @@ const stockItemMeasurementSchema = new mongoose.Schema({
         required: true,
         trim: true
     },
+    variantId: {
+        type: mongoose.Schema.Types.ObjectId,
+        default: null
+    },
+    variantName: {
+        type: String,
+        default: "Default"
+    },
+    // ADD THIS: Store attributes array
+    attributes: [attributeSchema],
     measurements: [measurementValueSchema],
     measuredAt: {
         type: Date,
@@ -138,6 +163,23 @@ const measurementSchema = new mongoose.Schema({
         default: 0
     },
 
+    convertedToPO: {
+        type: Boolean,
+        default: false
+    },
+    poRequestId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "CustomerRequest",
+        default: null
+    },
+    poConversionDate: {
+        type: Date
+    },
+    convertedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "ProjectManager"
+    },
+
     // Audit fields
     createdBy: {
         type: mongoose.Schema.Types.ObjectId,
@@ -156,7 +198,6 @@ const measurementSchema = new mongoose.Schema({
 measurementSchema.index({ organizationId: 1, createdAt: -1 });
 measurementSchema.index({ organizationId: 1, completionRate: 1 });
 measurementSchema.index({ "employeeMeasurements.employeeId": 1 });
-
-
+measurementSchema.index({ "employeeMeasurements.stockItems.variantId": 1 });
 
 module.exports = mongoose.model("Measurement", measurementSchema);

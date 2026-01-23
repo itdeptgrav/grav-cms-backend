@@ -9,7 +9,7 @@ const jwt = require('jsonwebtoken');
 const verifyCustomerToken = async (req, res, next) => {
   try {
     const token = req.cookies.customerToken;
-    
+
     if (!token) {
       return res.status(401).json({
         success: false,
@@ -32,9 +32,9 @@ const verifyCustomerToken = async (req, res, next) => {
 router.get('/', verifyCustomerToken, async (req, res) => {
   try {
     const { search = '', department = '', status = '' } = req.query;
-    
+
     let filter = { customerId: req.customerId };
-    
+
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: 'i' } },
@@ -43,30 +43,30 @@ router.get('/', verifyCustomerToken, async (req, res) => {
         { designation: { $regex: search, $options: 'i' } }
       ];
     }
-    
+
     if (department) {
       filter.department = department;
     }
-    
+
     if (status) {
       filter.status = status;
     }
-    
+
     const employees = await EmployeeMpc.find(filter)
       .select('-__v')
       .sort({ createdAt: -1 })
       .lean();
-    
+
     // Get department stats
     const departments = await EmployeeMpc.distinct('department', { customerId: req.customerId });
     const statusCounts = await EmployeeMpc.aggregate([
       { $match: { customerId: req.customerId } },
       { $group: { _id: '$status', count: { $sum: 1 } } }
     ]);
-    
+
     const activeCount = statusCounts.find(s => s._id === 'active')?.count || 0;
     const inactiveCount = statusCounts.find(s => s._id === 'inactive')?.count || 0;
-    
+
     res.status(200).json({
       success: true,
       employees,
@@ -77,7 +77,7 @@ router.get('/', verifyCustomerToken, async (req, res) => {
         departments: departments.filter(d => d) // Remove null/undefined
       }
     });
-    
+
   } catch (error) {
     console.error('Error fetching employees:', error);
     res.status(500).json({
@@ -95,28 +95,28 @@ router.get('/departments', verifyCustomerToken, async (req, res) => {
       customerId: req.customerId,
       status: 'active'
     }).lean();
-    
+
     let departments = [];
-    
+
     if (orgDept && orgDept.departments) {
       departments = orgDept.departments
         .filter(dept => dept.status === 'active')
         .map(dept => dept.name);
     }
-    
+
     // Also include departments that already have employees (in case they were removed from org dept)
     const employeeDepartments = await EmployeeMpc.distinct('department', {
       customerId: req.customerId
     });
-    
+
     // Merge and deduplicate
     const allDepartments = [...new Set([...departments, ...employeeDepartments])].filter(d => d);
-    
+
     res.status(200).json({
       success: true,
       departments: allDepartments
     });
-    
+
   } catch (error) {
     console.error('Error fetching departments:', error);
     res.status(500).json({
@@ -130,41 +130,41 @@ router.get('/departments', verifyCustomerToken, async (req, res) => {
 router.get('/departments/:department/designations', verifyCustomerToken, async (req, res) => {
   try {
     const { department } = req.params;
-    
+
     // Get organization departments for this customer
     const orgDept = await OrganizationDepartment.findOne({
       customerId: req.customerId,
       status: 'active'
     }).lean();
-    
+
     let designations = [];
-    
+
     if (orgDept && orgDept.departments) {
-      const dept = orgDept.departments.find(d => 
+      const dept = orgDept.departments.find(d =>
         d.name === decodeURIComponent(department) && d.status === 'active'
       );
-      
+
       if (dept && dept.designations) {
         designations = dept.designations
           .filter(desig => desig.status === 'active')
           .map(desig => desig.name);
       }
     }
-    
+
     // Also include designations that already have employees in this department
     const employeeDesignations = await EmployeeMpc.distinct('designation', {
       customerId: req.customerId,
       department: decodeURIComponent(department)
     });
-    
+
     // Merge and deduplicate
     const allDesignations = [...new Set([...designations, ...employeeDesignations])].filter(d => d);
-    
+
     res.status(200).json({
       success: true,
       designations: allDesignations
     });
-    
+
   } catch (error) {
     console.error('Error fetching designations:', error);
     res.status(500).json({
@@ -178,7 +178,7 @@ router.get('/departments/:department/designations', verifyCustomerToken, async (
 router.post('/', verifyCustomerToken, async (req, res) => {
   try {
     const { name, uin, department, designation, gender, status } = req.body;
-    
+
     // Validation
     if (!name || !name.trim()) {
       return res.status(400).json({
@@ -186,36 +186,29 @@ router.post('/', verifyCustomerToken, async (req, res) => {
         message: 'Name is required'
       });
     }
-    
+
     if (!uin || !uin.trim()) {
       return res.status(400).json({
         success: false,
         message: 'UIN is required'
       });
     }
-    
+
     if (!department) {
       return res.status(400).json({
         success: false,
         message: 'Department is required'
       });
     }
-    
+
     if (!designation) {
       return res.status(400).json({
         success: false,
         message: 'Designation is required'
       });
     }
-    
-    if (!gender || !['Male', 'Female'].includes(gender)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Valid gender is required'
-      });
-    }
-    
-    // Check if UIN already exists
+
+
     const existingEmployee = await EmployeeMpc.findOne({ uin: uin.toUpperCase() });
     if (existingEmployee) {
       return res.status(400).json({
@@ -223,37 +216,71 @@ router.post('/', verifyCustomerToken, async (req, res) => {
         message: 'Employee with this UIN already exists'
       });
     }
-    
-    // Create new employee
+
+
+    const normalizeString = (str) => {
+      if (!str) return '';
+      return str.trim().split(' ')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+        .join(' ');
+    };
+
+
+    if (!department) {
+      return res.status(400).json({
+        success: false,
+        message: 'Department is required'
+      });
+    }
+
+    if (!designation) {
+      return res.status(400).json({
+        success: false,
+        message: 'Designation is required'
+      });
+    }
+
+    if (!gender || !['Male', 'Female', 'male', 'female', 'MALE', 'FEMALE'].includes(gender)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid gender is required'
+      });
+    }
+
+    const formattedGender = gender.charAt(0).toUpperCase() + gender.slice(1).toLowerCase();
+    const formattedDepartment = normalizeString(department);
+    const formattedDesignation = normalizeString(designation);
+
+
     const newEmployee = new EmployeeMpc({
       customerId: req.customerId,
       name: name.trim(),
       uin: uin.trim().toUpperCase(),
-      department: department.trim(),
-      designation: designation.trim(),
-      gender,
+      department: formattedDepartment,
+      designation: formattedDesignation,
+      gender: formattedGender,
       status: status || 'active',
       createdBy: req.customerId
     });
-    
+
     await newEmployee.save();
-    
+
     res.status(201).json({
       success: true,
       message: 'Employee created successfully',
       employee: newEmployee
     });
-    
+
   } catch (error) {
     console.error('Error creating employee:', error);
-    
+
     if (error.code === 11000) {
       return res.status(400).json({
         success: false,
         message: 'Employee with this UIN already exists'
       });
     }
-    
+
     res.status(500).json({
       success: false,
       message: 'Server error while creating employee'
@@ -266,55 +293,55 @@ router.post('/', verifyCustomerToken, async (req, res) => {
 router.post('/batch', verifyCustomerToken, async (req, res) => {
   try {
     const { employees } = req.body;
-    
+
     if (!employees || !Array.isArray(employees) || employees.length === 0) {
       return res.status(400).json({
         success: false,
         message: 'Employee data is required'
       });
     }
-    
+
     // Get existing UINs to check for duplicates
-    const existingEmployees = await EmployeeMpc.find({ 
-      customerId: req.customerId 
+    const existingEmployees = await EmployeeMpc.find({
+      customerId: req.customerId
     }).select('uin').lean();
-    
+
     const existingUins = existingEmployees.map(emp => emp.uin.toUpperCase());
-    
+
     // Validate and process employees
     const validationErrors = [];
     const employeesToCreate = [];
     const skippedEmployees = [];
-    
+
     for (const [index, emp] of employees.entries()) {
       const rowNumber = index + 1;
-      
+
       // Validate required fields
       if (!emp.name || !emp.name.trim()) {
         validationErrors.push(`Row ${rowNumber}: Name is required`);
         continue;
       }
-      
+
       if (!emp.uin || !emp.uin.trim()) {
         validationErrors.push(`Row ${rowNumber}: UIN is required`);
         continue;
       }
-      
+
       if (!emp.department) {
         validationErrors.push(`Row ${rowNumber}: Department is required`);
         continue;
       }
-      
+
       if (!emp.designation) {
         validationErrors.push(`Row ${rowNumber}: Designation is required`);
         continue;
       }
-      
+
       if (!emp.gender) {
         validationErrors.push(`Row ${rowNumber}: Gender is required`);
         continue;
       }
-      
+
       // Format gender properly
       let formattedGender;
       if (emp.gender.toLowerCase() === 'male') {
@@ -325,9 +352,9 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         validationErrors.push(`Row ${rowNumber}: Gender must be Male or Female`);
         continue;
       }
-      
+
       const formattedUin = emp.uin.trim().toUpperCase();
-      
+
       // Check if UIN already exists in database
       if (existingUins.includes(formattedUin)) {
         skippedEmployees.push({
@@ -338,7 +365,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         });
         continue;
       }
-      
+
       // Check if UIN already exists in this batch (duplicate within the same file)
       const isDuplicateInBatch = employeesToCreate.some(e => e.uin === formattedUin);
       if (isDuplicateInBatch) {
@@ -350,7 +377,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         });
         continue;
       }
-      
+
       // Add to create list
       employeesToCreate.push({
         customerId: req.customerId,
@@ -362,11 +389,11 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         status: 'active',
         createdBy: req.customerId
       });
-      
+
       // Add to existing UINs list to prevent duplicates within batch
       existingUins.push(formattedUin);
     }
-    
+
     // If no valid employees to create
     if (employeesToCreate.length === 0) {
       return res.status(400).json({
@@ -380,7 +407,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         skippedCount: skippedEmployees.length
       });
     }
-    
+
     // Create employees
     let createdEmployees = [];
     try {
@@ -399,12 +426,12 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
             });
           }
         });
-        
+
         // Get successfully inserted documents
         createdEmployees = error.insertedDocs || [];
       }
     }
-    
+
     // Return detailed response
     res.status(201).json({
       success: true,
@@ -418,14 +445,14 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       createdCount: createdEmployees.length,
       validationErrors: validationErrors.slice(0, 20), // Limit to first 20 errors
       skippedEmployees: skippedEmployees.slice(0, 20), // Limit to first 20 skipped
-      note: validationErrors.length > 20 || skippedEmployees.length > 20 
-        ? '... and more (only showing first 20 of each)' 
+      note: validationErrors.length > 20 || skippedEmployees.length > 20
+        ? '... and more (only showing first 20 of each)'
         : null
     });
-    
+
   } catch (error) {
     console.error('Error creating batch employees:', error);
-    
+
     res.status(500).json({
       success: false,
       message: 'Server error while processing employees',
@@ -442,16 +469,16 @@ router.get('/organization-departments', verifyCustomerToken, async (req, res) =>
       customerId: req.customerId,
       status: 'active'
     })
-    .populate("departments.designations.assignedStockItems.stockItemId", "name reference category images variants")
-    .lean();
-    
+      .populate("departments.designations.assignedStockItems.stockItemId", "name reference category images variants")
+      .lean();
+
     if (!orgDept) {
       return res.status(404).json({
         success: false,
         message: 'Organization departments not found'
       });
     }
-    
+
     // Process the organization departments to get variant images
     const processedOrgDept = {
       ...orgDept,
@@ -464,16 +491,16 @@ router.get('/organization-departments', verifyCustomerToken, async (req, res) =>
             if (!stockItem) {
               return item;
             }
-            
+
             let variantImages = [];
             let variantInfo = null;
-            
+
             // If variantId exists, get variant-specific images
             if (item.variantId && stockItem.variants) {
-              const variant = stockItem.variants.find(v => 
+              const variant = stockItem.variants.find(v =>
                 v._id && v._id.toString() === item.variantId.toString()
               );
-              
+
               if (variant && variant.images && variant.images.length > 0) {
                 variantImages = variant.images;
                 variantInfo = {
@@ -498,7 +525,7 @@ router.get('/organization-departments', verifyCustomerToken, async (req, res) =>
                 note: "No variant selected"
               };
             }
-            
+
             return {
               ...item,
               stockItemId: stockItem._id,
@@ -511,12 +538,12 @@ router.get('/organization-departments', verifyCustomerToken, async (req, res) =>
         }))
       }))
     };
-    
+
     res.status(200).json({
       success: true,
       organizationDepartment: processedOrgDept
     });
-    
+
   } catch (error) {
     console.error('Error fetching organization departments:', error);
     res.status(500).json({
@@ -530,25 +557,25 @@ router.get('/organization-departments', verifyCustomerToken, async (req, res) =>
 router.post('/stock-items/details', verifyCustomerToken, async (req, res) => {
   try {
     const { stockItemIds } = req.body;
-    
+
     if (!stockItemIds || !Array.isArray(stockItemIds)) {
       return res.status(400).json({
         success: false,
         message: 'Stock item IDs are required'
       });
     }
-    
+
     const stockItems = await StockItem.find({
       _id: { $in: stockItemIds }
     })
-    .select('name reference images')
-    .lean();
-    
+      .select('name reference images')
+      .lean();
+
     res.status(200).json({
       success: true,
       stockItems
     });
-    
+
   } catch (error) {
     console.error('Error fetching stock items details:', error);
     res.status(500).json({
@@ -565,19 +592,19 @@ router.get('/:id', verifyCustomerToken, async (req, res) => {
       _id: req.params.id,
       customerId: req.customerId
     }).lean();
-    
+
     if (!employee) {
       return res.status(404).json({
         success: false,
         message: 'Employee not found'
       });
     }
-    
+
     res.status(200).json({
       success: true,
       employee
     });
-    
+
   } catch (error) {
     console.error('Error fetching employee:', error);
     res.status(500).json({
@@ -587,32 +614,31 @@ router.get('/:id', verifyCustomerToken, async (req, res) => {
   }
 });
 
-// UPDATE employee
-// UPDATE employee - UPDATED VERSION
+
 router.put('/:id', verifyCustomerToken, async (req, res) => {
   try {
     const { name, uin, department, designation, gender, status } = req.body;
-    
-    // Check if employee exists and belongs to this customer
+
+
     let employee = await EmployeeMpc.findOne({
       _id: req.params.id,
       customerId: req.customerId
     });
-    
+
     if (!employee) {
       return res.status(404).json({
         success: false,
         message: 'Employee not found'
       });
     }
-    
-    // Check if UIN is being changed and if it already exists
+
+
     if (uin && uin !== employee.uin) {
-      const existingEmployee = await EmployeeMpc.findOne({ 
+      const existingEmployee = await EmployeeMpc.findOne({
         uin: uin.toUpperCase(),
         _id: { $ne: req.params.id }
       });
-      
+
       if (existingEmployee) {
         return res.status(400).json({
           success: false,
@@ -620,8 +646,8 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
         });
       }
     }
-    
-    // Format gender properly
+
+
     let formattedGender = gender;
     if (gender) {
       if (gender.toLowerCase() === 'male') {
@@ -635,8 +661,8 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
         });
       }
     }
-    
-    // Update fields
+
+
     if (name !== undefined) employee.name = name.trim();
     if (uin !== undefined) employee.uin = uin.trim().toUpperCase();
     if (department !== undefined) employee.department = department.trim();
@@ -644,18 +670,18 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
     if (gender !== undefined) employee.gender = formattedGender;
     if (status !== undefined) employee.status = status;
     employee.updatedBy = req.customerId;
-    
+
     await employee.save();
-    
+
     res.status(200).json({
       success: true,
       message: 'Employee updated successfully',
       employee
     });
-    
+
   } catch (error) {
     console.error('Error updating employee:', error);
-    
+
     if (error.name === 'ValidationError') {
       return res.status(400).json({
         success: false,
@@ -663,14 +689,14 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
         error: error.message
       });
     }
-    
+
     if (error.code === 11000) {
       return res.status(400).json({
         success: false,
         message: 'Employee with this UIN already exists'
       });
     }
-    
+
     res.status(500).json({
       success: false,
       message: 'Server error while updating employee'
@@ -685,19 +711,19 @@ router.delete('/:id', verifyCustomerToken, async (req, res) => {
       _id: req.params.id,
       customerId: req.customerId
     });
-    
+
     if (!employee) {
       return res.status(404).json({
         success: false,
         message: 'Employee not found'
       });
     }
-    
+
     res.status(200).json({
       success: true,
       message: 'Employee deleted successfully'
     });
-    
+
   } catch (error) {
     console.error('Error deleting employee:', error);
     res.status(500).json({
@@ -711,14 +737,14 @@ router.delete('/:id', verifyCustomerToken, async (req, res) => {
 router.patch('/:id/status', verifyCustomerToken, async (req, res) => {
   try {
     const { status } = req.body;
-    
+
     if (!status || !['active', 'inactive'].includes(status)) {
       return res.status(400).json({
         success: false,
         message: 'Valid status is required'
       });
     }
-    
+
     const employee = await EmployeeMpc.findOneAndUpdate(
       {
         _id: req.params.id,
@@ -730,20 +756,20 @@ router.patch('/:id/status', verifyCustomerToken, async (req, res) => {
       },
       { new: true }
     );
-    
+
     if (!employee) {
       return res.status(404).json({
         success: false,
         message: 'Employee not found'
       });
     }
-    
+
     res.status(200).json({
       success: true,
       message: 'Employee status updated successfully',
       employee
     });
-    
+
   } catch (error) {
     console.error('Error updating employee status:', error);
     res.status(500).json({
@@ -757,54 +783,54 @@ router.patch('/:id/status', verifyCustomerToken, async (req, res) => {
 
 // GET specific stock item with variants
 router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
-    try {
-        const stockItem = await StockItem.findById(req.params.id)
-            .select('name reference images variants')
-            .lean();
-        
-        if (!stockItem) {
-            return res.status(404).json({
-                success: false,
-                message: 'Stock item not found'
-            });
-        }
-        
-        // If a specific variant ID is requested via query parameter
-        const { variantId } = req.query;
-        if (variantId && stockItem.variants) {
-            const variant = stockItem.variants.find(v => v._id.toString() === variantId);
-            if (variant) {
-                // Return variant-specific images if available
-                const variantData = {
-                    ...stockItem,
-                    variantImages: variant.images || stockItem.images,
-                    variantDetails: {
-                        variantId: variant._id,
-                        attributes: variant.attributes,
-                        sku: variant.sku,
-                        variantName: variant.attributes?.map(a => a.value).join(" • ") || "Default"
-                    }
-                };
-                
-                return res.status(200).json({
-                    success: true,
-                    stockItem: variantData
-                });
-            }
-        }
-        
-        res.status(200).json({
-            success: true,
-            stockItem
-        });
-        
-    } catch (error) {
-        console.error('Error fetching stock item:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while fetching stock item'
-        });
+  try {
+    const stockItem = await StockItem.findById(req.params.id)
+      .select('name reference images variants')
+      .lean();
+
+    if (!stockItem) {
+      return res.status(404).json({
+        success: false,
+        message: 'Stock item not found'
+      });
     }
+
+    // If a specific variant ID is requested via query parameter
+    const { variantId } = req.query;
+    if (variantId && stockItem.variants) {
+      const variant = stockItem.variants.find(v => v._id.toString() === variantId);
+      if (variant) {
+        // Return variant-specific images if available
+        const variantData = {
+          ...stockItem,
+          variantImages: variant.images || stockItem.images,
+          variantDetails: {
+            variantId: variant._id,
+            attributes: variant.attributes,
+            sku: variant.sku,
+            variantName: variant.attributes?.map(a => a.value).join(" • ") || "Default"
+          }
+        };
+
+        return res.status(200).json({
+          success: true,
+          stockItem: variantData
+        });
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      stockItem
+    });
+
+  } catch (error) {
+    console.error('Error fetching stock item:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while fetching stock item'
+    });
+  }
 });
 
 // Export employees to CSV
@@ -814,9 +840,9 @@ router.get('/export/csv', verifyCustomerToken, async (req, res) => {
       .select('name uin department designation gender status createdAt')
       .sort({ createdAt: -1 })
       .lean();
-    
+
     const headers = ['Name', 'UIN', 'Department', 'Designation', 'Gender', 'Status', 'Created At'];
-    
+
     const csvRows = employees.map(emp => [
       `"${emp.name}"`,
       emp.uin,
@@ -826,16 +852,16 @@ router.get('/export/csv', verifyCustomerToken, async (req, res) => {
       emp.status,
       new Date(emp.createdAt).toISOString()
     ]);
-    
+
     const csvContent = [
       headers.join(','),
       ...csvRows.map(row => row.join(','))
     ].join('\n');
-    
+
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename=employees_${Date.now()}.csv`);
     res.send(csvContent);
-    
+
   } catch (error) {
     console.error('Error exporting employees:', error);
     res.status(500).json({
