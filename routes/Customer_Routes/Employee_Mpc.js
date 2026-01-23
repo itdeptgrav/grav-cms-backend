@@ -240,14 +240,14 @@ router.post('/', verifyCustomerToken, async (req, res) => {
       });
     }
 
-    if (!gender || !['Male', 'Female', 'male', 'female', 'MALE', 'FEMALE'].includes(gender)) {
+    if (!gender) {
       return res.status(400).json({
         success: false,
-        message: 'Valid gender is required'
+        message: 'Gender is required'
       });
     }
 
-    const formattedGender = gender.charAt(0).toUpperCase() + gender.slice(1).toLowerCase();
+
     const formattedDepartment = normalizeString(department);
     const formattedDesignation = normalizeString(designation);
 
@@ -258,7 +258,7 @@ router.post('/', verifyCustomerToken, async (req, res) => {
       uin: uin.trim().toUpperCase(),
       department: formattedDepartment,
       designation: formattedDesignation,
-      gender: formattedGender,
+      gender: gender,  // <-- Just pass the gender as-is, schema will format it
       status: status || 'active',
       createdBy: req.customerId
     });
@@ -342,17 +342,6 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         continue;
       }
 
-      // Format gender properly
-      let formattedGender;
-      if (emp.gender.toLowerCase() === 'male') {
-        formattedGender = 'Male';
-      } else if (emp.gender.toLowerCase() === 'female') {
-        formattedGender = 'Female';
-      } else {
-        validationErrors.push(`Row ${rowNumber}: Gender must be Male or Female`);
-        continue;
-      }
-
       const formattedUin = emp.uin.trim().toUpperCase();
 
       // Check if UIN already exists in database
@@ -385,7 +374,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         uin: formattedUin,
         department: emp.department.trim(),
         designation: emp.designation.trim(),
-        gender: formattedGender,
+        gender: gender,
         status: 'active',
         createdBy: req.customerId
       });
@@ -648,26 +637,14 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
     }
 
 
-    let formattedGender = gender;
-    if (gender) {
-      if (gender.toLowerCase() === 'male') {
-        formattedGender = 'Male';
-      } else if (gender.toLowerCase() === 'female') {
-        formattedGender = 'Female';
-      } else {
-        return res.status(400).json({
-          success: false,
-          message: 'Gender must be Male or Female'
-        });
-      }
-    }
-
-
     if (name !== undefined) employee.name = name.trim();
     if (uin !== undefined) employee.uin = uin.trim().toUpperCase();
     if (department !== undefined) employee.department = department.trim();
     if (designation !== undefined) employee.designation = designation.trim();
-    if (gender !== undefined) employee.gender = formattedGender;
+    if (gender !== undefined) {
+      // Remove gender validation and just use the setter from schema
+      employee.gender = gender;
+    }
     if (status !== undefined) employee.status = status;
     employee.updatedBy = req.customerId;
 
