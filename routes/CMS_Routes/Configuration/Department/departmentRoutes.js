@@ -135,121 +135,125 @@ router.post("/", async (req, res) => {
   }
 });
 
-// UPDATE department
-// UPDATE department
+// UPDATE department - Modified to be less strict about variants
 router.put("/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, description, designations } = req.body;
-    const userId = req.user.id;
-
-    const department = await Department.findById(id);
-    if (!department) {
-      return res.status(404).json({
-        success: false,
-        message: "Department not found"
-      });
-    }
-
-    // Check if name is being changed and if it already exists
-    if (name && name !== department.name) {
-      const existingDepartment = await Department.findOne({ name });
-      if (existingDepartment) {
-        return res.status(400).json({
-          success: false,
-          message: "Department with this name already exists"
-        });
-      }
-      department.name = name;
-    }
-
-    if (description !== undefined) {
-      department.description = description;
-    }
-
-    // Update designations if provided
-    if (designations) {
-      // Validate stock items exist
-      for (const designation of designations) {
-        for (const stockItem of designation.assignedStockItems || []) {
-          const stockItemExists = await StockItem.findById(stockItem.stockItemId);
-          if (!stockItemExists) {
-            return res.status(400).json({
-              success: false,
-              message: `Stock item with ID ${stockItem.stockItemId} not found`
-            });
-          }
-
-          // Validate variant exists if provided
-          if (stockItem.variantId) {
-            const variantExists = stockItemExists.variants?.some(v =>
-              v._id.toString() === stockItem.variantId
-            );
-            if (!variantExists) {
-              return res.status(400).json({
+    try {
+        const { id } = req.params;
+        const { name, description, designations } = req.body;
+        const userId = req.user.id;
+        
+        const department = await Department.findById(id);
+        if (!department) {
+            return res.status(404).json({
                 success: false,
-                message: `Variant with ID ${stockItem.variantId} not found for stock item ${stockItemExists.name}`
-              });
+                message: "Department not found"
+            });
+        }
+        
+        // Check if name is being changed and if it already exists
+        if (name && name !== department.name) {
+            const existingDepartment = await Department.findOne({ name });
+            if (existingDepartment) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Department with this name already exists"
+                });
             }
-          }
+            department.name = name;
         }
-      }
-
-      // Update designations
-      department.designations = designations.map(designation => {
-        // Check if designation already exists
-        const existingDesignation = designation._id ?
-          department.designations.id(designation._id) : null;
-
-        if (existingDesignation) {
-          // Update existing designation
-          existingDesignation.name = designation.name;
-          existingDesignation.description = designation.description;
-          existingDesignation.status = designation.status || "active";
-
-          // Update assigned stock items with variants
-          existingDesignation.assignedStockItems = designation.assignedStockItems?.map(item => ({
-            stockItemId: item.stockItemId,
-            variantId: item.variantId || null, // Include variant ID
-            assignedBy: userId
-          })) || [];
-
-          existingDesignation.updatedBy = userId;
-          return existingDesignation;
-        } else {
-          // Create new designation
-          return {
-            name: designation.name,
-            description: designation.description,
-            status: designation.status || "active",
-            assignedStockItems: designation.assignedStockItems?.map(item => ({
-              stockItemId: item.stockItemId,
-              variantId: item.variantId || null, // Include variant ID
-              assignedBy: userId
-            })) || [],
-            createdBy: userId
-          };
+        
+        if (description !== undefined) {
+            department.description = description;
         }
-      });
+        
+        // Update designations if provided
+        if (designations) {
+            // Validate stock items exist (but don't validate variants strictly)
+            for (const designation of designations) {
+                for (const stockItem of designation.assignedStockItems || []) {
+                    const stockItemExists = await StockItem.findById(stockItem.stockItemId);
+                    if (!stockItemExists) {
+                        return res.status(400).json({
+                            success: false,
+                            message: `Stock item with ID ${stockItem.stockItemId} not found`
+                        });
+                    }
+                    
+                    // Only validate variant if it's provided AND we want to check
+                    // Comment out strict validation for now
+                    /*
+                    if (stockItem.variantId) {
+                        const variantExists = stockItemExists.variants?.some(v => 
+                            v._id.toString() === stockItem.variantId
+                        );
+                        if (!variantExists) {
+                            return res.status(400).json({
+                                success: false,
+                                message: `Variant with ID ${stockItem.variantId} not found for stock item ${stockItemExists.name}`
+                            });
+                        }
+                    }
+                    */
+                }
+            }
+            
+            // Update designations
+            department.designations = designations.map(designation => {
+                // Check if designation already exists
+                const existingDesignation = designation._id ? 
+                    department.designations.id(designation._id) : null;
+                
+                if (existingDesignation) {
+                    // Update existing designation
+                    existingDesignation.name = designation.name;
+                    existingDesignation.description = designation.description;
+                    existingDesignation.status = designation.status || "active";
+                    
+                    // Update assigned stock items with variants (accept any variant ID)
+                    existingDesignation.assignedStockItems = designation.assignedStockItems?.map(item => ({
+                        stockItemId: item.stockItemId,
+                        variantId: item.variantId || null, // Accept whatever variant ID is sent
+                        quantity: item.quantity || 1, // Make sure quantity is included
+                        assignedBy: userId
+                    })) || [];
+                    
+                    existingDesignation.updatedBy = userId;
+                    return existingDesignation;
+                } else {
+                    // Create new designation
+                    return {
+                        name: designation.name,
+                        description: designation.description,
+                        status: designation.status || "active",
+                        assignedStockItems: designation.assignedStockItems?.map(item => ({
+                            stockItemId: item.stockItemId,
+                            variantId: item.variantId || null,
+                            quantity: item.quantity || 1,
+                            assignedBy: userId
+                        })) || [],
+                        createdBy: userId
+                    };
+                }
+            });
+        }
+        
+        department.updatedBy = userId;
+        department.updatedAt = Date.now();
+        await department.save();
+        
+        res.json({
+            success: true,
+            message: "Department updated successfully",
+            department
+        });
+        
+    } catch (error) {
+        console.error("Error updating department:", error);
+        res.status(500).json({
+            success: false,
+            message: "Server error while updating department"
+        });
     }
-
-    department.updatedBy = userId;
-    department.updatedAt = Date.now();
-    await department.save();
-
-    res.json({
-      success: true,
-      message: "Department updated successfully",
-      department
-    });
-
-  } catch (error) {
-    console.error("Error updating department:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating department"
-    });
-  }
 });
 
 // DELETE department
