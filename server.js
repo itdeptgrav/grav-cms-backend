@@ -5,6 +5,9 @@ const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs"); // Add this
 require("dotenv").config();
 
+const MpcMeasurement = require("./models/MpcMeasurement");
+
+
 const app = express();
 
 const allowedOrigins = [
@@ -46,6 +49,33 @@ const connectDB = async () => {
 };
 
 connectDB();
+
+
+
+const createDefaultMpcMeasurement = async () => {
+  try {
+    const existingUser = await MpcMeasurement.findOne({
+      email: "measurement@grav.in"
+    });
+
+    if (!existingUser) {
+      await MpcMeasurement.create({
+        email: "measurement@grav.in",
+        password: "measuremnt@grav2025"
+      });
+
+      console.log("✅ Default MPC Measurement user created");
+    } else {
+      console.log("ℹ️ MPC Measurement user already exists");
+    }
+  } catch (error) {
+    console.error("❌ Error creating MPC Measurement user:", error.message);
+  }
+};
+
+// Call it
+createDefaultMpcMeasurement();
+
 
 
 
