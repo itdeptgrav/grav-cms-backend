@@ -136,6 +136,7 @@ router.post("/", async (req, res) => {
 });
 
 // UPDATE department - Modified to be less strict about variants
+// UPDATE department - Accept variant names instead of IDs
 router.put("/:id", async (req, res) => {
     try {
         const { id } = req.params;
@@ -168,7 +169,7 @@ router.put("/:id", async (req, res) => {
         
         // Update designations if provided
         if (designations) {
-            // Validate stock items exist (but don't validate variants strictly)
+            // Validate stock items exist
             for (const designation of designations) {
                 for (const stockItem of designation.assignedStockItems || []) {
                     const stockItemExists = await StockItem.findById(stockItem.stockItemId);
@@ -179,21 +180,27 @@ router.put("/:id", async (req, res) => {
                         });
                     }
                     
-                    // Only validate variant if it's provided AND we want to check
-                    // Comment out strict validation for now
-                    /*
-                    if (stockItem.variantId) {
+                    // If variantId is provided but not found, try to find by variantName
+                    if (stockItem.variantId && stockItem.variantName) {
                         const variantExists = stockItemExists.variants?.some(v => 
                             v._id.toString() === stockItem.variantId
                         );
+                        
                         if (!variantExists) {
-                            return res.status(400).json({
-                                success: false,
-                                message: `Variant with ID ${stockItem.variantId} not found for stock item ${stockItemExists.name}`
+                            // Try to find variant by name
+                            const variantByName = stockItemExists.variants?.find(v => {
+                                const variantDisplayName = v.attributes?.map(a => a.value).join(" • ") || "Default";
+                                return variantDisplayName === stockItem.variantName;
                             });
+                            
+                            if (variantByName) {
+                                stockItem.variantId = variantByName._id;
+                            } else {
+                                // If variant not found by name either, set variantId to null
+                                stockItem.variantId = null;
+                            }
                         }
                     }
-                    */
                 }
             }
             
@@ -209,11 +216,12 @@ router.put("/:id", async (req, res) => {
                     existingDesignation.description = designation.description;
                     existingDesignation.status = designation.status || "active";
                     
-                    // Update assigned stock items with variants (accept any variant ID)
+                    // Update assigned stock items
                     existingDesignation.assignedStockItems = designation.assignedStockItems?.map(item => ({
                         stockItemId: item.stockItemId,
-                        variantId: item.variantId || null, // Accept whatever variant ID is sent
-                        quantity: item.quantity || 1, // Make sure quantity is included
+                        variantId: item.variantId || null,
+                        variantName: item.variantName || "Default",
+                        quantity: item.quantity || 1,
                         assignedBy: userId
                     })) || [];
                     
@@ -228,6 +236,7 @@ router.put("/:id", async (req, res) => {
                         assignedStockItems: designation.assignedStockItems?.map(item => ({
                             stockItemId: item.stockItemId,
                             variantId: item.variantId || null,
+                            variantName: item.variantName || "Default",
                             quantity: item.quantity || 1,
                             assignedBy: userId
                         })) || [],
