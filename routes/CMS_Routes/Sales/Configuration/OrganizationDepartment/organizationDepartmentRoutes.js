@@ -438,26 +438,7 @@ router.put("/organization/:customerId/departments/single", async (req, res) => {
       }
       
       // Validate stock items if they exist
-      for (const stockItem of designation.assignedStockItems || []) {
-        const stockItemExists = await StockItem.findById(stockItem.stockItemId);
-        if (!stockItemExists) {
-          return res.status(400).json({
-            success: false,
-            message: `Stock item with ID ${stockItem.stockItemId} not found`
-          });
-        }
-        
-        // If variantId is provided, validate it exists
-        if (stockItem.variantId) {
-          const variant = stockItemExists.variants.id(stockItem.variantId);
-          if (!variant) {
-            return res.status(400).json({
-              success: false,
-              message: `Variant with ID ${stockItem.variantId} not found in stock item ${stockItemExists.name}`
-            });
-          }
-        }
-      }
+      
     }
     
     // Get existing organization department
@@ -600,26 +581,7 @@ router.post("/organization/:customerId/departments/single", async (req, res) => 
       }
       
       // Validate stock items if they exist
-      for (const stockItem of designation.assignedStockItems || []) {
-        const stockItemExists = await StockItem.findById(stockItem.stockItemId);
-        if (!stockItemExists) {
-          return res.status(400).json({
-            success: false,
-            message: `Stock item with ID ${stockItem.stockItemId} not found`
-          });
-        }
-        
-        // If variantId is provided, validate it exists
-        if (stockItem.variantId) {
-          const variant = stockItemExists.variants.id(stockItem.variantId);
-          if (!variant) {
-            return res.status(400).json({
-              success: false,
-              message: `Variant with ID ${stockItem.variantId} not found in stock item ${stockItemExists.name}`
-            });
-          }
-        }
-      }
+      
     }
     
     // Get existing organization department or create new
