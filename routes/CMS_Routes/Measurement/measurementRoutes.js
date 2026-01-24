@@ -938,6 +938,7 @@ router.post('/', async (req, res) => {
                     employeeUIN: data.employeeUIN,
                     department: data.department,
                     designation: data.designation,
+                    remarks: data.remarks || "",
                     stockItems: []
                 });
             }
@@ -1192,7 +1193,6 @@ router.get('/:measurementId', async (req, res) => {
     }
 });
 
-
 // ADD NEW EMPLOYEES to existing measurement (NEW ROUTE)
 router.put('/:measurementId/add-employees', async (req, res) => {
     try {
@@ -1258,6 +1258,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                         employeeUIN: data.employeeUIN,
                         department: data.department,
                         designation: data.designation,
+                        remarks: data.remarks || "",
                         stockItems: []
                     });
                 }
@@ -1323,7 +1324,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
 });
 
 // UPDATE measurement (updated)
-// UPDATE measurement (updated with attributes)
+// UPDATE measurement (updated with attributes) - FIXED VERSION
 router.put('/:measurementId', async (req, res) => {
     try {
         const { measurementId } = req.params;
@@ -1348,6 +1349,16 @@ router.put('/:measurementId', async (req, res) => {
 
         // If measurementData is provided, update measurements
         if (measurementData && Array.isArray(measurementData)) {
+            // Create a map for incoming data by employeeId for remarks lookup
+            const incomingEmployeeDataMap = new Map();
+            measurementData.forEach(data => {
+                if (data.employeeId) {
+                    incomingEmployeeDataMap.set(data.employeeId.toString(), {
+                        remarks: data.remarks || ""
+                    });
+                }
+            });
+
             // Create a map of existing employees for quick lookup
             const existingEmployeeMap = new Map();
             measurement.employeeMeasurements.forEach(emp => {
@@ -1388,7 +1399,7 @@ router.put('/:measurementId', async (req, res) => {
                     variantId: data.variantId,
                     variantName: data.variantName || "Default",
                     stockItemName: data.stockItemName,
-                    attributes: data.attributes || [], // ADD THIS: Include attributes
+                    attributes: data.attributes || [],
                     measurements: measurementsArray
                 });
             });
@@ -1396,6 +1407,10 @@ router.put('/:measurementId', async (req, res) => {
             // Update employee measurements
             measurement.employeeMeasurements = measurement.employeeMeasurements.map(emp => {
                 const employeeId = emp.employeeId.toString();
+                
+                // Get remarks from incoming data if available
+                const incomingEmployeeData = incomingEmployeeDataMap.get(employeeId);
+                const employeeRemarks = incomingEmployeeData ? incomingEmployeeData.remarks : emp.remarks;
 
                 // Update stock items for this employee
                 const updatedStockItems = emp.stockItems.map(stockItem => {
@@ -1418,7 +1433,7 @@ router.put('/:measurementId', async (req, res) => {
                             stockItemName: stockItemName,
                             variantId: update.variantId,
                             variantName: update.variantName,
-                            attributes: update.attributes || [], // ADD THIS: Update attributes
+                            attributes: update.attributes || [],
                             measurements: update.measurements,
                             measuredAt: new Date()
                         };
@@ -1440,6 +1455,7 @@ router.put('/:measurementId', async (req, res) => {
                 return {
                     ...emp.toObject ? emp.toObject() : emp,
                     stockItems: updatedStockItems,
+                    remarks: employeeRemarks,  // FIXED: Use employeeRemarks instead of data.remarks
                     isCompleted: isCompleted,
                     completedAt: isCompleted ? new Date() : emp.completedAt
                 };

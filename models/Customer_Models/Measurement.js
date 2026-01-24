@@ -94,6 +94,11 @@ const employeeMeasurementSchema = new mongoose.Schema({
     },
     completedAt: {
         type: Date
+    },
+    remarks: {
+        type: String,
+        default: "",
+        trim: true
     }
 }, { _id: false });
 
