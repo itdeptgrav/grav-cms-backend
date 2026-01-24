@@ -212,6 +212,15 @@ app.use("/api/cms/sales", quotationRoutes);
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
 
+const jobPostingsRouter = require("./routes/HrRoutes/JobPosting_Section");
+app.use("/api/hr/job-postings", jobPostingsRouter);
+
+const CandidatesRouter = require("./routes/HrRoutes/Candidates_section");
+app.use("/api/hr/candidates", CandidatesRouter);
+
+const employeeTasksRouter = require("./routes/HrRoutes/EmployeeTasks_section");
+app.use("/api/hr/tasks", employeeTasksRouter);
+
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
