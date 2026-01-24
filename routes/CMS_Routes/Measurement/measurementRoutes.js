@@ -1258,7 +1258,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                         employeeUIN: data.employeeUIN,
                         department: data.department,
                         designation: data.designation,
-                        remarks: data.remarks || "",
+                        remarks: data.remarks || "",  // Store remarks here
                         stockItems: []
                     });
                 }
@@ -1284,17 +1284,20 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                             stockItem.measurements.every(m => m.value && m.value.trim() !== '')
                         );
 
-                    // Add new employee with their measurements
+                    // Add new employee with their measurements AND REMARKS
                     measurement.employeeMeasurements.push({
                         employeeId: newEmployeeData.employeeId,
                         employeeName: newEmployeeData.employeeName,
                         employeeUIN: newEmployeeData.employeeUIN,
                         department: newEmployeeData.department,
                         designation: newEmployeeData.designation,
+                        remarks: newEmployeeData.remarks || "",  // MAKE SURE TO INCLUDE REMARKS HERE
                         stockItems: newEmployeeData.stockItems,
                         isCompleted: isCompleted,
                         completedAt: isCompleted ? new Date() : null
                     });
+                    
+                    console.log(`Added employee ${newEmployeeData.employeeName} with remarks: "${newEmployeeData.remarks}"`);
                 } else {
                     console.log(`Employee ${employeeId} already exists in measurement, skipping...`);
                 }
