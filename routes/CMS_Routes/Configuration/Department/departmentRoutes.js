@@ -135,8 +135,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// UPDATE department - Modified to be less strict about variants
-// UPDATE department - Accept variant names instead of IDs
+// UPDATE department - Skip variant validation
 router.put("/:id", async (req, res) => {
     try {
         const { id } = req.params;
@@ -169,7 +168,7 @@ router.put("/:id", async (req, res) => {
         
         // Update designations if provided
         if (designations) {
-            // Validate stock items exist
+            // Only validate that stock items exist
             for (const designation of designations) {
                 for (const stockItem of designation.assignedStockItems || []) {
                     const stockItemExists = await StockItem.findById(stockItem.stockItemId);
@@ -179,51 +178,42 @@ router.put("/:id", async (req, res) => {
                             message: `Stock item with ID ${stockItem.stockItemId} not found`
                         });
                     }
-                    
-                    // If variantId is provided but not found, try to find by variantName
-                    if (stockItem.variantId && stockItem.variantName) {
-                        const variantExists = stockItemExists.variants?.some(v => 
-                            v._id.toString() === stockItem.variantId
-                        );
-                        
-                        if (!variantExists) {
-                            // Try to find variant by name
-                            const variantByName = stockItemExists.variants?.find(v => {
-                                const variantDisplayName = v.attributes?.map(a => a.value).join(" • ") || "Default";
-                                return variantDisplayName === stockItem.variantName;
-                            });
-                            
-                            if (variantByName) {
-                                stockItem.variantId = variantByName._id;
-                            } else {
-                                // If variant not found by name either, set variantId to null
-                                stockItem.variantId = null;
-                            }
-                        }
-                    }
+                    // SKIP VARIANT VALIDATION - Accept whatever variant ID is sent
                 }
             }
             
-            // Update designations
+            // Update designations - preserve existing variant IDs
             department.designations = designations.map(designation => {
                 // Check if designation already exists
                 const existingDesignation = designation._id ? 
                     department.designations.id(designation._id) : null;
                 
                 if (existingDesignation) {
-                    // Update existing designation
+                    // Update existing designation - preserve variant IDs
                     existingDesignation.name = designation.name;
                     existingDesignation.description = designation.description;
                     existingDesignation.status = designation.status || "active";
                     
-                    // Update assigned stock items
-                    existingDesignation.assignedStockItems = designation.assignedStockItems?.map(item => ({
-                        stockItemId: item.stockItemId,
-                        variantId: item.variantId || null,
-                        variantName: item.variantName || "Default",
-                        quantity: item.quantity || 1,
-                        assignedBy: userId
-                    })) || [];
+                    // Merge assigned stock items - preserve existing variant IDs
+                    const existingItemsMap = new Map();
+                    existingDesignation.assignedStockItems.forEach(item => {
+                        existingItemsMap.set(item.stockItemId.toString(), {
+                            variantId: item.variantId,
+                            variantName: item.variantName
+                        });
+                    });
+                    
+                    // Update with new items, preserving variant data
+                    existingDesignation.assignedStockItems = designation.assignedStockItems?.map(item => {
+                        const existingItem = existingItemsMap.get(item.stockItemId.toString());
+                        return {
+                            stockItemId: item.stockItemId,
+                            variantId: existingItem?.variantId || item.variantId || null,
+                            variantName: existingItem?.variantName || item.variantName || "Default",
+                            quantity: item.quantity || 1,
+                            assignedBy: userId
+                        };
+                    }) || [];
                     
                     existingDesignation.updatedBy = userId;
                     return existingDesignation;
