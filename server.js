@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
-const bcrypt = require("bcryptjs"); // Add this
+const bcrypt = require("bcryptjs"); 
 require("dotenv").config();
 
 
