@@ -299,7 +299,7 @@ router.get("/stock-items/search", async (req, res) => {
     
     const stockItems = await StockItem.find(query)
       .select("_id name reference category status variants")
-      .limit(20)
+      .limit(50)
       .lean();
     
     // Process stock items to include variant information
