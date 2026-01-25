@@ -52,6 +52,60 @@ connectDB();
 
 
 
+const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
+
+const CATEGORY_MEASUREMENTS = {
+  Shirts: [
+    "Length",
+    "Chest",
+    "Stomach",
+    "Button Hem",
+    "Shoulder",
+    "Sleeve Length",
+    "Cuff",
+    "Coller",
+  ],
+  Outerwear: [
+    "Length",
+    "Chest",
+    "Stomach",
+    "Button Hem",
+    "Shoulder",
+  ],
+  Bottoms: [
+    "Length",
+    "Waist",
+    "Sheet",
+    "Thigh",
+    "Knee",
+    "Buttom",
+    "Crouch Kista Cut",
+  ],
+};
+
+const overwriteExistingMeasurements = async () => {
+  try {
+    for (const [category, measurements] of Object.entries(CATEGORY_MEASUREMENTS)) {
+      const result = await StockItem.updateMany(
+        { category },
+        { $set: { measurements } }
+      );
+
+      console.log(
+        `✅ ${category}: ${result.modifiedCount} documents updated`
+      );
+    }
+  } catch (error) {
+    console.error("❌ Measurement overwrite failed:", error.message);
+  }
+};
+
+overwriteExistingMeasurements();
+
+
+
+
+
 
 
 /* =====================
