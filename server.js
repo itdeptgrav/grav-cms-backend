@@ -100,7 +100,7 @@ const overwriteExistingMeasurements = async () => {
   }
 };
 
-overwriteExistingMeasurements();
+
 
 
 
