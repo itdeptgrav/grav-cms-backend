@@ -95,6 +95,282 @@ router.get('/organizations', async (req, res) => {
     }
 });
 
+router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
+    try {
+        const { orgId } = req.params;
+
+        // Validate organization ID
+        if (!orgId || !mongoose.Types.ObjectId.isValid(orgId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Valid organization ID is required'
+            });
+        }
+
+        // Step 1: Get organization details
+        const customer = await Customer.findById(orgId)
+            .select('_id name email phone')
+            .lean();
+
+        if (!customer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Organization not found'
+            });
+        }
+
+        // Step 2: Get all measurements for this organization
+        const measurements = await Measurement.find({
+            organizationId: orgId
+        })
+            .select('name employeeMeasurements')
+            .populate({
+                path: 'employeeMeasurements.stockItems.stockItemId',
+                select: 'name reference baseSalesPrice'
+            })
+            .lean();
+
+        if (!measurements || measurements.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'No measurements found for this organization'
+            });
+        }
+
+        // Step 3: Get organization departments to get assigned quantities
+        const orgDept = await OrganizationDepartment.findOne({
+            customerId: orgId,
+            status: 'active'
+        }).lean();
+
+        if (!orgDept) {
+            return res.status(404).json({
+                success: false,
+                message: 'Organization departments not found'
+            });
+        }
+
+        // Step 4: Create helper function to find assigned quantity
+        const getAssignedQuantity = (departmentName, designationName, stockItemId, variantId) => {
+            // Find the department
+            const department = orgDept.departments.find(dept => 
+                dept.status === 'active' && dept.name === departmentName
+            );
+            
+            if (!department) return 1; // Default to 1 if department not found
+            
+            // Find the designation
+            const designation = department.designations.find(desig => 
+                desig.status === 'active' && desig.name === designationName
+            );
+            
+            if (!designation || !designation.assignedStockItems) return 1; // Default to 1
+            
+            // Find the assigned stock item
+            const assignedItem = designation.assignedStockItems.find(item => {
+                // First check if stockItemId matches
+                const stockItemMatches = item.stockItemId.toString() === stockItemId.toString();
+                
+                // Check variant match
+                if (variantId) {
+                    // If we have variantId, check if it matches or if assigned item has no variantId
+                    return stockItemMatches && (
+                        (item.variantId && item.variantId.toString() === variantId.toString()) ||
+                        !item.variantId
+                    );
+                } else {
+                    // If no variantId, check if assigned item has no variantId
+                    return stockItemMatches && !item.variantId;
+                }
+            });
+            
+            return assignedItem ? assignedItem.quantity : 1; // Return assigned quantity or default to 1
+        };
+
+        // Step 5: Create a map to store aggregated data
+        const productDataMap = new Map();
+
+        // Process all measurements
+        measurements.forEach(measurement => {
+            measurement.employeeMeasurements.forEach(emp => {
+                emp.stockItems.forEach(stockItem => {
+                    if (!stockItem.stockItemId) return;
+
+                    const stockItemId = stockItem.stockItemId._id.toString();
+                    const variantId = stockItem.variantId ? stockItem.variantId.toString() : null;
+                    const key = `${stockItemId}_${variantId || 'no-variant'}`;
+
+                    // Initialize if not exists
+                    if (!productDataMap.has(key)) {
+                        productDataMap.set(key, {
+                            stockItemId: stockItemId,
+                            stockItemName: stockItem.stockItemId.name || stockItem.stockItemName,
+                            stockItemReference: stockItem.stockItemId.reference || '',
+                            variantId: variantId,
+                            variantName: stockItem.variantName || "Default",
+                            basePrice: stockItem.stockItemId.baseSalesPrice || 0,
+                            employees: [], // Store employee objects with department/designation
+                            departmentDesignationMap: new Map() // Map to track department/designation groups
+                        });
+                    }
+
+                    const data = productDataMap.get(key);
+                    
+                    // Create employee object with all details
+                    const employeeObj = {
+                        name: emp.employeeName,
+                        department: emp.department,
+                        designation: emp.designation,
+                        uin: emp.employeeUIN
+                    };
+                    
+                    // Add employee to list
+                    data.employees.push(employeeObj);
+                    
+                    // Track department/designation combination
+                    const deptDesigKey = `${emp.department}_${emp.designation}`;
+                    if (!data.departmentDesignationMap.has(deptDesigKey)) {
+                        data.departmentDesignationMap.set(deptDesigKey, {
+                            department: emp.department,
+                            designation: emp.designation,
+                            employeeCount: 0
+                        });
+                    }
+                    
+                    const deptData = data.departmentDesignationMap.get(deptDesigKey);
+                    deptData.employeeCount += 1;
+                });
+            });
+        });
+
+        // Step 6: Calculate quantities and prepare data
+        const productData = Array.from(productDataMap.values()).map(data => {
+            let totalQuantity = 0;
+            const departmentBreakdown = [];
+            
+            // Calculate quantity for each department/designation group
+            data.departmentDesignationMap.forEach(deptData => {
+                // Get assigned quantity for this department/designation
+                const assignedQuantity = getAssignedQuantity(
+                    deptData.department,
+                    deptData.designation,
+                    data.stockItemId,
+                    data.variantId
+                );
+                
+                const deptTotalQuantity = deptData.employeeCount * assignedQuantity;
+                totalQuantity += deptTotalQuantity;
+                
+                departmentBreakdown.push({
+                    department: deptData.department,
+                    designation: deptData.designation,
+                    employeeCount: deptData.employeeCount,
+                    quantityPerEmployee: assignedQuantity,
+                    totalQuantity: deptTotalQuantity
+                });
+            });
+            
+            // Format employee names with their department/designation
+            const employeeDetails = data.employees.map(emp => 
+                `${emp.name} (${emp.department} - ${emp.designation})`
+            ).join(', ');
+            
+            const totalEmployees = data.employees.length;
+            const totalEstimatedPrice = totalQuantity * data.basePrice;
+            
+            return {
+                ...data,
+                employeeDetails,
+                totalEmployees,
+                totalQuantity,
+                totalEstimatedPrice,
+                departmentBreakdown
+            };
+        });
+
+        // Step 7: Create CSV content with the required format
+        const headers = [
+            'Stock Item Name',
+            'Variant Name',
+            'Stock Item Reference',
+            'Employees with Measurements (Department - Designation)',
+            'Total Employees',
+            'Quantity Per Employee (Dept-Designation Based)',
+            'Total Quantity',
+            'Base Price',
+            'Total Estimated Price',
+            'Department-wise Breakdown'
+        ];
+
+        const rows = productData.map(item => {
+            // Create a string showing quantity per employee by department/designation
+            const quantityPerEmployeeInfo = item.departmentBreakdown.map(dept => 
+                `${dept.department}-${dept.designation}: ${dept.quantityPerEmployee}`
+            ).join('; ');
+            
+            // Format department breakdown as readable string
+            const deptBreakdownStr = item.departmentBreakdown.map(dept => 
+                `${dept.department} - ${dept.designation}: ${dept.employeeCount} employees × ${dept.quantityPerEmployee} = ${dept.totalQuantity}`
+            ).join(' | ');
+            
+            return [
+                `"${item.stockItemName}"`,
+                `"${item.variantName}"`,
+                item.stockItemReference,
+                `"${item.employeeDetails}"`,
+                item.totalEmployees,
+                `"${quantityPerEmployeeInfo}"`,
+                item.totalQuantity,
+                `₹${item.basePrice.toFixed(2)}`,
+                `₹${item.totalEstimatedPrice.toFixed(2)}`,
+                `"${deptBreakdownStr}"`
+            ];
+        });
+
+        // Add summary row
+        const totalSummary = productData.reduce((acc, item) => ({
+            totalEmployees: acc.totalEmployees + item.totalEmployees,
+            totalQuantity: acc.totalQuantity + item.totalQuantity,
+            totalPrice: acc.totalPrice + item.totalEstimatedPrice,
+            itemCount: acc.itemCount + 1
+        }), { totalEmployees: 0, totalQuantity: 0, totalPrice: 0, itemCount: 0 });
+
+        const summaryRow = [
+            '=== SUMMARY ===',
+            '',
+            '',
+            '',
+            `Total Employees: ${totalSummary.totalEmployees}`,
+            '',
+            `Total Quantity: ${totalSummary.totalQuantity}`,
+            '',
+            `Total Estimated Price: ₹${totalSummary.totalPrice.toFixed(2)}`,
+            `Total Items: ${totalSummary.itemCount}`
+        ];
+
+        const csvContent = [
+            headers.join(','),
+            ...rows.map(row => row.join(',')),
+            '',
+            summaryRow.join(',')
+        ].join('\n');
+
+        // Step 8: Send response
+        const filename = `Product_Pricing_${customer.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.csv`;
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(csvContent);
+
+    } catch (error) {
+        console.error('Error exporting product pricing data:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while exporting product pricing data',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
 
 
 router.get('/organization/:orgId/departments-with-items-variants', async (req, res) => {
