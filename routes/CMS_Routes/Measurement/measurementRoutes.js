@@ -99,7 +99,6 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
     try {
         const { orgId } = req.params;
 
-        // Validate organization ID
         if (!orgId || !mongoose.Types.ObjectId.isValid(orgId)) {
             return res.status(400).json({
                 success: false,
@@ -107,7 +106,6 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
             });
         }
 
-        // Step 1: Get organization details
         const customer = await Customer.findById(orgId)
             .select('_id name email phone')
             .lean();
@@ -119,7 +117,6 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
             });
         }
 
-        // Step 2: Get all measurements for this organization
         const measurements = await Measurement.find({
             organizationId: orgId
         })
@@ -137,7 +134,6 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
             });
         }
 
-        // Step 3: Get organization departments to get assigned quantities
         const orgDept = await OrganizationDepartment.findOne({
             customerId: orgId,
             status: 'active'
@@ -150,47 +146,35 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
             });
         }
 
-        // Step 4: Create helper function to find assigned quantity
         const getAssignedQuantity = (departmentName, designationName, stockItemId, variantId) => {
-            // Find the department
-            const department = orgDept.departments.find(dept =>
-                dept.status === 'active' && dept.name === departmentName
+            const department = orgDept.departments.find(
+                d => d.status === 'active' && d.name === departmentName
             );
+            if (!department) return 1;
 
-            if (!department) return 1; // Default to 1 if department not found
-
-            // Find the designation
-            const designation = department.designations.find(desig =>
-                desig.status === 'active' && desig.name === designationName
+            const designation = department.designations.find(
+                des => des.status === 'active' && des.name === designationName
             );
+            if (!designation || !designation.assignedStockItems) return 1;
 
-            if (!designation || !designation.assignedStockItems) return 1; // Default to 1
-
-            // Find the assigned stock item
             const assignedItem = designation.assignedStockItems.find(item => {
-                // First check if stockItemId matches
-                const stockItemMatches = item.stockItemId.toString() === stockItemId.toString();
-
-                // Check variant match
+                const stockMatch = item.stockItemId.toString() === stockItemId.toString();
                 if (variantId) {
-                    // If we have variantId, check if it matches or if assigned item has no variantId
-                    return stockItemMatches && (
+                    return stockMatch && (
                         (item.variantId && item.variantId.toString() === variantId.toString()) ||
                         !item.variantId
                     );
-                } else {
-                    // If no variantId, check if assigned item has no variantId
-                    return stockItemMatches && !item.variantId;
                 }
+                return stockMatch && !item.variantId;
             });
 
-            return assignedItem ? assignedItem.quantity : 1; // Return assigned quantity or default to 1
+            return assignedItem ? assignedItem.quantity : 1;
         };
 
-        // Step 5: Create a map to store aggregated data
+        /** ---------------- FIX STARTS HERE ---------------- **/
+
         const productDataMap = new Map();
 
-        // Process all measurements
         measurements.forEach(measurement => {
             measurement.employeeMeasurements.forEach(emp => {
                 emp.stockItems.forEach(stockItem => {
@@ -200,62 +184,53 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
                     const variantId = stockItem.variantId ? stockItem.variantId.toString() : null;
                     const key = `${stockItemId}_${variantId || 'no-variant'}`;
 
-                    // Initialize if not exists
                     if (!productDataMap.has(key)) {
                         productDataMap.set(key, {
-                            stockItemId: stockItemId,
-                            stockItemName: stockItem.stockItemId.name || stockItem.stockItemName,
+                            stockItemId,
+                            stockItemName: stockItem.stockItemId.name || '',
                             stockItemReference: stockItem.stockItemId.reference || '',
-                            variantId: variantId,
-                            variantName: stockItem.variantName || "Default",
+                            variantId,
+                            variantName: stockItem.variantName || 'Default',
                             basePrice: stockItem.stockItemId.baseSalesPrice || 0,
-                            employees: new Set(), // Use Set to store unique employee names
-                            employeeDetails: new Set(), // Use Set to store unique employee details
-                            departmentDesignationMap: new Map() // Map to track department/designation groups
+
+                            // 👇 IMPORTANT: dedupe employees using Map
+                            employees: new Map(), // key = employeeUIN
+
+                            departmentDesignationMap: new Map()
                         });
                     }
 
                     const data = productDataMap.get(key);
 
-                    // Create unique key for employee (name + department + designation)
-                    const employeeUniqueKey = `${emp.employeeName}_${emp.department}_${emp.designation}`;
-                    
-                    // Add employee name to Set (automatically removes duplicates)
-                    data.employees.add(emp.employeeName);
-                    
-                    // Add employee details to Set
-                    data.employeeDetails.add(`${emp.employeeName}`);
+                    // Deduplicate employees
+                    if (emp.employeeUIN && !data.employees.has(emp.employeeUIN)) {
+                        data.employees.set(emp.employeeUIN, {
+                            name: emp.employeeName,
+                            department: emp.department,
+                            designation: emp.designation,
+                            uin: emp.employeeUIN
+                        });
+                    }
 
-                    // Track department/designation combination
                     const deptDesigKey = `${emp.department}_${emp.designation}`;
                     if (!data.departmentDesignationMap.has(deptDesigKey)) {
                         data.departmentDesignationMap.set(deptDesigKey, {
                             department: emp.department,
                             designation: emp.designation,
-                            employeeCount: 0,
-                            employeeSet: new Set() // Track unique employees in this department/designation
+                            employeeCount: 0
                         });
                     }
 
-                    const deptData = data.departmentDesignationMap.get(deptDesigKey);
-                    
-                    // Only increment employee count if this employee hasn't been counted for this stock item
-                    if (!deptData.employeeSet.has(employeeUniqueKey)) {
-                        deptData.employeeSet.add(employeeUniqueKey);
-                        deptData.employeeCount += 1;
-                    }
+                    data.departmentDesignationMap.get(deptDesigKey).employeeCount += 1;
                 });
             });
         });
 
-        // Step 6: Calculate quantities and prepare data
         const productData = Array.from(productDataMap.values()).map(data => {
             let totalQuantity = 0;
             const departmentBreakdown = [];
 
-            // Calculate quantity for each department/designation group
             data.departmentDesignationMap.forEach(deptData => {
-                // Get assigned quantity for this department/designation
                 const assignedQuantity = getAssignedQuantity(
                     deptData.department,
                     deptData.designation,
@@ -263,113 +238,75 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
                     data.variantId
                 );
 
-                const deptTotalQuantity = deptData.employeeCount * assignedQuantity;
-                totalQuantity += deptTotalQuantity;
+                const deptTotal = deptData.employeeCount * assignedQuantity;
+                totalQuantity += deptTotal;
 
                 departmentBreakdown.push({
                     department: deptData.department,
                     designation: deptData.designation,
                     employeeCount: deptData.employeeCount,
                     quantityPerEmployee: assignedQuantity,
-                    totalQuantity: deptTotalQuantity
+                    totalQuantity: deptTotal
                 });
             });
 
-            // Convert Sets to Arrays and format
-            const employeeNames = Array.from(data.employees);
-            const employeeDetailsList = Array.from(data.employeeDetails);
-            
-            // Format employee names for CSV
-            const employeeNamesStr = employeeNames.join(', ');
-            const employeeDetailsStr = employeeDetailsList.join(', ');
-
-            const totalEmployees = employeeNames.length; // Count unique employees
-            const totalEstimatedPrice = totalQuantity * data.basePrice;
+            const uniqueEmployees = Array.from(data.employees.values());
 
             return {
                 ...data,
-                employeeNames: employeeNames,
-                employeeNamesStr: employeeNamesStr,
-                employeeDetailsStr: employeeDetailsStr,
-                totalEmployees,
+                employeeDetails: uniqueEmployees.map(e => e.name).join(', '),
+                totalEmployees: uniqueEmployees.length,
                 totalQuantity,
-                totalEstimatedPrice,
+                totalEstimatedPrice: totalQuantity * data.basePrice,
                 departmentBreakdown
             };
         });
 
-        // Step 7: Create CSV content with the required format
-        // Use BOM (Byte Order Mark) to ensure proper UTF-8 encoding
+        /** ---------------- FIX ENDS HERE ---------------- **/
+
         const headers = [
             'Stock Item Name',
             'Variant Name',
             'Stock Item Reference',
             'Employees with Measurements',
-            'Employee Count (Unique)',
+            'Total Employees',
             'Total Quantity',
             'Base Price',
             'Total Estimated Price'
         ];
 
-        const rows = productData.map(item => {
-            return [
-                `"${item.stockItemName}"`,
-                `"${item.variantName}"`,
-                item.stockItemReference,
-                `"${item.employeeDetailsStr}"`, // Show detailed employee info
-                item.totalEmployees, // Show unique employee count
-                item.totalQuantity,
-                item.basePrice.toFixed(2),
-                item.totalEstimatedPrice.toFixed(2)
-            ];
-        });
-
-        // Add summary row
-        const totalSummary = productData.reduce((acc, item) => ({
-            totalEmployees: acc.totalEmployees + item.totalEmployees,
-            totalQuantity: acc.totalQuantity + item.totalQuantity,
-            totalPrice: acc.totalPrice + item.totalEstimatedPrice,
-            itemCount: acc.itemCount + 1
-        }), { totalEmployees: 0, totalQuantity: 0, totalPrice: 0, itemCount: 0 });
-
-        const summaryRow = [
-            '=== SUMMARY ===',
-            '',
-            '',
-            '',
-            `Unique Employees: ${totalSummary.totalEmployees}`,
-            `Total Quantity: ${totalSummary.totalQuantity}`,
-            '',
-            `Total Estimated Price: ${totalSummary.totalPrice.toFixed(2)}`
-        ];
+        const rows = productData.map(item => [
+            `"${item.stockItemName}"`,
+            `"${item.variantName}"`,
+            item.stockItemReference,
+            `"${item.employeeDetails}"`,
+            item.totalEmployees,
+            item.totalQuantity,
+            item.basePrice.toFixed(2),
+            item.totalEstimatedPrice.toFixed(2)
+        ]);
 
         const csvContent = [
             headers.join(','),
-            ...rows.map(row => row.join(',')),
-            '',
-            summaryRow.join(',')
+            ...rows.map(r => r.join(','))
         ].join('\n');
 
-        // Step 8: Send response with proper UTF-8 encoding
-        const filename = `Product_Pricing_${customer.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.csv`;
-
-        // Use UTF-8 with BOM for Excel compatibility
+        const filename = `Product_Pricing_${customer.name.replace(/\s+/g, '_')}.csv`;
         const bom = '\uFEFF';
-        const csvWithBom = bom + csvContent;
 
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        res.send(csvWithBom);
+        res.send(bom + csvContent);
 
     } catch (error) {
-        console.error('Error exporting product pricing data:', error);
+        console.error('Export error:', error);
         res.status(500).json({
             success: false,
-            message: 'Server error while exporting product pricing data',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+            message: 'Server error while exporting product pricing data'
         });
     }
 });
+
 
 // Simplified version focusing on quantity calculation
 router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
