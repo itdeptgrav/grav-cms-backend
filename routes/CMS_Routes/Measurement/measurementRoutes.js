@@ -335,43 +335,32 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
 
 router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
     try {
-        console.log('🚀 Starting product pricing export');
         const { orgId } = req.params;
-
-        // Get organization details
+        
+        // 1. Get organization name
         const customer = await Customer.findById(orgId).select('name').lean();
         if (!customer) {
-            return res.status(404).json({
-                success: false,
-                message: 'Organization not found'
-            });
+            return res.status(404).json({ success: false, message: 'Organization not found' });
         }
 
-        // Step 1: Get all employees to see their actual department/designation
-        const employees = await EmployeeMpc.find({
-            customerId: orgId,
-            status: 'active'
-        })
-            .select('name uin department designation')
-            .lean();
-
-        console.log(`Found ${employees.length} employees`);
+        // 2. Get ALL employees for this organization
+        const allEmployees = await EmployeeMpc.find({ 
+            customerId: orgId, 
+            status: 'active' 
+        }).select('_id name department designation').lean();
         
         // Create employee map for quick lookup
         const employeeMap = new Map();
-        employees.forEach(emp => {
+        allEmployees.forEach(emp => {
             employeeMap.set(emp._id.toString(), {
                 name: emp.name,
-                uin: emp.uin,
-                department: emp.department, // This is transformed by setter
-                designation: emp.designation // This is transformed by setter
+                department: emp.department,
+                designation: emp.designation
             });
         });
 
-        // Step 2: Get all measurements
-        const measurements = await Measurement.find({
-            organizationId: orgId
-        })
+        // 3. Get measurements
+        const measurements = await Measurement.find({ organizationId: orgId })
             .select('employeeMeasurements')
             .populate({
                 path: 'employeeMeasurements.stockItems.stockItemId',
@@ -380,235 +369,269 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
             .lean();
 
         if (!measurements || measurements.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'No measurements found'
-            });
+            return res.status(404).json({ success: false, message: 'No measurements found' });
         }
 
-        // Step 3: Get organization department
-        const orgDept = await OrganizationDepartment.findOne({
-            customerId: orgId,
-            status: 'active'
+        // 4. Get organization department
+        const orgDept = await OrganizationDepartment.findOne({ 
+            customerId: orgId, 
+            status: 'active' 
         }).lean();
 
         if (!orgDept) {
-            return res.status(404).json({
-                success: false,
-                message: 'Organization departments not found'
-            });
+            return res.status(404).json({ success: false, message: 'Organization departments not found' });
         }
 
-        // Step 4: Build a better lookup structure that handles all cases
-        const orgDeptLookup = new Map();
-        
-        orgDept.departments.forEach(dept => {
-            if (dept.status === 'active') {
-                // Store multiple variations of the department name
-                const deptVariations = [
-                    dept.name, // Original
-                    dept.name.toLowerCase(),
-                    dept.name.toUpperCase(),
-                    dept.name.replace(/[^a-zA-Z0-9&]/g, ''), // Remove special chars
-                    dept.name.replace(/&/g, 'and'), // Replace & with 'and'
-                    dept.name.replace(/and/g, '&') // Replace 'and' with &
-                ];
-                
-                dept.designations.forEach(desig => {
-                    if (desig.status === 'active' && desig.assignedStockItems) {
-                        // Store multiple variations of designation name
-                        const desigVariations = [
-                            desig.name,
-                            desig.name.toLowerCase(),
-                            desig.name.toUpperCase(),
-                            desig.name.replace(/[^a-zA-Z0-9]/g, '') // Remove special chars
-                        ];
-                        
-                        // Create all combinations
-                        deptVariations.forEach(deptVar => {
-                            desigVariations.forEach(desigVar => {
-                                const key = `${deptVar}_${desigVar}`;
-                                orgDeptLookup.set(key, {
-                                    department: dept.name,
-                                    designation: desig.name,
-                                    assignedStockItems: desig.assignedStockItems
-                                });
-                            });
-                        });
-                    }
-                });
-            }
-        });
-
-        console.log(`Built lookup with ${orgDeptLookup.size} combinations`);
-
-        // Step 5: Process measurements
-        const productMap = new Map();
+        // 5. FIRST: Create a map to track employees by department/designation
+        const employeesByDeptDesig = new Map();
         
         measurements.forEach(measurement => {
             measurement.employeeMeasurements.forEach(emp => {
-                // Get employee info from employeeMap (transformed by setter)
                 const employeeInfo = employeeMap.get(emp.employeeId.toString());
                 
-                // Use the department from employee record (transformed) OR from measurement
-                const employeeDept = employeeInfo ? employeeInfo.department : emp.department;
-                const employeeDesig = employeeInfo ? employeeInfo.designation : emp.designation;
+                // Use employee's actual department/designation from EmployeeMpc
+                const dept = employeeInfo ? employeeInfo.department : emp.department;
+                const desig = employeeInfo ? employeeInfo.designation : emp.designation;
                 
-                console.log(`\nEmployee: ${emp.employeeName}`);
-                console.log(`Measurement Dept: "${emp.department}", Desig: "${emp.designation}"`);
-                console.log(`Employee Record Dept: "${employeeDept}", Desig: "${employeeDesig}"`);
+                const key = `${dept}|${desig}`;
                 
-                // Try different lookup strategies
-                let foundAssignment = null;
-                
-                // Strategy 1: Try exact match from employee record (transformed)
-                const key1 = `${employeeDept}_${employeeDesig}`;
-                foundAssignment = orgDeptLookup.get(key1);
-                if (foundAssignment) {
-                    console.log(`✅ Found with Strategy 1 (employee record)`);
+                if (!employeesByDeptDesig.has(key)) {
+                    employeesByDeptDesig.set(key, {
+                        department: dept,
+                        designation: desig,
+                        employeeIds: new Set(),
+                        employeeNames: new Set()
+                    });
                 }
                 
-                // Strategy 2: Try exact match from measurement
-                if (!foundAssignment) {
-                    const key2 = `${emp.department}_${emp.designation}`;
-                    foundAssignment = orgDeptLookup.get(key2);
-                    if (foundAssignment) {
-                        console.log(`✅ Found with Strategy 2 (measurement)`);
-                    }
-                }
+                const group = employeesByDeptDesig.get(key);
+                group.employeeIds.add(emp.employeeId.toString());
+                group.employeeNames.add(emp.employeeName);
+            });
+        });
+
+        // 6. Process each department in orgDept
+        const productMap = new Map();
+        
+        orgDept.departments.forEach(dept => {
+            if (dept.status !== 'active') return;
+            
+            dept.designations.forEach(desig => {
+                if (desig.status !== 'active' || !desig.assignedStockItems) return;
                 
-                // Strategy 3: Try case-insensitive match
-                if (!foundAssignment) {
-                    const key3 = `${employeeDept.toLowerCase()}_${employeeDesig.toLowerCase()}`;
-                    foundAssignment = orgDeptLookup.get(key3);
-                    if (foundAssignment) {
-                        console.log(`✅ Found with Strategy 3 (case-insensitive)`);
-                    }
-                }
+                // Find matching employee group
+                let employeeGroup = null;
                 
-                // Strategy 4: Try with special character normalization
-                if (!foundAssignment) {
-                    const normalizedDept = employeeDept.replace(/[^a-zA-Z0-9&]/g, '').toLowerCase();
-                    const normalizedDesig = employeeDesig.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-                    const key4 = `${normalizedDept}_${normalizedDesig}`;
-                    foundAssignment = orgDeptLookup.get(key4);
-                    if (foundAssignment) {
-                        console.log(`✅ Found with Strategy 4 (normalized)`);
-                    }
-                }
+                // Try exact match first
+                const exactKey = `${dept.name}|${desig.name}`;
+                employeeGroup = employeesByDeptDesig.get(exactKey);
                 
-                if (!foundAssignment) {
-                    console.log(`❌ No assignment found for employee`);
-                    console.log(`Tried keys: ${key1}, ${emp.department}_${emp.designation}, etc.`);
-                }
-                
-                // Process stock items
-                emp.stockItems.forEach(empStockItem => {
-                    if (!empStockItem.stockItemId) return;
-                    
-                    const stockItemId = empStockItem.stockItemId._id?.toString();
-                    const variantId = empStockItem.variantId?.toString() || 'default';
-                    const productKey = `${stockItemId}_${variantId}`;
-                    
-                    // Determine quantity
-                    let quantity = 1;
-                    
-                    if (foundAssignment && foundAssignment.assignedStockItems) {
-                        const assignedItem = foundAssignment.assignedStockItems.find(item => {
-                            const itemStockItemId = item.stockItemId?.toString();
-                            const itemVariantId = item.variantId ? item.variantId.toString() : 'default';
-                            return itemStockItemId === stockItemId && itemVariantId === variantId;
-                        });
-                        
-                        if (assignedItem) {
-                            quantity = assignedItem.quantity || 1;
-                            console.log(`  ✅ Stock item ${stockItemId}: Quantity = ${quantity}`);
-                        } else {
-                            console.log(`  ⚠️  Stock item ${stockItemId}: No assigned quantity found`);
+                // If no exact match, try case-insensitive
+                if (!employeeGroup) {
+                    for (const [key, group] of employeesByDeptDesig) {
+                        const [empDept, empDesig] = key.split('|');
+                        if (empDept.toLowerCase() === dept.name.toLowerCase() && 
+                            empDesig.toLowerCase() === desig.name.toLowerCase()) {
+                            employeeGroup = group;
+                            break;
                         }
                     }
+                }
+                
+                if (employeeGroup && employeeGroup.employeeIds.size > 0) {
+                    const employeeCount = employeeGroup.employeeIds.size;
+                    const employeeNames = Array.from(employeeGroup.employeeNames);
                     
-                    // Update product map
-                    if (!productMap.has(productKey)) {
-                        productMap.set(productKey, {
-                            stockItemName: empStockItem.stockItemId.name || empStockItem.stockItemName,
-                            variantName: empStockItem.variantName || "Default",
-                            reference: empStockItem.stockItemId.reference || '',
-                            basePrice: empStockItem.stockItemId.baseSalesPrice || 0,
-                            totalQuantity: 0,
-                            employees: new Set()
+                    console.log(`\nDepartment: ${dept.name}, Designation: ${desig.name}`);
+                    console.log(`Employee Count: ${employeeCount}`);
+                    console.log(`Employee Names: ${employeeNames.join(', ')}`);
+                    
+                    // Process assigned stock items
+                    desig.assignedStockItems.forEach(item => {
+                        if (!item.stockItemId) return;
+                        
+                        const stockItemId = item.stockItemId.toString();
+                        const variantId = item.variantId ? item.variantId.toString() : 'default';
+                        const productKey = `${stockItemId}_${variantId}`;
+                        const quantityPerEmployee = item.quantity || 1;
+                        const totalQuantity = employeeCount * quantityPerEmployee;
+                        
+                        if (!productMap.has(productKey)) {
+                            productMap.set(productKey, {
+                                stockItemId: stockItemId,
+                                variantId: variantId,
+                                employeeCount: 0,
+                                employeeNamesSet: new Set(), // Use Set to avoid duplicates
+                                totalQuantity: 0,
+                                quantityPerEmployee: quantityPerEmployee,
+                                department: dept.name,
+                                designation: desig.name
+                            });
+                        }
+                        
+                        const product = productMap.get(productKey);
+                        
+                        // Add employee names to set (no duplicates)
+                        employeeNames.forEach(name => {
+                            product.employeeNamesSet.add(name);
                         });
+                        
+                        // Update counts
+                        product.employeeCount = product.employeeNamesSet.size; // Actual unique count
+                        product.totalQuantity += totalQuantity;
+                        
+                        console.log(`  Stock Item: ${stockItemId}, Variant: ${variantId}`);
+                        console.log(`  Quantity per employee: ${quantityPerEmployee}`);
+                        console.log(`  Employees for this item: ${Array.from(product.employeeNamesSet).join(', ')}`);
+                        console.log(`  Employee count: ${product.employeeCount}`);
+                        console.log(`  Total quantity added: ${totalQuantity}`);
+                    });
+                }
+            });
+        });
+
+        // 7. Get stock item details
+        const stockItemIds = Array.from(productMap.values()).map(p => p.stockItemId);
+        const stockItems = await StockItem.find({ 
+            _id: { $in: stockItemIds } 
+        }).select('name reference baseSalesPrice').lean();
+        
+        const stockItemDetails = new Map();
+        stockItems.forEach(item => {
+            stockItemDetails.set(item._id.toString(), {
+                name: item.name,
+                reference: item.reference,
+                basePrice: item.baseSalesPrice || 0
+            });
+        });
+
+        // 8. Get variant names from measurements
+        const variantNames = new Map();
+        measurements.forEach(measurement => {
+            measurement.employeeMeasurements.forEach(emp => {
+                emp.stockItems.forEach(stockItem => {
+                    if (stockItem.stockItemId && stockItem.variantId) {
+                        const key = `${stockItem.stockItemId._id.toString()}_${stockItem.variantId.toString()}`;
+                        variantNames.set(key, stockItem.variantName || "Default");
                     }
-                    
-                    const product = productMap.get(productKey);
-                    product.employees.add(emp.employeeName);
-                    product.totalQuantity += quantity;
                 });
             });
         });
 
-        // Step 6: Prepare final data
-        const products = Array.from(productMap.values()).map(p => ({
-            ...p,
-            employeeCount: p.employees.size,
-            employeeNames: Array.from(p.employees).join(', '),
-            totalPrice: p.totalQuantity * p.basePrice
-        }));
+        // 9. Prepare final products - ensure consistency
+        const products = Array.from(productMap.entries()).map(([key, product]) => {
+            const stockItemId = product.stockItemId;
+            const variantId = product.variantId;
+            
+            const stockItem = stockItemDetails.get(stockItemId) || {
+                name: 'Unknown',
+                reference: '',
+                basePrice: 0
+            };
+            
+            const variantName = variantNames.get(key) || "Default";
+            const totalPrice = product.totalQuantity * stockItem.basePrice;
+            
+            // Get unique employee names
+            const uniqueEmployeeNames = Array.from(product.employeeNamesSet);
+            
+            // CRITICAL: Make sure employee count matches unique names count
+            const actualEmployeeCount = uniqueEmployeeNames.length;
+            
+            console.log(`\nFinalizing product: ${stockItem.name}`);
+            console.log(`Employee Names: ${uniqueEmployeeNames.join(', ')}`);
+            console.log(`Employee Count (Set size): ${actualEmployeeCount}`);
+            console.log(`Employee Count (stored): ${product.employeeCount}`);
+            
+            return {
+                stockItemName: stockItem.name,
+                variantName: variantName,
+                reference: stockItem.reference,
+                basePrice: stockItem.basePrice,
+                employeeCount: actualEmployeeCount, // Use actual unique count
+                employeeNames: uniqueEmployeeNames.join(', '),
+                quantityPerEmployee: product.quantityPerEmployee,
+                totalQuantity: product.totalQuantity,
+                totalPrice: totalPrice,
+                department: product.department,
+                designation: product.designation
+            };
+        });
 
-        // Step 7: Create CSV
+        // 10. Create CSV with verified data
         const headers = [
             'Stock Item', 
             'Variant', 
             'Reference', 
             'Employees', 
             'Employee Count', 
+            'Quantity/Employee', 
             'Total Quantity', 
             'Unit Price', 
-            'Total Price'
+            'Total Price',
+            'Department',
+            'Designation'
         ];
         
-        const rows = products.map(p => [
-            `"${p.stockItemName}"`,
-            `"${p.variantName}"`,
-            p.reference,
-            `"${p.employeeNames}"`,
-            p.employeeCount,
-            p.totalQuantity,
-            p.basePrice.toFixed(2),
-            p.totalPrice.toFixed(2)
-        ]);
+        const rows = products.map(p => {
+            // Verify consistency before creating row
+            const namesArray = p.employeeNames.split(',').map(name => name.trim()).filter(name => name);
+            const actualCount = namesArray.length;
+            
+            console.log(`\nCSV Row for ${p.stockItemName}:`);
+            console.log(`  Names in CSV: ${p.employeeNames}`);
+            console.log(`  Names count: ${namesArray.length}`);
+            console.log(`  Employee Count: ${p.employeeCount}`);
+            
+            // Ensure counts match
+            if (actualCount !== p.employeeCount) {
+                console.warn(`  ⚠️  COUNT MISMATCH! Adjusting from ${p.employeeCount} to ${actualCount}`);
+                p.employeeCount = actualCount;
+            }
+            
+            return [
+                `"${p.stockItemName}"`,
+                `"${p.variantName}"`,
+                p.reference,
+                `"${p.employeeNames}"`,
+                p.employeeCount,
+                p.quantityPerEmployee,
+                p.totalQuantity,
+                p.basePrice.toFixed(2),
+                p.totalPrice.toFixed(2),
+                `"${p.department}"`,
+                `"${p.designation}"`
+            ];
+        });
 
-        const totals = products.reduce((acc, p) => ({
-            totalQuantity: acc.totalQuantity + p.totalQuantity,
-            totalPrice: acc.totalPrice + p.totalPrice
-        }), { totalQuantity: 0, totalPrice: 0 });
+        // Calculate totals
+        let totalEmployeeCount = 0;
+        let totalQuantity = 0;
+        let totalPrice = 0;
+        
+        products.forEach(p => {
+            totalEmployeeCount += p.employeeCount;
+            totalQuantity += p.totalQuantity;
+            totalPrice += p.totalPrice;
+        });
 
         const csvContent = [
             headers.join(','),
             ...rows.map(r => r.join(',')),
-            `,,,,Total: ${totals.totalQuantity},,Total: ${totals.totalPrice.toFixed(2)}`
+            `,,,,Total Employees: ${totalEmployeeCount},Total: ${totalQuantity},,Total: ${totalPrice.toFixed(2)},,`
         ].join('\n');
 
-        // Step 8: Send response
+        // 11. Send response
         const filename = `Product_Pricing_${customer.name.replace(/\s+/g, '_')}.csv`;
-        
-        // Add UTF-8 BOM for Excel
         const bom = '\uFEFF';
         const csvWithBom = bom + csvContent;
         
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        
-        console.log(`\n✅ Export complete:`);
-        console.log(`   Products: ${products.length}`);
-        console.log(`   Total Quantity: ${totals.totalQuantity}`);
-        console.log(`   Total Price: ${totals.totalPrice}`);
-        
         res.send(csvWithBom);
 
     } catch (error) {
         console.error('Export error:', error);
-        console.error('Error stack:', error.stack);
         res.status(500).json({
             success: false,
             message: 'Export failed',
