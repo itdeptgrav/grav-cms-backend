@@ -307,10 +307,9 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
     }
 });
 
-
-// Simplified version focusing on quantity calculation
-router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res) => {
+router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
     try {
+        console.log('🚀 Starting product pricing export');
         const { orgId } = req.params;
 
         // Get organization details
@@ -322,7 +321,28 @@ router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res)
             });
         }
 
-        // Get all measurements
+        // Step 1: Get all employees to see their actual department/designation
+        const employees = await EmployeeMpc.find({
+            customerId: orgId,
+            status: 'active'
+        })
+            .select('name uin department designation')
+            .lean();
+
+        console.log(`Found ${employees.length} employees`);
+        
+        // Create employee map for quick lookup
+        const employeeMap = new Map();
+        employees.forEach(emp => {
+            employeeMap.set(emp._id.toString(), {
+                name: emp.name,
+                uin: emp.uin,
+                department: emp.department, // This is transformed by setter
+                designation: emp.designation // This is transformed by setter
+            });
+        });
+
+        // Step 2: Get all measurements
         const measurements = await Measurement.find({
             organizationId: orgId
         })
@@ -340,7 +360,7 @@ router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res)
             });
         }
 
-        // Get organization department
+        // Step 3: Get organization department
         const orgDept = await OrganizationDepartment.findOne({
             customerId: orgId,
             status: 'active'
@@ -353,42 +373,110 @@ router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res)
             });
         }
 
-        // SIMPLE APPROACH: Create a map of all assignments by department+designation
-        const assignmentsMap = new Map();
+        // Step 4: Build a better lookup structure that handles all cases
+        const orgDeptLookup = new Map();
         
         orgDept.departments.forEach(dept => {
             if (dept.status === 'active') {
+                // Store multiple variations of the department name
+                const deptVariations = [
+                    dept.name, // Original
+                    dept.name.toLowerCase(),
+                    dept.name.toUpperCase(),
+                    dept.name.replace(/[^a-zA-Z0-9&]/g, ''), // Remove special chars
+                    dept.name.replace(/&/g, 'and'), // Replace & with 'and'
+                    dept.name.replace(/and/g, '&') // Replace 'and' with &
+                ];
+                
                 dept.designations.forEach(desig => {
                     if (desig.status === 'active' && desig.assignedStockItems) {
-                        const key = `${dept.name}_${desig.name}`;
+                        // Store multiple variations of designation name
+                        const desigVariations = [
+                            desig.name,
+                            desig.name.toLowerCase(),
+                            desig.name.toUpperCase(),
+                            desig.name.replace(/[^a-zA-Z0-9]/g, '') // Remove special chars
+                        ];
                         
-                        if (!assignmentsMap.has(key)) {
-                            assignmentsMap.set(key, []);
-                        }
-                        
-                        desig.assignedStockItems.forEach(item => {
-                            if (item.stockItemId) {
-                                assignmentsMap.get(key).push({
-                                    stockItemId: item.stockItemId.toString(),
-                                    variantId: item.variantId ? item.variantId.toString() : 'default',
-                                    quantity: item.quantity || 1
+                        // Create all combinations
+                        deptVariations.forEach(deptVar => {
+                            desigVariations.forEach(desigVar => {
+                                const key = `${deptVar}_${desigVar}`;
+                                orgDeptLookup.set(key, {
+                                    department: dept.name,
+                                    designation: desig.name,
+                                    assignedStockItems: desig.assignedStockItems
                                 });
-                            }
+                            });
                         });
                     }
                 });
             }
         });
 
-        // Process measurements and calculate quantities
-        const productMap = new Map(); // key: stockItemId_variantId
+        console.log(`Built lookup with ${orgDeptLookup.size} combinations`);
+
+        // Step 5: Process measurements
+        const productMap = new Map();
         
         measurements.forEach(measurement => {
             measurement.employeeMeasurements.forEach(emp => {
-                const assignmentKey = `${emp.department}_${emp.designation}`;
-                const assignments = assignmentsMap.get(assignmentKey) || [];
+                // Get employee info from employeeMap (transformed by setter)
+                const employeeInfo = employeeMap.get(emp.employeeId.toString());
                 
-                // For each stock item the employee has measurements for
+                // Use the department from employee record (transformed) OR from measurement
+                const employeeDept = employeeInfo ? employeeInfo.department : emp.department;
+                const employeeDesig = employeeInfo ? employeeInfo.designation : emp.designation;
+                
+                console.log(`\nEmployee: ${emp.employeeName}`);
+                console.log(`Measurement Dept: "${emp.department}", Desig: "${emp.designation}"`);
+                console.log(`Employee Record Dept: "${employeeDept}", Desig: "${employeeDesig}"`);
+                
+                // Try different lookup strategies
+                let foundAssignment = null;
+                
+                // Strategy 1: Try exact match from employee record (transformed)
+                const key1 = `${employeeDept}_${employeeDesig}`;
+                foundAssignment = orgDeptLookup.get(key1);
+                if (foundAssignment) {
+                    console.log(`✅ Found with Strategy 1 (employee record)`);
+                }
+                
+                // Strategy 2: Try exact match from measurement
+                if (!foundAssignment) {
+                    const key2 = `${emp.department}_${emp.designation}`;
+                    foundAssignment = orgDeptLookup.get(key2);
+                    if (foundAssignment) {
+                        console.log(`✅ Found with Strategy 2 (measurement)`);
+                    }
+                }
+                
+                // Strategy 3: Try case-insensitive match
+                if (!foundAssignment) {
+                    const key3 = `${employeeDept.toLowerCase()}_${employeeDesig.toLowerCase()}`;
+                    foundAssignment = orgDeptLookup.get(key3);
+                    if (foundAssignment) {
+                        console.log(`✅ Found with Strategy 3 (case-insensitive)`);
+                    }
+                }
+                
+                // Strategy 4: Try with special character normalization
+                if (!foundAssignment) {
+                    const normalizedDept = employeeDept.replace(/[^a-zA-Z0-9&]/g, '').toLowerCase();
+                    const normalizedDesig = employeeDesig.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+                    const key4 = `${normalizedDept}_${normalizedDesig}`;
+                    foundAssignment = orgDeptLookup.get(key4);
+                    if (foundAssignment) {
+                        console.log(`✅ Found with Strategy 4 (normalized)`);
+                    }
+                }
+                
+                if (!foundAssignment) {
+                    console.log(`❌ No assignment found for employee`);
+                    console.log(`Tried keys: ${key1}, ${emp.department}_${emp.designation}, etc.`);
+                }
+                
+                // Process stock items
                 emp.stockItems.forEach(empStockItem => {
                     if (!empStockItem.stockItemId) return;
                     
@@ -396,22 +484,33 @@ router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res)
                     const variantId = empStockItem.variantId?.toString() || 'default';
                     const productKey = `${stockItemId}_${variantId}`;
                     
-                    // Find if this stock item is assigned to this employee's department+designation
-                    const assignment = assignments.find(a => 
-                        a.stockItemId === stockItemId && 
-                        a.variantId === variantId
-                    );
+                    // Determine quantity
+                    let quantity = 1;
                     
-                    const quantity = assignment ? assignment.quantity : 1;
+                    if (foundAssignment && foundAssignment.assignedStockItems) {
+                        const assignedItem = foundAssignment.assignedStockItems.find(item => {
+                            const itemStockItemId = item.stockItemId?.toString();
+                            const itemVariantId = item.variantId ? item.variantId.toString() : 'default';
+                            return itemStockItemId === stockItemId && itemVariantId === variantId;
+                        });
+                        
+                        if (assignedItem) {
+                            quantity = assignedItem.quantity || 1;
+                            console.log(`  ✅ Stock item ${stockItemId}: Quantity = ${quantity}`);
+                        } else {
+                            console.log(`  ⚠️  Stock item ${stockItemId}: No assigned quantity found`);
+                        }
+                    }
                     
+                    // Update product map
                     if (!productMap.has(productKey)) {
                         productMap.set(productKey, {
                             stockItemName: empStockItem.stockItemId.name || empStockItem.stockItemName,
                             variantName: empStockItem.variantName || "Default",
-                            totalQuantity: 0,
-                            employees: new Set(),
+                            reference: empStockItem.stockItemId.reference || '',
                             basePrice: empStockItem.stockItemId.baseSalesPrice || 0,
-                            reference: empStockItem.stockItemId.reference || ''
+                            totalQuantity: 0,
+                            employees: new Set()
                         });
                     }
                     
@@ -422,7 +521,7 @@ router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res)
             });
         });
 
-        // Convert to array
+        // Step 6: Prepare final data
         const products = Array.from(productMap.values()).map(p => ({
             ...p,
             employeeCount: p.employees.size,
@@ -430,8 +529,18 @@ router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res)
             totalPrice: p.totalQuantity * p.basePrice
         }));
 
-        // Create CSV
-        const headers = ['Stock Item', 'Variant', 'Reference', 'Employees', 'Employee Count', 'Total Quantity', 'Unit Price', 'Total Price'];
+        // Step 7: Create CSV
+        const headers = [
+            'Stock Item', 
+            'Variant', 
+            'Reference', 
+            'Employees', 
+            'Employee Count', 
+            'Total Quantity', 
+            'Unit Price', 
+            'Total Price'
+        ];
+        
         const rows = products.map(p => [
             `"${p.stockItemName}"`,
             `"${p.variantName}"`,
@@ -454,16 +563,216 @@ router.get('/organization/:orgId/export-product-pricing-fixed', async (req, res)
             `,,,,Total: ${totals.totalQuantity},,Total: ${totals.totalPrice.toFixed(2)}`
         ].join('\n');
 
+        // Step 8: Send response
         const filename = `Product_Pricing_${customer.name.replace(/\s+/g, '_')}.csv`;
-        res.setHeader('Content-Type', 'text/csv');
+        
+        // Add UTF-8 BOM for Excel
+        const bom = '\uFEFF';
+        const csvWithBom = bom + csvContent;
+        
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        res.send(csvContent);
+        
+        console.log(`\n✅ Export complete:`);
+        console.log(`   Products: ${products.length}`);
+        console.log(`   Total Quantity: ${totals.totalQuantity}`);
+        console.log(`   Total Price: ${totals.totalPrice}`);
+        
+        res.send(csvWithBom);
 
     } catch (error) {
         console.error('Export error:', error);
+        console.error('Error stack:', error.stack);
         res.status(500).json({
             success: false,
             message: 'Export failed',
+            error: error.message
+        });
+    }
+});
+
+
+
+router.get('/organization/:orgId/export-product-pricing-debug', async (req, res) => {
+    try {
+        const { orgId } = req.params;
+        
+        console.log('\n=== STARTING DEBUG EXPORT ===\n');
+
+        // Get organization details
+        const customer = await Customer.findById(orgId).select('name').lean();
+        if (!customer) {
+            return res.status(404).json({
+                success: false,
+                message: 'Organization not found'
+            });
+        }
+
+        console.log(`Organization: ${customer.name}`);
+
+        // Get one measurement to debug
+        const measurement = await Measurement.findOne({
+            organizationId: orgId
+        })
+            .select('employeeMeasurements')
+            .populate({
+                path: 'employeeMeasurements.stockItems.stockItemId',
+                select: 'name'
+            })
+            .lean();
+
+        if (!measurement) {
+            return res.status(404).json({
+                success: false,
+                message: 'No measurements found'
+            });
+        }
+
+        console.log('\n=== MEASUREMENT DATA ===');
+        console.log(`Total employees in measurement: ${measurement.employeeMeasurements.length}`);
+        
+        // Look at first few employees
+        measurement.employeeMeasurements.slice(0, 5).forEach((emp, index) => {
+            console.log(`\nEmployee ${index + 1}: ${emp.employeeName}`);
+            console.log(`  Department: "${emp.department}"`);
+            console.log(`  Designation: "${emp.designation}"`);
+            console.log(`  Stock items: ${emp.stockItems.length}`);
+            
+            // Check character codes
+            console.log(`  Department char codes: ${Array.from(emp.department).map(c => c.charCodeAt(0)).join(', ')}`);
+            console.log(`  Designation char codes: ${Array.from(emp.designation).map(c => c.charCodeAt(0)).join(', ')}`);
+        });
+
+        // Get organization department
+        const orgDept = await OrganizationDepartment.findOne({
+            customerId: orgId,
+            status: 'active'
+        }).lean();
+
+        if (!orgDept) {
+            return res.status(404).json({
+                success: false,
+                message: 'Organization departments not found'
+            });
+        }
+
+        console.log('\n=== ORGANIZATION DEPARTMENT DATA ===');
+        
+        // Find the E&M/E&m department
+        const emDept = orgDept.departments.find(dept => 
+            dept.name.toLowerCase().includes('e&') || 
+            dept.name.toLowerCase().includes('e and') ||
+            dept.name.toLowerCase().includes('e &')
+        );
+
+        if (emDept) {
+            console.log(`Found department: "${emDept.name}"`);
+            console.log(`Status: ${emDept.status}`);
+            
+            // Find Executive designation
+            const executiveDesig = emDept.designations.find(desig => 
+                desig.name.toLowerCase().includes('executive')
+            );
+            
+            if (executiveDesig) {
+                console.log(`Found designation: "${executiveDesig.name}"`);
+                console.log(`Status: ${executiveDesig.status}`);
+                console.log(`Assigned stock items: ${executiveDesig.assignedStockItems?.length || 0}`);
+                
+                if (executiveDesig.assignedStockItems) {
+                    executiveDesig.assignedStockItems.forEach((item, index) => {
+                        console.log(`  Item ${index + 1}:`);
+                        console.log(`    StockItemId: ${item.stockItemId}`);
+                        console.log(`    VariantId: ${item.variantId || 'none'}`);
+                        console.log(`    Quantity: ${item.quantity || 1}`);
+                    });
+                }
+            } else {
+                console.log('Executive designation not found in this department');
+                console.log('Available designations:');
+                emDept.designations.forEach(d => {
+                    console.log(`  - "${d.name}" (${d.status})`);
+                });
+            }
+        } else {
+            console.log('No E&M/E&m department found');
+            console.log('Available departments:');
+            orgDept.departments.forEach(d => {
+                console.log(`  - "${d.name}" (${d.status})`);
+            });
+        }
+
+        // Now let's do a direct comparison
+        console.log('\n=== DIRECT COMPARISON TEST ===');
+        
+        const testEmployee = measurement.employeeMeasurements.find(emp => 
+            emp.employeeName === "SANGRAM KESHARI PANDA"
+        );
+
+        if (testEmployee) {
+            console.log(`Test employee: ${testEmployee.employeeName}`);
+            console.log(`Measurement dept: "${testEmployee.department}"`);
+            console.log(`Measurement desig: "${testEmployee.designation}"`);
+            
+            // Try to find exact match
+            const exactDept = orgDept.departments.find(dept => 
+                dept.name === testEmployee.department
+            );
+            
+            console.log(`\nExact department match: ${exactDept ? 'FOUND' : 'NOT FOUND'}`);
+            
+            if (exactDept) {
+                const exactDesig = exactDept.designations.find(desig => 
+                    desig.name === testEmployee.designation
+                );
+                console.log(`Exact designation match: ${exactDesig ? 'FOUND' : 'NOT FOUND'}`);
+            }
+            
+            // Try case-insensitive match
+            const caseInsensitiveDept = orgDept.departments.find(dept => 
+                dept.name.toLowerCase() === testEmployee.department.toLowerCase()
+            );
+            
+            console.log(`\nCase-insensitive department match: ${caseInsensitiveDept ? 'FOUND' : 'NOT FOUND'}`);
+            
+            if (caseInsensitiveDept) {
+                console.log(`Matched to department: "${caseInsensitiveDept.name}"`);
+                
+                const caseInsensitiveDesig = caseInsensitiveDept.designations.find(desig => 
+                    desig.name.toLowerCase() === testEmployee.designation.toLowerCase()
+                );
+                
+                console.log(`Case-insensitive designation match: ${caseInsensitiveDesig ? 'FOUND' : 'NOT FOUND'}`);
+                
+                if (caseInsensitiveDesig) {
+                    console.log(`Matched to designation: "${caseInsensitiveDesig.name}"`);
+                }
+            }
+        }
+
+        // Send debug info as JSON
+        res.status(200).json({
+            success: true,
+            debugInfo: {
+                measurementDepartment: testEmployee?.department,
+                measurementDesignation: testEmployee?.designation,
+                orgDepartments: orgDept.departments.map(d => ({
+                    name: d.name,
+                    status: d.status,
+                    designations: d.designations.map(desig => ({
+                        name: desig.name,
+                        status: desig.status,
+                        assignedItems: desig.assignedStockItems?.length || 0
+                    }))
+                }))
+            }
+        });
+
+    } catch (error) {
+        console.error('Debug error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Debug failed',
             error: error.message
         });
     }
