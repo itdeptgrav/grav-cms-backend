@@ -153,24 +153,24 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
         // Step 4: Create helper function to find assigned quantity
         const getAssignedQuantity = (departmentName, designationName, stockItemId, variantId) => {
             // Find the department
-            const department = orgDept.departments.find(dept => 
+            const department = orgDept.departments.find(dept =>
                 dept.status === 'active' && dept.name === departmentName
             );
-            
+
             if (!department) return 1; // Default to 1 if department not found
-            
+
             // Find the designation
-            const designation = department.designations.find(desig => 
+            const designation = department.designations.find(desig =>
                 desig.status === 'active' && desig.name === designationName
             );
-            
+
             if (!designation || !designation.assignedStockItems) return 1; // Default to 1
-            
+
             // Find the assigned stock item
             const assignedItem = designation.assignedStockItems.find(item => {
                 // First check if stockItemId matches
                 const stockItemMatches = item.stockItemId.toString() === stockItemId.toString();
-                
+
                 // Check variant match
                 if (variantId) {
                     // If we have variantId, check if it matches or if assigned item has no variantId
@@ -183,7 +183,7 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
                     return stockItemMatches && !item.variantId;
                 }
             });
-            
+
             return assignedItem ? assignedItem.quantity : 1; // Return assigned quantity or default to 1
         };
 
@@ -209,36 +209,41 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
                             variantId: variantId,
                             variantName: stockItem.variantName || "Default",
                             basePrice: stockItem.stockItemId.baseSalesPrice || 0,
-                            employees: [], // Store employee objects with department/designation
+                            employees: new Set(), // Use Set to store unique employee names
+                            employeeDetails: new Set(), // Use Set to store unique employee details
                             departmentDesignationMap: new Map() // Map to track department/designation groups
                         });
                     }
 
                     const data = productDataMap.get(key);
+
+                    // Create unique key for employee (name + department + designation)
+                    const employeeUniqueKey = `${emp.employeeName}_${emp.department}_${emp.designation}`;
                     
-                    // Create employee object with all details
-                    const employeeObj = {
-                        name: emp.employeeName,
-                        department: emp.department,
-                        designation: emp.designation,
-                        uin: emp.employeeUIN
-                    };
+                    // Add employee name to Set (automatically removes duplicates)
+                    data.employees.add(emp.employeeName);
                     
-                    // Add employee to list
-                    data.employees.push(employeeObj);
-                    
+                    // Add employee details to Set
+                    data.employeeDetails.add(`${emp.employeeName}`);
+
                     // Track department/designation combination
                     const deptDesigKey = `${emp.department}_${emp.designation}`;
                     if (!data.departmentDesignationMap.has(deptDesigKey)) {
                         data.departmentDesignationMap.set(deptDesigKey, {
                             department: emp.department,
                             designation: emp.designation,
-                            employeeCount: 0
+                            employeeCount: 0,
+                            employeeSet: new Set() // Track unique employees in this department/designation
                         });
                     }
-                    
+
                     const deptData = data.departmentDesignationMap.get(deptDesigKey);
-                    deptData.employeeCount += 1;
+                    
+                    // Only increment employee count if this employee hasn't been counted for this stock item
+                    if (!deptData.employeeSet.has(employeeUniqueKey)) {
+                        deptData.employeeSet.add(employeeUniqueKey);
+                        deptData.employeeCount += 1;
+                    }
                 });
             });
         });
@@ -247,7 +252,7 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
         const productData = Array.from(productDataMap.values()).map(data => {
             let totalQuantity = 0;
             const departmentBreakdown = [];
-            
+
             // Calculate quantity for each department/designation group
             data.departmentDesignationMap.forEach(deptData => {
                 // Get assigned quantity for this department/designation
@@ -257,10 +262,10 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
                     data.stockItemId,
                     data.variantId
                 );
-                
+
                 const deptTotalQuantity = deptData.employeeCount * assignedQuantity;
                 totalQuantity += deptTotalQuantity;
-                
+
                 departmentBreakdown.push({
                     department: deptData.department,
                     designation: deptData.designation,
@@ -269,18 +274,23 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
                     totalQuantity: deptTotalQuantity
                 });
             });
+
+            // Convert Sets to Arrays and format
+            const employeeNames = Array.from(data.employees);
+            const employeeDetailsList = Array.from(data.employeeDetails);
             
-            // Format employee names with their department/designation
-            const employeeDetails = data.employees.map(emp => 
-                `${emp.name} (${emp.department} - ${emp.designation})`
-            ).join(', ');
-            
-            const totalEmployees = data.employees.length;
+            // Format employee names for CSV
+            const employeeNamesStr = employeeNames.join(', ');
+            const employeeDetailsStr = employeeDetailsList.join(', ');
+
+            const totalEmployees = employeeNames.length; // Count unique employees
             const totalEstimatedPrice = totalQuantity * data.basePrice;
-            
+
             return {
                 ...data,
-                employeeDetails,
+                employeeNames: employeeNames,
+                employeeNamesStr: employeeNamesStr,
+                employeeDetailsStr: employeeDetailsStr,
                 totalEmployees,
                 totalQuantity,
                 totalEstimatedPrice,
@@ -289,41 +299,28 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
         });
 
         // Step 7: Create CSV content with the required format
+        // Use BOM (Byte Order Mark) to ensure proper UTF-8 encoding
         const headers = [
             'Stock Item Name',
             'Variant Name',
             'Stock Item Reference',
-            'Employees with Measurements (Department - Designation)',
-            'Total Employees',
-            'Quantity Per Employee (Dept-Designation Based)',
+            'Employees with Measurements',
+            'Employee Count (Unique)',
             'Total Quantity',
             'Base Price',
-            'Total Estimated Price',
-            'Department-wise Breakdown'
+            'Total Estimated Price'
         ];
 
         const rows = productData.map(item => {
-            // Create a string showing quantity per employee by department/designation
-            const quantityPerEmployeeInfo = item.departmentBreakdown.map(dept => 
-                `${dept.department}-${dept.designation}: ${dept.quantityPerEmployee}`
-            ).join('; ');
-            
-            // Format department breakdown as readable string
-            const deptBreakdownStr = item.departmentBreakdown.map(dept => 
-                `${dept.department} - ${dept.designation}: ${dept.employeeCount} employees × ${dept.quantityPerEmployee} = ${dept.totalQuantity}`
-            ).join(' | ');
-            
             return [
                 `"${item.stockItemName}"`,
                 `"${item.variantName}"`,
                 item.stockItemReference,
-                `"${item.employeeDetails}"`,
-                item.totalEmployees,
-                `"${quantityPerEmployeeInfo}"`,
+                `"${item.employeeDetailsStr}"`, // Show detailed employee info
+                item.totalEmployees, // Show unique employee count
                 item.totalQuantity,
-                `₹${item.basePrice.toFixed(2)}`,
-                `₹${item.totalEstimatedPrice.toFixed(2)}`,
-                `"${deptBreakdownStr}"`
+                item.basePrice.toFixed(2),
+                item.totalEstimatedPrice.toFixed(2)
             ];
         });
 
@@ -340,12 +337,10 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
             '',
             '',
             '',
-            `Total Employees: ${totalSummary.totalEmployees}`,
-            '',
+            `Unique Employees: ${totalSummary.totalEmployees}`,
             `Total Quantity: ${totalSummary.totalQuantity}`,
             '',
-            `Total Estimated Price: ₹${totalSummary.totalPrice.toFixed(2)}`,
-            `Total Items: ${totalSummary.itemCount}`
+            `Total Estimated Price: ${totalSummary.totalPrice.toFixed(2)}`
         ];
 
         const csvContent = [
@@ -355,12 +350,16 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
             summaryRow.join(',')
         ].join('\n');
 
-        // Step 8: Send response
+        // Step 8: Send response with proper UTF-8 encoding
         const filename = `Product_Pricing_${customer.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.csv`;
 
-        res.setHeader('Content-Type', 'text/csv');
+        // Use UTF-8 with BOM for Excel compatibility
+        const bom = '\uFEFF';
+        const csvWithBom = bom + csvContent;
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        res.send(csvContent);
+        res.send(csvWithBom);
 
     } catch (error) {
         console.error('Error exporting product pricing data:', error);
@@ -467,7 +466,7 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
 
                     const product = productMap.get(key);
                     product.employees.add(emp.employeeName);
-                    
+
                     // Get quantity for this employee's department/designation
                     const quantityKey = `${emp.department}_${emp.designation}_${stockItemId}_${variantId}`;
                     const quantity = quantityMap.get(quantityKey) || 1;
@@ -583,6 +582,162 @@ router.get('/organization/:orgId/departments-with-items-variants', async (req, r
         res.status(500).json({
             success: false,
             message: 'Server error while fetching departments with stock items and variants'
+        });
+    }
+});
+
+
+// Add this route in your measurementRoutes.js (before the export route)
+router.get('/organization/:orgId/export-product-pricing/stats', async (req, res) => {
+    try {
+        const { orgId } = req.params;
+
+        // Validate organization ID
+        if (!orgId || !mongoose.Types.ObjectId.isValid(orgId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Valid organization ID is required'
+            });
+        }
+
+        // Step 1: Get all measurements for this organization
+        const measurements = await Measurement.find({
+            organizationId: orgId
+        })
+            .select('employeeMeasurements')
+            .lean();
+
+        if (!measurements || measurements.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'No measurements found for this organization'
+            });
+        }
+
+        // Step 2: Get organization departments
+        const orgDept = await OrganizationDepartment.findOne({
+            customerId: orgId,
+            status: 'active'
+        }).lean();
+
+        if (!orgDept) {
+            return res.status(404).json({
+                success: false,
+                message: 'Organization departments not found'
+            });
+        }
+
+        // Helper function to get assigned quantity (same as in export route)
+        const getAssignedQuantity = (departmentName, designationName, stockItemId, variantId) => {
+            const department = orgDept.departments.find(dept =>
+                dept.status === 'active' && dept.name === departmentName
+            );
+
+            if (!department) return 1;
+
+            const designation = department.designations.find(desig =>
+                desig.status === 'active' && desig.name === designationName
+            );
+
+            if (!designation || !designation.assignedStockItems) return 1;
+
+            const assignedItem = designation.assignedStockItems.find(item => {
+                const stockItemMatches = item.stockItemId.toString() === stockItemId.toString();
+
+                if (variantId) {
+                    return stockItemMatches && (
+                        (item.variantId && item.variantId.toString() === variantId.toString()) ||
+                        !item.variantId
+                    );
+                } else {
+                    return stockItemMatches && !item.variantId;
+                }
+            });
+
+            return assignedItem ? assignedItem.quantity : 1;
+        };
+
+        // Process measurements to calculate stats
+        const productMap = new Map();
+        let totalEmployees = 0;
+        const employeeSet = new Set();
+
+        measurements.forEach(measurement => {
+            measurement.employeeMeasurements.forEach(emp => {
+                // Track unique employees
+                const employeeKey = `${emp.employeeId}_${emp.department}_${emp.designation}`;
+                if (!employeeSet.has(employeeKey)) {
+                    employeeSet.add(employeeKey);
+                    totalEmployees++;
+                }
+
+                emp.stockItems.forEach(stockItem => {
+                    if (!stockItem.stockItemId) return;
+
+                    const stockItemId = stockItem.stockItemId.toString();
+                    const variantId = stockItem.variantId ? stockItem.variantId.toString() : null;
+                    const key = `${stockItemId}_${variantId || 'no-variant'}`;
+
+                    if (!productMap.has(key)) {
+                        productMap.set(key, {
+                            stockItemId: stockItemId,
+                            variantId: variantId,
+                            deptDesignationMap: new Map()
+                        });
+                    }
+
+                    const data = productMap.get(key);
+                    const deptDesigKey = `${emp.department}_${emp.designation}`;
+
+                    if (!data.deptDesignationMap.has(deptDesigKey)) {
+                        data.deptDesignationMap.set(deptDesigKey, {
+                            department: emp.department,
+                            designation: emp.designation,
+                            employeeCount: 0
+                        });
+                    }
+
+                    const deptData = data.deptDesignationMap.get(deptDesigKey);
+                    deptData.employeeCount += 1;
+                });
+            });
+        });
+
+        // Calculate totals
+        let totalProducts = productMap.size;
+        let totalQuantity = 0;
+
+        productMap.forEach(data => {
+            data.deptDesignationMap.forEach(deptData => {
+                const assignedQuantity = getAssignedQuantity(
+                    deptData.department,
+                    deptData.designation,
+                    data.stockItemId,
+                    data.variantId
+                );
+                totalQuantity += deptData.employeeCount * assignedQuantity;
+            });
+        });
+
+        // For demo, we'll use an average price - you might want to fetch actual prices
+        const averagePrice = 500; // Average product price
+        const totalEstimatedPrice = totalQuantity * averagePrice;
+
+        res.status(200).json({
+            success: true,
+            stats: {
+                totalProducts,
+                totalQuantity,
+                totalEstimatedPrice,
+                totalEmployees
+            }
+        });
+
+    } catch (error) {
+        console.error('Error fetching export stats:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while fetching export stats'
         });
     }
 });
@@ -899,7 +1054,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             let variantPrice = stockItem.baseSalesPrice;
             let finalVariantId = groupData.variantId;
 
-            console.log(`Processing: ${stockItem.name}, variantId: ${groupData.variantId}, variants count: ${stockItem.variants?.length || 0}`);
+            
 
             // Find variant by variantId
             if (groupData.variantId && stockItem.variants && stockItem.variants.length > 0) {
@@ -923,7 +1078,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                     }
                 } else {
                     console.warn(`Variant ${groupData.variantId} not found in stock item ${stockItem.name}`);
-                    
+
                     // If variant not found, use first variant or create default
                     if (stockItem.variants.length > 0) {
                         const firstVariant = stockItem.variants[0];
@@ -965,7 +1120,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
 
                 // Find assigned stock item
                 let assignedItem = null;
-                
+
                 // Try exact match with variantId
                 if (finalVariantId) {
                     assignedItem = designation.assignedStockItems.find(item =>
@@ -973,7 +1128,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                         item.variantId && item.variantId.toString() === finalVariantId.toString()
                     );
                 }
-                
+
                 // Try without variantId
                 if (!assignedItem) {
                     assignedItem = designation.assignedStockItems.find(item =>
@@ -981,7 +1136,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                         (!item.variantId || !item.variantId.toString())
                     );
                 }
-                
+
                 // Try any variant of this stock item
                 if (!assignedItem) {
                     assignedItem = designation.assignedStockItems.find(item =>
@@ -1517,10 +1672,6 @@ router.post('/', async (req, res) => {
 });
 
 
-
-
-// GET single measurement (updated)
-// GET single measurement (updated)
 router.get('/:measurementId', async (req, res) => {
     try {
         const { measurementId } = req.params;
@@ -1533,7 +1684,9 @@ router.get('/:measurementId', async (req, res) => {
             });
         }
 
+        // Use select to explicitly include all necessary fields including remarks
         const measurement = await Measurement.findById(measurementId)
+            .select('organizationId organizationName name description registeredEmployeeIds employeeMeasurements totalRegisteredEmployees measuredEmployees pendingEmployees completionRate totalMeasurements completedMeasurements pendingMeasurements convertedToPO poRequestId poConversionDate convertedBy createdBy updatedBy createdAt updatedAt')
             .populate({
                 path: 'employeeMeasurements.stockItems.stockItemId',
                 select: 'name reference category measurements'
@@ -1548,6 +1701,9 @@ router.get('/:measurementId', async (req, res) => {
             });
         }
 
+        
+
+        // Rest of your existing code...
         // Calculate additional statistics for frontend
         const totalEmployees = await EmployeeMpc.countDocuments({
             customerId: measurement.organizationId,
@@ -1630,10 +1786,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
         const { measurementId } = req.params;
         const { measurementData, newEmployeeIds, updatedRegisteredEmployeeIds } = req.body;
 
-        console.log('ADD EMPLOYEES REQUEST:', {
-            newEmployeeCount: newEmployeeIds?.length || 0,
-            measurementDataCount: measurementData?.length || 0
-        });
+       
 
         // Find measurement
         const measurement = await Measurement.findById(measurementId);
@@ -1727,8 +1880,8 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                         isCompleted: isCompleted,
                         completedAt: isCompleted ? new Date() : null
                     });
+
                     
-                    console.log(`Added employee ${newEmployeeData.employeeName} with remarks: "${newEmployeeData.remarks}"`);
                 } else {
                     console.log(`Employee ${employeeId} already exists in measurement, skipping...`);
                 }
@@ -1841,7 +1994,7 @@ router.put('/:measurementId', async (req, res) => {
             // Update employee measurements
             measurement.employeeMeasurements = measurement.employeeMeasurements.map(emp => {
                 const employeeId = emp.employeeId.toString();
-                
+
                 // Get remarks from incoming data if available
                 const incomingEmployeeData = incomingEmployeeDataMap.get(employeeId);
                 const employeeRemarks = incomingEmployeeData ? incomingEmployeeData.remarks : emp.remarks;
@@ -1970,7 +2123,124 @@ router.delete('/:measurementId', async (req, res) => {
     }
 });
 
-// Export measurement to CSV (updated)
+// In your measurementRoutes.js, update the export route and add new grouped export route
+
+// Add this route for grouped CSV export
+router.get('/:measurementId/export-grouped', async (req, res) => {
+    try {
+        const { measurementId } = req.params;
+
+        const measurement = await Measurement.findById(measurementId)
+            .populate({
+                path: 'employeeMeasurements.stockItems.stockItemId',
+                select: 'name reference'
+            })
+            .lean();
+
+        if (!measurement) {
+            return res.status(404).json({
+                success: false,
+                message: 'Measurement not found'
+            });
+        }
+
+        // Group measurements by stock item
+        const stockItemMap = new Map();
+
+        measurement.employeeMeasurements.forEach(emp => {
+            emp.stockItems.forEach(stockItem => {
+                const key = stockItem.stockItemId?._id?.toString() || stockItem.stockItemName;
+                if (!stockItemMap.has(key)) {
+                    stockItemMap.set(key, {
+                        stockItemName: stockItem.stockItemName,
+                        reference: stockItem.stockItemId?.reference || '',
+                        employees: [],
+                        measurements: stockItem.measurements.map(m => ({
+                            name: m.measurementName,
+                            unit: m.unit || ''
+                        }))
+                    });
+                }
+
+                const stockItemData = stockItemMap.get(key);
+
+                // Create employee measurement object
+                const empMeasurement = {
+                    employeeName: emp.employeeName,
+                    employeeUIN: emp.employeeUIN,
+                    department: emp.department,
+                    designation: emp.designation,
+                    remarks: emp.remarks || '',
+                    measurements: {}
+                };
+
+                // Map measurements to object for easy access
+                stockItem.measurements.forEach(m => {
+                    empMeasurement.measurements[m.measurementName] = m.value || '';
+                });
+
+                stockItemData.employees.push(empMeasurement);
+            });
+        });
+
+        // Create CSV content grouped by stock item
+        let csvContent = '';
+
+        // Add BOM for UTF-8 encoding
+        csvContent += '\uFEFF';
+
+        stockItemMap.forEach((stockItemData, stockItemId) => {
+            csvContent += `Stock Item: "${stockItemData.stockItemName}"`;
+            if (stockItemData.reference) {
+                csvContent += ` (Ref: ${stockItemData.reference})`;
+            }
+            csvContent += '\n\n';
+
+            // Headers
+            const headers = ['Employee Name', 'UIN', 'Department', 'Designation', 'Remarks'];
+            stockItemData.measurements.forEach(m => {
+                headers.push(`${m.name}${m.unit ? ` (${m.unit})` : ''}`);
+            });
+            csvContent += headers.join(',') + '\n';
+
+            // Rows
+            stockItemData.employees.forEach(emp => {
+                const row = [
+                    `"${emp.employeeName}"`,
+                    emp.employeeUIN,
+                    emp.department,
+                    emp.designation,
+                    `"${emp.remarks}"`,
+                    ...stockItemData.measurements.map(m => emp.measurements[m.name] || '')
+                ];
+                csvContent += row.join(',') + '\n';
+            });
+
+            csvContent += '\n\n';
+        });
+
+        // Add summary
+        csvContent += '=== SUMMARY ===\n';
+        csvContent += `Total Employees: ${measurement.employeeMeasurements.length}\n`;
+        csvContent += `Total Stock Items: ${stockItemMap.size}\n`;
+        csvContent += `Generated: ${new Date().toLocaleString()}\n`;
+
+        const filename = `${measurement.name.replace(/\s+/g, '_')}_grouped_measurements.csv`;
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(csvContent);
+
+    } catch (error) {
+        console.error('Error exporting grouped measurement:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while exporting grouped measurement'
+        });
+    }
+});
+
+// Update the existing export route to fix UTF-8 encoding
 router.get('/:measurementId/export', async (req, res) => {
     try {
         const { measurementId } = req.params;
@@ -2007,6 +2277,7 @@ router.get('/:measurementId/export', async (req, res) => {
             'UIN',
             'Department',
             'Designation',
+            'Remarks',
             'Stock Item',
             'Stock Item Reference'
         ].concat(measurementNames.map(name => `${name}`));
@@ -2019,6 +2290,7 @@ router.get('/:measurementId/export', async (req, res) => {
                     emp.employeeUIN,
                     emp.department,
                     emp.designation,
+                    `"${emp.remarks || ''}"`,
                     `"${stockItem.stockItemName}"`,
                     stockItem.stockItemId?.reference || ''
                 ];
@@ -2034,11 +2306,12 @@ router.get('/:measurementId/export', async (req, res) => {
         );
 
         const csvContent = [
+            '\uFEFF', // BOM for UTF-8
             headers.join(','),
             ...rows.map(row => row.join(','))
         ].join('\n');
 
-        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${measurement.name}_${measurementId}.csv"`);
         res.send(csvContent);
 
