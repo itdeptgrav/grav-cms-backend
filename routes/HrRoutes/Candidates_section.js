@@ -3,6 +3,7 @@ const router = express.Router();
 const JobPosting = require("../../models/HR_Models/JobPosting");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const Candidate = require("../../models/HR_Models/Candidates");
+const EmployeeTask = require("../../models/HR_Models/EmployeeTask");
 
 // ✅ GET candidates for a job posting
 router.get("/:jobId", EmployeeAuthMiddleware, async (req, res) => {
@@ -141,14 +142,15 @@ router.post("/:jobId/candidates", EmployeeAuthMiddleware, async (req, res) => {
 
 // ✅ UPDATE candidate stage
 router.patch(
-  "/:jobId/candidates/:candidateId/stage",
+  "/:jobPostingId/candidates/:candidateId/stage",
   EmployeeAuthMiddleware,
   async (req, res) => {
     try {
-      const { jobId, candidateId } = req.params;
+      const { candidateId } = req.params;
       const { stage } = req.body;
+      const { user } = req;
 
-      // Validate stage
+      // Validate stage transition
       const validStages = [
         "screening",
         "technical_interview",
@@ -165,40 +167,41 @@ router.patch(
         });
       }
 
-      // Verify job posting exists
-      const jobPosting = await JobPosting.findById(jobId);
-      if (!jobPosting) {
-        return res.status(404).json({
-          success: false,
-          message: "Job posting not found",
-        });
-      }
-
-      // Update candidate stage
-      const updatedCandidate = await Candidate.findByIdAndUpdate(
-        candidateId,
-        { stage },
-        { new: true },
-      );
-
-      if (!updatedCandidate) {
+      const candidate = await Candidate.findById(candidateId);
+      if (!candidate) {
         return res.status(404).json({
           success: false,
           message: "Candidate not found",
         });
       }
 
-      // If candidate is hired, decrement positions open
-      if (stage === "hired" && jobPosting.positionsOpen > 0) {
-        await JobPosting.findByIdAndUpdate(jobId, {
-          $inc: { positionsOpen: -1 },
+      // If moving to hired, check if training is complete
+      if (stage === "hired" && candidate.stage !== "training") {
+        return res.status(400).json({
+          success: false,
+          message: "Candidate must complete training before being hired",
         });
       }
+
+      // Update candidate stage
+      candidate.stage = stage;
+
+      // If rejected, archive the candidate
+      if (stage === "rejected") {
+        candidate.status = "archived";
+      }
+
+      await candidate.save();
+
+      // Log the stage change
+      console.log(
+        `Candidate ${candidate.name} stage changed from ${candidate.stage} to ${stage} by ${user.id}`,
+      );
 
       res.status(200).json({
         success: true,
         message: "Candidate stage updated successfully",
-        data: updatedCandidate,
+        data: candidate,
       });
     } catch (error) {
       console.error("Update candidate stage error:", error);
@@ -508,6 +511,34 @@ router.patch(
       res.status(500).json({
         success: false,
         message: "Error archiving candidate",
+      });
+    }
+  },
+);
+
+router.get(
+  "/:jobPostingId/candidates/:candidateId/interviews",
+  EmployeeAuthMiddleware,
+  async (req, res) => {
+    try {
+      const { candidateId } = req.params;
+
+      const interviews = await EmployeeTask.find({
+        candidateId,
+        type: "interview",
+      })
+        .sort({ scheduledDate: -1 })
+        .lean();
+
+      res.status(200).json({
+        success: true,
+        data: interviews,
+      });
+    } catch (error) {
+      console.error("Get candidate interviews error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Error fetching interviews",
       });
     }
   },

@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
-const bcrypt = require("bcryptjs"); // Add this
+
 require("dotenv").config();
 
 const app = express();
@@ -227,6 +227,10 @@ app.use("/api/employee/auth", employeeLoginRoutes);
 
 const employeeAuthRoutes = require("./routes/Employee_Routes/employeeAuth");
 app.use("/api/employee", employeeAuthRoutes);
+
+const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
+app.use("/api/employee/tasks", TasksEmployee);
+
 /* =====================
     HEALTH CHECK
   ===================== */

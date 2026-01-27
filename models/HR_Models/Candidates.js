@@ -218,5 +218,59 @@ candidateSchema.pre("save", function (next) {
   next();
 });
 
+candidateSchema.methods.addInterviewQuestion = function (questionData) {
+  if (!this.interviewQuestions) {
+    this.interviewQuestions = [];
+  }
+
+  // Remove existing question from same stage by same evaluator
+  this.interviewQuestions = this.interviewQuestions.filter(
+    (q) =>
+      !(
+        q.stage === questionData.stage &&
+        q.evaluatedBy?.employeeId?.toString() ===
+          questionData.evaluatedBy?.employeeId?.toString() &&
+        q.question === questionData.question
+      ),
+  );
+
+  this.interviewQuestions.push(questionData);
+  return this.save();
+};
+
+candidateSchema.methods.calculateOverallRating = function () {
+  const questionsWithRatings =
+    this.interviewQuestions?.filter((q) => q.rating > 0) || [];
+
+  if (questionsWithRatings.length === 0) {
+    this.rating = 0;
+    return 0;
+  }
+
+  const totalRating = questionsWithRatings.reduce(
+    (sum, q) => sum + q.rating,
+    0,
+  );
+  this.rating =
+    Math.round((totalRating / questionsWithRatings.length) * 10) / 10;
+  return this.rating;
+};
+
+candidateSchema.methods.updateStage = function (newStage) {
+  this.stage = newStage;
+
+  // If rejected, archive the candidate
+  if (newStage === "rejected") {
+    this.status = "archived";
+  }
+
+  // If hired, mark as active but completed
+  if (newStage === "hired") {
+    this.status = "active";
+  }
+
+  return this.save();
+};
+
 const Candidate = mongoose.model("Candidate", candidateSchema);
 module.exports = Candidate;

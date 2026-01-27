@@ -1,6 +1,6 @@
 const jwt = require("jsonwebtoken");
 
-const EmployeeAuthMiddleware = (req, res, next) => {
+const AllEmployeeAppMiddleware = (req, res, next) => {
   try {
     const token = req.cookies?.employee_token;
 
@@ -28,4 +28,4 @@ const EmployeeAuthMiddleware = (req, res, next) => {
   }
 };
 
-module.exports = EmployeeAuthMiddleware;
+module.exports = AllEmployeeAppMiddleware;

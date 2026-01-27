@@ -401,4 +401,96 @@ router.get("/upcoming/tasks", EmployeeAuthMiddleware, async (req, res) => {
   }
 });
 
+router.patch("/:taskId/complete", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { outcome, outcomeNotes, candidateRating } = req.body;
+    const { user } = req;
+
+    const task = await EmployeeTask.findById(taskId).populate(
+      "jobPostingId",
+      "technicalRole",
+    );
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        message: "Task not found",
+      });
+    }
+
+    // Update task status
+    task.status = "completed";
+    task.completedAt = new Date();
+    task.outcome = outcome || "pending";
+    task.outcomeNotes = outcomeNotes || "";
+
+    // Get HR user info
+    const hrUser = await HRDepartment.findById(user.id).select("name").lean();
+    const userName = hrUser?.name || "HR Manager";
+
+    // Update candidate stage based on interview completion
+    const candidate = await Candidate.findById(task.candidateId);
+    if (candidate) {
+      const currentStage = task.interviewStage;
+      const isTechnicalRole = task.jobPostingId?.technicalRole || false;
+
+      let nextStage = null;
+
+      if (currentStage === "screening") {
+        nextStage = isTechnicalRole ? "technical_interview" : "hr_interview";
+      } else if (currentStage === "technical_interview") {
+        nextStage = "hr_interview";
+      } else if (currentStage === "hr_interview") {
+        nextStage = "training";
+      }
+
+      if (nextStage && outcome === "positive") {
+        candidate.stage = nextStage;
+        console.log(`Candidate ${candidate.name} moved to ${nextStage} stage`);
+      } else if (outcome === "negative") {
+        candidate.stage = "rejected";
+        candidate.status = "archived";
+      }
+
+      // Update candidate rating if provided
+      if (candidateRating) {
+        // Add interview question rating
+        const question = {
+          question: `Interview feedback for ${currentStage}`,
+          rating: candidateRating,
+          notes: outcomeNotes,
+          stage: currentStage,
+          evaluatedBy: {
+            name: userName,
+            employeeId: user.id,
+          },
+          evaluatedAt: new Date(),
+        };
+
+        if (!candidate.interviewQuestions) {
+          candidate.interviewQuestions = [];
+        }
+        candidate.interviewQuestions.push(question);
+      }
+
+      await candidate.save();
+    }
+
+    await task.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Interview completed successfully",
+      data: task,
+    });
+  } catch (error) {
+    console.error("Complete interview error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error completing interview",
+    });
+  }
+});
+
 module.exports = router;

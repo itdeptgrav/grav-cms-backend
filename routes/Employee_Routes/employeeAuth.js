@@ -4,10 +4,10 @@ const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
-const EmployeeAuthMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
+const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
 
 // Get employee profile
-router.get("/profile", EmployeeAuthMiddleware, async (req, res) => {
+router.get("/profile", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const employee = await Employee.findById(req.user.id)
       .select("-password -temporaryPassword -__v")
@@ -41,7 +41,7 @@ router.get("/profile", EmployeeAuthMiddleware, async (req, res) => {
 });
 
 // Update employee profile (self-update)
-router.put("/profile", EmployeeAuthMiddleware, async (req, res) => {
+router.put("/profile", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const { user } = req;
     const updateData = req.body;
@@ -97,7 +97,7 @@ router.put("/profile", EmployeeAuthMiddleware, async (req, res) => {
 });
 
 // Change password
-router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
+router.put("/change-password", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const { user } = req;
     const { currentPassword, newPassword } = req.body;
@@ -162,7 +162,7 @@ router.put("/change-password", EmployeeAuthMiddleware, async (req, res) => {
 });
 
 // Get dashboard statistics
-router.get("/dashboard", EmployeeAuthMiddleware, async (req, res) => {
+router.get("/dashboard", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const { user } = req;
 

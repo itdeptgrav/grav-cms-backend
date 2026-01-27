@@ -199,5 +199,29 @@ employeeTaskSchema.virtual("isUpcoming").get(function () {
   return scheduled > now && scheduled < new Date(now.getTime() + oneDay);
 });
 
+employeeTaskSchema.virtual("nextStage").get(function () {
+  const currentStage = this.interviewStage;
+  const isTechnicalRole = this.jobPostingId?.technicalRole || false;
+
+  // CORRECTED WORKFLOW:
+  // Screening → Technical/HR → Training → Hired
+  if (currentStage === "screening") {
+    return isTechnicalRole ? "technical_interview" : "hr_interview";
+  } else if (
+    currentStage === "technical_interview" ||
+    currentStage === "hr_interview"
+  ) {
+    return "training";
+  } else if (currentStage === "training") {
+    return "hired";
+  } else if (currentStage === "hired") {
+    return null;
+  } else if (currentStage === "rejected") {
+    return null;
+  }
+
+  return null;
+});
+
 const EmployeeTask = mongoose.model("EmployeeTask", employeeTaskSchema);
 module.exports = EmployeeTask;
