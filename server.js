@@ -221,6 +221,9 @@ app.use("/api/hr/candidates", CandidatesRouter);
 const employeeTasksRouter = require("./routes/HrRoutes/EmployeeTasks_section");
 app.use("/api/hr/tasks", employeeTasksRouter);
 
+const vendorDetailsRoutes = require("./routes/Vendor_Routes/vendorRoutes");
+app.use("/api/hr/vendors", vendorDetailsRoutes);
+
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
@@ -230,6 +233,10 @@ app.use("/api/employee", employeeAuthRoutes);
 
 const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
 app.use("/api/employee/tasks", TasksEmployee);
+
+// Vendor Routes For Vendor Portal
+const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes"); // NEW FILE
+app.use("/api/vendor", vendorAuthRoutes);
 
 /* =====================
     HEALTH CHECK
