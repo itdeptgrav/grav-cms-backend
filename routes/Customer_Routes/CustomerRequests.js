@@ -12,7 +12,7 @@ const CustomerEmailService = require('../../services/CustomerEmailService');
 const verifyCustomerToken = async (req, res, next) => {
   try {
     const token = req.cookies.customerToken;
-    
+
     if (!token) {
       return res.status(401).json({
         success: false,
@@ -58,7 +58,7 @@ router.post('/', verifyCustomerToken, async (req, res) => {
     const validatedItems = [];
     for (const item of items) {
       const stockItem = await StockItem.findById(item.stockItemId);
-      
+
       if (!stockItem) {
         return res.status(400).json({
           success: false,
@@ -136,8 +136,9 @@ router.post('/', verifyCustomerToken, async (req, res) => {
         }
 
         // Calculate estimated price for this variant
-        let variantPrice = stockItem.salesPrice * variant.quantity;
-        
+        let variantPrice = stockItem.baseSalesPrice * variant.quantity;
+        let variantId = null;
+
         // Check if there's a matching variant with different price
         if (variant.attributes && stockItem.variants.length > 0) {
           const matchingVariant = stockItem.variants.find(sv =>
@@ -148,12 +149,14 @@ router.post('/', verifyCustomerToken, async (req, res) => {
             )
           );
 
-          if (matchingVariant && matchingVariant.salesPrice) {
+          if (matchingVariant) {
             variantPrice = matchingVariant.salesPrice * variant.quantity;
+            variantId = matchingVariant._id;
           }
         }
 
         validatedVariants.push({
+          variantId: variantId,
           attributes: variant.attributes || [],
           quantity: variant.quantity,
           specialInstructions: variant.specialInstructions?.filter(inst => inst.trim()) || [],
@@ -241,7 +244,7 @@ router.post('/', verifyCustomerToken, async (req, res) => {
 
   } catch (error) {
     console.error('Create request error:', error);
-    
+
     if (error.name === 'ValidationError') {
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({
@@ -266,7 +269,7 @@ router.post('/', verifyCustomerToken, async (req, res) => {
 router.get('/', verifyCustomerToken, async (req, res) => {
   try {
     const customerId = req.customerId;
-    
+
     const requests = await Request.find({ customerId })
       .sort({ createdAt: -1 })
       .select('-__v -updatedAt')
@@ -275,20 +278,20 @@ router.get('/', verifyCustomerToken, async (req, res) => {
     // Process each request to check for pending edit approvals
     const processedRequests = requests.map(request => {
       // Check for pending edit approvals
-      const pendingEditApprovals = request.editRequests ? 
-        request.editRequests.filter(editReq => 
+      const pendingEditApprovals = request.editRequests ?
+        request.editRequests.filter(editReq =>
           editReq.status === 'pending_approval'
         ).length : 0;
-      
+
       // Check if there's a pending edit request that needs customer approval
       const hasPendingCustomerApproval = request.editRequests ?
-        request.editRequests.some(editReq => 
+        request.editRequests.some(editReq =>
           editReq.status === 'pending_approval'
         ) : false;
-      
+
       // Get the latest edit request for quick access
       const latestEditRequest = request.editRequests && request.editRequests.length > 0 ?
-        request.editRequests.sort((a, b) => 
+        request.editRequests.sort((a, b) =>
           new Date(b.requestedAt || b.createdAt) - new Date(a.requestedAt || a.createdAt)
         )[0] : null;
 
@@ -328,9 +331,9 @@ router.get('/:requestId', verifyCustomerToken, async (req, res) => {
     const { requestId } = req.params;
     const customerId = req.customerId;
 
-    const request = await Request.findOne({ 
-      _id: requestId, 
-      customerId 
+    const request = await Request.findOne({
+      _id: requestId,
+      customerId
     }).select('-__v -updatedAt');
 
     if (!request) {
@@ -363,9 +366,9 @@ router.put('/:requestId', verifyCustomerToken, async (req, res) => {
     const updateData = req.body;
 
     // Find request
-    const request = await Request.findOne({ 
-      _id: requestId, 
-      customerId 
+    const request = await Request.findOne({
+      _id: requestId,
+      customerId
     });
 
     if (!request) {
@@ -388,7 +391,7 @@ router.put('/:requestId', verifyCustomerToken, async (req, res) => {
       ...request.customerInfo,
       ...updateData.customerInfo
     };
-    
+
     request.clothCategories = updateData.clothCategories || request.clothCategories;
     request.updatedAt = new Date();
 
@@ -402,7 +405,7 @@ router.put('/:requestId', verifyCustomerToken, async (req, res) => {
 
   } catch (error) {
     console.error('Update request error:', error);
-    
+
     if (error.name === 'ValidationError') {
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({
@@ -425,9 +428,9 @@ router.patch('/:requestId/cancel', verifyCustomerToken, async (req, res) => {
     const { requestId } = req.params;
     const customerId = req.customerId;
 
-    const request = await Request.findOne({ 
-      _id: requestId, 
-      customerId 
+    const request = await Request.findOne({
+      _id: requestId,
+      customerId
     });
 
     if (!request) {
@@ -469,295 +472,373 @@ router.patch('/:requestId/cancel', verifyCustomerToken, async (req, res) => {
 
 // CREATE edit request
 router.post("/:requestId/edit-request", async (req, res) => {
-    try {
-        const { requestId } = req.params;
-        const { customerInfo, reason, changes } = req.body;
+  try {
+    const { requestId } = req.params;
+    const { customerInfo, reason, changes } = req.body;
 
-        if (!reason || !reason.trim()) {
-            return res.status(400).json({
-                success: false,
-                message: "Reason for edit is required"
-            });
-        }
-
-        if (!changes || !Array.isArray(changes) || changes.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: "No changes specified"
-            });
-        }
-
-        const request = await CustomerRequest.findById(requestId);
-        
-        if (!request) {
-            return res.status(404).json({
-                success: false,
-                message: "Request not found"
-            });
-        }
-
-        // Check if request can be edited
-        if (request.status === 'completed' || request.status === 'cancelled') {
-            return res.status(400).json({
-                success: false,
-                message: "Cannot edit completed or cancelled requests"
-            });
-        }
-
-        // Check if there's already a pending edit request
-        const hasPendingEdit = request.editRequests.some(edit => 
-            edit.status === 'pending_approval'
-        );
-
-        if (hasPendingEdit) {
-            return res.status(400).json({
-                success: false,
-                message: "There is already a pending edit request for this order"
-            });
-        }
-
-        // Generate edit request ID
-        const editRequestCount = await CustomerRequest.countDocuments({
-            'editRequests.requestId': { $exists: true }
-        });
-        const editRequestId = `EDIT-${request.requestId}-${editRequestCount + 1}`;
-
-        // Create edit request
-        const editRequest = {
-            requestId: editRequestId,
-            requestedBy: req.user.id,
-            requestedAt: new Date(),
-            customerInfo: {
-                name: customerInfo.name || request.customerInfo.name,
-                email: customerInfo.email || request.customerInfo.email,
-                phone: customerInfo.phone || request.customerInfo.phone,
-                address: customerInfo.address || request.customerInfo.address,
-                city: customerInfo.city || request.customerInfo.city,
-                postalCode: customerInfo.postalCode || request.customerInfo.postalCode,
-                description: customerInfo.description || request.customerInfo.description,
-                deliveryDeadline: customerInfo.deliveryDeadline || request.customerInfo.deliveryDeadline,
-                preferredContactMethod: customerInfo.preferredContactMethod || request.customerInfo.preferredContactMethod
-            },
-            changes: changes,
-            reason: reason.trim(),
-            status: 'pending_approval'
-        };
-
-        // Add to edit requests array
-        request.editRequests.unshift(editRequest);
-        
-        // Update main request status
-        request.status = 'pending_edit_approval';
-        request.pendingEditRequest = editRequest._id;
-        request.updatedAt = new Date();
-
-        // Add note about edit request
-        request.notes.push({
-            text: `Edit request created: ${reason}`,
-            addedBy: req.user.id,
-            addedByModel: 'SalesDepartment',
-            createdAt: new Date()
-        });
-
-        await request.save();
-
-        // TODO: Send notification/email to customer about edit request
-
-        res.json({
-            success: true,
-            message: "Edit request sent to customer for approval",
-            editRequest: editRequest,
-            request: request
-        });
-
-    } catch (error) {
-        console.error("Error creating edit request:", error);
-        res.status(500).json({
-            success: false,
-            message: "Server error while creating edit request"
-        });
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Reason for edit is required"
+      });
     }
+
+    if (!changes || !Array.isArray(changes) || changes.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No changes specified"
+      });
+    }
+
+    const request = await CustomerRequest.findById(requestId);
+
+    if (!request) {
+      return res.status(404).json({
+        success: false,
+        message: "Request not found"
+      });
+    }
+
+    // Check if request can be edited
+    if (request.status === 'completed' || request.status === 'cancelled') {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot edit completed or cancelled requests"
+      });
+    }
+
+    // Check if there's already a pending edit request
+    const hasPendingEdit = request.editRequests.some(edit =>
+      edit.status === 'pending_approval'
+    );
+
+    if (hasPendingEdit) {
+      return res.status(400).json({
+        success: false,
+        message: "There is already a pending edit request for this order"
+      });
+    }
+
+    // Generate edit request ID
+    const editRequestCount = await CustomerRequest.countDocuments({
+      'editRequests.requestId': { $exists: true }
+    });
+    const editRequestId = `EDIT-${request.requestId}-${editRequestCount + 1}`;
+
+    // Create edit request
+    const editRequest = {
+      requestId: editRequestId,
+      requestedBy: req.user.id,
+      requestedAt: new Date(),
+      customerInfo: {
+        name: customerInfo.name || request.customerInfo.name,
+        email: customerInfo.email || request.customerInfo.email,
+        phone: customerInfo.phone || request.customerInfo.phone,
+        address: customerInfo.address || request.customerInfo.address,
+        city: customerInfo.city || request.customerInfo.city,
+        postalCode: customerInfo.postalCode || request.customerInfo.postalCode,
+        description: customerInfo.description || request.customerInfo.description,
+        deliveryDeadline: customerInfo.deliveryDeadline || request.customerInfo.deliveryDeadline,
+        preferredContactMethod: customerInfo.preferredContactMethod || request.customerInfo.preferredContactMethod
+      },
+      changes: changes,
+      reason: reason.trim(),
+      status: 'pending_approval'
+    };
+
+    // Add to edit requests array
+    request.editRequests.unshift(editRequest);
+
+    // Update main request status
+    request.status = 'pending_edit_approval';
+    request.pendingEditRequest = editRequest._id;
+    request.updatedAt = new Date();
+
+    // Add note about edit request
+    request.notes.push({
+      text: `Edit request created: ${reason}`,
+      addedBy: req.user.id,
+      addedByModel: 'SalesDepartment',
+      createdAt: new Date()
+    });
+
+    await request.save();
+
+    // TODO: Send notification/email to customer about edit request
+
+    res.json({
+      success: true,
+      message: "Edit request sent to customer for approval",
+      editRequest: editRequest,
+      request: request
+    });
+
+  } catch (error) {
+    console.error("Error creating edit request:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while creating edit request"
+    });
+  }
 });
 
 // GET edit requests for a request
 router.get("/:requestId/edit-requests", async (req, res) => {
-    try {
-        const { requestId } = req.params;
+  try {
+    const { requestId } = req.params;
 
-        const request = await CustomerRequest.findById(requestId)
-            .select('editRequests')
-            .populate('editRequests.requestedBy', 'name email')
-            .populate('editRequests.reviewedBy', 'name email');
+    const request = await CustomerRequest.findById(requestId)
+      .select('editRequests')
+      .populate('editRequests.requestedBy', 'name email')
+      .populate('editRequests.reviewedBy', 'name email');
 
-        if (!request) {
-            return res.status(404).json({
-                success: false,
-                message: "Request not found"
-            });
-        }
-
-        res.json({
-            success: true,
-            editRequests: request.editRequests || []
-        });
-
-    } catch (error) {
-        console.error("Error fetching edit requests:", error);
-        res.status(500).json({
-            success: false,
-            message: "Server error while fetching edit requests"
-        });
+    if (!request) {
+      return res.status(404).json({
+        success: false,
+        message: "Request not found"
+      });
     }
+
+    res.json({
+      success: true,
+      editRequests: request.editRequests || []
+    });
+
+  } catch (error) {
+    console.error("Error fetching edit requests:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching edit requests"
+    });
+  }
 });
 
 // APPROVE edit request (sales side)
 router.post("/:requestId/approve-edit", async (req, res) => {
-    try {
-        const { requestId } = req.params;
-        const { action } = req.body; // "approve_and_proceed"
+  try {
+    const { requestId } = req.params;
+    const { action } = req.body; // "approve_and_proceed"
 
-        const request = await CustomerRequest.findById(requestId);
-        
-        if (!request) {
-            return res.status(404).json({
-                success: false,
-                message: "Request not found"
-            });
-        }
+    const request = await CustomerRequest.findById(requestId);
 
-        // Check if there's a pending edit request
-        const pendingEditIndex = request.editRequests.findIndex(edit => 
-            edit.status === 'pending_approval'
-        );
-
-        if (pendingEditIndex === -1) {
-            return res.status(400).json({
-                success: false,
-                message: "No pending edit request found"
-            });
-        }
-
-        const pendingEdit = request.editRequests[pendingEditIndex];
-
-        // Only allow if status is pending_edit_approval
-        if (request.status !== 'pending_edit_approval') {
-            return res.status(400).json({
-                success: false,
-                message: "Request is not in edit approval status"
-            });
-        }
-
-        // Update edit request status
-        request.editRequests[pendingEditIndex].status = 'approved';
-        request.editRequests[pendingEditIndex].reviewedBy = req.user.id;
-        request.editRequests[pendingEditIndex].reviewedAt = new Date();
-        request.editRequests[pendingEditIndex].reviewNotes = 'Approved by sales team';
-
-        // Apply changes to main request
-        if (action === 'approve_and_proceed') {
-            // Update customer info with edited values
-            request.customerInfo = pendingEdit.customerInfo;
-            
-            // Update request status based on action
-            request.status = 'in_progress';
-            request.pendingEditRequest = null;
-            
-            // Add note about approval
-            request.notes.push({
-                text: `Edit request approved and applied. Request moved to In Progress.`,
-                addedBy: req.user.id,
-                addedByModel: 'SalesDepartment',
-                createdAt: new Date()
-            });
-        }
-
-        request.updatedAt = new Date();
-        await request.save();
-
-        res.json({
-            success: true,
-            message: "Edit request approved successfully",
-            request: request
-        });
-
-    } catch (error) {
-        console.error("Error approving edit request:", error);
-        res.status(500).json({
-            success: false,
-            message: "Server error while approving edit request"
-        });
+    if (!request) {
+      return res.status(404).json({
+        success: false,
+        message: "Request not found"
+      });
     }
+
+    // Check if there's a pending edit request
+    const pendingEditIndex = request.editRequests.findIndex(edit =>
+      edit.status === 'pending_approval'
+    );
+
+    if (pendingEditIndex === -1) {
+      return res.status(400).json({
+        success: false,
+        message: "No pending edit request found"
+      });
+    }
+
+    const pendingEdit = request.editRequests[pendingEditIndex];
+
+    // Only allow if status is pending_edit_approval
+    if (request.status !== 'pending_edit_approval') {
+      return res.status(400).json({
+        success: false,
+        message: "Request is not in edit approval status"
+      });
+    }
+
+    // Update edit request status
+    request.editRequests[pendingEditIndex].status = 'approved';
+    request.editRequests[pendingEditIndex].reviewedBy = req.user.id;
+    request.editRequests[pendingEditIndex].reviewedAt = new Date();
+    request.editRequests[pendingEditIndex].reviewNotes = 'Approved by sales team';
+
+    // Apply changes to main request
+    if (action === 'approve_and_proceed') {
+      // Update customer info with edited values
+      request.customerInfo = pendingEdit.customerInfo;
+
+      // Update request status based on action
+      request.status = 'in_progress';
+      request.pendingEditRequest = null;
+
+      // Add note about approval
+      request.notes.push({
+        text: `Edit request approved and applied. Request moved to In Progress.`,
+        addedBy: req.user.id,
+        addedByModel: 'SalesDepartment',
+        createdAt: new Date()
+      });
+    }
+
+    request.updatedAt = new Date();
+    await request.save();
+
+    res.json({
+      success: true,
+      message: "Edit request approved successfully",
+      request: request
+    });
+
+  } catch (error) {
+    console.error("Error approving edit request:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while approving edit request"
+    });
+  }
 });
 
 // REJECT edit request (sales side)
 router.post("/:requestId/reject-edit", async (req, res) => {
-    try {
-        const { requestId } = req.params;
-        const { reason } = req.body;
+  try {
+    const { requestId } = req.params;
+    const { reason } = req.body;
 
-        const request = await CustomerRequest.findById(requestId);
-        
-        if (!request) {
-            return res.status(404).json({
-                success: false,
-                message: "Request not found"
-            });
-        }
+    const request = await CustomerRequest.findById(requestId);
 
-        // Check if there's a pending edit request
-        const pendingEditIndex = request.editRequests.findIndex(edit => 
-            edit.status === 'pending_approval'
-        );
-
-        if (pendingEditIndex === -1) {
-            return res.status(400).json({
-                success: false,
-                message: "No pending edit request found"
-            });
-        }
-
-        // Only allow if status is pending_edit_approval
-        if (request.status !== 'pending_edit_approval') {
-            return res.status(400).json({
-                success: false,
-                message: "Request is not in edit approval status"
-            });
-        }
-
-        // Update edit request status
-        request.editRequests[pendingEditIndex].status = 'rejected';
-        request.editRequests[pendingEditIndex].reviewedBy = req.user.id;
-        request.editRequests[pendingEditIndex].reviewedAt = new Date();
-        request.editRequests[pendingEditIndex].reviewNotes = reason || 'Rejected by sales team';
-
-        // Revert to original status (pending)
-        request.status = 'pending';
-        request.pendingEditRequest = null;
-        
-        // Add note about rejection
-        request.notes.push({
-            text: `Edit request rejected. Reason: ${reason || 'No reason provided'}`,
-            addedBy: req.user.id,
-            addedByModel: 'SalesDepartment',
-            createdAt: new Date()
-        });
-
-        request.updatedAt = new Date();
-        await request.save();
-
-        res.json({
-            success: true,
-            message: "Edit request rejected successfully",
-            request: request
-        });
-
-    } catch (error) {
-        console.error("Error rejecting edit request:", error);
-        res.status(500).json({
-            success: false,
-            message: "Server error while rejecting edit request"
-        });
+    if (!request) {
+      return res.status(404).json({
+        success: false,
+        message: "Request not found"
+      });
     }
+
+    // Check if there's a pending edit request
+    const pendingEditIndex = request.editRequests.findIndex(edit =>
+      edit.status === 'pending_approval'
+    );
+
+    if (pendingEditIndex === -1) {
+      return res.status(400).json({
+        success: false,
+        message: "No pending edit request found"
+      });
+    }
+
+    // Only allow if status is pending_edit_approval
+    if (request.status !== 'pending_edit_approval') {
+      return res.status(400).json({
+        success: false,
+        message: "Request is not in edit approval status"
+      });
+    }
+
+    // Update edit request status
+    request.editRequests[pendingEditIndex].status = 'rejected';
+    request.editRequests[pendingEditIndex].reviewedBy = req.user.id;
+    request.editRequests[pendingEditIndex].reviewedAt = new Date();
+    request.editRequests[pendingEditIndex].reviewNotes = reason || 'Rejected by sales team';
+
+    // Revert to original status (pending)
+    request.status = 'pending';
+    request.pendingEditRequest = null;
+
+    // Add note about rejection
+    request.notes.push({
+      text: `Edit request rejected. Reason: ${reason || 'No reason provided'}`,
+      addedBy: req.user.id,
+      addedByModel: 'SalesDepartment',
+      createdAt: new Date()
+    });
+
+    request.updatedAt = new Date();
+    await request.save();
+
+    res.json({
+      success: true,
+      message: "Edit request rejected successfully",
+      request: request
+    });
+
+  } catch (error) {
+    console.error("Error rejecting edit request:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while rejecting edit request"
+    });
+  }
+});
+
+
+router.get('/stock-items/available-items', verifyCustomerToken, async (req, res) => {
+  try {
+    const { search = '', category = '' } = req.query;
+
+    let query = {
+      status: 'In Stock'
+    };
+
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { reference: { $regex: search, $options: 'i' } },
+        { category: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    if (category) {
+      query.category = category;
+    }
+
+    const stockItems = await StockItem.find(query)
+      .select('_id name reference category baseSalesPrice salesPrice images attributes variants')
+      .limit(50)
+      .lean();
+
+    // Process stock items for frontend
+    const processedItems = stockItems.map(item => {
+      // Get all categories from attributes
+      const categories = item.attributes?.map(attr => attr.name) || [];
+
+      // Get unique attribute values
+      const attributeData = item.attributes?.map(attr => ({
+        name: attr.name,
+        values: attr.values || []
+      })) || [];
+
+      // Process variants
+      const variants = item.variants?.map(variant => ({
+        _id: variant._id,
+        attributes: variant.attributes || [],
+        salesPrice: variant.salesPrice,
+        quantityOnHand: variant.quantityOnHand || 0,
+        images: variant.images || []
+      })) || [];
+
+      return {
+        _id: item._id,
+        id: item._id, // Add id field for frontend compatibility
+        name: item.name,
+        reference: item.reference,
+        category: item.category,
+        baseSalesPrice: item.baseSalesPrice || item.salesPrice || 0,
+        images: item.images || [],
+        attributes: attributeData,
+        variants: variants,
+        hasVariants: variants.length > 0
+      };
+    });
+
+    // Get unique categories
+    const uniqueCategories = [...new Set(processedItems.map(item => item.category).filter(Boolean))];
+
+    res.status(200).json({
+      success: true,
+      items: processedItems,
+      categories: uniqueCategories
+    });
+
+  } catch (error) {
+    console.error('Error fetching available items:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while fetching available items'
+    });
+  }
 });
 
 

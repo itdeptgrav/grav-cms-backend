@@ -7,6 +7,8 @@ const bcrypt = require("bcryptjs");
 const HRDepartment = require("../models/HRDepartment");
 const ProjectManager = require("../models/ProjectManager");
 const SalesDepartment = require("../models/SalesDepartment"); // Add this
+const MpcMeasurement = require("../models/MpcMeasurement");
+
 
 router.post("/login", async (req, res) => {
   try {
@@ -24,22 +26,28 @@ router.post("/login", async (req, res) => {
 
     // Check in all departments
     // 1. HR Department
+    // Check in all departments
     user = await HRDepartment.findOne({ email: email.toLowerCase() });
     if (user) {
       userModel = "hr";
     } else {
-      // 2. Project Manager
       user = await ProjectManager.findOne({ email: email.toLowerCase() });
       if (user) {
         userModel = "project_manager";
       } else {
-        // 3. Sales Department
         user = await SalesDepartment.findOne({ email: email.toLowerCase() });
         if (user) {
           userModel = "sales";
+        } else {
+          // ✅ MPC Measurement
+          user = await MpcMeasurement.findOne({ email: email.toLowerCase() });
+          if (user) {
+            userModel = "mpc-measurement";
+          }
         }
       }
     }
+
 
     // If user not found in any collection
     if (!user || !user.isActive) {
@@ -84,6 +92,9 @@ router.post("/login", async (req, res) => {
     if (user.role === "hr_manager") redirectPath = "/hr/dashboard";
     if (user.role === "project_manager") redirectPath = "/project-manager/dashboard";
     if (user.role === "sales") redirectPath = "/sales/dashboard";
+    if (user.role === "mpc-measurement")
+      redirectPath = "/mpc-measurement/dashboard";
+
 
     res.status(200).json({
       success: true,
@@ -134,6 +145,9 @@ router.post("/verify", async (req, res) => {
         break;
       case "sales":
         user = await SalesDepartment.findById(decoded.id).select("-password");
+        break;
+      case "mpc-measurement":
+        user = await MpcMeasurement.findById(decoded.id).select("-password");
         break;
       default: // "hr" or undefined
         user = await HRDepartment.findById(decoded.id).select("-password");

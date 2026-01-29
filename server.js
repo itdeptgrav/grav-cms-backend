@@ -2,8 +2,14 @@ const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
+<<<<<<< HEAD
 
+=======
+const bcrypt = require("bcryptjs"); 
+>>>>>>> origin/main
 require("dotenv").config();
+
+
 
 const app = express();
 
@@ -39,7 +45,11 @@ const connectDB = async () => {
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
     );
     console.log("✅ MongoDB connected successfully");
+<<<<<<< HEAD
     createDefaultHR();
+=======
+
+>>>>>>> origin/main
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -48,19 +58,60 @@ const connectDB = async () => {
 
 connectDB();
 
-const HRDepartment = require("./models/HRDepartment");
+//changes
 
-const createDefaultHR = async () => {
+
+const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
+
+const CATEGORY_MEASUREMENTS = {
+  Shirts: [
+    "Length",
+    "Chest",
+    "Stomach",
+    "Button Hem",
+    "Shoulder",
+    "Sleeve Length",
+    "Cuff",
+    "Coller",
+  ],
+  Outerwear: [
+    "Length",
+    "Chest",
+    "Stomach",
+    "Button Hem",
+    "Shoulder",
+  ],
+  Bottoms: [
+    "Length",
+    "Waist",
+    "Sheet",
+    "Thigh",
+    "Knee",
+    "Buttom",
+    "Crouch Kista Cut",
+  ],
+};
+
+const overwriteExistingMeasurements = async () => {
   try {
+<<<<<<< HEAD
     const existingHR = await HRDepartment.findOne({
       role: "hr_manager",
       department: "Human Resources",
     });
+=======
+    for (const [category, measurements] of Object.entries(CATEGORY_MEASUREMENTS)) {
+      const result = await StockItem.updateMany(
+        { category },
+        { $set: { measurements } }
+      );
+>>>>>>> origin/main
 
-    if (existingHR) {
-      console.log("ℹ️ HR Department already exists");
-      return;
+      console.log(
+        `✅ ${category}: ${result.modifiedCount} documents updated`
+      );
     }
+<<<<<<< HEAD
 
     const defaultHR = new HRDepartment({
       name: "HR Admin",
@@ -76,11 +127,24 @@ const createDefaultHR = async () => {
     await defaultHR.save();
 
     console.log("✅ Default HR Department created successfully");
+=======
+>>>>>>> origin/main
   } catch (error) {
-    console.error("❌ Error creating default HR:", error.message);
+    console.error("❌ Measurement overwrite failed:", error.message);
   }
 };
 
+<<<<<<< HEAD
+=======
+
+
+
+
+
+
+
+
+>>>>>>> origin/main
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -120,9 +184,15 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
+<<<<<<< HEAD
 /* =====================
     CMS ROUTES
   ===================== */
+=======
+/* ===================
+  CMS ROUTES
+===================== */
+>>>>>>> origin/main
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);

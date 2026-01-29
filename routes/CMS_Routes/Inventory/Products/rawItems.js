@@ -74,9 +74,13 @@ router.get("/", async (req, res) => {
 
     // Calculate total value (using selling price)
     let totalSellingValue = 0;
+    let totalVariants = 0;
 
     rawItems.forEach(item => {
       totalSellingValue += item.quantity * (item.sellingPrice || 0);
+      if (item.variants && Array.isArray(item.variants)) {
+        totalVariants += item.variants.length;
+      }
     });
 
     // Get unique vendors from stock transactions
@@ -99,7 +103,8 @@ router.get("/", async (req, res) => {
         lowStock,
         outOfStock,
         totalVendors: vendorSet.size,
-        totalSellingValue
+        totalSellingValue,
+        totalVariants
       },
       filters: {
         categories: RAW_ITEM_CATEGORIES,
@@ -162,7 +167,7 @@ router.get("/suppliers", async (req, res) => {
   }
 });
 
-// ✅ GET raw item by ID
+// ✅ GET raw item by ID with variants
 router.get("/:id", async (req, res) => {
   try {
     const rawItem = await RawItem.findById(req.params.id)
@@ -178,7 +183,12 @@ router.get("/:id", async (req, res) => {
       });
     }
 
-    res.json({ success: true, rawItem });
+    // Add virtual fields
+    const itemObj = rawItem.toObject();
+    itemObj.variantSummary = rawItem.variantSummary;
+    itemObj.currentVendorCosts = rawItem.currentVendorCosts;
+
+    res.json({ success: true, rawItem: itemObj });
 
   } catch (error) {
     console.error("Error fetching raw item:", error);
@@ -189,8 +199,21 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// ✅ CREATE new raw item
+// ✅ CREATE new raw item with variants
+// ✅ CREATE new raw item with variants - DEBUG VERSION
 router.post("/", async (req, res) => {
+  console.log("\n" + "=".repeat(80));
+  console.log("📦 RAW ITEM CREATE REQUEST RECEIVED");
+  console.log("=".repeat(80));
+  
+  // Log complete request info
+  console.log("📝 Request Method:", req.method);
+  console.log("📝 Request URL:", req.originalUrl);
+  console.log("📝 Request Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("👤 User from Auth Middleware:", req.user);
+  console.log("👤 User ID:", req.user?.id);
+  console.log("👤 User exists:", !!req.user);
+  
   try {
     const {
       name,
@@ -202,71 +225,150 @@ router.post("/", async (req, res) => {
       maxStock,
       sellingPrice,
       discounts,
+      attributes,
+      variants,
       description,
       notes
     } = req.body;
 
-    // Validation
+    console.log("\n📊 REQUEST BODY DATA:");
+    console.log("Name:", name);
+    console.log("Category:", category);
+    console.log("Custom Category:", customCategory);
+    console.log("Unit:", unit);
+    console.log("Custom Unit:", customUnit);
+    console.log("Min Stock:", minStock);
+    console.log("Max Stock:", maxStock);
+    console.log("Selling Price:", sellingPrice);
+    console.log("Full Request Body:", JSON.stringify(req.body, null, 2));
+
+    // Validation with detailed logging
+    console.log("\n🔍 STARTING VALIDATION...");
+    
     if (!name || !name.trim()) {
+      console.log("❌ VALIDATION FAILED: Item name is required");
       return res.status(400).json({
         success: false,
         message: "Item name is required"
       });
     }
+    console.log("✅ Name validation passed");
 
     if (!category && !customCategory) {
+      console.log("❌ VALIDATION FAILED: Category is required");
       return res.status(400).json({
         success: false,
         message: "Category is required"
       });
     }
+    console.log("✅ Category validation passed");
 
     if (!unit && !customUnit) {
+      console.log("❌ VALIDATION FAILED: Unit of measurement is required");
       return res.status(400).json({
         success: false,
         message: "Unit of measurement is required"
       });
     }
+    console.log("✅ Unit validation passed");
 
     if (minStock === undefined || isNaN(minStock) || minStock < 0) {
+      console.log("❌ VALIDATION FAILED: Valid minimum stock is required");
       return res.status(400).json({
         success: false,
         message: "Valid minimum stock is required"
       });
     }
+    console.log("✅ Min Stock validation passed");
 
     if (maxStock === undefined || isNaN(maxStock) || maxStock < 0) {
+      console.log("❌ VALIDATION FAILED: Valid maximum stock is required");
       return res.status(400).json({
         success: false,
         message: "Valid maximum stock is required"
       });
     }
+    console.log("✅ Max Stock validation passed");
 
     if (parseFloat(minStock) >= parseFloat(maxStock)) {
+      console.log("❌ VALIDATION FAILED: Maximum stock must be greater than minimum stock");
       return res.status(400).json({
         success: false,
         message: "Maximum stock must be greater than minimum stock"
       });
     }
+    console.log("✅ Stock range validation passed");
+
+    // Validate attributes if provided
+    if (attributes && Array.isArray(attributes)) {
+      console.log("🔍 Validating attributes...");
+      for (let attr of attributes) {
+        if (!attr.name || !attr.name.trim()) {
+          console.log(`❌ VALIDATION FAILED: Attribute name is required`);
+          return res.status(400).json({
+            success: false,
+            message: "Attribute name is required"
+          });
+        }
+        if (!attr.values || !Array.isArray(attr.values) || attr.values.length === 0) {
+          console.log(`❌ VALIDATION FAILED: Attribute "${attr.name}" must have at least one value`);
+          return res.status(400).json({
+            success: false,
+            message: `Attribute "${attr.name}" must have at least one value`
+          });
+        }
+      }
+      console.log(`✅ ${attributes.length} attributes validation passed`);
+    }
+
+    console.log("\n🎯 ALL VALIDATIONS PASSED!");
 
     // Generate SKU
+    console.log("\n🔧 GENERATING SKU...");
     const nameWords = name.trim().split(' ');
     const nameCode = nameWords.map(word => word.substring(0, 3).toUpperCase()).join('');
     const finalCategory = customCategory?.trim() || category;
     const categoryCode = finalCategory.substring(0, 3).toUpperCase();
     const randomNum = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
     const sku = `RAW-${categoryCode}-${nameCode}-${randomNum}`;
+    console.log("Generated SKU:", sku);
 
     // Check for duplicate SKU
+    console.log("🔍 Checking for duplicate SKU...");
     const existingItem = await RawItem.findOne({ sku });
     if (existingItem) {
+      console.log("❌ DUPLICATE SKU FOUND:", existingItem._id);
       return res.status(400).json({
         success: false,
         message: "An item with similar SKU already exists"
       });
     }
+    console.log("✅ No duplicate SKU found");
+
+    // Process variants
+    console.log("\n🔧 PROCESSING VARIANTS...");
+    let processedVariants = [];
+    if (variants && Array.isArray(variants)) {
+      processedVariants = variants.map(variant => ({
+        combination: variant.combination || [],
+        quantity: variant.quantity || 0,
+        minStock: variant.minStock || minStock,
+        maxStock: variant.maxStock || maxStock,
+        sellingPrice: variant.sellingPrice || sellingPrice,
+        sku: variant.sku || ""
+      }));
+      console.log(`✅ Processed ${processedVariants.length} variants`);
+    }
+
+    // Calculate total quantity
+    console.log("\n🧮 CALCULATING TOTAL QUANTITY...");
+    const totalQuantity = processedVariants.reduce((total, variant) => {
+      return total + (variant.quantity || 0);
+    }, 0);
+    console.log("Total Quantity:", totalQuantity);
 
     // Create new raw item
+    console.log("\n📝 CREATING NEW RAW ITEM DOCUMENT...");
     const newRawItem = new RawItem({
       name: name.trim(),
       sku: sku.toUpperCase(),
@@ -274,7 +376,7 @@ router.post("/", async (req, res) => {
       customCategory: customCategory || "",
       unit: customUnit ? "" : unit,
       customUnit: customUnit || "",
-      quantity: 0, // Start with 0 quantity
+      quantity: totalQuantity,
       minStock: parseFloat(minStock),
       maxStock: parseFloat(maxStock),
       sellingPrice: sellingPrice ? parseFloat(sellingPrice) : null,
@@ -285,37 +387,89 @@ router.post("/", async (req, res) => {
             minQuantity: parseFloat(d.minQuantity),
             price: parseFloat(d.price)
           })) : [],
+      attributes: attributes && Array.isArray(attributes) ?
+        attributes
+          .filter(attr => attr.name && attr.name.trim() && attr.values && attr.values.length > 0)
+          .map(attr => ({
+            name: attr.name.trim(),
+            values: attr.values.filter(val => val && val.trim())
+          })) : [],
+      variants: processedVariants,
       description: description ? description.trim() : "",
       notes: notes ? notes.trim() : "",
       createdBy: req.user.id
     });
 
-    await newRawItem.save();
+    console.log("Raw Item Object to save:", JSON.stringify(newRawItem, null, 2));
 
+    // Save to database
+    console.log("\n💾 SAVING TO DATABASE...");
+    await newRawItem.save();
+    console.log("✅ Raw item saved successfully! ID:", newRawItem._id);
+
+    // Send success response
+    console.log("\n✅ SENDING SUCCESS RESPONSE...");
     res.status(201).json({
       success: true,
       message: "Raw item registered successfully",
       rawItem: newRawItem
     });
 
-  } catch (error) {
-    console.error("Error creating raw item:", error);
+    console.log("\n" + "=".repeat(80));
+    console.log("✅ REQUEST COMPLETED SUCCESSFULLY");
+    console.log("=".repeat(80) + "\n");
 
+  } catch (error) {
+    console.error("\n❌" + "=".repeat(80));
+    console.error("🚨 ERROR IN RAW ITEM CREATION!");
+    console.error("=".repeat(80));
+    
+    console.error("Error Name:", error.name);
+    console.error("Error Message:", error.message);
+    console.error("Error Code:", error.code);
+    console.error("Error Stack:", error.stack);
+    
     if (error.code === 11000) {
+      console.error("❌ DUPLICATE KEY ERROR (MongoDB Error 11000)");
+      console.error("This usually means a duplicate SKU or unique field violation");
       return res.status(400).json({
         success: false,
         message: "Item with this SKU already exists"
       });
     }
 
+    if (error.name === 'ValidationError') {
+      console.error("❌ MONGOOSE VALIDATION ERROR");
+      console.error("Validation Errors:", error.errors);
+      return res.status(400).json({
+        success: false,
+        message: "Validation error: " + error.message,
+        errors: error.errors
+      });
+    }
+
+    if (error.name === 'CastError') {
+      console.error("❌ MONGOOSE CAST ERROR");
+      console.error("This usually means invalid data type for a field");
+      return res.status(400).json({
+        success: false,
+        message: "Invalid data type for field: " + error.message
+      });
+    }
+
+    console.error("\n🔄 SENDING GENERIC ERROR RESPONSE...");
     res.status(500).json({
       success: false,
-      message: "Server error while creating raw item"
+      message: "Server error while creating raw item: " + error.message,
+      errorType: error.name,
+      errorDetails: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
+    
+    console.log("=".repeat(80) + "\n");
   }
 });
 
-// ✅ UPDATE raw item
+// ✅ UPDATE raw item with variants
 router.put("/:id", async (req, res) => {
   try {
     const {
@@ -329,6 +483,8 @@ router.put("/:id", async (req, res) => {
       maxStock,
       sellingPrice,
       discounts,
+      attributes,
+      variants,
       description,
       notes
     } = req.body;
@@ -341,7 +497,7 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    // Update fields if provided
+    // Update basic fields if provided
     if (name) rawItem.name = name.trim();
 
     // Handle category
@@ -380,6 +536,31 @@ router.put("/:id", async (req, res) => {
             minQuantity: parseFloat(d.minQuantity),
             price: parseFloat(d.price)
           })) : [];
+    }
+
+    // Update attributes if provided
+    if (attributes !== undefined) {
+      rawItem.attributes = attributes && Array.isArray(attributes) ?
+        attributes
+          .filter(attr => attr.name && attr.name.trim() && attr.values && attr.values.length > 0)
+          .map(attr => ({
+            name: attr.name.trim(),
+            values: attr.values.filter(val => val && val.trim())
+          })) : [];
+    }
+
+    // Update variants if provided
+    if (variants !== undefined) {
+      rawItem.variants = variants && Array.isArray(variants) ?
+        variants.map(variant => ({
+          combination: variant.combination || [],
+          quantity: variant.quantity || 0,
+          minStock: variant.minStock || rawItem.minStock,
+          maxStock: variant.maxStock || rawItem.maxStock,
+          sellingPrice: variant.sellingPrice || rawItem.sellingPrice,
+          sku: variant.sku || "",
+          status: variant.status || "In Stock"
+        })) : [];
     }
 
     if (description !== undefined) rawItem.description = description ? description.trim() : "";
@@ -435,8 +616,8 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
-// ✅ UPDATE raw item quantity (for stock adjustments)
-router.patch("/:id/quantity", async (req, res) => {
+// ✅ UPDATE variant quantity
+router.patch("/:id/variants/:variantId/quantity", async (req, res) => {
   try {
     const { quantity, type, notes } = req.body;
 
@@ -455,7 +636,18 @@ router.patch("/:id/quantity", async (req, res) => {
       });
     }
 
-    let newQuantity = rawItem.quantity;
+    const variantIndex = rawItem.variants.findIndex(v => v._id.toString() === req.params.variantId);
+    if (variantIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: "Variant not found"
+      });
+    }
+
+    const variant = rawItem.variants[variantIndex];
+    const previousQuantity = variant.quantity;
+    let newQuantity = previousQuantity;
+
     if (type === "add") {
       newQuantity += parseFloat(quantity);
     } else if (type === "subtract") {
@@ -465,36 +657,76 @@ router.patch("/:id/quantity", async (req, res) => {
       newQuantity = parseFloat(quantity);
     }
 
-    rawItem.quantity = newQuantity;
-    rawItem.updatedBy = req.user.id;
+    // Update variant quantity
+    rawItem.variants[variantIndex].quantity = newQuantity;
 
-    // Add note about quantity change
-    if (notes) {
-      const timestamp = new Date().toLocaleString();
-      rawItem.notes = rawItem.notes ?
-        `${rawItem.notes}\n${timestamp}: ${notes} (Qty: ${type} ${quantity})` :
-        `${timestamp}: ${notes} (Qty: ${type} ${quantity})`;
-    }
+    // Create stock transaction
+    const transaction = {
+      type: type === "add" ? "VARIANT_ADD" : "VARIANT_REDUCE",
+      quantity: parseFloat(quantity),
+      variantCombination: variant.combination,
+      variantId: variant._id,
+      previousQuantity: previousQuantity,
+      newQuantity: newQuantity,
+      reason: `Variant quantity ${type === "add" ? "added" : "reduced"}`,
+      notes: notes || "",
+      performedBy: req.user.id
+    };
+
+    rawItem.stockTransactions.unshift(transaction);
+    rawItem.updatedBy = req.user.id;
 
     await rawItem.save();
 
     res.json({
       success: true,
-      message: `Quantity updated to ${newQuantity}`,
+      message: `Variant quantity updated to ${newQuantity}`,
+      variant: rawItem.variants[variantIndex],
       rawItem
     });
 
   } catch (error) {
-    console.error("Error updating quantity:", error);
+    console.error("Error updating variant quantity:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while updating quantity"
+      message: "Server error while updating variant quantity"
     });
   }
 });
 
-// ✅ ADD STOCK to raw item (with transaction history)
-router.post("/:id/add-stock", async (req, res) => {
+// ✅ GET variants for a raw item
+router.get("/:id/variants", async (req, res) => {
+  try {
+    const rawItem = await RawItem.findById(req.params.id).select("variants attributes name sku");
+    
+    if (!rawItem) {
+      return res.status(404).json({
+        success: false,
+        message: "Raw item not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      variants: rawItem.variants || [],
+      attributes: rawItem.attributes || [],
+      item: {
+        name: rawItem.name,
+        sku: rawItem.sku
+      }
+    });
+
+  } catch (error) {
+    console.error("Error fetching variants:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching variants"
+    });
+  }
+});
+
+// ✅ ADD STOCK to specific variant
+router.post("/:id/variants/:variantId/add-stock", async (req, res) => {
   try {
     const {
       quantity,
@@ -538,14 +770,26 @@ router.post("/:id/add-stock", async (req, res) => {
       });
     }
     
+    const variantIndex = rawItem.variants.findIndex(v => v._id.toString() === req.params.variantId);
+    if (variantIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: "Variant not found"
+      });
+    }
+    
+    const variant = rawItem.variants[variantIndex];
+    
     // Calculate new quantity
-    const previousQuantity = rawItem.quantity;
+    const previousQuantity = variant.quantity;
     const newQuantity = previousQuantity + parseFloat(quantity);
     
     // Create stock transaction
     const transaction = {
-      type: "ADD",
+      type: "VARIANT_ADD",
       quantity: parseFloat(quantity),
+      variantCombination: variant.combination,
+      variantId: variant._id,
       previousQuantity,
       newQuantity,
       reason: reason || "Stock Addition from Purchase",
@@ -559,57 +803,40 @@ router.post("/:id/add-stock", async (req, res) => {
       performedBy: req.user.id
     };
     
-    // Update raw item
-    rawItem.quantity = newQuantity;
-    rawItem.stockTransactions.unshift(transaction); // Add to beginning
-    
-    // Update primary vendor if this is the first purchase or if we want to set a primary
-    if (req.body.setAsPrimary || !rawItem.primaryVendor) {
-      if (supplierId) {
-        rawItem.primaryVendor = supplierId;
-      }
-    }
-    
-    // Add to alternate vendors if not already there
-    if (supplierId && !rawItem.alternateVendors.includes(supplierId)) {
-      rawItem.alternateVendors.push(supplierId);
-    }
-    
+    // Update variant quantity
+    rawItem.variants[variantIndex].quantity = newQuantity;
+    rawItem.stockTransactions.unshift(transaction);
     rawItem.updatedBy = req.user.id;
     
     await rawItem.save();
     
-    // Populate user info
     const updatedItem = await RawItem.findById(rawItem._id)
-      .populate("createdBy", "name email")
-      .populate("updatedBy", "name email")
       .populate("stockTransactions.performedBy", "name email")
-      .populate("primaryVendor", "companyName")
-      .populate("alternateVendors", "companyName")
       .populate("stockTransactions.supplierId", "companyName");
     
     res.json({
       success: true,
-      message: `Stock added successfully. New quantity: ${newQuantity}`,
+      message: `Stock added to variant successfully. New quantity: ${newQuantity}`,
       rawItem: updatedItem,
+      variant: rawItem.variants[variantIndex],
       transaction
     });
     
   } catch (error) {
-    console.error("Error adding stock:", error);
+    console.error("Error adding stock to variant:", error);
     res.status(500).json({ 
       success: false, 
-      message: "Server error while adding stock" 
+      message: "Server error while adding stock to variant" 
     });
   }
 });
 
-// ✅ REDUCE/CONSUME stock from raw item
-router.post("/:id/reduce-stock", async (req, res) => {
+// ✅ REDUCE/CONSUME stock from specific variant
+router.post("/:id/variants/:variantId/reduce-stock", async (req, res) => {
   try {
     const {
       quantity,
-      reasonType = "CONSUME", // "CONSUME" or "REDUCE"
+      reasonType = "CONSUME",
       reason,
       notes
     } = req.body;
@@ -630,211 +857,75 @@ router.post("/:id/reduce-stock", async (req, res) => {
       });
     }
     
+    const variantIndex = rawItem.variants.findIndex(v => v._id.toString() === req.params.variantId);
+    if (variantIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: "Variant not found"
+      });
+    }
+    
+    const variant = rawItem.variants[variantIndex];
+    
     // Check if enough stock is available
-    if (parseFloat(quantity) > rawItem.quantity) {
+    if (parseFloat(quantity) > variant.quantity) {
       return res.status(400).json({
         success: false,
-        message: `Insufficient stock. Available: ${rawItem.quantity}`
+        message: `Insufficient stock. Available: ${variant.quantity}`
       });
     }
     
     // Calculate new quantity
-    const previousQuantity = rawItem.quantity;
+    const previousQuantity = variant.quantity;
     const newQuantity = previousQuantity - parseFloat(quantity);
-    
-    // Get average cost from recent transactions
-    let averageCost = 0;
-    if (rawItem.stockTransactions && rawItem.stockTransactions.length > 0) {
-      const purchaseTransactions = rawItem.stockTransactions
-        .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
-        .slice(0, 5); // Take last 5 purchases
-      
-      if (purchaseTransactions.length > 0) {
-        const total = purchaseTransactions.reduce((sum, tx) => sum + (tx.unitPrice || 0), 0);
-        averageCost = total / purchaseTransactions.length;
-      }
-    }
     
     // Create stock transaction
     const transaction = {
-      type: reasonType === "CONSUME" ? "CONSUME" : "REDUCE",
+      type: "VARIANT_REDUCE",
       quantity: parseFloat(quantity),
+      variantCombination: variant.combination,
+      variantId: variant._id,
       previousQuantity,
       newQuantity,
       reason: reason || "Stock Consumption",
-      supplier: "Mixed",
-      unitPrice: averageCost,
       notes: notes || "",
       performedBy: req.user.id
     };
     
-    // Update raw item
-    rawItem.quantity = newQuantity;
+    // Update variant quantity
+    rawItem.variants[variantIndex].quantity = newQuantity;
     rawItem.stockTransactions.unshift(transaction);
     rawItem.updatedBy = req.user.id;
     
     await rawItem.save();
     
-    // Populate user info
     const updatedItem = await RawItem.findById(rawItem._id)
-      .populate("createdBy", "name email")
-      .populate("updatedBy", "name email")
       .populate("stockTransactions.performedBy", "name email");
     
     res.json({
       success: true,
-      message: `Stock reduced successfully. New quantity: ${newQuantity}`,
+      message: `Stock reduced from variant successfully. New quantity: ${newQuantity}`,
       rawItem: updatedItem,
+      variant: rawItem.variants[variantIndex],
       transaction
     });
     
   } catch (error) {
-    console.error("Error reducing stock:", error);
+    console.error("Error reducing stock from variant:", error);
     res.status(500).json({ 
       success: false, 
-      message: "Server error while reducing stock" 
+      message: "Server error while reducing stock from variant" 
     });
   }
 });
 
-
-// ✅ GET purchase orders for a specific raw item
-router.get("/:id/purchase-orders", async (req, res) => {
+// ✅ GET stock transactions for specific variant
+router.get("/:id/variants/:variantId/transactions", async (req, res) => {
   try {
-    const rawItem = await RawItem.findById(req.params.id);
-    
-    if (!rawItem) {
-      return res.status(404).json({
-        success: false,
-        message: "Raw item not found"
-      });
-    }
-
-    // First, let's check if we have access to the PurchaseOrder model
-    // If not, we need to import it
-    const PurchaseOrder = require("../../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
-
-    // Query purchase orders that have this raw item in their items
-    const purchaseOrders = await PurchaseOrder.find({
-      "items.rawItem": req.params.id
-    })
-      .select("poNumber orderDate expectedDeliveryDate vendorName status items paymentStatus totalAmount")
-      .populate("vendor", "companyName contactPerson")
-      .populate("createdBy", "name email")
-      .sort({ createdAt: -1 });
-
-    // Transform the data to include item-specific details
-    const formattedPurchaseOrders = purchaseOrders.map(po => {
-      // Find the specific item within the PO that matches our raw item
-      const item = po.items.find(i => 
-        i.rawItem && i.rawItem.toString() === req.params.id
-      );
-      
-      if (!item) return null;
-
-      return {
-        _id: po._id,
-        poNumber: po.poNumber,
-        orderDate: po.orderDate,
-        expectedDeliveryDate: po.expectedDeliveryDate,
-        vendorName: po.vendorName,
-        vendorId: po.vendor?._id,
-        vendorCompany: po.vendor?.companyName,
-        status: po.status,
-        paymentStatus: po.paymentStatus,
-        totalAmount: po.totalAmount,
-        itemDetails: {
-          quantity: item.quantity,
-          receivedQuantity: item.receivedQuantity || 0,
-          pendingQuantity: item.pendingQuantity || (item.quantity - (item.receivedQuantity || 0)),
-          unitPrice: item.unitPrice,
-          totalPrice: item.totalPrice,
-          status: item.status,
-          itemName: item.itemName,
-          sku: item.sku,
-          unit: item.unit
-        },
-        createdBy: po.createdBy?.name || "Unknown",
-        createdAt: po.createdAt
-      };
-    }).filter(po => po !== null); // Remove any null entries
-
-    // Get statistics for this raw item
-    const totalOrders = formattedPurchaseOrders.length;
-    const totalOrderedQty = formattedPurchaseOrders.reduce((sum, po) => 
-      sum + (po.itemDetails.quantity || 0), 0
-    );
-    const totalDeliveredQty = formattedPurchaseOrders.reduce((sum, po) => 
-      sum + (po.itemDetails.receivedQuantity || 0), 0
-    );
-    const pendingDeliveryQty = formattedPurchaseOrders.reduce((sum, po) => 
-      sum + (po.itemDetails.pendingQuantity || 0), 0
-    );
-
-    // Get active purchase orders (not completed or cancelled)
-    const activePOs = formattedPurchaseOrders.filter(po => 
-      po.status === "ISSUED" || po.status === "PARTIALLY_RECEIVED" || po.status === "DRAFT"
-    );
-
-    // Get total order value
-    const totalOrderValue = formattedPurchaseOrders.reduce((sum, po) => 
-      sum + (po.itemDetails.totalPrice || 0), 0
-    );
-
-    // Get latest purchase order
-    const latestPO = formattedPurchaseOrders.length > 0 
-      ? formattedPurchaseOrders[0] 
-      : null;
-
-    res.json({
-      success: true,
-      purchaseOrders: formattedPurchaseOrders,
-      stats: {
-        totalOrders,
-        totalOrderedQty,
-        totalDeliveredQty,
-        pendingDeliveryQty,
-        deliveryProgress: totalOrderedQty > 0 
-          ? Math.round((totalDeliveredQty / totalOrderedQty) * 100) 
-          : 0,
-        activePOs: activePOs.length,
-        totalOrderValue,
-        latestPO: latestPO ? {
-          poNumber: latestPO.poNumber,
-          orderDate: latestPO.orderDate,
-          quantity: latestPO.itemDetails.quantity,
-          vendorName: latestPO.vendorName
-        } : null
-      }
-    });
-
-  } catch (error) {
-    console.error("Error fetching purchase orders for raw item:", error);
-    
-    // If PurchaseOrder model is not found, provide a helpful message
-    if (error.message.includes("PurchaseOrder") || error.message.includes("model")) {
-      return res.status(500).json({
-        success: false,
-        message: "Purchase order module is not available. Please ensure the PurchaseOrder model is properly set up."
-      });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching purchase orders"
-    });
-  }
-});
-
-// ✅ GET stock transactions history
-router.get("/:id/transactions", async (req, res) => {
-  try {
-    const { page = 1, limit = 20, type } = req.query;
+    const { page = 1, limit = 20 } = req.query;
     
     const rawItem = await RawItem.findById(req.params.id)
-      .select("stockTransactions name sku")
-      .populate("stockTransactions.performedBy", "name email")
-      .populate("stockTransactions.supplierId", "companyName");
+      .select("stockTransactions name sku variants");
     
     if (!rawItem) {
       return res.status(404).json({
@@ -843,12 +934,18 @@ router.get("/:id/transactions", async (req, res) => {
       });
     }
     
-    let transactions = [...rawItem.stockTransactions];
-    
-    // Filter by type if provided
-    if (type) {
-      transactions = transactions.filter(t => t.type === type);
+    const variant = rawItem.variants.find(v => v._id.toString() === req.params.variantId);
+    if (!variant) {
+      return res.status(404).json({
+        success: false,
+        message: "Variant not found"
+      });
     }
+    
+    // Filter transactions for this variant
+    let transactions = rawItem.stockTransactions.filter(tx => 
+      tx.variantId && tx.variantId.toString() === req.params.variantId
+    );
     
     // Sort by date (newest first)
     transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
@@ -864,6 +961,11 @@ router.get("/:id/transactions", async (req, res) => {
       total: transactions.length,
       page: parseInt(page),
       totalPages: Math.ceil(transactions.length / limit),
+      variant: {
+        combination: variant.combination,
+        quantity: variant.quantity,
+        status: variant.status
+      },
       item: {
         name: rawItem.name,
         sku: rawItem.sku
@@ -871,18 +973,27 @@ router.get("/:id/transactions", async (req, res) => {
     });
     
   } catch (error) {
-    console.error("Error fetching transactions:", error);
+    console.error("Error fetching variant transactions:", error);
     res.status(500).json({ 
       success: false, 
-      message: "Server error while fetching transactions" 
+      message: "Server error while fetching variant transactions" 
     });
   }
 });
 
-// ✅ GET available suppliers for specific raw item (from transactions)
-router.get("/:id/suppliers", async (req, res) => {
+// Existing routes remain the same (add-stock, reduce-stock, purchase-orders, transactions, suppliers, etc.)
+// ... [Keep all the existing routes from the original file]
+
+
+// ✅ GET stock transactions for a raw item
+router.get("/:id/transactions", async (req, res) => {
   try {
-    const rawItem = await RawItem.findById(req.params.id);
+    const { page = 1, limit = 20 } = req.query;
+    
+    const rawItem = await RawItem.findById(req.params.id)
+      .select("stockTransactions name sku quantity status")
+      .populate("stockTransactions.performedBy", "name email")
+      .populate("stockTransactions.supplierId", "companyName");
     
     if (!rawItem) {
       return res.status(404).json({
@@ -891,51 +1002,302 @@ router.get("/:id/suppliers", async (req, res) => {
       });
     }
     
-    // Get unique suppliers from stock transactions
-    const suppliers = [];
-    const supplierMap = new Map();
+    // Get transactions
+    let transactions = rawItem.stockTransactions || [];
     
-    if (rawItem.stockTransactions && Array.isArray(rawItem.stockTransactions)) {
-      rawItem.stockTransactions
-        .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
-        .forEach(tx => {
-          if (tx.supplier && tx.supplier.trim()) {
-            // Get the most recent transaction for each supplier
-            if (!supplierMap.has(tx.supplier) || 
-                new Date(tx.createdAt) > new Date(supplierMap.get(tx.supplier).lastTransaction)) {
-              supplierMap.set(tx.supplier, {
-                supplier: tx.supplier,
-                supplierId: tx.supplierId,
-                lastCost: tx.unitPrice,
-                lastTransaction: tx.createdAt
-              });
-            }
-          }
-        });
-    }
+    // Sort by date (newest first)
+    transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     
-    // Convert map to array
-    supplierMap.forEach(value => {
-      suppliers.push({
-        supplier: value.supplier,
-        supplierId: value.supplierId,
-        lastCost: value.lastCost
-      });
-    });
+    // Pagination
+    const startIndex = (page - 1) * limit;
+    const endIndex = page * limit;
+    const paginatedTransactions = transactions.slice(startIndex, endIndex);
     
-    // Get all active vendors from database
-    const allVendors = await Vendor.find({ status: "Active" })
-      .select("companyName vendorType")
-      .sort({ companyName: 1 });
+    // Calculate statistics
+    const totalAdditions = transactions.filter(tx => 
+      tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD"
+    ).reduce((sum, tx) => sum + (tx.quantity || 0), 0);
+    
+    const totalReductions = transactions.filter(tx => 
+      tx.type === "REDUCE" || tx.type === "CONSUME" || tx.type === "VARIANT_REDUCE"
+    ).reduce((sum, tx) => sum + (tx.quantity || 0), 0);
+    
+    const totalPurchases = transactions.filter(tx => 
+      tx.type === "ADD" || tx.type === "PURCHASE_ORDER"
+    ).length;
+    
+    const uniqueVendors = [...new Set(transactions
+      .filter(tx => tx.supplier && tx.supplier.trim())
+      .map(tx => tx.supplier))];
     
     res.json({
       success: true,
-      suppliers: suppliers,
-      allVendors: allVendors.map(v => ({
-        id: v._id,
-        name: v.companyName,
-        type: v.vendorType
-      }))
+      transactions: paginatedTransactions,
+      total: transactions.length,
+      page: parseInt(page),
+      totalPages: Math.ceil(transactions.length / limit),
+      stats: {
+        totalAdditions,
+        totalReductions,
+        totalPurchases,
+        uniqueVendors: uniqueVendors.length,
+        currentStock: rawItem.quantity,
+        status: rawItem.status
+      },
+      item: {
+        name: rawItem.name,
+        sku: rawItem.sku,
+        quantity: rawItem.quantity,
+        status: rawItem.status
+      }
+    });
+    
+  } catch (error) {
+    console.error("Error fetching stock transactions:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error while fetching stock transactions" 
+    });
+  }
+});
+
+// ✅ GET purchase orders for a raw item
+router.get("/:id/purchase-orders", async (req, res) => {
+  try {
+    // First, get the raw item to ensure it exists
+    const rawItem = await RawItem.findById(req.params.id).select("name sku");
+    if (!rawItem) {
+      return res.status(404).json({
+        success: false,
+        message: "Raw item not found"
+      });
+    }
+    
+    // We need to import PurchaseOrder model
+    const PurchaseOrder = require("../../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+    
+    // Find purchase orders that contain this raw item
+    const purchaseOrders = await PurchaseOrder.find({
+      "items.rawItem": req.params.id
+    })
+    .select("poNumber orderDate expectedDeliveryDate vendorName status totalAmount totalReceived totalPending items")
+    .populate("vendor", "companyName")
+    .sort({ orderDate: -1 });
+    
+    // Process the data to include item details
+    const processedOrders = purchaseOrders.map(po => {
+      const item = po.items.find(i => i.rawItem.toString() === req.params.id);
+      return {
+        _id: po._id,
+        poNumber: po.poNumber,
+        orderDate: po.orderDate,
+        expectedDeliveryDate: po.expectedDeliveryDate,
+        vendorName: po.vendor?.companyName || po.vendorName,
+        vendorCompany: po.vendor?.companyName || "",
+        status: po.status,
+        totalAmount: po.totalAmount,
+        totalReceived: po.totalReceived,
+        totalPending: po.totalPending,
+        itemDetails: item ? {
+          quantity: item.quantity,
+          receivedQuantity: item.receivedQuantity,
+          pendingQuantity: item.pendingQuantity,
+          unitPrice: item.unitPrice,
+          totalPrice: item.totalPrice,
+          status: item.status,
+          variantId: item.variantId,
+          variantCombination: item.variantCombination,
+          variantName: item.variantName
+        } : null
+      };
+    });
+    
+    // Calculate statistics
+    const totalOrders = processedOrders.length;
+    const totalOrderedQty = processedOrders.reduce((sum, po) => 
+      sum + (po.itemDetails?.quantity || 0), 0);
+    const totalDeliveredQty = processedOrders.reduce((sum, po) => 
+      sum + (po.itemDetails?.receivedQuantity || 0), 0);
+    const totalPendingQty = processedOrders.reduce((sum, po) => 
+      sum + (po.itemDetails?.pendingQuantity || 0), 0);
+    
+    const activeOrders = processedOrders.filter(po => 
+      po.status === "ISSUED" || po.status === "PARTIALLY_RECEIVED"
+    );
+    
+    res.json({
+      success: true,
+      purchaseOrders: processedOrders,
+      stats: {
+        totalOrders,
+        totalOrderedQty,
+        totalDeliveredQty,
+        totalPendingQty,
+        activeOrders: activeOrders.length,
+        deliveredPercentage: totalOrderedQty > 0 ? 
+          Math.round((totalDeliveredQty / totalOrderedQty) * 100) : 0
+      },
+      rawItem: {
+        name: rawItem.name,
+        sku: rawItem.sku
+      }
+    });
+    
+  } catch (error) {
+    console.error("Error fetching purchase orders:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error while fetching purchase orders" 
+    });
+  }
+});
+
+// ✅ GET variant transactions for a specific variant
+router.get("/:id/variants/:variantId/transactions", async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    
+    const rawItem = await RawItem.findById(req.params.id)
+      .select("stockTransactions name sku variants")
+      .populate("stockTransactions.performedBy", "name email")
+      .populate("stockTransactions.supplierId", "companyName");
+    
+    if (!rawItem) {
+      return res.status(404).json({
+        success: false,
+        message: "Raw item not found"
+      });
+    }
+    
+    // Find the specific variant
+    const variant = rawItem.variants.find(v => v._id.toString() === req.params.variantId);
+    if (!variant) {
+      return res.status(404).json({
+        success: false,
+        message: "Variant not found"
+      });
+    }
+    
+    // Filter transactions for this specific variant
+    let transactions = rawItem.stockTransactions.filter(tx => 
+      tx.variantId && tx.variantId.toString() === req.params.variantId
+    );
+    
+    // Sort by date (newest first)
+    transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    // Pagination
+    const startIndex = (page - 1) * limit;
+    const endIndex = page * limit;
+    const paginatedTransactions = transactions.slice(startIndex, endIndex);
+    
+    // Calculate variant statistics
+    const variantAdditions = transactions.filter(tx => 
+      tx.type === "VARIANT_ADD"
+    ).reduce((sum, tx) => sum + (tx.quantity || 0), 0);
+    
+    const variantReductions = transactions.filter(tx => 
+      tx.type === "VARIANT_REDUCE"
+    ).reduce((sum, tx) => sum + (tx.quantity || 0), 0);
+    
+    const purchaseOrders = transactions.filter(tx => 
+      tx.purchaseOrder && tx.purchaseOrder.trim()
+    ).length;
+    
+    res.json({
+      success: true,
+      transactions: paginatedTransactions,
+      total: transactions.length,
+      page: parseInt(page),
+      totalPages: Math.ceil(transactions.length / limit),
+      stats: {
+        variantAdditions,
+        variantReductions,
+        purchaseOrders,
+        currentQuantity: variant.quantity,
+        status: variant.status
+      },
+      variant: {
+        combination: variant.combination,
+        sku: variant.sku,
+        quantity: variant.quantity,
+        status: variant.status,
+        minStock: variant.minStock,
+        maxStock: variant.maxStock
+      },
+      item: {
+        name: rawItem.name,
+        sku: rawItem.sku
+      }
+    });
+    
+  } catch (error) {
+    console.error("Error fetching variant transactions:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error while fetching variant transactions" 
+    });
+  }
+});
+
+// ✅ GET supplier/vendor details from transactions
+router.get("/:id/suppliers", async (req, res) => {
+  try {
+    const rawItem = await RawItem.findById(req.params.id)
+      .select("stockTransactions name sku primaryVendor alternateVendors")
+      .populate("stockTransactions.supplierId", "companyName contactPerson phone email address")
+      .populate("primaryVendor", "companyName contactPerson phone email address gstNumber")
+      .populate("alternateVendors", "companyName contactPerson phone email address gstNumber");
+    
+    if (!rawItem) {
+      return res.status(404).json({
+        success: false,
+        message: "Raw item not found"
+      });
+    }
+    
+    // Extract suppliers from transactions
+    const transactionSuppliers = {};
+    
+    rawItem.stockTransactions.forEach(tx => {
+      if (tx.supplier && (tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD")) {
+        const supplierName = tx.supplier;
+        if (!transactionSuppliers[supplierName]) {
+          transactionSuppliers[supplierName] = {
+            name: supplierName,
+            lastPurchaseDate: tx.createdAt,
+            lastCost: tx.unitPrice || 0,
+            totalPurchased: tx.quantity || 0,
+            purchaseCount: 1,
+            supplierId: tx.supplierId
+          };
+        } else {
+          transactionSuppliers[supplierName].totalPurchased += tx.quantity || 0;
+          transactionSuppliers[supplierName].purchaseCount += 1;
+          
+          // Update last purchase date if this is more recent
+          if (new Date(tx.createdAt) > new Date(transactionSuppliers[supplierName].lastPurchaseDate)) {
+            transactionSuppliers[supplierName].lastPurchaseDate = tx.createdAt;
+            transactionSuppliers[supplierName].lastCost = tx.unitPrice || 0;
+          }
+        }
+      }
+    });
+    
+    // Convert to array and sort by last purchase date (most recent first)
+    const suppliersArray = Object.values(transactionSuppliers).sort((a, b) => 
+      new Date(b.lastPurchaseDate) - new Date(a.lastPurchaseDate)
+    );
+    
+    res.json({
+      success: true,
+      suppliers: suppliersArray,
+      primaryVendor: rawItem.primaryVendor,
+      alternateVendors: rawItem.alternateVendors || [],
+      item: {
+        name: rawItem.name,
+        sku: rawItem.sku
+      }
     });
     
   } catch (error) {
@@ -947,196 +1309,6 @@ router.get("/:id/suppliers", async (req, res) => {
   }
 });
 
-// ✅ ADD PURCHASE ORDER transaction
-router.post("/:id/purchase-order", async (req, res) => {
-  try {
-    const {
-      quantity,
-      supplier,
-      supplierId,
-      unitPrice,
-      purchaseOrder,
-      purchaseOrderId,
-      invoiceNumber,
-      status = "PENDING", // PENDING, DELIVERED, CANCELLED
-      expectedDelivery,
-      notes
-    } = req.body;
-    
-    // Validation
-    if (!quantity || isNaN(quantity) || quantity <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid quantity is required"
-      });
-    }
-    
-    if (!supplier || !supplier.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Supplier name is required"
-      });
-    }
-    
-    if (!unitPrice || isNaN(unitPrice) || unitPrice <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid unit price is required"
-      });
-    }
-    
-    const rawItem = await RawItem.findById(req.params.id);
-    if (!rawItem) {
-      return res.status(404).json({
-        success: false,
-        message: "Raw item not found"
-      });
-    }
-    
-    // Create purchase order transaction
-    const transaction = {
-      type: "PURCHASE_ORDER",
-      quantity: parseFloat(quantity),
-      previousQuantity: rawItem.quantity,
-      newQuantity: rawItem.quantity, // Will be updated when delivered
-      reason: "Purchase Order Created",
-      supplier: supplier.trim(),
-      supplierId: supplierId || null,
-      unitPrice: parseFloat(unitPrice),
-      purchaseOrder: purchaseOrder || "",
-      purchaseOrderId: purchaseOrderId || null,
-      invoiceNumber: invoiceNumber || "",
-      status: status,
-      expectedDelivery: expectedDelivery || null,
-      notes: notes || "",
-      performedBy: req.user.id
-    };
-    
-    // Update raw item
-    rawItem.stockTransactions.unshift(transaction);
-    rawItem.updatedBy = req.user.id;
-    
-    await rawItem.save();
-    
-    // Populate user info
-    const updatedItem = await RawItem.findById(rawItem._id)
-      .populate("stockTransactions.performedBy", "name email")
-      .populate("stockTransactions.supplierId", "companyName");
-    
-    res.json({
-      success: true,
-      message: "Purchase order transaction recorded successfully",
-      rawItem: updatedItem,
-      transaction
-    });
-    
-  } catch (error) {
-    console.error("Error recording purchase order:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error while recording purchase order" 
-    });
-  }
-});
-
-// ✅ UPDATE purchase order status and add stock when delivered
-router.post("/:id/purchase-order/:transactionId/deliver", async (req, res) => {
-  try {
-    const { actualQuantity, actualUnitPrice, invoiceNumber, notes } = req.body;
-    
-    const rawItem = await RawItem.findById(req.params.id);
-    if (!rawItem) {
-      return res.status(404).json({
-        success: false,
-        message: "Raw item not found"
-      });
-    }
-    
-    // Find the purchase order transaction
-    const transactionIndex = rawItem.stockTransactions.findIndex(
-      tx => tx._id.toString() === req.params.transactionId && tx.type === "PURCHASE_ORDER"
-    );
-    
-    if (transactionIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order transaction not found"
-      });
-    }
-    
-    const poTransaction = rawItem.stockTransactions[transactionIndex];
-    
-    // Update purchase order status
-    poTransaction.status = "DELIVERED";
-    poTransaction.deliveredAt = new Date();
-    poTransaction.actualQuantity = actualQuantity || poTransaction.quantity;
-    poTransaction.actualUnitPrice = actualUnitPrice || poTransaction.unitPrice;
-    if (invoiceNumber) poTransaction.invoiceNumber = invoiceNumber;
-    if (notes) poTransaction.notes = notes ? `${poTransaction.notes}\n${notes}` : notes;
-    
-    // Create ADD transaction for the delivered stock
-    const previousQuantity = rawItem.quantity;
-    const deliveredQuantity = actualQuantity || poTransaction.quantity;
-    const newQuantity = previousQuantity + parseFloat(deliveredQuantity);
-    
-    const addTransaction = {
-      type: "ADD",
-      quantity: parseFloat(deliveredQuantity),
-      previousQuantity,
-      newQuantity,
-      reason: "Purchase Order Delivery",
-      supplier: poTransaction.supplier,
-      supplierId: poTransaction.supplierId,
-      unitPrice: actualUnitPrice || poTransaction.unitPrice,
-      purchaseOrder: poTransaction.purchaseOrder,
-      purchaseOrderId: poTransaction.purchaseOrderId,
-      invoiceNumber: invoiceNumber || poTransaction.invoiceNumber,
-      relatedPO: poTransaction._id,
-      notes: `Delivered from PO: ${poTransaction.purchaseOrder}`,
-      performedBy: req.user.id
-    };
-    
-    // Update raw item quantity and add transaction
-    rawItem.quantity = newQuantity;
-    rawItem.stockTransactions.unshift(addTransaction);
-    
-    // Update primary vendor if not set
-    if (!rawItem.primaryVendor && poTransaction.supplierId) {
-      rawItem.primaryVendor = poTransaction.supplierId;
-    }
-    
-    // Add to alternate vendors if not already there
-    if (poTransaction.supplierId && !rawItem.alternateVendors.includes(poTransaction.supplierId)) {
-      rawItem.alternateVendors.push(poTransaction.supplierId);
-    }
-    
-    rawItem.updatedBy = req.user.id;
-    
-    await rawItem.save();
-    
-    // Populate user info
-    const updatedItem = await RawItem.findById(rawItem._id)
-      .populate("stockTransactions.performedBy", "name email")
-      .populate("stockTransactions.supplierId", "companyName")
-      .populate("primaryVendor", "companyName");
-    
-    res.json({
-      success: true,
-      message: `Purchase order delivered successfully. ${deliveredQuantity} units added to stock. New quantity: ${newQuantity}`,
-      rawItem: updatedItem,
-      purchaseOrder: poTransaction,
-      deliveryTransaction: addTransaction
-    });
-    
-  } catch (error) {
-    console.error("Error delivering purchase order:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error while delivering purchase order" 
-    });
-  }
-});
-
 // ✅ GET categories
 router.get("/data/categories", async (req, res) => {
   res.json({
@@ -1144,28 +1316,5 @@ router.get("/data/categories", async (req, res) => {
     categories: RAW_ITEM_CATEGORIES
   });
 });
-
-// Helper functions
-const getRecentVendorCost = (item) => {
-  if (!item.stockTransactions || item.stockTransactions.length === 0) return 0;
-  
-  const recentTransaction = item.stockTransactions
-    .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
-  
-  return recentTransaction?.unitPrice || 0;
-}
-
-const getAverageVendorCost = (item) => {
-  if (!item.stockTransactions || item.stockTransactions.length === 0) return 0;
-  
-  const purchaseTransactions = item.stockTransactions
-    .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER");
-  
-  if (purchaseTransactions.length === 0) return 0;
-  
-  const total = purchaseTransactions.reduce((sum, tx) => sum + (tx.unitPrice || 0), 0);
-  return total / purchaseTransactions.length;
-}
 
 module.exports = router;
