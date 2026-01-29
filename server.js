@@ -2,14 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
-<<<<<<< HEAD
-
-=======
-const bcrypt = require("bcryptjs"); 
->>>>>>> origin/main
+const bcrypt = require("bcryptjs");
 require("dotenv").config();
-
-
 
 const app = express();
 
@@ -45,11 +39,6 @@ const connectDB = async () => {
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
     );
     console.log("✅ MongoDB connected successfully");
-<<<<<<< HEAD
-    createDefaultHR();
-=======
-
->>>>>>> origin/main
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -59,7 +48,6 @@ const connectDB = async () => {
 connectDB();
 
 //changes
-
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
 
@@ -74,13 +62,7 @@ const CATEGORY_MEASUREMENTS = {
     "Cuff",
     "Coller",
   ],
-  Outerwear: [
-    "Length",
-    "Chest",
-    "Stomach",
-    "Button Hem",
-    "Shoulder",
-  ],
+  Outerwear: ["Length", "Chest", "Stomach", "Button Hem", "Shoulder"],
   Bottoms: [
     "Length",
     "Waist",
@@ -94,24 +76,20 @@ const CATEGORY_MEASUREMENTS = {
 
 const overwriteExistingMeasurements = async () => {
   try {
-<<<<<<< HEAD
     const existingHR = await HRDepartment.findOne({
       role: "hr_manager",
       department: "Human Resources",
     });
-=======
-    for (const [category, measurements] of Object.entries(CATEGORY_MEASUREMENTS)) {
+    for (const [category, measurements] of Object.entries(
+      CATEGORY_MEASUREMENTS,
+    )) {
       const result = await StockItem.updateMany(
         { category },
-        { $set: { measurements } }
+        { $set: { measurements } },
       );
->>>>>>> origin/main
 
-      console.log(
-        `✅ ${category}: ${result.modifiedCount} documents updated`
-      );
+      console.log(`✅ ${category}: ${result.modifiedCount} documents updated`);
     }
-<<<<<<< HEAD
 
     const defaultHR = new HRDepartment({
       name: "HR Admin",
@@ -127,24 +105,11 @@ const overwriteExistingMeasurements = async () => {
     await defaultHR.save();
 
     console.log("✅ Default HR Department created successfully");
-=======
->>>>>>> origin/main
   } catch (error) {
     console.error("❌ Measurement overwrite failed:", error.message);
   }
 };
 
-<<<<<<< HEAD
-=======
-
-
-
-
-
-
-
-
->>>>>>> origin/main
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -184,15 +149,9 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
-<<<<<<< HEAD
-/* =====================
-    CMS ROUTES
-  ===================== */
-=======
 /* ===================
   CMS ROUTES
 ===================== */
->>>>>>> origin/main
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
