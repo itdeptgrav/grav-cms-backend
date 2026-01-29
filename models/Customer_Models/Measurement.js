@@ -19,27 +19,13 @@ const measurementValueSchema = new mongoose.Schema({
     }
 }, { _id: false });
 
-// Add this schema for attributes
-const attributeSchema = new mongoose.Schema({
-    name: {
-        type: String,
-        required: true,
-        trim: true
-    },
-    value: {
-        type: String,
-        required: true,
-        trim: true
-    }
-}, { _id: false });
-
-const stockItemMeasurementSchema = new mongoose.Schema({
-    stockItemId: {
+const productMeasurementSchema = new mongoose.Schema({
+    productId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "StockItem",
         required: true
     },
-    stockItemName: {
+    productName: {
         type: String,
         required: true,
         trim: true
@@ -52,8 +38,12 @@ const stockItemMeasurementSchema = new mongoose.Schema({
         type: String,
         default: "Default"
     },
-    // ADD THIS: Store attributes array
-    attributes: [attributeSchema],
+    quantity: {
+        type: Number,
+        required: true,
+        min: 1,
+        default: 1
+    },
     measurements: [measurementValueSchema],
     measuredAt: {
         type: Date,
@@ -77,17 +67,12 @@ const employeeMeasurementSchema = new mongoose.Schema({
         required: true,
         trim: true
     },
-    department: {
+    gender: {
         type: String,
         required: true,
         trim: true
     },
-    designation: {
-        type: String,
-        required: true,
-        trim: true
-    },
-    stockItems: [stockItemMeasurementSchema],
+    products: [productMeasurementSchema],
     isCompleted: {
         type: Boolean,
         default: false
@@ -203,6 +188,5 @@ const measurementSchema = new mongoose.Schema({
 measurementSchema.index({ organizationId: 1, createdAt: -1 });
 measurementSchema.index({ organizationId: 1, completionRate: 1 });
 measurementSchema.index({ "employeeMeasurements.employeeId": 1 });
-measurementSchema.index({ "employeeMeasurements.stockItems.variantId": 1 });
 
 module.exports = mongoose.model("Measurement", measurementSchema);

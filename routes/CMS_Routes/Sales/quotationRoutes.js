@@ -7,6 +7,7 @@ const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
 const CustomerEmailService = require('../../../services/CustomerEmailService');
 const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const mongoose = require("mongoose");
 
 // Apply auth middleware
 router.use(EmployeeAuthMiddleware);
@@ -510,8 +511,7 @@ router.get("/requests/:requestId/quotation/:quotationId/payment-submissions", as
   }
 });
 
-
-// SALES APPROVAL
+// SALES APPROVAL - FIXED VERSION with Variant Raw Item Support
 router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -541,6 +541,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
       });
     }
 
+    // Update quotation status
     quotation.status = 'sales_approved';
     quotation.salesApproval = {
       approved: true,
@@ -550,28 +551,76 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     };
     quotation.updatedAt = new Date();
 
+    // Update request status
     request.status = 'quotation_sales_approved';
     request.finalOrderPrice = quotation.grandTotal;
     request.updatedAt = new Date();
 
+    // Clear notifications
     request.quotationNotifications = request.quotationNotifications.filter(
       n => n.type !== 'sales_approval_required'
     );
 
     const createdWorkOrders = [];
 
+    // Process each item in the request
     for (const item of request.items) {
       const stockItem = await StockItem.findById(item.stockItemId);
-      if (!stockItem) continue;
+      if (!stockItem) {
+        console.warn(`StockItem not found: ${item.stockItemId} for ${item.stockItemName}`);
+        continue;
+      }
 
+      // Process each variant in the item
       for (const variant of item.variants) {
-        const variantData = stockItem.variants.find(
-          v => v.sku === variant.variantId || v.attributes.some(attr =>
-            attr.name === variant.attributes[0]?.name &&
-            attr.value === variant.attributes[0]?.value
-          )
-        );
+        console.log(`Processing variant: ${JSON.stringify(variant)}`);
+        
+        // Find the correct variant in stockItem
+        let variantData = null;
+        
+        // Method 1: Try to match by variantId (if it's a MongoDB ObjectId string)
+        if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
+          variantData = stockItem.variants.find(v => 
+            v._id.toString() === variant.variantId
+          );
+        }
+        
+        // Method 2: If no match by ID or variantId is not ObjectId, try to match by attributes
+        if (!variantData && variant.attributes && variant.attributes.length > 0) {
+          variantData = stockItem.variants.find(v => {
+            // Check if all attributes match
+            if (!v.attributes || v.attributes.length !== variant.attributes.length) {
+              return false;
+            }
+            
+            // Check each attribute
+            const allAttributesMatch = variant.attributes.every(reqAttr => {
+              const stockAttr = v.attributes.find(a => a.name === reqAttr.name);
+              return stockAttr && stockAttr.value === reqAttr.value;
+            });
+            
+            return allAttributesMatch;
+          });
+        }
+        
+        // Method 3: Try to match by variantId as SKU (if variantId is actually SKU)
+        if (!variantData && variant.variantId) {
+          variantData = stockItem.variants.find(v => v.sku === variant.variantId);
+        }
 
+        if (!variantData) {
+          console.warn(`Variant not found in stockItem. Request variant:`, variant);
+          console.warn(`Available variants in stockItem:`, stockItem.variants.map(v => ({
+            id: v._id,
+            sku: v.sku,
+            attributes: v.attributes
+          })));
+          continue;
+        }
+
+        console.log(`Found matching variant: ${variantData.sku}`);
+
+        // Get operations from stockItem
         const operations = stockItem.operations.map(op => ({
           operationType: op.type,
           machineType: op.machineType,
@@ -587,26 +636,43 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           status: "pending"
         }));
 
-        const rawMaterials = stockItem.rawItems.map(rawItem => ({
-          rawItemId: rawItem.rawItemId,
-          name: rawItem.name,
-          sku: rawItem.sku,
-          quantityRequired: rawItem.quantity * variant.quantity,
-          quantityAllocated: 0,
-          quantityIssued: 0,
-          unit: rawItem.unit,
-          unitCost: rawItem.unitCost,
-          totalCost: rawItem.unitCost * rawItem.quantity * variant.quantity,
-          allocationStatus: "not_allocated"
-        }));
+        // Get raw materials - FROM VARIANT-SPECIFIC RAW ITEMS
+        let rawMaterials = [];
+        
+        if (variantData.rawItems && variantData.rawItems.length > 0) {
+          rawMaterials = variantData.rawItems.map(rawItem => ({
+            rawItemId: rawItem.rawItemId,
+            name: rawItem.rawItemName,
+            sku: rawItem.rawItemSku,
+            // STORE VARIANT INFORMATION FOR RAW ITEMS
+            rawItemVariantId: rawItem.variantId || null,
+            rawItemVariantCombination: rawItem.variantCombination || [],
+            quantityRequired: rawItem.quantity * variant.quantity,
+            quantityAllocated: 0,
+            quantityIssued: 0,
+            unit: rawItem.unit,
+            unitCost: rawItem.unitCost,
+            totalCost: rawItem.totalCost * variant.quantity,
+            allocationStatus: "not_allocated"
+          }));
+        } else {
+          console.warn(`No raw items found for variant: ${variantData.sku}. Using empty BOM.`);
+        }
 
+        // Get variant attributes
+        const variantAttributes = variant.attributes || [];
+        if (variantAttributes.length === 0 && variantData.attributes) {
+          variantAttributes.push(...variantData.attributes);
+        }
+
+        // Create work order
         const workOrder = new WorkOrder({
           customerRequestId: request._id,
           stockItemId: item.stockItemId,
           stockItemName: item.stockItemName,
           stockItemReference: item.stockItemReference,
-          variantId: variant.variantId,
-          variantAttributes: variant.attributes,
+          variantId: variantData._id.toString(),
+          variantAttributes: variantAttributes,
           quantity: variant.quantity,
           customerId: request.customerId,
           customerName: request.customerInfo.name,
@@ -623,13 +689,22 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
             scheduledEndDate: null
           },
           specialInstructions: variant.specialInstructions || [],
-          estimatedCost: rawMaterials.reduce((total, rm) => total + rm.totalCost, 0),
+          estimatedCost: rawMaterials.reduce((total, rm) => total + (rm.totalCost || 0), 0),
           actualCost: 0,
           createdBy: req.user.id
         });
 
         await workOrder.save();
-        createdWorkOrders.push(workOrder);
+        createdWorkOrders.push({
+          _id: workOrder._id,
+          workOrderNumber: workOrder.workOrderNumber,
+          stockItemName: workOrder.stockItemName,
+          variantId: workOrder.variantId,
+          variantAttributes: workOrder.variantAttributes,
+          quantity: workOrder.quantity,
+          rawMaterialCount: workOrder.rawMaterials.length,
+          status: workOrder.status
+        });
       }
     }
 
@@ -637,7 +712,9 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 
     res.json({
       success: true,
-      message: `Quotation approved by sales and ${createdWorkOrders.length} work order(s) created`,
+      message: createdWorkOrders.length > 0 
+        ? `Quotation approved by sales and ${createdWorkOrders.length} work order(s) created` 
+        : "Quotation approved by sales but no work orders were created (check variant matching)",
       request: request,
       createdWorkOrders: createdWorkOrders
     });
@@ -646,7 +723,8 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     console.error("Error processing sales approval:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while processing approval"
+      message: "Server error while processing approval",
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });

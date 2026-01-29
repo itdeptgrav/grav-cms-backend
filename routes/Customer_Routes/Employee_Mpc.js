@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const EmployeeMpc = require('../../models/Customer_Models/Employee_Mpc');
-const OrganizationDepartment = require('../../models/CMS_Models/Configuration/OrganizationDepartment');
 const StockItem = require('../../models/CMS_Models/Inventory/Products/StockItem');
 const jwt = require('jsonwebtoken');
 
@@ -31,21 +30,15 @@ const verifyCustomerToken = async (req, res, next) => {
 // GET all employees for the customer
 router.get('/', verifyCustomerToken, async (req, res) => {
   try {
-    const { search = '', department = '', status = '' } = req.query;
+    const { search = '', status = '' } = req.query;
 
     let filter = { customerId: req.customerId };
 
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: 'i' } },
-        { uin: { $regex: search, $options: 'i' } },
-        { department: { $regex: search, $options: 'i' } },
-        { designation: { $regex: search, $options: 'i' } }
+        { uin: { $regex: search, $options: 'i' } }
       ];
-    }
-
-    if (department) {
-      filter.department = department;
     }
 
     if (status) {
@@ -57,8 +50,7 @@ router.get('/', verifyCustomerToken, async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    // Get department stats
-    const departments = await EmployeeMpc.distinct('department', { customerId: req.customerId });
+    // Get status counts
     const statusCounts = await EmployeeMpc.aggregate([
       { $match: { customerId: req.customerId } },
       { $group: { _id: '$status', count: { $sum: 1 } } }
@@ -73,8 +65,7 @@ router.get('/', verifyCustomerToken, async (req, res) => {
       stats: {
         total: employees.length,
         active: activeCount,
-        inactive: inactiveCount,
-        departments: departments.filter(d => d) // Remove null/undefined
+        inactive: inactiveCount
       }
     });
 
@@ -87,97 +78,86 @@ router.get('/', verifyCustomerToken, async (req, res) => {
   }
 });
 
-// GET departments for the customer
-router.get('/departments', verifyCustomerToken, async (req, res) => {
+// GET available products for customer
+// GET available products for customer with search
+router.get('/products/available', verifyCustomerToken, async (req, res) => {
   try {
-    // Get organization departments for this customer
-    const orgDept = await OrganizationDepartment.findOne({
-      customerId: req.customerId,
-      status: 'active'
-    }).lean();
-
-    let departments = [];
-
-    if (orgDept && orgDept.departments) {
-      departments = orgDept.departments
-        .filter(dept => dept.status === 'active')
-        .map(dept => dept.name);
+    const { search = '' } = req.query;
+    
+    let filter = {
+      status: { $in: ["In Stock", "Low Stock"] }
+    };
+    
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { reference: { $regex: search, $options: 'i' } },
+        { category: { $regex: search, $options: 'i' } }
+      ];
     }
 
-    // Also include departments that already have employees (in case they were removed from org dept)
-    const employeeDepartments = await EmployeeMpc.distinct('department', {
-      customerId: req.customerId
-    });
-
-    // Merge and deduplicate
-    const allDepartments = [...new Set([...departments, ...employeeDepartments])].filter(d => d);
+    const products = await StockItem.find(filter)
+      .select('name reference category baseSalesPrice totalQuantityOnHand images variants')
+      .sort({ name: 1 })
+      .limit(50) // Limit results
+      .lean();
 
     res.status(200).json({
       success: true,
-      departments: allDepartments
+      products
     });
 
   } catch (error) {
-    console.error('Error fetching departments:', error);
+    console.error('Error fetching products:', error);
     res.status(500).json({
       success: false,
-      message: 'Server error while fetching departments'
+      message: 'Server error while fetching products'
     });
   }
 });
 
-// GET designations for a specific department
-router.get('/departments/:department/designations', verifyCustomerToken, async (req, res) => {
+// GET product variants
+router.get('/products/:id/variants', verifyCustomerToken, async (req, res) => {
   try {
-    const { department } = req.params;
+    const product = await StockItem.findById(req.params.id)
+      .select('name reference variants')
+      .lean();
 
-    // Get organization departments for this customer
-    const orgDept = await OrganizationDepartment.findOne({
-      customerId: req.customerId,
-      status: 'active'
-    }).lean();
-
-    let designations = [];
-
-    if (orgDept && orgDept.departments) {
-      const dept = orgDept.departments.find(d =>
-        d.name === decodeURIComponent(department) && d.status === 'active'
-      );
-
-      if (dept && dept.designations) {
-        designations = dept.designations
-          .filter(desig => desig.status === 'active')
-          .map(desig => desig.name);
-      }
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
     }
 
-    // Also include designations that already have employees in this department
-    const employeeDesignations = await EmployeeMpc.distinct('designation', {
-      customerId: req.customerId,
-      department: decodeURIComponent(department)
-    });
-
-    // Merge and deduplicate
-    const allDesignations = [...new Set([...designations, ...employeeDesignations])].filter(d => d);
+    const variants = product.variants || [];
 
     res.status(200).json({
       success: true,
-      designations: allDesignations
+      productName: product.name,
+      variants: variants.map(v => ({
+        _id: v._id,
+        sku: v.sku,
+        attributes: v.attributes,
+        salesPrice: v.salesPrice,
+        quantityOnHand: v.quantityOnHand,
+        images: v.images || []
+      }))
     });
 
   } catch (error) {
-    console.error('Error fetching designations:', error);
+    console.error('Error fetching product variants:', error);
     res.status(500).json({
       success: false,
-      message: 'Server error while fetching designations'
+      message: 'Server error while fetching product variants'
     });
   }
 });
 
-// CREATE new employee
+// CREATE single employee
 router.post('/', verifyCustomerToken, async (req, res) => {
   try {
-    const { name, uin, department, designation, gender, status } = req.body;
+    const { name, uin, gender, products } = req.body;
 
     // Validation
     if (!name || !name.trim()) {
@@ -194,52 +174,6 @@ router.post('/', verifyCustomerToken, async (req, res) => {
       });
     }
 
-    if (!department) {
-      return res.status(400).json({
-        success: false,
-        message: 'Department is required'
-      });
-    }
-
-    if (!designation) {
-      return res.status(400).json({
-        success: false,
-        message: 'Designation is required'
-      });
-    }
-
-
-    const existingEmployee = await EmployeeMpc.findOne({ uin: uin.toUpperCase() });
-    if (existingEmployee) {
-      return res.status(400).json({
-        success: false,
-        message: 'Employee with this UIN already exists'
-      });
-    }
-
-
-    const normalizeString = (str) => {
-      if (!str) return '';
-      return str.trim().split(' ')
-        .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-        .join(' ');
-    };
-
-
-    if (!department) {
-      return res.status(400).json({
-        success: false,
-        message: 'Department is required'
-      });
-    }
-
-    if (!designation) {
-      return res.status(400).json({
-        success: false,
-        message: 'Designation is required'
-      });
-    }
-
     if (!gender) {
       return res.status(400).json({
         success: false,
@@ -247,19 +181,68 @@ router.post('/', verifyCustomerToken, async (req, res) => {
       });
     }
 
+    if (!products || !Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'At least one product is required'
+      });
+    }
 
-    const formattedDepartment = normalizeString(department);
-    const formattedDesignation = normalizeString(designation);
+    // Check for existing UIN
+    const existingEmployee = await EmployeeMpc.findOne({ 
+      uin: uin.toUpperCase(),
+      customerId: req.customerId 
+    });
+    
+    if (existingEmployee) {
+      return res.status(400).json({
+        success: false,
+        message: 'Employee with this UIN already exists'
+      });
+    }
 
+    // Validate products
+    const validProducts = [];
+    for (const product of products) {
+      if (!product.productId) {
+        return res.status(400).json({
+          success: false,
+          message: 'Product ID is required'
+        });
+      }
+
+      const stockItem = await StockItem.findById(product.productId);
+      if (!stockItem) {
+        return res.status(400).json({
+          success: false,
+          message: `Product not found: ${product.productId}`
+        });
+      }
+
+      if (product.variantId) {
+        const variant = stockItem.variants.find(v => v._id.toString() === product.variantId);
+        if (!variant) {
+          return res.status(400).json({
+            success: false,
+            message: `Variant not found: ${product.variantId}`
+          });
+        }
+      }
+
+      validProducts.push({
+        productId: product.productId,
+        variantId: product.variantId || null,
+        quantity: product.quantity || 1
+      });
+    }
 
     const newEmployee = new EmployeeMpc({
       customerId: req.customerId,
       name: name.trim(),
       uin: uin.trim().toUpperCase(),
-      department: formattedDepartment,
-      designation: formattedDesignation,
-      gender: emp.gender,  // <-- Just pass the gender as-is, schema will format it
-      status: status || 'active',
+      gender: gender,
+      products: validProducts,
+      status: 'active',
       createdBy: req.customerId
     });
 
@@ -289,7 +272,6 @@ router.post('/', verifyCustomerToken, async (req, res) => {
 });
 
 // CREATE multiple employees (batch)
-// CREATE multiple employees (batch) - UPDATED VERSION
 router.post('/batch', verifyCustomerToken, async (req, res) => {
   try {
     const { employees } = req.body;
@@ -301,14 +283,12 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       });
     }
 
-    // Get existing UINs to check for duplicates
     const existingEmployees = await EmployeeMpc.find({
       customerId: req.customerId
     }).select('uin').lean();
 
     const existingUins = existingEmployees.map(emp => emp.uin.toUpperCase());
 
-    // Validate and process employees
     const validationErrors = [];
     const employeesToCreate = [];
     const skippedEmployees = [];
@@ -327,24 +307,19 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         continue;
       }
 
-      if (!emp.department) {
-        validationErrors.push(`Row ${rowNumber}: Department is required`);
-        continue;
-      }
-
-      if (!emp.designation) {
-        validationErrors.push(`Row ${rowNumber}: Designation is required`);
-        continue;
-      }
-
       if (!emp.gender) {
         validationErrors.push(`Row ${rowNumber}: Gender is required`);
         continue;
       }
 
+      if (!emp.products || !Array.isArray(emp.products) || emp.products.length === 0) {
+        validationErrors.push(`Row ${rowNumber}: At least one product is required`);
+        continue;
+      }
+
       const formattedUin = emp.uin.trim().toUpperCase();
 
-      // Check if UIN already exists in database
+      // Check for duplicates
       if (existingUins.includes(formattedUin)) {
         skippedEmployees.push({
           row: rowNumber,
@@ -355,7 +330,6 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         continue;
       }
 
-      // Check if UIN already exists in this batch (duplicate within the same file)
       const isDuplicateInBatch = employeesToCreate.some(e => e.uin === formattedUin);
       if (isDuplicateInBatch) {
         skippedEmployees.push({
@@ -367,23 +341,53 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         continue;
       }
 
-      // Add to create list
+      // Validate products
+      const validProducts = [];
+      for (const product of emp.products) {
+        if (!product.productId) {
+          validationErrors.push(`Row ${rowNumber}: Product ID is required`);
+          continue;
+        }
+
+        const stockItem = await StockItem.findById(product.productId);
+        if (!stockItem) {
+          validationErrors.push(`Row ${rowNumber}: Product not found`);
+          continue;
+        }
+
+        if (product.variantId) {
+          const variant = stockItem.variants.find(v => v._id.toString() === product.variantId);
+          if (!variant) {
+            validationErrors.push(`Row ${rowNumber}: Variant not found`);
+            continue;
+          }
+        }
+
+        validProducts.push({
+          productId: product.productId,
+          variantId: product.variantId || null,
+          quantity: product.quantity || 1
+        });
+      }
+
+      if (validProducts.length === 0) {
+        validationErrors.push(`Row ${rowNumber}: No valid products to assign`);
+        continue;
+      }
+
       employeesToCreate.push({
         customerId: req.customerId,
         name: emp.name.trim(),
         uin: formattedUin,
-        department: emp.department.trim(),
-        designation: emp.designation.trim(),
         gender: emp.gender,
+        products: validProducts,
         status: 'active',
         createdBy: req.customerId
       });
 
-      // Add to existing UINs list to prevent duplicates within batch
       existingUins.push(formattedUin);
     }
 
-    // If no valid employees to create
     if (employeesToCreate.length === 0) {
       return res.status(400).json({
         success: false,
@@ -397,12 +401,10 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       });
     }
 
-    // Create employees
     let createdEmployees = [];
     try {
       createdEmployees = await EmployeeMpc.insertMany(employeesToCreate, { ordered: false });
     } catch (error) {
-      // Handle individual document errors (like duplicate key errors)
       if (error.writeErrors && error.writeErrors.length > 0) {
         error.writeErrors.forEach(writeError => {
           if (writeError.code === 11000) {
@@ -415,13 +417,10 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
             });
           }
         });
-
-        // Get successfully inserted documents
         createdEmployees = error.insertedDocs || [];
       }
     }
 
-    // Return detailed response
     res.status(201).json({
       success: true,
       message: `Processed ${employees.length} employees`,
@@ -432,8 +431,8 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         validationErrors: validationErrors.length
       },
       createdCount: createdEmployees.length,
-      validationErrors: validationErrors.slice(0, 20), // Limit to first 20 errors
-      skippedEmployees: skippedEmployees.slice(0, 20), // Limit to first 20 skipped
+      validationErrors: validationErrors.slice(0, 20),
+      skippedEmployees: skippedEmployees.slice(0, 20),
       note: validationErrors.length > 20 || skippedEmployees.length > 20
         ? '... and more (only showing first 20 of each)'
         : null
@@ -441,135 +440,9 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
 
   } catch (error) {
     console.error('Error creating batch employees:', error);
-
     res.status(500).json({
       success: false,
-      message: 'Server error while processing employees',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// GET organization departments with stock item details
-// Update the GET organization departments route to include variant images
-router.get('/organization-departments', verifyCustomerToken, async (req, res) => {
-  try {
-    const orgDept = await OrganizationDepartment.findOne({
-      customerId: req.customerId,
-      status: 'active'
-    })
-      .populate("departments.designations.assignedStockItems.stockItemId", "name reference category images variants")
-      .lean();
-
-    if (!orgDept) {
-      return res.status(404).json({
-        success: false,
-        message: 'Organization departments not found'
-      });
-    }
-
-    // Process the organization departments to get variant images
-    const processedOrgDept = {
-      ...orgDept,
-      departments: orgDept.departments?.map(dept => ({
-        ...dept,
-        designations: dept.designations?.map(designation => ({
-          ...designation,
-          assignedStockItems: designation.assignedStockItems?.map(item => {
-            const stockItem = item.stockItemId;
-            if (!stockItem) {
-              return item;
-            }
-
-            let variantImages = [];
-            let variantInfo = null;
-
-            // If variantId exists, get variant-specific images
-            if (item.variantId && stockItem.variants) {
-              const variant = stockItem.variants.find(v =>
-                v._id && v._id.toString() === item.variantId.toString()
-              );
-
-              if (variant && variant.images && variant.images.length > 0) {
-                variantImages = variant.images;
-                variantInfo = {
-                  variantId: variant._id,
-                  variantName: variant.attributes?.map(a => a.value).join(" • ") || "Default",
-                  sku: variant.sku
-                };
-              } else if (stockItem.images && stockItem.images.length > 0) {
-                // Fallback to stock item images if variant has no images
-                variantImages = stockItem.images;
-                variantInfo = {
-                  variantId: item.variantId,
-                  variantName: item.variantName || "Default",
-                  note: "Using stock item images"
-                };
-              }
-            } else if (stockItem.images && stockItem.images.length > 0) {
-              // No variant selected, use stock item images
-              variantImages = stockItem.images;
-              variantInfo = {
-                variantName: "Default",
-                note: "No variant selected"
-              };
-            }
-
-            return {
-              ...item,
-              stockItemId: stockItem._id,
-              stockItemName: stockItem.name,
-              stockItemImages: stockItem.images || [],
-              variantImages: variantImages,
-              variantInfo: variantInfo
-            };
-          })
-        }))
-      }))
-    };
-
-    res.status(200).json({
-      success: true,
-      organizationDepartment: processedOrgDept
-    });
-
-  } catch (error) {
-    console.error('Error fetching organization departments:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error while fetching organization departments'
-    });
-  }
-});
-
-// GET stock items details for multiple IDs
-router.post('/stock-items/details', verifyCustomerToken, async (req, res) => {
-  try {
-    const { stockItemIds } = req.body;
-
-    if (!stockItemIds || !Array.isArray(stockItemIds)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Stock item IDs are required'
-      });
-    }
-
-    const stockItems = await StockItem.find({
-      _id: { $in: stockItemIds }
-    })
-      .select('name reference images')
-      .lean();
-
-    res.status(200).json({
-      success: true,
-      stockItems
-    });
-
-  } catch (error) {
-    console.error('Error fetching stock items details:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error while fetching stock items details'
+      message: 'Server error while processing employees'
     });
   }
 });
@@ -603,11 +476,10 @@ router.get('/:id', verifyCustomerToken, async (req, res) => {
   }
 });
 
-
+// UPDATE employee
 router.put('/:id', verifyCustomerToken, async (req, res) => {
   try {
-    const { name, uin, department, designation, gender, status } = req.body;
-
+    const { name, uin, gender, products, status } = req.body;
 
     let employee = await EmployeeMpc.findOne({
       _id: req.params.id,
@@ -621,11 +493,11 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
       });
     }
 
-
     if (uin && uin !== employee.uin) {
       const existingEmployee = await EmployeeMpc.findOne({
         uin: uin.toUpperCase(),
-        _id: { $ne: req.params.id }
+        _id: { $ne: req.params.id },
+        customerId: req.customerId
       });
 
       if (existingEmployee) {
@@ -636,15 +508,55 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
       }
     }
 
-
     if (name !== undefined) employee.name = name.trim();
     if (uin !== undefined) employee.uin = uin.trim().toUpperCase();
-    if (department !== undefined) employee.department = department.trim();
-    if (designation !== undefined) employee.designation = designation.trim();
-    if (gender !== undefined) {
-      // Remove gender validation and just use the setter from schema
-      employee.gender = gender;
+    if (gender !== undefined) employee.gender = gender;
+    
+    if (products !== undefined) {
+      if (!Array.isArray(products) || products.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'At least one product is required'
+        });
+      }
+
+      const validProducts = [];
+      for (const product of products) {
+        if (!product.productId) {
+          return res.status(400).json({
+            success: false,
+            message: 'Product ID is required'
+          });
+        }
+
+        const stockItem = await StockItem.findById(product.productId);
+        if (!stockItem) {
+          return res.status(400).json({
+            success: false,
+            message: `Product not found: ${product.productId}`
+          });
+        }
+
+        if (product.variantId) {
+          const variant = stockItem.variants.find(v => v._id.toString() === product.variantId);
+          if (!variant) {
+            return res.status(400).json({
+              success: false,
+              message: `Variant not found: ${product.variantId}`
+            });
+          }
+        }
+
+        validProducts.push({
+          productId: product.productId,
+          variantId: product.variantId || null,
+          quantity: product.quantity || 1
+        });
+      }
+
+      employee.products = validProducts;
     }
+    
     if (status !== undefined) employee.status = status;
     employee.updatedBy = req.customerId;
 
@@ -756,9 +668,7 @@ router.patch('/:id/status', verifyCustomerToken, async (req, res) => {
   }
 });
 
-// Add this new route to your backend API
-
-// GET specific stock item with variants
+// GET stock item details
 router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
   try {
     const stockItem = await StockItem.findById(req.params.id)
@@ -770,30 +680,6 @@ router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
         success: false,
         message: 'Stock item not found'
       });
-    }
-
-    // If a specific variant ID is requested via query parameter
-    const { variantId } = req.query;
-    if (variantId && stockItem.variants) {
-      const variant = stockItem.variants.find(v => v._id.toString() === variantId);
-      if (variant) {
-        // Return variant-specific images if available
-        const variantData = {
-          ...stockItem,
-          variantImages: variant.images || stockItem.images,
-          variantDetails: {
-            variantId: variant._id,
-            attributes: variant.attributes,
-            sku: variant.sku,
-            variantName: variant.attributes?.map(a => a.value).join(" • ") || "Default"
-          }
-        };
-
-        return res.status(200).json({
-          success: true,
-          stockItem: variantData
-        });
-      }
     }
 
     res.status(200).json({
@@ -814,18 +700,53 @@ router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
 router.get('/export/csv', verifyCustomerToken, async (req, res) => {
   try {
     const employees = await EmployeeMpc.find({ customerId: req.customerId })
-      .select('name uin department designation gender status createdAt')
+      .select('name uin gender products status createdAt')
       .sort({ createdAt: -1 })
       .lean();
 
-    const headers = ['Name', 'UIN', 'Department', 'Designation', 'Gender', 'Status', 'Created At'];
+    // Fetch product details for CSV
+    const employeesWithProductDetails = await Promise.all(
+      employees.map(async (emp) => {
+        const productDetails = [];
+        for (const product of emp.products) {
+          const stockItem = await StockItem.findById(product.productId)
+            .select('name reference')
+            .lean();
+          
+          if (stockItem) {
+            let variantInfo = '';
+            if (product.variantId && stockItem.variants) {
+              const variant = stockItem.variants.find(v => v._id.toString() === product.variantId);
+              if (variant && variant.attributes) {
+                variantInfo = variant.attributes.map(a => a.value).join(' | ');
+              }
+            }
+            
+            productDetails.push({
+              name: stockItem.name,
+              variant: variantInfo,
+              quantity: product.quantity,
+              reference: stockItem.reference
+            });
+          }
+        }
+        
+        return {
+          ...emp,
+          productDetails: productDetails
+        };
+      })
+    );
 
-    const csvRows = employees.map(emp => [
+    const headers = ['Name', 'UIN', 'Gender', 'Products', 'Status', 'Created At'];
+
+    const csvRows = employeesWithProductDetails.map(emp => [
       `"${emp.name}"`,
       emp.uin,
-      emp.department,
-      emp.designation,
       emp.gender,
+      emp.productDetails.map(p => 
+        `${p.name}${p.variant ? ` (${p.variant})` : ''} x${p.quantity}`
+      ).join('; '),
       emp.status,
       new Date(emp.createdAt).toISOString()
     ]);
