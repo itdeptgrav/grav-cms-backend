@@ -81,21 +81,30 @@ const rawMaterialAllocationSchema = new mongoose.Schema({
   rawItemId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "RawItem",
-    
+    required: true
   },
   name: {
     type: String,
     trim: true,
-    
+    required: true
   },
   sku: {
     type: String,
     trim: true,
-    
+    required: true
   },
+  // ADD THESE FIELDS FOR VARIANT-BASED RAW ITEMS
+  rawItemVariantId: { // Which variant of raw item is required
+    type: mongoose.Schema.Types.ObjectId,
+    default: null
+  },
+  rawItemVariantCombination: [{ // Specific variant combination needed
+    type: String,
+    trim: true
+  }],
   quantityRequired: {
     type: Number,
-    
+    required: true,
     min: 0
   },
   quantityAllocated: {
@@ -111,16 +120,16 @@ const rawMaterialAllocationSchema = new mongoose.Schema({
   unit: {
     type: String,
     trim: true,
-    
+    required: true
   },
   unitCost: {
     type: Number,
-    
+    required: true,
     min: 0
   },
   totalCost: {
     type: Number,
-    
+    required: true,
     min: 0
   },
   allocationStatus: {
@@ -187,26 +196,26 @@ const workOrderSchema = new mongoose.Schema({
   customerRequestId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "CustomerRequest",
-    
+
   },
   stockItemId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "StockItem",
-    
+
   },
   stockItemName: {
     type: String,
     trim: true,
-    
+
   },
   stockItemReference: {
     type: String,
     trim: true,
-    
+
   },
   variantId: {
     type: String,
-    
+
   },
   variantAttributes: [{
     name: {
@@ -220,7 +229,7 @@ const workOrderSchema = new mongoose.Schema({
   }],
   quantity: {
     type: Number,
-    
+
     min: 1
   },
   originalQuantity: { // To track if quantity was reduced
@@ -230,7 +239,7 @@ const workOrderSchema = new mongoose.Schema({
   customerId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Customer",
-    
+
   },
   customerName: {
     type: String,
@@ -243,7 +252,7 @@ const workOrderSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ["pending","planned", "scheduled", "ready_to_start", "in_progress", "paused", "completed", "cancelled", "delayed", "partial_allocation"],
+    enum: ["pending", "planned", "scheduled", "ready_to_start", "in_progress", "paused", "completed", "cancelled", "delayed", "partial_allocation"],
     default: "pending"
   },
   operations: [operationAssignmentSchema],
@@ -301,7 +310,7 @@ const workOrderSchema = new mongoose.Schema({
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "SalesDepartment",
-    
+
   },
   plannedBy: {
     type: mongoose.Schema.Types.ObjectId,
@@ -333,41 +342,6 @@ const workOrderSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
-workOrderSchema.pre("save", function(next) {
-  if (!this.workOrderNumber) {
-    const date = new Date();
-    const year = date.getFullYear().toString().slice(-2);
-    const month = (date.getMonth() + 1).toString().padStart(2, '0');
-    const day = date.getDate().toString().padStart(2, '0');
-    const random = Math.floor(1000 + Math.random() * 9000);
-    this.workOrderNumber = `WO-${year}${month}${day}-${random}`;
-  }
-  
-  // Set original quantity if not set
-  if (!this.originalQuantity) {
-    this.originalQuantity = this.quantity;
-  }
-  
-  this.estimatedCost = this.rawMaterials.reduce((total, item) => total + (item.totalCost || 0), 0);
-  
-  if (this.timeline) {
-    this.timeline.totalEstimatedSeconds = this.operations.reduce((total, op) => total + (op.estimatedTimeSeconds || 0), 0);
-    this.timeline.totalPlannedSeconds = this.operations.reduce((total, op) => total + (op.plannedTimeSeconds || op.estimatedTimeSeconds || 0), 0);
-    
-    // Calculate efficiency percentage (max 70% allowed)
-    if (this.timeline.totalEstimatedSeconds > 0) {
-      const efficiency = (this.timeline.totalEstimatedSeconds / this.timeline.totalPlannedSeconds) * 100;
-      this.timeline.efficiencyPercentage = Math.min(Math.max(efficiency, 0), 70);
-    }
-  }
-  
-  // Calculate max allowed time for each operation (70% efficiency)
-  this.operations.forEach(op => {
-    if (op.estimatedTimeSeconds > 0) {
-      op.maxAllowedSeconds = Math.ceil(op.estimatedTimeSeconds / 0.7); // Max 70% efficiency
-    }
-  });
-  
-});
+
 
 module.exports = mongoose.model("WorkOrder", workOrderSchema);

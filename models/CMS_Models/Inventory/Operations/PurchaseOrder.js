@@ -5,51 +5,84 @@ const mongoose = require("mongoose");
 const purchaseOrderItemSchema = new mongoose.Schema({
     rawItem: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: "RawItem"
+        ref: "RawItem",
+        required: [true, "Raw item is required"]
     },
     itemName: {
         type: String,
-        trim: true
+        trim: true,
+        required: [true, "Item name is required"]
     },
     sku: {
         type: String,
-        trim: true
+        trim: true,
+        default: ""
     },
     unit: {
         type: String,
-        trim: true
+        trim: true,
+        default: "unit"
     },
     quantity: {
         type: Number,
-        min: 0
+        min: [0, "Quantity cannot be negative"],
+        required: [true, "Quantity is required"]
     },
     unitPrice: {
         type: Number,
-        min: 0
+        min: [0, "Unit price cannot be negative"],
+        required: [true, "Unit price is required"]
     },
     totalPrice: {
         type: Number,
-        min: 0
+        min: [0, "Total price cannot be negative"],
+        default: 0
     },
     receivedQuantity: {
         type: Number,
-        min: 0,
+        min: [0, "Received quantity cannot be negative"],
         default: 0
     },
     pendingQuantity: {
         type: Number,
-        min: 0
+        min: [0, "Pending quantity cannot be negative"],
+        default: 0
     },
     status: {
         type: String,
         enum: ["PENDING", "PARTIALLY_RECEIVED", "COMPLETED", "CANCELLED"],
         default: "PENDING"
+    },
+
+    variantId: {
+        type: mongoose.Schema.Types.ObjectId
+    },
+   
+    receivedQuantity: {
+        type: Number,
+        min: [0, "Received quantity cannot be negative"],
+        default: 0
+    },
+    variantCombination: [{
+        type: String,
+        trim: true
+    }],
+    variantName: {
+        type: String,
+        trim: true,
+        default: ""
+    },
+    variantSku: {
+        type: String,
+        trim: true,
+        default: ""
     }
 }, { _id: true });
 
 const deliverySchema = new mongoose.Schema({
     deliveryDate: {
-        type: Date
+        type: Date,
+        default: Date.now
     },
     quantityReceived: {
         type: Number,
@@ -69,33 +102,32 @@ const deliverySchema = new mongoose.Schema({
     }
 }, { timestamps: true });
 
-
 const paymentSchema = new mongoose.Schema({
-  date: {
-    type: Date,
-    default: Date.now
-  },
-  amount: {
-    type: Number,
-    min: 0
-  },
-  paymentMethod: {
-    type: String,
-    enum: ["CASH", "BANK_TRANSFER", "CHEQUE", "ONLINE", "OTHER"],
-    default: "BANK_TRANSFER"
-  },
-  referenceNumber: {
-    type: String,
-    trim: true
-  },
-  notes: {
-    type: String,
-    trim: true
-  },
-  recordedBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "ProjectManager"
-  }
+    date: {
+        type: Date,
+        default: Date.now
+    },
+    amount: {
+        type: Number,
+        min: 0
+    },
+    paymentMethod: {
+        type: String,
+        enum: ["CASH", "BANK_TRANSFER", "CHEQUE", "ONLINE", "OTHER"],
+        default: "BANK_TRANSFER"
+    },
+    referenceNumber: {
+        type: String,
+        trim: true
+    },
+    notes: {
+        type: String,
+        trim: true
+    },
+    recordedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "ProjectManager"
+    }
 }, { timestamps: true });
 
 const purchaseOrderSchema = new mongoose.Schema({
@@ -103,15 +135,18 @@ const purchaseOrderSchema = new mongoose.Schema({
     poNumber: {
         type: String,
         trim: true,
-        unique: true
+        unique: true,
+        required: [true, "PO number is required"]
     },
     vendor: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: "Vendor"
+        ref: "Vendor",
+        required: [true, "Vendor is required"]
     },
     vendorName: {
         type: String,
-        trim: true
+        trim: true,
+        default: ""
     },
 
     // Order Details
@@ -120,7 +155,8 @@ const purchaseOrderSchema = new mongoose.Schema({
         default: Date.now
     },
     expectedDeliveryDate: {
-        type: Date
+        type: Date,
+        default: null
     },
 
     // Items
@@ -129,7 +165,8 @@ const purchaseOrderSchema = new mongoose.Schema({
     // Pricing
     subtotal: {
         type: Number,
-        min: 0
+        min: 0,
+        default: 0
     },
     taxRate: {
         type: Number,
@@ -154,7 +191,8 @@ const purchaseOrderSchema = new mongoose.Schema({
     },
     totalAmount: {
         type: Number,
-        min: 0
+        min: 0,
+        default: 0
     },
 
     // Delivery Tracking
@@ -166,7 +204,8 @@ const purchaseOrderSchema = new mongoose.Schema({
     },
     totalPending: {
         type: Number,
-        min: 0
+        min: 0,
+        default: 0
     },
 
     // Status
@@ -185,67 +224,38 @@ const purchaseOrderSchema = new mongoose.Schema({
     payments: [paymentSchema],
     paymentTerms: {
         type: String,
-        trim: true
+        trim: true,
+        default: ""
     },
 
     // Additional Info
     notes: {
         type: String,
-        trim: true
+        trim: true,
+        default: ""
     },
     termsConditions: {
         type: String,
-        trim: true
+        trim: true,
+        default: ""
     },
 
     // References
     createdBy: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: "ProjectManager"
+        ref: "ProjectManager",
+        required: [true, "Created by is required"]
     },
     approvedBy: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "ProjectManager"
     }
-}, { timestamps: true });
-
-// Calculate totals before saving
-purchaseOrderSchema.pre("save", function (next) {
-    // Calculate item totals
-    this.items.forEach(item => {
-        item.totalPrice = (item.quantity || 0) * (item.unitPrice || 0);
-        item.pendingQuantity = (item.quantity || 0) - (item.receivedQuantity || 0);
-
-        // Update item status
-        if (item.receivedQuantity >= item.quantity) {
-            item.status = "COMPLETED";
-        } else if (item.receivedQuantity > 0) {
-            item.status = "PARTIALLY_RECEIVED";
-        } else {
-            item.status = "PENDING";
-        }
-    });
-
-    // Calculate subtotal
-    this.subtotal = this.items.reduce((sum, item) => sum + (item.totalPrice || 0), 0);
-
-    // Calculate tax
-    this.taxAmount = (this.subtotal * (this.taxRate || 0)) / 100;
-
-    // Calculate total amount
-    this.totalAmount = this.subtotal + this.taxAmount + (this.shippingCharges || 0) - (this.discount || 0);
-
-    // Calculate total received and pending
-    this.totalReceived = this.items.reduce((sum, item) => sum + (item.receivedQuantity || 0), 0);
-    this.totalPending = this.items.reduce((sum, item) => sum + (item.pendingQuantity || 0), 0);
-
-    // Update overall PO status based on items
-    if (this.totalPending === 0 && this.items.length > 0) {
-        this.status = "COMPLETED";
-    } else if (this.totalReceived > 0 && this.totalPending > 0) {
-        this.status = "PARTIALLY_RECEIVED";
-    }
-
+}, {
+    timestamps: true,
+    // Disable strict mode to allow additional fields
+    strict: false
 });
+
+
 
 module.exports = mongoose.model("PurchaseOrder", purchaseOrderSchema);

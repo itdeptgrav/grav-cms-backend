@@ -164,20 +164,7 @@ router.post("/organization/:customerId/departments", async (req, res) => {
       });
     }
     
-    // Validate stock items exist
-    for (const department of departments || []) {
-      for (const designation of department.designations || []) {
-        for (const stockItem of designation.assignedStockItems || []) {
-          const stockItemExists = await StockItem.findById(stockItem.stockItemId);
-          if (!stockItemExists) {
-            return res.status(400).json({
-              success: false,
-              message: `Stock item with ID ${stockItem.stockItemId} not found`
-            });
-          }
-        }
-      }
-    }
+    
     
     // Check if organization department exists
     let organizationDepartment = await OrganizationDepartment.findOne({
@@ -185,22 +172,53 @@ router.post("/organization/:customerId/departments", async (req, res) => {
       status: "active"
     });
     
+    // Process departments with variant names
+    const processedDepartments = await Promise.all(
+      departments.map(async (dept) => {
+        const processedDesignations = await Promise.all(
+          (dept.designations || []).map(async (designation) => {
+            const processedStockItems = await Promise.all(
+              (designation.assignedStockItems || []).map(async (item) => {
+                const stockItem = await StockItem.findById(item.stockItemId);
+                let variantName = "Default";
+                
+                if (item.variantId && stockItem) {
+                  const variant = stockItem.variants.id(item.variantId);
+                  if (variant) {
+                    variantName = variant.attributes?.map(a => a.value).join(" • ") || "Default";
+                  }
+                }
+                
+                return {
+                  stockItemId: item.stockItemId,
+                  quantity: item.quantity || 1,
+                  variantId: item.variantId || null,
+                  variantName: variantName
+                };
+              })
+            );
+            
+            return {
+              name: designation.name,
+              description: designation.description || "",
+              status: designation.status || "active",
+              assignedStockItems: processedStockItems
+            };
+          })
+        );
+        
+        return {
+          name: dept.name,
+          description: dept.description || "",
+          status: dept.status || "active",
+          designations: processedDesignations
+        };
+      })
+    );
+    
     if (organizationDepartment) {
       // Update existing
-      organizationDepartment.departments = departments.map(dept => ({
-        name: dept.name,
-        description: dept.description || "",
-        status: dept.status || "active",
-        designations: dept.designations?.map(designation => ({
-          name: designation.name,
-          description: designation.description || "",
-          status: designation.status || "active",
-          assignedStockItems: designation.assignedStockItems?.map(item => ({
-            stockItemId: item.stockItemId,
-            quantity: item.quantity || 1
-          })) || []
-        })) || []
-      }));
+      organizationDepartment.departments = processedDepartments;
     } else {
       // Create new
       organizationDepartment = new OrganizationDepartment({
@@ -208,29 +226,20 @@ router.post("/organization/:customerId/departments", async (req, res) => {
         customerName: customer.name,
         customerEmail: customer.email,
         customerPhone: customer.phone,
-        departments: departments.map(dept => ({
-          name: dept.name,
-          description: dept.description || "",
-          status: dept.status || "active",
-          designations: dept.designations?.map(designation => ({
-            name: designation.name,
-            description: designation.description || "",
-            status: designation.status || "active",
-            assignedStockItems: designation.assignedStockItems?.map(item => ({
-              stockItemId: item.stockItemId,
-              quantity: item.quantity || 1
-            })) || []
-          })) || []
-        }))
+        departments: processedDepartments
       });
     }
     
     await organizationDepartment.save();
     
+    // Populate for response
+    const populatedOrg = await OrganizationDepartment.findById(organizationDepartment._id)
+      .populate("departments.designations.assignedStockItems.stockItemId", "name reference category");
+    
     res.json({
       success: true,
       message: "Organization departments saved successfully",
-      organizationDepartment
+      organizationDepartment: populatedOrg
     });
     
   } catch (error) {
@@ -274,7 +283,7 @@ router.delete("/organization/:customerId", async (req, res) => {
   }
 });
 
-// GET stock items for autocomplete
+// GET stock items for autocomplete WITH VARIANTS
 router.get("/stock-items/search", async (req, res) => {
   try {
     const { search = "" } = req.query;
@@ -289,13 +298,23 @@ router.get("/stock-items/search", async (req, res) => {
     }
     
     const stockItems = await StockItem.find(query)
-      .select("_id name reference category status")
-      .limit(20)
+      .select("_id name reference category status variants")
+      .limit(50)
       .lean();
+    
+    // Process stock items to include variant information
+    const processedStockItems = stockItems.map(item => ({
+      _id: item._id,
+      name: item.name,
+      reference: item.reference,
+      category: item.category || "Uncategorized",
+      status: item.status,
+      variants: item.variants || []
+    }));
     
     res.json({
       success: true,
-      stockItems
+      stockItems: processedStockItems
     });
     
   } catch (error) {
@@ -335,6 +354,290 @@ router.post("/organization/:customerId/activate", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Server error while activating organization departments"
+    });
+  }
+});
+
+// Add this new route after the existing routes:
+
+// UPDATE single department (for individual department editing)
+// PUT route for updating a specific department (for the new single department edit mode)
+router.put("/organization/:customerId/departments/single", async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { department } = req.body;
+    
+    console.log("PUT request received for department:", department);
+    
+    // Get customer details
+    const customer = await Customer.findById(customerId)
+      .select("_id name email phone")
+      .lean();
+    
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: "Customer not found"
+      });
+    }
+    
+    // Validate department data
+    if (!department) {
+      return res.status(400).json({
+        success: false,
+        message: "Department data is required"
+      });
+    }
+    
+    if (!department.name || !department.name.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Department name is required"
+      });
+    }
+    
+    // If department has _id, it's an update, otherwise it's an error
+    if (!department._id) {
+      return res.status(400).json({
+        success: false,
+        message: "Department ID is required for update"
+      });
+    }
+    
+    // Validate designations
+    for (const designation of department.designations || []) {
+      if (!designation.name || !designation.name.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: "Designation name is required"
+        });
+      }
+      
+      // Validate stock items if they exist
+      
+    }
+    
+    // Get existing organization department
+    let organizationDepartment = await OrganizationDepartment.findOne({
+      customerId: customerId,
+      status: "active"
+    });
+    
+    if (!organizationDepartment) {
+      // Create new organization department if it doesn't exist
+      organizationDepartment = new OrganizationDepartment({
+        customerId: customer._id,
+        customerName: customer.name,
+        customerEmail: customer.email,
+        customerPhone: customer.phone,
+        departments: []
+      });
+    }
+    
+    // Find the department index by _id
+    const departmentIndex = organizationDepartment.departments.findIndex(
+      dept => dept._id && dept._id.toString() === department._id
+    );
+    
+    // Process the department
+    const processedDepartment = await (async () => {
+      const processedDesignations = await Promise.all(
+        (department.designations || []).map(async (designation) => {
+          const processedStockItems = await Promise.all(
+            (designation.assignedStockItems || []).map(async (item) => {
+              const stockItem = await StockItem.findById(item.stockItemId);
+              let variantName = "Default";
+              
+              if (item.variantId && stockItem) {
+                const variant = stockItem.variants.id(item.variantId);
+                if (variant) {
+                  variantName = variant.attributes?.map(a => a.value).join(" • ") || "Default";
+                }
+              }
+              
+              return {
+                stockItemId: item.stockItemId,
+                quantity: item.quantity || 1,
+                variantId: item.variantId || null,
+                variantName: variantName
+              };
+            })
+          );
+          
+          return {
+            name: designation.name.trim(),
+            description: (designation.description || "").trim(),
+            status: designation.status || "active",
+            assignedStockItems: processedStockItems
+          };
+        })
+      );
+      
+      return {
+        _id: department._id, // Preserve the original _id
+        name: department.name.trim(),
+        description: (department.description || "").trim(),
+        status: department.status || "active",
+        designations: processedDesignations
+      };
+    })();
+    
+    if (departmentIndex !== -1) {
+      // Update existing department
+      organizationDepartment.departments[departmentIndex] = processedDepartment;
+    } else {
+      // Add as new department (this shouldn't happen for PUT, but handle it)
+      organizationDepartment.departments.push(processedDepartment);
+    }
+    
+    await organizationDepartment.save();
+    
+    // Populate for response
+    const populatedOrg = await OrganizationDepartment.findById(organizationDepartment._id)
+      .populate("departments.designations.assignedStockItems.stockItemId", "name reference category");
+    
+    res.json({
+      success: true,
+      message: departmentIndex !== -1 ? "Department updated successfully" : "Department added successfully",
+      organizationDepartment: populatedOrg
+    });
+    
+  } catch (error) {
+    console.error("Error updating department:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while updating department"
+    });
+  }
+});
+
+
+// POST route for creating a new department
+router.post("/organization/:customerId/departments/single", async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { department } = req.body;
+    
+    console.log("POST request received for new department:", department);
+    
+    // Get customer details
+    const customer = await Customer.findById(customerId)
+      .select("_id name email phone")
+      .lean();
+    
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: "Customer not found"
+      });
+    }
+    
+    // Validate department data
+    if (!department) {
+      return res.status(400).json({
+        success: false,
+        message: "Department data is required"
+      });
+    }
+    
+    if (!department.name || !department.name.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Department name is required"
+      });
+    }
+    
+    // Validate designations
+    for (const designation of department.designations || []) {
+      if (!designation.name || !designation.name.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: "Designation name is required"
+        });
+      }
+      
+      // Validate stock items if they exist
+      
+    }
+    
+    // Get existing organization department or create new
+    let organizationDepartment = await OrganizationDepartment.findOne({
+      customerId: customerId,
+      status: "active"
+    });
+    
+    if (!organizationDepartment) {
+      organizationDepartment = new OrganizationDepartment({
+        customerId: customer._id,
+        customerName: customer.name,
+        customerEmail: customer.email,
+        customerPhone: customer.phone,
+        departments: []
+      });
+    }
+    
+    // Process the new department
+    const processedDepartment = await (async () => {
+      const processedDesignations = await Promise.all(
+        (department.designations || []).map(async (designation) => {
+          const processedStockItems = await Promise.all(
+            (designation.assignedStockItems || []).map(async (item) => {
+              const stockItem = await StockItem.findById(item.stockItemId);
+              let variantName = "Default";
+              
+              if (item.variantId && stockItem) {
+                const variant = stockItem.variants.id(item.variantId);
+                if (variant) {
+                  variantName = variant.attributes?.map(a => a.value).join(" • ") || "Default";
+                }
+              }
+              
+              return {
+                stockItemId: item.stockItemId,
+                quantity: item.quantity || 1,
+                variantId: item.variantId || null,
+                variantName: variantName
+              };
+            })
+          );
+          
+          return {
+            name: designation.name.trim(),
+            description: (designation.description || "").trim(),
+            status: designation.status || "active",
+            assignedStockItems: processedStockItems
+          };
+        })
+      );
+      
+      return {
+        name: department.name.trim(),
+        description: (department.description || "").trim(),
+        status: department.status || "active",
+        designations: processedDesignations
+      };
+    })();
+    
+    // Add new department
+    organizationDepartment.departments.push(processedDepartment);
+    
+    await organizationDepartment.save();
+    
+    // Populate for response
+    const populatedOrg = await OrganizationDepartment.findById(organizationDepartment._id)
+      .populate("departments.designations.assignedStockItems.stockItemId", "name reference category");
+    
+    res.json({
+      success: true,
+      message: "Department created successfully",
+      organizationDepartment: populatedOrg
+    });
+    
+  } catch (error) {
+    console.error("Error creating department:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while creating department"
     });
   }
 });
