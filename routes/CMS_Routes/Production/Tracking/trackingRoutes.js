@@ -146,7 +146,7 @@ router.post("/scan", async (req, res) => {
       if (!currentOperation) {
         return res.status(400).json({
           success: false,
-          message: "No operation assigned to this machine for the work order",
+          message: "No operation assigned to this machine",
         });
       }
 
@@ -225,7 +225,7 @@ router.post("/scan", async (req, res) => {
       if (!operator) {
         return res.status(400).json({
           success: false,
-          message: `Employee with identityId ${scanId} not found or not authorized`,
+          message: `Employee with identityId ${scanId} not found`,
         });
       }
 
