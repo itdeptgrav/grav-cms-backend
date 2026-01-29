@@ -1,7 +1,23 @@
 const mongoose = require("mongoose");
 
+const productAssignmentSchema = new mongoose.Schema({
+  productId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "StockItem",
+    required: true
+  },
+  variantId: {
+    type: mongoose.Schema.Types.ObjectId
+  },
+  quantity: {
+    type: Number,
+    required: true,
+    min: 1,
+    default: 1
+  }
+}, { _id: false });
+
 const employeeMpcSchema = new mongoose.Schema({
-  // Customer reference
   customerId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Customer",
@@ -24,35 +40,9 @@ const employeeMpcSchema = new mongoose.Schema({
     index: true
   },
 
-  department: {
-    type: String,
-    required: true,
-    trim: true,
-    set: function (value) {
-      if (!value) return value;
-      return value.trim().split(' ')
-        .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-        .join(' ');
-    }
-  },
-
-
-  designation: {
-    type: String,
-    required: true,
-    trim: true,
-    set: function (value) {
-      if (!value) return value;
-      return value.trim().split(' ')
-        .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-        .join(' ');
-    }
-  },
-
-
   gender: {
     type: String,
-    enum: ["Male", "Female", "MALE", "FEMALE", "male", "female"],
+    enum: ["Male", "Female"],
     required: true,
     set: function (value) {
       if (!value) return value;
@@ -60,13 +50,14 @@ const employeeMpcSchema = new mongoose.Schema({
     }
   },
 
+  // Product assignments (replacing department/designation)
+  products: [productAssignmentSchema],
 
   status: {
     type: String,
     enum: ["active", "inactive"],
     default: "active"
   },
-
 
   notes: {
     type: String,
@@ -88,11 +79,9 @@ const employeeMpcSchema = new mongoose.Schema({
 });
 
 // Index for better query performance
-employeeMpcSchema.index({ customerId: 1, department: 1 });
 employeeMpcSchema.index({ customerId: 1, status: 1 });
 employeeMpcSchema.index({ customerId: 1, createdAt: -1 });
-
-// Compound index for unique employee per customer
+employeeMpcSchema.index({ customerId: 1, "products.productId": 1 });
 employeeMpcSchema.index({ customerId: 1, uin: 1 }, { unique: true });
 
 module.exports = mongoose.model("EmployeeMpc", employeeMpcSchema);
