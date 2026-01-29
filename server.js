@@ -117,7 +117,7 @@ const authRoutes = require("./routes/login");
 const employeeRoutes = require("./routes/HrRoutes/Employee-Section");
 
 // HR Profile Routes
-const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-section");
+const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
