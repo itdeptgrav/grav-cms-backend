@@ -46,7 +46,8 @@ const findWorkOrderByShortId = async (shortId) => {
   }
 };
 
-// POST - Process scan (MAJOR UPDATE)
+
+// POST - Process scan
 router.post("/scan", async (req, res) => {
   try {
     const { scanId, machineId, timeStamp } = req.body;
@@ -101,87 +102,23 @@ router.post("/scan", async (req, res) => {
       machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
     }
 
-    // Handle barcode scan
+    // -------------------- BARCODE SCAN (FAST + NO WORKORDER CHECK) --------------------
     if (isBarcodeId(scanId)) {
-      // Parse barcode
-      const barcodeInfo = parseBarcode(scanId);
-      if (!barcodeInfo.success) {
-        return res.status(400).json({
-          success: false,
-          message: barcodeInfo.error,
-        });
-      }
 
-      // Find work order to get operation details
-      const workOrder = await findWorkOrderByShortId(
-        barcodeInfo.workOrderShortId,
-      );
-      if (!workOrder) {
-        return res.status(400).json({
-          success: false,
-          message: "Work order not found for this barcode",
-        });
-      }
-
-      // Check which operation this machine is assigned to in the work order
-      let currentOperation = null;
-      let operationNumber = 1; // Default to first operation
-
-      // Find if this machine is assigned to any operation in the work order
-      for (let i = 0; i < workOrder.operations.length; i++) {
-        const op = workOrder.operations[i];
-        if (op.assignedMachine && op.assignedMachine.toString() === machineId) {
-          currentOperation = op;
-          operationNumber = i + 1;
-          break;
-        }
-      }
-
-      // If machine not assigned to any operation, use first operation as default
-      if (!currentOperation && workOrder.operations.length > 0) {
-        currentOperation = workOrder.operations[0];
-        operationNumber = 1;
-      }
-
-      if (!currentOperation) {
-        return res.status(400).json({
-          success: false,
-          message: "No operation assigned to this machine",
-        });
-      }
-
-      // Find or create operation tracking for this machine
-      let operationTracking = machineTracking.operationTracking.find(
-        (op) => op.operationNumber === operationNumber,
+      // Must have signed-in operator
+      const operationTracking = machineTracking.operationTracking.find(
+        (op) => op.currentOperatorIdentityId
       );
 
       if (!operationTracking) {
-        operationTracking = {
-          operationNumber: operationNumber,
-          operationType: currentOperation.operationType,
-          currentOperatorIdentityId: null,
-          operators: [],
-        };
-        machineTracking.operationTracking.push(operationTracking);
-        operationTracking =
-          machineTracking.operationTracking[
-            machineTracking.operationTracking.length - 1
-          ];
-      }
-
-      // Check if operator is signed in to this operation
-      if (!operationTracking.currentOperatorIdentityId) {
         return res.status(400).json({
           success: false,
-          message: `No operator is currently signed in to Operation ${operationNumber}`,
+          message: "No operator is signed in on this machine",
         });
       }
 
-      // Find current operator's active session for this operation
       const operatorTracking = operationTracking.operators.find(
-        (op) =>
-          op.operatorIdentityId ===
-            operationTracking.currentOperatorIdentityId && !op.signOutTime,
+        (op) => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
       );
 
       if (!operatorTracking) {
@@ -191,36 +128,32 @@ router.post("/scan", async (req, res) => {
         });
       }
 
-      // Add barcode scan
+      // Just save scan directly (NO WO SEARCH)
       operatorTracking.barcodeScans.push({
         barcodeId: scanId,
         timeStamp: scanTime,
-        operationNumber: operationNumber,
       });
 
       await trackingDoc.save();
 
+      const employeeName = operatorTracking.operatorName || "Unknown";
+      const scanCount = operatorTracking.barcodeScans.length;
+
       return res.json({
         success: true,
-        message: `Unit ${barcodeInfo.unitNumber} scanned for Operation ${operationNumber} (${currentOperation.operationType})`,
-        action: "barcode_scan",
-        barcodeId: scanId,
-        unitNumber: barcodeInfo.unitNumber,
-        operationNumber: operationNumber,
-        operationType: currentOperation.operationType,
-        machineId: machineId,
-        machineName: machine.name,
-        scanTime: scanTime,
+        message: "Barcode scanned",
+        employeeName,
+        scanCount,
       });
-    } else if (isEmployeeId(scanId)) {
-      // Handle employee sign in/out
+    }
 
-      // Find employee
+    // -------------------- EMPLOYEE SIGN IN/OUT --------------------
+    if (isEmployeeId(scanId)) {
       const operator = await Employee.findOne({
         identityId: scanId,
         needsToOperate: true,
         status: "active",
-      });
+      }).select("firstName lastName identityId");
 
       if (!operator) {
         return res.status(400).json({
@@ -229,20 +162,14 @@ router.post("/scan", async (req, res) => {
         });
       }
 
-      // Ask which operation the operator wants to work on (for multi-operation machines)
-      // For now, we'll use the first operation assigned to this machine
-      // In a real system, you'd have a UI to select operation
-
       let targetOperationNumber = 1;
       let targetOperationType = "Default Operation";
 
-      // Find work orders that have operations assigned to this machine
       const allWorkOrders = await WorkOrder.find({
         "operations.assignedMachine": machineId,
-      });
+      }).select("operations");
 
       if (allWorkOrders.length > 0) {
-        // Use the first work order's operation assigned to this machine
         const workOrder = allWorkOrders[0];
         const operation = workOrder.operations.find(
           (op) =>
@@ -254,7 +181,6 @@ router.post("/scan", async (req, res) => {
         }
       }
 
-      // Find or create operation tracking
       let operationTracking = machineTracking.operationTracking.find(
         (op) => op.operationNumber === targetOperationNumber,
       );
@@ -269,14 +195,16 @@ router.post("/scan", async (req, res) => {
         machineTracking.operationTracking.push(operationTracking);
         operationTracking =
           machineTracking.operationTracking[
-            machineTracking.operationTracking.length - 1
+          machineTracking.operationTracking.length - 1
           ];
       }
 
-      // Check if someone is already signed in to this operation
+      const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
+
+      // Someone already signed in
       if (operationTracking.currentOperatorIdentityId) {
         if (operationTracking.currentOperatorIdentityId === scanId) {
-          // Same operator - sign out
+          // Sign out
           const operatorTracking = operationTracking.operators.find(
             (op) => op.operatorIdentityId === scanId && !op.signOutTime,
           );
@@ -289,23 +217,20 @@ router.post("/scan", async (req, res) => {
 
             return res.json({
               success: true,
-              message: `Operator signed out from Operation ${targetOperationNumber}`,
-              action: "sign_out",
-              identityId: scanId,
-              operationNumber: targetOperationNumber,
-              machineId: machineId,
-              signOutTime: scanTime,
+              message: `Signed out`,
+              employeeName,
+              scanCount: 0,
             });
           }
-        } else {
-          // Different operator - sign out existing, sign in new
-          const existingOperatorId =
-            operationTracking.currentOperatorIdentityId;
-          const existingOperator = await Employee.findOne({
-            identityId: existingOperatorId,
-          });
 
-          // Sign out existing operator
+          return res.status(400).json({
+            success: false,
+            message: "Operator session not found",
+          });
+        } else {
+          // Different operator: sign out existing and sign in new
+          const existingOperatorId = operationTracking.currentOperatorIdentityId;
+
           const existingOperatorTracking = operationTracking.operators.find(
             (op) =>
               op.operatorIdentityId === existingOperatorId && !op.signOutTime,
@@ -315,9 +240,9 @@ router.post("/scan", async (req, res) => {
             existingOperatorTracking.signOutTime = scanTime;
           }
 
-          // Sign in new operator
           operationTracking.operators.push({
             operatorIdentityId: scanId,
+            operatorName: employeeName,
             signInTime: scanTime,
             signOutTime: null,
             barcodeScans: [],
@@ -329,66 +254,62 @@ router.post("/scan", async (req, res) => {
 
           return res.json({
             success: true,
-            message: `Operator ${operator.firstName} ${operator.lastName} signed in to Operation ${targetOperationNumber}. Previous operator was signed out.`,
-            action: "sign_in_with_signout",
-            identityId: scanId,
-            operationNumber: targetOperationNumber,
-            machineId: machineId,
-            signInTime: scanTime,
-            previousOperatorId: existingOperatorId,
+            message: `Signed in`,
+            employeeName,
+            scanCount: 0,
           });
         }
-      } else {
-        // No one signed in - sign in new operator
-        // Check if operator has existing session in this operation
-        const existingOperator = operationTracking.operators.find(
-          (op) => op.operatorIdentityId === scanId && !op.signOutTime,
-        );
+      }
 
-        if (existingOperator) {
-          return res.status(400).json({
-            success: false,
-            message: "Operator already signed in and not signed out",
-          });
-        }
+      // No one signed in -> sign in
+      const existingOperator = operationTracking.operators.find(
+        (op) => op.operatorIdentityId === scanId && !op.signOutTime,
+      );
 
-        // Sign in new operator
-        operationTracking.operators.push({
-          operatorIdentityId: scanId,
-          signInTime: scanTime,
-          signOutTime: null,
-          barcodeScans: [],
-        });
-
-        operationTracking.currentOperatorIdentityId = scanId;
-
-        await trackingDoc.save();
-
-        return res.json({
-          success: true,
-          message: `Operator ${operator.firstName} ${operator.lastName} signed in to Operation ${targetOperationNumber}`,
-          action: "sign_in",
-          identityId: scanId,
-          operationNumber: targetOperationNumber,
-          machineId: machineId,
-          signInTime: scanTime,
+      if (existingOperator) {
+        return res.status(400).json({
+          success: false,
+          message: "Operator already signed in and not signed out",
         });
       }
-    } else {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid scan ID format",
+
+      operationTracking.operators.push({
+        operatorIdentityId: scanId,
+        operatorName: employeeName,
+        signInTime: scanTime,
+        signOutTime: null,
+        barcodeScans: [],
+      });
+
+      operationTracking.currentOperatorIdentityId = scanId;
+
+      await trackingDoc.save();
+
+      return res.json({
+        success: true,
+        message: `Signed in`,
+        employeeName,
+        scanCount: 0,
       });
     }
+
+    // -------------------- INVALID --------------------
+    return res.status(400).json({
+      success: false,
+      message: "Invalid scan ID format",
+    });
   } catch (error) {
     console.error("Error processing scan:", error);
     res.status(500).json({
       success: false,
       message: "Server error while processing scan",
-      error: error.message,
     });
   }
 });
+
+
+
+
 
 router.get("/status/:date", async (req, res) => {
   try {
@@ -443,13 +364,13 @@ router.get("/status/:date", async (req, res) => {
 
           currentOperator = operator
             ? {
-                identityId: operator.identityId,
-                name: `${operator.firstName} ${operator.lastName}`,
-              }
+              identityId: operator.identityId,
+              name: `${operator.firstName} ${operator.lastName}`,
+            }
             : {
-                identityId: op.currentOperatorIdentityId,
-                name: "Unknown Operator",
-              };
+              identityId: op.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
         }
 
         // Get all operator details for this operation
@@ -566,13 +487,13 @@ router.get("/status/today", async (req, res) => {
 
           currentOperator = operator
             ? {
-                identityId: operator.identityId,
-                name: `${operator.firstName} ${operator.lastName}`,
-              }
+              identityId: operator.identityId,
+              name: `${operator.firstName} ${operator.lastName}`,
+            }
             : {
-                identityId: op.currentOperatorIdentityId,
-                name: "Unknown Operator",
-              };
+              identityId: op.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
         }
 
         // Get all operator details for this operation
@@ -681,13 +602,13 @@ router.get("/machine/:machineId/operations", async (req, res) => {
 
           currentOperator = operator
             ? {
-                identityId: operator.identityId,
-                name: `${operator.firstName} ${operator.lastName}`,
-              }
+              identityId: operator.identityId,
+              name: `${operator.firstName} ${operator.lastName}`,
+            }
             : {
-                identityId: op.currentOperatorIdentityId,
-                name: "Unknown Operator",
-              };
+              identityId: op.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
         }
 
         // Calculate scans for this operation
