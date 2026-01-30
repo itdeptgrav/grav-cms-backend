@@ -35,6 +35,41 @@ const parseBarcode = (barcodeId) => {
   }
 };
 
+// Helper to determine unit completion based on scan sequence
+const determineUnitStatus = (unitNumber, allScans) => {
+  // Get all units that have been scanned
+  const scannedUnits = [...new Set(allScans.map((s) => s.unitNumber))];
+
+  // Sort units by their first scan time
+  scannedUnits.sort((a, b) => {
+    const firstScanA = allScans.find((s) => s.unitNumber === a)?.timestamp;
+    const firstScanB = allScans.find((s) => s.unitNumber === b)?.timestamp;
+    return new Date(firstScanA) - new Date(firstScanB);
+  });
+
+  // Find the current/last scanned unit
+  const lastScannedUnit =
+    scannedUnits.length > 0 ? scannedUnits[scannedUnits.length - 1] : 0;
+
+  // Check if this unit has been scanned
+  const hasScans = allScans.some((s) => s.unitNumber === unitNumber);
+
+  if (!hasScans) {
+    return { status: "pending", isCurrent: false };
+  }
+
+  if (unitNumber === lastScannedUnit) {
+    return { status: "in_progress", isCurrent: true };
+  } else if (
+    scannedUnits.includes(unitNumber) &&
+    unitNumber < lastScannedUnit
+  ) {
+    return { status: "completed", isCurrent: false };
+  } else {
+    return { status: "in_progress", isCurrent: false };
+  }
+};
+
 // Find work order by short ID
 const findWorkOrderByShortId = async (shortId) => {
   try {

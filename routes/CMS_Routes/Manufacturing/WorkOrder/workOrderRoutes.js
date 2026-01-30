@@ -1080,13 +1080,3 @@ router.post("/:id/start-production", async (req, res) => {
 
 // Export the router
 module.exports = router;
-
-// Ok so basically as you can see there is an functionality for the generating barcodes , that's basically need to modify ok because my concept of generating barcode is now goona changed ok..
-
-// Basically the new concept of generating barcode is panel wise ok.
-
-// -> Means just thing that one Wo is having 20 quantity of tshirt ok and that product(Tshirt) is having 7 pannels(already defined in the stock item schema)(means which is happening at the time of cutting) so 20 quantity means 20*7 = 140 peace of barcode will goona generate ok...
-
-// -> and as you know that we are assigning the operation to each machine at the time of planning the wo, hence from the machine Id we can track the operation ok.so that barcode will represent which Wo and what is the quantity/unit number(means for this case it will represent which quantity out of this 20).
-
-// -> So hope you understood ok so change the
