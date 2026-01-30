@@ -24,6 +24,7 @@
     "mongodb": "^7.0.0",
     "mongoose": "^8.19.3",
     "pdfkit": "^0.17.2",
+    "socket.io": "^4.8.3",
     "stream-buffers": "^3.0.3",
     "streamifier": "^0.1.1"
   },
