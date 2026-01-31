@@ -97,7 +97,7 @@ const isBarcodeId = (id) => {
 };
 
 const isEmployeeId = (id) => {
-  return id && typeof id === "string" && id.startsWith("GR-");
+  return id && typeof id === "string" && id.startsWith("GR");
 };
 
 // Parse barcode to extract work order ID and unit number
