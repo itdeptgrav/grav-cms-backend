@@ -5,6 +5,9 @@ const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
 require("dotenv").config();
 
+const http = require('http');
+const { Server } = require('socket.io');
+
 const app = express();
 
 const allowedOrigins = [
@@ -32,6 +35,44 @@ app.use(
 app.use(express.json({ limit: "50mb" })); // Increased from default 100kb
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
+
+
+// Create HTTP server
+const server = http.createServer(app);
+
+// Initialize Socket.IO with CORS configuration
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    credentials: true,
+    methods: ["GET", "POST"]
+  },
+  transports: ['websocket', 'polling']
+});
+
+// WebSocket connection handling
+io.on('connection', (socket) => {
+  console.log('✅ New WebSocket client connected:', socket.id);
+  
+  // Join a specific work order room
+  socket.on('join-workorder', (workOrderId) => {
+    socket.join(`workorder-${workOrderId}`);
+    console.log(`Socket ${socket.id} joined room workorder-${workOrderId}`);
+  });
+  
+  // Leave a work order room
+  socket.on('leave-workorder', (workOrderId) => {
+    socket.leave(`workorder-${workOrderId}`);
+    console.log(`Socket ${socket.id} left room workorder-${workOrderId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('❌ WebSocket client disconnected:', socket.id);
+  });
+});
+
+// Make io accessible to routes
+app.set('io', io);
 
 const connectDB = async () => {
   try {
@@ -296,6 +337,7 @@ app.get("/", (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
+  console.log(`✅ WebSocket server is ready`);
 });

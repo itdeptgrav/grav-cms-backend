@@ -7,6 +7,90 @@ const Employee = require("../../../../models/Employee");
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 
+let io;
+
+
+
+// Initialize Socket.IO instance
+router.use((req, res, next) => {
+  io = req.app.get('io');
+  next();
+});
+
+// Helper function to emit tracking updates
+const emitTrackingUpdate = async (date) => {
+  if (!io) return;
+
+  try {
+    // Fetch fresh tracking data
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+
+    const trackingDoc = await ProductionTracking.findOne({
+      date: queryDate,
+    })
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    if (!trackingDoc) return;
+
+    // Calculate total scans
+    let totalScans = 0;
+    trackingDoc.machines.forEach(machine => {
+      machine.operationTracking?.forEach(op => {
+        totalScans += op.operators?.reduce(
+          (total, operator) => total + (operator.barcodeScans?.length || 0),
+          0
+        ) || 0;
+      });
+    });
+
+    // Emit to all interested clients
+    io.emit('tracking-data-updated', {
+      date: trackingDoc.date,
+      totalScans: totalScans,
+      totalMachines: trackingDoc.machines?.length || 0,
+      timestamp: new Date()
+    });
+
+    // Also emit to specific work orders if we can identify them
+    // Collect all work orders from barcode scans
+    const workOrderIds = new Set();
+
+    trackingDoc.machines.forEach(machine => {
+      machine.operationTracking?.forEach(op => {
+        op.operators?.forEach(operator => {
+          operator.barcodeScans?.forEach(scan => {
+            if (scan.barcodeId && scan.barcodeId.startsWith('WO-')) {
+              const parts = scan.barcodeId.split('-');
+              if (parts.length >= 3) {
+                const shortId = parts[1];
+                // Find work order by short ID
+                workOrderIds.add(shortId);
+              }
+            }
+          });
+        });
+      });
+    });
+
+    // Convert short IDs to actual work order IDs and emit
+    for (const shortId of workOrderIds) {
+      const workOrder = await findWorkOrderByShortId(shortId);
+      if (workOrder) {
+        io.to(`workorder-${workOrder._id}`).emit('workorder-tracking-update', {
+          workOrderId: workOrder._id,
+          date: trackingDoc.date,
+          timestamp: new Date()
+        });
+      }
+    }
+
+  } catch (error) {
+    console.error('Error emitting tracking update:', error);
+  }
+};
+
 // Helper functions
 const isBarcodeId = (id) => {
   return id && typeof id === "string" && id.startsWith("WO-");
@@ -83,6 +167,7 @@ const findWorkOrderByShortId = async (shortId) => {
 
 
 // POST - Process scan
+// POST - Process scan
 router.post("/scan", async (req, res) => {
   try {
     const { scanId, machineId, timeStamp } = req.body;
@@ -139,10 +224,9 @@ router.post("/scan", async (req, res) => {
 
     // -------------------- BARCODE SCAN (FAST + NO WORKORDER CHECK) --------------------
     if (isBarcodeId(scanId)) {
-
       // Must have signed-in operator
       const operationTracking = machineTracking.operationTracking.find(
-        (op) => op.currentOperatorIdentityId
+        (op) => op.currentOperatorIdentityId,
       );
 
       if (!operationTracking) {
@@ -153,7 +237,9 @@ router.post("/scan", async (req, res) => {
       }
 
       const operatorTracking = operationTracking.operators.find(
-        (op) => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
+        (op) =>
+          op.operatorIdentityId === operationTracking.currentOperatorIdentityId &&
+          !op.signOutTime,
       );
 
       if (!operatorTracking) {
@@ -174,11 +260,113 @@ router.post("/scan", async (req, res) => {
       const employeeName = operatorTracking.operatorName || "Unknown";
       const scanCount = operatorTracking.barcodeScans.length;
 
+      // ============ WEBSOCKET EMIT WITH ERROR HANDLING ============
+      // If it's a barcode scan, emit work order specific update
+      try {
+        const parsedBarcode = parseBarcode(scanId);
+        if (parsedBarcode.success) {
+          console.log("📡 Parsed barcode data:", {
+            barcodeId: scanId,
+            shortId: parsedBarcode.workOrderShortId,
+            unitNumber: parsedBarcode.unitNumber,
+            operationNumber: parsedBarcode.operationNumber,
+          });
+
+          const workOrder = await findWorkOrderByShortId(
+            parsedBarcode.workOrderShortId,
+          );
+
+          if (workOrder) {
+            console.log("✅ Found work order:", workOrder._id);
+            console.log("📡 Work order number:", workOrder.workOrderNumber);
+
+            if (io) {
+              const roomName = `workorder-${workOrder._id}`;
+
+              // Emit to specific work order room
+              io.to(roomName).emit("workorder-scan-update", {
+                workOrderId: workOrder._id,
+                workOrderNumber: workOrder.workOrderNumber,
+                barcodeId: scanId,
+                unitNumber: parsedBarcode.unitNumber,
+                operationNumber: parsedBarcode.operationNumber,
+                machineId: machineId,
+                machineName: machine.name,
+                timestamp: scanTime,
+                employeeName: employeeName,
+                type: "scan",
+                scanCount: scanCount,
+              });
+
+              console.log(`📢 Emitted to room: ${roomName}`);
+
+              // Also emit general tracking update
+              io.emit("tracking-data-updated", {
+                date: scanDate,
+                timestamp: new Date(),
+                message: "New scan recorded",
+                workOrderId: workOrder._id,
+                unitNumber: parsedBarcode.unitNumber,
+              });
+
+              console.log("📢 Emitted general tracking update");
+            } else {
+              console.warn("⚠️ WebSocket (io) not available");
+            }
+          } else {
+            console.warn("⚠️ Work order not found for short ID:", parsedBarcode.workOrderShortId);
+
+            // Try to find work order by full ID if short ID doesn't work
+            // If your barcode contains the full work order ID, try that:
+            if (scanId.includes("WO-")) {
+              const parts = scanId.split("-");
+              if (parts.length >= 2) {
+                // Try to find by full ID (parts[1] might be the full Mongo ID)
+                const possibleWorkOrderId = parts[1];
+                try {
+                  const workOrderByFullId = await WorkOrder.findById(possibleWorkOrderId);
+                  if (workOrderByFullId && io) {
+                    io.to(`workorder-${workOrderByFullId._id}`).emit(
+                      "workorder-scan-update",
+                      {
+                        workOrderId: workOrderByFullId._id,
+                        workOrderNumber: workOrderByFullId.workOrderNumber,
+                        barcodeId: scanId,
+                        unitNumber: parsedBarcode.unitNumber,
+                        operationNumber: parsedBarcode.operationNumber,
+                        machineId: machineId,
+                        machineName: machine.name,
+                        timestamp: scanTime,
+                        employeeName: employeeName,
+                        type: "scan",
+                        scanCount: scanCount,
+                      },
+                    );
+                    console.log(`📢 Emitted using full ID to room: workorder-${workOrderByFullId._id}`);
+                  }
+                } catch (idError) {
+                  console.error("Error finding work order by full ID:", idError);
+                }
+              }
+            }
+          }
+        } else {
+          console.warn("⚠️ Failed to parse barcode:", parsedBarcode.error);
+        }
+      } catch (wsError) {
+        console.error("❌ Error emitting WebSocket event:", wsError);
+        // Don't fail the scan if WebSocket fails - scan was already saved
+      }
+      // ============ END WEBSOCKET EMIT ============
+
       return res.json({
         success: true,
-        message: "Barcode scanned",
+        message: "New Barcode scanned",
         employeeName,
         scanCount,
+        barcodeData: {
+          barcodeId: scanId,
+        },
       });
     }
 
@@ -250,12 +438,28 @@ router.post("/scan", async (req, res) => {
 
             await trackingDoc.save();
 
+            // Emit operator sign-out event
+            try {
+              if (io) {
+                io.emit("operator-status-update", {
+                  machineId: machineId,
+                  machineName: machine.name,
+                  employeeName: employeeName,
+                  status: "signed_out",
+                  timestamp: new Date(),
+                });
+              }
+            } catch (wsError) {
+              console.error("Error emitting operator status update:", wsError);
+            }
+
             return res.json({
               success: true,
-              message: `Signed out`,
+              message: `${employeeName} signed out from ${machine.name}`,
               employeeName,
               scanCount: 0,
             });
+
           }
 
           return res.status(400).json({
@@ -287,12 +491,28 @@ router.post("/scan", async (req, res) => {
 
           await trackingDoc.save();
 
+          // Emit operator sign-in event
+          try {
+            if (io) {
+              io.emit("operator-status-update", {
+                machineId: machineId,
+                machineName: machine.name,
+                employeeName: employeeName,
+                status: `${employeeName} signed in to ${machine.name}`,
+                timestamp: new Date(),
+              });
+            }
+          } catch (wsError) {
+            console.error("Error emitting operator status update:", wsError);
+          }
+
           return res.json({
             success: true,
-            message: `Signed in`,
+            message: `${employeeName} signed in to ${machine.name}`,
             employeeName,
             scanCount: 0,
           });
+
         }
       }
 
@@ -320,6 +540,21 @@ router.post("/scan", async (req, res) => {
 
       await trackingDoc.save();
 
+      // Emit operator sign-in event
+      try {
+        if (io) {
+          io.emit("operator-status-update", {
+            machineId: machineId,
+            machineName: machine.name,
+            employeeName: employeeName,
+            status: "signed_in",
+            timestamp: new Date(),
+          });
+        }
+      } catch (wsError) {
+        console.error("Error emitting operator status update:", wsError);
+      }
+
       return res.json({
         success: true,
         message: `Signed in`,
@@ -338,10 +573,10 @@ router.post("/scan", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Server error while processing scan",
+      error: error.message,
     });
   }
 });
-
 
 
 
