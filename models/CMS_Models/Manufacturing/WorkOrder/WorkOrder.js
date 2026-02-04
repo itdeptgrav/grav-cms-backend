@@ -1,4 +1,4 @@
-// models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js - UPDATED
+// models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js - UPDATED WITH PRODUCTION COMPLETION
 
 const mongoose = require("mongoose");
 
@@ -53,7 +53,7 @@ const operationAssignmentSchema = new mongoose.Schema(
       trim: true,
       default: null,
     },
-    additionalMachines: [additionalMachineSchema], // Support for multiple machines
+    additionalMachines: [additionalMachineSchema],
     estimatedTimeSeconds: {
       type: Number,
       min: 0,
@@ -65,7 +65,6 @@ const operationAssignmentSchema = new mongoose.Schema(
       default: 0,
     },
     maxAllowedSeconds: {
-      // For 70% efficiency constraint
       type: Number,
       min: 0,
       default: 0,
@@ -101,15 +100,12 @@ const rawMaterialAllocationSchema = new mongoose.Schema(
       trim: true,
       required: true,
     },
-    // ADD THESE FIELDS FOR VARIANT-BASED RAW ITEMS
     rawItemVariantId: {
-      // Which variant of raw item is required
       type: mongoose.Schema.Types.ObjectId,
       default: null,
     },
     rawItemVariantCombination: [
       {
-        // Specific variant combination needed
         type: String,
         trim: true,
       },
@@ -199,13 +195,262 @@ const timelineSchema = new mongoose.Schema({
     min: 0,
   },
   efficiencyPercentage: {
-    // Efficiency used (max 70%)
     type: Number,
     default: 100,
     min: 0,
     max: 100,
   },
 });
+
+// NEW: Production Completion Tracking Schema
+const operationCompletionSchema = new mongoose.Schema(
+  {
+    operationNumber: {
+      type: Number,
+      required: true,
+    },
+    operationType: {
+      type: String,
+      trim: true,
+    },
+    machineType: {
+      type: String,
+      trim: true,
+    },
+    completedQuantity: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    totalQuantity: {
+      type: Number,
+      required: true,
+    },
+    completionPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    status: {
+      type: String,
+      enum: ["pending", "in_progress", "completed"],
+      default: "pending",
+    },
+    assignedMachines: [
+      {
+        machineId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Machine",
+        },
+        machineName: String,
+        machineSerial: String,
+      },
+    ],
+  },
+  { _id: false },
+);
+
+const operatorDetailSchema = new mongoose.Schema(
+  {
+    operatorId: {
+      type: String,
+      required: true,
+    },
+    operatorName: {
+      type: String,
+      required: true,
+    },
+    operationNumber: {
+      type: Number,
+      required: true,
+    },
+    operationType: {
+      type: String,
+    },
+    machineId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Machine",
+    },
+    machineName: {
+      type: String,
+    },
+    totalScans: {
+      type: Number,
+      default: 0,
+    },
+    signInTime: {
+      type: Date,
+    },
+    signOutTime: {
+      type: Date,
+    },
+  },
+  { _id: false },
+);
+
+const efficiencyMetricSchema = new mongoose.Schema(
+  {
+    operationNumber: {
+      type: Number,
+      required: true,
+    },
+    operationType: {
+      type: String,
+    },
+    machineId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Machine",
+    },
+    machineName: {
+      type: String,
+    },
+    operatorId: {
+      type: String,
+    },
+    operatorName: {
+      type: String,
+    },
+    unitsCompleted: {
+      type: Number,
+      default: 0,
+    },
+    avgTimePerUnit: {
+      type: Number, // in seconds
+      default: 0,
+    },
+    estimatedTimePerUnit: {
+      type: Number,
+      default: 0,
+    },
+    plannedTimePerUnit: {
+      type: Number,
+      default: 0,
+    },
+    efficiencyPercentage: {
+      type: Number,
+      default: 0,
+    },
+    utilizationRate: {
+      type: Number, // percentage of productive time vs total session time
+      default: 0,
+    },
+    totalProductiveTime: {
+      type: Number, // seconds
+      default: 0,
+    },
+    totalSessionTime: {
+      type: Number, // seconds
+      default: 0,
+    },
+  },
+  { _id: false },
+);
+
+const timeMetricSchema = new mongoose.Schema(
+  {
+    operationNumber: {
+      type: Number,
+      required: true,
+    },
+    operationType: {
+      type: String,
+    },
+    machineId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Machine",
+    },
+    machineName: {
+      type: String,
+    },
+    avgCompletionTimeSeconds: {
+      type: Number,
+      default: 0,
+    },
+    minCompletionTimeSeconds: {
+      type: Number,
+      default: 0,
+    },
+    maxCompletionTimeSeconds: {
+      type: Number,
+      default: 0,
+    },
+    totalUnitsAnalyzed: {
+      type: Number,
+      default: 0,
+    },
+  },
+  { _id: false },
+);
+
+const invalidScanSchema = new mongoose.Schema(
+  {
+    barcodeId: {
+      type: String,
+      required: true,
+    },
+    timestamp: {
+      type: Date,
+      required: true,
+    },
+    unitNumber: {
+      type: Number,
+      default: null,
+    },
+    operatorId: {
+      type: String,
+    },
+    operatorName: {
+      type: String,
+    },
+    machineId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Machine",
+    },
+    machineName: {
+      type: String,
+    },
+    reason: {
+      type: String,
+      enum: ["invalid_format", "exceeds_quantity", "duplicate", "other"],
+      default: "other",
+    },
+    details: {
+      type: String,
+    },
+  },
+  { _id: false },
+);
+
+const productionCompletionSchema = new mongoose.Schema(
+  {
+    overallCompletedQuantity: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    overallCompletionPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    operationCompletion: [operationCompletionSchema],
+    operatorDetails: [operatorDetailSchema],
+    efficiencyMetrics: [efficiencyMetricSchema],
+    timeMetrics: [timeMetricSchema],
+    invalidScansCount: {
+      type: Number,
+      default: 0,
+    },
+    invalidScans: [invalidScanSchema],
+    lastSyncedAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  { _id: false },
+);
 
 const workOrderSchema = new mongoose.Schema(
   {
@@ -247,11 +492,9 @@ const workOrderSchema = new mongoose.Schema(
     ],
     quantity: {
       type: Number,
-
       min: 1,
     },
     originalQuantity: {
-      // To track if quantity was reduced
       type: Number,
       min: 1,
     },
@@ -287,6 +530,10 @@ const workOrderSchema = new mongoose.Schema(
     operations: [operationAssignmentSchema],
     rawMaterials: [rawMaterialAllocationSchema],
     timeline: timelineSchema,
+
+    // NEW: Production completion tracking (populated by cron job)
+    productionCompletion: productionCompletionSchema,
+
     specialInstructions: [
       {
         type: String,
@@ -381,12 +628,10 @@ const workOrderSchema = new mongoose.Schema(
       default: "",
     },
     isSplitOrder: {
-      // Flag if this was created from split
       type: Boolean,
       default: false,
     },
     parentWorkOrderId: {
-      // Reference to original WO if split
       type: mongoose.Schema.Types.ObjectId,
       ref: "WorkOrder",
       default: null,
