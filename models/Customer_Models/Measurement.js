@@ -48,7 +48,13 @@ const productMeasurementSchema = new mongoose.Schema({
     measuredAt: {
         type: Date,
         default: Date.now
+    },
+
+    qrGenerated: {
+        type: Boolean,
+        default: false
     }
+
 }, { _id: false });
 
 const employeeMeasurementSchema = new mongoose.Schema({

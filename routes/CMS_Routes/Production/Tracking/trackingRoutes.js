@@ -154,10 +154,9 @@ const determineUnitStatus = (unitNumber, allScans) => {
   }
 };
 
-// Find work order by short ID
 const findWorkOrderByShortId = async (shortId) => {
   try {
-    // Find work order where the last 8 characters of _id match the shortId
+
     const workOrders = await WorkOrder.find({});
     return workOrders.find((wo) => wo._id.toString().slice(-8) === shortId);
   } catch (error) {
@@ -165,12 +164,32 @@ const findWorkOrderByShortId = async (shortId) => {
   }
 };
 
+const extractEmployeeIdFromUrl = (value) => {
+  try {
+    if (!value || typeof value !== "string") return value;
 
-// POST - Process scan
-// POST - Process scan
+    const trimmed = value.trim();
+
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      const url = new URL(trimmed);
+      const parts = url.pathname.split("/").filter(Boolean); // ["employee","GR045"]
+      const lastPart = parts[parts.length - 1];
+      return lastPart || value;
+    }
+
+    return value;
+  } catch (err) {
+    return value;
+  }
+};
+
+
+
 router.post("/scan", async (req, res) => {
   try {
     const { scanId, machineId, timeStamp } = req.body;
+    
+    scanId = extractEmployeeIdFromUrl(scanId);
 
     // Validate required fields
     if (!scanId || !machineId || !timeStamp) {
@@ -577,6 +596,8 @@ router.post("/scan", async (req, res) => {
     });
   }
 });
+
+// basically sometime the scan id is coming as https
 
 
 
