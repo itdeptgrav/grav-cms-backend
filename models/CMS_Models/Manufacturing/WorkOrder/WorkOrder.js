@@ -340,6 +340,28 @@ const workOrderSchema = new mongoose.Schema(
         trim: true,
       },
     },
+
+    cuttingStatus: {
+      type: String,
+      enum: ["pending", "in_progress", "completed"],
+      default: "pending"
+    },
+
+    cuttingProgress: {
+      completed: {
+        type: Number,
+        default: 0,
+        min: 0
+      },
+      remaining: {
+        type: Number,
+        default: function() {
+          return this.quantity || 0;
+        },
+        min: 0
+      }
+    },
+    
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "SalesDepartment",

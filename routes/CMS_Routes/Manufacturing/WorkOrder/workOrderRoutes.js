@@ -17,14 +17,12 @@ router.use(EmployeeAuthMiddleware);
 
 // routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js - ADD THIS ENDPOINT
 
-// routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js
 
-// GET single work order details
+// GET single work order details - OPTIMIZED FOR FRONTEND USAGE
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Check if id is valid
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
@@ -32,11 +30,10 @@ router.get("/:id", async (req, res) => {
       });
     }
 
+    // OPTIMIZED: Select only needed fields, minimal population
     const workOrder = await WorkOrder.findById(id)
-      .populate("stockItemId", "name reference")
-      .populate("customerRequestId", "customerInfo requestId")
-      .populate("createdBy", "name email")
-      .populate("plannedBy", "name email")
+      .select("workOrderNumber status priority quantity stockItemName stockItemReference variantAttributes specialInstructions createdAt estimatedCost rawMaterials operations planningNotes")
+      .populate("plannedBy", "name") // ONLY name, not email
       .lean();
 
     if (!workOrder) {
@@ -46,10 +43,107 @@ router.get("/:id", async (req, res) => {
       });
     }
 
-    res.json({
+    // OPTIMIZED: Get panel count if needed (frontend fetches separately)
+    const panelCount = await getPanelCount(workOrder.stockItemId);
+
+    // OPTIMIZED: Transform raw materials - remove unused data
+    const optimizedRawMaterials = (workOrder.rawMaterials || []).map(rm => ({
+      name: rm.name,
+      sku: rm.sku,
+      unit: rm.unit,
+      unitCost: rm.unitCost,
+      totalCost: rm.totalCost,
+      quantityRequired: rm.quantityRequired,
+      quantityAllocated: rm.quantityAllocated || 0,
+      quantityIssued: rm.quantityIssued || 0,
+      allocationStatus: rm.allocationStatus || "not_allocated",
+      rawItemVariantId: rm.rawItemVariantId,
+      rawItemVariantCombination: rm.rawItemVariantCombination || [],
+      variantName: rm.rawItemVariantCombination?.join(" • ") || 
+                 (rm.rawItemVariantId ? `Variant #${rm.rawItemVariantId.toString().slice(-6)}` : "Default")
+    }));
+
+    // OPTIMIZED: Transform operations - remove unused fields
+    const optimizedOperations = (workOrder.operations || []).map((op, index) => ({
+      _id: op._id,
+      operationType: op.operationType,
+      machineType: op.machineType,
+      status: op.status || "pending",
+      notes: op.notes || "",
+      estimatedTimeSeconds: op.estimatedTimeSeconds || 0,
+      plannedTimeSeconds: op.plannedTimeSeconds || op.estimatedTimeSeconds || 0,
+      maxAllowedSeconds: op.maxAllowedSeconds || 
+                       (op.estimatedTimeSeconds ? Math.ceil(op.estimatedTimeSeconds / 0.7) : 0),
+      assignedMachine: op.assignedMachine,
+      assignedMachineName: op.assignedMachineName,
+      assignedMachineSerial: op.assignedMachineSerial,
+      additionalMachines: (op.additionalMachines || []).map(am => ({
+        assignedMachine: am.assignedMachine,
+        assignedMachineName: am.assignedMachineName,
+        assignedMachineSerial: am.assignedMachineSerial,
+        notes: am.notes || ""
+      }))
+    }));
+
+    // OPTIMIZED: Calculate timeline totals
+    const totalPlannedSeconds = optimizedOperations.reduce(
+      (sum, op) => sum + (op.plannedTimeSeconds || 0), 0
+    );
+
+    // OPTIMIZED: Calculate material status counts
+    const rawMaterialStats = {
+      total: optimizedRawMaterials.length,
+      fullyAllocated: optimizedRawMaterials.filter(rm => 
+        rm.allocationStatus === "fully_allocated" || rm.allocationStatus === "issued"
+      ).length,
+      partiallyAllocated: optimizedRawMaterials.filter(rm => 
+        rm.allocationStatus === "partially_allocated"
+      ).length,
+      notAllocated: optimizedRawMaterials.filter(rm => 
+        rm.allocationStatus === "not_allocated"
+      ).length,
+      variantSpecific: optimizedRawMaterials.filter(rm => 
+        rm.rawItemVariantId || (rm.rawItemVariantCombination?.length > 0)
+      ).length
+    };
+
+    // OPTIMIZED: Calculate operation status
+    const needsPlanning = optimizedRawMaterials.some(rm => 
+      rm.allocationStatus === "not_allocated"
+    ) || optimizedOperations.some(op => !op.assignedMachine);
+
+    // OPTIMIZED: Minimal response
+    const response = {
       success: true,
-      workOrder,
-    });
+      workOrder: {
+        _id: workOrder._id,
+        workOrderNumber: workOrder.workOrderNumber,
+        status: workOrder.status,
+        priority: workOrder.priority,
+        quantity: workOrder.quantity,
+        stockItemName: workOrder.stockItemName,
+        stockItemReference: workOrder.stockItemReference,
+        variantAttributes: workOrder.variantAttributes || [],
+        specialInstructions: workOrder.specialInstructions || [],
+        estimatedCost: workOrder.estimatedCost || 0,
+        createdAt: workOrder.createdAt,
+        plannedBy: workOrder.plannedBy?.name || null,
+        
+        // Calculated fields for frontend
+        panelCount: panelCount,
+        totalBarcodes: panelCount > 0 ? workOrder.quantity * panelCount : 
+                      workOrder.quantity * optimizedOperations.length,
+        totalPlannedSeconds: totalPlannedSeconds,
+        needsPlanning: needsPlanning,
+        rawMaterialStats: rawMaterialStats,
+        
+        // Core data arrays
+        rawMaterials: optimizedRawMaterials,
+        operations: optimizedOperations
+      }
+    };
+
+    res.json(response);
   } catch (error) {
     console.error("Error fetching work order:", error);
     res.status(500).json({
@@ -58,6 +152,20 @@ router.get("/:id", async (req, res) => {
     });
   }
 });
+
+// Helper function for panel count
+async function getPanelCount(stockItemId) {
+  try {
+    if (!stockItemId) return 0;
+    const stockItem = await StockItem.findById(stockItemId)
+      .select("numberOfPanels")
+      .lean();
+    return stockItem?.numberOfPanels || 0;
+  } catch (error) {
+    console.error("Error fetching panel count:", error);
+    return 0;
+  }
+}
 
 // Add this route to get stock item details with panel info
 router.get("/stock-items/:id", async (req, res) => {
