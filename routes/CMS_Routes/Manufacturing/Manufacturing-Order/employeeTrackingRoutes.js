@@ -45,128 +45,69 @@ const findWorkOrderByShortId = async (shortId) => {
   }
 };
 
-// FIXED: Calculate employee-based sequential unit allocation with proper completion logic
+// SIMPLIFIED FIX: Assume units are completed sequentially starting from 001
 const calculateEmployeeSequentialAllocation = (
-  allScans,
+  productionCompletionData,
   employeeProducts,
   employeeIndex,
 ) => {
-  // Sort all scans by timestamp
-  const sortedScans = allScans.sort(
-    (a, b) => new Date(a.timestamp) - new Date(b.timestamp),
-  );
-
-  // Get the specific work order short ID for this employee's product
+  const overallCompletedQuantity =
+    productionCompletionData?.overallCompletedQuantity || 0;
   const product = employeeProducts[0];
+
   if (!product.workOrderId) {
     return {
       completedUnits: 0,
       pendingUnits: product.quantity,
-      unitDetails: Array.from({ length: product.quantity }, (_, i) => ({
-        unitNumber: i + 1,
-        status: "pending",
-        scans: 0,
-      })),
+      unitDetails: [],
     };
   }
 
-  const woShortId = product.workOrderId.toString().slice(-8);
-
-  // Filter scans for this work order only
-  const workOrderScans = sortedScans.filter((scan) => {
-    const parsed = parseBarcode(scan.barcodeId);
-    return parsed.success && parsed.workOrderShortId === woShortId;
-  });
-
-  // Calculate employee-specific unit ranges
+  // Calculate employee's unit range
   let employeeStartUnit = 1;
-
-  // Calculate total units assigned to previous employees
   for (let i = 0; i < employeeIndex; i++) {
     if (employeeProducts[i] && employeeProducts[i].quantity) {
       employeeStartUnit += employeeProducts[i].quantity;
     }
   }
-
   const employeeEndUnit = employeeStartUnit + product.quantity - 1;
 
-  // Get all unique unit numbers scanned in chronological order
-  const allScannedUnits = [];
-  const unitScanMap = new Map();
+  // FIXED LOGIC: Units are completed sequentially from 001
+  // So if overallCompletedQuantity = 9, then units 001-009 are completed
 
-  workOrderScans.forEach((scan) => {
-    const parsed = parseBarcode(scan.barcodeId);
-    if (parsed.success) {
-      const unitNum = parsed.unitNumber;
-      if (!unitScanMap.has(unitNum)) {
-        unitScanMap.set(unitNum, []);
-      }
-      unitScanMap.get(unitNum).push({
-        timestamp: scan.timestamp,
-        scanId: scan._id || scan.barcodeId,
-      });
-      // Add to all scanned units in order of first scan
-      if (!allScannedUnits.includes(unitNum)) {
-        allScannedUnits.push(unitNum);
-      }
-    }
-  });
-
-  // Sort all scanned units by their first scan time
-  allScannedUnits.sort((a, b) => {
-    const aFirstScan = unitScanMap.get(a)[0].timestamp;
-    const bFirstScan = unitScanMap.get(b)[0].timestamp;
-    return new Date(aFirstScan) - new Date(bFirstScan);
-  });
-
-  // Calculate which units belong to this employee and their completion status
-  const unitDetails = [];
   let completedUnits = 0;
 
+  // How many of this employee's units fall within the first N completed units?
+  if (overallCompletedQuantity >= employeeStartUnit) {
+    // Some of this employee's units are completed
+    completedUnits =
+      Math.min(overallCompletedQuantity, employeeEndUnit) -
+      employeeStartUnit +
+      1;
+    // But ensure it's not negative
+    completedUnits = Math.max(0, completedUnits);
+  } else {
+    // None of this employee's units are completed yet
+    completedUnits = 0;
+  }
+
+  // Create unit details
+  const unitDetails = [];
   for (let i = 1; i <= product.quantity; i++) {
     const employeeUnitNumber = employeeStartUnit + i - 1;
-    const isScanned = unitScanMap.has(employeeUnitNumber);
-    const scans = isScanned ? unitScanMap.get(employeeUnitNumber).length : 0;
-
-    // FIXED: Determine if unit is completed based on sequential scanning rules
     let status = "pending";
-    if (isScanned) {
-      // Find the position of this unit in the scan sequence
-      const unitIndexInSequence = allScannedUnits.indexOf(employeeUnitNumber);
 
-      // A unit is completed if:
-      // 1. It has been scanned AND
-      // 2. The next unit in sequence (for ANY employee) has been scanned OR
-      // 3. It's the LAST unit in the ENTIRE work order and has been scanned (FIXED)
-      const nextUnitInWorkOrder = employeeUnitNumber + 1;
-      const isNextUnitScanned = unitScanMap.has(nextUnitInWorkOrder);
-
-      // Get total quantity from all employee products for this work order
-      const totalWorkOrderQuantity = employeeProducts.reduce(
-        (sum, emp) => sum + emp.quantity,
-        0,
-      );
-      const lastUnitInWorkOrder =
-        employeeStartUnit + totalWorkOrderQuantity - 1;
-      const isLastUnit = employeeUnitNumber === lastUnitInWorkOrder;
-
-      if (isNextUnitScanned || isLastUnit) {
-        status = "completed";
-        completedUnits++;
-      } else {
-        status = "in_progress";
-      }
+    if (employeeUnitNumber <= overallCompletedQuantity) {
+      status = "completed";
+    } else if (employeeUnitNumber === overallCompletedQuantity + 1) {
+      status = "in_progress";
     }
 
     unitDetails.push({
       unitNumber: employeeUnitNumber,
-      employeeUnitIndex: i, // 1-based index within employee's allocation
+      employeeUnitIndex: i,
       status: status,
-      scans: scans,
-      lastScan: isScanned
-        ? unitScanMap.get(employeeUnitNumber)[scans - 1].timestamp
-        : null,
-      isAssignedToThisEmployee: true,
+      scans: 0,
     });
   }
 
@@ -176,17 +117,17 @@ const calculateEmployeeSequentialAllocation = (
     unitDetails,
     employeeUnitRange: {
       start: employeeStartUnit,
-      end: employeeEndUnit ,
+      end: employeeEndUnit,
     },
   };
 };
 
-// GET employee production tracking for a manufacturing order
+// GET employee production tracking for a manufacturing order - USING PRODUCTIONCOMPLETION
 router.get("/manufacturing-order/:moId/employees", async (req, res) => {
   try {
     const { moId } = req.params;
 
-    console.log("=== EMPLOYEE TRACKING DEBUG ===");
+    console.log("=== EMPLOYEE TRACKING DEBUG (PRODUCTIONCOMPLETION) ===");
     console.log("MO ID:", moId);
 
     // Get manufacturing order
@@ -228,10 +169,10 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
       });
     }
 
-    // Get associated work orders
+    // Get associated work orders WITH PRODUCTION COMPLETION
     const workOrders = await WorkOrder.find({ customerRequestId: moId })
       .select(
-        "workOrderNumber stockItemName stockItemId quantity variantAttributes operations status",
+        "workOrderNumber stockItemName stockItemId quantity variantAttributes operations status productionCompletion",
       )
       .lean();
 
@@ -265,7 +206,7 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
               employeeUIN: emp.employeeUIN,
               gender: emp.gender,
               organizationName: measurement.organizationName,
-              originalIndex: empIndex, // Store original index for sequencing
+              originalIndex: empIndex,
               products: [],
               totalQuantity: 0,
               productMap: new Map(),
@@ -305,51 +246,7 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
       }
     }
 
-    // Get production tracking data (last 30 days)
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    thirtyDaysAgo.setHours(0, 0, 0, 0);
-
-    const productionTracking = await ProductionTracking.find({
-      date: { $gte: thirtyDaysAgo },
-    })
-      .select("machines date")
-      .lean();
-
-    console.log("Production tracking docs found:", productionTracking.length);
-
-    // Collect all barcode scans
-    const allBarcodeScans = [];
-    if (productionTracking && productionTracking.length > 0) {
-      productionTracking.forEach((trackDoc) => {
-        if (!trackDoc.machines) return;
-
-        trackDoc.machines.forEach((machine) => {
-          if (!machine.operationTracking) return;
-
-          machine.operationTracking.forEach((op) => {
-            if (!op.operators) return;
-
-            op.operators.forEach((operator) => {
-              if (!operator.barcodeScans) return;
-
-              operator.barcodeScans.forEach((scan) => {
-                allBarcodeScans.push({
-                  barcodeId: scan.barcodeId,
-                  timestamp: scan.timeStamp,
-                  machineId: machine.machineId,
-                  operatorId: operator.operatorIdentityId,
-                });
-              });
-            });
-          });
-        });
-      });
-    }
-
-    console.log("Total barcode scans collected:", allBarcodeScans.length);
-
-    // FIXED: Group employees by product to calculate sequential allocation correctly
+    // Group employees by product to calculate sequential allocation
     const productEmployeeMap = new Map();
 
     employeeData.forEach((employee) => {
@@ -375,7 +272,7 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
       employees.sort((a, b) => a.originalIndex - b.originalIndex);
     });
 
-    // Match work orders to employee products and calculate progress
+    // Match work orders to employee products and calculate progress FROM PRODUCTIONCOMPLETION
     const enhancedEmployeeData = await Promise.all(
       employeeData.map(async (employee) => {
         const productsWithProgress = await Promise.all(
@@ -415,9 +312,9 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
                 emp.employeeId.toString() === employee.employeeId.toString(),
             );
 
-            // Calculate employee-specific sequential allocation
+            // Calculate employee-specific sequential allocation USING PRODUCTIONCOMPLETION
             const progress = calculateEmployeeSequentialAllocation(
-              allBarcodeScans,
+              matchingWorkOrder.productionCompletion,
               productEmployees.map((emp) => ({
                 ...emp.product,
                 workOrderId: matchingWorkOrder._id,
@@ -440,6 +337,7 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
               completionPercentage,
               unitDetails: progress.unitDetails,
               employeeUnitRange: progress.employeeUnitRange,
+              lastUpdated: matchingWorkOrder.productionCompletion?.lastSyncedAt,
             };
           }),
         );
@@ -469,7 +367,7 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
       (a, b) => b.overallCompletionPercentage - a.overallCompletionPercentage,
     );
 
-    // Calculate statistics
+    // Calculate statistics FROM PRODUCTIONCOMPLETION
     const totalUnitsAssigned = enhancedEmployeeData.reduce(
       (sum, emp) => sum + emp.totalQuantity,
       0,
@@ -488,10 +386,22 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
           )
         : 0;
 
-    console.log("=== FINAL STATS ===");
+    // Also calculate from workOrders productionCompletion for verification
+    const totalFromProductionCompletion = workOrders.reduce(
+      (sum, wo) =>
+        sum + (wo.productionCompletion?.overallCompletedQuantity || 0),
+      0,
+    );
+
+    console.log("=== FINAL STATS (FROM PRODUCTIONCOMPLETION) ===");
     console.log("Total Employees:", enhancedEmployeeData.length);
     console.log("Total Units Assigned:", totalUnitsAssigned);
-    console.log("Total Units Completed:", totalUnitsCompleted);
+    console.log("Total Units Completed (employee sum):", totalUnitsCompleted);
+    console.log(
+      "Total Units Completed (productionCompletion):",
+      totalFromProductionCompletion,
+    );
+    console.log("Average Completion:", averageCompletion);
     console.log("==================");
 
     res.json({
@@ -504,12 +414,22 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
         stockItemId: wo.stockItemId,
         quantity: wo.quantity,
         status: wo.status,
+        productionCompletion: {
+          overallCompletedQuantity:
+            wo.productionCompletion?.overallCompletedQuantity || 0,
+          overallCompletionPercentage:
+            wo.productionCompletion?.overallCompletionPercentage || 0,
+          operationCompletion:
+            wo.productionCompletion?.operationCompletion || [],
+          lastSyncedAt: wo.productionCompletion?.lastSyncedAt,
+        },
       })),
       stats: {
         totalEmployees: enhancedEmployeeData.length,
         totalWorkOrders: workOrders.length,
         totalUnitsAssigned,
         totalUnitsCompleted,
+        totalUnitsFromProductionCompletion: totalFromProductionCompletion,
         averageCompletion,
       },
     });
