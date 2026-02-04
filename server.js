@@ -5,8 +5,11 @@ const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
 require("dotenv").config();
 
-const http = require('http');
-const { Server } = require('socket.io');
+const http = require("http");
+const { Server } = require("socket.io");
+
+// IMPORT PRODUCTION SYNC SERVICE
+const productionSyncService = require("./services/productionSyncService");
 
 const app = express();
 
@@ -16,7 +19,7 @@ const allowedOrigins = [
   "https://grav-cms.vercel.app",
   "https://cms.grav.in",
   "https://customer.grav.in",
-  "http://192.168.1.30:3000", // ngrok example
+  "http://192.168.1.30:3000",
 ];
 
 app.use(
@@ -32,7 +35,7 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: "50mb" })); // Increased from default 100kb
+app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 
@@ -48,34 +51,32 @@ const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
     credentials: true,
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST"],
   },
-  transports: ['websocket', 'polling']
+  transports: ["websocket", "polling"],
 });
 
 // WebSocket connection handling
-io.on('connection', (socket) => {
-  console.log('✅ New WebSocket client connected:', socket.id);
-  
-  // Join a specific work order room
-  socket.on('join-workorder', (workOrderId) => {
+io.on("connection", (socket) => {
+  console.log("✅ New WebSocket client connected:", socket.id);
+
+  socket.on("join-workorder", (workOrderId) => {
     socket.join(`workorder-${workOrderId}`);
     console.log(`Socket ${socket.id} joined room workorder-${workOrderId}`);
   });
-  
-  // Leave a work order room
-  socket.on('leave-workorder', (workOrderId) => {
+
+  socket.on("leave-workorder", (workOrderId) => {
     socket.leave(`workorder-${workOrderId}`);
     console.log(`Socket ${socket.id} left room workorder-${workOrderId}`);
   });
-  
-  socket.on('disconnect', () => {
-    console.log('❌ WebSocket client disconnected:', socket.id);
+
+  socket.on("disconnect", () => {
+    console.log("❌ WebSocket client disconnected:", socket.id);
   });
 });
 
 // Make io accessible to routes
-app.set('io', io);
+app.set("io", io);
 
 const connectDB = async () => {
   try {
@@ -83,6 +84,9 @@ const connectDB = async () => {
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
     );
     console.log("✅ MongoDB connected successfully");
+
+    // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
+    productionSyncService.initialize();
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -310,6 +314,9 @@ app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
 const ProductionSchedule = require("./routes/CMS_Routes/Production/ProductionSchedule/productionScheduleRoutes.js");
 app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
 
+const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
+app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
+
 // Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
 app.use("/api/cms/sales", salesRoutes);
@@ -392,11 +399,95 @@ app.get("/", (req, res) => {
   });
 });
 
-// In your server.js, add this after the other route imports:
+/* =====================
+    PRODUCTION SYNC MANAGEMENT ROUTES
+  ===================== */
+app.post("/api/cms/production/sync/manual", async (req, res) => {
+  try {
+    await productionSyncService.manualSync();
+    res.json({
+      success: true,
+      message: "Manual sync completed successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error during manual sync",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/cms/production/cleanup/manual", async (req, res) => {
+  try {
+    await productionSyncService.manualCleanup();
+    res.json({
+      success: true,
+      message: "Manual cleanup completed successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error during manual cleanup",
+      error: error.message,
+    });
+  }
+});
+
+// Health check with sync service status
+app.get("/api/health", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Backend server is running 🚀",
+    database:
+      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+    productionSync: {
+      enabled: true,
+      syncInterval: "Every 20 minutes",
+      cleanupSchedule: "Daily at 2 AM",
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Graceful shutdown
+let isShuttingDown = false;
+
+const gracefulShutdown = (signal) => {
+  if (isShuttingDown) return;
+
+  isShuttingDown = true;
+  console.log(`\n🛑 ${signal} received, starting graceful shutdown...`);
+
+  // Stop production sync service
+  productionSyncService.stop();
+
+  // Close server
+  server.close(() => {
+    console.log("✅ HTTP server closed");
+
+    // Close MongoDB connection
+    mongoose.connection.close(false, () => {
+      console.log("✅ MongoDB connection closed");
+      console.log("👋 Shutdown complete");
+      process.exit(0);
+    });
+  });
+
+  // Force shutdown after 10 seconds
+  setTimeout(() => {
+    console.error("⚠️  Forcing shutdown after timeout");
+    process.exit(1);
+  }, 10000);
+};
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
   console.log(`✅ WebSocket server is ready`);
+  console.log(`✅ Production sync service is active`);
 });
