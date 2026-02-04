@@ -15,8 +15,6 @@ const streamBuffers = require("stream-buffers");
 
 router.use(EmployeeAuthMiddleware);
 
-// routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js - ADD THIS ENDPOINT
-
 
 // GET single work order details - OPTIMIZED FOR FRONTEND USAGE
 router.get("/:id", async (req, res) => {

@@ -9,11 +9,9 @@ const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder
 
 let io;
 
-
-
 // Initialize Socket.IO instance
 router.use((req, res, next) => {
-  io = req.app.get('io');
+  io = req.app.get("io");
   next();
 });
 
@@ -36,33 +34,34 @@ const emitTrackingUpdate = async (date) => {
 
     // Calculate total scans
     let totalScans = 0;
-    trackingDoc.machines.forEach(machine => {
-      machine.operationTracking?.forEach(op => {
-        totalScans += op.operators?.reduce(
-          (total, operator) => total + (operator.barcodeScans?.length || 0),
-          0
-        ) || 0;
+    trackingDoc.machines.forEach((machine) => {
+      machine.operationTracking?.forEach((op) => {
+        totalScans +=
+          op.operators?.reduce(
+            (total, operator) => total + (operator.barcodeScans?.length || 0),
+            0,
+          ) || 0;
       });
     });
 
     // Emit to all interested clients
-    io.emit('tracking-data-updated', {
+    io.emit("tracking-data-updated", {
       date: trackingDoc.date,
       totalScans: totalScans,
       totalMachines: trackingDoc.machines?.length || 0,
-      timestamp: new Date()
+      timestamp: new Date(),
     });
 
     // Also emit to specific work orders if we can identify them
     // Collect all work orders from barcode scans
     const workOrderIds = new Set();
 
-    trackingDoc.machines.forEach(machine => {
-      machine.operationTracking?.forEach(op => {
-        op.operators?.forEach(operator => {
-          operator.barcodeScans?.forEach(scan => {
-            if (scan.barcodeId && scan.barcodeId.startsWith('WO-')) {
-              const parts = scan.barcodeId.split('-');
+    trackingDoc.machines.forEach((machine) => {
+      machine.operationTracking?.forEach((op) => {
+        op.operators?.forEach((operator) => {
+          operator.barcodeScans?.forEach((scan) => {
+            if (scan.barcodeId && scan.barcodeId.startsWith("WO-")) {
+              const parts = scan.barcodeId.split("-");
               if (parts.length >= 3) {
                 const shortId = parts[1];
                 // Find work order by short ID
@@ -78,16 +77,15 @@ const emitTrackingUpdate = async (date) => {
     for (const shortId of workOrderIds) {
       const workOrder = await findWorkOrderByShortId(shortId);
       if (workOrder) {
-        io.to(`workorder-${workOrder._id}`).emit('workorder-tracking-update', {
+        io.to(`workorder-${workOrder._id}`).emit("workorder-tracking-update", {
           workOrderId: workOrder._id,
           date: trackingDoc.date,
-          timestamp: new Date()
+          timestamp: new Date(),
         });
       }
     }
-
   } catch (error) {
-    console.error('Error emitting tracking update:', error);
+    console.error("Error emitting tracking update:", error);
   }
 };
 
@@ -156,7 +154,6 @@ const determineUnitStatus = (unitNumber, allScans) => {
 
 const findWorkOrderByShortId = async (shortId) => {
   try {
-
     const workOrders = await WorkOrder.find({});
     return workOrders.find((wo) => wo._id.toString().slice(-8) === shortId);
   } catch (error) {
@@ -183,13 +180,11 @@ const extractEmployeeIdFromUrl = (value) => {
   }
 };
 
-
-
 router.post("/scan", async (req, res) => {
   try {
-    const { scanId, machineId, timeStamp } = req.body;
-    
-    scanId = extractEmployeeIdFromUrl(scanId);
+    const { scanId: rawScanId, machineId, timeStamp } = req.body;
+
+    const scanId = extractEmployeeIdFromUrl(rawScanId);
 
     // Validate required fields
     if (!scanId || !machineId || !timeStamp) {
@@ -257,8 +252,8 @@ router.post("/scan", async (req, res) => {
 
       const operatorTracking = operationTracking.operators.find(
         (op) =>
-          op.operatorIdentityId === operationTracking.currentOperatorIdentityId &&
-          !op.signOutTime,
+          op.operatorIdentityId ===
+            operationTracking.currentOperatorIdentityId && !op.signOutTime,
       );
 
       if (!operatorTracking) {
@@ -333,7 +328,10 @@ router.post("/scan", async (req, res) => {
               console.warn("⚠️ WebSocket (io) not available");
             }
           } else {
-            console.warn("⚠️ Work order not found for short ID:", parsedBarcode.workOrderShortId);
+            console.warn(
+              "⚠️ Work order not found for short ID:",
+              parsedBarcode.workOrderShortId,
+            );
 
             // Try to find work order by full ID if short ID doesn't work
             // If your barcode contains the full work order ID, try that:
@@ -343,7 +341,8 @@ router.post("/scan", async (req, res) => {
                 // Try to find by full ID (parts[1] might be the full Mongo ID)
                 const possibleWorkOrderId = parts[1];
                 try {
-                  const workOrderByFullId = await WorkOrder.findById(possibleWorkOrderId);
+                  const workOrderByFullId =
+                    await WorkOrder.findById(possibleWorkOrderId);
                   if (workOrderByFullId && io) {
                     io.to(`workorder-${workOrderByFullId._id}`).emit(
                       "workorder-scan-update",
@@ -361,10 +360,15 @@ router.post("/scan", async (req, res) => {
                         scanCount: scanCount,
                       },
                     );
-                    console.log(`📢 Emitted using full ID to room: workorder-${workOrderByFullId._id}`);
+                    console.log(
+                      `📢 Emitted using full ID to room: workorder-${workOrderByFullId._id}`,
+                    );
                   }
                 } catch (idError) {
-                  console.error("Error finding work order by full ID:", idError);
+                  console.error(
+                    "Error finding work order by full ID:",
+                    idError,
+                  );
                 }
               }
             }
@@ -437,11 +441,12 @@ router.post("/scan", async (req, res) => {
         machineTracking.operationTracking.push(operationTracking);
         operationTracking =
           machineTracking.operationTracking[
-          machineTracking.operationTracking.length - 1
+            machineTracking.operationTracking.length - 1
           ];
       }
 
-      const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
+      const employeeName =
+        `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
 
       // Someone already signed in
       if (operationTracking.currentOperatorIdentityId) {
@@ -478,7 +483,6 @@ router.post("/scan", async (req, res) => {
               employeeName,
               scanCount: 0,
             });
-
           }
 
           return res.status(400).json({
@@ -487,7 +491,8 @@ router.post("/scan", async (req, res) => {
           });
         } else {
           // Different operator: sign out existing and sign in new
-          const existingOperatorId = operationTracking.currentOperatorIdentityId;
+          const existingOperatorId =
+            operationTracking.currentOperatorIdentityId;
 
           const existingOperatorTracking = operationTracking.operators.find(
             (op) =>
@@ -531,7 +536,6 @@ router.post("/scan", async (req, res) => {
             employeeName,
             scanCount: 0,
           });
-
         }
       }
 
@@ -599,9 +603,6 @@ router.post("/scan", async (req, res) => {
 
 // basically sometime the scan id is coming as https
 
-
-
-
 router.get("/status/:date", async (req, res) => {
   try {
     const { date } = req.params;
@@ -655,13 +656,13 @@ router.get("/status/:date", async (req, res) => {
 
           currentOperator = operator
             ? {
-              identityId: operator.identityId,
-              name: `${operator.firstName} ${operator.lastName}`,
-            }
+                identityId: operator.identityId,
+                name: `${operator.firstName} ${operator.lastName}`,
+              }
             : {
-              identityId: op.currentOperatorIdentityId,
-              name: "Unknown Operator",
-            };
+                identityId: op.currentOperatorIdentityId,
+                name: "Unknown Operator",
+              };
         }
 
         // Get all operator details for this operation
@@ -778,13 +779,13 @@ router.get("/status/today", async (req, res) => {
 
           currentOperator = operator
             ? {
-              identityId: operator.identityId,
-              name: `${operator.firstName} ${operator.lastName}`,
-            }
+                identityId: operator.identityId,
+                name: `${operator.firstName} ${operator.lastName}`,
+              }
             : {
-              identityId: op.currentOperatorIdentityId,
-              name: "Unknown Operator",
-            };
+                identityId: op.currentOperatorIdentityId,
+                name: "Unknown Operator",
+              };
         }
 
         // Get all operator details for this operation
@@ -893,13 +894,13 @@ router.get("/machine/:machineId/operations", async (req, res) => {
 
           currentOperator = operator
             ? {
-              identityId: operator.identityId,
-              name: `${operator.firstName} ${operator.lastName}`,
-            }
+                identityId: operator.identityId,
+                name: `${operator.firstName} ${operator.lastName}`,
+              }
             : {
-              identityId: op.currentOperatorIdentityId,
-              name: "Unknown Operator",
-            };
+                identityId: op.currentOperatorIdentityId,
+                name: "Unknown Operator",
+              };
         }
 
         // Calculate scans for this operation

@@ -39,10 +39,6 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 
-
-
-
-
 // Create HTTP server
 const server = http.createServer(app);
 
@@ -97,8 +93,6 @@ connectDB().then(async () => {
   await createDefaultCuttingMaster();
 });
 
-
-
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment"); // make sure this exists in server.js also
 
@@ -132,7 +126,6 @@ const createDefaultCuttingMaster = async () => {
     console.error("❌ Cutting Master creation failed:", error.message);
   }
 };
-
 
 //changes
 
@@ -307,6 +300,9 @@ app.use(
   workOrderProgressRoutes,
 );
 
+const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
+app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
+
 // In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
 app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
@@ -353,22 +349,18 @@ app.use("/api/employee", employeeAuthRoutes);
 const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
 app.use("/api/employee/tasks", TasksEmployee);
 
-
-
 // Import the cutting master routes
-const cuttingMasterRoutes = require('./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes');
-app.use('/api/cms/manufacturing/cutting-master', cuttingMasterRoutes);
-
+const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
+app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
 
 // Import measurement routes
-const CuttingmeasurementRoutes = require('./routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes');
-app.use('/api/cms/manufacturing/cutting-master', CuttingmeasurementRoutes);
+const CuttingmeasurementRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes");
+app.use("/api/cms/manufacturing/cutting-master", CuttingmeasurementRoutes);
 
 // Import the bulk cutting routes
-const bulkCuttingRoutes = require('./routes/CMS_Routes/Manufacturing/CuttingMaster/bulkCuttingRoutes.js');
+const bulkCuttingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/bulkCuttingRoutes.js");
 // Merge the routers
-app.use('/api/cms/manufacturing/cutting-master', bulkCuttingRoutes);
-
+app.use("/api/cms/manufacturing/cutting-master", bulkCuttingRoutes);
 
 // Vendor Routes For Vendor Portal
 const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes"); // NEW FILE
