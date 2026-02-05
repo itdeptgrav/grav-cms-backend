@@ -185,6 +185,10 @@ router.post("/scan", async (req, res) => {
     const { scanId: rawScanId, machineId, timeStamp } = req.body;
 
     const scanId = extractEmployeeIdFromUrl(rawScanId);
+<<<<<<< HEAD
+=======
+
+>>>>>>> origin/main
 
     // Validate required fields
     if (!scanId || !machineId || !timeStamp) {

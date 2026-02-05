@@ -300,8 +300,15 @@ app.use(
   workOrderProgressRoutes,
 );
 
+<<<<<<< HEAD
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
+=======
+
+
+const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
+app.use("/api/cms/production/dashboard", productionDashboardRoutes);
+>>>>>>> origin/main
 
 // In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
