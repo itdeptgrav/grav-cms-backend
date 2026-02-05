@@ -307,6 +307,11 @@ app.use(
   workOrderProgressRoutes,
 );
 
+
+
+const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
+app.use("/api/cms/production/dashboard", productionDashboardRoutes);
+
 // In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
 app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
