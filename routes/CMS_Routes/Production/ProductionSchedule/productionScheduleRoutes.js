@@ -16,7 +16,7 @@ router.use(EmployeeAuthMiddleware);
 // =====================
 
 /**
- * Parse time string to minutes since midnight
+ * Parse time string (HH:MM) to minutes since midnight
  */
 const timeToMinutes = (timeString) => {
   const [hours, minutes] = timeString.split(":").map(Number);
@@ -33,7 +33,7 @@ const minutesToTime = (minutes) => {
 };
 
 /**
- * Create date with specific time
+ * Create Date object with specific time on a given date
  */
 const createDateWithTime = (date, timeString) => {
   const [hours, minutes] = timeString.split(":").map(Number);
@@ -145,42 +145,35 @@ const isWorkOrderReadyForScheduling = (workOrder) => {
 };
 
 /**
- * Calculate total duration for work order in minutes - FIXED
+ * FIXED: Calculate total work order duration including all operations and quantity
  */
 const calculateWorkOrderDuration = (workOrder) => {
-  // FIXED: Calculate from operations (including quantity)
   if (!workOrder.operations || workOrder.operations.length === 0) {
     return 0;
   }
 
-  // Sum planned time from all operations
-  const totalPlannedSeconds = workOrder.operations.reduce(
+  // Sum all operation times
+  const totalSeconds = workOrder.operations.reduce(
     (sum, op) => sum + (op.plannedTimeSeconds || op.estimatedTimeSeconds || 0),
     0,
   );
 
-  // Convert to minutes
-  const minutesPerUnit = Math.ceil(totalPlannedSeconds / 60);
-
-  // Multiply by quantity for total duration
+  // Convert to minutes and multiply by quantity
+  const minutesPerUnit = Math.ceil(totalSeconds / 60);
   const totalMinutes = minutesPerUnit * (workOrder.quantity || 1);
 
-  console.log(`Duration calculation for ${workOrder.workOrderNumber}:`, {
-    totalPlannedSeconds,
-    quantity: workOrder.quantity,
+  console.log(`[DURATION] ${workOrder.workOrderNumber}:`, {
+    totalSeconds,
     minutesPerUnit,
+    quantity: workOrder.quantity,
     totalMinutes,
-    operations: workOrder.operations.map((op) => ({
-      type: op.operationType,
-      plannedSeconds: op.plannedTimeSeconds,
-    })),
   });
 
   return totalMinutes;
 };
 
 /**
- * Get or create schedule for a specific date with enhanced settings
+ * Get or create schedule for a specific date
  */
 const getOrCreateSchedule = async (date, userId = null) => {
   const searchDate = new Date(date);
@@ -189,17 +182,13 @@ const getOrCreateSchedule = async (date, userId = null) => {
   let schedule = await ProductionSchedule.findOne({ date: searchDate });
 
   if (!schedule) {
-    // Create new schedule with default settings
     const dayOfWeek = searchDate.getDay();
     const isSunday = dayOfWeek === 0;
-    const isSaturday = dayOfWeek === 6;
 
-    // Default work hours
     const startTime = "09:30";
     const endTime = "18:30";
     const totalMinutes = timeToMinutes(endTime) - timeToMinutes(startTime);
 
-    // Default breaks
     const defaultBreaks = [
       {
         name: "Lunch Break",
@@ -220,29 +209,22 @@ const getOrCreateSchedule = async (date, userId = null) => {
     schedule = new ProductionSchedule({
       date: searchDate,
       workHours: {
-        startTime: startTime,
-        endTime: endTime,
-        totalMinutes: totalMinutes,
+        startTime,
+        endTime,
+        totalMinutes,
         isActive: !isSunday,
         customHours: false,
       },
-      defaultBreaks: defaultBreaks,
+      defaultBreaks,
       breaks: [],
       isHoliday: isSunday,
       isSundayOverride: false,
-      isSaturdayOverride: false,
       scheduledWorkOrders: [],
-      notes: isSunday
-        ? "Sunday - Day Off"
-        : isSaturday
-          ? "Saturday - Weekend"
-          : "Regular Work Day",
+      notes: isSunday ? "Sunday - Day Off" : "Regular Work Day",
     });
 
-    // Calculate available minutes
     schedule.calculateAvailableMinutes();
 
-    // Add creation record
     if (userId) {
       schedule.modifications.push({
         modifiedBy: userId,
@@ -329,6 +311,311 @@ const calculateAvailableTimeSlots = (schedule, startDate = null) => {
   }
 
   return slots;
+};
+
+const isDayAvailable = (schedule) => {
+  if (!schedule) return false;
+  if (schedule.isHoliday) return false;
+  if (!schedule.workHours || !schedule.workHours.isActive) return false;
+
+  const dayOfWeek = new Date(schedule.date).getDay();
+  if (dayOfWeek === 0 && !schedule.isSundayOverride) return false;
+
+  return true;
+};
+
+/**
+ * FIXED: Get all available time slots for a day, respecting breaks
+ */
+const getAvailableTimeSlots = (schedule) => {
+  const slots = [];
+
+  if (!isDayAvailable(schedule)) {
+    return slots;
+  }
+
+  const scheduleDate = new Date(schedule.date);
+  const workStart = createDateWithTime(
+    scheduleDate,
+    schedule.workHours.startTime,
+  );
+  const workEnd = createDateWithTime(scheduleDate, schedule.workHours.endTime);
+
+  // Get all breaks sorted by start time
+  const allBreaks = [
+    ...(schedule.defaultBreaks || []),
+    ...(schedule.breaks || []),
+  ].sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
+
+  let currentTime = new Date(workStart);
+
+  // Process each break
+  for (const br of allBreaks) {
+    const breakStart = createDateWithTime(scheduleDate, br.startTime);
+    const breakEnd = createDateWithTime(scheduleDate, br.endTime);
+
+    // Add slot before break if there's time
+    if (currentTime < breakStart) {
+      const slotDuration = (breakStart - currentTime) / 60000; // minutes
+      slots.push({
+        start: new Date(currentTime),
+        end: new Date(breakStart),
+        durationMinutes: Math.floor(slotDuration),
+      });
+    }
+
+    // Move current time to after break
+    currentTime = new Date(breakEnd);
+  }
+
+  // Add remaining time after last break
+  if (currentTime < workEnd) {
+    const slotDuration = (workEnd - currentTime) / 60000;
+    slots.push({
+      start: new Date(currentTime),
+      end: new Date(workEnd),
+      durationMinutes: Math.floor(slotDuration),
+    });
+  }
+
+  console.log(`[SLOTS] ${schedule.date.toDateString()}:`, {
+    workHours: `${schedule.workHours.startTime}-${schedule.workHours.endTime}`,
+    breaks: allBreaks.length,
+    slots: slots.map((s) => ({
+      start: s.start.toLocaleTimeString(),
+      end: s.end.toLocaleTimeString(),
+      duration: s.durationMinutes,
+    })),
+  });
+
+  return slots;
+};
+
+/**
+ * FIXED: Schedule work order across multiple days if needed
+ */
+const scheduleWorkOrderAcrossDays = async (
+  workOrder,
+  mo,
+  startDate,
+  colorCode,
+  userId,
+) => {
+  try {
+    const durationMinutes = calculateWorkOrderDuration(workOrder);
+
+    if (durationMinutes <= 0) {
+      return {
+        success: false,
+        message: "Work order has no planned duration",
+      };
+    }
+
+    console.log(`[SCHEDULE] Starting ${workOrder.workOrderNumber}:`, {
+      totalDuration: durationMinutes,
+      startDate: startDate.toDateString(),
+    });
+
+    let currentDate = new Date(startDate);
+    currentDate.setHours(0, 0, 0, 0);
+
+    let remainingMinutes = durationMinutes;
+    const scheduledSegments = [];
+    const scheduleIds = [];
+    let daysSpanned = 0;
+    const maxDays = 90; // Safety limit
+
+    while (remainingMinutes > 0 && daysSpanned < maxDays) {
+      // Get or create schedule for current date
+      const schedule = await getOrCreateSchedule(currentDate, userId);
+
+      // Skip if day is not available
+      if (!isDayAvailable(schedule)) {
+        console.log(
+          `[SKIP] ${currentDate.toDateString()} - Not available (holiday/off)`,
+        );
+        currentDate.setDate(currentDate.getDate() + 1);
+        continue;
+      }
+
+      // Get available time slots
+      const timeSlots = getAvailableTimeSlots(schedule);
+
+      if (timeSlots.length === 0) {
+        console.log(
+          `[SKIP] ${currentDate.toDateString()} - No time slots available`,
+        );
+        currentDate.setDate(currentDate.getDate() + 1);
+        continue;
+      }
+
+      // Calculate already scheduled time
+      const scheduledMinutes = schedule.scheduledWorkOrders.reduce(
+        (sum, wo) => sum + (wo.durationMinutes || 0),
+        0,
+      );
+
+      // Find the first available slot after existing work orders
+      let slotStartTime = null;
+      let availableSlot = null;
+
+      // Get the latest end time of existing work orders
+      let latestEndTime = timeSlots[0].start;
+
+      if (schedule.scheduledWorkOrders.length > 0) {
+        const sortedWOs = [...schedule.scheduledWorkOrders].sort(
+          (a, b) => new Date(b.scheduledEndTime) - new Date(a.scheduledEndTime),
+        );
+        const lastWO = sortedWOs[0];
+        latestEndTime = new Date(lastWO.scheduledEndTime);
+      }
+
+      // Find slot that can accommodate our start time
+      for (const slot of timeSlots) {
+        if (slot.end > latestEndTime) {
+          slotStartTime =
+            latestEndTime > slot.start ? latestEndTime : slot.start;
+          availableSlot = {
+            start: slotStartTime,
+            end: slot.end,
+            durationMinutes: Math.floor((slot.end - slotStartTime) / 60000),
+          };
+          break;
+        }
+      }
+
+      if (!availableSlot || availableSlot.durationMinutes <= 0) {
+        console.log(
+          `[SKIP] ${currentDate.toDateString()} - No available capacity`,
+        );
+        currentDate.setDate(currentDate.getDate() + 1);
+        continue;
+      }
+
+      // Calculate how much we can schedule today
+      const minutesToSchedule = Math.min(
+        remainingMinutes,
+        availableSlot.durationMinutes,
+      );
+
+      const segmentEndTime = new Date(
+        availableSlot.start.getTime() + minutesToSchedule * 60000,
+      );
+
+      console.log(
+        `[SEGMENT] ${currentDate.toDateString()} Day ${daysSpanned + 1}:`,
+        {
+          start: availableSlot.start.toLocaleTimeString(),
+          end: segmentEndTime.toLocaleTimeString(),
+          duration: minutesToSchedule,
+          remaining: remainingMinutes - minutesToSchedule,
+        },
+      );
+
+      // Create scheduled work order segment
+      const scheduledSegment = {
+        workOrderId: workOrder._id,
+        workOrderNumber: workOrder.workOrderNumber,
+        manufacturingOrderId: mo._id,
+        manufacturingOrderNumber: `MO-${mo.requestId}`,
+        stockItemName: workOrder.stockItemId?.name || "Unknown",
+        stockItemReference: workOrder.stockItemId?.reference || "",
+        quantity: workOrder.quantity,
+        scheduledStartTime: availableSlot.start,
+        scheduledEndTime: segmentEndTime,
+        durationMinutes: minutesToSchedule,
+        colorCode: colorCode,
+        position: schedule.scheduledWorkOrders.length,
+        status: "scheduled",
+        isMultiDay: remainingMinutes > minutesToSchedule,
+        dayNumber: daysSpanned + 1,
+        totalDays: Math.ceil(durationMinutes / 480), // Rough estimate
+      };
+
+      // Add to schedule
+      schedule.scheduledWorkOrders.push(scheduledSegment);
+      schedule.calculateUtilization();
+
+      // Check for over-capacity warning
+      if (schedule.isOverCapacity) {
+        scheduledSegment.exceedsCapacity = true;
+        scheduledSegment.warnings = [
+          {
+            type: "exceeds_day",
+            message: `Schedule exceeds capacity by ${Math.round(schedule.utilizationPercentage - 100)}%`,
+            timestamp: new Date(),
+          },
+        ];
+      }
+
+      schedule.modifications.push({
+        modifiedBy: userId,
+        modifiedAt: new Date(),
+        modificationType: "work_order_added",
+        details: `Scheduled ${workOrder.workOrderNumber} (Day ${daysSpanned + 1})`,
+      });
+
+      await schedule.save();
+
+      scheduledSegments.push(scheduledSegment);
+      scheduleIds.push(schedule._id);
+      remainingMinutes -= minutesToSchedule;
+      daysSpanned++;
+
+      // Move to next day if needed
+      if (remainingMinutes > 0) {
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+    }
+
+    if (remainingMinutes > 0) {
+      // Rollback all segments
+      console.error(
+        `[ROLLBACK] Could not schedule ${workOrder.workOrderNumber} completely`,
+      );
+      for (const scheduleId of scheduleIds) {
+        const schedule = await ProductionSchedule.findById(scheduleId);
+        if (schedule) {
+          schedule.scheduledWorkOrders = schedule.scheduledWorkOrders.filter(
+            (wo) => wo.workOrderId.toString() !== workOrder._id.toString(),
+          );
+          schedule.calculateUtilization();
+          await schedule.save();
+        }
+      }
+
+      return {
+        success: false,
+        message: `Could not find enough capacity in ${maxDays} days. Remaining: ${remainingMinutes} minutes`,
+      };
+    }
+
+    const firstSegment = scheduledSegments[0];
+    const lastSegment = scheduledSegments[scheduledSegments.length - 1];
+
+    console.log(`[SUCCESS] ${workOrder.workOrderNumber} scheduled:`, {
+      daysSpanned,
+      start: firstSegment.scheduledStartTime.toLocaleString(),
+      end: lastSegment.scheduledEndTime.toLocaleString(),
+      totalDuration: durationMinutes,
+    });
+
+    return {
+      success: true,
+      scheduledStartTime: firstSegment.scheduledStartTime,
+      scheduledEndTime: lastSegment.scheduledEndTime,
+      daysSpanned,
+      scheduleIds,
+      scheduledSegments,
+      totalDuration: durationMinutes,
+    };
+  } catch (error) {
+    console.error("[ERROR] scheduleWorkOrderAcrossDays:", error);
+    return {
+      success: false,
+      message: error.message,
+    };
+  }
 };
 
 /**
@@ -1047,15 +1334,11 @@ router.get("/work-order/:workOrderId", async (req, res) => {
  * POST /api/cms/manufacturing/production-schedule/schedule-work-order
  * Schedule a single work order with advanced logic
  */
+
 router.post("/schedule-work-order", async (req, res) => {
   try {
-    const {
-      workOrderId,
-      manufacturingOrderId,
-      startDate,
-      colorCode,
-      allowRescheduling = true,
-    } = req.body;
+    const { workOrderId, manufacturingOrderId, startDate, colorCode } =
+      req.body;
 
     if (!workOrderId || !startDate) {
       return res.status(400).json({
@@ -1063,6 +1346,12 @@ router.post("/schedule-work-order", async (req, res) => {
         message: "workOrderId and startDate are required",
       });
     }
+
+    console.log(`[API] Schedule WO Request:`, {
+      workOrderId,
+      startDate,
+      colorCode,
+    });
 
     // Get work order
     const workOrder = await WorkOrder.findById(workOrderId)
@@ -1076,28 +1365,12 @@ router.post("/schedule-work-order", async (req, res) => {
       });
     }
 
-    // Check if work order is ready for scheduling
-    const planningStatus = isWorkOrderReadyForScheduling(workOrder);
-
-    if (!planningStatus.ready) {
-      return res.status(400).json({
-        success: false,
-        message: "Work order is not ready for scheduling",
-        details: planningStatus,
-      });
-    }
-
-    // Get MO details if not provided
-    let mo;
-    if (manufacturingOrderId) {
-      mo = await CustomerRequest.findById(manufacturingOrderId)
-        .select("requestId customerInfo")
-        .lean();
-    } else {
-      mo = await CustomerRequest.findById(workOrder.customerRequestId)
-        .select("requestId customerInfo")
-        .lean();
-    }
+    // Get MO
+    const mo = await CustomerRequest.findById(
+      manufacturingOrderId || workOrder.customerRequestId,
+    )
+      .select("requestId customerInfo priority")
+      .lean();
 
     if (!mo) {
       return res.status(404).json({
@@ -1111,32 +1384,16 @@ router.post("/schedule-work-order", async (req, res) => {
       "scheduledWorkOrders.workOrderId": workOrderId,
     });
 
-    if (existingSchedule && !allowRescheduling) {
+    if (existingSchedule) {
       return res.status(400).json({
         success: false,
-        message: "Work order is already scheduled",
-        existingSchedule: {
-          scheduleId: existingSchedule._id,
-          date: existingSchedule.date,
-          scheduledStartTime: existingSchedule.scheduledWorkOrders.find(
-            (wo) => wo.workOrderId.toString() === workOrderId,
-          )?.scheduledStartTime,
-        },
+        message:
+          "Work order already scheduled. Use reschedule endpoint to move it.",
       });
     }
 
-    // Remove from existing schedule if rescheduling
-    if (existingSchedule && allowRescheduling) {
-      existingSchedule.scheduledWorkOrders =
-        existingSchedule.scheduledWorkOrders.filter(
-          (wo) => wo.workOrderId.toString() !== workOrderId,
-        );
-      existingSchedule.calculateUtilization();
-      await existingSchedule.save();
-    }
-
-    // Find best slot for work order
-    const slotResult = await findBestSlotForWorkOrder(
+    // Schedule the work order
+    const result = await scheduleWorkOrderAcrossDays(
       workOrder,
       mo,
       new Date(startDate),
@@ -1144,83 +1401,21 @@ router.post("/schedule-work-order", async (req, res) => {
       req.user.id,
     );
 
-    if (!slotResult.success) {
-      return res.status(400).json({
-        success: false,
-        message: slotResult.message,
-        details: slotResult,
-      });
+    if (!result.success) {
+      return res.status(400).json(result);
     }
 
-    // Schedule work order in each slot
-    const scheduledEntries = [];
-
-    for (const slot of slotResult.scheduledSlots) {
-      const schedule = await ProductionSchedule.findById(slot.scheduleId);
-
-      if (!schedule) {
-        console.error(`Schedule not found: ${slot.scheduleId}`);
-        continue;
-      }
-
-      // Create scheduled work order entry
-      const scheduledWO = {
-        workOrderId: workOrder._id,
-        workOrderNumber: workOrder.workOrderNumber,
-        manufacturingOrderId: mo._id,
-        manufacturingOrderNumber: `MO-${mo.requestId}`,
-        stockItemName: workOrder.stockItemId?.name || "Unknown",
-        stockItemReference: workOrder.stockItemId?.reference || "",
-        quantity: workOrder.quantity,
-        scheduledStartTime: slot.start,
-        scheduledEndTime: slot.end,
-        durationMinutes: slot.durationMinutes,
-        colorCode: colorCode || "#3B82F6",
-        position: schedule.scheduledWorkOrders.length,
-        status: "scheduled",
-        isMultiDay: slotResult.scheduledSlots.length > 1,
-        originalScheduleId: slotResult.scheduledSlots[0].scheduleId,
-        continuationScheduleIds: slotResult.scheduledSlots
-          .slice(1)
-          .map((s) => s.scheduleId),
-      };
-
-      // Add to schedule
-      schedule.scheduledWorkOrders.push(scheduledWO);
-      schedule.calculateUtilization();
-
-      // Add modification record
-      schedule.modifications.push({
-        modifiedBy: req.user.id,
-        modifiedAt: new Date(),
-        modificationType: "work_order_added",
-        details: `Scheduled ${workOrder.workOrderNumber} from ${slot.start.toLocaleTimeString()} to ${slot.end.toLocaleTimeString()}`,
-      });
-
-      await schedule.save();
-      scheduledEntries.push({
-        scheduleId: schedule._id,
-        date: schedule.date,
-        startTime: slot.start,
-        endTime: slot.end,
-      });
-    }
-
-    // Update work order timeline and status
-    const firstSlot = slotResult.scheduledSlots[0];
-    const lastSlot =
-      slotResult.scheduledSlots[slotResult.scheduledSlots.length - 1];
-
+    // Update work order timeline
     await WorkOrder.findByIdAndUpdate(workOrderId, {
       $set: {
-        "timeline.scheduledStartDate": firstSlot.start,
-        "timeline.scheduledEndDate": lastSlot.end,
-        "timeline.totalPlannedSeconds": slotResult.totalDuration * 60, // Store in seconds
         status: "scheduled",
+        "timeline.scheduledStartDate": result.scheduledStartTime,
+        "timeline.scheduledEndDate": result.scheduledEndTime,
+        "timeline.totalPlannedSeconds": result.totalDuration * 60,
       },
       $push: {
         productionNotes: {
-          note: `Scheduled for production from ${firstSlot.start.toLocaleDateString()} ${firstSlot.start.toLocaleTimeString()} to ${lastSlot.end.toLocaleDateString()} ${lastSlot.end.toLocaleTimeString()}`,
+          note: `Scheduled for ${result.daysSpanned} day(s) from ${result.scheduledStartTime.toLocaleDateString()}`,
           addedBy: req.user.id,
           addedByModel: "ProjectManager",
           addedAt: new Date(),
@@ -1230,21 +1425,18 @@ router.post("/schedule-work-order", async (req, res) => {
 
     res.json({
       success: true,
-      message: `Work order scheduled successfully`,
+      message: `Work order scheduled across ${result.daysSpanned} day(s)`,
       workOrderNumber: workOrder.workOrderNumber,
-      totalDuration: slotResult.totalDuration,
-      daysSpanned: slotResult.daysSpanned,
-      scheduledEntries,
-      timeline: {
-        scheduledStartDate: firstSlot.start,
-        scheduledEndDate: lastSlot.end,
-      },
+      daysSpanned: result.daysSpanned,
+      scheduledStartTime: result.scheduledStartTime,
+      scheduledEndTime: result.scheduledEndTime,
+      totalDuration: result.totalDuration,
     });
   } catch (error) {
-    console.error("Error scheduling work order:", error);
+    console.error("[ERROR] schedule-work-order:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while scheduling work order",
+      message: "Server error",
       error: error.message,
     });
   }
@@ -1310,27 +1502,16 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
     const {
       manufacturingOrderId,
       startDate,
-      strategy = "sequential",
-      maxConcurrent = 1,
-      rescheduleExisting = true, // NEW: Allow rescheduling
+      rescheduleExisting = false,
     } = req.body;
 
-    console.log("Schedule MO Request:", {
+    console.log(`[API] Schedule MO Request:`, {
       manufacturingOrderId,
       startDate,
-      strategy,
-      maxConcurrent,
       rescheduleExisting,
     });
 
-    if (!manufacturingOrderId || !startDate) {
-      return res.status(400).json({
-        success: false,
-        message: "manufacturingOrderId and startDate are required",
-      });
-    }
-
-    // Get MO and its work orders
+    // Get MO
     const mo = await CustomerRequest.findById(manufacturingOrderId)
       .select("requestId customerInfo priority")
       .lean();
@@ -1342,18 +1523,16 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
       });
     }
 
-    console.log(`Found MO: MO-${mo.requestId}`);
-
-    // Get all work orders for this MO
+    // Get work orders
     const workOrders = await WorkOrder.find({
       customerRequestId: manufacturingOrderId,
-      status: { $in: ["planned", "ready_to_start", "scheduled", "pending"] }, // Include pending
+      status: { $in: ["planned", "ready_to_start", "scheduled"] },
     })
       .populate("stockItemId", "name reference")
       .lean();
 
     console.log(
-      `Found ${workOrders.length} work orders for MO-${mo.requestId}`,
+      `[API] Found ${workOrders.length} work orders for MO-${mo.requestId}`,
     );
 
     if (workOrders.length === 0) {
@@ -1363,335 +1542,150 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
       });
     }
 
-    // Filter to only work orders ready for scheduling
+    // Filter work orders ready for scheduling
     const readyWorkOrders = [];
-    const notReadyWorkOrders = [];
 
     for (const wo of workOrders) {
-      const workOrderNumber =
-        wo.workOrderNumber || `ID:${wo._id.toString().slice(-6)}`;
-      const planningStatus = isWorkOrderReadyForScheduling(wo);
+      // Check if it has operations with planned time
+      const hasPlannedTime =
+        wo.operations?.some((op) => op.plannedTimeSeconds > 0) || false;
 
-      console.log(`Work Order ${workOrderNumber}:`, {
-        status: wo.status,
-        operationsCount: wo.operations?.length || 0,
-        plannedTimeSeconds: wo.operations?.[0]?.plannedTimeSeconds,
-        assignedMachine: wo.operations?.[0]?.assignedMachine,
-        rawMaterials: wo.rawMaterials?.length || 0,
-        planningStatus: planningStatus,
+      if (!hasPlannedTime) {
+        console.log(`[SKIP] ${wo.workOrderNumber} - No planned time`);
+        continue;
+      }
+
+      // If already scheduled and not rescheduling, skip
+      const isScheduled = await ProductionSchedule.findOne({
+        "scheduledWorkOrders.workOrderId": wo._id,
       });
 
-      if (planningStatus.ready) {
-        // Remove existing schedule if rescheduling
-        if (wo.status === "scheduled" && rescheduleExisting) {
-          try {
-            const existingSchedule = await ProductionSchedule.findOne({
-              "scheduledWorkOrders.workOrderId": wo._id,
-            });
-
-            if (existingSchedule) {
-              console.log(
-                `Removing ${workOrderNumber} from existing schedule ${existingSchedule._id}`,
-              );
-
-              existingSchedule.scheduledWorkOrders =
-                existingSchedule.scheduledWorkOrders.filter(
-                  (scheduledWO) =>
-                    scheduledWO.workOrderId.toString() !== wo._id.toString(),
-                );
-
-              existingSchedule.calculateUtilization();
-              await existingSchedule.save();
-
-              await WorkOrder.findByIdAndUpdate(wo._id, {
-                $set: {
-                  status: "planned",
-                  "timeline.scheduledStartDate": null,
-                  "timeline.scheduledEndDate": null,
-                },
-              });
-
-              console.log(
-                `Updated ${workOrderNumber} status from scheduled to planned`,
-              );
-            }
-          } catch (error) {
-            console.error(
-              `Error removing ${workOrderNumber} from schedule:`,
-              error,
-            );
-          }
-        }
-
-        readyWorkOrders.push({
-          workOrder: wo,
-          durationMinutes: calculateWorkOrderDuration(wo),
-          planningStatus,
-          wasScheduled: wo.status === "scheduled",
-        });
-      } else {
-        notReadyWorkOrders.push({
-          workOrderNumber: workOrderNumber,
-          reason: planningStatus.reason,
-          details: planningStatus,
-        });
+      if (isScheduled && !rescheduleExisting) {
+        console.log(`[SKIP] ${wo.workOrderNumber} - Already scheduled`);
+        continue;
       }
-    }
 
-    console.log(
-      `Ready WOs: ${readyWorkOrders.length}, Not Ready: ${notReadyWorkOrders.length}`,
-    );
+      // Remove from existing schedule if rescheduling
+      if (isScheduled && rescheduleExisting) {
+        isScheduled.scheduledWorkOrders =
+          isScheduled.scheduledWorkOrders.filter(
+            (swo) => swo.workOrderId.toString() !== wo._id.toString(),
+          );
+        isScheduled.calculateUtilization();
+        await isScheduled.save();
+
+        await WorkOrder.findByIdAndUpdate(wo._id, {
+          $set: {
+            status: "planned",
+            "timeline.scheduledStartDate": null,
+            "timeline.scheduledEndDate": null,
+          },
+        });
+
+        console.log(`[REMOVE] ${wo.workOrderNumber} from existing schedule`);
+      }
+
+      readyWorkOrders.push(wo);
+    }
 
     if (readyWorkOrders.length === 0) {
       return res.status(400).json({
         success: false,
-        message: "No work orders are ready for scheduling",
-        notReadyWorkOrders,
-        details: "Check if work orders have operations with planned time",
+        message: "No work orders ready for scheduling",
       });
     }
 
-    // Sort work orders based on strategy
-    if (strategy === "sequential") {
-      readyWorkOrders.sort((a, b) => {
-        // Sort by wasScheduled first (already scheduled ones first)
-        if (a.wasScheduled && !b.wasScheduled) return -1;
-        if (!a.wasScheduled && b.wasScheduled) return 1;
+    // Sort by duration (longest first for better packing)
+    readyWorkOrders.sort((a, b) => {
+      const aDuration = calculateWorkOrderDuration(a);
+      const bDuration = calculateWorkOrderDuration(b);
+      return bDuration - aDuration;
+    });
 
-        // Then by duration (longest first)
-        return b.durationMinutes - a.durationMinutes;
-      });
-    } else if (strategy === "parallel") {
-      readyWorkOrders.sort((a, b) => {
-        const aCategory = a.workOrder.stockItemId?.category || "";
-        const bCategory = b.workOrder.stockItemId?.category || "";
-        return aCategory.localeCompare(bCategory);
-      });
-    }
-
-    // Schedule work orders
+    // Schedule each work order sequentially
     let currentDate = new Date(startDate);
-    const scheduledResults = [];
-    const failedResults = [];
-    let concurrentCount = 0;
+    const results = {
+      successful: [],
+      failed: [],
+    };
 
-    for (const {
-      workOrder,
-      durationMinutes,
-      wasScheduled,
-    } of readyWorkOrders) {
-      try {
-        // FIXED: Get or generate work order number
-        const workOrderNumber =
-          workOrder.workOrderNumber || generateWorkOrderNumber(workOrder);
+    for (const wo of readyWorkOrders) {
+      const result = await scheduleWorkOrderAcrossDays(
+        wo,
+        mo,
+        currentDate,
+        getColorCode(mo.priority),
+        req.user.id,
+      );
 
-        console.log(
-          `Scheduling ${workOrderNumber} (${wasScheduled ? "rescheduling" : "new"}), duration: ${durationMinutes} minutes`,
-        );
-
-        // Find best slot for work order
-        const slotResult = await findBestSlotForWorkOrder(
-          workOrder,
-          mo,
-          currentDate,
-          getColorCode(mo.priority),
-          req.user.id,
-        );
-
-        if (slotResult.success) {
-          const firstSlot = slotResult.scheduledSlots[0];
-          const lastSlot =
-            slotResult.scheduledSlots[slotResult.scheduledSlots.length - 1];
-
-          console.log(`Found slot for ${workOrderNumber}:`, {
-            daysSpanned: slotResult.daysSpanned,
-            slots: slotResult.scheduledSlots.length,
-            firstSlot: firstSlot.start,
-            lastSlot: lastSlot.end,
-          });
-
-          // Calculate total planned seconds for timeline
-          const totalPlannedSeconds = workOrder.operations.reduce(
-            (sum, op) => sum + (op.plannedTimeSeconds || 0),
-            0,
-          );
-
-          // Schedule the work order
-          for (const slot of slotResult.scheduledSlots) {
-            const schedule = await ProductionSchedule.findById(slot.scheduleId);
-
-            const scheduledWO = {
-              workOrderId: workOrder._id,
-              workOrderNumber: workOrderNumber, // Use generated number
-              manufacturingOrderId: mo._id,
-              manufacturingOrderNumber: `MO-${mo.requestId}`,
-              stockItemName: workOrder.stockItemId?.name || "Unknown",
-              stockItemReference: workOrder.stockItemId?.reference || "",
-              quantity: workOrder.quantity,
-              scheduledStartTime: slot.start,
-              scheduledEndTime: slot.end,
-              durationMinutes: slot.durationMinutes,
-              colorCode: getColorCode(mo.priority),
-              position: schedule.scheduledWorkOrders.length,
-              status: "scheduled",
-              isMultiDay: slotResult.scheduledSlots.length > 1,
-              originalScheduleId: firstSlot.scheduleId,
-              continuationScheduleIds: slotResult.scheduledSlots
-                .slice(1)
-                .map((s) => s.scheduleId),
-            };
-
-            schedule.scheduledWorkOrders.push(scheduledWO);
-            schedule.calculateUtilization();
-
-            schedule.modifications.push({
-              modifiedBy: req.user.id,
-              modifiedAt: new Date(),
-              modificationType: wasScheduled
-                ? "work_order_rescheduled"
-                : "work_order_added",
-              details: `${wasScheduled ? "Rescheduled" : "Scheduled"} ${workOrderNumber} as part of MO-${mo.requestId}`,
-            });
-
-            await schedule.save();
-            console.log(
-              `Added ${workOrderNumber} to schedule ${schedule.date.toISOString().split("T")[0]}`,
-            );
-          }
-
-          // Update work order with the generated number if missing
-          const updateData = {
-            $set: {
-              status: "scheduled",
-              "timeline.scheduledStartDate": firstSlot.start,
-              "timeline.scheduledEndDate": lastSlot.end,
-              "timeline.totalPlannedSeconds": totalPlannedSeconds,
-              "timeline.totalEstimatedSeconds": totalPlannedSeconds,
-              "timeline.plannedStartDate": firstSlot.start,
-              "timeline.plannedEndDate": lastSlot.end,
+      if (result.success) {
+        // Update work order
+        await WorkOrder.findByIdAndUpdate(wo._id, {
+          $set: {
+            status: "scheduled",
+            "timeline.scheduledStartDate": result.scheduledStartTime,
+            "timeline.scheduledEndDate": result.scheduledEndTime,
+            "timeline.totalPlannedSeconds": result.totalDuration * 60,
+          },
+          $push: {
+            productionNotes: {
+              note: `Scheduled for ${result.daysSpanned} day(s) from ${result.scheduledStartTime.toLocaleDateString()}`,
+              addedBy: req.user.id,
+              addedByModel: "ProjectManager",
+              addedAt: new Date(),
             },
-            $push: {
-              productionNotes: {
-                note: `Scheduled for production from ${firstSlot.start.toLocaleDateString()} to ${lastSlot.end.toLocaleDateString()} (${durationMinutes} minutes)`,
-                addedBy: req.user.id,
-                addedByModel: "ProjectManager",
-                addedAt: new Date(),
-              },
-            },
-          };
+          },
+        });
 
-          // Add workOrderNumber to update if missing
-          if (!workOrder.workOrderNumber) {
-            updateData.$set.workOrderNumber = workOrderNumber;
-          }
+        results.successful.push({
+          workOrderNumber: wo.workOrderNumber,
+          daysSpanned: result.daysSpanned,
+          scheduledStart: result.scheduledStartTime,
+          scheduledEnd: result.scheduledEndTime,
+        });
 
-          await WorkOrder.findByIdAndUpdate(workOrder._id, updateData);
-
-          scheduledResults.push({
-            workOrderNumber: workOrderNumber,
-            originalWorkOrderId: workOrder._id,
-            durationMinutes: durationMinutes,
-            scheduledStart: firstSlot.start,
-            scheduledEnd: lastSlot.end,
-            daysSpanned: slotResult.daysSpanned,
-            wasScheduled: wasScheduled,
-            workOrderNumberGenerated: !workOrder.workOrderNumber,
-          });
-
-          console.log(
-            `Successfully ${wasScheduled ? "rescheduled" : "scheduled"} ${workOrderNumber}`,
-          );
-
-          // Update current date for next work order
-          if (strategy === "sequential") {
-            currentDate = new Date(lastSlot.end);
-          } else if (strategy === "parallel") {
-            concurrentCount++;
-            if (concurrentCount >= maxConcurrent) {
-              const earliestEnd = scheduledResults
-                .slice(-maxConcurrent)
-                .reduce(
-                  (earliest, result) =>
-                    result.scheduledEnd < earliest
-                      ? result.scheduledEnd
-                      : earliest,
-                  scheduledResults[scheduledResults.length - 1].scheduledEnd,
-                );
-              currentDate = earliestEnd;
-              concurrentCount = 0;
-            }
-          }
-        } else {
-          console.log(
-            `Failed to find slot for ${workOrderNumber}:`,
-            slotResult.message,
-          );
-          failedResults.push({
-            workOrderNumber: workOrderNumber,
-            reason: slotResult.message,
-            wasScheduled: wasScheduled,
-          });
-        }
-      } catch (error) {
-        console.error(
-          `Error scheduling ${workOrder.workOrderNumber || workOrder._id}:`,
-          error,
-        );
-        failedResults.push({
-          workOrderNumber:
-            workOrder.workOrderNumber || workOrder._id.toString().slice(-6),
-          reason: error.message,
-          wasScheduled: wasScheduled,
+        // Move current date to end of this work order for next one
+        currentDate = new Date(result.scheduledEndTime);
+      } else {
+        results.failed.push({
+          workOrderNumber: wo.workOrderNumber,
+          reason: result.message,
         });
       }
     }
-    // Update MO status if any work orders scheduled
-    if (scheduledResults.length > 0) {
+
+    // Update MO status
+    if (results.successful.length > 0) {
       await CustomerRequest.findByIdAndUpdate(manufacturingOrderId, {
-        $set: {
-          status: "production",
-        },
+        $set: { status: "production" },
       });
-      console.log(`Updated MO-${mo.requestId} status to production`);
     }
 
     res.json({
       success: true,
-      message: `${scheduledResults.length} work orders scheduled (${scheduledResults.filter((r) => r.wasScheduled).length} rescheduled)${failedResults.length > 0 ? `, ${failedResults.length} failed` : ""}`,
+      message: `Scheduled ${results.successful.length} work orders`,
       moNumber: `MO-${mo.requestId}`,
-      scheduledResults,
-      failedResults,
-      notReadyWorkOrders,
-      summary: {
-        totalWorkOrders: workOrders.length,
-        readyForScheduling: readyWorkOrders.length,
-        successfullyScheduled: scheduledResults.length,
-        failedToSchedule: failedResults.length,
-        notReady: notReadyWorkOrders.length,
-        rescheduled: scheduledResults.filter((r) => r.wasScheduled).length,
-        newlyScheduled: scheduledResults.filter((r) => !r.wasScheduled).length,
-      },
+      results,
     });
   } catch (error) {
-    console.error("Error scheduling manufacturing order:", error);
+    console.error("[ERROR] schedule-manufacturing-order:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while scheduling manufacturing order",
+      message: "Server error",
       error: error.message,
-      stack: error.stack,
     });
   }
 });
 
-// Helper function to get color code based on priority
+// Helper function for color codes
 const getColorCode = (priority) => {
   const colorMap = {
-    urgent: "#EF4444", // red-500
-    high: "#F59E0B", // amber-500
-    medium: "#3B82F6", // blue-500
-    low: "#10B981", // emerald-500
+    urgent: "#EF4444",
+    high: "#F59E0B",
+    medium: "#3B82F6",
+    low: "#10B981",
   };
-  return colorMap[priority] || "#3B82F6"; // default blue
+  return colorMap[priority] || "#3B82F6";
 };
 
 /**
