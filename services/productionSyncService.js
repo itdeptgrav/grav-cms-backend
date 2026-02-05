@@ -19,7 +19,7 @@ class ProductionSyncService {
     console.log("🚀 Initializing Production Sync Service...");
 
     // Run every 1 minute - sync production data to work orders
-    this.syncJob = cron.schedule("*/1 * * * *", async () => {
+    this.syncJob = cron.schedule("*/20 * * * *", async () => {
       await this.syncProductionToWorkOrders();
     });
 

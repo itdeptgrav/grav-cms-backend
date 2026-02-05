@@ -9,8 +9,6 @@ const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
-// routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes.js - UPDATED
-
 // GET employee measurements for a specific work order
 router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
   try {
