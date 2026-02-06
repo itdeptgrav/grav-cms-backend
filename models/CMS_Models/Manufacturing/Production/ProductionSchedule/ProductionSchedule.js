@@ -256,15 +256,16 @@ const productionScheduleSchema = new mongoose.Schema(
         modificationType: {
           type: String,
           enum: [
-            "schedule_created", // ADD THIS
+            "schedule_created",
             "work_order_added",
             "work_order_removed",
             "work_order_rescheduled",
             "day_settings_changed",
             "break_added",
             "break_removed",
-            "work_order_time_updated", // ADD THIS
-            "schedule_cleared", // ADD THIS
+            "work_order_time_updated",
+            "schedule_cleared",
+            "work_order_moved",
           ],
         },
         details: {
