@@ -85,11 +85,18 @@ const getEmployeeName = async (identityId) => {
 };
 
 /**
- * Calculate unit positions
+ * FIXED: Calculate unit positions and completion
+ * A unit is COMPLETE only when it has been scanned in ALL required operations
  */
-const calculateUnitPositions = (scans, totalOperations, totalUnits) => {
+const calculateUnitPositions = (scans, workOrderOperations, totalUnits) => {
   const unitPositions = {};
+  
+  // Get total number of operations from work order
+  const totalOperations = workOrderOperations.length;
+  
+  console.log(`📊 Calculating for ${totalUnits} units across ${totalOperations} operations`);
 
+  // Initialize all units
   for (let i = 1; i <= totalUnits; i++) {
     unitPositions[i] = {
       currentOperation: 0,
@@ -102,7 +109,10 @@ const calculateUnitPositions = (scans, totalOperations, totalUnits) => {
     };
   }
 
-  const scansByUnitAndOp = {};
+  // Group scans by unit number and operation number
+  // Key: "unitNumber-operationNumber"
+  // Value: array of scans (we only care if it exists, not count)
+  const scansByUnitAndOperation = new Map();
   
   scans.forEach((scan) => {
     const parsed = parseBarcode(scan.barcodeId);
@@ -110,64 +120,114 @@ const calculateUnitPositions = (scans, totalOperations, totalUnits) => {
       const unitNum = parsed.unitNumber;
       const opNum = parsed.operationNumber || scan.operationNumber || 1;
       
-      if (!scansByUnitAndOp[unitNum]) {
-        scansByUnitAndOp[unitNum] = {};
-      }
-      if (!scansByUnitAndOp[unitNum][opNum]) {
-        scansByUnitAndOp[unitNum][opNum] = [];
+      const key = `${unitNum}-${opNum}`;
+      
+      if (!scansByUnitAndOperation.has(key)) {
+        scansByUnitAndOperation.set(key, []);
       }
       
-      scansByUnitAndOp[unitNum][opNum].push({
+      scansByUnitAndOperation.get(key).push({
         ...scan,
         timestamp: scan.timestamp || scan.timeStamp,
       });
     }
   });
 
-  Object.entries(scansByUnitAndOp).forEach(([unitNum, operationScans]) => {
-    const unit = unitPositions[parseInt(unitNum)];
-    if (!unit) return;
+  console.log(`📦 Found scans for ${scansByUnitAndOperation.size} unique unit-operation combinations`);
 
+  // Now check each unit to see which operations are complete
+  for (let unitNum = 1; unitNum <= totalUnits; unitNum++) {
+    const unit = unitPositions[unitNum];
+    const completedOpsForThisUnit = [];
+    
+    // Check each operation (1 to totalOperations)
     for (let opNum = 1; opNum <= totalOperations; opNum++) {
-      const opScans = operationScans[opNum] || [];
+      const key = `${unitNum}-${opNum}`;
+      const scansForThisOp = scansByUnitAndOperation.get(key);
       
-      if (opScans.length > 0) {
-        if (!unit.completedOperations.includes(opNum)) {
-          unit.completedOperations.push(opNum);
-        }
+      // If this unit has been scanned in this operation (even once), mark operation as complete
+      if (scansForThisOp && scansForThisOp.length > 0) {
+        completedOpsForThisUnit.push(opNum);
         
-        const latestScan = opScans[opScans.length - 1];
+        // Update unit info with latest scan
+        const latestScan = scansForThisOp[scansForThisOp.length - 1];
         unit.lastScanTime = latestScan.timestamp;
         unit.currentMachine = latestScan.machineName;
         unit.currentOperator = latestScan.operatorName;
       }
     }
-
-    unit.completedOperations.sort((a, b) => a - b);
-
-    const allOpsCompleted = unit.completedOperations.length === totalOperations;
-    const someOpsCompleted = unit.completedOperations.length > 0;
-
-    if (allOpsCompleted) {
+    
+    unit.completedOperations = completedOpsForThisUnit.sort((a, b) => a - b);
+    
+    // CRITICAL: A unit is COMPLETE only when ALL operations are done
+    const allOperationsComplete = unit.completedOperations.length === totalOperations;
+    
+    if (allOperationsComplete) {
       unit.currentOperation = totalOperations;
       unit.status = "completed";
       unit.isMoving = false;
-    } else if (someOpsCompleted) {
+      console.log(`✅ Unit ${unitNum} COMPLETED all ${totalOperations} operations`);
+    } else if (unit.completedOperations.length > 0) {
       const lastCompletedOp = unit.completedOperations[unit.completedOperations.length - 1];
       unit.currentOperation = lastCompletedOp;
       unit.status = "in_progress";
       
       if (unit.lastScanTime) {
         const timeSinceLastScan = Date.now() - new Date(unit.lastScanTime);
-        unit.isMoving = timeSinceLastScan < 300000;
+        unit.isMoving = timeSinceLastScan < 300000; // 5 minutes
       }
+      console.log(`🔄 Unit ${unitNum} in progress: ${unit.completedOperations.length}/${totalOperations} operations done`);
     } else {
       unit.currentOperation = 0;
       unit.status = "pending";
+      console.log(`⏳ Unit ${unitNum} pending (no scans yet)`);
     }
-  });
+  }
 
   return unitPositions;
+};
+
+/**
+ * FIXED: Calculate production completion by operation
+ */
+const calculateProductionCompletion = (scans, workOrderOperations, totalUnits) => {
+  const operationCompletion = [];
+  const totalOperations = workOrderOperations.length;
+  
+  // For each operation, count how many unique units have been scanned
+  for (let opNum = 1; opNum <= totalOperations; opNum++) {
+    const operation = workOrderOperations[opNum - 1];
+    const uniqueUnitsForThisOp = new Set();
+    
+    scans.forEach((scan) => {
+      const parsed = parseBarcode(scan.barcodeId);
+      if (parsed.success && parsed.unitNumber) {
+        const scanOpNum = parsed.operationNumber || scan.operationNumber || 1;
+        
+        // If this scan is for the current operation, add the unit number
+        if (scanOpNum === opNum) {
+          uniqueUnitsForThisOp.add(parsed.unitNumber);
+        }
+      }
+    });
+    
+    const completedQuantity = uniqueUnitsForThisOp.size;
+    const completionPercentage = Math.round((completedQuantity / totalUnits) * 100);
+    
+    operationCompletion.push({
+      operationNumber: opNum,
+      operationType: operation.operationType || `Operation ${opNum}`,
+      totalQuantity: totalUnits,
+      completedQuantity: completedQuantity,
+      completionPercentage: completionPercentage,
+    });
+    
+    console.log(`🔧 Operation ${opNum}: ${completedQuantity}/${totalUnits} units (${completionPercentage}%)`);
+  }
+  
+  return {
+    operationCompletion,
+  };
 };
 
 /**
@@ -232,7 +292,7 @@ const calculateEmployeeEfficiency = (operatorScans, plannedTimePerUnit) => {
 
 /**
  * GET /api/cms/production/dashboard/current-production
- * FIXED: Properly populate operator names
+ * FIXED: Properly calculate completed units
  */
 router.get("/current-production", async (req, res) => {
   try {
@@ -272,7 +332,7 @@ router.get("/current-production", async (req, res) => {
     const machineData = new Map();
     let totalScans = 0;
 
-    // FIXED: Populate operator names
+    // Collect all scans and populate operator names
     for (const machine of trackingDoc.machines) {
       const machineId = machine.machineId?._id?.toString();
       if (!machineId) continue;
@@ -285,7 +345,7 @@ router.get("/current-production", async (req, res) => {
         totalScans: 0,
         operators: [],
         status: "idle",
-        operationTracking: [], // IMPORTANT: Keep operation tracking
+        operationTracking: [],
       });
 
       const machineInfo = machineData.get(machineId);
@@ -303,12 +363,11 @@ router.get("/current-production", async (req, res) => {
 
           if (operation.operators) {
             for (const operator of operation.operators) {
-              // FIXED: Get operator name from Employee collection
               const operatorName = await getEmployeeName(operator.operatorIdentityId);
 
               const operatorData = {
                 operatorIdentityId: operator.operatorIdentityId,
-                operatorName: operatorName, // POPULATED NAME
+                operatorName: operatorName,
                 signInTime: operator.signInTime,
                 signOutTime: operator.signOutTime,
                 barcodeScans: operator.barcodeScans || [],
@@ -332,12 +391,11 @@ router.get("/current-production", async (req, res) => {
                     workOrderScans.get(woShortId).push({
                       ...scan,
                       unitNumber: parsed.unitNumber,
-                      operationNumber:
-                        parsed.operationNumber || operation.operationNumber,
+                      operationNumber: parsed.operationNumber || operation.operationNumber,
                       machineId: machineId,
                       machineName: machine.machineId?.name,
                       operatorId: operator.operatorIdentityId,
-                      operatorName: operatorName, // POPULATED NAME
+                      operatorName: operatorName,
                       timestamp: scan.timeStamp || scan.timestamp,
                     });
 
@@ -350,7 +408,7 @@ router.get("/current-production", async (req, res) => {
                     ) {
                       machineInfo.operators.push({
                         operatorId: operator.operatorIdentityId,
-                        operatorName: operatorName, // POPULATED NAME
+                        operatorName: operatorName,
                         scans: 1,
                       });
                     } else {
@@ -387,11 +445,38 @@ router.get("/current-production", async (req, res) => {
       );
 
       const totalOperations = workOrder.operations?.length || 0;
+      
+      console.log(`\n🔍 Processing WO ${workOrder.workOrderNumber}:`);
+      console.log(`   - Total Units: ${workOrder.quantity}`);
+      console.log(`   - Total Operations: ${totalOperations}`);
+      console.log(`   - Total Scans: ${scans.length}`);
+
+      // FIXED: Calculate unit positions with correct logic
       const unitPositions = calculateUnitPositions(
         scans,
-        totalOperations,
+        workOrder.operations || [],
         workOrder.quantity
       );
+
+      // FIXED: Calculate production completion by operation
+      const productionCompletion = calculateProductionCompletion(
+        scans,
+        workOrder.operations || [],
+        workOrder.quantity
+      );
+
+      // Count units by status
+      const completedUnits = Object.values(unitPositions).filter(
+        (u) => u.status === "completed"
+      ).length;
+      
+      const inProgressUnits = Object.values(unitPositions).filter(
+        (u) => u.status === "in_progress"
+      ).length;
+
+      console.log(`✅ COMPLETED UNITS: ${completedUnits}/${workOrder.quantity}`);
+      console.log(`🔄 IN PROGRESS: ${inProgressUnits}`);
+      console.log(`⏳ PENDING: ${workOrder.quantity - completedUnits - inProgressUnits}`);
 
       const operationDistribution = {};
       for (let i = 0; i <= totalOperations + 1; i++) {
@@ -402,13 +487,7 @@ router.get("/current-production", async (req, res) => {
         operationDistribution[unit.currentOperation]++;
       });
 
-      const completedUnits = Object.values(unitPositions).filter(
-        (u) => u.status === "completed"
-      ).length;
-      const inProgressUnits = Object.values(unitPositions).filter(
-        (u) => u.status === "in_progress"
-      ).length;
-
+      // Employee metrics
       const employeeMetrics = [];
       const employeeScansMap = new Map();
 
@@ -416,7 +495,7 @@ router.get("/current-production", async (req, res) => {
         if (!employeeScansMap.has(scan.operatorId)) {
           employeeScansMap.set(scan.operatorId, {
             operatorId: scan.operatorId,
-            operatorName: scan.operatorName, // POPULATED NAME
+            operatorName: scan.operatorName,
             scans: [],
             machines: new Set(),
           });
@@ -439,7 +518,7 @@ router.get("/current-production", async (req, res) => {
 
         employeeMetrics.push({
           operatorId: data.operatorId,
-          operatorName: data.operatorName, // POPULATED NAME
+          operatorName: data.operatorName,
           totalScans: data.scans.length,
           machinesUsed: Array.from(data.machines),
           ...efficiency,
@@ -471,6 +550,7 @@ router.get("/current-production", async (req, res) => {
         ),
         unitPositions: unitPositions,
         operationDistribution: operationDistribution,
+        productionCompletion: productionCompletion,
         employeeMetrics: employeeMetrics,
         lastScanTime: scans.length > 0 ? scans[scans.length - 1].timestamp : null,
       });
@@ -480,6 +560,13 @@ router.get("/current-production", async (req, res) => {
       if (!a.lastScanTime) return 1;
       if (!b.lastScanTime) return -1;
       return new Date(b.lastScanTime) - new Date(a.lastScanTime);
+    });
+
+    console.log(`\n📈 SUMMARY:`);
+    console.log(`   Total Active WOs: ${activeWorkOrders.length}`);
+    console.log(`   Total Scans: ${totalScans}`);
+    activeWorkOrders.forEach(wo => {
+      console.log(`   - ${wo.workOrderNumber}: ${wo.completedUnits}/${wo.quantity} units done`);
     });
 
     res.json({
@@ -577,7 +664,6 @@ router.get("/all-machines", async (req, res) => {
 
             if (operation.operators) {
               for (const operator of operation.operators) {
-                // Get operator name
                 const operatorName = await getEmployeeName(operator.operatorIdentityId);
 
                 const scanCount = operator.barcodeScans?.length || 0;
@@ -684,153 +770,180 @@ router.get("/operators", async (req, res) => {
   }
 });
 
-/**
- * POST /api/cms/production/dashboard/generate-day-report
- * NEW: Generate day report in CSV format
- */
-router.post("/generate-day-report", async (req, res) => {
+
+const validateAndParseBarcode = (barcodeId, workOrder) => {
   try {
-    const { date } = req.body;
+    const parts = barcodeId.split("-");
+    
+    // Valid format: WO-{workOrderId}-{unitNumber}-{operationNumber}
+    if (parts.length >= 4 && parts[0] === "WO") {
+      const woId = parts[1];
+      const unitNumber = parseInt(parts[2]);
+      const operationNumber = parseInt(parts[3]);
+      
+      // Validate work order ID matches
+      const woIdStr = workOrder._id.toString();
+      const woShortId = woIdStr.slice(-8);
+      
+      if (woId === woShortId || woId === woIdStr) {
+        // Validate unit number is within range
+        if (unitNumber >= 1 && unitNumber <= workOrder.quantity) {
+          // Validate operation number is within range
+          const totalOperations = workOrder.operations?.length || 0;
+          if (operationNumber >= 1 && operationNumber <= totalOperations) {
+            return {
+              success: true,
+              workOrderId: woId,
+              unitNumber: unitNumber,
+              operationNumber: operationNumber,
+              isValid: true
+            };
+          }
+        }
+      }
+    }
+    return { success: false, error: "Invalid barcode format or data" };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+};
+
+
+
+// Add this to your productionDashboardRoutes.js file:
+
+/**
+ * GET /api/cms/production/dashboard/operator-details
+ * Get detailed operator information including all sessions
+ */
+router.get("/operator-details", async (req, res) => {
+  try {
+    const { operatorId, date } = req.query;
     
     let queryDate;
     if (date) {
       queryDate = new Date(date);
     } else {
-      const now = new Date();
-      const istOffset = 5.5 * 60 * 60 * 1000;
-      const istTime = new Date(now.getTime() + istOffset);
-      queryDate = new Date(istTime.toISOString().split('T')[0]);
+      queryDate = new Date();
     }
     queryDate.setHours(0, 0, 0, 0);
 
-    const trackingDoc = await ProductionTracking.findOne({
-      date: queryDate,
-    })
-      .populate("machines.machineId", "name serialNumber type")
-      .lean();
+    console.log("👤 Fetching operator details:", operatorId, "for date:", queryDate);
 
-    if (!trackingDoc) {
-      return res.status(404).json({
-        success: false,
-        message: "No production data for this date",
+    // Get basic employee info
+    const employee = await Employee.findOne({
+      $or: [
+        { identityId: operatorId },
+        { biometricId: operatorId },
+        { _id: operatorId }
+      ]
+    })
+    .select("firstName lastName identityId biometricId department designation")
+    .lean();
+
+    if (!employee) {
+      return res.json({
+        success: true,
+        details: {
+          name: operatorId,
+          department: "Unknown",
+          designation: "Operator"
+        }
       });
     }
 
-    // Collect all WO data
-    const workOrderScans = new Map();
-    
-    for (const machine of trackingDoc.machines) {
-      const machineId = machine.machineId?._id?.toString();
-      if (!machineId) continue;
+    // Get tracking data for the day
+    const trackingDoc = await ProductionTracking.findOne({
+      date: queryDate,
+    })
+    .populate("machines.machineId", "name serialNumber type")
+    .lean();
 
-      for (const operation of machine.operationTracking || []) {
-        for (const operator of operation.operators || []) {
-          const operatorName = await getEmployeeName(operator.operatorIdentityId);
+    const sessions = [];
+    let totalScans = 0;
 
-          for (const scan of operator.barcodeScans || []) {
-            const parsed = parseBarcode(scan.barcodeId);
-            if (parsed.success) {
-              const woShortId = parsed.workOrderShortId;
-
-              if (!workOrderScans.has(woShortId)) {
-                workOrderScans.set(woShortId, []);
+    if (trackingDoc) {
+      for (const machine of trackingDoc.machines) {
+        const machineName = machine.machineId?.name || "Unknown";
+        
+        if (machine.operationTracking) {
+          for (const operation of machine.operationTracking) {
+            if (operation.operators) {
+              for (const operator of operation.operators) {
+                if (operator.operatorIdentityId === operatorId || 
+                    operator.operatorIdentityId === employee.identityId ||
+                    operator.operatorIdentityId === employee.biometricId) {
+                  
+                  const scanCount = operator.barcodeScans?.length || 0;
+                  totalScans += scanCount;
+                  
+                  sessions.push({
+                    machineId: machine.machineId?._id,
+                    machineName: machineName,
+                    operationType: operation.operationType,
+                    operationNumber: operation.operationNumber,
+                    signInTime: operator.signInTime,
+                    signOutTime: operator.signOutTime,
+                    isCurrent: !operator.signOutTime,
+                    scansCount: scanCount,
+                    barcodeScans: operator.barcodeScans || []
+                  });
+                }
               }
-
-              workOrderScans.get(woShortId).push({
-                operatorId: operator.operatorIdentityId,
-                operatorName: operatorName,
-                machineName: machine.machineId?.name,
-                operationType: operation.operationType,
-                operationNumber: operation.operationNumber,
-                unitNumber: parsed.unitNumber,
-                timestamp: scan.timeStamp,
-              });
             }
           }
         }
       }
     }
 
-    // Build CSV report
-    const reportData = [];
-
-    for (const [woShortId, scans] of workOrderScans) {
-      const workOrder = await findWorkOrderByShortId(woShortId);
-      if (!workOrder) continue;
-
-      const manufacturingOrder = await getManufacturingOrder(
-        workOrder.customerRequestId
+    // Calculate efficiency from scans
+    let avgTimeBetweenScans = 0;
+    let scansPerHour = 0;
+    
+    if (totalScans > 1) {
+      const allScans = sessions.flatMap(s => s.barcodeScans);
+      const sortedScans = allScans.sort((a, b) => 
+        new Date(a.timeStamp) - new Date(b.timeStamp)
       );
-
-      // Group by employee
-      const employeeData = new Map();
-
-      scans.forEach((scan) => {
-        const key = `${scan.operatorId}-${scan.operationNumber}`;
-        if (!employeeData.has(key)) {
-          employeeData.set(key, {
-            operatorName: scan.operatorName,
-            operationType: scan.operationType,
-            operationNumber: scan.operationNumber,
-            machineName: scan.machineName,
-            units: new Set(),
-            scans: [],
-          });
+      
+      const timeGaps = [];
+      for (let i = 1; i < sortedScans.length; i++) {
+        const timeDiff = (new Date(sortedScans[i].timeStamp) - 
+                         new Date(sortedScans[i-1].timeStamp)) / 1000;
+        if (timeDiff > 0 && timeDiff < 28800) {
+          timeGaps.push(timeDiff);
         }
-        const data = employeeData.get(key);
-        data.units.add(scan.unitNumber);
-        data.scans.push(scan.timestamp);
-      });
-
-      // Calculate avg time for each employee
-      employeeData.forEach((data, key) => {
-        const sortedScans = data.scans.sort((a, b) => new Date(a) - new Date(b));
-        let totalTime = 0;
-        let intervals = 0;
-
-        for (let i = 1; i < sortedScans.length; i++) {
-          const timeDiff = (new Date(sortedScans[i]) - new Date(sortedScans[i - 1])) / 1000;
-          if (timeDiff < 3600) {
-            totalTime += timeDiff;
-            intervals++;
-          }
-        }
-
-        const avgTime = intervals > 0 ? Math.round(totalTime / intervals) : 0;
-
-        reportData.push({
-          Date: queryDate.toISOString().split('T')[0],
-          "Work Order": workOrder.workOrderNumber,
-          "MO Number": manufacturingOrder ? `MO-${manufacturingOrder.requestId}` : "N/A",
-          "Customer": manufacturingOrder?.customerInfo?.name || "N/A",
-          "Stock Item": workOrder.stockItemName,
-          "Employee Name": data.operatorName,
-          "Operation Number": data.operationNumber,
-          "Operation Type": data.operationType,
-          "Machine": data.machineName,
-          "Units Completed": data.units.size,
-          "Total Punchings": data.scans.length,
-          "Avg Time Between Punchings (seconds)": avgTime,
-        });
-      });
+      }
+      
+      if (timeGaps.length > 0) {
+        avgTimeBetweenScans = Math.round(timeGaps.reduce((a, b) => a + b, 0) / timeGaps.length);
+        scansPerHour = Math.round((3600 / avgTimeBetweenScans) * 10) / 10;
+      }
     }
 
     res.json({
       success: true,
-      reportData: reportData,
-      date: queryDate,
+      details: {
+        name: `${employee.firstName} ${employee.lastName}`,
+        identityId: employee.identityId || employee.biometricId,
+        department: employee.department || "Production",
+        designation: employee.designation || "Operator",
+        sessions: sessions.sort((a, b) => new Date(b.signInTime) - new Date(a.signInTime)),
+        totalScans: totalScans,
+        avgTimeBetweenScans: avgTimeBetweenScans,
+        scansPerHour: scansPerHour,
+        efficiency: avgTimeBetweenScans > 0 ? Math.round((3600 / avgTimeBetweenScans) * 100) : 0
+      }
     });
 
   } catch (error) {
-    console.error("Error generating report:", error);
+    console.error("Error fetching operator details:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while generating report",
+      message: "Server error while fetching operator details",
       error: error.message,
     });
   }
 });
 
 module.exports = router;
-
-
