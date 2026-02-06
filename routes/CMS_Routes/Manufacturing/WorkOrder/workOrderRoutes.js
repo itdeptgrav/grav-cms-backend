@@ -15,7 +15,6 @@ const streamBuffers = require("stream-buffers");
 
 router.use(EmployeeAuthMiddleware);
 
-
 // GET single work order details - OPTIMIZED FOR FRONTEND USAGE
 router.get("/:id", async (req, res) => {
   try {
@@ -30,7 +29,9 @@ router.get("/:id", async (req, res) => {
 
     // OPTIMIZED: Select only needed fields, minimal population
     const workOrder = await WorkOrder.findById(id)
-      .select("workOrderNumber status priority quantity stockItemName stockItemReference variantAttributes specialInstructions createdAt estimatedCost rawMaterials operations planningNotes")
+      .select(
+        "workOrderNumber status priority quantity stockItemName stockItemReference variantAttributes specialInstructions createdAt estimatedCost rawMaterials operations planningNotes",
+      )
       .populate("plannedBy", "name") // ONLY name, not email
       .lean();
 
@@ -45,7 +46,7 @@ router.get("/:id", async (req, res) => {
     const panelCount = await getPanelCount(workOrder.stockItemId);
 
     // OPTIMIZED: Transform raw materials - remove unused data
-    const optimizedRawMaterials = (workOrder.rawMaterials || []).map(rm => ({
+    const optimizedRawMaterials = (workOrder.rawMaterials || []).map((rm) => ({
       name: rm.name,
       sku: rm.sku,
       unit: rm.unit,
@@ -57,58 +58,71 @@ router.get("/:id", async (req, res) => {
       allocationStatus: rm.allocationStatus || "not_allocated",
       rawItemVariantId: rm.rawItemVariantId,
       rawItemVariantCombination: rm.rawItemVariantCombination || [],
-      variantName: rm.rawItemVariantCombination?.join(" • ") || 
-                 (rm.rawItemVariantId ? `Variant #${rm.rawItemVariantId.toString().slice(-6)}` : "Default")
+      variantName:
+        rm.rawItemVariantCombination?.join(" • ") ||
+        (rm.rawItemVariantId
+          ? `Variant #${rm.rawItemVariantId.toString().slice(-6)}`
+          : "Default"),
     }));
 
     // OPTIMIZED: Transform operations - remove unused fields
-    const optimizedOperations = (workOrder.operations || []).map((op, index) => ({
-      _id: op._id,
-      operationType: op.operationType,
-      machineType: op.machineType,
-      status: op.status || "pending",
-      notes: op.notes || "",
-      estimatedTimeSeconds: op.estimatedTimeSeconds || 0,
-      plannedTimeSeconds: op.plannedTimeSeconds || op.estimatedTimeSeconds || 0,
-      maxAllowedSeconds: op.maxAllowedSeconds || 
-                       (op.estimatedTimeSeconds ? Math.ceil(op.estimatedTimeSeconds / 0.7) : 0),
-      assignedMachine: op.assignedMachine,
-      assignedMachineName: op.assignedMachineName,
-      assignedMachineSerial: op.assignedMachineSerial,
-      additionalMachines: (op.additionalMachines || []).map(am => ({
-        assignedMachine: am.assignedMachine,
-        assignedMachineName: am.assignedMachineName,
-        assignedMachineSerial: am.assignedMachineSerial,
-        notes: am.notes || ""
-      }))
-    }));
+    const optimizedOperations = (workOrder.operations || []).map(
+      (op, index) => ({
+        _id: op._id,
+        operationType: op.operationType,
+        machineType: op.machineType,
+        status: op.status || "pending",
+        notes: op.notes || "",
+        estimatedTimeSeconds: op.estimatedTimeSeconds || 0,
+        plannedTimeSeconds:
+          op.plannedTimeSeconds || op.estimatedTimeSeconds || 0,
+        maxAllowedSeconds:
+          op.maxAllowedSeconds ||
+          (op.estimatedTimeSeconds
+            ? Math.ceil(op.estimatedTimeSeconds / 0.7)
+            : 0),
+        assignedMachine: op.assignedMachine,
+        assignedMachineName: op.assignedMachineName,
+        assignedMachineSerial: op.assignedMachineSerial,
+        additionalMachines: (op.additionalMachines || []).map((am) => ({
+          assignedMachine: am.assignedMachine,
+          assignedMachineName: am.assignedMachineName,
+          assignedMachineSerial: am.assignedMachineSerial,
+          notes: am.notes || "",
+        })),
+      }),
+    );
 
     // OPTIMIZED: Calculate timeline totals
     const totalPlannedSeconds = optimizedOperations.reduce(
-      (sum, op) => sum + (op.plannedTimeSeconds || 0), 0
+      (sum, op) => sum + (op.plannedTimeSeconds || 0),
+      0,
     );
 
     // OPTIMIZED: Calculate material status counts
     const rawMaterialStats = {
       total: optimizedRawMaterials.length,
-      fullyAllocated: optimizedRawMaterials.filter(rm => 
-        rm.allocationStatus === "fully_allocated" || rm.allocationStatus === "issued"
+      fullyAllocated: optimizedRawMaterials.filter(
+        (rm) =>
+          rm.allocationStatus === "fully_allocated" ||
+          rm.allocationStatus === "issued",
       ).length,
-      partiallyAllocated: optimizedRawMaterials.filter(rm => 
-        rm.allocationStatus === "partially_allocated"
+      partiallyAllocated: optimizedRawMaterials.filter(
+        (rm) => rm.allocationStatus === "partially_allocated",
       ).length,
-      notAllocated: optimizedRawMaterials.filter(rm => 
-        rm.allocationStatus === "not_allocated"
+      notAllocated: optimizedRawMaterials.filter(
+        (rm) => rm.allocationStatus === "not_allocated",
       ).length,
-      variantSpecific: optimizedRawMaterials.filter(rm => 
-        rm.rawItemVariantId || (rm.rawItemVariantCombination?.length > 0)
-      ).length
+      variantSpecific: optimizedRawMaterials.filter(
+        (rm) => rm.rawItemVariantId || rm.rawItemVariantCombination?.length > 0,
+      ).length,
     };
 
     // OPTIMIZED: Calculate operation status
-    const needsPlanning = optimizedRawMaterials.some(rm => 
-      rm.allocationStatus === "not_allocated"
-    ) || optimizedOperations.some(op => !op.assignedMachine);
+    const needsPlanning =
+      optimizedRawMaterials.some(
+        (rm) => rm.allocationStatus === "not_allocated",
+      ) || optimizedOperations.some((op) => !op.assignedMachine);
 
     // OPTIMIZED: Minimal response
     const response = {
@@ -126,19 +140,21 @@ router.get("/:id", async (req, res) => {
         estimatedCost: workOrder.estimatedCost || 0,
         createdAt: workOrder.createdAt,
         plannedBy: workOrder.plannedBy?.name || null,
-        
+
         // Calculated fields for frontend
         panelCount: panelCount,
-        totalBarcodes: panelCount > 0 ? workOrder.quantity * panelCount : 
-                      workOrder.quantity * optimizedOperations.length,
+        totalBarcodes:
+          panelCount > 0
+            ? workOrder.quantity * panelCount
+            : workOrder.quantity * optimizedOperations.length,
         totalPlannedSeconds: totalPlannedSeconds,
         needsPlanning: needsPlanning,
         rawMaterialStats: rawMaterialStats,
-        
+
         // Core data arrays
         rawMaterials: optimizedRawMaterials,
-        operations: optimizedOperations
-      }
+        operations: optimizedOperations,
+      },
     };
 
     res.json(response);
@@ -329,7 +345,14 @@ router.get("/:id/planning", async (req, res) => {
 
     const workOrder = await WorkOrder.findById(id)
       .populate("stockItemId", "name reference operations rawItems")
-      .populate("customerRequestId", "customerInfo deliveryDeadline")
+      .populate({
+        path: "customerRequestId",
+        select: "customerInfo deliveryDeadline",
+        populate: {
+          path: "customerId",
+          select: "shippingAddress billingAddress",
+        },
+      })
       .lean();
 
     if (!workOrder) {
@@ -338,6 +361,28 @@ router.get("/:id/planning", async (req, res) => {
         message: "Work order not found",
       });
     }
+
+    // Get customer info with address
+    let customerWithAddress = null;
+    if (workOrder.customerRequestId?.customerId) {
+      // If customerId is populated, get the customer details
+      const Customer = require("../../../../models/Customer_Models/Customer");
+      customerWithAddress = await Customer.findById(
+        workOrder.customerRequestId.customerId,
+      )
+        .select("shippingAddress billingAddress phone email")
+        .lean();
+    }
+
+    // Format customer info with address
+    const customerInfo = {
+      ...workOrder.customerRequestId?.customerInfo,
+      address:
+        customerWithAddress?.shippingAddress?.fullAddress ||
+        customerWithAddress?.billingAddress?.fullAddress ||
+        workOrder.customerRequestId?.customerInfo?.address ||
+        "Address not available",
+    };
 
     // Get stock item for operations reference
     const stockItem = await StockItem.findById(workOrder.stockItemId).lean();
@@ -461,8 +506,16 @@ router.get("/:id/planning", async (req, res) => {
         ...workOrder,
         operations: operationsWithMachines,
         rawMaterials: rawMaterialsWithStock,
-        maxProducibleQuantity: Math.max(1, maxProducibleQuantity), // At least 1 unit
+        maxProducibleQuantity: Math.max(1, maxProducibleQuantity),
         stockItemOperations: stockItem?.operations || [],
+        // Add customer info with address
+        customerRequestId: workOrder.customerRequestId
+          ? {
+              ...workOrder.customerRequestId,
+              customerInfo: customerInfo,
+              deliveryDeadline: workOrder.customerRequestId.deliveryDeadline,
+            }
+          : null,
       },
     });
   } catch (error) {
