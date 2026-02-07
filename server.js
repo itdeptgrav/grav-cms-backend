@@ -95,6 +95,7 @@ connectDB().then(async () => {
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment"); // make sure this exists in server.js also
+const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js"); // ✅ ADD THIS
 
 const createDefaultCuttingMaster = async () => {
   try {
@@ -127,6 +128,41 @@ const createDefaultCuttingMaster = async () => {
   }
 };
 
+const createDefaultAccountant = async () => {
+  try {
+    const existingAccountant = await AccountantDepartment.findOne({
+      role: "accountant",
+      department: "Accounting",
+    });
+
+    if (existingAccountant) {
+      console.log("✅ Accountant already exists, skipping creation");
+      return;
+    }
+
+    const defaultAccountant = new AccountantDepartment({
+      name: "Accountant Admin",
+      email: "accountant@grav.in",
+      password: "Account@12345", // will be hashed automatically
+      employeeId: "ACC001",
+      phone: "9999999999",
+      department: "Accounting",
+      role: "accountant",
+      isActive: true,
+    });
+
+    await defaultAccountant.save();
+
+    console.log("✅ Default Accountant created successfully");
+  } catch (error) {
+    console.error("❌ Accountant creation failed:", error.message);
+  }
+};
+
+// Update the database connection section
+connectDB().then(async () => {
+  await createDefaultAccountant(); // ✅ ADD THIS
+});
 //changes
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
@@ -341,6 +377,10 @@ app.use("/api/hr/tasks", employeeTasksRouter);
 
 const vendorDetailsRoutes = require("./routes/Vendor_Routes/vendorRoutes");
 app.use("/api/hr/vendors", vendorDetailsRoutes);
+
+// Accountant Department Routes
+const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
+app.use("/api/accountant/customers", accountantCustomersRoutes);
 
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
