@@ -5,12 +5,16 @@ const router = express.Router();
 const Customer = require("../../models/Customer_Models/Customer");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const mongoose = require("mongoose");
+const jwt = require("jsonwebtoken");
 
-// Middleware to verify accountant token
-// Middleware to verify token - Using unified auth system
+// Import the accountant authentication middleware
+// Alternatively, you can use the inline middleware below
+// const AccountantAuthMiddleware = require('../../Middleware/AccountantAuthMiddleware');
+
+// Middleware to verify accountant token (inline version)
 const verifyAccountantToken = async (req, res, next) => {
   try {
-    // 🔐 Read token from cookie (same as other departments)
+    // 🔐 Read token from cookie (same as login system)
     const token = req.cookies.auth_token;
 
     if (!token) {
@@ -20,29 +24,16 @@ const verifyAccountantToken = async (req, res, next) => {
       });
     }
 
-    // Verify token using JWT secret
-    const jwt = require("jsonwebtoken");
     const decoded = jwt.verify(
       token,
       process.env.JWT_SECRET || "grav_clothing_secret_key",
     );
 
-    // Check if user is actually an accountant
-    if (decoded.userType !== "accountant" && decoded.role !== "accountant") {
+    // Verify that user is an accountant
+    if (decoded.role !== "accountant" || decoded.userType !== "accountant") {
       return res.status(403).json({
         success: false,
-        message: "Access denied. Accountant access only.",
-      });
-    }
-
-    // ✅ VERIFY USER EXISTS AND IS ACTIVE
-    const AccountantDepartment = require("../../models/Accountant_model/AccountantDepartment");
-    const accountant = await AccountantDepartment.findById(decoded.id);
-
-    if (!accountant || !accountant.isActive) {
-      return res.status(401).json({
-        success: false,
-        message: "Account not active or not found",
+        message: "Access denied. Accountant privileges required.",
       });
     }
 
@@ -51,13 +42,13 @@ const verifyAccountantToken = async (req, res, next) => {
     req.user = {
       id: decoded.id,
       role: decoded.role,
-      userType: decoded.userType,
       employeeId: decoded.employeeId,
+      userType: decoded.userType,
     };
 
     next();
   } catch (error) {
-    console.error("Accountant auth error:", error);
+    console.error("Accountant auth middleware error:", error);
 
     if (error.name === "TokenExpiredError") {
       return res.status(401).json({
@@ -473,5 +464,216 @@ router.get(
     }
   },
 );
+
+// ✅ POST - Approve quotation (accountant approval for payment processing)
+router.post(
+  "/:customerId/requests/:requestId/quotations/:quotationId/approve",
+  verifyAccountantToken,
+  async (req, res) => {
+    try {
+      const { customerId, requestId, quotationId } = req.params;
+      const { notes } = req.body;
+
+      // Find the request with the quotation
+      const request = await CustomerRequest.findOne({
+        _id: requestId,
+        customerId: customerId,
+        "quotations._id": quotationId,
+      });
+
+      if (!request) {
+        return res.status(404).json({
+          success: false,
+          message: "Request or quotation not found",
+        });
+      }
+
+      // Find the specific quotation
+      const quotation = request.quotations.id(quotationId);
+
+      if (!quotation) {
+        return res.status(404).json({
+          success: false,
+          message: "Quotation not found",
+        });
+      }
+
+      // Check if customer has approved first
+      if (!quotation.customerApproval || !quotation.customerApproval.approved) {
+        return res.status(400).json({
+          success: false,
+          message: "Cannot approve: Customer approval required first",
+        });
+      }
+
+      // Check if already approved
+      if (
+        quotation.accountantApproval &&
+        quotation.accountantApproval.approved
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Quotation already approved by accountant",
+        });
+      }
+
+      // Approve the quotation
+      if (!quotation.accountantApproval) {
+        quotation.accountantApproval = {};
+      }
+
+      quotation.accountantApproval.approved = true;
+      quotation.accountantApproval.approvedBy = req.accountantId;
+      quotation.accountantApproval.approvedAt = new Date();
+      quotation.accountantApproval.notes =
+        notes || "Approved for payment processing";
+
+      // Add to approval history
+      if (!quotation.accountantApproval.approvalHistory) {
+        quotation.accountantApproval.approvalHistory = [];
+      }
+
+      quotation.accountantApproval.approvalHistory.push({
+        action: "approved",
+        actionBy: req.accountantId,
+        actionAt: new Date(),
+        notes: notes || "Approved for payment processing",
+      });
+
+      await request.save();
+
+      res.status(200).json({
+        success: true,
+        message: "Quotation approved successfully",
+        quotation: {
+          id: quotation._id,
+          quotationNumber: quotation.quotationNumber,
+          accountantApproval: quotation.accountantApproval,
+        },
+      });
+    } catch (error) {
+      console.error("Error approving quotation:", error);
+      res.status(500).json({
+        success: false,
+        message: "Server error while approving quotation",
+      });
+    }
+  },
+);
+
+// ✅ POST - Revoke quotation approval
+router.post(
+  "/:customerId/requests/:requestId/quotations/:quotationId/revoke-approval",
+  verifyAccountantToken,
+  async (req, res) => {
+    try {
+      const { customerId, requestId, quotationId } = req.params;
+      const { notes } = req.body;
+
+      const request = await CustomerRequest.findOne({
+        _id: requestId,
+        customerId: customerId,
+        "quotations._id": quotationId,
+      });
+
+      if (!request) {
+        return res.status(404).json({
+          success: false,
+          message: "Request or quotation not found",
+        });
+      }
+
+      const quotation = request.quotations.id(quotationId);
+
+      if (
+        !quotation ||
+        !quotation.accountantApproval ||
+        !quotation.accountantApproval.approved
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Quotation is not approved",
+        });
+      }
+
+      // Revoke approval
+      quotation.accountantApproval.approved = false;
+      quotation.accountantApproval.approvalHistory.push({
+        action: "revoked",
+        actionBy: req.accountantId,
+        actionAt: new Date(),
+        notes: notes || "Approval revoked",
+      });
+
+      await request.save();
+
+      res.status(200).json({
+        success: true,
+        message: "Approval revoked successfully",
+      });
+    } catch (error) {
+      console.error("Error revoking approval:", error);
+      res.status(500).json({
+        success: false,
+        message: "Server error while revoking approval",
+      });
+    }
+  },
+);
+
+// GET pending quotations awaiting accountant approval
+router.get("/pending-approvals", verifyAccountantToken, async (req, res) => {
+  try {
+    const requests = await CustomerRequest.find({
+      "quotations.customerApproval.approved": true,
+      "quotations.accountantApproval.approved": { $ne: true },
+    })
+      .populate("customerId", "name email phone")
+      .select("requestId quotations customerId")
+      .lean();
+
+    const pendingApprovals = [];
+
+    requests.forEach((request) => {
+      if (request.quotations && request.quotations.length > 0) {
+        request.quotations.forEach((quotation) => {
+          // Check if customer approved but accountant hasn't
+          if (
+            quotation.customerApproval?.approved &&
+            (!quotation.accountantApproval ||
+              !quotation.accountantApproval.approved)
+          ) {
+            pendingApprovals.push({
+              requestId: request.requestId,
+              quotationId: quotation._id,
+              quotationNumber: quotation.quotationNumber,
+              grandTotal: quotation.grandTotal,
+              customer: request.customerId,
+              customerApprovedAt: quotation.customerApproval.approvedAt,
+              createdAt: quotation.createdAt,
+            });
+          }
+        });
+      }
+    });
+
+    // Sort by oldest first (FIFO)
+    pendingApprovals.sort(
+      (a, b) => new Date(a.createdAt) - new Date(b.createdAt),
+    );
+
+    res.status(200).json({
+      success: true,
+      pendingApprovals,
+      count: pendingApprovals.length,
+    });
+  } catch (error) {
+    console.error("Error fetching pending approvals:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching pending approvals",
+    });
+  }
+});
 
 module.exports = router;
