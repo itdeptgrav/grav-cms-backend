@@ -42,7 +42,8 @@ app.use(cookieParser());
 // Create HTTP server
 const server = http.createServer(app);
 
-// Initialize Socket.IO with CORS configuration
+// In server.js, update the WebSocket section after creating the Server instance:
+
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -50,29 +51,81 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
   transports: ["websocket", "polling"],
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+  },
 });
 
-// WebSocket connection handling
+// WebSocket connection handling with production schedule support
 io.on("connection", (socket) => {
   console.log("✅ New WebSocket client connected:", socket.id);
 
+  // Join production schedule room
+  socket.on("join-production-schedule", () => {
+    socket.join("production-schedule");
+    console.log(`Socket ${socket.id} joined production-schedule room`);
+
+    // Send initial data
+    socket.emit("production-schedule:initial", {
+      message: "Connected to production schedule updates",
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  socket.on("leave-production-schedule", () => {
+    socket.leave("production-schedule");
+    console.log(`Socket ${socket.id} left production-schedule room`);
+  });
+
+  // Join specific work order room
   socket.on("join-workorder", (workOrderId) => {
-    socket.join(`workorder-${workOrderId}`);
-    console.log(`Socket ${socket.id} joined room workorder-${workOrderId}`);
+    const roomName = `workorder-${workOrderId}`;
+    socket.join(roomName);
+    console.log(`Socket ${socket.id} joined room ${roomName}`);
   });
 
   socket.on("leave-workorder", (workOrderId) => {
-    socket.leave(`workorder-${workOrderId}`);
-    console.log(`Socket ${socket.id} left room workorder-${workOrderId}`);
+    const roomName = `workorder-${workOrderId}`;
+    socket.leave(roomName);
+    console.log(`Socket ${socket.id} left room ${roomName}`);
   });
 
-  socket.on("disconnect", () => {
-    console.log("❌ WebSocket client disconnected:", socket.id);
+  // Join manufacturing order room
+  socket.on("join-manufacturing-order", (moId) => {
+    const roomName = `manufacturing-order-${moId}`;
+    socket.join(roomName);
+    console.log(`Socket ${socket.id} joined room ${roomName}`);
+  });
+
+  socket.on("disconnect", (reason) => {
+    console.log("❌ WebSocket client disconnected:", socket.id, "Reason:", reason);
+  });
+
+  // Error handling
+  socket.on("error", (error) => {
+    console.error("WebSocket error:", error);
   });
 });
 
-// Make io accessible to routes
+// Helper function to broadcast production schedule updates
+const broadcastProductionScheduleUpdate = async (updateType, data) => {
+  try {
+    io.to("production-schedule").emit("production-schedule:update", {
+      type: updateType,
+      data: data,
+      timestamp: new Date().toISOString(),
+    });
+    console.log(`📢 Broadcasted ${updateType} update to production-schedule room`);
+  } catch (error) {
+    console.error("Error broadcasting update:", error);
+  }
+};
+
+// Make io and broadcast function accessible to routes
 app.set("io", io);
+app.set("broadcastProductionScheduleUpdate", broadcastProductionScheduleUpdate);
 
 const connectDB = async () => {
   try {
