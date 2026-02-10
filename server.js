@@ -382,6 +382,10 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
 
+// Accountant Vendor Routes
+const accountantVendorRoutes = require("./routes/Accountant_Routes/vendors");
+app.use("/api/accountant/vendors", accountantVendorRoutes);
+
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
