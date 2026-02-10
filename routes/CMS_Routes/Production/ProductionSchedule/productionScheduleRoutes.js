@@ -10,6 +10,11 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 
 router.use(EmployeeAuthMiddleware);
 
+
+function getUserId(req) {
+  return req.user?.id || 'anonymous';
+}
+
 // ============================================================================
 // SIMPLE DATE UTILITIES - NO TIMEZONE NONSENSE
 // ============================================================================
@@ -667,7 +672,6 @@ router.get("/day-settings/:date", async (req, res) => {
   }
 });
 
-// POST schedule work order
 router.post("/schedule-work-order", async (req, res) => {
   try {
     const { workOrderId, manufacturingOrderId, startDate, colorCode } = req.body;
@@ -685,6 +689,25 @@ router.post("/schedule-work-order", async (req, res) => {
       req.user.id
     );
 
+    // Get WebSocket instance
+    const io = req.app.get("io");
+    const broadcastProductionScheduleUpdate = req.app.get("broadcastProductionScheduleUpdate");
+
+    // Broadcast update
+    await broadcastProductionScheduleUpdate("WORK_ORDER_SCHEDULED", {
+      workOrderId: workOrderId,
+      manufacturingOrderId: manufacturingOrderId,
+      startDate: startDate,
+      result: result
+    });
+
+    // Also notify specific manufacturing order room
+    io.to(`manufacturing-order-${manufacturingOrderId}`).emit("manufacturing-order:updated", {
+      type: "WORK_ORDER_SCHEDULED",
+      workOrderId: workOrderId,
+      timestamp: new Date().toISOString(),
+    });
+
     res.json({
       success: true,
       message: `Scheduled across ${result.totalDays} day(s)`,
@@ -697,10 +720,13 @@ router.post("/schedule-work-order", async (req, res) => {
   }
 });
 
-// POST schedule MO
 router.post("/schedule-manufacturing-order", async (req, res) => {
   try {
     const { manufacturingOrderId, startDate } = req.body;
+    const userId = req.user?.id || "system";
+
+    console.log(`\n[API] Schedule MO Request: ${manufacturingOrderId}`);
+    console.log(`  Start Date: ${formatDate(startDate)}`);
 
     const mo = await CustomerRequest.findById(manufacturingOrderId).lean();
     if (!mo) throw new Error("MO not found");
@@ -716,6 +742,9 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
     let currentDate = parseDate(startDate);
     const results = { successful: [], failed: [] };
 
+    const io = req.app.get("io");
+    const broadcastProductionScheduleUpdate = req.app.get("broadcastProductionScheduleUpdate");
+
     for (const wo of workOrders) {
       const isScheduled = await ProductionSchedule.findOne({
         "scheduledWorkOrders.workOrderId": wo._id
@@ -724,14 +753,51 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
       if (isScheduled) continue;
 
       try {
-        const result = await scheduleWorkOrder(wo._id, mo._id, currentDate, colorCode, req.user.id);
+        const result = await scheduleWorkOrder(wo._id, mo._id, currentDate, colorCode, userId);
         results.successful.push({ workOrderNumber: wo.workOrderNumber, days: result.totalDays });
+
+        // Broadcast individual work order scheduled
+        if (io) {
+          io.to("production-schedule").emit("production-schedule:update", {
+            type: "WORK_ORDER_SCHEDULED",
+            data: {
+              workOrderId: wo._id,
+              manufacturingOrderId: mo._id,
+              startDate: currentDate,
+              result: result,
+              timestamp: new Date().toISOString()
+            }
+          });
+        }
 
         const lastSeg = result.segments[result.segments.length - 1];
         currentDate = addDays(lastSeg.date, 1);
       } catch (error) {
         results.failed.push({ workOrderNumber: wo.workOrderNumber, reason: error.message });
       }
+    }
+
+    // Broadcast manufacturing order completion
+    if (io) {
+      io.to("production-schedule").emit("production-schedule:update", {
+        type: "MANUFACTURING_ORDER_SCHEDULED",
+        data: {
+          manufacturingOrderId: manufacturingOrderId,
+          startDate: startDate,
+          results: results,
+          timestamp: new Date().toISOString()
+        }
+      });
+
+      // Also broadcast to specific manufacturing order room
+      io.to(`manufacturing-order-${manufacturingOrderId}`).emit("manufacturing-order:updated", {
+        type: "MANUFACTURING_ORDER_SCHEDULED",
+        data: {
+          manufacturingOrderId: manufacturingOrderId,
+          successfulCount: results.successful.length,
+          timestamp: new Date().toISOString()
+        }
+      });
     }
 
     res.json({
@@ -745,7 +811,6 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
   }
 });
 
-// POST move work order
 router.post("/move-work-order", async (req, res) => {
   try {
     const { workOrderId, sourceDate, targetDate } = req.body;
@@ -789,6 +854,15 @@ router.post("/move-work-order", async (req, res) => {
 
     const result = await scheduleWorkOrder(workOrderId, moId, target, colorCode, req.user.id);
 
+    // Broadcast update via WebSocket
+    const broadcastProductionScheduleUpdate = req.app.get("broadcastProductionScheduleUpdate");
+    await broadcastProductionScheduleUpdate("WORK_ORDER_MOVED", {
+      workOrderId: workOrderId,
+      fromDate: sourceDate,
+      toDate: targetDate,
+      result: result
+    });
+
     res.json({
       success: true,
       message: `Moved to ${formatDate(target)}`,
@@ -800,15 +874,155 @@ router.post("/move-work-order", async (req, res) => {
   }
 });
 
-// PUT update day settings - ENHANCED VERSION WITH BREAKS SUPPORT
+
+router.post("/move-work-order-all-segments", async (req, res) => {
+  try {
+    const { workOrderId, segmentIds, sourceDate, targetDate } = req.body;
+
+    console.log(`\n[MOVE ALL] Moving WO ${workOrderId}`);
+    console.log(`[MOVE ALL] Segments: ${segmentIds.length}`);
+    console.log(`[MOVE ALL] From: ${sourceDate} To: ${targetDate}`);
+
+    const source = parseDate(sourceDate);
+    const target = parseDate(targetDate);
+
+    if (isNaN(source.getTime()) || isNaN(target.getTime())) {
+      throw new Error(`Invalid dates. Source: ${sourceDate}, Target: ${targetDate}`);
+    }
+
+    const schedules = await ProductionSchedule.find({
+      "scheduledWorkOrders.workOrderId": workOrderId
+    });
+
+    if (schedules.length === 0) throw new Error("WO not scheduled");
+
+    let colorCode = "#3B82F6";
+    let moId = null;
+
+    for (const schedule of schedules) {
+      const segments = schedule.scheduledWorkOrders.filter(
+        s => String(s.workOrderId) === String(workOrderId)
+      );
+
+      if (segments.length > 0) {
+        colorCode = segments[0].colorCode;
+        moId = segments[0].manufacturingOrderId;
+      }
+
+      schedule.scheduledWorkOrders = schedule.scheduledWorkOrders.filter(
+        s => String(s.workOrderId) !== String(workOrderId)
+      );
+      schedule.calculateUtilization();
+      await schedule.save();
+    }
+
+    const result = await scheduleWorkOrder(workOrderId, moId, target, colorCode, req.user.id, true);
+
+    // Broadcast update via WebSocket
+    const io = req.app.get("io");
+    const broadcastProductionScheduleUpdate = req.app.get("broadcastProductionScheduleUpdate");
+
+    if (io) {
+      io.to("production-schedule").emit("production-schedule:update", {
+        type: "WORK_ORDER_MOVED_ALL_SEGMENTS",
+        data: {
+          workOrderId: workOrderId,
+          fromDate: sourceDate,
+          toDate: targetDate,
+          segmentCount: segmentIds.length,
+          result: result,
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Moved ${segmentIds.length} segments to ${formatDate(target)}`,
+      totalDays: result.totalDays
+    });
+  } catch (error) {
+    console.error("Error moving work order segments:", error);
+    res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+
+router.post("/move-entire-work-order", async (req, res) => {
+  try {
+    const { workOrderId, sourceDate, targetDate } = req.body;
+
+    console.log(`\n[MOVE ENTIRE] Moving entire WO ${workOrderId}`);
+    console.log(`[MOVE ENTIRE] From: ${sourceDate} To: ${targetDate}`);
+
+    const source = parseDate(sourceDate);
+    const target = parseDate(targetDate);
+
+    if (isNaN(source.getTime()) || isNaN(target.getTime())) {
+      throw new Error(`Invalid dates. Source: ${sourceDate}, Target: ${targetDate}`);
+    }
+
+    const schedules = await ProductionSchedule.find({
+      "scheduledWorkOrders.workOrderId": workOrderId
+    });
+
+    if (schedules.length === 0) throw new Error("WO not scheduled");
+
+    let colorCode = "#3B82F6";
+    let moId = null;
+
+    for (const schedule of schedules) {
+      const segments = schedule.scheduledWorkOrders.filter(
+        s => String(s.workOrderId) === String(workOrderId)
+      );
+
+      if (segments.length > 0) {
+        colorCode = segments[0].colorCode;
+        moId = segments[0].manufacturingOrderId;
+      }
+
+      schedule.scheduledWorkOrders = schedule.scheduledWorkOrders.filter(
+        s => String(s.workOrderId) !== String(workOrderId)
+      );
+      schedule.calculateUtilization();
+      await schedule.save();
+    }
+
+    const result = await scheduleWorkOrder(workOrderId, moId, target, colorCode, req.user.id, true);
+
+    // Broadcast update via WebSocket
+    const io = req.app.get("io");
+    if (io) {
+      io.to("production-schedule").emit("production-schedule:update", {
+        type: "WORK_ORDER_MOVED_ENTIRE",
+        data: {
+          workOrderId: workOrderId,
+          fromDate: sourceDate,
+          toDate: targetDate,
+          result: result,
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Moved entire work order to ${formatDate(target)}`,
+      totalDays: result.totalDays
+    });
+  } catch (error) {
+    console.error("Error moving entire work order:", error);
+    res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+
 router.put("/day-settings/:date", async (req, res) => {
   try {
     const { date } = req.params;
     const { workHours, breaks, defaultBreaks, isHoliday, holidayReason, isSundayOverride, notes } = req.body;
 
     console.log(`\n[DAY-SETTINGS] Update request for ${formatDate(date)}`);
-    console.log(`  Breaks count: ${breaks?.length || 0}`);
-    console.log(`  Work hours: ${workHours?.startTime} - ${workHours?.endTime}`);
 
     const schedule = await getScheduleForDate(date);
     const wasAvailable = canScheduleOnDay(schedule);
@@ -824,10 +1038,7 @@ router.put("/day-settings/:date", async (req, res) => {
 
     // Handle Sunday override
     if (isSunday && isSundayOverride !== undefined) {
-      console.log(`[DAY-SETTINGS] Applying Sunday override: ${isSundayOverride}`);
-
       schedule.isSundayOverride = isSundayOverride;
-
       if (isSundayOverride) {
         schedule.isHoliday = false;
         schedule.workHours.isActive = true;
@@ -853,8 +1064,6 @@ router.put("/day-settings/:date", async (req, res) => {
       schedule.workHours.endTime = workHours.endTime || schedule.workHours.endTime;
       schedule.workHours.totalMinutes = totalMinutes;
       schedule.workHours.customHours = true;
-      
-      console.log(`[DAY-SETTINGS] Updated work hours: ${schedule.workHours.startTime} - ${schedule.workHours.endTime} (${totalMinutes} minutes)`);
     }
 
     // Update default breaks if provided
@@ -885,9 +1094,6 @@ router.put("/day-settings/:date", async (req, res) => {
 
     // Calculate available minutes based on breaks
     schedule.calculateAvailableMinutes();
-    
-    console.log(`[DAY-SETTINGS] Available minutes: ${schedule.availableMinutes}`);
-    console.log(`[DAY-SETTINGS] Total breaks: ${[...(schedule.defaultBreaks || []), ...(schedule.breaks || [])].reduce((sum, br) => sum + (br.durationMinutes || 0), 0)} minutes`);
 
     schedule.modifications.push({
       modifiedBy: req.user.id,
@@ -900,11 +1106,7 @@ router.put("/day-settings/:date", async (req, res) => {
 
     const isNowAvailable = canScheduleOnDay(schedule);
 
-    console.log(`[DAY-SETTINGS] Was available: ${wasAvailable}, Now: ${isNowAvailable}`);
-    console.log(`[DAY-SETTINGS] Original holiday: ${originalIsHoliday}, New: ${schedule.isHoliday}`);
-    console.log(`[DAY-SETTINGS] Original available: ${originalAvailableMinutes}, New: ${schedule.availableMinutes}`);
-
-    // Check if day status changed (holiday <-> working) OR available minutes changed
+    // Check if day status changed
     const dayStatusChanged = (originalIsHoliday !== schedule.isHoliday) ||
       (originalWorkHoursActive !== schedule.workHours.isActive);
     
@@ -912,14 +1114,25 @@ router.put("/day-settings/:date", async (req, res) => {
     const workHoursChanged = (originalStartTime !== schedule.workHours.startTime) || 
                             (originalEndTime !== schedule.workHours.endTime);
 
-    console.log(`[DAY-SETTINGS] Changes detected: Day Status: ${dayStatusChanged}, Available Minutes: ${availableMinutesChanged}, Work Hours: ${workHoursChanged}`);
-
     // AUTO-RESCHEDULE if any significant change detected
     let autoRescheduleResult = null;
     if (dayStatusChanged || availableMinutesChanged || workHoursChanged) {
       console.log(`[DAY-SETTINGS] Triggering intelligent auto-reschedule...`);
       autoRescheduleResult = await autoRescheduleForDayChange(date, req.user.id);
     }
+
+    // Broadcast update via WebSocket
+    const broadcastProductionScheduleUpdate = req.app.get("broadcastProductionScheduleUpdate");
+    await broadcastProductionScheduleUpdate("DAY_SETTINGS_UPDATED", {
+      date: date,
+      schedule: schedule,
+      autoRescheduleResult: autoRescheduleResult,
+      changesDetected: {
+        dayStatusChanged,
+        availableMinutesChanged,
+        workHoursChanged
+      }
+    });
 
     res.json({
       success: true,
@@ -938,7 +1151,6 @@ router.put("/day-settings/:date", async (req, res) => {
   }
 });
 
-// DELETE remove work order - IMPROVED VERSION
 router.delete("/remove-work-order/:workOrderId", async (req, res) => {
   try {
     const { workOrderId } = req.params;
@@ -990,6 +1202,13 @@ router.delete("/remove-work-order/:workOrderId", async (req, res) => {
 
     console.log(`[REMOVE] Successfully removed from all schedules`);
 
+    // Broadcast update via WebSocket
+    const broadcastProductionScheduleUpdate = req.app.get("broadcastProductionScheduleUpdate");
+    await broadcastProductionScheduleUpdate("WORK_ORDER_REMOVED", {
+      workOrderId: workOrderId,
+      schedulesAffected: schedules.length
+    });
+
     res.json({
       success: true,
       message: `Work order removed from ${schedules.length} schedule(s)`,
@@ -1023,6 +1242,29 @@ router.get("/check-scheduled/:workOrderId", async (req, res) => {
     console.error("Error checking schedule status:", error);
     res.status(500).json({ success: false, message: error.message });
   }
+});
+
+
+router.post("/websocket/reconnect", (req, res) => {
+  const io = req.app.get("io");
+  
+  if (!io) {
+    return res.status(500).json({
+      success: false,
+      message: "WebSocket server not available"
+    });
+  }
+
+  // Force disconnect all clients (they will reconnect)
+  io.sockets.sockets.forEach(socket => {
+    socket.disconnect(true);
+  });
+
+  res.json({
+    success: true,
+    message: "WebSocket reconnection initiated",
+    disconnectedClients: io.sockets.sockets.size
+  });
 });
 
 module.exports = router;
