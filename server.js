@@ -339,8 +339,51 @@ app.use("/api/hr/candidates", CandidatesRouter);
 const employeeTasksRouter = require("./routes/HrRoutes/EmployeeTasks_section");
 app.use("/api/hr/tasks", employeeTasksRouter);
 
+
+
+
+
+
+
+
+
+
+
 const vendorDetailsRoutes = require("./routes/Vendor_Routes/vendorRoutes");
 app.use("/api/hr/vendors", vendorDetailsRoutes);
+
+const vendorProfileRoutes = require("./routes/Vendor_Routes/profile.js");
+app.use("/api/vendor/profile", vendorProfileRoutes);
+
+const vendorEmployees = require("./routes/Vendor_Routes/Partneremployees.js");
+app.use("/api/vendor/partner-employees", vendorEmployees);
+
+const vendorWO = require("./routes/Vendor_Routes/vendorWorkOrderRoutes.js");
+app.use("/api/vendor/work-orders", vendorWO);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");

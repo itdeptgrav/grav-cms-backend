@@ -1,3 +1,5 @@
+// models/Vendor_Models/vendor.js
+
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
