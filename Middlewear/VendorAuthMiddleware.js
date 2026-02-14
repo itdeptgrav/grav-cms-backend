@@ -30,6 +30,7 @@ const VendorAuthMiddleware = (req, res, next) => {
     // Attach vendor info to request
     req.vendor = {
       id: decoded.id,
+      _id: decoded.id,
       vendorCode: decoded.vendorCode,
       email: decoded.email,
       role: decoded.role,
