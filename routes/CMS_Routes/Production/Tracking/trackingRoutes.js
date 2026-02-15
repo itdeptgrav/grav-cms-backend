@@ -1,13 +1,9 @@
-// routes/CMS_Routes/Production/Tracking/trackingRoutes.js - COMPLETELY UPDATED
-
 const express = require("express");
 const router = express.Router();
 const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
 const Employee = require("../../../../models/Employee");
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
-
-
 
 // Helper functions
 const isBarcodeId = (id) => id && typeof id === "string" && id.startsWith("WO-");
@@ -29,6 +25,7 @@ const extractEmployeeIdFromUrl = (value) => {
   }
 };
 
+// ==================== SCAN ENDPOINT (FIXED) ====================
 router.post("/scan", async (req, res) => {
   try {
     const { scanId: rawScanId, machineId, timeStamp } = req.body;
@@ -54,7 +51,7 @@ router.post("/scan", async (req, res) => {
     const scanDate = new Date(scanTime);
     scanDate.setHours(0, 0, 0, 0);
 
-    // Get or create tracking doc - use upsert for speed
+    // Get or create tracking doc
     let trackingDoc = await ProductionTracking.findOne({ date: scanDate });
     if (!trackingDoc) {
       trackingDoc = new ProductionTracking({ 
@@ -85,7 +82,7 @@ router.post("/scan", async (req, res) => {
       trackingDoc.machines.push(machineTracking);
     }
 
-    // -------------------- BARCODE SCAN (OPTIMIZED) --------------------
+    // -------------------- BARCODE SCAN --------------------
     if (isBarcodeId(scanId)) {
       // Fast operator check
       const operationTracking = machineTracking.operationTracking.find(
@@ -119,31 +116,32 @@ router.post("/scan", async (req, res) => {
 
       await trackingDoc.save();
 
-      // Fast response - no WebSocket
       return res.status(202).json({
         success: true,
-        message: "New Scan recorded"
+        message: "Scan recorded",
+        employeeName: operatorTracking.operatorName
       });
     }
 
-    // -------------------- EMPLOYEE SIGN IN/OUT (OPTIMIZED) --------------------
+    // -------------------- EMPLOYEE SIGN IN/OUT (FIXED) --------------------
     if (isEmployeeId(scanId)) {
-      // Quick employee lookup
+      // FIXED: Added needsToOperate: true back
       const operator = await Employee.findOne({
         identityId: scanId,
+        needsToOperate: true,  // ← CRITICAL: Only operators can sign in
         status: "active"
       }).select("firstName lastName identityId").lean();
 
       if (!operator) {
         return res.status(404).json({
           success: false,
-          message: "Employee not found"
+          message: "Employee not found or not authorized to operate machines"
         });
       }
 
       const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
 
-      // Simple operation tracking - default to operation 1
+      // Find or create operation tracking (default to operation 1)
       let operationTracking = machineTracking.operationTracking.find(
         op => op.operationNumber === 1
       );
@@ -158,34 +156,42 @@ router.post("/scan", async (req, res) => {
         machineTracking.operationTracking.push(operationTracking);
       }
 
-      // Handle sign in/out
-      if (operationTracking.currentOperatorIdentityId) {
-        // Someone is signed in
-        if (operationTracking.currentOperatorIdentityId === scanId) {
-          // Sign out current operator
-          const currentOp = operationTracking.operators?.find(
-            op => op.operatorIdentityId === scanId && !op.signOutTime
-          );
-          
-          if (currentOp) {
-            currentOp.signOutTime = scanTime;
-            operationTracking.currentOperatorIdentityId = null;
-            await trackingDoc.save();
+      // Check if this operator already has an active session
+      const existingActiveSession = operationTracking.operators?.find(
+        op => op.operatorIdentityId === scanId && !op.signOutTime
+      );
 
-            return res.status(200).json({
-              success: true,
-              message: `${employeeName} signed out`,
-              employeeName: employeeName,
-              action: "signout"
-            });
-          }
-        } else {
-          // Auto sign out previous and sign in new
-          const prevOp = operationTracking.operators?.find(
-            op => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
-          );
-          if (prevOp) prevOp.signOutTime = scanTime;
+      // CASE 1: Same operator trying to sign in again (toggle sign out)
+      if (operationTracking.currentOperatorIdentityId === scanId && existingActiveSession) {
+        // Sign out current operator
+        existingActiveSession.signOutTime = scanTime;
+        operationTracking.currentOperatorIdentityId = null;
+        await trackingDoc.save();
+
+        return res.status(200).json({
+          success: true,
+          message: `${employeeName} signed out`,
+          employeeName: employeeName,
+          action: "signout"
+        });
+      }
+      
+      // CASE 2: Different operator trying to sign in
+      if (operationTracking.currentOperatorIdentityId && 
+          operationTracking.currentOperatorIdentityId !== scanId) {
+        // Sign out previous operator
+        const prevOperator = operationTracking.operators?.find(
+          op => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
+        );
+        if (prevOperator) {
+          prevOperator.signOutTime = scanTime;
         }
+      }
+
+      // CASE 3: Operator already has session but not current (should not happen, but handle)
+      if (existingActiveSession && operationTracking.currentOperatorIdentityId !== scanId) {
+        // Close the orphaned session
+        existingActiveSession.signOutTime = scanTime;
       }
 
       // Sign in new operator
@@ -225,8 +231,7 @@ router.post("/scan", async (req, res) => {
   }
 });
 
-
-// Bulk scans endpoint for offline sync
+// ==================== BULK SCANS ENDPOINT ====================
 router.post("/bulk-scans", async (req, res) => {
   try {
     const { scans } = req.body;
@@ -372,88 +377,7 @@ router.post("/bulk-scans", async (req, res) => {
   }
 });
 
-// Helper function for employee scans
-async function processEmployeeScan(machineTracking, scan, machine) {
-  // Default to operation 1
-  let operationTracking = machineTracking.operationTracking.find(
-    op => op.operationNumber === 1
-  );
 
-  if (!operationTracking) {
-    operationTracking = {
-      operationNumber: 1,
-      operationType: "Default",
-      currentOperatorIdentityId: null,
-      operators: []
-    };
-    machineTracking.operationTracking.push(operationTracking);
-  }
-
-  const employeeName = scan.employeeName || "Unknown";
-  const employeeId = scan.employeeId || scan.scanId;
-
-  if (scan.action === "signout") {
-    // Sign out
-    const currentOp = operationTracking.operators?.find(
-      op => op.operatorIdentityId === employeeId && !op.signOutTime
-    );
-    
-    if (currentOp) {
-      currentOp.signOutTime = new Date(scan.timeStamp);
-      operationTracking.currentOperatorIdentityId = null;
-    }
-  } else {
-    // Sign in (default action)
-    // Auto sign out previous if exists
-    if (operationTracking.currentOperatorIdentityId) {
-      const prevOp = operationTracking.operators?.find(
-        op => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
-      );
-      if (prevOp) {
-        prevOp.signOutTime = new Date(scan.timeStamp);
-      }
-    }
-
-    // Sign in new operator
-    if (!operationTracking.operators) operationTracking.operators = [];
-    
-    operationTracking.operators.push({
-      operatorIdentityId: employeeId,
-      operatorName: employeeName,
-      signInTime: new Date(scan.timeStamp),
-      signOutTime: null,
-      barcodeScans: []
-    });
-
-    operationTracking.currentOperatorIdentityId = employeeId;
-  }
-}
-
-// Helper function for barcode scans
-async function processBarcodeScan(machineTracking, scan, machine) {
-  // Find active operator
-  const operationTracking = machineTracking.operationTracking.find(
-    op => op.currentOperatorIdentityId
-  );
-
-  if (!operationTracking) {
-    // No operator signed in - store scan anyway but log warning
-    console.warn(`No operator signed in for machine ${machine.name} at ${scan.timeStamp}`);
-    return;
-  }
-
-  const operatorTracking = operationTracking.operators?.find(
-    op => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
-  );
-
-  if (operatorTracking) {
-    operatorTracking.barcodeScans = operatorTracking.barcodeScans || [];
-    operatorTracking.barcodeScans.push({
-      barcodeId: scan.scanId,
-      timeStamp: new Date(scan.timeStamp)
-    });
-  }
-}
 
 
 
