@@ -247,13 +247,14 @@ router.post("/scan", async (req, res) => {
         return res.status(400).json({
           success: false,
           message: "No operator is signed in on this machine",
+          action: "error"
         });
       }
 
       const operatorTracking = operationTracking.operators.find(
         (op) =>
           op.operatorIdentityId ===
-            operationTracking.currentOperatorIdentityId && !op.signOutTime,
+          operationTracking.currentOperatorIdentityId && !op.signOutTime,
       );
 
       if (!operatorTracking) {
@@ -441,7 +442,7 @@ router.post("/scan", async (req, res) => {
         machineTracking.operationTracking.push(operationTracking);
         operationTracking =
           machineTracking.operationTracking[
-            machineTracking.operationTracking.length - 1
+          machineTracking.operationTracking.length - 1
           ];
       }
 
@@ -479,10 +480,13 @@ router.post("/scan", async (req, res) => {
 
             return res.json({
               success: true,
-              message: `${employeeName} signed out from ${machine.name}`,
+              message: `${employeeName} signed out`,
               employeeName,
+              employeeId: scanId,
+              action: "signout",
               scanCount: 0,
             });
+
           }
 
           return res.status(400).json({
@@ -532,10 +536,14 @@ router.post("/scan", async (req, res) => {
 
           return res.json({
             success: true,
-            message: `${employeeName} signed in to ${machine.name}`,
+            message: `${employeeName} signed in`,
             employeeName,
+            employeeId: scanId,
+            action: "signin",
             scanCount: 0,
           });
+
+
         }
       }
 
@@ -582,8 +590,11 @@ router.post("/scan", async (req, res) => {
         success: true,
         message: `${employeeName} signed in`,
         employeeName,
+        employeeId: scanId,
+        action: "signin",
         scanCount: 0,
       });
+
     }
 
     // -------------------- INVALID --------------------
@@ -678,20 +689,20 @@ router.post("/bulk-scans", async (req, res) => {
     // Process each date group
     for (const dateKey in scansByDate) {
       const dateGroup = scansByDate[dateKey];
-      
+
       // Find or create tracking document for this date
       let trackingDoc = await ProductionTracking.findOne({ date: dateGroup.date });
       if (!trackingDoc) {
-        trackingDoc = new ProductionTracking({ 
+        trackingDoc = new ProductionTracking({
           date: dateGroup.date,
-          machines: [] 
+          machines: []
         });
       }
 
       // Process each machine in this date
       for (const machineId in dateGroup.machines) {
         const machineData = dateGroup.machines[machineId];
-        
+
         // Validate machine exists
         const machine = await Machine.findById(machineId);
         if (!machine) {
@@ -727,9 +738,9 @@ router.post("/bulk-scans", async (req, res) => {
             results.successful++;
           } catch (scanError) {
             results.failed++;
-            results.errors.push({ 
-              scanId: scan.scanId, 
-              error: scanError.message 
+            results.errors.push({
+              scanId: scan.scanId,
+              error: scanError.message
             });
           }
         }
@@ -808,13 +819,13 @@ router.get("/status/:date", async (req, res) => {
 
           currentOperator = operator
             ? {
-                identityId: operator.identityId,
-                name: `${operator.firstName} ${operator.lastName}`,
-              }
+              identityId: operator.identityId,
+              name: `${operator.firstName} ${operator.lastName}`,
+            }
             : {
-                identityId: op.currentOperatorIdentityId,
-                name: "Unknown Operator",
-              };
+              identityId: op.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
         }
 
         // Get all operator details for this operation
@@ -931,13 +942,13 @@ router.get("/status/today", async (req, res) => {
 
           currentOperator = operator
             ? {
-                identityId: operator.identityId,
-                name: `${operator.firstName} ${operator.lastName}`,
-              }
+              identityId: operator.identityId,
+              name: `${operator.firstName} ${operator.lastName}`,
+            }
             : {
-                identityId: op.currentOperatorIdentityId,
-                name: "Unknown Operator",
-              };
+              identityId: op.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
         }
 
         // Get all operator details for this operation
@@ -1046,13 +1057,13 @@ router.get("/machine/:machineId/operations", async (req, res) => {
 
           currentOperator = operator
             ? {
-                identityId: operator.identityId,
-                name: `${operator.firstName} ${operator.lastName}`,
-              }
+              identityId: operator.identityId,
+              name: `${operator.firstName} ${operator.lastName}`,
+            }
             : {
-                identityId: op.currentOperatorIdentityId,
-                name: "Unknown Operator",
-              };
+              identityId: op.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
         }
 
         // Calculate scans for this operation
