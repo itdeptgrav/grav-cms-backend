@@ -226,6 +226,236 @@ router.post("/scan", async (req, res) => {
 });
 
 
+// Bulk scans endpoint for offline sync
+router.post("/bulk-scans", async (req, res) => {
+  try {
+    const { scans } = req.body;
+
+    if (!scans || !Array.isArray(scans) || scans.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Scans array is required"
+      });
+    }
+
+    console.log(`Processing ${scans.length} bulk scans`);
+
+    const results = {
+      total: scans.length,
+      successful: 0,
+      failed: 0,
+      errors: []
+    };
+
+    // Group scans by date for efficient processing
+    const scansByDate = {};
+
+    for (const scanData of scans) {
+      const { scanId, machineId, timeStamp, isEmployeeScan, employeeId, employeeName, action } = scanData;
+
+      // Validate required fields
+      if (!scanId || !machineId || !timeStamp) {
+        results.failed++;
+        results.errors.push({ scanId, error: "Missing required fields" });
+        continue;
+      }
+
+      // Parse timestamp and get date
+      const scanTime = new Date(timeStamp);
+      if (isNaN(scanTime.getTime())) {
+        results.failed++;
+        results.errors.push({ scanId, error: "Invalid timestamp" });
+        continue;
+      }
+
+      const scanDate = new Date(scanTime);
+      scanDate.setHours(0, 0, 0, 0);
+      const dateKey = scanDate.toISOString();
+
+      // Initialize date group
+      if (!scansByDate[dateKey]) {
+        scansByDate[dateKey] = {
+          date: scanDate,
+          machines: {}
+        };
+      }
+
+      // Initialize machine in date group
+      if (!scansByDate[dateKey].machines[machineId]) {
+        scansByDate[dateKey].machines[machineId] = {
+          machineId: machineId,
+          scans: []
+        };
+      }
+
+      // Add scan to machine
+      scansByDate[dateKey].machines[machineId].scans.push({
+        scanId,
+        timeStamp: scanTime,
+        isEmployeeScan: isEmployeeScan || false,
+        employeeId: employeeId || "",
+        employeeName: employeeName || "",
+        action: action || ""
+      });
+
+      results.successful++;
+    }
+
+    // Process each date group
+    for (const dateKey in scansByDate) {
+      const dateGroup = scansByDate[dateKey];
+      
+      // Find or create tracking document for this date
+      let trackingDoc = await ProductionTracking.findOne({ date: dateGroup.date });
+      if (!trackingDoc) {
+        trackingDoc = new ProductionTracking({ 
+          date: dateGroup.date,
+          machines: [] 
+        });
+      }
+
+      // Process each machine in this date
+      for (const machineId in dateGroup.machines) {
+        const machineData = dateGroup.machines[machineId];
+        
+        // Validate machine exists
+        const machine = await Machine.findById(machineId).select("name").lean();
+        if (!machine) {
+          results.failed += machineData.scans.length;
+          results.successful -= machineData.scans.length;
+          results.errors.push({ machineId, error: "Machine not found" });
+          continue;
+        }
+
+        // Find or create machine tracking
+        let machineTracking = trackingDoc.machines.find(
+          m => m.machineId && m.machineId.toString() === machineId
+        );
+
+        if (!machineTracking) {
+          machineTracking = {
+            machineId: machineId,
+            operationTracking: []
+          };
+          trackingDoc.machines.push(machineTracking);
+        }
+
+        // Process each scan for this machine
+        for (const scan of machineData.scans) {
+          if (scan.isEmployeeScan) {
+            // Employee sign in/out scan
+            await processEmployeeScan(machineTracking, scan, machine);
+          } else {
+            // Barcode scan
+            await processBarcodeScan(machineTracking, scan, machine);
+          }
+        }
+      }
+
+      // Save the tracking document
+      await trackingDoc.save();
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Processed ${results.successful} of ${results.total} scans`,
+      results: results
+    });
+
+  } catch (error) {
+    console.error("Bulk scan error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error processing bulk scans",
+      error: error.message
+    });
+  }
+});
+
+// Helper function for employee scans
+async function processEmployeeScan(machineTracking, scan, machine) {
+  // Default to operation 1
+  let operationTracking = machineTracking.operationTracking.find(
+    op => op.operationNumber === 1
+  );
+
+  if (!operationTracking) {
+    operationTracking = {
+      operationNumber: 1,
+      operationType: "Default",
+      currentOperatorIdentityId: null,
+      operators: []
+    };
+    machineTracking.operationTracking.push(operationTracking);
+  }
+
+  const employeeName = scan.employeeName || "Unknown";
+  const employeeId = scan.employeeId || scan.scanId;
+
+  if (scan.action === "signout") {
+    // Sign out
+    const currentOp = operationTracking.operators?.find(
+      op => op.operatorIdentityId === employeeId && !op.signOutTime
+    );
+    
+    if (currentOp) {
+      currentOp.signOutTime = new Date(scan.timeStamp);
+      operationTracking.currentOperatorIdentityId = null;
+    }
+  } else {
+    // Sign in (default action)
+    // Auto sign out previous if exists
+    if (operationTracking.currentOperatorIdentityId) {
+      const prevOp = operationTracking.operators?.find(
+        op => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
+      );
+      if (prevOp) {
+        prevOp.signOutTime = new Date(scan.timeStamp);
+      }
+    }
+
+    // Sign in new operator
+    if (!operationTracking.operators) operationTracking.operators = [];
+    
+    operationTracking.operators.push({
+      operatorIdentityId: employeeId,
+      operatorName: employeeName,
+      signInTime: new Date(scan.timeStamp),
+      signOutTime: null,
+      barcodeScans: []
+    });
+
+    operationTracking.currentOperatorIdentityId = employeeId;
+  }
+}
+
+// Helper function for barcode scans
+async function processBarcodeScan(machineTracking, scan, machine) {
+  // Find active operator
+  const operationTracking = machineTracking.operationTracking.find(
+    op => op.currentOperatorIdentityId
+  );
+
+  if (!operationTracking) {
+    // No operator signed in - store scan anyway but log warning
+    console.warn(`No operator signed in for machine ${machine.name} at ${scan.timeStamp}`);
+    return;
+  }
+
+  const operatorTracking = operationTracking.operators?.find(
+    op => op.operatorIdentityId === operationTracking.currentOperatorIdentityId && !op.signOutTime
+  );
+
+  if (operatorTracking) {
+    operatorTracking.barcodeScans = operatorTracking.barcodeScans || [];
+    operatorTracking.barcodeScans.push({
+      barcodeId: scan.scanId,
+      timeStamp: new Date(scan.timeStamp)
+    });
+  }
+}
+
+
 
 // basically sometime the scan id is coming as https
 
