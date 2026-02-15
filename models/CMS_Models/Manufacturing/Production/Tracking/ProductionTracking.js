@@ -46,7 +46,6 @@ const operationTrackingSchema = new mongoose.Schema(
   {
     operationNumber: {
       type: Number,
-      required: true,
     },
     operationType: {
       type: String,
