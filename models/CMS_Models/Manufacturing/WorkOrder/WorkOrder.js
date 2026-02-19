@@ -524,6 +524,7 @@ const workOrderSchema = new mongoose.Schema(
         "cancelled",
         "delayed",
         "partial_allocation",
+        "forwarded",
       ],
       default: "pending",
     },
@@ -602,13 +603,13 @@ const workOrderSchema = new mongoose.Schema(
       },
       remaining: {
         type: Number,
-        default: function() {
+        default: function () {
           return this.quantity || 0;
         },
         min: 0
       }
     },
-    
+
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "SalesDepartment",
@@ -641,6 +642,29 @@ const workOrderSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+
+
+    forwardedToVendor: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "VendorDetails",
+      default: null,
+    },
+    forwardedAt: {
+      type: Date,
+      default: null,
+    },
+    forwardedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ProjectManager", // or whichever employee model you use
+      default: null,
+    },
+    vendorWorkOrderReference: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+
   },
   { timestamps: true },
 );
