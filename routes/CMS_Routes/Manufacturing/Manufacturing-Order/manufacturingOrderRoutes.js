@@ -775,13 +775,6 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       customerRequest.measurementId
     );
 
-    // Log for debugging
-    console.log("=== REQUEST TYPE DEBUG ===");
-    console.log("CustomerRequest ID:", customerRequest._id);
-    console.log("requestType field:", customerRequest.requestType);
-    console.log("measurementId:", customerRequest.measurementId);
-    console.log("Calculated isMeasurementConversion:", isMeasurementConversion);
-
     const requestType = isMeasurementConversion
       ? "measurement_conversion"
       : "customer_request";
@@ -789,10 +782,6 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
     const requestTypeBadge = isMeasurementConversion
       ? "MEASUREMENT"
       : "CUSTOMER";
-
-    console.log("Final requestType:", requestType);
-    console.log("Final requestTypeBadge:", requestTypeBadge);
-    console.log("========================");
 
     const manufacturingOrder = {
       _id: customerRequest._id,
@@ -884,5 +873,118 @@ router.get("/employeeTracking/:id/work-orders", async (req, res) => {
     });
   }
 });
+
+
+// =============================================
+// NEW ROUTE: Get active vendors for sharing
+// =============================================
+router.get("/vendors/active", async (req, res) => {
+  try {
+    const Vendor = require("../../../../models/Vendor_Models/vendor");
+    
+    const vendors = await Vendor.find({ 
+      status: "active",
+      isDeleted: false 
+    })
+    .select("name contactPerson email phone vendorCode category city state")
+    .sort({ name: 1 })
+    .lean();
+
+    res.json({
+      success: true,
+      vendors
+    });
+  } catch (error) {
+    console.error("Error fetching active vendors:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching vendors"
+    });
+  }
+});
+
+// =============================================
+// NEW ROUTE: Share work orders to vendor
+// =============================================
+router.post("/share-to-vendor", async (req, res) => {
+  try {
+    const { workOrderIds, vendorId, forwardedBy } = req.body;
+
+    if (!workOrderIds || !workOrderIds.length || !vendorId) {
+      return res.status(400).json({
+        success: false,
+        message: "Work order IDs and vendor ID are required"
+      });
+    }
+
+    // Validate vendor exists
+    const Vendor = require("../../../../models/Vendor_Models/vendor");
+    const vendor = await Vendor.findOne({ 
+      _id: vendorId, 
+      status: "active",
+      isDeleted: false 
+    });
+
+    if (!vendor) {
+      return res.status(404).json({
+        success: false,
+        message: "Active vendor not found"
+      });
+    }
+
+    // Update all selected work orders
+    const updateData = {
+      status: "forwarded",
+      forwardedToVendor: vendorId,
+      forwardedAt: new Date(),
+      forwardedBy: forwardedBy || null,
+      vendorWorkOrderReference: null // Will be set by vendor when they accept
+    };
+
+    const result = await WorkOrder.updateMany(
+      { 
+        _id: { $in: workOrderIds },
+        status: { $nin: ["completed", "cancelled", "forwarded"] }
+      },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid work orders found to share"
+      });
+    }
+
+    // Fetch the updated work orders for response
+    const updatedWorkOrders = await WorkOrder.find({
+      _id: { $in: workOrderIds }
+    })
+    .select("workOrderNumber status forwardedToVendor forwardedAt")
+    .populate("forwardedToVendor", "name vendorCode")
+    .lean();
+
+    res.json({
+      success: true,
+      message: `${result.modifiedCount} work order(s) shared successfully`,
+      sharedCount: result.modifiedCount,
+      workOrders: updatedWorkOrders,
+      vendor: {
+        id: vendor._id,
+        name: vendor.name,
+        vendorCode: vendor.vendorCode
+      }
+    });
+
+  } catch (error) {
+    console.error("Error sharing work orders to vendor:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while sharing work orders"
+    });
+  }
+});
+
+
 
 module.exports = router;
