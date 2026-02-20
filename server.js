@@ -394,30 +394,6 @@ app.use("/api/vendor/partner-employees", vendorEmployees);
 const vendorWO = require("./routes/Vendor_Routes/vendorWorkOrderRoutes.js");
 app.use("/api/vendor/work-orders", vendorWO);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
@@ -431,6 +407,9 @@ app.use("/api/employee/tasks", TasksEmployee);
 // Import the cutting master routes
 const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
 app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
+
+const patternGradingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/patternGradingRoutes");
+app.use("/api/cms/manufacturing/cutting-master", patternGradingRoutes);
 
 // Import measurement routes
 const CuttingmeasurementRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes");
