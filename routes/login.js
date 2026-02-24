@@ -1,5 +1,3 @@
-// routes/login.js
-
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
@@ -9,9 +7,8 @@ const HRDepartment = require("../models/HRDepartment");
 const ProjectManager = require("../models/ProjectManager");
 const SalesDepartment = require("../models/SalesDepartment");
 const MpcMeasurement = require("../models/MpcMeasurement");
-
-// ✅ ADD THIS
 const CuttingMasterDepartment = require("../models/CuttingMasterDepartment");
+const AccountantDepartment = require("../models/Accountant_model/AccountantDepartment"); // ✅ ADD THIS
 
 router.post("/login", async (req, res) => {
   try {
@@ -44,12 +41,19 @@ router.post("/login", async (req, res) => {
           if (user) {
             userModel = "mpc-measurement";
           } else {
-            // ✅ Cutting Master Department
             user = await CuttingMasterDepartment.findOne({
               email: email.toLowerCase(),
             });
             if (user) {
               userModel = "cutting-master";
+            } else {
+              // ✅ ADD ACCOUNTANT CHECK
+              user = await AccountantDepartment.findOne({
+                email: email.toLowerCase(),
+              });
+              if (user) {
+                userModel = "accountant";
+              }
             }
           }
         }
@@ -81,7 +85,7 @@ router.post("/login", async (req, res) => {
         userType: userModel,
       },
       process.env.JWT_SECRET || "grav_clothing_secret_key",
-      { expiresIn: "24h" }
+      { expiresIn: "24h" },
     );
 
     const isProduction = process.env.NODE_ENV === "production";
@@ -103,10 +107,9 @@ router.post("/login", async (req, res) => {
     if (user.role === "sales") redirectPath = "/sales/dashboard";
     if (user.role === "mpc-measurement")
       redirectPath = "/mpc-measurement/dashboard";
-
-    // ✅ ADD THIS
     if (user.role === "cutting_master")
       redirectPath = "/cutting-master/dashboard";
+    if (user.role === "accountant") redirectPath = "/accountant/"; // ✅ ADD THIS
 
     res.status(200).json({
       success: true,
@@ -144,7 +147,7 @@ router.post("/verify", async (req, res) => {
 
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key"
+      process.env.JWT_SECRET || "grav_clothing_secret_key",
     );
 
     let user = null;
@@ -163,10 +166,15 @@ router.post("/verify", async (req, res) => {
         user = await MpcMeasurement.findById(decoded.id).select("-password");
         break;
 
-      // ✅ ADD THIS
       case "cutting-master":
         user = await CuttingMasterDepartment.findById(decoded.id).select(
-          "-password"
+          "-password",
+        );
+        break;
+
+      case "accountant": // ✅ ADD THIS CASE
+        user = await AccountantDepartment.findById(decoded.id).select(
+          "-password",
         );
         break;
 
