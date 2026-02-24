@@ -95,6 +95,7 @@ connectDB().then(async () => {
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment"); // make sure this exists in server.js also
+const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js"); // ✅ ADD THIS
 
 const createDefaultCuttingMaster = async () => {
   try {
@@ -127,6 +128,41 @@ const createDefaultCuttingMaster = async () => {
   }
 };
 
+const createDefaultAccountant = async () => {
+  try {
+    const existingAccountant = await AccountantDepartment.findOne({
+      role: "accountant",
+      department: "Accounting",
+    });
+
+    if (existingAccountant) {
+      console.log("✅ Accountant already exists, skipping creation");
+      return;
+    }
+
+    const defaultAccountant = new AccountantDepartment({
+      name: "Accountant Admin",
+      email: "accountant@grav.in",
+      password: "Account@12345", // will be hashed automatically
+      employeeId: "ACC001",
+      phone: "9999999999",
+      department: "Accounting",
+      role: "accountant",
+      isActive: true,
+    });
+
+    await defaultAccountant.save();
+
+    console.log("✅ Default Accountant created successfully");
+  } catch (error) {
+    console.error("❌ Accountant creation failed:", error.message);
+  }
+};
+
+// Update the database connection section
+connectDB().then(async () => {
+  await createDefaultAccountant(); // ✅ ADD THIS
+});
 //changes
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
@@ -339,19 +375,16 @@ app.use("/api/hr/candidates", CandidatesRouter);
 const employeeTasksRouter = require("./routes/HrRoutes/EmployeeTasks_section");
 app.use("/api/hr/tasks", employeeTasksRouter);
 
-
-
-
-
-
-
-
-
-
-
 const vendorDetailsRoutes = require("./routes/Vendor_Routes/vendorRoutes");
 app.use("/api/hr/vendors", vendorDetailsRoutes);
 
+// Accountant Department Routes
+const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
+app.use("/api/accountant/customers", accountantCustomersRoutes);
+
+// Accountant Vendor Routes
+const accountantVendorRoutes = require("./routes/Accountant_Routes/vendors");
+app.use("/api/accountant/vendors", accountantVendorRoutes);
 const vendorProfileRoutes = require("./routes/Vendor_Routes/profile.js");
 app.use("/api/vendor/profile", vendorProfileRoutes);
 
@@ -360,30 +393,6 @@ app.use("/api/vendor/partner-employees", vendorEmployees);
 
 const vendorWO = require("./routes/Vendor_Routes/vendorWorkOrderRoutes.js");
 app.use("/api/vendor/work-orders", vendorWO);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
@@ -398,6 +407,9 @@ app.use("/api/employee/tasks", TasksEmployee);
 // Import the cutting master routes
 const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
 app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
+
+const patternGradingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/patternGradingRoutes");
+app.use("/api/cms/manufacturing/cutting-master", patternGradingRoutes);
 
 // Import measurement routes
 const CuttingmeasurementRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes");
