@@ -11,8 +11,128 @@ const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
+// ─── GET: List / search stock items for Designer CAD sidebar ──────────────────
+// GET /api/cms/manufacturing/cutting-master/pattern-grading/stock-items?search=shirt&limit=30
+router.get("/pattern-grading/stock-items", async (req, res) => {
+  try {
+    const { search = "", limit = 30, page = 1 } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 30, 100);
+    const skip = (parseInt(page) - 1) * limitNum;
+
+    // Build query — filter to only items that make sense for pattern grading
+    // (Goods with measurements defined, or all goods)
+    const query = { productType: { $in: ["Goods", "Combo"] } };
+
+    if (search.trim()) {
+      const rx = new RegExp(search.trim(), "i");
+      query.$or = [{ name: rx }, { reference: rx }, { category: rx }];
+    }
+
+    const [stockItems, total] = await Promise.all([
+      StockItem.find(query)
+        .select("name reference category measurements numberOfPanels status")
+        .sort({ name: 1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      StockItem.countDocuments(query),
+    ]);
+
+    // Attach whether a pattern config exists for each item
+    const ids = stockItems.map((s) => s._id);
+    const configs = await PatternGradingConfig.find({
+      stockItemId: { $in: ids },
+      isActive: true,
+    })
+      .select("stockItemId svgFileUrl measureGroups keyframes updatedAt")
+      .lean();
+
+    const configMap = {};
+    for (const c of configs) {
+      configMap[c.stockItemId.toString()] = {
+        hasConfig: true,
+        hasSVG: !!c.svgFileUrl,
+        groupCount: c.measureGroups?.length || 0,
+        keyframeCount: c.keyframes?.length || 0,
+        updatedAt: c.updatedAt,
+      };
+    }
+
+    const enriched = stockItems.map((s) => ({
+      ...s,
+      patternInfo: configMap[s._id.toString()] || {
+        hasConfig: false,
+        hasSVG: false,
+        groupCount: 0,
+        keyframeCount: 0,
+      },
+    }));
+
+    res.json({
+      success: true,
+      stockItems: enriched,
+      total,
+      page: parseInt(page),
+      pages: Math.ceil(total / limitNum),
+    });
+  } catch (error) {
+    console.error("Error listing stock items for CAD:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─── GET: Single stock item by ID ─────────────────────────────────────────────
+// GET /api/cms/manufacturing/cutting-master/pattern-grading/stock-items/:stockItemId
+router.get("/pattern-grading/stock-items/:stockItemId", async (req, res) => {
+  try {
+    const { stockItemId } = req.params;
+
+    const stockItem = await StockItem.findById(stockItemId)
+      .select("name reference category measurements numberOfPanels status")
+      .lean();
+
+    if (!stockItem) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Stock item not found" });
+    }
+
+    // Also attach pattern config summary
+    const config = await PatternGradingConfig.findOne({
+      stockItemId,
+      isActive: true,
+    })
+      .select("svgFileUrl measureGroups keyframes updatedAt")
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    res.json({
+      success: true,
+      stockItem: {
+        ...stockItem,
+        patternInfo: config
+          ? {
+              hasConfig: true,
+              hasSVG: !!config.svgFileUrl,
+              groupCount: config.measureGroups?.length || 0,
+              keyframeCount: config.keyframes?.length || 0,
+              updatedAt: config.updatedAt,
+            }
+          : {
+              hasConfig: false,
+              hasSVG: false,
+              groupCount: 0,
+              keyframeCount: 0,
+            },
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching stock item:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // ─── GET: Fetch pattern config for a stock item ───────────────
-// GET /api/cms/manufacturing/cutting-master/pattern-grading/stock-item/:stockItemId
 router.get("/pattern-grading/stock-item/:stockItemId", async (req, res) => {
   try {
     const { stockItemId } = req.params;
@@ -24,7 +144,6 @@ router.get("/pattern-grading/stock-item/:stockItemId", async (req, res) => {
       .sort({ updatedAt: -1 })
       .lean();
 
-    // Also fetch stock item info
     const stockItem = await StockItem.findById(stockItemId)
       .select("name reference numberOfPanels measurements category")
       .lean();
@@ -40,57 +159,59 @@ router.get("/pattern-grading/stock-item/:stockItemId", async (req, res) => {
   }
 });
 
-router.post("/pattern-grading/stock-item/:stockItemId/save-svg-url", async (req, res) => {
-  try {
-    const { stockItemId } = req.params;
-    const { svgFileUrl, svgPublicId, originalFilename, bytes } = req.body;
+router.post(
+  "/pattern-grading/stock-item/:stockItemId/save-svg-url",
+  async (req, res) => {
+    try {
+      const { stockItemId } = req.params;
+      const { svgFileUrl, svgPublicId, originalFilename, bytes } = req.body;
 
-    if (!svgFileUrl) {
-      return res
-        .status(400)
-        .json({ success: false, message: "svgFileUrl is required" });
-    }
+      if (!svgFileUrl) {
+        return res
+          .status(400)
+          .json({ success: false, message: "svgFileUrl is required" });
+      }
 
-    if (!svgFileUrl.startsWith("https://")) {
-      return res.status(400).json({
-        success: false,
-        message: "svgFileUrl must be a valid https URL",
+      if (!svgFileUrl.startsWith("https://")) {
+        return res.status(400).json({
+          success: false,
+          message: "svgFileUrl must be a valid https URL",
+        });
+      }
+
+      const config = await PatternGradingConfig.findOneAndUpdate(
+        { stockItemId },
+        {
+          $set: {
+            svgFileUrl,
+            svgPublicId: svgPublicId || null,
+            originalFilename: originalFilename || null,
+            svgFileSizeBytes: bytes || null,
+            svgUploadedAt: new Date(),
+            updatedAt: new Date(),
+          },
+          $setOnInsert: {
+            stockItemId,
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true, new: true },
+      );
+
+      return res.json({
+        success: true,
+        message: "SVG URL saved successfully",
+        svgFileUrl: config.svgFileUrl,
+        configId: config._id,
       });
+    } catch (err) {
+      console.error("Error saving SVG URL:", err);
+      return res.status(500).json({ success: false, message: err.message });
     }
+  },
+);
 
-    const config = await PatternGradingConfig.findOneAndUpdate(
-      { stockItemId },
-      {
-        $set: {
-          svgFileUrl,
-          svgPublicId: svgPublicId || null,
-          originalFilename: originalFilename || null,
-          svgFileSizeBytes: bytes || null,
-          svgUploadedAt: new Date(),
-          updatedAt: new Date(),
-        },
-        $setOnInsert: {
-          stockItemId,
-          createdAt: new Date(),
-        },
-      },
-      { upsert: true, new: true },
-    );
-
-    return res.json({
-      success: true,
-      message: "SVG URL saved successfully",
-      svgFileUrl: config.svgFileUrl,
-      configId: config._id,
-    });
-  } catch (err) {
-    console.error("Error saving SVG URL:", err);
-    return res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// ─── POST: Save full pattern grading config (paths + groups + keyframes) ─
-// POST /api/cms/manufacturing/cutting-master/pattern-grading/stock-item/:stockItemId/save-config
+// ─── POST: Save full pattern grading config ──────────────────
 router.post(
   "/pattern-grading/stock-item/:stockItemId/save-config",
   async (req, res) => {
@@ -158,9 +279,7 @@ router.post(
 );
 
 // ─── GET: Fetch employee measurements + pattern config for CAD page ─────
-// This is the main endpoint used when a master opens the CAD page for an employee
-// GET /api/cms/manufacturing/cutting-master/pattern-grading/employee/:employeeId/cad-data
-//     ?woId=xxx
+// GET /api/cms/manufacturing/cutting-master/pattern-grading/employee/:employeeId/cad-data?woId=xxx
 router.get(
   "/pattern-grading/employee/:employeeId/cad-data",
   async (req, res) => {
@@ -174,7 +293,7 @@ router.get(
           .json({ success: false, message: "woId query param required" });
       }
 
-      // 1. Get work order → get stockItemId + customerRequestId
+      // 1. Get work order
       const workOrder = await WorkOrder.findById(woId)
         .select(
           "workOrderNumber stockItemId stockItemName stockItemReference variantAttributes customerRequestId quantity",
@@ -187,7 +306,7 @@ router.get(
           .json({ success: false, message: "Work order not found" });
       }
 
-      // 2. Get stock item → measurements list + panelCount
+      // 2. Get stock item
       const stockItem = await StockItem.findById(workOrder.stockItemId)
         .select("name reference numberOfPanels measurements category")
         .lean();
@@ -203,7 +322,6 @@ router.get(
 
       if (measurement) {
         for (const emp of measurement.employeeMeasurements) {
-          // Match by employeeId (ObjectId or string)
           if (emp.employeeId.toString() === employeeId.toString()) {
             employeeInfo = {
               employeeId: emp.employeeId,
@@ -212,7 +330,6 @@ router.get(
               gender: emp.gender,
             };
 
-            // Find the product matching this work order
             const product = emp.products.find(
               (p) => p.productName === workOrder.stockItemName,
             );
@@ -230,7 +347,7 @@ router.get(
         }
       }
 
-      // 5. Get pattern grading config for this stock item
+      // 5. Get pattern grading config
       const patternConfig = await PatternGradingConfig.findOne({
         stockItemId: workOrder.stockItemId,
         isActive: true,
@@ -238,50 +355,26 @@ router.get(
         .sort({ updatedAt: -1 })
         .lean();
 
-      // 6. Build measurement map: { measurementName: { value, unit } }
+      // 6. Build measurement map
       const measurementMap = {};
       if (employeeMeasurementData?.measurements) {
         for (const m of employeeMeasurementData.measurements) {
-          measurementMap[m.measurementName] = {
-            value: parseFloat(m.value) || 0,
-            unit: m.unit || "inch",
-          };
+          measurementMap[m.measurementName] = parseFloat(m.value) || 0;
         }
       }
 
-      // 7. If we have pattern config + employee measurements, compute what
-      //    targetFullInches should be for each group based on employee's body data
+      // 7. Compute group targets
       let computedGroupTargets = [];
-
       if (
         patternConfig &&
         patternConfig.measureGroups?.length &&
         employeeMeasurementData
       ) {
         computedGroupTargets = patternConfig.measureGroups.map((group) => {
-          // Map part key to possible measurement names
-          const PART_KEY_TO_MEASUREMENT_NAMES = {
-            chest: ["Chest", "chest", "CHEST"],
-            shoulder: ["Shoulder", "shoulder", "SHOULDER"],
-            waist: ["Waist", "waist", "WAIST", "Stomach"],
-            hip: ["Hip", "hip", "HIP"],
-            sleeve: ["Sleeve Length", "sleeve", "Sleeve", "SLEEVE"],
-            neck: ["Coller", "Collar", "collar", "Neck", "neck"],
-            length: ["Length", "length", "LENGTH"],
-            armhole: ["Armhole", "armhole"],
-          };
-
-          const possibleNames = PART_KEY_TO_MEASUREMENT_NAMES[
-            group.partKey
-          ] || [group.partKey];
-          let employeeValue = null;
-
-          for (const name of possibleNames) {
-            if (measurementMap[name] !== undefined) {
-              employeeValue = measurementMap[name].value;
-              break;
-            }
-          }
+          const employeeValue =
+            measurementMap[group.partKey] !== undefined
+              ? measurementMap[group.partKey]
+              : null;
 
           return {
             groupClientId: group.clientId,
@@ -290,7 +383,6 @@ router.get(
             assignedSize: group.assignedSize,
             multiplier: group.multiplier,
             baseFullInches: group.baseFullInches,
-            // If employee has this measurement, use it; else fall back to base
             targetFullInches:
               employeeValue !== null ? employeeValue : group.baseFullInches,
             hasEmployeeData: employeeValue !== null,
@@ -329,7 +421,7 @@ router.get(
   },
 );
 
-// ─── GET: List all pattern configs (for management UI) ───────
+// ─── GET: List all pattern configs ───────────────────────────
 router.get("/pattern-grading/configs", async (req, res) => {
   try {
     const configs = await PatternGradingConfig.find({ isActive: true })
@@ -365,7 +457,6 @@ router.delete("/pattern-grading/configs/:configId", async (req, res) => {
         .json({ success: false, message: "Config not found" });
     }
 
-    // Soft delete
     config.isActive = false;
     await config.save();
 
@@ -377,3 +468,4 @@ router.delete("/pattern-grading/configs/:configId", async (req, res) => {
 });
 
 module.exports = router;
+  
