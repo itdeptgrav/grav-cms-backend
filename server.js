@@ -424,6 +424,11 @@ app.use("/api/cms/manufacturing/cutting-master", bulkCuttingRoutes);
 const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes"); // NEW FILE
 app.use("/api/vendor", vendorAuthRoutes);
 
+
+const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
+app.use("/api/barcode-scanner", barcodeScannerRoutes);
+
+
 /* =====================
     HEALTH CHECK
   ===================== */
