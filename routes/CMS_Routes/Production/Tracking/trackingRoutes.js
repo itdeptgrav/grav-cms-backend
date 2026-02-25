@@ -240,7 +240,7 @@ router.post("/scan", async (req, res) => {
     if (isBarcodeId(scanId)) {
       // Must have signed-in operator
       const operationTracking = machineTracking.operationTracking.find(
-        (op) => op.currentOperatorIdentityId,
+        (op) => op.currentOperatorIdentityId && op.currentOperatorIdentityId !== null
       );
 
       if (!operationTracking) {
