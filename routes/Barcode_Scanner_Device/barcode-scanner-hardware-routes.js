@@ -6,33 +6,8 @@ const fs = require('fs');
 const BarcodeDevice = require('../../models/Barcode_Scanner_Device/BarcodeDevice');
 const Firmware = require('../../models/Barcode_Scanner_Device/Firmware');
 
-// Configure multer for file upload
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const firmwareDir = path.join(__dirname, '../../firmware');
-    // Create directory if it doesn't exist
-    if (!fs.existsSync(firmwareDir)) {
-      fs.mkdirSync(firmwareDir, { recursive: true });
-    }
-    cb(null, firmwareDir);
-  },
-  filename: function (req, file, cb) {
-    // Get version from request body
-    let version = 'unknown';
-    
-    // Try to get version from different places
-    if (req.body.version) {
-      version = req.body.version;
-    } else if (req.query.version) {
-      version = req.query.version;
-    }
-    
-    // Clean the version (remove any special characters)
-    version = version.replace(/[^a-zA-Z0-9.]/g, '_');
-    
-    cb(null, `firmware_v${version}.bin`);
-  }
-});
+// IMPORTANT: Use multer memory storage first, then process later
+const storage = multer.memoryStorage(); // Store in memory temporarily
 
 const upload = multer({ 
   storage: storage,
@@ -106,8 +81,8 @@ router.post('/check-update', async (req, res) => {
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
         
-        // Generate the firmware URL - FORCE HTTP (ESP32 works better with HTTP)
-        const baseUrl = `http://${req.get('host')}`; // Force HTTP, not HTTPS
+        // Generate the firmware URL - FORCE HTTP
+        const baseUrl = `http://${req.get('host')}`;
         firmwareInfo = {
           version: latestFirmware.version,
           url: `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
@@ -152,7 +127,7 @@ router.get('/firmware/download/:version', (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename=firmware_v${version}.bin`);
       res.setHeader('Content-Length', stats.size);
       res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Access-Control-Allow-Origin', '*'); // Allow any origin
+      res.setHeader('Access-Control-Allow-Origin', '*');
       
       // Stream the file
       const fileStream = fs.createReadStream(firmwarePath);
@@ -172,7 +147,7 @@ router.get('/firmware/download/:version', (req, res) => {
   }
 });
 
-// GET /api/barcode-devices - Get all devices (for frontend)
+// GET /api/barcode-devices - Get all devices
 router.get('/', async (req, res) => {
   try {
     const devices = await BarcodeDevice.find({})
@@ -226,11 +201,15 @@ router.get('/:deviceId', async (req, res) => {
   }
 });
 
-// POST /api/barcode-devices/firmware - Upload new firmware (from frontend)
+// POST /api/barcode-devices/firmware - Upload new firmware (FIXED VERSION)
 router.post('/firmware', upload.single('firmware'), async (req, res) => {
   try {
     const { version, description, targetDevices } = req.body;
     const file = req.file;
+
+    console.log('Received upload request:');
+    console.log('Version from body:', version);
+    console.log('File received:', file ? file.originalname : 'No file');
 
     if (!version) {
       return res.status(400).json({
@@ -249,8 +228,24 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     // Get file size
     const fileSize = file.size;
 
-    // Generate the firmware URL - FORCE HTTP (ESP32 works better with HTTP)
-    const baseUrl = `http://${req.get('host')}`; // Force HTTP
+    // Create firmware directory if it doesn't exist
+    const firmwareDir = path.join(__dirname, '../../firmware');
+    if (!fs.existsSync(firmwareDir)) {
+      fs.mkdirSync(firmwareDir, { recursive: true });
+    }
+
+    // Save file with correct version name
+    const filename = `firmware_v${version}.bin`;
+    const filePath = path.join(firmwareDir, filename);
+    
+    console.log('Saving firmware to:', filePath);
+    
+    // Write file from memory buffer
+    fs.writeFileSync(filePath, file.buffer);
+    console.log('File saved successfully');
+
+    // Generate the firmware URL - FORCE HTTP
+    const baseUrl = `http://${req.get('host')}`;
     const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
 
     // Deactivate previous versions with same version number
@@ -272,7 +267,7 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     // Create new firmware record
     const firmware = new Firmware({
       version,
-      cloudinaryUrl: firmwareUrl, // Store your server URL here
+      cloudinaryUrl: firmwareUrl,
       fileSize,
       description,
       isActive: true,
