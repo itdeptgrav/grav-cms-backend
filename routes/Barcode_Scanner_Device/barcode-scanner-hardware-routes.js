@@ -82,7 +82,7 @@ router.post('/check-update', async (req, res) => {
         updateAvailable = true;
         
         // Generate the firmware URL - FORCE HTTP
-        const baseUrl = `http://${req.get('host')}`;
+        const baseUrl = `https://${req.get('host')}`;
         firmwareInfo = {
           version: latestFirmware.version,
           url: `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
@@ -245,7 +245,7 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     console.log('File saved successfully');
 
     // Generate the firmware URL - FORCE HTTP
-    const baseUrl = `http://${req.get('host')}`;
+    const baseUrl = `https://${req.get('host')}`;
     const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
 
     // Deactivate previous versions with same version number
