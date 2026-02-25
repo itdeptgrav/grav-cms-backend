@@ -243,6 +243,21 @@ router.post("/pattern-grading/stock-item/:stockItemId/save-config", async (req, 
 
     if (unitsPerInch !== undefined) config.unitsPerInch = unitsPerInch;
     if (basePatternSize !== undefined) config.basePatternSize = basePatternSize;
+
+    // ── Persist viewport to dedicated savedViewport field ──────────────────
+    if (req.body.viewport && typeof req.body.viewport === "object") {
+      const vp = req.body.viewport;
+      const scale = parseFloat(vp.scale);
+      if (!isNaN(scale) && scale > 0) {
+        config.savedViewport = {
+          scale,
+          x: parseFloat(vp.x) || 0,
+          y: parseFloat(vp.y) || 0,
+        };
+        config.markModified("savedViewport");
+      }
+    }
+
     if (configSnapshot !== undefined) config.configSnapshot = configSnapshot;
     if (measurementPartRules !== undefined) config.measurementPartRules = measurementPartRules;
 
