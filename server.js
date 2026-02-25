@@ -426,7 +426,7 @@ app.use("/api/vendor", vendorAuthRoutes);
 
 
 const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
-app.use("/api/barcode-scanner", barcodeScannerRoutes);
+app.use("/api/barcode-devices", barcodeScannerRoutes);
 
 
 /* =====================
