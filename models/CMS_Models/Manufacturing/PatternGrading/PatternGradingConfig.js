@@ -176,6 +176,11 @@ const patternGradingConfigSchema = new mongoose.Schema(
     configSnapshot: { type: mongoose.Schema.Types.Mixed, default: null },
     measurementPartRules: { type: mongoose.Schema.Types.Mixed, default: null },
 
+    savedViewport: {
+      scale: { type: Number, default: null },
+      x: { type: Number, default: null },
+      y: { type: Number, default: null },
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "CuttingMaster",
