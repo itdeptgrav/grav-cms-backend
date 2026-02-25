@@ -17,8 +17,19 @@ const storage = multer.diskStorage({
     cb(null, firmwareDir);
   },
   filename: function (req, file, cb) {
-    // Save with version number from request body
-    const version = req.body.version || 'unknown';
+    // Get version from request body
+    let version = 'unknown';
+    
+    // Try to get version from different places
+    if (req.body.version) {
+      version = req.body.version;
+    } else if (req.query.version) {
+      version = req.query.version;
+    }
+    
+    // Clean the version (remove any special characters)
+    version = version.replace(/[^a-zA-Z0-9.]/g, '_');
+    
     cb(null, `firmware_v${version}.bin`);
   }
 });
@@ -95,8 +106,8 @@ router.post('/check-update', async (req, res) => {
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
         
-        // Generate the firmware URL (using your server)
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        // Generate the firmware URL - FORCE HTTP (ESP32 works better with HTTP)
+        const baseUrl = `http://${req.get('host')}`; // Force HTTP, not HTTPS
         firmwareInfo = {
           version: latestFirmware.version,
           url: `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
@@ -141,6 +152,7 @@ router.get('/firmware/download/:version', (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename=firmware_v${version}.bin`);
       res.setHeader('Content-Length', stats.size);
       res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Access-Control-Allow-Origin', '*'); // Allow any origin
       
       // Stream the file
       const fileStream = fs.createReadStream(firmwarePath);
@@ -237,8 +249,8 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     // Get file size
     const fileSize = file.size;
 
-    // Generate the firmware URL (using your server)
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    // Generate the firmware URL - FORCE HTTP (ESP32 works better with HTTP)
+    const baseUrl = `http://${req.get('host')}`; // Force HTTP
     const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
 
     // Deactivate previous versions with same version number
