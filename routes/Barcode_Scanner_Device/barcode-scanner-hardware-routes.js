@@ -1,14 +1,47 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const BarcodeDevice = require('../../models/Barcode_Scanner_Device/BarcodeDevice');
 const Firmware = require('../../models/Barcode_Scanner_Device/Firmware');
 
-// Helper to validate deviceId format (24 char hex)
+// Configure multer for file upload
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const firmwareDir = path.join(__dirname, '../../firmware');
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(firmwareDir)) {
+      fs.mkdirSync(firmwareDir, { recursive: true });
+    }
+    cb(null, firmwareDir);
+  },
+  filename: function (req, file, cb) {
+    // Save with version number from request body
+    const version = req.body.version || 'unknown';
+    cb(null, `firmware_v${version}.bin`);
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    // Accept only .bin files
+    if (file.originalname.endsWith('.bin') || file.mimetype === 'application/octet-stream') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only .bin files are allowed'));
+    }
+  }
+});
+
+// Helper to validate deviceId format (8 char hex)
 const isValidDeviceId = (deviceId) => {
   return /^[0-9a-fA-F]{8}$/.test(deviceId);
 };
 
-// POST /api/barcode-devices/register - Device registration/update check
+// POST /api/barcode-devices/check-update - Device registration/update check
 router.post('/check-update', async (req, res) => {
   try {
     const { deviceId, currentVersion, ipAddress, wifiSSID } = req.body;
@@ -61,9 +94,12 @@ router.post('/check-update', async (req, res) => {
 
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
+        
+        // Generate the firmware URL (using your server)
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
         firmwareInfo = {
           version: latestFirmware.version,
-          url: latestFirmware.cloudinaryUrl,
+          url: `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
           fileSize: latestFirmware.fileSize,
           description: latestFirmware.description
         };
@@ -87,12 +123,49 @@ router.post('/check-update', async (req, res) => {
   }
 });
 
+// GET /api/barcode-devices/firmware/download/:version - Download firmware file
+router.get('/firmware/download/:version', (req, res) => {
+  try {
+    const version = req.params.version;
+    const firmwarePath = path.join(__dirname, '../../firmware', `firmware_v${version}.bin`);
+    
+    console.log('Looking for firmware at:', firmwarePath);
+    
+    // Check if file exists
+    if (fs.existsSync(firmwarePath)) {
+      // Get file stats
+      const stats = fs.statSync(firmwarePath);
+      
+      // Set headers for binary download
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename=firmware_v${version}.bin`);
+      res.setHeader('Content-Length', stats.size);
+      res.setHeader('Cache-Control', 'no-cache');
+      
+      // Stream the file
+      const fileStream = fs.createReadStream(firmwarePath);
+      fileStream.pipe(res);
+      
+      fileStream.on('error', (error) => {
+        console.error('Error streaming firmware:', error);
+        res.status(500).json({ success: false, message: 'Error streaming file' });
+      });
+    } else {
+      console.error('Firmware file not found:', firmwarePath);
+      res.status(404).json({ success: false, message: 'Firmware not found' });
+    }
+  } catch (error) {
+    console.error('Error downloading firmware:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 // GET /api/barcode-devices - Get all devices (for frontend)
 router.get('/', async (req, res) => {
   try {
     const devices = await BarcodeDevice.find({})
       .sort({ lastSeen: -1 })
-      .select('deviceId currentFirmwareVersion lastSeen status wifiSSID firstSeen');
+      .select('deviceId machineId currentFirmwareVersion lastSeen status wifiSSID firstSeen');
 
     res.json({
       success: true,
@@ -142,16 +215,31 @@ router.get('/:deviceId', async (req, res) => {
 });
 
 // POST /api/barcode-devices/firmware - Upload new firmware (from frontend)
-router.post('/firmware', async (req, res) => {
+router.post('/firmware', upload.single('firmware'), async (req, res) => {
   try {
-    const { version, cloudinaryUrl, cloudinaryPublicId, fileSize, description, targetDevices } = req.body;
+    const { version, description, targetDevices } = req.body;
+    const file = req.file;
 
-    if (!version || !cloudinaryUrl) {
+    if (!version) {
       return res.status(400).json({
         success: false,
-        message: 'Version and Cloudinary URL are required'
+        message: 'Version is required'
       });
     }
+
+    if (!file) {
+      return res.status(400).json({
+        success: false,
+        message: 'Firmware file is required'
+      });
+    }
+
+    // Get file size
+    const fileSize = file.size;
+
+    // Generate the firmware URL (using your server)
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
 
     // Deactivate previous versions with same version number
     await Firmware.updateMany(
@@ -159,15 +247,24 @@ router.post('/firmware', async (req, res) => {
       { isActive: false }
     );
 
+    // Parse targetDevices if it's a string
+    let targetDevicesArray = ['all'];
+    if (targetDevices) {
+      try {
+        targetDevicesArray = JSON.parse(targetDevices);
+      } catch (e) {
+        targetDevicesArray = [targetDevices];
+      }
+    }
+
     // Create new firmware record
     const firmware = new Firmware({
       version,
-      cloudinaryUrl,
-      cloudinaryPublicId,
+      cloudinaryUrl: firmwareUrl, // Store your server URL here
       fileSize,
       description,
       isActive: true,
-      targetDevices: targetDevices || ['all'],
+      targetDevices: targetDevicesArray,
       releasedAt: new Date()
     });
 
@@ -176,7 +273,12 @@ router.post('/firmware', async (req, res) => {
     res.json({
       success: true,
       message: 'Firmware uploaded successfully',
-      firmware
+      firmware: {
+        version,
+        url: firmwareUrl,
+        fileSize,
+        description
+      }
     });
 
   } catch (error) {
