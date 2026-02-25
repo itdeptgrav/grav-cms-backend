@@ -81,7 +81,7 @@ router.post('/check-update', async (req, res) => {
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
         
-        // Generate the firmware URL - FORCE HTTP
+        // Generate the firmware URL
         const baseUrl = `https://${req.get('host')}`;
         firmwareInfo = {
           version: latestFirmware.version,
@@ -89,14 +89,19 @@ router.post('/check-update', async (req, res) => {
           fileSize: latestFirmware.fileSize,
           description: latestFirmware.description
         };
+        
+        console.log(`Update available for device ${deviceId}: v${latestFirmware.version}`);
+      } else {
+        console.log(`No update needed for device ${deviceId}. Current: ${device.currentFirmwareVersion}, Latest: ${latestFirmware.version}`);
       }
     }
 
+    // IMPORTANT FIX: Always include firmware info in response if available
     res.json({
       success: true,
       updateAvailable,
       currentVersion: device.currentFirmwareVersion,
-      ...(updateAvailable && { firmware: firmwareInfo })
+      ...(firmwareInfo && { firmware: firmwareInfo })  // This ensures firmware object is included
     });
 
   } catch (error) {
