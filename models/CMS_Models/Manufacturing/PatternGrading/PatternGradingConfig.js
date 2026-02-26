@@ -37,16 +37,14 @@ const nestedConditionSchema = new mongoose.Schema(
     id: { type: String },
     enabled: { type: Boolean, default: true },
     label: { type: String, default: "Condition" },
-    // WHEN: this group [operator] [compareValue or compareGroup]
     operator: {
       type: String,
       enum: ["greater_than", "less_than", "greater_equal", "less_equal", "equals"],
       default: "greater_than",
     },
-    compareGroupId: { type: String, default: null }, // null = fixed value
+    compareGroupId: { type: String, default: null },
     compareValue: { type: Number, default: 0 },
-    // THEN: apply to [targetGroupId]
-    targetGroupId: { type: String, default: null }, // null = self
+    targetGroupId: { type: String, default: null },
     action: {
       type: String,
       enum: [
@@ -105,8 +103,51 @@ const measureGroupSchema = new mongoose.Schema(
       default: "keyframe",
     },
     ruleProfile: ruleProfileSchema,
-    // ← Nested conditions stored per group
     nestedConditions: { type: [nestedConditionSchema], default: [] },
+    // Feature 2: Loosening / ease — additive offset on top of employee measurement
+    loosingEnabled: { type: Boolean, default: false },
+    loosingValueInches: { type: Number, default: 0, min: 0, max: 20 },
+    conditionsFollowLoosing: { type: Boolean, default: false },
+  },
+  { _id: true }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEAM EDGE — designer-defined, stock-item-level constant
+//
+// Key design contract:
+//   • Width (inches) is fixed for a given stock item — same for all employees.
+//   • fromSegIdx / toSegIdx reference nodes by their array position in basePaths.
+//   • Grading only *moves* nodes (via deltas); it never adds or removes them,
+//     so these indices remain valid on every employee's graded path.
+//   • The cutting-master page receives these as read-only; employees cannot
+//     modify seam widths or re-assign nodes.
+//   • The rendering pipeline (extractShortestArcPoints + _resolveSeamMiterJoins)
+//     runs identically on base paths and graded paths — corner gap prevention,
+//     miter joins, and outward direction all work the same way.
+// ─────────────────────────────────────────────────────────────────────────────
+const seamEdgeSchema = new mongoose.Schema(
+  {
+    // Stable client-side ID — used as React key and for hit-testing
+    clientId: { type: String, required: true },
+    // Human-readable label shown in canvas and property panel
+    name: { type: String, default: "Seam" },
+    // Index into basePaths array (same indexing on graded paths)
+    pathIdx: { type: Number, required: true },
+    // Start node index on that path
+    fromSegIdx: { type: Number, required: true },
+    // End node index on that path
+    toSegIdx: { type: Number, required: true },
+    // Allowance width in inches — constant across all employees
+    width: {
+      type: Number,
+      required: true,
+      default: 0.5,
+      min: 0.0625, // minimum 1/16"
+      max: 10,
+    },
+    // Soft-delete — hide without removing from DB
+    visible: { type: Boolean, default: true },
   },
   { _id: true }
 );
@@ -158,9 +199,13 @@ const patternGradingConfigSchema = new mongoose.Schema(
     basePaths: [pathSchema],
     unitsPerInch: { type: Number, default: 25.4 },
 
-    // Groups now carry nestedConditions inside them
     measureGroups: [measureGroupSchema],
     keyframes: [keyframeSchema],
+
+    // ── SEAM ALLOWANCES ───────────────────────────────────────────────────
+    // Stock-item-level constants set by the designer.
+    // All employees share the same seamEdges; only their graded geometry changes.
+    seamEdges: { type: [seamEdgeSchema], default: [] },
 
     basePatternSize: { type: String, default: "M" },
     isActive: { type: Boolean, default: true },
@@ -189,6 +234,12 @@ const patternGradingConfigSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-patternGradingConfigSchema.index({ stockItemId: 1, isActive: 1 }, { unique: false });
+patternGradingConfigSchema.index(
+  { stockItemId: 1, isActive: 1 },
+  { unique: false }
+);
 
-module.exports = mongoose.model("PatternGradingConfig", patternGradingConfigSchema);
+module.exports = mongoose.model(
+  "PatternGradingConfig",
+  patternGradingConfigSchema
+);
