@@ -45,7 +45,7 @@ router.get("/pattern-grading/stock-items", async (req, res) => {
     const configMap = {};
     for (const c of configs) {
       configMap[c.stockItemId.toString()] = {
-        hasConfig: true,
+        hasConfig: !!c,
         hasSVG: !!c.svgFileUrl,
         groupCount: c.measureGroups?.length || 0,
         keyframeCount: c.keyframes?.length || 0,
@@ -117,8 +117,6 @@ router.get("/pattern-grading/stock-items/:stockItemId", async (req, res) => {
 });
 
 // ─── GET: Fetch pattern config for a stock item ───────────────
-// Returns measureGroups, keyframes, AND seamEdges.
-// The cutting master page calls this endpoint once to load the shared config.
 router.get("/pattern-grading/stock-item/:stockItemId", async (req, res) => {
   try {
     const { stockItemId } = req.params;
@@ -131,12 +129,17 @@ router.get("/pattern-grading/stock-item/:stockItemId", async (req, res) => {
       .select("name reference numberOfPanels measurements category")
       .lean();
 
-    // Normalise seamEdges so clientId is always present as the stable id field
+    // Normalise seamEdges so clientId is always present
     if (config && config.seamEdges) {
       config.seamEdges = config.seamEdges.map((se) => ({
         ...se,
         clientId: se.clientId || se._id?.toString() || String(Date.now() + Math.random()),
       }));
+    }
+
+    // If there's a global rotation, include it
+    if (config && !config.globalRotation) {
+      config.globalRotation = { angle: 0, pivotX: 0, pivotY: 0 };
     }
 
     res.json({ success: true, config: config || null, stockItem: stockItem || null });
@@ -189,9 +192,6 @@ router.post(
 );
 
 // ─── POST: Save full pattern grading config ───────────────────
-// Persists measureGroups (with nestedConditions), keyframes, AND seamEdges.
-// seamEdges are stock-item constants — they are written here by the designer
-// and served read-only to the cutting master.
 router.post(
   "/pattern-grading/stock-item/:stockItemId/save-config",
   async (req, res) => {
@@ -206,6 +206,7 @@ router.post(
         basePatternSize,
         configSnapshot,
         measurementPartRules,
+        globalRotation,
       } = req.body;
 
       const stockItem = await StockItem.findById(stockItemId)
@@ -225,9 +226,17 @@ router.post(
         });
       }
 
-      if (basePaths !== undefined) config.basePaths = basePaths;
+      if (basePaths !== undefined) {
+        // Store original segments for rotation reference
+        config.basePaths = basePaths.map((path) => ({
+          ...path,
+          originalSegs: path.segs.map(seg => ({ ...seg })),
+          rotationAngle: path.rotationAngle || 0,
+          rotationPivot: path.rotationPivot || null
+        }));
+      }
 
-      // ── Persist measureGroups with nestedConditions ─────────────────────
+      // ── Persist measureGroups ─────────────────────
       if (measureGroups !== undefined) {
         config.measureGroups = measureGroups.map((g) => ({
           clientId: String(g.clientId || g.id || ""),
@@ -243,7 +252,7 @@ router.post(
             pathIdx: Number(g.ref2?.pathIdx ?? 0),
             segIdx: Number(g.ref2?.segIdx ?? 0),
           },
-          color: g.color || "#2980b9",
+          color: g.color || "#2563eb",
           targetFullInches: Number(g.targetFullInches) || 0,
           baseFullInches: Number(g.baseFullInches) || 0,
           measurementOffset: Number(g.measurementOffset) || 0,
@@ -266,7 +275,7 @@ router.post(
         }));
       }
 
-      // ── Persist keyframes ────────────────────────────────────────────────
+      // ── Persist keyframes ────────────────────────────────
       if (keyframes !== undefined) {
         config.keyframes = keyframes.map((kf) => ({
           clientId: String(kf.clientId || kf.id || ""),
@@ -288,9 +297,7 @@ router.post(
         }));
       }
 
-      // ── Persist seamEdges — stock-item-level constants ──────────────────
-      // Each entry stores: clientId, name, pathIdx, fromSegIdx, toSegIdx, width, visible.
-      // Width and node indices are invariant across employees.
+      // ── Persist seamEdges ──────────────────
       if (seamEdges !== undefined) {
         config.seamEdges = (seamEdges || []).map((se) => ({
           clientId: String(se.id || se.clientId || `seam-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`),
@@ -298,16 +305,16 @@ router.post(
           pathIdx: Number(se.pathIdx) || 0,
           fromSegIdx: Number(se.fromSegIdx) || 0,
           toSegIdx: Number(se.toSegIdx) || 0,
-          // Clamp width to valid range (1/16" – 10")
           width: Math.max(0.0625, Math.min(10, Number(se.width) || 0.5)),
           visible: se.visible !== false,
+          outwardSign: Number(se.outwardSign) || 1,
         }));
       }
 
       if (unitsPerInch !== undefined) config.unitsPerInch = unitsPerInch;
       if (basePatternSize !== undefined) config.basePatternSize = basePatternSize;
 
-      // ── Persist viewport ─────────────────────────────────────────────────
+      // ── Persist viewport ─────────────────────────────────
       if (req.body.viewport && typeof req.body.viewport === "object") {
         const vp = req.body.viewport;
         const scale = parseFloat(vp.scale);
@@ -317,8 +324,16 @@ router.post(
             x: parseFloat(vp.x) || 0,
             y: parseFloat(vp.y) || 0,
           };
-          config.markModified("savedViewport");
         }
+      }
+
+      // ── Persist global rotation ───────────────────────────
+      if (globalRotation) {
+        config.globalRotation = {
+          angle: Number(globalRotation.angle) || 0,
+          pivotX: Number(globalRotation.pivotX) || 0,
+          pivotY: Number(globalRotation.pivotY) || 0
+        };
       }
 
       if (configSnapshot !== undefined) config.configSnapshot = configSnapshot;
@@ -348,15 +363,6 @@ router.post(
 );
 
 // ─── GET: Employee CAD data ───────────────────────────────────
-// Returns everything the cutting-master page needs for one employee:
-//   • workOrder / stockItem info
-//   • patternConfig (measureGroups, keyframes, seamEdges, basePaths, …)
-//   • computedGroupTargets (per-employee measurement mapping)
-//   • seamEdges (top-level, pre-filtered to visible, for convenience)
-//
-// Note: seamEdges are stock-item constants — every employee sees the same
-// widths and node indices.  The cutting-master page applies grading offsets to
-// get the displayed path geometry, but never touches seamEdges.
 router.get(
   "/pattern-grading/employee/:employeeId/cad-data",
   async (req, res) => {
@@ -451,7 +457,6 @@ router.get(
       }
 
       // ── Serve seamEdges as top-level convenience field ─────────────────
-      // Only visible ones; clientId is normalised for front-end use.
       const seamEdges = (patternConfig?.seamEdges || [])
         .filter((se) => se.visible !== false)
         .map((se) => ({
@@ -463,6 +468,7 @@ router.get(
           toSegIdx: se.toSegIdx,
           width: se.width,
           visible: se.visible !== false,
+          outwardSign: se.outwardSign || 1,
         }));
 
       res.json({
@@ -481,8 +487,8 @@ router.get(
         measurementMap,
         patternConfig: patternConfig || null,
         computedGroupTargets,
-        // Seam allowances — same for every employee on this stock item
         seamEdges,
+        globalRotation: patternConfig?.globalRotation || { angle: 0, pivotX: 0, pivotY: 0 },
         hasPatternConfig: !!patternConfig,
         hasSVGFile: !!patternConfig?.svgFileUrl,
         hasGroups: !!patternConfig?.measureGroups?.length,
