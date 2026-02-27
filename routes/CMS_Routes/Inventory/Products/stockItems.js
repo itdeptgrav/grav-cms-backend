@@ -1,3 +1,5 @@
+// routes/CMS_Routes/Inventory/Products/stockItemRoutes.js
+
 const express = require("express");
 const router = express.Router();
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
@@ -43,10 +45,21 @@ const OPERATION_TYPES = [
 // Apply auth middleware to all routes
 router.use(EmployeeAuthMiddleware);
 
-// ✅ GET all stock items with variants
+// ✅ GET all stock items with variants (with pagination)
 router.get("/", async (req, res) => {
   try {
-    const { search = "", status, category } = req.query;
+    const { 
+      search = "", 
+      status, 
+      category,
+      page = 1,
+      limit = 10
+    } = req.query;
+
+    // Parse pagination parameters
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
 
     let filter = {};
 
@@ -66,19 +79,41 @@ router.get("/", async (req, res) => {
       filter.category = category;
     }
 
+    // Get total count for pagination
+    const totalItems = await StockItem.countDocuments(filter);
+    const totalPages = Math.ceil(totalItems / limitNum);
+
     const stockItems = await StockItem.find(filter)
-      .select("name reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants")
+      .select("name reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations")
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email")
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum);
 
-    // Calculate statistics
+    // Calculate statistics (based on all items, not just paginated)
     const total = await StockItem.countDocuments();
     const lowStock = await StockItem.countDocuments({ status: "Low Stock" });
     const outOfStock = await StockItem.countDocuments({ status: "Out of Stock" });
     
+    // Get all items for stats calculation (or use aggregation for better performance)
+    const allItems = await StockItem.find({}, "variants averageCost averageSalesPrice profitMargin totalQuantityOnHand");
+    
     // Count total variants across all stock items
-    const totalVariants = stockItems.reduce((sum, item) => sum + (item.variants?.length || 0), 0);
+    const totalVariants = allItems.reduce((sum, item) => sum + (item.variants?.length || 0), 0);
+    
+    // Calculate financial stats
+    const totalInventoryValue = allItems.reduce((sum, item) => {
+      return sum + ((item.averageCost || 0) * (item.totalQuantityOnHand || 0));
+    }, 0);
+    
+    const totalPotentialRevenue = allItems.reduce((sum, item) => {
+      return sum + ((item.averageSalesPrice || 0) * (item.totalQuantityOnHand || 0));
+    }, 0);
+    
+    const averageMargin = allItems.length > 0 
+      ? allItems.reduce((sum, item) => sum + (item.profitMargin || 0), 0) / allItems.length
+      : 0;
 
     res.json({
       success: true,
@@ -88,11 +123,22 @@ router.get("/", async (req, res) => {
         lowStock,
         outOfStock,
         totalVariants,
+        totalInventoryValue,
+        totalPotentialRevenue,
+        averageMargin,
         totalStockItems: total
       },
       filters: {
         categories: STOCK_ITEM_CATEGORIES,
         statuses: ["In Stock", "Low Stock", "Out of Stock"]
+      },
+      pagination: {
+        currentPage: pageNum,
+        totalPages,
+        totalItems,
+        itemsPerPage: limitNum,
+        hasNextPage: pageNum < totalPages,
+        hasPrevPage: pageNum > 1
       }
     });
 
@@ -103,47 +149,6 @@ router.get("/", async (req, res) => {
       message: "Server error while fetching stock items"
     });
   }
-});
-
-
-// routes/CMS_Routes/Inventory/Products/stockItemRoutes.js (or create new)
-router.get('/:stockItemId/variant/:variantId', async (req, res) => {
-    try {
-        const { stockItemId, variantId } = req.params;
-        
-        const stockItem = await StockItem.findById(stockItemId);
-        if (!stockItem) {
-            return res.status(404).json({
-                success: false,
-                message: 'Stock item not found'
-            });
-        }
-
-        const variant = stockItem.variants.find(v => v._id.toString() === variantId.toString());
-        if (!variant) {
-            return res.status(404).json({
-                success: false,
-                message: 'Variant not found'
-            });
-        }
-
-        res.json({
-            success: true,
-            variant: {
-                _id: variant._id,
-                attributes: variant.attributes || [],
-                salesPrice: variant.salesPrice,
-                quantityOnHand: variant.quantityOnHand
-            }
-        });
-
-    } catch (error) {
-        console.error('Error fetching variant:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while fetching variant'
-        });
-    }
 });
 
 // ✅ GET stock item by ID with variants
@@ -170,6 +175,9 @@ router.get("/:id", async (req, res) => {
     });
   }
 });
+
+// The rest of your routes remain the same...
+// (GET /:stockItemId/variant/:variantId, GET /data/raw-items, GET /data/create, POST /, PUT /:id, DELETE /:id)
 
 // ✅ GET raw items with their variants for stock item form
 router.get("/data/raw-items", async (req, res) => {
@@ -605,6 +613,46 @@ router.post("/", async (req, res) => {
       message: "Server error while creating stock item"
     });
   }
+});
+
+// ✅ GET variant by stockItemId and variantId
+router.get('/:stockItemId/variant/:variantId', async (req, res) => {
+    try {
+        const { stockItemId, variantId } = req.params;
+        
+        const stockItem = await StockItem.findById(stockItemId);
+        if (!stockItem) {
+            return res.status(404).json({
+                success: false,
+                message: 'Stock item not found'
+            });
+        }
+
+        const variant = stockItem.variants.find(v => v._id.toString() === variantId.toString());
+        if (!variant) {
+            return res.status(404).json({
+                success: false,
+                message: 'Variant not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            variant: {
+                _id: variant._id,
+                attributes: variant.attributes || [],
+                salesPrice: variant.salesPrice,
+                quantityOnHand: variant.quantityOnHand
+            }
+        });
+
+    } catch (error) {
+        console.error('Error fetching variant:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while fetching variant'
+        });
+    }
 });
 
 // ✅ UPDATE stock item with variants
