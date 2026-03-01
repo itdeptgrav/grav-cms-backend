@@ -73,42 +73,89 @@ const makeEmployeeNameCache = () => {
 };
 
 // Which operation number (1-based) is a given machine assigned to in a WO?
+// Returns null if no match found.
 const deriveOperationNumber = (machineId, workOrder) => {
-  if (!workOrder?.operations) return null;
+  if (!machineId || !workOrder?.operations) return null;
+  const mIdStr = machineId.toString();
   for (let i = 0; i < workOrder.operations.length; i++) {
     const op = workOrder.operations[i];
-    if (op.assignedMachine?.toString() === machineId) return i + 1;
-    if (op.additionalMachines?.some((am) => am.assignedMachine?.toString() === machineId)) return i + 1;
+    if (op.assignedMachine && op.assignedMachine.toString() === mIdStr) return i + 1;
+    if (op.additionalMachines?.some(
+      (am) => am.assignedMachine && am.assignedMachine.toString() === mIdStr
+    )) return i + 1;
   }
   return null;
+};
+
+// enrichScans: stamp each scan with its derived operationNumber.
+// Priority: (1) operationNumber already in barcode string, (2) derived from machine→WO assignment.
+// Falls back to 1 only when WO has exactly 1 operation (single-op WO).
+const enrichScansWithOpNumber = (scans, workOrder) => {
+  const totalOps = workOrder.operations?.length || 0;
+  return scans.map((scan) => {
+    // Already resolved upstream? Keep it.
+    if (scan.operationNumber) return scan;
+
+    // Re-check barcode string
+    const parsed = parseBarcode(scan.barcodeId);
+    if (parsed.operationNumber) return { ...scan, operationNumber: parsed.operationNumber };
+
+    // Derive from machine assignment
+    const derived = deriveOperationNumber(scan.machineId, workOrder);
+    if (derived) return { ...scan, operationNumber: derived };
+
+    // Last resort: only default to 1 if there's at most 1 operation defined
+    return { ...scan, operationNumber: totalOps <= 1 ? 1 : null };
+  });
 };
 
 const calculateUnitPositions = (scans, workOrderOperations, totalUnits) => {
   const unitPositions = {};
   const totalOperations = workOrderOperations.length;
 
+  // Edge case: no operations defined on WO yet — treat every scanned unit as pending
+  // (don't auto-complete everything just because totalOperations === 0)
+  if (totalOperations === 0) {
+    for (let i = 1; i <= totalUnits; i++) {
+      unitPositions[i] = {
+        currentOperation: 0, completedOperations: [],
+        lastScanTime: null, currentMachine: null, currentOperator: null,
+        isMoving: false, status: "pending",
+      };
+    }
+    // Still track which units have been scanned at all
+    scans.forEach((scan) => {
+      const parsed = parseBarcode(scan.barcodeId);
+      if (parsed.success && parsed.unitNumber && unitPositions[parsed.unitNumber]) {
+        const u = unitPositions[parsed.unitNumber];
+        u.status = "in_progress";
+        u.lastScanTime = scan.timestamp || scan.timeStamp;
+        u.currentMachine = scan.machineName;
+        u.currentOperator = scan.operatorName;
+      }
+    });
+    return unitPositions;
+  }
+
   for (let i = 1; i <= totalUnits; i++) {
     unitPositions[i] = {
-      currentOperation: 0,
-      completedOperations: [],
-      lastScanTime: null,
-      currentMachine: null,
-      currentOperator: null,
-      isMoving: false,
-      status: "pending",
+      currentOperation: 0, completedOperations: [],
+      lastScanTime: null, currentMachine: null, currentOperator: null,
+      isMoving: false, status: "pending",
     };
   }
 
-  // Group scans by unit+operation
+  // Group scans by unit+operation — use scan.operationNumber (already enriched by enrichScansWithOpNumber)
   const scansByUnitOp = new Map();
   scans.forEach((scan) => {
     const parsed = parseBarcode(scan.barcodeId);
-    if (parsed.success && parsed.unitNumber) {
-      const opNum = parsed.operationNumber || scan.operationNumber || 1;
-      const key = `${parsed.unitNumber}-${opNum}`;
-      if (!scansByUnitOp.has(key)) scansByUnitOp.set(key, []);
-      scansByUnitOp.get(key).push({ ...scan, timestamp: scan.timestamp || scan.timeStamp });
-    }
+    if (!parsed.success || !parsed.unitNumber) return;
+    // Use the enriched operationNumber on the scan object (not re-parsed from barcode)
+    const opNum = scan.operationNumber;
+    if (!opNum) return; // skip scans whose op couldn't be determined
+    const key = `${parsed.unitNumber}-${opNum}`;
+    if (!scansByUnitOp.has(key)) scansByUnitOp.set(key, []);
+    scansByUnitOp.get(key).push({ ...scan, timestamp: scan.timestamp || scan.timeStamp });
   });
 
   for (let unitNum = 1; unitNum <= totalUnits; unitNum++) {
@@ -129,7 +176,7 @@ const calculateUnitPositions = (scans, workOrderOperations, totalUnits) => {
 
     unit.completedOperations = completedOps.sort((a, b) => a - b);
 
-    if (unit.completedOperations.length === totalOperations) {
+    if (unit.completedOperations.length === totalOperations && totalOperations > 0) {
       unit.currentOperation = totalOperations;
       unit.status = "completed";
       unit.isMoving = false;
@@ -148,16 +195,35 @@ const calculateUnitPositions = (scans, workOrderOperations, totalUnits) => {
   return unitPositions;
 };
 
+// NOTE: scans passed here must already be enriched with operationNumber via enrichScansWithOpNumber.
 const calculateProductionCompletion = (scans, workOrderOperations, totalUnits) => {
   const operationCompletion = [];
-  for (let opNum = 1; opNum <= workOrderOperations.length; opNum++) {
+  const totalOps = workOrderOperations.length;
+
+  if (totalOps === 0) {
+    // No operations defined — report total unique units scanned as a single bucket
+    const uniqueUnits = new Set(
+      scans.map((s) => parseBarcode(s.barcodeId)).filter((p) => p.success).map((p) => p.unitNumber)
+    );
+    return {
+      operationCompletion: [{
+        operationNumber: 1,
+        operationType: "Production",
+        totalQuantity: totalUnits,
+        completedQuantity: uniqueUnits.size,
+        completionPercentage: totalUnits > 0 ? Math.round((uniqueUnits.size / totalUnits) * 100) : 0,
+      }],
+    };
+  }
+
+  for (let opNum = 1; opNum <= totalOps; opNum++) {
     const op = workOrderOperations[opNum - 1];
     const uniqueUnits = new Set();
     scans.forEach((scan) => {
-      const parsed = parseBarcode(scan.barcodeId);
-      if (parsed.success && parsed.unitNumber) {
-        const scanOpNum = parsed.operationNumber || scan.operationNumber || 1;
-        if (scanOpNum === opNum) uniqueUnits.add(parsed.unitNumber);
+      // Use scan.operationNumber directly (enriched value) — NOT re-parsed from barcode string
+      if (scan.operationNumber === opNum) {
+        const parsed = parseBarcode(scan.barcodeId);
+        if (parsed.success && parsed.unitNumber) uniqueUnits.add(parsed.unitNumber);
       }
     });
     operationCompletion.push({
@@ -437,12 +503,8 @@ router.get("/current-production", async (req, res) => {
       const workOrder = await findWorkOrderByShortId(woShortId);
       if (!workOrder) continue;
 
-      // Enrich scans with derived operation numbers from machine assignments
-      const enrichedScans = scans.map((scan) => {
-        if (scan.operationNumber) return scan;
-        const opNum = deriveOperationNumber(scan.machineId, workOrder);
-        return { ...scan, operationNumber: opNum || 1 };
-      });
+      // Enrich scans: derive operationNumber from machine→WO assignment (handles all edge cases)
+      const enrichedScans = enrichScansWithOpNumber(scans, workOrder);
 
       const manufacturingOrder = await getManufacturingOrder(workOrder.customerRequestId);
       const unitPositions = calculateUnitPositions(enrichedScans, workOrder.operations || [], workOrder.quantity);
