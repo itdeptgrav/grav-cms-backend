@@ -138,7 +138,7 @@ router.post("/scan", async (req, res) => {
           let workOrder = await findWorkOrderByShortId(parsedBarcode.workOrderShortId);
           if (!workOrder) {
             // Try full MongoDB ID
-            try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch {}
+            try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch { }
           }
 
           if (workOrder) {
@@ -196,6 +196,23 @@ router.post("/scan", async (req, res) => {
 
       const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
 
+      for (const m of trackingDoc.machines) {
+        if (
+          m.currentOperatorIdentityId === scanId &&
+          m.machineId.toString() !== machineId.toString()
+        ) {
+          const existingSession = m.operators.find(
+            (op) => op.operatorIdentityId === scanId && !op.signOutTime
+          );
+
+          if (existingSession) {
+            existingSession.signOutTime = scanTime;
+          }
+
+          m.currentOperatorIdentityId = null;
+        }
+      }
+
       // Case 1: Same operator already signed in → sign out
       if (machineTracking.currentOperatorIdentityId === scanId) {
         const session = machineTracking.operators.find(
@@ -211,7 +228,7 @@ router.post("/scan", async (req, res) => {
               machineId, machineName: machine.name, employeeName,
               message: `${employeeName} signed out`, timestamp: new Date(),
             });
-          } catch {}
+          } catch { }
 
           return res.json({ success: true, message: `${employeeName} signed out`, employeeName, employeeId: scanId, action: "signout", scanCount: 0 });
         }
@@ -242,7 +259,7 @@ router.post("/scan", async (req, res) => {
           machineId, machineName: machine.name, employeeName,
           status: `${employeeName} signed in to ${machine.name}`, timestamp: new Date(),
         });
-      } catch {}
+      } catch { }
 
       return res.json({ success: true, message: `${employeeName} signed in`, employeeName, employeeId: scanId, action: "signin", scanCount: 0 });
     }
