@@ -271,6 +271,10 @@ router.post(
             targetGroupId: cond.targetGroupId || null,
             action: cond.action || "match_to_current",
             actionValue: Number(cond.actionValue) || 0,
+            actionOperator: cond.actionOperator || "plus",
+            actionBaseGroupId: cond.actionBaseGroupId || null,
+            deriveSourceGroupId: cond.deriveSourceGroupId || null,
+            deriveOperator: cond.deriveOperator || "plus",
           })),
         }));
       }
@@ -338,6 +342,9 @@ router.post(
 
       if (configSnapshot !== undefined) config.configSnapshot = configSnapshot;
       if (measurementPartRules !== undefined) config.measurementPartRules = measurementPartRules;
+      if (req.body.customMeasurements !== undefined) {
+        config.customMeasurements = req.body.customMeasurements;
+      }
 
       config.lastConfiguredBy = req.user.id;
       config.lastConfiguredAt = new Date();
@@ -494,6 +501,7 @@ router.get(
         hasGroups: !!patternConfig?.measureGroups?.length,
         hasKeyframes: !!patternConfig?.keyframes?.length,
         hasSeamEdges: seamEdges.length > 0,
+        customMeasurements: patternConfig?.customMeasurements || [],
       });
     } catch (error) {
       console.error("Error fetching CAD data:", error);
