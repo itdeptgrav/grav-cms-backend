@@ -43,6 +43,8 @@ const nestedConditionSchema = new mongoose.Schema(
       default: "greater_than",
     },
     compareGroupId: { type: String, default: null },
+    actionOperator: { type: String, enum: ["plus", "minus", "set", "multiply"], default: "plus" },
+    actionBaseGroupId: { type: String, default: null },
     compareValue: { type: Number, default: 0 },
     targetGroupId: { type: String, default: null },
     action: {
@@ -54,10 +56,15 @@ const nestedConditionSchema = new mongoose.Schema(
         "subtract_offset",
         "multiply_by",
         "set_to_value",
+        "change_by_percent",
+        "change_by_ratio_of_trigger",
+        "derive_from_source",
       ],
       default: "match_to_current",
     },
     actionValue: { type: Number, default: 0 },
+    deriveSourceGroupId: { type: String, default: null },
+    deriveOperator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
   },
   { _id: false }
 );
@@ -207,6 +214,7 @@ const patternGradingConfigSchema = new mongoose.Schema(
 
     configSnapshot: { type: mongoose.Schema.Types.Mixed, default: null },
     measurementPartRules: { type: mongoose.Schema.Types.Mixed, default: null },
+    customMeasurements: { type: mongoose.Schema.Types.Mixed, default: [] },
 
     savedViewport: {
       scale: { type: Number, default: null },
