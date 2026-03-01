@@ -1,4 +1,6 @@
 // models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking.js
+// UPDATED: Removed operationNumber/operationType from tracking schema.
+// Operation info is derived at query time from barcode IDs + WorkOrder data.
 
 const mongoose = require("mongoose");
 
@@ -13,11 +15,7 @@ const barcodeScanSchema = new mongoose.Schema(
       type: Date,
       required: true,
     },
-    // ADD operation number if available in barcode
-    operationNumber: {
-      type: Number,
-      default: null,
-    },
+    // operationNumber REMOVED — derive from barcode + WO at query time
   },
   { _id: true },
 );
@@ -43,25 +41,9 @@ const operatorTrackingSchema = new mongoose.Schema(
   { _id: true },
 );
 
-// Create operation-specific tracking
-const operationTrackingSchema = new mongoose.Schema(
-  {
-    operationNumber: {
-      type: Number,
-    },
-    operationType: {
-      type: String,
-      trim: true,
-    },
-    currentOperatorIdentityId: {
-      type: String,
-      default: null,
-    },
-    operators: [operatorTrackingSchema],
-  },
-  { _id: true },
-);
-
+// Simplified: one slot per machine — no more operationNumber/operationType.
+// currentOperatorIdentityId tracks who is currently signed in on the machine.
+// Multiple WOs can happen on the same machine; the barcode encodes WO info.
 const machineTrackingSchema = new mongoose.Schema(
   {
     machineId: {
@@ -69,8 +51,13 @@ const machineTrackingSchema = new mongoose.Schema(
       ref: "Machine",
       required: true,
     },
-    // Each machine can track multiple operations separately
-    operationTracking: [operationTrackingSchema],
+    // Who is currently signed in on this machine (null if no one)
+    currentOperatorIdentityId: {
+      type: String,
+      default: null,
+    },
+    // All operator sessions on this machine today
+    operators: [operatorTrackingSchema],
   },
   { _id: true },
 );
@@ -89,11 +76,7 @@ const productionTrackingSchema = new mongoose.Schema(
   },
 );
 
-// Indexes for faster queries
 productionTrackingSchema.index({ date: 1 });
 productionTrackingSchema.index({ "machines.machineId": 1 });
-productionTrackingSchema.index({
-  "machines.operationTracking.operationNumber": 1,
-});
 
 module.exports = mongoose.model("ProductionTracking", productionTrackingSchema);
