@@ -1,9 +1,10 @@
-// routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js - UPDATED
+// routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes.js 
 
 const express = require("express");
 const router = express.Router();
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
@@ -14,6 +15,131 @@ const PDFDocument = require("pdfkit");
 const streamBuffers = require("stream-buffers");
 
 router.use(EmployeeAuthMiddleware);
+
+
+router.get("/machine-status", async (req, res) => {
+  try {
+    // 1. ALL machines — no status filter, no type filter
+    const allMachines = await Machine.find({}).lean();
+
+    // 2. Today's IST date
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const istNow    = new Date(Date.now() + istOffset);
+    const todayDate = new Date(istNow.toISOString().split("T")[0]);
+    todayDate.setHours(0, 0, 0, 0);
+
+    const todayTracking = await ProductionTracking.findOne({ date: todayDate })
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    // Map: machineId -> { isActiveToday }
+    const activeTodayMap = new Map();
+    if (todayTracking) {
+      for (const m of todayTracking.machines || []) {
+        const mId = m.machineId?._id?.toString();
+        if (!mId) continue;
+        const isActive = (m.operationTracking || []).some(op => op.currentOperatorIdentityId);
+        activeTodayMap.set(mId, isActive);
+      }
+    }
+
+    // 3. Active WorkOrders with machine assignments
+    const activeWOs = await WorkOrder.find({
+      status: { $in: ["in_progress", "scheduled", "ready_to_start"] },
+    })
+      .select("workOrderNumber stockItemName status quantity operations timeline productionCompletion")
+      .lean();
+
+    // Map: machineId -> { workOrder, operation }
+    const woByMachineMap = new Map();
+    for (const wo of activeWOs) {
+      for (const op of wo.operations || []) {
+        if (op.assignedMachine) {
+          const mId = op.assignedMachine.toString();
+          if (!woByMachineMap.has(mId)) woByMachineMap.set(mId, { wo, op });
+        }
+        for (const am of op.additionalMachines || []) {
+          if (am.assignedMachine) {
+            const mId = am.assignedMachine.toString();
+            if (!woByMachineMap.has(mId)) woByMachineMap.set(mId, { wo, op });
+          }
+        }
+      }
+    }
+
+    // 4. Build response
+    const machines = allMachines.map(machine => {
+      const mId         = machine._id.toString();
+      const isActiveNow = activeTodayMap.get(mId) || false;
+      const woEntry     = woByMachineMap.get(mId);
+
+      let status = "free";
+      // Respect machine's own status field first
+      if (machine.status === "Under Maintenance" || machine.status === "maintenance") {
+        status = "maintenance";
+      } else if (machine.status === "Offline" || machine.status === "offline") {
+        status = "offline";
+      } else if (woEntry) {
+        status = "busy";
+      } else if (isActiveNow) {
+        status = "busy";
+      }
+
+      let currentWorkOrder = null;
+      if (woEntry) {
+        const wo  = woEntry.wo;
+        const pct = wo.quantity > 0
+          ? Math.round(((wo.productionCompletion?.overallCompletedQuantity || 0) / wo.quantity) * 100)
+          : 0;
+        const totalSecs    = wo.timeline?.totalPlannedSeconds || 0;
+        const remainSecs   = Math.max(0, totalSecs * ((100 - pct) / 100));
+        const estimatedFreeAt = remainSecs > 0 ? new Date(Date.now() + remainSecs * 1000) : null;
+
+        currentWorkOrder = {
+          _id: wo._id,
+          workOrderNumber: wo.workOrderNumber,
+          stockItemName:   wo.stockItemName,
+          status:          wo.status,
+          quantity:        wo.quantity,
+          completionPercentage: pct,
+          totalPlannedSeconds:  totalSecs,
+          remainingSeconds:     remainSecs,
+          estimatedFreeAt,
+        };
+      }
+
+      return {
+        _id:            machine._id,
+        name:           machine.name,
+        serialNumber:   machine.serialNumber,
+        type:           machine.type,
+        model:          machine.model  || null,
+        location:       machine.location || null,
+        status,                    // "free" | "busy" | "maintenance" | "offline"
+        currentWorkOrder,
+        isActiveToday:  isActiveNow,
+        freeFromDate:   status === "free" ? (machine.updatedAt || null) : null,
+        lastMaintenance: machine.lastMaintenance || null,
+        nextMaintenance: machine.nextMaintenance || null,
+      };
+    });
+
+    res.json({
+      success: true,
+      machines,
+      summary: {
+        total:       machines.length,
+        free:        machines.filter(m => m.status === "free").length,
+        busy:        machines.filter(m => m.status === "busy").length,
+        maintenance: machines.filter(m => m.status === "maintenance").length,
+        offline:     machines.filter(m => m.status === "offline").length,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching machine status:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
 
 // GET single work order details - OPTIMIZED FOR FRONTEND USAGE
 router.get("/:id", async (req, res) => {
