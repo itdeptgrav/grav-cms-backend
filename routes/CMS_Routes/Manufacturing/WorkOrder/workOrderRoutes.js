@@ -9,12 +9,271 @@ const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawIte
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
+const Employee = require("../../../../models/Employee");
 const mongoose = require("mongoose");
 
 const PDFDocument = require("pdfkit");
 const streamBuffers = require("stream-buffers");
 
 router.use(EmployeeAuthMiddleware);
+
+
+const _parseBarcode = (barcodeId) => {
+  try {
+    const parts = barcodeId.split("-");
+    if (parts.length >= 3 && parts[0] === "WO") {
+      return {
+        success: true,
+        workOrderShortId: parts[1],
+        unitNumber: parseInt(parts[2], 10),
+        operationNumber: parts[3] ? parseInt(parts[3], 10) : null,
+      };
+    }
+    return { success: false };
+  } catch {
+    return { success: false };
+  }
+};
+
+// Which operation number (1-based) is this machine assigned to in the WO?
+const _deriveOpNumber = (machineId, workOrder) => {
+  if (!machineId || !workOrder?.operations) return null;
+  const mStr = machineId.toString();
+  for (let i = 0; i < workOrder.operations.length; i++) {
+    const op = workOrder.operations[i];
+    if (op.assignedMachine && op.assignedMachine.toString() === mStr) return i + 1;
+    if (op.additionalMachines?.some(
+      (am) => am.assignedMachine && am.assignedMachine.toString() === mStr
+    )) return i + 1;
+  }
+  return null;
+};
+
+// ─── ROUTE ────────────────────────────────────────────────────────────────────
+router.get("/:id/piece-history", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const unitNumber = parseInt(req.query.unitNumber, 10);
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid work order ID" });
+    }
+    if (isNaN(unitNumber) || unitNumber < 1) {
+      return res.status(400).json({ success: false, message: "unitNumber query param is required (integer ≥ 1)" });
+    }
+
+    // ── 1. Load the work order ────────────────────────────────────────────────
+    const workOrder = await WorkOrder.findById(id)
+      .select("workOrderNumber quantity operations stockItemName")
+      .lean();
+
+    if (!workOrder) {
+      return res.status(404).json({ success: false, message: "Work order not found" });
+    }
+
+    if (unitNumber > workOrder.quantity) {
+      return res.status(400).json({
+        success: false,
+        message: `Unit number ${unitNumber} exceeds work order quantity (${workOrder.quantity})`,
+      });
+    }
+
+    // Derive the WO short ID (last 8 chars of _id) used in barcodes
+    const woShortId = workOrder._id.toString().slice(-8);
+
+    // ── 2. Fetch ALL ProductionTracking docs that have any scan for this WO ───
+    // We search across all dates (not just today) to get historical data too.
+    const allTrackingDocs = await ProductionTracking.find({})
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    // ── 3. Walk every scan, filter to this WO + this unit number ─────────────
+    // Collect: [ { machineId, machineName, operatorId, operatorName, signInTime, signOutTime, scanTime, date } ]
+    // ── 3. Walk every scan, filter to this WO + this unit number ─────────────
+    const matchingScans = [];
+    const operatorIdsSet = new Set();
+
+    for (const doc of allTrackingDocs) {
+      const scanDate = doc.date;
+
+      for (const machine of doc.machines || []) {
+        const machineId = machine.machineId?._id?.toString();
+        const machineName = machine.machineId?.name || "Unknown";
+
+        for (const operator of machine.operators || []) {
+          const opId = operator.operatorIdentityId;
+          if (opId) operatorIdsSet.add(opId);
+
+          for (const scan of operator.barcodeScans || []) {
+            const parsed = _parseBarcode(scan.barcodeId);
+            if (!parsed.success) continue;
+            if (parsed.workOrderShortId !== woShortId) continue;
+            if (parsed.unitNumber !== unitNumber) continue;
+
+            matchingScans.push({
+              machineId,
+              machineName,
+              operatorId: opId,
+              operatorName: null, // will assign real name later
+              signInTime: operator.signInTime,
+              signOutTime: operator.signOutTime,
+              scanTime: scan.timeStamp,
+              barcodeId: scan.barcodeId,
+              operationNumber: parsed.operationNumber,
+              scanDate,
+            });
+          }
+        }
+      }
+    }
+
+    // Fetch employee names using identityId
+    const employees = await Employee.find({
+      identityId: { $in: [...operatorIdsSet] },
+    })
+      .select("identityId firstName lastName")
+      .lean();
+
+    const employeeMap = new Map(
+      employees.map((e) => [
+        e.identityId,
+        `${e.firstName || ""} ${e.lastName || ""}`.trim(),
+      ])
+    );
+
+    // Attach real employee name
+    matchingScans.forEach((scan) => {
+      scan.operatorName =
+        employeeMap.get(scan.operatorId) || scan.operatorId || "Unknown";
+    });
+
+    // ── 4. Enrich each scan with operationNumber derived from machine assignment ──
+    const enrichedScans = matchingScans.map((scan) => {
+      if (scan.operationNumber) return scan;
+      const derived = _deriveOpNumber(scan.machineId, workOrder);
+      return { ...scan, operationNumber: derived };
+    });
+
+    // ── 5. Build per-operation operator list ──────────────────────────────────
+    // Key: operationNumber → Map of operatorId → { name, scans[], signIn, signOut }
+    const opMap = new Map(); // opNum -> Map<operatorId -> data>
+
+    for (const scan of enrichedScans) {
+      const opNum = scan.operationNumber; // may be null if machine not assigned
+      const key = opNum ?? 0; // bucket unknown-op scans in 0
+
+      if (!opMap.has(key)) opMap.set(key, new Map());
+      const oprMap = opMap.get(key);
+
+      const oprKey = scan.operatorId;
+      if (!oprMap.has(oprKey)) {
+        oprMap.set(oprKey, {
+          operatorId: scan.operatorId,
+          operatorName: scan.operatorName,
+          scans: [],
+          signInTime: scan.signInTime,
+          signOutTime: scan.signOutTime,
+        });
+      }
+      oprMap.get(oprKey).scans.push(scan.scanTime);
+    }
+
+    // ── 6. Shape final operations array — match order to WO.operations ────────
+    const totalOps = workOrder.operations?.length || 0;
+
+    const buildOperators = (oprMap) =>
+      [...oprMap.values()].map((e) => {
+        const sorted = e.scans
+          .filter(Boolean)
+          .map((t) => new Date(t))
+          .sort((a, b) => a - b);
+
+        const firstScan = sorted[0] || null;
+        const lastScan = sorted[sorted.length - 1] || null;
+        const durationMs =
+          e.signInTime && e.signOutTime
+            ? new Date(e.signOutTime) - new Date(e.signInTime)
+            : firstScan && lastScan && lastScan - firstScan > 0
+              ? lastScan - firstScan
+              : 0;
+
+        const dateSet = new Set(
+          sorted.map((t) => t.toISOString().split("T")[0])
+        );
+
+        return {
+          operatorId: e.operatorId,
+          operatorName: e.operatorName,
+          firstScanTime: firstScan,
+          lastScanTime: lastScan,
+          durationMs,
+          scansCount: e.scans.length,
+          dates: [...dateSet],
+        };
+      }).sort(
+        (a, b) => new Date(a.firstScanTime) - new Date(b.firstScanTime)
+      );
+
+    const operations = [];
+
+    if (totalOps > 0) {
+      for (let i = 0; i < workOrder.operations.length; i++) {
+        const opNum = i + 1;
+        const woOp = workOrder.operations[i];
+        const oprMap = opMap.get(opNum);
+
+        operations.push({
+          operationNumber: opNum,
+          operationType: woOp.operationType || `Operation ${opNum}`,
+          assignedMachineName: woOp.assignedMachineName || null,
+          operators: oprMap ? buildOperators(oprMap) : [],
+        });
+      }
+    } else {
+      // WO has no defined operations — still show what we have
+      for (const [opNum, oprMap] of opMap) {
+        if (opNum === 0) continue; // show unknowns at the end
+        operations.push({
+          operationNumber: opNum,
+          operationType: `Operation ${opNum}`,
+          assignedMachineName: null,
+          operators: buildOperators(oprMap),
+        });
+      }
+    }
+
+    // Append "Unknown Operation" bucket if any scans couldn't be mapped
+    if (opMap.has(0)) {
+      operations.push({
+        operationNumber: null,
+        operationType: "Unknown Operation",
+        assignedMachineName: null,
+        operators: buildOperators(opMap.get(0)),
+      });
+    }
+
+    // ── 7. Respond ────────────────────────────────────────────────────────────
+    return res.json({
+      success: true,
+      unitNumber,
+      workOrderId: workOrder._id,
+      workOrderNumber: workOrder.workOrderNumber,
+      stockItemName: workOrder.stockItemName,
+      totalScansFound: matchingScans.length,
+      operations,
+    });
+
+  } catch (error) {
+    console.error("Error fetching piece history:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching piece history",
+      error: error.message,
+    });
+  }
+});
+// ─── END OF ROUTE ─────────────────────────────────────────────────────────────
+
 
 
 router.get("/machine-status", async (req, res) => {
@@ -24,7 +283,7 @@ router.get("/machine-status", async (req, res) => {
 
     // 2. Today's IST date
     const istOffset = 5.5 * 60 * 60 * 1000;
-    const istNow    = new Date(Date.now() + istOffset);
+    const istNow = new Date(Date.now() + istOffset);
     const todayDate = new Date(istNow.toISOString().split("T")[0]);
     todayDate.setHours(0, 0, 0, 0);
 
@@ -69,9 +328,9 @@ router.get("/machine-status", async (req, res) => {
 
     // 4. Build response
     const machines = allMachines.map(machine => {
-      const mId         = machine._id.toString();
+      const mId = machine._id.toString();
       const isActiveNow = activeTodayMap.get(mId) || false;
-      const woEntry     = woByMachineMap.get(mId);
+      const woEntry = woByMachineMap.get(mId);
 
       let status = "free";
       // Respect machine's own status field first
@@ -87,38 +346,38 @@ router.get("/machine-status", async (req, res) => {
 
       let currentWorkOrder = null;
       if (woEntry) {
-        const wo  = woEntry.wo;
+        const wo = woEntry.wo;
         const pct = wo.quantity > 0
           ? Math.round(((wo.productionCompletion?.overallCompletedQuantity || 0) / wo.quantity) * 100)
           : 0;
-        const totalSecs    = wo.timeline?.totalPlannedSeconds || 0;
-        const remainSecs   = Math.max(0, totalSecs * ((100 - pct) / 100));
+        const totalSecs = wo.timeline?.totalPlannedSeconds || 0;
+        const remainSecs = Math.max(0, totalSecs * ((100 - pct) / 100));
         const estimatedFreeAt = remainSecs > 0 ? new Date(Date.now() + remainSecs * 1000) : null;
 
         currentWorkOrder = {
           _id: wo._id,
           workOrderNumber: wo.workOrderNumber,
-          stockItemName:   wo.stockItemName,
-          status:          wo.status,
-          quantity:        wo.quantity,
+          stockItemName: wo.stockItemName,
+          status: wo.status,
+          quantity: wo.quantity,
           completionPercentage: pct,
-          totalPlannedSeconds:  totalSecs,
-          remainingSeconds:     remainSecs,
+          totalPlannedSeconds: totalSecs,
+          remainingSeconds: remainSecs,
           estimatedFreeAt,
         };
       }
 
       return {
-        _id:            machine._id,
-        name:           machine.name,
-        serialNumber:   machine.serialNumber,
-        type:           machine.type,
-        model:          machine.model  || null,
-        location:       machine.location || null,
+        _id: machine._id,
+        name: machine.name,
+        serialNumber: machine.serialNumber,
+        type: machine.type,
+        model: machine.model || null,
+        location: machine.location || null,
         status,                    // "free" | "busy" | "maintenance" | "offline"
         currentWorkOrder,
-        isActiveToday:  isActiveNow,
-        freeFromDate:   status === "free" ? (machine.updatedAt || null) : null,
+        isActiveToday: isActiveNow,
+        freeFromDate: status === "free" ? (machine.updatedAt || null) : null,
         lastMaintenance: machine.lastMaintenance || null,
         nextMaintenance: machine.nextMaintenance || null,
       };
@@ -128,11 +387,11 @@ router.get("/machine-status", async (req, res) => {
       success: true,
       machines,
       summary: {
-        total:       machines.length,
-        free:        machines.filter(m => m.status === "free").length,
-        busy:        machines.filter(m => m.status === "busy").length,
+        total: machines.length,
+        free: machines.filter(m => m.status === "free").length,
+        busy: machines.filter(m => m.status === "busy").length,
         maintenance: machines.filter(m => m.status === "maintenance").length,
-        offline:     machines.filter(m => m.status === "offline").length,
+        offline: machines.filter(m => m.status === "offline").length,
       },
     });
   } catch (error) {
@@ -637,10 +896,10 @@ router.get("/:id/planning", async (req, res) => {
         // Add customer info with address
         customerRequestId: workOrder.customerRequestId
           ? {
-              ...workOrder.customerRequestId,
-              customerInfo: customerInfo,
-              deliveryDeadline: workOrder.customerRequestId.deliveryDeadline,
-            }
+            ...workOrder.customerRequestId,
+            customerInfo: customerInfo,
+            deliveryDeadline: workOrder.customerRequestId.deliveryDeadline,
+          }
           : null,
       },
     });
@@ -949,10 +1208,10 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
       },
       newWorkOrder: newWorkOrder
         ? {
-            _id: newWorkOrder._id,
-            workOrderNumber: newWorkOrder.workOrderNumber,
-            quantity: newWorkOrder.quantity,
-          }
+          _id: newWorkOrder._id,
+          workOrderNumber: newWorkOrder.workOrderNumber,
+          quantity: newWorkOrder.quantity,
+        }
         : null,
       remainingQuantity: remainingQuantity,
       splitCreated: !!newWorkOrder,
@@ -1137,7 +1396,7 @@ router.post("/:id/complete-planning", async (req, res) => {
                 if (
                   !v.combination ||
                   v.combination.length !==
-                    rawMaterial.rawItemVariantCombination.length
+                  rawMaterial.rawItemVariantCombination.length
                 ) {
                   return false;
                 }
