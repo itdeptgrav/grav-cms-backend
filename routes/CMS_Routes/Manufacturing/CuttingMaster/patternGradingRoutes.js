@@ -227,12 +227,24 @@ router.post(
       }
 
       if (basePaths !== undefined) {
-        // Store original segments for rotation reference
         config.basePaths = basePaths.map((path) => ({
           ...path,
           originalSegs: path.segs.map(seg => ({ ...seg })),
           rotationAngle: path.rotationAngle || 0,
-          rotationPivot: path.rotationPivot || null
+          rotationPivot: path.rotationPivot || null,
+          // Mirror link fields — preserve if present
+          mirrorSourceIdx: path.mirrorSourceIdx !== undefined ? Number(path.mirrorSourceIdx) : null,
+          mirrorFoldAxis: path.mirrorFoldAxis
+            ? {
+              axisX: path.mirrorFoldAxis.axisX !== undefined ? Number(path.mirrorFoldAxis.axisX) : null,
+              n1: path.mirrorFoldAxis.n1
+                ? { pi: Number(path.mirrorFoldAxis.n1.pi || 0), si: Number(path.mirrorFoldAxis.n1.si || 0) }
+                : undefined,
+              n2: path.mirrorFoldAxis.n2
+                ? { pi: Number(path.mirrorFoldAxis.n2.pi || 0), si: Number(path.mirrorFoldAxis.n2.si || 0) }
+                : undefined,
+            }
+            : null,
         }));
       }
 
@@ -261,21 +273,63 @@ router.post(
           loosingEnabled: Boolean(g.loosingEnabled),
           loosingValueInches: Math.max(0, Number(g.loosingValueInches) || 0),
           conditionsFollowLoosing: Boolean(g.conditionsFollowLoosing),
-          nestedConditions: (g.nestedConditions || []).map((cond) => ({
-            id: String(cond.id || ""),
-            enabled: Boolean(cond.enabled !== false),
-            label: cond.label || "Condition",
-            operator: cond.operator || "greater_than",
-            compareGroupId: cond.compareGroupId || null,
-            compareValue: Number(cond.compareValue) || 0,
-            targetGroupId: cond.targetGroupId || null,
-            action: cond.action || "match_to_current",
-            actionValue: Number(cond.actionValue) || 0,
-            actionOperator: cond.actionOperator || "plus",
-            actionBaseGroupId: cond.actionBaseGroupId || null,
-            deriveSourceGroupId: cond.deriveSourceGroupId || null,
-            deriveOperator: cond.deriveOperator || "plus",
-          })),
+          nestedConditions: (g.nestedConditions || []).map((cond) => {
+            // Sanitize action — only allow known enum values, fall back to match_to_current
+            const VALID_ACTIONS = [
+              "match_to_current",
+              "match_to_current_offset",
+              "match_to_target",
+              "add_offset",
+              "subtract_offset",
+              "multiply_by",
+              "set_to_value",
+              "change_by_percent",
+              "change_by_ratio_of_trigger",
+              "derive_from_source",
+              "multi_group_expression",
+              "live_canvas_value",
+            ];
+            const safeAction = VALID_ACTIONS.includes(cond.action) ? cond.action : "match_to_current";
+            const VALID_OPS = ["plus", "minus", "multiply", "divide", "set"];
+            const safeDerive = VALID_OPS.includes(cond.deriveOperator) ? cond.deriveOperator : "plus";
+            return {
+              id: String(cond.id || ""),
+              enabled: Boolean(cond.enabled !== false),
+              label: cond.label || "Condition",
+              operator: cond.operator || "greater_than",
+              compareGroupId: cond.compareGroupId || null,
+              compareValue: Number(cond.compareValue) || 0,
+              targetGroupId: cond.targetGroupId || null,
+              action: safeAction,
+              actionValue: Number(cond.actionValue) || 0,
+              // Operator used by match_to_current_offset (plus / minus / multiply / divide)
+              matchOffsetOp: ["plus", "minus", "multiply", "divide"].includes(cond.matchOffsetOp)
+                ? cond.matchOffsetOp : "plus",
+              actionOperator: ["plus", "minus", "set", "multiply"].includes(cond.actionOperator)
+                ? cond.actionOperator : "plus",
+              actionBaseGroupId: cond.actionBaseGroupId || null,
+              deriveSourceGroupId: cond.deriveSourceGroupId || null,
+              deriveOperator: safeDerive,
+              // Multi-group expression fields
+              expressionGroups: (cond.expressionGroups || []).map(eg => ({
+                groupId: String(eg.groupId || ""),
+                operator: ["plus", "minus", "multiply", "divide"].includes(eg.operator)
+                  ? eg.operator : "plus",
+              })),
+              expressionOffset: Number(cond.expressionOffset) || 0,
+              // Backward-compatibility old sum fields
+              sumGroupAId: cond.sumGroupAId || null,
+              sumGroupBId: cond.sumGroupBId || null,
+              sumOperator: ["plus", "minus", "multiply", "divide"].includes(cond.sumOperator)
+                ? cond.sumOperator : "plus",
+              sumOffsetValue: Number(cond.sumOffsetValue) || 0,
+              // Live canvas fields
+              liveSourceGroupId: cond.liveSourceGroupId || null,
+              liveOperator: ["plus", "minus", "multiply", "divide"].includes(cond.liveOperator)
+                ? cond.liveOperator : "plus",
+              liveOffsetValue: Number(cond.liveOffsetValue) || 0,
+            };
+          }),
         }));
       }
 

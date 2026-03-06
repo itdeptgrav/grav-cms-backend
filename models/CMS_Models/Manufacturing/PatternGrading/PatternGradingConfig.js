@@ -51,6 +51,7 @@ const nestedConditionSchema = new mongoose.Schema(
       type: String,
       enum: [
         "match_to_current",
+        "match_to_current_offset",  // match group size + optional operator + offset
         "match_to_target",
         "add_offset",
         "subtract_offset",
@@ -59,12 +60,33 @@ const nestedConditionSchema = new mongoose.Schema(
         "change_by_percent",
         "change_by_ratio_of_trigger",
         "derive_from_source",
+        "multi_group_expression",
+        "live_canvas_value",
       ],
       default: "match_to_current",
     },
     actionValue: { type: Number, default: 0 },
+    // Operator for match_to_current_offset (plus, minus, multiply, divide)
+    matchOffsetOp: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
     deriveSourceGroupId: { type: String, default: null },
-    deriveOperator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
+    deriveOperator: { type: String, enum: ["plus", "minus", "multiply", "divide", "set"], default: "plus" },
+
+    // New multi-group expression structure
+    expressionGroups: [{
+      groupId: { type: String, required: true },
+      operator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" }
+    }],
+    expressionOffset: { type: Number, default: 0 },
+
+    // Keep old fields for backward compatibility during transition
+    sumGroupAId: { type: String, default: null },
+    sumGroupBId: { type: String, default: null },
+    sumOperator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
+    sumOffsetValue: { type: Number, default: 0 },
+
+    liveSourceGroupId: { type: String, default: null },
+    liveOperator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
+    liveOffsetValue: { type: Number, default: 0 },
   },
   { _id: false }
 );
@@ -169,7 +191,15 @@ const pathSchema = new mongoose.Schema(
     rotationPivot: {
       x: { type: Number },
       y: { type: Number }
-    }
+    },
+    // Mirror link — index into basePaths of the source path this was mirrored from
+    mirrorSourceIdx: { type: Number, default: null },
+    // Fold axis used when creating the mirror (defines the fold/unfold seam line)
+    mirrorFoldAxis: {
+      axisX: { type: Number, default: null },
+      n1: { pi: { type: Number }, si: { type: Number } },
+      n2: { pi: { type: Number }, si: { type: Number } },
+    },
   },
   { _id: false }
 );
