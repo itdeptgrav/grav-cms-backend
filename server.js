@@ -266,6 +266,9 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
+const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
+app.use("/api/cms", productOperations);
+
 /* ===================
   CMS ROUTES
 ===================== */
