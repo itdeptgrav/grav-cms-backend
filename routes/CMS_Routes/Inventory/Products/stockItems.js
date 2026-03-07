@@ -8,6 +8,10 @@ const Employee = require("../../../../models/Employee");
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 
+const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation")
+const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup")
+
+
 // Categories for stock items
 const STOCK_ITEM_CATEGORIES = [
   "T-Shirts",
@@ -48,9 +52,9 @@ router.use(EmployeeAuthMiddleware);
 // ✅ GET all stock items with variants (with pagination)
 router.get("/", async (req, res) => {
   try {
-    const { 
-      search = "", 
-      status, 
+    const {
+      search = "",
+      status,
       category,
       page = 1,
       limit = 10
@@ -95,23 +99,23 @@ router.get("/", async (req, res) => {
     const total = await StockItem.countDocuments();
     const lowStock = await StockItem.countDocuments({ status: "Low Stock" });
     const outOfStock = await StockItem.countDocuments({ status: "Out of Stock" });
-    
+
     // Get all items for stats calculation (or use aggregation for better performance)
     const allItems = await StockItem.find({}, "variants averageCost averageSalesPrice profitMargin totalQuantityOnHand");
-    
+
     // Count total variants across all stock items
     const totalVariants = allItems.reduce((sum, item) => sum + (item.variants?.length || 0), 0);
-    
+
     // Calculate financial stats
     const totalInventoryValue = allItems.reduce((sum, item) => {
       return sum + ((item.averageCost || 0) * (item.totalQuantityOnHand || 0));
     }, 0);
-    
+
     const totalPotentialRevenue = allItems.reduce((sum, item) => {
       return sum + ((item.averageSalesPrice || 0) * (item.totalQuantityOnHand || 0));
     }, 0);
-    
-    const averageMargin = allItems.length > 0 
+
+    const averageMargin = allItems.length > 0
       ? allItems.reduce((sum, item) => sum + (item.profitMargin || 0), 0) / allItems.length
       : 0;
 
@@ -150,6 +154,108 @@ router.get("/", async (req, res) => {
     });
   }
 });
+
+
+// ✅ GET data for creating stock item
+router.get("/data/create", async (req, res) => {
+  try {
+    // Get raw items with variants
+    const rawItemsResponse = await RawItem.find({})
+      .select("name sku category unit variants quantity sellingPrice stockTransactions")
+      .limit(20)
+      .sort({ name: 1 })
+
+    const processedRawItems = rawItemsResponse.map(item => {
+      const baseItem = {
+        id: item._id,
+        name: item.name,
+        sku: item.sku,
+        category: item.category || "Uncategorized",
+        baseUnit: item.unit || "Unit",
+        hasVariants: item.variants && item.variants.length > 0,
+        variants: []
+      }
+      if (item.variants && item.variants.length > 0) {
+        baseItem.variants = item.variants.map(variant => ({
+          id: variant._id,
+          combination: variant.combination || [],
+          combinationText: variant.combination?.join(" • ") || "Default",
+          quantity: variant.quantity || 0,
+          unit: baseItem.baseUnit,
+          cost: item.sellingPrice ? item.sellingPrice * 0.8 : 0,
+          status: variant.status || "Out of Stock"
+        }))
+      }
+      return baseItem
+    })
+
+    // Get machines
+    const machines = await Machine.find({ status: "Operational" })
+      .select("name type model serialNumber")
+      .sort({ type: 1, name: 1 })
+
+    // Get operator average salary
+    const operators = await Employee.find({
+      department: "Operator",
+      status: "active"
+    }).select("salary")
+
+    const averageSalary = operators.length > 0
+      ? operators.reduce((sum, emp) => sum + (emp.salary?.netSalary || 0), 0) / operators.length
+      : 0
+
+    // ── NEW: fetch registered operations & groups ──────────────────────────
+    const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation")
+    const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup")
+
+    const [registeredOperations, registeredGroups] = await Promise.all([
+      Operation.find().sort({ name: 1 }),
+      OperationGroup.find().populate("operations", "name totalSam durationSeconds machineType").sort({ name: 1 })
+    ])
+    // ──────────────────────────────────────────────────────────────────────
+
+    res.json({
+      success: true,
+      data: {
+        categories: STOCK_ITEM_CATEGORIES,
+        operationTypes: OPERATION_TYPES,
+        rawItems: processedRawItems,
+        machines: machines.map(machine => ({
+          id: machine._id,
+          name: machine.name,
+          type: machine.type,
+          model: machine.model,
+          serialNumber: machine.serialNumber
+        })),
+        averageOperatorSalary: Math.round(averageSalary),
+        // ── NEW fields ────────────────────────────────────────────────────
+        registeredOperations: registeredOperations.map(op => ({
+          _id: op._id,
+          name: op.name,
+          totalSam: op.totalSam,
+          durationSeconds: op.durationSeconds,
+          machineType: op.machineType
+        })),
+        registeredGroups: registeredGroups.map(grp => ({
+          _id: grp._id,
+          name: grp.name,
+          operations: grp.operations
+        }))
+        // ─────────────────────────────────────────────────────────────────
+      }
+    })
+
+  } catch (error) {
+    console.error("Error fetching create data:", error)
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching create data"
+    })
+  }
+})
+
+
+
 
 // ✅ GET stock item by ID with variants
 router.get("/:id", async (req, res) => {
@@ -220,8 +326,8 @@ router.get("/data/raw-items", async (req, res) => {
           let latestCost = 0;
           if (item.stockTransactions && item.stockTransactions.length > 0) {
             const variantTransactions = item.stockTransactions
-              .filter(tx => 
-                tx.variantId && 
+              .filter(tx =>
+                tx.variantId &&
                 tx.variantId.toString() === variant._id.toString() &&
                 (tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD")
               )
@@ -445,8 +551,8 @@ router.post("/", async (req, res) => {
     const barcode = "89" + Math.floor(Math.random() * 10000000000).toString().padStart(10, '0');
 
     // Process attributes
-    const processedAttributes = attributes.filter(attr => 
-      attr.name && attr.name.trim() && 
+    const processedAttributes = attributes.filter(attr =>
+      attr.name && attr.name.trim() &&
       attr.values && Array.isArray(attr.values) && attr.values.length > 0
     ).map(attr => ({
       name: attr.name.trim(),
@@ -477,12 +583,12 @@ router.post("/", async (req, res) => {
                 if (rawItemVariant) {
                   variantCombination = rawItemVariant.combination || [];
                   variantId = rawItem.variantId;
-                  
+
                   // Get cost for this specific variant
                   if (rawItemData.stockTransactions && rawItemData.stockTransactions.length > 0) {
                     const variantTransactions = rawItemData.stockTransactions
-                      .filter(tx => 
-                        tx.variantId && 
+                      .filter(tx =>
+                        tx.variantId &&
                         tx.variantId.toString() === rawItem.variantId &&
                         (tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD")
                       )
@@ -617,42 +723,42 @@ router.post("/", async (req, res) => {
 
 // ✅ GET variant by stockItemId and variantId
 router.get('/:stockItemId/variant/:variantId', async (req, res) => {
-    try {
-        const { stockItemId, variantId } = req.params;
-        
-        const stockItem = await StockItem.findById(stockItemId);
-        if (!stockItem) {
-            return res.status(404).json({
-                success: false,
-                message: 'Stock item not found'
-            });
-        }
+  try {
+    const { stockItemId, variantId } = req.params;
 
-        const variant = stockItem.variants.find(v => v._id.toString() === variantId.toString());
-        if (!variant) {
-            return res.status(404).json({
-                success: false,
-                message: 'Variant not found'
-            });
-        }
-
-        res.json({
-            success: true,
-            variant: {
-                _id: variant._id,
-                attributes: variant.attributes || [],
-                salesPrice: variant.salesPrice,
-                quantityOnHand: variant.quantityOnHand
-            }
-        });
-
-    } catch (error) {
-        console.error('Error fetching variant:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while fetching variant'
-        });
+    const stockItem = await StockItem.findById(stockItemId);
+    if (!stockItem) {
+      return res.status(404).json({
+        success: false,
+        message: 'Stock item not found'
+      });
     }
+
+    const variant = stockItem.variants.find(v => v._id.toString() === variantId.toString());
+    if (!variant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Variant not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      variant: {
+        _id: variant._id,
+        attributes: variant.attributes || [],
+        salesPrice: variant.salesPrice,
+        quantityOnHand: variant.quantityOnHand
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching variant:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while fetching variant'
+    });
+  }
 });
 
 // ✅ UPDATE stock item with variants
@@ -692,8 +798,8 @@ router.put("/:id", async (req, res) => {
 
     // Update attributes
     if (attributes !== undefined) {
-      const processedAttributes = attributes.filter(attr => 
-        attr.name && attr.name.trim() && 
+      const processedAttributes = attributes.filter(attr =>
+        attr.name && attr.name.trim() &&
         attr.values && Array.isArray(attr.values) && attr.values.length > 0
       ).map(attr => ({
         name: attr.name.trim(),
@@ -733,11 +839,11 @@ router.put("/:id", async (req, res) => {
                   if (rawItemVariant) {
                     variantCombination = rawItemVariant.combination || [];
                     variantId = rawItem.variantId;
-                    
+
                     if (rawItemData.stockTransactions && rawItemData.stockTransactions.length > 0) {
                       const variantTransactions = rawItemData.stockTransactions
-                        .filter(tx => 
-                          tx.variantId && 
+                        .filter(tx =>
+                          tx.variantId &&
                           tx.variantId.toString() === rawItem.variantId &&
                           (tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD")
                         )
