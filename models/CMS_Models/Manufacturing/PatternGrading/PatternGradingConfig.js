@@ -73,10 +73,13 @@ const nestedConditionSchema = new mongoose.Schema(
 
     // New multi-group expression structure
     expressionGroups: [{
-      groupId: { type: String, required: true },
-      operator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" }
+      type: { type: String, enum: ["group", "constant"], default: "group" },
+      groupId: { type: String },
+      operator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
+      constantValue: { type: Number },
     }],
     expressionOffset: { type: Number, default: 0 },
+    expressionScalarOp: { type: String, enum: ["none", "plus", "minus", "multiply", "divide"], default: "none" },
 
     // Keep old fields for backward compatibility during transition
     sumGroupAId: { type: String, default: null },
@@ -192,16 +195,44 @@ const pathSchema = new mongoose.Schema(
       x: { type: Number },
       y: { type: Number }
     },
-    // Mirror link — index into basePaths of the source path this was mirrored from
+    // Deprecated mirror fields — kept null for backward compat, no longer written
     mirrorSourceIdx: { type: Number, default: null },
-    // Fold axis used when creating the mirror (defines the fold/unfold seam line)
-    mirrorFoldAxis: {
-      axisX: { type: Number, default: null },
-      n1: { pi: { type: Number }, si: { type: Number } },
-      n2: { pi: { type: Number }, si: { type: Number } },
-    },
+    mirrorFoldAxis: { type: mongoose.Schema.Types.Mixed, default: null },
   },
   { _id: false }
+);
+
+// ── Fold Axis (Designer-defined fold/unfold seam line for cutting master)
+// The designer selects 2 nodes that define the fold axis of a pattern.
+// Cutting master can then unfold the pattern across this axis for cutting.
+const foldAxisSchema = new mongoose.Schema(
+  {
+    clientId: { type: String, required: true },
+    name: { type: String, default: "Fold Axis" },
+    // The two nodes that define the fold seam line
+    n1: {
+      pathIdx: { type: Number, required: true },
+      segIdx: { type: Number, required: true },
+      x: { type: Number }, // world X at time of creation — for reference positioning
+      y: { type: Number },
+    },
+    n2: {
+      pathIdx: { type: Number, required: true },
+      segIdx: { type: Number, required: true },
+      x: { type: Number },
+      y: { type: Number },
+    },
+    // Optional: seam-allowance reference nodes — cutting master uses these to
+    // offset the unfolded half by the seam allowance distance
+    seamN1: { pathIdx: { type: Number }, segIdx: { type: Number } },
+    seamN2: { pathIdx: { type: Number }, segIdx: { type: Number } },
+    seamAllowanceInches: { type: Number, default: 0 },
+    // Which path index to mirror when unfolding (set by designer on path-click)
+    foldPathIdx: { type: Number, default: null },
+    // Whether n1/n2 x/y coords are authoritative (set from explicit seam click)
+    axisExplicit: { type: Boolean, default: false },
+  },
+  { _id: true }
 );
 
 // ── Main Schema
@@ -231,6 +262,9 @@ const patternGradingConfigSchema = new mongoose.Schema(
 
     seamEdges: { type: [seamEdgeSchema], default: [] },
 
+    // Fold axes defined by the designer — used by cutting master for fold/unfold
+    foldAxes: { type: [foldAxisSchema], default: [] },
+
     basePatternSize: { type: String, default: "M" },
     isActive: { type: Boolean, default: true },
     version: { type: Number, default: 1 },
@@ -251,6 +285,9 @@ const patternGradingConfigSchema = new mongoose.Schema(
       x: { type: Number, default: null },
       y: { type: Number, default: null },
     },
+    // Named viewport pan positions saved by designer with Ctrl+1..9
+    // Cutting master presses 1..9 to jump to that position (zoom unchanged)
+    viewportSlots: { type: mongoose.Schema.Types.Mixed, default: {} },
     // Store the global rotation applied to the pattern
     globalRotation: {
       angle: { type: Number, default: 0 },

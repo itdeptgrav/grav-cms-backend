@@ -202,6 +202,8 @@ router.post(
         measureGroups,
         keyframes,
         seamEdges,
+        foldAxes,
+        viewportSlots,
         unitsPerInch,
         basePatternSize,
         configSnapshot,
@@ -232,19 +234,9 @@ router.post(
           originalSegs: path.segs.map(seg => ({ ...seg })),
           rotationAngle: path.rotationAngle || 0,
           rotationPivot: path.rotationPivot || null,
-          // Mirror link fields — preserve if present
-          mirrorSourceIdx: path.mirrorSourceIdx !== undefined ? Number(path.mirrorSourceIdx) : null,
-          mirrorFoldAxis: path.mirrorFoldAxis
-            ? {
-              axisX: path.mirrorFoldAxis.axisX !== undefined ? Number(path.mirrorFoldAxis.axisX) : null,
-              n1: path.mirrorFoldAxis.n1
-                ? { pi: Number(path.mirrorFoldAxis.n1.pi || 0), si: Number(path.mirrorFoldAxis.n1.si || 0) }
-                : undefined,
-              n2: path.mirrorFoldAxis.n2
-                ? { pi: Number(path.mirrorFoldAxis.n2.pi || 0), si: Number(path.mirrorFoldAxis.n2.si || 0) }
-                : undefined,
-            }
-            : null,
+          // Mirror fields deprecated — always null now
+          mirrorSourceIdx: null,
+          mirrorFoldAxis: null,
         }));
       }
 
@@ -312,11 +304,15 @@ router.post(
               deriveOperator: safeDerive,
               // Multi-group expression fields
               expressionGroups: (cond.expressionGroups || []).map(eg => ({
+                type: ["group", "constant"].includes(eg.type) ? eg.type : "group",
                 groupId: String(eg.groupId || ""),
                 operator: ["plus", "minus", "multiply", "divide"].includes(eg.operator)
                   ? eg.operator : "plus",
+                constantValue: eg.constantValue !== undefined ? Number(eg.constantValue) : undefined,
               })),
-              expressionOffset: Number(cond.expressionOffset) || 0,
+              expressionOffset: cond.expressionOffset !== undefined ? Number(cond.expressionOffset) : 0,
+              expressionScalarOp: ["none", "plus", "minus", "multiply", "divide"].includes(cond.expressionScalarOp)
+                ? cond.expressionScalarOp : "none",
               // Backward-compatibility old sum fields
               sumGroupAId: cond.sumGroupAId || null,
               sumGroupBId: cond.sumGroupBId || null,
@@ -369,6 +365,30 @@ router.post(
         }));
       }
 
+      // ── Persist foldAxes ────────────────────────────────────
+      if (foldAxes !== undefined) {
+        console.log("Saving fold axes to DB:", foldAxes); // Debug log
+        config.foldAxes = (foldAxes || []).map((fa) => ({
+          clientId: String(fa.clientId || `fa-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`),
+          name: fa.name || "Fold Axis",
+          n1: {
+            pathIdx: Number(fa.n1?.pathIdx ?? 0),
+            segIdx: Number(fa.n1?.segIdx ?? 0),
+            x: fa.n1?.x !== undefined ? Number(fa.n1.x) : undefined,
+            y: fa.n1?.y !== undefined ? Number(fa.n1.y) : undefined,
+          },
+          n2: {
+            pathIdx: Number(fa.n2?.pathIdx ?? 0),
+            segIdx: Number(fa.n2?.segIdx ?? 0),
+            x: fa.n2?.x !== undefined ? Number(fa.n2.x) : undefined,
+            y: fa.n2?.y !== undefined ? Number(fa.n2.y) : undefined,
+          },
+          seamAllowanceInches: Number(fa.seamAllowanceInches) || 0,
+          foldPathIdx: fa.foldPathIdx !== undefined ? Number(fa.foldPathIdx) : (fa._foldPathIdx !== undefined ? Number(fa._foldPathIdx) : null),
+          axisExplicit: !!fa._axisExplicit || !!fa.axisExplicit,
+        }));
+      }
+
       if (unitsPerInch !== undefined) config.unitsPerInch = unitsPerInch;
       if (basePatternSize !== undefined) config.basePatternSize = basePatternSize;
 
@@ -383,6 +403,11 @@ router.post(
             y: parseFloat(vp.y) || 0,
           };
         }
+      }
+
+      // ── Persist viewport position slots (Ctrl+1..9) ───────
+      if (viewportSlots && typeof viewportSlots === "object") {
+        config.viewportSlots = viewportSlots;
       }
 
       // ── Persist global rotation ───────────────────────────
@@ -423,6 +448,7 @@ router.post(
   }
 );
 
+// ─── GET: Employee CAD data ───────────────────────────────────
 // ─── GET: Employee CAD data ───────────────────────────────────
 router.get(
   "/pattern-grading/employee/:employeeId/cad-data",
@@ -532,6 +558,35 @@ router.get(
           outwardSign: se.outwardSign || 1,
         }));
 
+      // ── FIX: Always include foldAxes, even if empty array ────────────────
+      let foldAxesOut = [];
+      if (patternConfig && patternConfig.foldAxes && patternConfig.foldAxes.length > 0) {
+        foldAxesOut = patternConfig.foldAxes.map((fa) => ({
+          id: fa.clientId || fa._id?.toString(),
+          clientId: fa.clientId || fa._id?.toString(),
+          name: fa.name || "Fold Axis",
+          n1: {
+            pathIdx: fa.n1.pathIdx,
+            segIdx: fa.n1.segIdx,
+            x: fa.n1.x,
+            y: fa.n1.y
+          },
+          n2: {
+            pathIdx: fa.n2.pathIdx,
+            segIdx: fa.n2.segIdx,
+            x: fa.n2.x,
+            y: fa.n2.y
+          },
+          seamN1: fa.seamN1 || null,
+          seamN2: fa.seamN2 || null,
+          seamAllowanceInches: fa.seamAllowanceInches || 0,
+          foldPathIdx: fa.foldPathIdx ?? fa.n1?.pathIdx ?? 0,
+          axisExplicit: !!fa.axisExplicit,
+        }));
+      }
+
+      console.log(`Sending ${foldAxesOut.length} fold axes to cutting master`); // Debug log
+
       res.json({
         success: true,
         workOrder: {
@@ -549,6 +604,9 @@ router.get(
         patternConfig: patternConfig || null,
         computedGroupTargets,
         seamEdges,
+        foldAxes: foldAxesOut, // Always send this, even if empty
+        hasFoldAxes: foldAxesOut.length > 0,
+        viewportSlots: patternConfig?.viewportSlots || {}, // Named viewport positions
         globalRotation: patternConfig?.globalRotation || { angle: 0, pivotX: 0, pivotY: 0 },
         hasPatternConfig: !!patternConfig,
         hasSVGFile: !!patternConfig?.svgFileUrl,
