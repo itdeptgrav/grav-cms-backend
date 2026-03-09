@@ -385,6 +385,10 @@ app.use("/api/hr/payroll", payrollRoutes);
 const attendanceRoutes = require("./routes/HrRoutes/Attendance_section");
 app.use("/api/hr/attendance", attendanceRoutes);
 
+const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
+app.use("/api/hr/password-management", passwordMgmt);
+
+
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
