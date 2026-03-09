@@ -622,6 +622,115 @@ router.get(
   }
 );
 
+// ─── GET: Fetch keyboard shortcuts + pattern settings for a stock item ───────
+router.get("/pattern-grading/stock-item/:stockItemId/settings", async (req, res) => {
+  try {
+    const { stockItemId } = req.params;
+    const config = await PatternGradingConfig.findOne({ stockItemId, isActive: true })
+      .select("keyboardShortcuts patternTitle patternDescription patternNotes patternTags patternRevision patternDesigner stockItemName stockItemReference updatedAt")
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    if (!config) {
+      return res.json({ success: true, settings: null, keyboardShortcuts: {} });
+    }
+
+    res.json({
+      success: true,
+      settings: {
+        patternTitle: config.patternTitle || "",
+        patternDescription: config.patternDescription || "",
+        patternNotes: config.patternNotes || "",
+        patternTags: config.patternTags || [],
+        patternRevision: config.patternRevision || "1.0",
+        patternDesigner: config.patternDesigner || "",
+        stockItemName: config.stockItemName || "",
+        stockItemReference: config.stockItemReference || "",
+        updatedAt: config.updatedAt,
+      },
+      keyboardShortcuts: config.keyboardShortcuts || {},
+    });
+  } catch (error) {
+    console.error("Error fetching pattern settings:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─── POST: Save keyboard shortcuts + pattern settings for a stock item ────────
+router.post("/pattern-grading/stock-item/:stockItemId/settings", async (req, res) => {
+  try {
+    const { stockItemId } = req.params;
+    const {
+      keyboardShortcuts,
+      patternTitle,
+      patternDescription,
+      patternNotes,
+      patternTags,
+      patternRevision,
+      patternDesigner,
+    } = req.body;
+
+    const update = {};
+
+    if (keyboardShortcuts !== undefined) {
+      // Validate each shortcut entry
+      const sanitized = {};
+      for (const [actionId, binding] of Object.entries(keyboardShortcuts)) {
+        if (typeof binding === "object" && binding !== null) {
+          sanitized[actionId] = {
+            key: typeof binding.key === "string" ? binding.key : "",
+            ctrl: !!binding.ctrl,
+            shift: !!binding.shift,
+            alt: !!binding.alt,
+            meta: !!binding.meta,
+            label: typeof binding.label === "string" ? binding.label : actionId,
+            category: typeof binding.category === "string" ? binding.category : "general",
+            mouseButton: binding.mouseButton !== undefined ? Number(binding.mouseButton) : null,
+          };
+        }
+      }
+      update.keyboardShortcuts = sanitized;
+    }
+
+    if (patternTitle !== undefined) update.patternTitle = String(patternTitle).trim().slice(0, 200);
+    if (patternDescription !== undefined) update.patternDescription = String(patternDescription).trim().slice(0, 2000);
+    if (patternNotes !== undefined) update.patternNotes = String(patternNotes).trim().slice(0, 5000);
+    if (patternTags !== undefined) update.patternTags = Array.isArray(patternTags) ? patternTags.map(t => String(t).trim()).filter(Boolean).slice(0, 20) : [];
+    if (patternRevision !== undefined) update.patternRevision = String(patternRevision).trim().slice(0, 50);
+    if (patternDesigner !== undefined) update.patternDesigner = String(patternDesigner).trim().slice(0, 100);
+
+    update.lastConfiguredBy = req.user.id;
+    update.lastConfiguredAt = new Date();
+
+    const config = await PatternGradingConfig.findOneAndUpdate(
+      { stockItemId, isActive: true },
+      { $set: update },
+      { new: true, sort: { updatedAt: -1 } }
+    );
+
+    if (!config) {
+      return res.status(404).json({ success: false, message: "Pattern config not found — save the pattern first" });
+    }
+
+    res.json({
+      success: true,
+      message: "Settings saved successfully",
+      keyboardShortcuts: config.keyboardShortcuts || {},
+      settings: {
+        patternTitle: config.patternTitle,
+        patternDescription: config.patternDescription,
+        patternNotes: config.patternNotes,
+        patternTags: config.patternTags,
+        patternRevision: config.patternRevision,
+        patternDesigner: config.patternDesigner,
+      },
+    });
+  } catch (error) {
+    console.error("Error saving pattern settings:", error);
+    res.status(500).json({ success: false, message: "Server error: " + error.message });
+  }
+});
+
 // ─── GET: List all pattern configs ───────────────────────────
 router.get("/pattern-grading/configs", async (req, res) => {
   try {

@@ -294,6 +294,17 @@ const patternGradingConfigSchema = new mongoose.Schema(
       pivotX: { type: Number, default: 0 },
       pivotY: { type: Number, default: 0 }
     },
+
+    // ── Pattern metadata (shown/edited in Settings page) ─────────────────────
+    patternTitle: { type: String, trim: true, default: "" },
+    patternDescription: { type: String, trim: true, default: "" },
+    patternNotes: { type: String, trim: true, default: "" },
+    patternTags: { type: [String], default: [] },
+    patternRevision: { type: String, trim: true, default: "1.0" },
+    patternDesigner: { type: String, trim: true, default: "" },
+
+    keyboardShortcuts: { type: mongoose.Schema.Types.Mixed, default: {} },
+
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "CuttingMaster",

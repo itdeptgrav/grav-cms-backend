@@ -382,6 +382,9 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
 app.use("/api/hr/payroll", payrollRoutes);
 
+const attendanceRoutes = require("./routes/HrRoutes/Attendance_section");
+app.use("/api/hr/attendance", attendanceRoutes);
+
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
