@@ -72,41 +72,55 @@ const makeEmployeeNameCache = () => {
   };
 };
 
-// Which operation number (1-based) is a given machine assigned to in a WO?
-// Returns null if no match found.
-const deriveOperationNumber = (machineId, workOrder) => {
-  if (!machineId || !workOrder?.operations) return null;
+// Which operation numbers (1-based) is a given machine assigned to in a WO?
+// Returns an array — one machine can now handle MULTIPLE operations.
+const deriveOperationNumbers = (machineId, workOrder) => {
+  const results = [];
+  if (!machineId || !workOrder?.operations) return results;
   const mIdStr = machineId.toString();
   for (let i = 0; i < workOrder.operations.length; i++) {
     const op = workOrder.operations[i];
-    if (op.assignedMachine && op.assignedMachine.toString() === mIdStr) return i + 1;
-    if (op.additionalMachines?.some(
+    if (op.assignedMachine && op.assignedMachine.toString() === mIdStr) {
+      results.push(i + 1);
+    } else if (op.additionalMachines?.some(
       (am) => am.assignedMachine && am.assignedMachine.toString() === mIdStr
-    )) return i + 1;
+    )) {
+      results.push(i + 1);
+    }
   }
-  return null;
+  return results; // e.g. [1, 3] if machine is assigned to op 1 and op 3
 };
 
-// enrichScans: stamp each scan with its derived operationNumber.
-// Priority: (1) operationNumber already in barcode string, (2) derived from machine→WO assignment.
-// Falls back to 1 only when WO has exactly 1 operation (single-op WO).
+// enrichScans: for each scan, produce one enriched copy per operation the machine handles.
+// If Machine A is assigned to Op 1 AND Op 3, a scan on Machine A becomes two entries:
+// one with operationNumber=1 and one with operationNumber=3.
+// This ensures both operations get credited for that piece scan.
 const enrichScansWithOpNumber = (scans, workOrder) => {
   const totalOps = workOrder.operations?.length || 0;
-  return scans.map((scan) => {
-    // Already resolved upstream? Keep it.
-    if (scan.operationNumber) return scan;
+  const enriched = [];
 
-    // Re-check barcode string
-    const parsed = parseBarcode(scan.barcodeId);
-    if (parsed.operationNumber) return { ...scan, operationNumber: parsed.operationNumber };
+  for (const scan of scans) {
+    // Derive all op numbers this machine is responsible for
+    const opNumbers = deriveOperationNumbers(scan.machineId, workOrder);
 
-    // Derive from machine assignment
-    const derived = deriveOperationNumber(scan.machineId, workOrder);
-    if (derived) return { ...scan, operationNumber: derived };
+    if (opNumbers.length > 0) {
+      // Expand: one copy per assigned operation
+      for (const opNum of opNumbers) {
+        enriched.push({ ...scan, operationNumber: opNum });
+      }
+    } else {
+      // Machine not in WO assignment — try barcode-embedded op number
+      const parsed = parseBarcode(scan.barcodeId);
+      if (parsed.operationNumber) {
+        enriched.push({ ...scan, operationNumber: parsed.operationNumber });
+      } else {
+        // Last resort: only default to 1 for single-op WOs
+        enriched.push({ ...scan, operationNumber: totalOps <= 1 ? 1 : null });
+      }
+    }
+  }
 
-    // Last resort: only default to 1 if there's at most 1 operation defined
-    return { ...scan, operationNumber: totalOps <= 1 ? 1 : null };
-  });
+  return enriched;
 };
 
 const calculateUnitPositions = (scans, workOrderOperations, totalUnits) => {
