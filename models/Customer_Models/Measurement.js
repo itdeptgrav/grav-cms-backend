@@ -50,16 +50,16 @@ const productMeasurementSchema = new mongoose.Schema(
     },
     measurements: [measurementValueSchema],
     measuredAt: {
-        type: Date,
-        default: Date.now
+      type: Date,
+      default: Date.now
     },
 
     qrGenerated: {
-        type: Boolean,
-        default: false
+      type: Boolean,
+      default: false
     }
 
-}, { _id: false });
+  }, { _id: false });
 
 const employeeMeasurementSchema = new mongoose.Schema(
   {
@@ -185,6 +185,13 @@ const measurementSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "ProjectManager",
     },
+
+    poCreatedForEmployeeIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'EmployeeMpc'
+      }
+    ],
 
     // Audit fields
     createdBy: {

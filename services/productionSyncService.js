@@ -5,22 +5,36 @@
 const cron = require("node-cron");
 const WorkOrder = require("../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const ProductionTracking = require("../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const Measurement = require("../models/Customer_Models/Measurement");
+const EmployeeProductionProgress = require("../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 
 class ProductionSyncService {
   constructor() {
     this.syncJob = null;
     this.cleanupJob = null;
+    this.employeeSyncJob = null;
     this.isRunning = false;
+    this.isEmpSyncRunning = false;
+    this.isInitialized = false;
     this.syncCount = 0;
   }
 
   initialize() {
+    if (this.isInitialized) {
+      console.log("⚠️  Production Sync Service already initialized — skipping duplicate init");
+      return;
+    }
+    this.isInitialized = true;
     console.log("🚀 Initializing Production Sync Service...");
     this.syncJob = cron.schedule("*/2 * * * *", async () => {
       await this.syncProductionToWorkOrders();
     });
     this.cleanupJob = cron.schedule("0 2 * * *", async () => {
       await this.cleanupOldTrackingData();
+    });
+    // Employee progress sync — every 5 minutes
+    this.employeeSyncJob = cron.schedule("*/5 * * * *", async () => {
+      await this.syncEmployeeProgress();
     });
     console.log("✅ Production Sync Service initialized");
   }
@@ -98,15 +112,21 @@ class ProductionSyncService {
     return { updated: true, invalidScans: totalInvalidScans };
   }
 
-  // ─── Derive which operation number a machine is assigned to ───────────────
-  deriveOperationNumber(machineId, workOrderData) {
-    if (!workOrderData?.operations) return null;
+  // ─── Derive ALL operation numbers a machine is assigned to ────────────────
+  // One machine can now handle multiple operations — returns every matching op.
+  deriveOperationNumbers(machineId, workOrderData) {
+    const results = [];
+    if (!machineId || !workOrderData?.operations) return results;
+    const mStr = machineId.toString();
     for (let i = 0; i < workOrderData.operations.length; i++) {
       const op = workOrderData.operations[i];
-      if (op.assignedMachine?.toString() === machineId?.toString()) return i + 1;
-      if (op.additionalMachines?.some((am) => am.assignedMachine?.toString() === machineId?.toString())) return i + 1;
+      if (op.assignedMachine?.toString() === mStr) {
+        results.push(i + 1);
+      } else if (op.additionalMachines?.some((am) => am.assignedMachine?.toString() === mStr)) {
+        results.push(i + 1);
+      }
     }
-    return null;
+    return results; // e.g. [1, 3] if machine is assigned to op 1 and op 3
   }
 
   extractAndValidateScansForWorkOrder(trackingDocs, workOrderShortId, workOrderData, totalQuantity) {
@@ -141,47 +161,18 @@ class ProductionSyncService {
           type: machine.machineId?.type,
         };
 
-        // Derive operation number from machine assignment in WO
-        const derivedOpNumber = this.deriveOperationNumber(machineInfo.id, workOrderData);
-        if (!derivedOpNumber) continue; // Machine not assigned to this WO
+        // KEY CHANGE: one machine may be assigned to MULTIPLE operations.
+        // Get ALL op numbers this machine handles for this WO.
+        const derivedOpNumbers = this.deriveOperationNumbers(machineInfo.id, workOrderData);
+        if (derivedOpNumbers.length === 0) continue; // Machine not assigned to this WO at all
 
-        const workOrderOp = workOrderData.operations?.[derivedOpNumber - 1];
-        if (!workOrderOp) continue;
+        // Pre-collect all valid scans for this machine once (shared across all op buckets)
+        const machineValidScans = [];
+        const machineInvalidScans = [];
 
-        const opNumber = derivedOpNumber;
-
-        if (!scansByOperation[opNumber]) {
-          scansByOperation[opNumber] = {
-            operationNumber: opNumber,
-            operationType: workOrderOp.operationType,
-            machineType: workOrderOp.machineType,
-            estimatedTimeSeconds: workOrderOp.estimatedTimeSeconds,
-            plannedTimeSeconds: workOrderOp.plannedTimeSeconds,
-            machines: {},
-          };
-        }
-
-        if (!scansByOperation[opNumber].machines[machineInfo.id]) {
-          scansByOperation[opNumber].machines[machineInfo.id] = {
-            machineInfo,
-            operators: {},
-            allScans: [],
-            validScans: [],
-          };
-        }
-
-        // Process each operator's scans (flat array now)
         for (const operator of machine.operators || []) {
           const operatorId = operator.operatorIdentityId;
           const operatorName = operator.operatorName || `Operator ${operatorId}`;
-
-          if (!scansByOperation[opNumber].machines[machineInfo.id].operators[operatorId]) {
-            scansByOperation[opNumber].machines[machineInfo.id].operators[operatorId] = {
-              operatorIdentityId: operatorId,
-              operatorName,
-              sessions: [],
-            };
-          }
 
           const relevantScans = (operator.barcodeScans || []).filter((scan) =>
             scan.barcodeId.startsWith(`WO-${workOrderShortId}-`)
@@ -198,8 +189,13 @@ class ProductionSyncService {
                 barcodeId: scan.barcodeId,
                 timestamp: scan.timeStamp,
                 unitNumber,
+                operatorId,
+                operatorName,
+                signInTime: operator.signInTime,
+                signOutTime: operator.signOutTime,
               });
             } else {
+              // Only count invalid once — not duplicated per op
               totalInvalidScans++;
               invalidScans.push({
                 barcodeId: scan.barcodeId,
@@ -218,13 +214,54 @@ class ProductionSyncService {
           });
 
           if (validSessionScans.length > 0) {
+            machineValidScans.push({ operatorId, operatorName, validSessionScans, operator });
+          }
+        }
+
+        if (machineValidScans.length === 0) continue;
+
+        // Now bucket these same scans into EACH operation this machine is assigned to.
+        // This is the core multi-op fix: op 1 and op 3 both get credited for the same scan.
+        for (const opNumber of derivedOpNumbers) {
+          const workOrderOp = workOrderData.operations?.[opNumber - 1];
+          if (!workOrderOp) continue;
+
+          if (!scansByOperation[opNumber]) {
+            scansByOperation[opNumber] = {
+              operationNumber: opNumber,
+              operationType: workOrderOp.operationType,
+              machineType: workOrderOp.machineType,
+              estimatedTimeSeconds: workOrderOp.estimatedTimeSeconds,
+              plannedTimeSeconds: workOrderOp.plannedTimeSeconds,
+              machines: {},
+            };
+          }
+
+          if (!scansByOperation[opNumber].machines[machineInfo.id]) {
+            scansByOperation[opNumber].machines[machineInfo.id] = {
+              machineInfo,
+              operators: {},
+              allScans: [],
+              validScans: [],
+            };
+          }
+
+          for (const { operatorId, operatorName, validSessionScans, operator } of machineValidScans) {
+            if (!scansByOperation[opNumber].machines[machineInfo.id].operators[operatorId]) {
+              scansByOperation[opNumber].machines[machineInfo.id].operators[operatorId] = {
+                operatorIdentityId: operatorId,
+                operatorName,
+                sessions: [],
+              };
+            }
+
             scansByOperation[opNumber].machines[machineInfo.id].operators[operatorId].sessions.push({
               signInTime: operator.signInTime,
               signOutTime: operator.signOutTime,
               scans: validSessionScans,
             });
 
-            const enriched = validSessionScans.map((s) => ({ ...s, operatorId, operatorName }));
+            const enriched = validSessionScans.map((s) => ({ ...s }));
             scansByOperation[opNumber].machines[machineInfo.id].allScans.push(...enriched);
             scansByOperation[opNumber].machines[machineInfo.id].validScans.push(...enriched);
           }
@@ -402,6 +439,11 @@ class ProductionSyncService {
       const workOrder = await WorkOrder.findById(workOrderId);
       if (!workOrder) throw new Error("Work order not found");
 
+      // ── Self-heal: if workOrderNumber was never set on this doc, set it now ──
+      if (!workOrder.workOrderNumber) {
+        workOrder.workOrderNumber = `WO-${workOrderId.toString().slice(-8)}`;
+      }
+
       if (!workOrder.productionCompletion) workOrder.productionCompletion = {};
 
       const existingInvalid = workOrder.productionCompletion.invalidScans || [];
@@ -442,10 +484,13 @@ class ProductionSyncService {
 
       const shouldLog = this.syncCount % 10 === 1 || invalidScansCount > 0 || completionData.overallCompletedQuantity > 0;
       if (shouldLog) {
-        console.log(`      ✅ Updated ${workOrderNumber}: ${completionData.overallCompletedQuantity}/${workOrder.quantity} (${(completionData.overallCompletionPercentage || 0).toFixed(1)}%)${invalidScansCount > 0 ? ` | ⚠️ ${invalidScansCount} invalid` : ""}`);
+        // Use the freshly-fetched doc's workOrderNumber — the passed-in param may be stale/undefined
+        const displayName = workOrder.workOrderNumber || workOrderNumber || workOrderId.toString().slice(-8);
+        console.log(`      ✅ Updated ${displayName}: ${completionData.overallCompletedQuantity}/${workOrder.quantity} (${(completionData.overallCompletionPercentage || 0).toFixed(1)}%)${invalidScansCount > 0 ? ` | ⚠️ ${invalidScansCount} invalid` : ""}`);
       }
     } catch (error) {
-      console.error(`Error updating WO ${workOrderNumber}:`, error.message);
+      const displayName = workOrderNumber || workOrderId?.toString?.()?.slice(-8) || "unknown";
+      console.error(`Error updating WO ${displayName}:`, error.message);
     }
   }
 
@@ -453,6 +498,12 @@ class ProductionSyncService {
     try {
       const workOrder = await WorkOrder.findById(workOrderId);
       if (!workOrder) return;
+
+      // Self-heal missing workOrderNumber
+      if (!workOrder.workOrderNumber) {
+        workOrder.workOrderNumber = `WO-${workOrderId.toString().slice(-8)}`;
+      }
+
       if (!workOrder.productionCompletion) workOrder.productionCompletion = {};
 
       const existing = workOrder.productionCompletion.invalidScans || [];
@@ -466,7 +517,8 @@ class ProductionSyncService {
       workOrder.productionCompletion.lastSyncedAt = new Date();
       await workOrder.save();
     } catch (error) {
-      console.error(`Error updating invalid scans for ${workOrderNumber}:`, error.message);
+      const displayName = workOrderNumber || workOrderId?.toString?.()?.slice(-8) || "unknown";
+      console.error(`Error updating invalid scans for ${displayName}:`, error.message);
     }
   }
 
@@ -486,13 +538,174 @@ class ProductionSyncService {
   stop() {
     if (this.syncJob) { this.syncJob.stop(); this.syncJob = null; }
     if (this.cleanupJob) { this.cleanupJob.stop(); this.cleanupJob = null; }
+    if (this.employeeSyncJob) { this.employeeSyncJob.stop(); this.employeeSyncJob = null; }
     this.isRunning = false;
+    this.isEmpSyncRunning = false;
     this.syncCount = 0;
     console.log("✅ Production Sync Service stopped");
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EMPLOYEE PROGRESS SYNC
+  // Runs every 5 minutes.
+  //
+  // Logic:
+  //  1. Find all Measurements where convertedToPO = true.
+  //  2. For each Measurement → for each WorkOrder on that MO (matched by
+  //     stockItemId + variantId to measurement product):
+  //     a. Build the ordered employee list for that WO (employees who have
+  //        that product in their measurements, in array order).
+  //     b. Compute each employee's unit range:
+  //        employee 1 → units 1..q1, employee 2 → q1+1..q1+q2, …
+  //        (same logic as QRCodeGenerator.jsx generateEmployeeBarcodes())
+  //     c. Scan ProductionTracking for barcodes matching
+  //        `${wo.workOrderNumber}-NNN` (exact format QRCodeGenerator uses).
+  //     d. Upsert EmployeeProductionProgress with counts.
+  // ═══════════════════════════════════════════════════════════════════════════
+  async syncEmployeeProgress() {
+    if (this.isEmpSyncRunning) return;
+    this.isEmpSyncRunning = true;
+    try {
+      // Only measurements that have been converted to a manufacturing order
+      const measurements = await Measurement.find({ convertedToPO: true })
+        .select("_id employeeMeasurements poRequestId")
+        .lean();
+
+      for (const measurement of measurements) {
+        try {
+          await this._syncOneMeasurement(measurement);
+        } catch (err) {
+          console.error(`[EmpSync] Measurement ${measurement._id}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      console.error("[EmpSync] Fatal:", err.message);
+    } finally {
+      this.isEmpSyncRunning = false;
+    }
+  }
+
+  async _syncOneMeasurement(measurement) {
+    const moId = measurement.poRequestId;
+    if (!moId) return;
+
+    // ── 1. All WOs for this MO ──────────────────────────────────────────────
+    const workOrders = await WorkOrder.find({ customerRequestId: moId })
+      .select("_id workOrderNumber stockItemId variantId quantity")
+      .lean();
+    if (!workOrders.length) return;
+
+    // ── 2. For each WO, build employee unit ranges + count scans ───────────
+    for (const wo of workOrders) {
+      const stockIdStr   = wo.stockItemId?.toString();
+      const variantIdStr = wo.variantId?.toString() || null;
+
+      // Collect employees who have this product in their measurements,
+      // in the exact order they appear in employeeMeasurements[].
+      // This order determines unit numbering — must match QRCodeGenerator.
+      const employeeEntries = [];
+
+      for (const empM of measurement.employeeMeasurements || []) {
+        const productEntry = (empM.products || []).find((p) => {
+          // Match by stockItemId; if WO has variantId, also match variantId
+          if (p.productId?.toString() !== stockIdStr) return false;
+          if (variantIdStr) return p.variantId?.toString() === variantIdStr;
+          return true; // no variantId on WO → match any variant of that product
+        });
+        if (!productEntry) continue;
+
+        employeeEntries.push({
+          employeeId:   empM.employeeId,
+          employeeName: empM.employeeName,
+          employeeUIN:  empM.employeeUIN,
+          gender:       empM.gender,
+          quantity:     productEntry.quantity || 1,
+        });
+      }
+
+      if (!employeeEntries.length) continue;
+
+      // ── 3. Fetch scanned unit numbers for this WO ───────────────────────
+      // QRCodeGenerator barcode format: `${workOrderNumber}-${unitNumber.padStart(3,"0")}`
+      // e.g. "WO-2024-001-001"
+      // We match: barcodeId starts with `${wo.workOrderNumber}-`
+      // and parse the suffix as the unit number.
+      const woPrefix       = `${wo.workOrderNumber}-`;
+      const escapedPrefix  = woPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      const trackingDocs = await ProductionTracking.find({
+        "machines.operators.barcodeScans.barcodeId": {
+          $regex: `^${escapedPrefix}`,
+        },
+      })
+        .select("machines.operators.barcodeScans.barcodeId")
+        .lean();
+
+      // Collect unique scanned unit numbers
+      const scannedUnits = new Set();
+      for (const doc of trackingDocs) {
+        for (const machine of doc.machines || []) {
+          for (const operator of machine.operators || []) {
+            for (const scan of operator.barcodeScans || []) {
+              if (!scan.barcodeId.startsWith(woPrefix)) continue;
+              // Suffix after "WO-XXXX-" is the zero-padded unit number
+              const suffix  = scan.barcodeId.slice(woPrefix.length);
+              const unitNum = parseInt(suffix, 10);
+              if (!isNaN(unitNum) && unitNum > 0) scannedUnits.add(unitNum);
+            }
+          }
+        }
+      }
+
+      // ── 4. Assign unit ranges and upsert one doc per employee ───────────
+      // Same sequential logic as QRCodeGenerator.generateEmployeeBarcodes():
+      //   employee 0: startUnit=1,       endUnit=q0
+      //   employee 1: startUnit=q0+1,    endUnit=q0+q1
+      //   employee i: startUnit=sum(0..i-1)+1, endUnit=sum(0..i)
+      let cursor = 1;
+      for (const emp of employeeEntries) {
+        const unitStart = cursor;
+        const unitEnd   = cursor + emp.quantity - 1;
+        cursor          = unitEnd + 1;
+
+        const completedUnitNumbers = [];
+        for (let u = unitStart; u <= unitEnd; u++) {
+          if (scannedUnits.has(u)) completedUnitNumbers.push(u);
+        }
+
+        const completedUnits = completedUnitNumbers.length;
+        const completionPercentage =
+          emp.quantity > 0
+            ? Math.min(Math.round((completedUnits / emp.quantity) * 100), 100)
+            : 0;
+
+        await EmployeeProductionProgress.findOneAndUpdate(
+          { workOrderId: wo._id, employeeId: emp.employeeId },
+          {
+            $set: {
+              measurementId:        measurement._id,
+              manufacturingOrderId: moId,
+              employeeName:         emp.employeeName,
+              employeeUIN:          emp.employeeUIN,
+              gender:               emp.gender,
+              unitStart,
+              unitEnd,
+              totalUnits:           emp.quantity,
+              completedUnits,
+              completedUnitNumbers,
+              completionPercentage,
+              lastSyncedAt:         new Date(),
+            },
+          },
+          { upsert: true }
+        );
+      }
+    }
+  }
+
   async manualSync() { await this.syncProductionToWorkOrders(); }
   async manualCleanup() { await this.cleanupOldTrackingData(); }
+  async manualEmployeeSync() { await this.syncEmployeeProgress(); }
 }
 
 module.exports = new ProductionSyncService();

@@ -709,21 +709,21 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
     }
 });
 
-// Updated PO conversion route - FIXED VERSION
-// Updated PO conversion route - FIXED VERSION with correct variant structure
 router.post('/:measurementId/convert-to-po', async (req, res) => {
     try {
         const { measurementId } = req.params;
+        const { poName, poDescription, selectedEmployeeIds } = req.body;
 
-        // Validate measurementId
+        // ── Validate inputs ───────────────────────────────────────────────────
         if (!measurementId || !mongoose.Types.ObjectId.isValid(measurementId)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Valid measurement ID is required'
-            });
+            return res.status(400).json({ success: false, message: 'Valid measurement ID is required' });
         }
 
-        // Get measurement with populated products
+        if (!selectedEmployeeIds || !Array.isArray(selectedEmployeeIds) || selectedEmployeeIds.length === 0) {
+            return res.status(400).json({ success: false, message: 'Please select at least one employee for the PO' });
+        }
+
+        // ── Fetch measurement ────────────────────────────────────────────────
         const measurement = await Measurement.findById(measurementId)
             .populate({
                 path: 'employeeMeasurements.products.productId',
@@ -732,129 +732,87 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             .lean();
 
         if (!measurement) {
-            return res.status(404).json({
-                success: false,
-                message: 'Measurement not found'
-            });
+            return res.status(404).json({ success: false, message: 'Measurement not found' });
         }
 
-        // Check if already converted to PO
         if (measurement.convertedToPO) {
-            return res.status(400).json({
-                success: false,
-                message: 'Measurement already converted to PO'
-            });
+            return res.status(400).json({ success: false, message: 'Measurement has already been converted to a PO' });
         }
 
-        // Calculate completion rate
-        let totalMeasurementFields = 0;
-        let completedMeasurementFields = 0;
+        // ── Split employees: selected (go to PO) vs remaining (move to new doc) ──
+        const selectedSet = new Set(selectedEmployeeIds.map(id => id.toString()));
 
-        measurement.employeeMeasurements.forEach(emp => {
-            emp.products.forEach(product => {
-                totalMeasurementFields += product.measurements.length;
-                completedMeasurementFields += product.measurements.filter(m =>
-                    m.value && m.value.trim() !== ""
-                ).length;
-            });
-        });
-
-        const completionRate = totalMeasurementFields > 0
-            ? Math.round((completedMeasurementFields / totalMeasurementFields) * 100)
-            : 0;
-
-        // Check if measurement is complete
-        if (completionRate < 100) {
-            return res.status(400).json({
-                success: false,
-                message: 'Cannot convert incomplete measurement to PO. Please complete all measurements first.'
-            });
-        }
-
-        // Get customer
-        const customer = await Customer.findById(measurement.organizationId);
-        if (!customer) {
-            return res.status(404).json({
-                success: false,
-                message: 'Customer not found'
-            });
-        }
-
-        console.log(`Found ${measurement.employeeMeasurements.length} employees with measurements`);
-
-        // STEP 1: Get all measured employees from EmployeeMpc
-        const measuredEmployeeIds = measurement.employeeMeasurements.map(emp => 
-            emp.employeeId.toString()
+        const selectedEmployeeMeasurements = measurement.employeeMeasurements.filter(
+            emp => selectedSet.has(emp.employeeId?.toString())
+        );
+        const remainingEmployeeMeasurements = measurement.employeeMeasurements.filter(
+            emp => !selectedSet.has(emp.employeeId?.toString())
         );
 
-        const measuredEmployees = await EmployeeMpc.find({
-            _id: { $in: measuredEmployeeIds },
-            status: 'active'
-        })
-        .select('_id name products')
-        .populate({
-            path: 'products.productId',
-            select: 'name reference baseSalesPrice variants'
-        })
-        .lean();
+        if (selectedEmployeeMeasurements.length === 0) {
+            return res.status(400).json({ success: false, message: 'None of the selected employees were found in this measurement.' });
+        }
 
-        console.log(`Fetched ${measuredEmployees.length} measured employees from EmployeeMpc`);
-
-        // Create employee map for quick lookup
-        const employeeProductMap = new Map();
-        measuredEmployees.forEach(emp => {
-            employeeProductMap.set(emp._id.toString(), {
-                name: emp.name,
-                products: emp.products || []
+        // ── Check all selected employees have complete measurements ───────────
+        let totalFields = 0;
+        let completedFields = 0;
+        selectedEmployeeMeasurements.forEach(emp => {
+            emp.products.forEach(product => {
+                totalFields += product.measurements.length;
+                completedFields += product.measurements.filter(m => m.value && m.value.trim() !== '').length;
             });
         });
 
-        // STEP 2: Group products by productId + variantId from EmployeeMpc data
+        if (totalFields > 0 && Math.round((completedFields / totalFields) * 100) < 100) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot convert to PO. Some selected employees have incomplete measurements. Please complete all measurements first.'
+            });
+        }
+
+        // ── Fetch customer ────────────────────────────────────────────────────
+        const customer = await Customer.findById(measurement.organizationId);
+        if (!customer) {
+            return res.status(404).json({ success: false, message: 'Customer not found' });
+        }
+
+        // ── Get EmployeeMpc product assignments for selected employees ─────────
+        const measuredEmployees = await EmployeeMpc.find({
+            _id: { $in: selectedEmployeeMeasurements.map(emp => emp.employeeId) },
+            status: 'active'
+        })
+            .select('_id name products')
+            .populate({ path: 'products.productId', select: 'name reference baseSalesPrice variants' })
+            .lean();
+
+        const employeeProductMap = new Map();
+        measuredEmployees.forEach(emp => {
+            employeeProductMap.set(emp._id.toString(), { name: emp.name, products: emp.products || [] });
+        });
+
+        // ── Build product map (productId_variantId → aggregated totals) ───────
         const productMap = new Map();
 
-        measurement.employeeMeasurements.forEach(emp => {
+        selectedEmployeeMeasurements.forEach(emp => {
             const employeeData = employeeProductMap.get(emp.employeeId.toString());
-            if (!employeeData) {
-                console.warn(`Employee ${emp.employeeId} not found in EmployeeMpc`);
-                return;
-            }
+            if (!employeeData) return;
 
-            // For each product in measurement, find matching product assignment in EmployeeMpc
             emp.products.forEach(measuredProduct => {
-                // Find the matching product assignment from EmployeeMpc
                 const productAssignment = employeeData.products.find(pa => {
                     const paProductId = pa.productId?._id?.toString();
                     const mpProductId = measuredProduct.productId?._id?.toString();
-                    
-                    // Match productId
                     if (paProductId !== mpProductId) return false;
-                    
-                    // Match variantId if both exist
-                    if (pa.variantId && measuredProduct.variantId) {
+                    if (pa.variantId && measuredProduct.variantId)
                         return pa.variantId.toString() === measuredProduct.variantId.toString();
-                    }
-                    
-                    // If one has variantId and other doesn't, don't match
-                    if ((pa.variantId && !measuredProduct.variantId) || 
-                        (!pa.variantId && measuredProduct.variantId)) {
+                    if ((pa.variantId && !measuredProduct.variantId) || (!pa.variantId && measuredProduct.variantId))
                         return false;
-                    }
-                    
-                    // Match if both don't have variantId
                     return true;
                 });
 
-                if (!productAssignment) {
-                    console.warn(`Product assignment not found for ${measuredProduct.productName} for employee ${employeeData.name}`);
-                    return;
-                }
+                if (!productAssignment) return;
 
-                // Get the actual product details from populated data
                 const stockItem = productAssignment.productId;
-                if (!stockItem || !stockItem._id) {
-                    console.warn(`Product data not found for assignment`);
-                    return;
-                }
+                if (!stockItem?._id) return;
 
                 const productId = stockItem._id.toString();
                 const variantId = productAssignment.variantId ? productAssignment.variantId.toString() : 'default';
@@ -862,40 +820,25 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                 const quantity = productAssignment.quantity || 1;
 
                 if (!productMap.has(productKey)) {
-                    // Get variant name and attributes if exists
-                    let variantName = "Default";
+                    let variantName = 'Default';
                     let variantAttributes = [];
-                    
+                    let variantPrice = stockItem.baseSalesPrice || 0;
+
                     if (productAssignment.variantId && stockItem.variants) {
-                        const variant = stockItem.variants.find(v => 
+                        const variant = stockItem.variants.find(v =>
                             v._id.toString() === productAssignment.variantId.toString()
                         );
                         if (variant) {
-                            // Set variant name
-                            if (variant.attributes && variant.attributes.length > 0) {
-                                variantName = variant.attributes.map(a => a.value).join(" • ");
+                            if (variant.attributes?.length > 0) {
+                                variantName = variant.attributes.map(a => a.value).join(' • ');
+                                variantAttributes = variant.attributes.map(attr => ({
+                                    name: attr.name || 'Attribute',
+                                    value: attr.value || ''
+                                }));
                             } else if (variant.name) {
                                 variantName = variant.name;
                             }
-                            
-                            // Extract attributes for the variant
-                            if (variant.attributes) {
-                                variantAttributes = variant.attributes.map(attr => ({
-                                    name: attr.name || "Attribute",
-                                    value: attr.value || ""
-                                }));
-                            }
-                        }
-                    }
-
-                    // Get variant price if exists
-                    let variantPrice = stockItem.baseSalesPrice || 0;
-                    if (productAssignment.variantId && stockItem.variants) {
-                        const variant = stockItem.variants.find(v => 
-                            v._id.toString() === productAssignment.variantId.toString()
-                        );
-                        if (variant && variant.salesPrice) {
-                            variantPrice = variant.salesPrice;
+                            if (variant.salesPrice) variantPrice = variant.salesPrice;
                         }
                     }
 
@@ -904,8 +847,8 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                         stockItemName: stockItem.name,
                         stockItemReference: stockItem.reference || '',
                         variantId: productAssignment.variantId || null,
-                        variantName: variantName,
-                        variantAttributes: variantAttributes,
+                        variantName,
+                        variantAttributes,
                         unitPrice: variantPrice,
                         employeeCount: 0,
                         totalQuantity: 0,
@@ -920,59 +863,37 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             });
         });
 
-        // Convert map to array
         const products = Array.from(productMap.values());
-        
         if (products.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'No valid products found for PO creation'
-            });
+            return res.status(400).json({ success: false, message: 'No valid products found for PO creation' });
         }
 
-        console.log(`Found ${products.length} unique product-variant combinations for PO`);
-
-        // STEP 3: Create validated items for CustomerRequest - FIXED STRUCTURE
+        // ── Build CustomerRequest items ────────────────────────────────────────
         const validatedItems = products.map(product => {
             const totalPrice = product.totalQuantity * product.unitPrice;
-
-            // Create variant object according to requestItemVariantSchema
-            const variant = {
-                // variantId should be a string. Use the actual variantId if exists, or generate one
-                variantId: product.variantId ? product.variantId.toString() : `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                // attributes should be an array of objects with name and value
-                attributes: product.variantAttributes.length > 0 
-                    ? product.variantAttributes 
-                    : (product.variantName !== "Default" 
-                        ? [{ name: "Variant", value: product.variantName }] 
-                        : []),
-                quantity: product.totalQuantity,
-                specialInstructions: [],
-                estimatedPrice: totalPrice
-            };
-
             return {
                 stockItemId: product.stockItemId,
                 stockItemName: product.stockItemName,
                 stockItemReference: product.stockItemReference,
-                variants: [variant], // Array with one variant object
+                variants: [{
+                    variantId: product.variantId
+                        ? product.variantId.toString()
+                        : `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                    attributes: product.variantAttributes.length > 0
+                        ? product.variantAttributes
+                        : (product.variantName !== 'Default' ? [{ name: 'Variant', value: product.variantName }] : []),
+                    quantity: product.totalQuantity,
+                    specialInstructions: [],
+                    estimatedPrice: totalPrice
+                }],
                 totalQuantity: product.totalQuantity,
                 totalEstimatedPrice: totalPrice,
-                // Additional fields you might want to include
                 employeeCount: product.employeeCount,
                 employeeNames: product.employeeNames.join(', ')
             };
         });
 
-        // Log items for debugging
-        console.log('PO Items to be created:');
-        validatedItems.forEach(item => {
-            const variant = item.variants[0];
-            console.log(`  ${item.stockItemName}, Variant: ${variant.variantId}, Quantity: ${item.totalQuantity}, Price: ${item.totalEstimatedPrice}`);
-            console.log(`  Attributes: ${JSON.stringify(variant.attributes)}`);
-        });
-
-        // STEP 4: Create CustomerRequest
+        // ── Create CustomerRequest ─────────────────────────────────────────────
         const requestCount = await CustomerRequest.countDocuments();
         const requestId = `REQ-${new Date().getFullYear()}-${String(requestCount + 1).padStart(4, '0')}`;
 
@@ -986,7 +907,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                 address: customer.profile?.address?.street || '',
                 city: customer.profile?.address?.city || '',
                 postalCode: customer.profile?.address?.pincode || '',
-                description: `Purchase order generated from measurement: ${measurement.name}`,
+                description: poDescription || `Purchase order generated from measurement: ${measurement.name}`,
                 deliveryDeadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
                 preferredContactMethod: 'phone'
             },
@@ -1000,24 +921,118 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
         });
 
         await newRequest.save();
+        console.log(`Created PO request: ${requestId}`);
 
-        // Update measurement
+        // ── Helper: clean sub-docs for saving back to Mongo ───────────────────
+        const cleanEmployeeList = (list) => list.map(emp => ({
+            employeeId: emp.employeeId,
+            employeeName: emp.employeeName,
+            employeeUIN: emp.employeeUIN,
+            gender: emp.gender,
+            remarks: emp.remarks || '',
+            isCompleted: emp.isCompleted || false,
+            completedAt: emp.completedAt || null,
+            products: emp.products.map(p => ({
+                productId: p.productId?._id || p.productId,
+                productName: p.productName,
+                variantId: p.variantId || null,
+                variantName: p.variantName || 'Default',
+                quantity: p.quantity || 1,
+                measurements: p.measurements.map(m => ({
+                    measurementName: m.measurementName,
+                    value: m.value || '',
+                    unit: m.unit || ''
+                })),
+                measuredAt: p.measuredAt || new Date()
+            }))
+        }));
+
+        // ── STEP 1: Create new measurement for remaining employees ─────────────
+        let newMeasurementId = null;
+
+        if (remainingEmployeeMeasurements.length > 0) {
+            const remainingMeasurementName = `${measurement.name} - Part ${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
+
+            let remTotal = 0, remCompleted = 0;
+            remainingEmployeeMeasurements.forEach(emp => {
+                emp.products.forEach(p => {
+                    remTotal += p.measurements.length;
+                    remCompleted += p.measurements.filter(m => m.value && m.value.trim() !== '').length;
+                });
+            });
+
+            const remCompletedEmps = remainingEmployeeMeasurements.filter(emp =>
+                emp.products.length > 0 &&
+                emp.products.every(p => p.measurements.every(m => m.value && m.value.trim() !== ''))
+            ).length;
+
+            const newMeasurement = new Measurement({
+                organizationId: measurement.organizationId,
+                organizationName: measurement.organizationName,
+                name: remainingMeasurementName,
+                description: `Continuation of "${measurement.name}". Contains ${remainingEmployeeMeasurements.length} employee(s) not included in PO ${requestId}.`,
+                registeredEmployeeIds: remainingEmployeeMeasurements.map(emp => emp.employeeId),
+                employeeMeasurements: cleanEmployeeList(remainingEmployeeMeasurements),
+                totalRegisteredEmployees: remainingEmployeeMeasurements.length,
+                measuredEmployees: remCompletedEmps,
+                pendingEmployees: remainingEmployeeMeasurements.length - remCompletedEmps,
+                completionRate: remTotal > 0 ? Math.round((remCompleted / remTotal) * 100) : 0,
+                totalMeasurements: remTotal,
+                completedMeasurements: remCompleted,
+                pendingMeasurements: remTotal - remCompleted,
+                convertedToPO: false,
+                createdBy: req.user?.id || measurement.createdBy
+            });
+
+            await newMeasurement.save();
+            newMeasurementId = newMeasurement._id;
+            console.log(`New measurement created for ${remainingEmployeeMeasurements.length} remaining employees: ${newMeasurement._id}`);
+        }
+
+        // ── STEP 2: Update original measurement ───────────────────────────────
+        // ONLY selected employees stay. Remaining are fully removed from this doc.
+        let selTotal = 0, selCompleted = 0;
+        selectedEmployeeMeasurements.forEach(emp => {
+            emp.products.forEach(p => {
+                selTotal += p.measurements.length;
+                selCompleted += p.measurements.filter(m => m.value && m.value.trim() !== '').length;
+            });
+        });
+
+        const selCompletedEmps = selectedEmployeeMeasurements.filter(emp =>
+            emp.products.length > 0 &&
+            emp.products.every(p => p.measurements.every(m => m.value && m.value.trim() !== ''))
+        ).length;
+
         await Measurement.findByIdAndUpdate(measurementId, {
+            employeeMeasurements: cleanEmployeeList(selectedEmployeeMeasurements),   // ← only selected
+            registeredEmployeeIds: selectedEmployeeMeasurements.map(emp => emp.employeeId),
+            totalRegisteredEmployees: selectedEmployeeMeasurements.length,
+            measuredEmployees: selCompletedEmps,
+            pendingEmployees: selectedEmployeeMeasurements.length - selCompletedEmps,
+            completionRate: selTotal > 0 ? Math.round((selCompleted / selTotal) * 100) : 100,
+            totalMeasurements: selTotal,
+            completedMeasurements: selCompleted,
+            pendingMeasurements: selTotal - selCompleted,
             convertedToPO: true,
             poRequestId: newRequest._id,
             poConversionDate: new Date(),
-            convertedBy: req.user && req.user.id ? req.user.id : null,
-            completionRate: 100,
-            measuredEmployees: measurement.registeredEmployeeIds?.length || 0,
-            pendingEmployees: 0
+            convertedBy: req.user?.id || null,
         });
 
+        console.log(`Original measurement updated: kept ${selectedEmployeeMeasurements.length}, removed ${remainingEmployeeMeasurements.length}`);
+
+        // ── Respond ───────────────────────────────────────────────────────────
         res.status(201).json({
             success: true,
-            message: 'Measurement successfully converted to Purchase Order',
+            message: `Purchase Order created for ${selectedEmployeeMeasurements.length} employee(s).${remainingEmployeeMeasurements.length > 0 ? ` ${remainingEmployeeMeasurements.length} employee(s) moved to a new measurement document.` : ''}`,
             poRequestId: newRequest._id,
+            requestId: newRequest.requestId,
             totalEstimatedPrice: validatedItems.reduce((sum, item) => sum + item.totalEstimatedPrice, 0),
             totalItems: validatedItems.length,
+            selectedEmployeeCount: selectedEmployeeMeasurements.length,
+            remainingEmployeeCount: remainingEmployeeMeasurements.length,
+            newMeasurementId,
             items: validatedItems.map(item => ({
                 name: item.stockItemName,
                 variantId: item.variants[0].variantId,
@@ -1032,10 +1047,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
 
         if (error.name === 'ValidationError') {
             const messages = Object.values(error.errors).map(err => err.message);
-            return res.status(400).json({
-                success: false,
-                message: messages.join(', ')
-            });
+            return res.status(400).json({ success: false, message: messages.join(', ') });
         }
 
         res.status(500).json({
@@ -1547,341 +1559,6 @@ router.delete('/:measurementId', async (req, res) => {
 
 
 
-
-
-
-router.post('/:measurementId/convert-to-po', async (req, res) => {
-    try {
-        const { measurementId } = req.params;
-
-        // Validate measurementId
-        if (!measurementId || !mongoose.Types.ObjectId.isValid(measurementId)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Valid measurement ID is required'
-            });
-        }
-
-        // Get measurement
-        const measurement = await Measurement.findById(measurementId);
-        if (!measurement) {
-            return res.status(404).json({
-                success: false,
-                message: 'Measurement not found'
-            });
-        }
-
-        // Check if already converted to PO
-        if (measurement.convertedToPO) {
-            return res.status(404).json({
-                success: false,
-                message: 'Measurement already converted to PO'
-            });
-        }
-
-        // Check if measurement is complete
-        let totalMeasurementFields = 0;
-        let completedMeasurementFields = 0;
-
-        measurement.employeeMeasurements.forEach(emp => {
-            emp.products.forEach(product => {
-                totalMeasurementFields += product.measurements.length;
-                completedMeasurementFields += product.measurements.filter(m =>
-                    m.value && m.value.trim() !== ""
-                ).length;
-            });
-        });
-
-        const completionRate = totalMeasurementFields > 0
-            ? Math.round((completedMeasurementFields / totalMeasurementFields) * 100)
-            : 0;
-
-        if (completionRate < 100) {
-            return res.status(400).json({
-                success: false,
-                message: 'Cannot convert incomplete measurement to PO. Please complete all measurements first.'
-            });
-        }
-
-        // Get customer
-        const customer = await Customer.findById(measurement.organizationId);
-        if (!customer) {
-            return res.status(404).json({
-                success: false,
-                message: 'Customer not found'
-            });
-        }
-
-        console.log(`Converting measurement to PO for customer: ${customer.name}`);
-
-        // STEP 1: Get measured employee IDs
-        const measuredEmployeeIds = measurement.employeeMeasurements.map(emp => 
-            emp.employeeId.toString()
-        );
-
-        console.log(`Measured employee IDs: ${measuredEmployeeIds.join(', ')}`);
-
-        // STEP 2: Get product assignments from EmployeeMpc for measured employees
-        const measuredEmployees = await EmployeeMpc.find({
-            _id: { $in: measuredEmployeeIds },
-            status: 'active'
-        })
-        .select('_id name products')
-        .populate({
-            path: 'products.productId',
-            select: 'name reference baseSalesPrice variants'
-        })
-        .lean();
-
-        if (measuredEmployees.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'No product assignments found for measured employees'
-            });
-        }
-
-        console.log(`Found ${measuredEmployees.length} measured employees with product assignments`);
-
-        // STEP 3: Group product assignments by productId + variantId
-        const productMap = new Map(); // Key: productId_variantId
-        
-        measuredEmployees.forEach(employee => {
-            if (!employee.products || employee.products.length === 0) return;
-            
-            employee.products.forEach(productAssignment => {
-                if (!productAssignment.productId) return;
-                
-                const productId = productAssignment.productId._id.toString();
-                const variantId = productAssignment.variantId ? productAssignment.variantId.toString() : 'no-variant';
-                const productKey = `${productId}_${variantId}`;
-                const quantity = productAssignment.quantity || 1;
-                
-                const stockItem = productAssignment.productId;
-                
-                if (!productMap.has(productKey)) {
-                    // Get variant name if exists
-                    let variantName = "Default";
-                    if (productAssignment.variantId && stockItem.variants) {
-                        const variant = stockItem.variants.find(v => 
-                            v._id.toString() === productAssignment.variantId.toString()
-                        );
-                        if (variant && variant.attributes) {
-                            variantName = variant.attributes.map(a => a.value).join(" • ") || "Default";
-                        }
-                    }
-                    
-                    productMap.set(productKey, {
-                        stockItemId: productId,
-                        stockItemName: stockItem.name,
-                        stockItemReference: stockItem.reference || '',
-                        variantId: variantId !== 'no-variant' ? variantId : null,
-                        variantName: variantName,
-                        basePrice: stockItem.baseSalesPrice || 0,
-                        variantPrice: null,
-                        totalQuantity: 0,
-                        employeeCount: 0,
-                        employeeNames: []
-                    });
-                }
-                
-                const productData = productMap.get(productKey);
-                productData.totalQuantity += quantity;
-                productData.employeeCount += 1;
-                productData.employeeNames.push(employee.name);
-            });
-        });
-
-        const products = Array.from(productMap.values());
-        
-        if (products.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'No valid products found for PO creation'
-            });
-        }
-
-        console.log(`Found ${products.length} unique product-variant combinations`);
-
-        // STEP 4: Get variant prices
-        for (const product of products) {
-            if (product.variantId) {
-                try {
-                    const stockItem = await StockItem.findById(product.stockItemId)
-                        .select('variants')
-                        .lean();
-                    
-                    if (stockItem && stockItem.variants) {
-                        const variant = stockItem.variants.find(v => 
-                            v._id.toString() === product.variantId
-                        );
-                        if (variant && variant.salesPrice) {
-                            product.variantPrice = variant.salesPrice;
-                            console.log(`Variant price for ${product.stockItemName}: ${variant.salesPrice}`);
-                        }
-                    }
-                } catch (err) {
-                    console.error(`Error fetching variant price for product ${product.stockItemId}:`, err);
-                }
-            }
-        }
-
-        // STEP 5: Create items for CustomerRequest
-        const items = products.map(product => {
-            const unitPrice = product.variantPrice || product.basePrice || 0;
-            const totalEstimatedPrice = product.totalQuantity * unitPrice;
-            
-            // Get variant attributes if available
-            let variantAttributes = [];
-            if (product.variantId) {
-                try {
-                    const stockItem = StockItem.findById(product.stockItemId)
-                        .select('variants')
-                        .lean();
-                    
-                    if (stockItem && stockItem.variants) {
-                        const variant = stockItem.variants.find(v => 
-                            v._id.toString() === product.variantId
-                        );
-                        if (variant && variant.attributes) {
-                            variantAttributes = variant.attributes.map(attr => ({
-                                name: attr.name,
-                                value: attr.value || ""
-                            }));
-                        }
-                    }
-                } catch (err) {
-                    console.error(`Error fetching variant attributes:`, err);
-                }
-            }
-
-            const variant = {
-                variantId: product.variantId,
-                variantName: product.variantName,
-                attributes: variantAttributes,
-                quantity: product.totalQuantity,
-                specialInstructions: [],
-                estimatedPrice: totalEstimatedPrice
-            };
-
-            return {
-                stockItemId: product.stockItemId,
-                stockItemName: product.stockItemName,
-                stockItemReference: product.stockItemReference,
-                variants: [variant],
-                totalQuantity: product.totalQuantity,
-                totalEstimatedPrice: totalEstimatedPrice,
-                employeeCount: product.employeeCount,
-                employeeNames: product.employeeNames
-            };
-        });
-
-        // STEP 6: Create CustomerRequest
-        const requestCount = await CustomerRequest.countDocuments();
-        const requestId = `REQ-${new Date().getFullYear()}-${String(requestCount + 1).padStart(4, '0')}`;
-
-        const newRequest = new CustomerRequest({
-            requestId,
-            customerId: measurement.organizationId,
-            customerInfo: {
-                name: customer.name,
-                email: customer.email || '',
-                phone: customer.phone || '',
-                address: customer.profile?.address?.street || '',
-                city: customer.profile?.address?.city || '',
-                postalCode: customer.profile?.address?.pincode || '',
-                description: `Purchase order generated from measurement: ${measurement.name}`,
-                deliveryDeadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-                preferredContactMethod: 'phone'
-            },
-            items: items,
-            status: 'pending',
-            priority: 'high',
-            measurementId: measurement._id,
-            measurementName: measurement.name,
-            requestType: 'measurement_conversion',
-            createdAt: new Date()
-        });
-
-        await newRequest.save();
-
-        console.log(`Created PO request: ${requestId}`);
-
-        // Populate request
-        const populatedRequest = await CustomerRequest.findById(newRequest._id)
-            .populate({
-                path: 'items.stockItemId',
-                select: 'name reference category images'
-            });
-
-        // Send email (optional)
-        try {
-            if (CustomerEmailService && CustomerEmailService.sendRequestConfirmationEmail) {
-                CustomerEmailService.sendRequestConfirmationEmail(
-                    {
-                        requestId: populatedRequest.requestId,
-                        createdAt: populatedRequest.createdAt,
-                        items: populatedRequest.items.map(item => ({
-                            name: item.stockItemName,
-                            reference: item.stockItemReference,
-                            variants: item.variants,
-                            totalQuantity: item.totalQuantity,
-                            totalEstimatedPrice: item.totalEstimatedPrice
-                        })),
-                        totalEstimatedPrice: populatedRequest.items.reduce((sum, item) => sum + item.totalEstimatedPrice, 0)
-                    },
-                    {
-                        name: customer.name,
-                        email: customer.email,
-                        phone: customer.phone
-                    }
-                );
-                console.log('Confirmation email sent');
-            }
-        } catch (emailError) {
-            console.error('Request email sending failed:', emailError);
-        }
-
-        // STEP 7: Update measurement
-        measurement.convertedToPO = true;
-        measurement.poRequestId = newRequest._id;
-        measurement.poConversionDate = new Date();
-        if (req.user && req.user.id) {
-            measurement.convertedBy = req.user.id;
-        }
-
-        measurement.completionRate = 100;
-        measurement.measuredEmployees = measurement.registeredEmployeeIds?.length || 0;
-        measurement.pendingEmployees = 0;
-
-        await measurement.save();
-
-        console.log(`Measurement ${measurementId} successfully converted to PO`);
-
-        res.status(201).json({
-            success: true,
-            message: 'Measurement successfully converted to Purchase Order.',
-            request: populatedRequest,
-            totalEstimatedPrice: populatedRequest.items.reduce((sum, item) => sum + item.totalEstimatedPrice, 0)
-        });
-
-    } catch (error) {
-        console.error('Error converting measurement to PO:', error);
-
-        if (error.name === 'ValidationError') {
-            const messages = Object.values(error.errors).map(err => err.message);
-            return res.status(400).json({
-                success: false,
-                message: messages.join(', ')
-            });
-        }
-
-        res.status(500).json({
-            success: false,
-            message: 'Server error while converting measurement to PO',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
-    }
-});
 
 
 // GET organization measurements

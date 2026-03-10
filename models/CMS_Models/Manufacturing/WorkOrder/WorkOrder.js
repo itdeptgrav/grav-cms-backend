@@ -251,6 +251,26 @@ const operationCompletionSchema = new mongoose.Schema(
   { _id: false },
 );
 
+
+const dispatchRecordSchema = new mongoose.Schema(
+  {
+    dispatchedQuantity: { type: Number, required: true, min: 1 },
+    dispatchedAt:       { type: Date,   default: Date.now },
+    dispatchedBy:       { type: String },
+    notes:              { type: String, trim: true },
+    // "person_wise" for measurement orders, "bulk" for bulk orders
+    dispatchType: {
+      type: String,
+      enum: ["person_wise", "bulk"],
+      default: "bulk",
+    },
+    // For measurement orders — which employees in this batch
+    employeeIds:   [{ type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" }],
+    employeeNames: [{ type: String }],
+  },
+  { _id: true }
+);
+
 const operatorDetailSchema = new mongoose.Schema(
   {
     operatorId: {
@@ -609,6 +629,11 @@ const workOrderSchema = new mongoose.Schema(
         min: 0
       }
     },
+
+
+
+    dispatchedQuantity: { type: Number, default: 0, min: 0 },
+    dispatchRecords: [dispatchRecordSchema],
 
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,

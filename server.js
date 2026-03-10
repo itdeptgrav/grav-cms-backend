@@ -293,7 +293,7 @@ app.use("/api/cms/vendors", vendorRoutes);
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
 app.use("/api/cms/raw-items", rawItemsRoutes);
 
-const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems");
+const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/StockItems");
 app.use("/api/cms/stock-items", stockItemsRoutes);
 
 // Operations Category
@@ -361,6 +361,12 @@ app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
 
 const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
 app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
+
+const dispatchRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/dispatchRoutes.js");
+app.use("/api/cms/manufacturing/dispatch", dispatchRoutes);
+
+const markAsDoneRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/markAsDoneRoutes");
+app.use("/api/cms/manufacturing/mark-as-done", markAsDoneRoutes);
 
 // Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
