@@ -394,6 +394,16 @@ app.use("/api/hr/tasks", employeeTasksRouter);
 const vendorDetailsRoutes = require("./routes/Vendor_Routes/vendorRoutes");
 app.use("/api/hr/vendors", vendorDetailsRoutes);
 
+const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
+app.use("/api/hr/payroll", payrollRoutes);
+
+const attendanceRoutes = require("./routes/HrRoutes/Attendance_section");
+app.use("/api/hr/attendance", attendanceRoutes);
+
+const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
+app.use("/api/hr/password-management", passwordMgmt);
+
+
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
