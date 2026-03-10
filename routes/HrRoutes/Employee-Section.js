@@ -2,21 +2,144 @@ const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
+const SalaryConfig = require("../../models/Salaryconfig");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const emailService = require("../../services/emailService");
 
 require("dotenv").config();
 
-// CREATE new employee - No required field validation, accept whatever is provided
+// ─── SALARY CALCULATION HELPER ───────────────────────────────────────────────
+// Accepts a config object (from SalaryConfig model) so all rates are dynamic.
+// Falls back to statutory defaults if no config is passed.
+function recalculateSalary(salary = {}, cfg = {}) {
+  const basicPct = (cfg.basicPct ?? 50) / 100;
+  const hraPct = (cfg.hraPct ?? 20) / 100;
+  const eepfPct = (cfg.eepfPct ?? 12) / 100;
+  const epsPct = (cfg.epsPct ?? 8.33) / 100;
+  const epsCapAmount = cfg.epsCapAmount ?? 1250;
+  const edliPct = (cfg.edliPct ?? 0.5) / 100;
+  const edliCapAmount = cfg.edliCapAmount ?? 75;
+  const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
+  const esiWageLimit = cfg.esiWageLimit ?? 21000;
+  const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
+  const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
+
+  const gross = salary.gross || 0;
+  const calDays = salary.calendarDays || 0;
+  const workDays = salary.actualWorkingDays || 0;
+
+  const payableGross = (calDays > 0 && workDays > 0 && workDays <= calDays)
+    ? Math.round((gross / calDays) * workDays)
+    : gross;
+
+  const basic = Math.round(payableGross * basicPct);
+  const hra = Math.round(payableGross * hraPct);
+
+  const eepf = Math.round(basic * eepfPct);
+  const eps = Math.min(Math.round(basic * epsPct), epsCapAmount);
+  const epf = Math.round(basic * eepfPct) - eps;            // employer 12% - EPS
+  const edli = Math.min(Math.round(basic * edliPct), edliCapAmount);
+  const adminCharges = Math.round(basic * adminPct);
+
+  const esiApplicable = gross <= esiWageLimit;
+  const eeesic = esiApplicable ? Math.round(payableGross * eeEsicPct) : 0;
+  const erEsic = esiApplicable ? Math.round(payableGross * erEsicPct) : 0;
+
+  const salaryAdvance = salary.salaryAdvance || 0;
+  const loan = salary.loan || 0;
+  const otherDeductions = salary.otherDeductions || 0;
+
+  const totalDeduction = eepf + eeesic + salaryAdvance + loan + otherDeductions;
+  const netSalary = Math.max(payableGross - totalDeduction, 0);
+
+  return {
+    gross, calendarDays: calDays, actualWorkingDays: workDays,
+    basic, hra,
+    eepf, eps, epf, edli, adminCharges,
+    eeesic, erEsic,
+    salaryAdvance, loan, otherDeductions,
+    totalDeduction, netSalary,
+    allowances: hra, deductions: totalDeduction,
+  };
+}
+
+// ─── SALARY CONFIG — GET ──────────────────────────────────────────────────────
+// Using /config/salary so it never collides with the /:id param routes
+router.get("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const config = await SalaryConfig.getSingleton();
+    res.json({ success: true, data: config });
+  } catch (err) {
+    console.error("Salary config GET error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch salary config" });
+  }
+});
+
+// ─── SALARY CONFIG — UPDATE ───────────────────────────────────────────────────
+router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { user } = req;
+
+    const allowed = [
+      "basicPct", "hraPct",
+      "eepfPct", "epsPct", "epsCapAmount",
+      "edliPct", "edliCapAmount", "adminChargesPct",
+      "esiWageLimit", "eeEsicPct", "erEsicPct",
+    ];
+
+    const updates = {};
+    allowed.forEach((k) => { if (req.body[k] !== undefined) updates[k] = Number(req.body[k]); });
+    updates.updatedBy = user.id;
+    updates.updatedAt = new Date();
+
+    const config = await SalaryConfig.findOneAndUpdate(
+      {},
+      { $set: updates },
+      { new: true, upsert: true, runValidators: true }
+    );
+
+    res.json({ success: true, message: "Salary config updated", data: config });
+  } catch (err) {
+    console.error("Salary config PUT error:", err);
+    if (err.name === "ValidationError") {
+      const errors = Object.values(err.errors).map((e) => e.message);
+      return res.status(400).json({ success: false, message: "Validation error", errors });
+    }
+    res.status(500).json({ success: false, message: "Failed to update salary config" });
+  }
+});
+
+// ─── CREATE new employee ──────────────────────────────────────────────────────
 router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     const employeeData = req.body;
 
-    // Generate a temporary password for the employee
+    // Sanitize fields that are ObjectId references — empty string causes a BSONError cast fail
+    const OBJECTID_FIELDS = ["departmentId", "primaryManager.managerId", "secondaryManager.managerId"];
+    OBJECTID_FIELDS.forEach((path) => {
+      const [top, nested] = path.split(".");
+      if (nested) {
+        if (employeeData[top] && employeeData[top][nested] === "") {
+          delete employeeData[top][nested];
+        }
+      } else {
+        if (employeeData[top] === "" || employeeData[top] === null) {
+          delete employeeData[top];
+        }
+      }
+    });
+
+    // Also strip any other empty-string values that map to typed fields to avoid cast errors
+    if (employeeData.primaryManager && !employeeData.primaryManager.managerId) {
+      delete employeeData.primaryManager;
+    }
+    if (employeeData.secondaryManager && !employeeData.secondaryManager.managerId) {
+      delete employeeData.secondaryManager;
+    }
+
     const temporaryPassword = Math.random().toString(36).slice(-8);
 
-    // Create employee with whatever data was provided
     const newEmployee = new Employee({
       ...employeeData,
       password: temporaryPassword,
@@ -27,76 +150,52 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
 
     await newEmployee.save();
 
-    // Send welcome email asynchronously (only if email service is enabled)
+    // Send welcome email asynchronously
     if (process.env.ENABLE_EMAILS === "true" && employeeData.email) {
       try {
         const emailData = {
-          name: `${employeeData.firstName || ""} ${employeeData.lastName || ""}`.trim() || "Employee",
+          name: [employeeData.firstName, employeeData.lastName].filter(Boolean).join(" ") || "Employee",
           email: employeeData.email,
           employeeId: employeeData.biometricId,
           department: employeeData.department,
           designation: employeeData.designation || employeeData.jobPosition,
-          temporaryPassword: temporaryPassword,
+          temporaryPassword,
         };
-
-        emailService
-          .sendWelcomeEmail(emailData)
+        emailService.sendWelcomeEmail(emailData)
           .then(() => {
-            console.log(`✅ Welcome email sent to ${employeeData.email}`);
             Employee.findByIdAndUpdate(newEmployee._id, {
               $set: { welcomeEmailSent: true, emailSentAt: new Date(), temporaryPassword: null },
-            }).catch((err) => console.error("Error updating email status:", err));
+            }).catch(console.error);
           })
-          .catch((emailError) => {
-            console.error(`❌ Failed to send email to ${employeeData.email}:`, emailError.message);
+          .catch((err) => {
             Employee.findByIdAndUpdate(newEmployee._id, {
-              $set: { welcomeEmailSent: false, emailError: emailError.message },
-            }).catch((err) => console.error("Error updating email error status:", err));
+              $set: { welcomeEmailSent: false, emailError: err.message },
+            }).catch(console.error);
           });
-      } catch (emailError) {
-        console.error("Error in email sending process:", emailError);
-      }
+      } catch (e) { console.error("Email error:", e); }
     }
 
-    const employeeResponse = newEmployee.toObject();
-    delete employeeResponse.password;
-    delete employeeResponse.temporaryPassword;
-    delete employeeResponse.__v;
+    const resp = newEmployee.toObject();
+    delete resp.password;
+    delete resp.temporaryPassword;
+    delete resp.__v;
 
-    res.status(201).json({
-      success: true,
-      message: "Employee created successfully",
-      data: employeeResponse,
-    });
+    res.status(201).json({ success: true, message: "Employee created successfully", data: resp });
   } catch (error) {
     console.error("Create employee error:", error);
-
     if (error.name === "ValidationError") {
-      const errors = Object.values(error.errors).map((err) => err.message);
-      return res.status(400).json({
-        success: false,
-        message: "Validation error",
-        errors,
-      });
+      const errors = Object.values(error.errors).map((e) => e.message);
+      return res.status(400).json({ success: false, message: "Validation error", errors });
     }
-
     if (error.code === 11000) {
       const field = Object.keys(error.keyPattern)[0];
-      return res.status(400).json({
-        success: false,
-        message: `${field} already exists. Please use a different value.`,
-      });
+      return res.status(400).json({ success: false, message: `${field} already exists.` });
     }
-
-    res.status(500).json({
-      success: false,
-      message: "Error creating employee",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+    res.status(500).json({ success: false, message: "Error creating employee" });
   }
 });
 
-// UPDATE employee
+// ─── UPDATE employee ──────────────────────────────────────────────────────────
 router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
@@ -105,33 +204,19 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     const canUpdate = user.role === "hr_manager" || user.id === id;
     if (!canUpdate) {
-      return res.status(403).json({
-        success: false,
-        message: "You don't have permission to update this employee",
-      });
+      return res.status(403).json({ success: false, message: "Permission denied" });
     }
 
-    // Clean up base64 profile photo
-    if (
-      updateData.profilePhoto &&
-      typeof updateData.profilePhoto === "string" &&
-      updateData.profilePhoto.startsWith("data:image")
-    ) {
+    // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
+    if (updateData.profilePhoto && typeof updateData.profilePhoto === "string" && updateData.profilePhoto.startsWith("data:image")) {
       delete updateData.profilePhoto;
     }
-
-    // Clean up base64 document files
     if (updateData.documents) {
-      ["aadharFile", "panFile", "resumeFile"].forEach((field) => {
-        if (
-          updateData.documents[field] &&
-          typeof updateData.documents[field] === "string" &&
-          updateData.documents[field].startsWith("data:image")
-        ) {
-          delete updateData.documents[field];
+      ["aadharFile", "panFile", "resumeFile", "offerLetterFile", "appointmentLetterFile"].forEach((f) => {
+        if (updateData.documents[f] && typeof updateData.documents[f] === "string" && updateData.documents[f].startsWith("data:image")) {
+          delete updateData.documents[f];
         }
       });
-
       if (updateData.documents.additionalDocuments) {
         updateData.documents.additionalDocuments = updateData.documents.additionalDocuments.filter(
           (doc) => !(doc.url && typeof doc.url === "string" && doc.url.startsWith("data:image"))
@@ -139,139 +224,108 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       }
     }
 
-    // Fields that should not be updated via this endpoint
-    const restrictedFields = ["email", "password", "temporaryPassword", "createdBy", "createdAt"];
-    restrictedFields.forEach((field) => delete updateData[field]);
+    // Restricted fields
+    ["email", "password", "temporaryPassword", "createdBy", "createdAt"].forEach((f) => delete updateData[f]);
 
-    const updatedEmployee = await Employee.findByIdAndUpdate(id, updateData, {
-      new: true,
-      runValidators: false, // Don't run validators on update to allow partial data
+    // Sanitize empty-string ObjectId fields to prevent BSONError cast failures
+    if (updateData.departmentId === "" || updateData.departmentId === null) {
+      delete updateData.departmentId;
+    }
+    if (updateData.primaryManager && !updateData.primaryManager.managerId) {
+      delete updateData.primaryManager;
+    }
+    if (updateData.secondaryManager && !updateData.secondaryManager.managerId) {
+      delete updateData.secondaryManager;
+    }
+
+    // Recalculate all salary fields from gross using current config rates
+    if (updateData.salary) {
+      const cfg = await SalaryConfig.getSingleton();
+      updateData.salary = recalculateSalary(updateData.salary, cfg.toObject());
+    }
+
+    const updated = await Employee.findByIdAndUpdate(id, updateData, {
+      new: true, runValidators: false,
     }).select("-password -temporaryPassword -__v");
 
-    if (!updatedEmployee) {
-      return res.status(404).json({
-        success: false,
-        message: "Employee not found",
-      });
-    }
+    if (!updated) return res.status(404).json({ success: false, message: "Employee not found" });
 
-    res.status(200).json({
-      success: true,
-      message: "Employee updated successfully",
-      data: updatedEmployee,
-    });
+    res.status(200).json({ success: true, message: "Employee updated successfully", data: updated });
   } catch (error) {
     console.error("Update employee error:", error);
-
-    if (error.name === "ValidationError") {
-      const errors = Object.values(error.errors).map((err) => err.message);
-      return res.status(400).json({
-        success: false,
-        message: "Validation error",
-        errors,
-      });
-    }
-
-    if (error.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        message: "Duplicate key error - a value you entered already exists",
-      });
-    }
-
-    if (error.name === "CastError") {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid employee ID",
-      });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: "Error updating employee",
-    });
+    if (error.code === 11000) return res.status(400).json({ success: false, message: "Duplicate value error" });
+    if (error.name === "CastError") return res.status(400).json({ success: false, message: "Invalid employee ID" });
+    res.status(500).json({ success: false, message: "Error updating employee" });
   }
 });
 
-// UPDATE EMPLOYEE DOCUMENTS ONLY
+// ─── UPDATE DOCUMENTS ONLY ────────────────────────────────────────────────────
 router.patch("/:id/documents", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     const { id } = req.params;
     const { documents } = req.body;
 
-    const canUpdate = user.role === "hr_manager" || user.id === id;
-    if (!canUpdate) {
-      return res.status(403).json({ success: false, message: "You don't have permission to update documents" });
+    if (user.role !== "hr_manager" && user.id !== id) {
+      return res.status(403).json({ success: false, message: "Permission denied" });
     }
 
-    const cleanDocuments = { ...documents };
-    ["aadharFile", "panFile", "resumeFile"].forEach((field) => {
-      if (cleanDocuments[field] && typeof cleanDocuments[field] === "string" && cleanDocuments[field].startsWith("data:image")) {
-        delete cleanDocuments[field];
-      }
+    const clean = { ...documents };
+    ["aadharFile", "panFile", "resumeFile"].forEach((f) => {
+      if (clean[f] && typeof clean[f] === "string" && clean[f].startsWith("data:image")) delete clean[f];
     });
-    if (cleanDocuments.additionalDocuments) {
-      cleanDocuments.additionalDocuments = cleanDocuments.additionalDocuments.filter(
-        (doc) => !(doc.url && typeof doc.url === "string" && doc.url.startsWith("data:image"))
+    if (clean.additionalDocuments) {
+      clean.additionalDocuments = clean.additionalDocuments.filter(
+        (d) => !(d.url && typeof d.url === "string" && d.url.startsWith("data:image"))
       );
     }
 
-    const updatedEmployee = await Employee.findByIdAndUpdate(
-      id,
-      { $set: { documents: cleanDocuments } },
-      { new: true, runValidators: false }
-    ).select("documents firstName lastName employeeId");
+    const updated = await Employee.findByIdAndUpdate(
+      id, { $set: { documents: clean } }, { new: true, runValidators: false }
+    ).select("documents firstName lastName biometricId");
 
-    if (!updatedEmployee) {
-      return res.status(404).json({ success: false, message: "Employee not found" });
-    }
+    if (!updated) return res.status(404).json({ success: false, message: "Employee not found" });
 
-    res.status(200).json({ success: true, message: "Documents updated successfully", data: updatedEmployee.documents });
+    res.status(200).json({ success: true, message: "Documents updated successfully", data: updated.documents });
   } catch (error) {
     console.error("Update documents error:", error);
     res.status(500).json({ success: false, message: "Error updating documents" });
   }
 });
 
-// UPDATE PROFILE PHOTO ONLY
+// ─── UPDATE PROFILE PHOTO ONLY ────────────────────────────────────────────────
 router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     const { id } = req.params;
     const { profilePhoto } = req.body;
 
-    const canUpdate = user.role === "hr_manager" || user.id === id;
-    if (!canUpdate) {
-      return res.status(403).json({ success: false, message: "You don't have permission to update profile photo" });
+    if (user.role !== "hr_manager" && user.id !== id) {
+      return res.status(403).json({ success: false, message: "Permission denied" });
     }
 
-    if (!profilePhoto || !profilePhoto.url || !profilePhoto.publicId) {
-      return res.status(400).json({ success: false, message: "Valid profile photo with URL and publicId is required" });
+    if (!profilePhoto?.url || !profilePhoto?.publicId) {
+      return res.status(400).json({ success: false, message: "Valid profilePhoto with url and publicId required" });
     }
 
     if (typeof profilePhoto.url === "string" && profilePhoto.url.startsWith("data:image")) {
-      return res.status(400).json({ success: false, message: "Profile photo must be uploaded to Cloudinary first" });
+      return res.status(400).json({ success: false, message: "Upload to Cloudinary first" });
     }
 
-    const updatedEmployee = await Employee.findByIdAndUpdate(
-      id,
-      { $set: { profilePhoto } },
-      { new: true, runValidators: false }
-    ).select("profilePhoto firstName lastName employeeId");
+    const updated = await Employee.findByIdAndUpdate(
+      id, { $set: { profilePhoto } }, { new: true, runValidators: false }
+    ).select("profilePhoto firstName lastName biometricId");
 
-    if (!updatedEmployee) {
-      return res.status(404).json({ success: false, message: "Employee not found" });
-    }
+    if (!updated) return res.status(404).json({ success: false, message: "Employee not found" });
 
-    res.status(200).json({ success: true, message: "Profile photo updated successfully", data: updatedEmployee.profilePhoto });
+    res.status(200).json({ success: true, message: "Profile photo updated successfully", data: updated.profilePhoto });
   } catch (error) {
     console.error("Update profile photo error:", error);
     res.status(500).json({ success: false, message: "Error updating profile photo" });
   }
 });
 
-// Get all employees (with pagination and filters)
+// ─── GET ALL employees (paginated, filterable) ─────────────────────────────────
 router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { page = 1, limit = 10, department, status, search } = req.query;
@@ -283,27 +337,32 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
       filter.$or = [
         { firstName: { $regex: search, $options: "i" } },
         { lastName: { $regex: search, $options: "i" } },
+        { middleName: { $regex: search, $options: "i" } },
         { email: { $regex: search, $options: "i" } },
-        { employeeId: { $regex: search, $options: "i" } },
+        { biometricId: { $regex: search, $options: "i" } },
+        { identityId: { $regex: search, $options: "i" } },
         { jobTitle: { $regex: search, $options: "i" } },
+        { designation: { $regex: search, $options: "i" } },
+        { phone: { $regex: search, $options: "i" } },
       ];
     }
 
-    const skip = (page - 1) * limit;
-    const employees = await Employee.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit))
-      .select("-password -temporaryPassword -__v")
-      .lean();
-
-    const total = await Employee.countDocuments(filter);
-    const totalPages = Math.ceil(total / limit);
-
-    const departmentStats = await Employee.aggregate([
-      { $group: { _id: "$department", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [employees, total, deptStats] = await Promise.all([
+      Employee.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .select("-password -temporaryPassword -__v")
+        .lean(),
+      Employee.countDocuments(filter),
+      Employee.aggregate([
+        { $group: { _id: "$department", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]),
     ]);
+
+    const totalPages = Math.ceil(total / parseInt(limit));
 
     res.status(200).json({
       success: true,
@@ -313,10 +372,10 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
           currentPage: parseInt(page),
           totalPages,
           totalEmployees: total,
-          hasNextPage: page < totalPages,
-          hasPrevPage: page > 1,
+          hasNextPage: parseInt(page) < totalPages,
+          hasPrevPage: parseInt(page) > 1,
         },
-        stats: { total, departmentStats },
+        stats: { total, departmentStats: deptStats },
       },
     });
   } catch (error) {
@@ -325,25 +384,22 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
-// Get single employee
+// ─── GET single employee ──────────────────────────────────────────────────────
 router.get("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    const { id } = req.params;
-    const employee = await Employee.findById(id).select("-password -temporaryPassword -__v").lean();
-    if (!employee) {
-      return res.status(404).json({ success: false, message: "Employee not found" });
-    }
+    const employee = await Employee.findById(req.params.id)
+      .select("-password -temporaryPassword -__v")
+      .lean();
+    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
     res.status(200).json({ success: true, data: employee });
   } catch (error) {
     console.error("Get employee error:", error);
-    if (error.name === "CastError") {
-      return res.status(400).json({ success: false, message: "Invalid employee ID" });
-    }
+    if (error.name === "CastError") return res.status(400).json({ success: false, message: "Invalid employee ID" });
     res.status(500).json({ success: false, message: "Error fetching employee" });
   }
 });
 
-// Get single employee with detailed information
+// ─── GET employee DETAILS (full formatted) ────────────────────────────────────
 router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { id } = req.params;
@@ -351,42 +407,66 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
     const employee = await Employee.findById(id)
       .select("-password -temporaryPassword -__v")
       .populate("departmentId", "name designations managers")
-      .populate("primaryManager.managerId", "firstName lastName employeeId department jobTitle")
-      .populate("secondaryManager.managerId", "firstName lastName employeeId department jobTitle")
+      .populate("primaryManager.managerId", "firstName lastName biometricId department jobTitle")
+      .populate("secondaryManager.managerId", "firstName lastName biometricId department jobTitle")
       .populate("createdBy", "name email")
       .lean();
 
-    if (!employee) {
-      return res.status(404).json({ success: false, message: "Employee not found" });
-    }
+    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
 
     const [teamMembers, managerHierarchy, recentActivities] = await Promise.all([
       Employee.find({
-        $or: [{ "primaryManager.managerId": id }, { "secondaryManager.managerId": id }],
+        $or: [
+          { "primaryManager.managerId": id },
+          { "secondaryManager.managerId": id },
+        ],
       })
-        .select("firstName lastName employeeId department jobTitle status")
-        .limit(5)
+        .select("firstName lastName biometricId department jobTitle status")
+        .limit(10)
         .lean(),
       getManagerHierarchy(id),
       getRecentActivities(id),
     ]);
 
-    const formattedEmployee = {
+    const fullName = [employee.firstName, employee.middleName, employee.lastName].filter(Boolean).join(" ").trim();
+
+    const formatted = {
       basicInfo: {
         id: employee._id,
         biometricId: employee.biometricId,
         identityId: employee.identityId,
+        title: employee.title || "",
         firstName: employee.firstName,
+        middleName: employee.middleName || "",
         lastName: employee.lastName,
-        fullName: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
+        fullName,
+        nickName: employee.nickName || "",
         email: employee.email,
+        personalEmail: employee.personalEmail || "",
         phone: employee.phone,
         alternatePhone: employee.alternatePhone || "Not Provided",
-        dateOfBirth: employee.dateOfBirth ? new Date(employee.dateOfBirth).toLocaleDateString() : "Not Provided",
+        extension: employee.extension || "",
+        dateOfBirth: employee.dateOfBirth ? new Date(employee.dateOfBirth).toLocaleDateString("en-IN") : "Not Provided",
         age: employee.dateOfBirth ? calculateAge(employee.dateOfBirth) : null,
-        gender: employee.gender ? employee.gender.charAt(0).toUpperCase() + employee.gender.slice(1) : "Not Provided",
-        maritalStatus: employee.maritalStatus ? employee.maritalStatus.charAt(0).toUpperCase() + employee.maritalStatus.slice(1) : "Not Provided",
+        gender: employee.gender ? capitalize(employee.gender) : "Not Provided",
+        bloodGroup: employee.bloodGroup || "Not Provided",
+        maritalStatus: employee.maritalStatus ? capitalize(employee.maritalStatus) : "Not Provided",
+        marriageDate: employee.marriageDate ? new Date(employee.marriageDate).toLocaleDateString("en-IN") : null,
+        spouseName: employee.spouseName || null,
+        spouseDOB: employee.spouseDOB ? new Date(employee.spouseDOB).toLocaleDateString("en-IN") : null,
+        nationality: employee.nationality || "Not Provided",
+        religion: employee.religion || "Not Provided",
+        placeOfBirth: employee.placeOfBirth || "Not Provided",
+        countryOfOrigin: employee.countryOfOrigin || "Not Provided",
+        residentialStatus: employee.residentialStatus || "Not Provided",
+        fatherName: [employee.fatherFirstName, employee.fatherMiddleName, employee.fatherLastName].filter(Boolean).join(" ") || "Not Provided",
+        fatherDateOfBirth: employee.fatherDateOfBirth ? new Date(employee.fatherDateOfBirth).toLocaleDateString("en-IN") : null,
+        motherName: [employee.motherFirstName, employee.motherMiddleName, employee.motherLastName].filter(Boolean).join(" ") || "Not Provided",
+        isDirector: employee.isDirector ? "Yes" : "No",
+        isInternational: employee.isInternational ? "Yes" : "No",
+        isPhysicallyChallenged: employee.isPhysicallyChallenged ? "Yes" : "No",
         profilePhoto: employee.profilePhoto,
+        customFields: employee.personalCustomFields || [],
       },
       workInfo: {
         department: employee.department,
@@ -396,52 +476,69 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
         biometricId: employee.biometricId,
         identityId: employee.identityId,
         needsToOperate: employee.needsToOperate || false,
-        dateOfJoining: employee.dateOfJoining ? new Date(employee.dateOfJoining).toLocaleDateString() : "Not Provided",
+        dateOfJoining: employee.dateOfJoining ? new Date(employee.dateOfJoining).toLocaleDateString("en-IN") : "Not Provided",
+        confirmationDate: employee.confirmationDate ? new Date(employee.confirmationDate).toLocaleDateString("en-IN") : null,
+        probationPeriod: employee.probationPeriod ? `${employee.probationPeriod} months` : null,
         tenure: employee.dateOfJoining ? calculateTenure(employee.dateOfJoining) : null,
         employmentType: formatEmploymentType(employee.employmentType),
         workLocation: employee.workLocation || "GRAV Clothing",
-        status: employee.status ? employee.status.charAt(0).toUpperCase() + employee.status.slice(1) : "Active",
+        shift: employee.shift || "Not Assigned",
+        status: employee.status ? capitalize(employee.status) : "Active",
         isActive: employee.isActive ? "Yes" : "No",
+        customFields: employee.workCustomFields || [],
       },
       managers: {
         primary: employee.primaryManager
           ? {
-              managerId: employee.primaryManager.managerId?._id,
-              name: employee.primaryManager.managerName || (employee.primaryManager.managerId ? `${employee.primaryManager.managerId.firstName} ${employee.primaryManager.managerId.lastName}` : ""),
-              employeeId: employee.primaryManager.managerId?.employeeId,
-              department: employee.primaryManager.managerId?.department,
-              jobTitle: employee.primaryManager.managerId?.jobTitle,
-            }
+            managerId: employee.primaryManager.managerId?._id,
+            name: employee.primaryManager.managerName ||
+              [employee.primaryManager.managerId?.firstName, employee.primaryManager.managerId?.lastName].filter(Boolean).join(" "),
+            employeeId: employee.primaryManager.managerId?.biometricId,
+            department: employee.primaryManager.managerId?.department,
+            jobTitle: employee.primaryManager.managerId?.jobTitle,
+          }
           : null,
         secondary: employee.secondaryManager
           ? {
-              managerId: employee.secondaryManager.managerId?._id,
-              name: employee.secondaryManager.managerName || (employee.secondaryManager.managerId ? `${employee.secondaryManager.managerId.firstName} ${employee.secondaryManager.managerId.lastName}` : ""),
-              employeeId: employee.secondaryManager.managerId?.employeeId,
-              department: employee.secondaryManager.managerId?.department,
-              jobTitle: employee.secondaryManager.managerId?.jobTitle,
-            }
+            managerId: employee.secondaryManager.managerId?._id,
+            name: employee.secondaryManager.managerName ||
+              [employee.secondaryManager.managerId?.firstName, employee.secondaryManager.managerId?.lastName].filter(Boolean).join(" "),
+            employeeId: employee.secondaryManager.managerId?.biometricId,
+            department: employee.secondaryManager.managerId?.department,
+            jobTitle: employee.secondaryManager.managerId?.jobTitle,
+          }
           : null,
       },
       salaryInfo: {
-        basic: employee.salary?.basic ? `₹${employee.salary.basic.toLocaleString("en-IN")}` : "Not Provided",
-        allowances: employee.salary?.allowances ? `₹${employee.salary.allowances.toLocaleString("en-IN")}` : "₹0",
-        deductions: employee.salary?.deductions ? `₹${employee.salary.deductions.toLocaleString("en-IN")}` : "₹0",
-        netSalary: employee.salary?.netSalary ? `₹${employee.salary.netSalary.toLocaleString("en-IN")}` : "Not Provided",
+        gross: employee.salary?.gross ? `₹${employee.salary.gross.toLocaleString("en-IN")}` : "Not Provided",
+        // Legacy fields
+        basic: employee.salary?.basic ? `₹${employee.salary.basic.toLocaleString("en-IN")}` : null,
+        netSalary: employee.salary?.netSalary ? `₹${employee.salary.netSalary.toLocaleString("en-IN")}` : null,
+        customFields: employee.salaryCustomFields || [],
       },
       bankDetails: {
         bankName: employee.bankDetails?.bankName || "Not Provided",
         accountNumber: employee.bankDetails?.accountNumber ? `XXXX${employee.bankDetails.accountNumber.slice(-4)}` : "Not Provided",
         ifscCode: employee.bankDetails?.ifscCode || "Not Provided",
+        accountType: employee.bankDetails?.accountType ? capitalize(employee.bankDetails.accountType) : "Not Provided",
+        branchName: employee.bankDetails?.branchName || "Not Provided",
       },
       documents: {
-        aadharNumber: employee.documents?.aadharNumber || "Not Provided",
+        aadharNumber: employee.documents?.aadharNumber ? maskId(employee.documents.aadharNumber) : "Not Provided",
         panNumber: employee.documents?.panNumber || "Not Provided",
         uanNumber: employee.documents?.uanNumber || "Not Provided",
+        passportNumber: employee.documents?.passportNumber || "Not Provided",
+        voterIdNumber: employee.documents?.voterIdNumber || "Not Provided",
+        drivingLicenseNumber: employee.documents?.drivingLicenseNumber || "Not Provided",
+        esicNumber: employee.documents?.esicNumber || "Not Provided",
+        pfNumber: employee.documents?.pfNumber || "Not Provided",
         aadharFile: employee.documents?.aadharFile,
         panFile: employee.documents?.panFile,
         resumeFile: employee.documents?.resumeFile,
+        offerLetterFile: employee.documents?.offerLetterFile,
+        appointmentLetterFile: employee.documents?.appointmentLetterFile,
         additionalDocuments: employee.documents?.additionalDocuments || [],
+        customFields: employee.documentCustomFields || [],
       },
       address: {
         current: {
@@ -450,6 +547,7 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
           state: employee.address?.current?.state || "Not Provided",
           pincode: employee.address?.current?.pincode || "Not Provided",
           country: employee.address?.current?.country || "India",
+          ownershipType: employee.address?.current?.ownershipType || "Not Provided",
         },
         permanent: {
           street: employee.address?.permanent?.street || "Same as Current",
@@ -457,61 +555,58 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
           state: employee.address?.permanent?.state || "Same as Current",
           pincode: employee.address?.permanent?.pincode || "Same as Current",
           country: employee.address?.permanent?.country || "India",
+          ownershipType: employee.address?.permanent?.ownershipType || "Not Provided",
         },
+        customFields: employee.addressCustomFields || [],
       },
       systemInfo: {
         createdBy: employee.createdBy?.name || "HR System",
-        createdAt: employee.createdAt ? new Date(employee.createdAt).toLocaleDateString() : "Not Available",
-        updatedAt: employee.updatedAt ? new Date(employee.updatedAt).toLocaleDateString() : "Not Available",
+        createdAt: employee.createdAt ? new Date(employee.createdAt).toLocaleDateString("en-IN") : "N/A",
+        updatedAt: employee.updatedAt ? new Date(employee.updatedAt).toLocaleDateString("en-IN") : "N/A",
       },
       relatedData: {
-        teamMembers: teamMembers.map((member) => ({
-          id: member._id,
-          name: `${member.firstName} ${member.lastName}`,
-          employeeId: member.employeeId,
-          department: member.department,
-          jobTitle: member.jobTitle,
-          status: member.status,
+        teamMembers: teamMembers.map((m) => ({
+          id: m._id,
+          name: [m.firstName, m.lastName].filter(Boolean).join(" "),
+          employeeId: m.biometricId,
+          department: m.department,
+          jobTitle: m.jobTitle,
+          status: m.status,
         })),
         managerHierarchy,
         recentActivities,
       },
     };
 
-    res.status(200).json({ success: true, data: formattedEmployee });
+    res.status(200).json({ success: true, data: formatted });
   } catch (error) {
     console.error("Get employee details error:", error);
-    if (error.name === "CastError") {
-      return res.status(400).json({ success: false, message: "Invalid employee ID" });
-    }
+    if (error.name === "CastError") return res.status(400).json({ success: false, message: "Invalid employee ID" });
     res.status(500).json({ success: false, message: "Error fetching employee details" });
   }
 });
 
-// Get employees by department and designation (for manager selection)
+// ─── GET employees by dept + designation (manager picker) ─────────────────────
 router.get("/department/employees", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { departmentId, designation } = req.query;
-
     if (!departmentId || !designation) {
-      return res.status(400).json({ success: false, message: "Department ID and designation are required" });
+      return res.status(400).json({ success: false, message: "departmentId and designation required" });
     }
 
     const employees = await Employee.find({
-      departmentId: departmentId,
-      designation: designation,
-      status: "active",
-      isActive: true,
+      departmentId, designation, status: "active", isActive: true,
     })
-      .select("firstName lastName employeeId email phone department designation jobTitle profilePhoto")
+      .select("firstName middleName lastName biometricId identityId email phone department designation jobTitle profilePhoto")
       .sort({ firstName: 1 })
       .lean();
 
-    const formattedEmployees = employees.map((emp) => ({
+    const formatted = employees.map((emp) => ({
       id: emp._id,
-      employeeId: emp.employeeId || emp.biometricId,
-      name: `${emp.firstName || ""} ${emp.lastName || ""}`.trim(),
-      fullName: `${emp.firstName || ""} ${emp.lastName || ""}`.trim(),
+      employeeId: emp.biometricId || emp.identityId,
+      biometricId: emp.biometricId,
+      name: [emp.firstName, emp.lastName].filter(Boolean).join(" ").trim(),
+      fullName: [emp.firstName, emp.middleName, emp.lastName].filter(Boolean).join(" ").trim(),
       email: emp.email,
       phone: emp.phone,
       department: emp.department,
@@ -520,27 +615,23 @@ router.get("/department/employees", EmployeeAuthMiddlewear, async (req, res) => 
       profilePhoto: emp.profilePhoto,
     }));
 
-    res.status(200).json({ success: true, data: formattedEmployees, count: formattedEmployees.length });
+    res.status(200).json({ success: true, data: formatted, count: formatted.length });
   } catch (error) {
-    console.error("Get department employees error:", error);
+    console.error("Get dept employees error:", error);
     res.status(500).json({ success: false, message: "Error fetching employees" });
   }
 });
 
-// Delete employee (soft delete)
+// ─── SOFT DELETE ──────────────────────────────────────────────────────────────
 router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    const { id } = req.params;
-
     if (user.role !== "hr_manager") {
       return res.status(403).json({ success: false, message: "Only HR managers can delete employees" });
     }
 
-    const employee = await Employee.findById(id);
-    if (!employee) {
-      return res.status(404).json({ success: false, message: "Employee not found" });
-    }
+    const employee = await Employee.findById(req.params.id);
+    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
 
     employee.isActive = false;
     employee.status = "inactive";
@@ -549,75 +640,83 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     res.status(200).json({ success: true, message: "Employee deactivated successfully" });
   } catch (error) {
     console.error("Delete employee error:", error);
-    if (error.name === "CastError") {
-      return res.status(400).json({ success: false, message: "Invalid employee ID" });
-    }
+    if (error.name === "CastError") return res.status(400).json({ success: false, message: "Invalid employee ID" });
     res.status(500).json({ success: false, message: "Error deleting employee" });
   }
 });
 
-// Helper functions
-const calculateAge = (dateOfBirth) => {
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+const capitalize = (str) =>
+  str ? str.charAt(0).toUpperCase() + str.slice(1) : str;
+
+const maskId = (id) => {
+  if (!id || id.length < 4) return id;
+  return "XXXX XXXX " + id.slice(-4);
+};
+
+const calculateAge = (dob) => {
   const today = new Date();
-  const birthDate = new Date(dateOfBirth);
-  let age = today.getFullYear() - birthDate.getFullYear();
-  const monthDiff = today.getMonth() - birthDate.getMonth();
-  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) age--;
+  const birth = new Date(dob);
+  let age = today.getFullYear() - birth.getFullYear();
+  const m = today.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) age--;
   return age;
 };
 
 const calculateTenure = (dateOfJoining) => {
   const today = new Date();
-  const joiningDate = new Date(dateOfJoining);
-  let years = today.getFullYear() - joiningDate.getFullYear();
-  let months = today.getMonth() - joiningDate.getMonth();
+  const joining = new Date(dateOfJoining);
+  let years = today.getFullYear() - joining.getFullYear();
+  let months = today.getMonth() - joining.getMonth();
   if (months < 0) { years--; months += 12; }
   return { years, months };
 };
 
 const formatEmploymentType = (type) => {
-  const types = { full_time: "Full Time", part_time: "Part Time", contract: "Contract", intern: "Intern" };
-  return types[type] || type || "Not Provided";
+  const map = {
+    full_time: "Full Time",
+    part_time: "Part Time",
+    contract: "Contract",
+    intern: "Intern",
+  };
+  return map[type] || type || "Not Provided";
 };
 
 const getManagerHierarchy = async (employeeId) => {
   try {
     const hierarchy = [];
-    let currentEmployee = await Employee.findById(employeeId)
-      .select("primaryManager secondaryManager firstName lastName employeeId department")
-      .populate("primaryManager.managerId", "firstName lastName employeeId department")
+    let current = await Employee.findById(employeeId)
+      .select("primaryManager firstName lastName biometricId department")
+      .populate("primaryManager.managerId", "firstName lastName biometricId department")
       .lean();
-    let visited = new Set();
-    while (currentEmployee && !visited.has(currentEmployee._id.toString())) {
-      visited.add(currentEmployee._id.toString());
+    const visited = new Set();
+    while (current && !visited.has(current._id.toString())) {
+      visited.add(current._id.toString());
       hierarchy.push({
-        id: currentEmployee._id,
-        name: `${currentEmployee.firstName || ""} ${currentEmployee.lastName || ""}`.trim(),
-        employeeId: currentEmployee.employeeId,
-        department: currentEmployee.department,
+        id: current._id,
+        name: [current.firstName, current.lastName].filter(Boolean).join(" ").trim(),
+        employeeId: current.biometricId,
+        department: current.department,
         level: hierarchy.length + 1,
       });
-      if (currentEmployee.primaryManager?.managerId) {
-        currentEmployee = await Employee.findById(currentEmployee.primaryManager.managerId._id)
-          .select("primaryManager secondaryManager firstName lastName employeeId department")
-          .populate("primaryManager.managerId", "firstName lastName employeeId department")
+      if (current.primaryManager?.managerId) {
+        current = await Employee.findById(current.primaryManager.managerId._id)
+          .select("primaryManager firstName lastName biometricId department")
+          .populate("primaryManager.managerId", "firstName lastName biometricId department")
           .lean();
-      } else {
-        break;
-      }
+      } else break;
     }
     return hierarchy.reverse();
-  } catch (error) {
-    console.error("Error fetching manager hierarchy:", error);
+  } catch (e) {
+    console.error("Manager hierarchy error:", e);
     return [];
   }
 };
 
 const getRecentActivities = async (employeeId) => {
+  // Placeholder – integrate with an audit log collection if available
   return [
-    { id: 1, activity: "Profile updated", date: "2024-01-15", type: "update" },
-    { id: 2, activity: "Login from new device", date: "2024-01-14", type: "security" },
-    { id: 3, activity: "Salary credited", date: "2024-01-10", type: "salary" },
+    { id: 1, activity: "Profile updated", date: new Date().toLocaleDateString("en-IN"), type: "update" },
   ];
 };
 
