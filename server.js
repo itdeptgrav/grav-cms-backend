@@ -266,6 +266,9 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
+const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
+app.use("/api/cms", productOperations);
+
 /* ===================
   CMS ROUTES
 ===================== */
@@ -342,6 +345,12 @@ app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
 app.use("/api/cms/production/dashboard", productionDashboardRoutes);
+
+
+const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
+app.use("/api/cms/production/canvas-layout", productionMachineLayout);
+
+
 
 // In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
@@ -434,6 +443,11 @@ app.use("/api/cms/manufacturing/cutting-master", bulkCuttingRoutes);
 // Vendor Routes For Vendor Portal
 const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes"); // NEW FILE
 app.use("/api/vendor", vendorAuthRoutes);
+
+
+const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
+app.use("/api/barcode-devices", barcodeScannerRoutes);
+
 
 /* =====================
     HEALTH CHECK
@@ -552,3 +566,7 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Production sync service is active`);
 });
+
+
+
+
