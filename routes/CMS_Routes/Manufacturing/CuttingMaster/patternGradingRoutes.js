@@ -202,6 +202,8 @@ router.post(
         measureGroups,
         keyframes,
         seamEdges,
+        foldAxes,
+        viewportSlots,
         unitsPerInch,
         basePatternSize,
         configSnapshot,
@@ -227,12 +229,14 @@ router.post(
       }
 
       if (basePaths !== undefined) {
-        // Store original segments for rotation reference
         config.basePaths = basePaths.map((path) => ({
           ...path,
           originalSegs: path.segs.map(seg => ({ ...seg })),
           rotationAngle: path.rotationAngle || 0,
-          rotationPivot: path.rotationPivot || null
+          rotationPivot: path.rotationPivot || null,
+          // Mirror fields deprecated — always null now
+          mirrorSourceIdx: null,
+          mirrorFoldAxis: null,
         }));
       }
 
@@ -261,21 +265,67 @@ router.post(
           loosingEnabled: Boolean(g.loosingEnabled),
           loosingValueInches: Math.max(0, Number(g.loosingValueInches) || 0),
           conditionsFollowLoosing: Boolean(g.conditionsFollowLoosing),
-          nestedConditions: (g.nestedConditions || []).map((cond) => ({
-            id: String(cond.id || ""),
-            enabled: Boolean(cond.enabled !== false),
-            label: cond.label || "Condition",
-            operator: cond.operator || "greater_than",
-            compareGroupId: cond.compareGroupId || null,
-            compareValue: Number(cond.compareValue) || 0,
-            targetGroupId: cond.targetGroupId || null,
-            action: cond.action || "match_to_current",
-            actionValue: Number(cond.actionValue) || 0,
-            actionOperator: cond.actionOperator || "plus",
-            actionBaseGroupId: cond.actionBaseGroupId || null,
-            deriveSourceGroupId: cond.deriveSourceGroupId || null,
-            deriveOperator: cond.deriveOperator || "plus",
-          })),
+          nestedConditions: (g.nestedConditions || []).map((cond) => {
+            // Sanitize action — only allow known enum values, fall back to match_to_current
+            const VALID_ACTIONS = [
+              "match_to_current",
+              "match_to_current_offset",
+              "match_to_target",
+              "add_offset",
+              "subtract_offset",
+              "multiply_by",
+              "set_to_value",
+              "change_by_percent",
+              "change_by_ratio_of_trigger",
+              "derive_from_source",
+              "multi_group_expression",
+              "live_canvas_value",
+            ];
+            const safeAction = VALID_ACTIONS.includes(cond.action) ? cond.action : "match_to_current";
+            const VALID_OPS = ["plus", "minus", "multiply", "divide", "set"];
+            const safeDerive = VALID_OPS.includes(cond.deriveOperator) ? cond.deriveOperator : "plus";
+            return {
+              id: String(cond.id || ""),
+              enabled: Boolean(cond.enabled !== false),
+              label: cond.label || "Condition",
+              operator: cond.operator || "greater_than",
+              compareGroupId: cond.compareGroupId || null,
+              compareValue: Number(cond.compareValue) || 0,
+              targetGroupId: cond.targetGroupId || null,
+              action: safeAction,
+              actionValue: Number(cond.actionValue) || 0,
+              // Operator used by match_to_current_offset (plus / minus / multiply / divide)
+              matchOffsetOp: ["plus", "minus", "multiply", "divide"].includes(cond.matchOffsetOp)
+                ? cond.matchOffsetOp : "plus",
+              actionOperator: ["plus", "minus", "set", "multiply"].includes(cond.actionOperator)
+                ? cond.actionOperator : "plus",
+              actionBaseGroupId: cond.actionBaseGroupId || null,
+              deriveSourceGroupId: cond.deriveSourceGroupId || null,
+              deriveOperator: safeDerive,
+              // Multi-group expression fields
+              expressionGroups: (cond.expressionGroups || []).map(eg => ({
+                type: ["group", "constant"].includes(eg.type) ? eg.type : "group",
+                groupId: String(eg.groupId || ""),
+                operator: ["plus", "minus", "multiply", "divide"].includes(eg.operator)
+                  ? eg.operator : "plus",
+                constantValue: eg.constantValue !== undefined ? Number(eg.constantValue) : undefined,
+              })),
+              expressionOffset: cond.expressionOffset !== undefined ? Number(cond.expressionOffset) : 0,
+              expressionScalarOp: ["none", "plus", "minus", "multiply", "divide"].includes(cond.expressionScalarOp)
+                ? cond.expressionScalarOp : "none",
+              // Backward-compatibility old sum fields
+              sumGroupAId: cond.sumGroupAId || null,
+              sumGroupBId: cond.sumGroupBId || null,
+              sumOperator: ["plus", "minus", "multiply", "divide"].includes(cond.sumOperator)
+                ? cond.sumOperator : "plus",
+              sumOffsetValue: Number(cond.sumOffsetValue) || 0,
+              // Live canvas fields
+              liveSourceGroupId: cond.liveSourceGroupId || null,
+              liveOperator: ["plus", "minus", "multiply", "divide"].includes(cond.liveOperator)
+                ? cond.liveOperator : "plus",
+              liveOffsetValue: Number(cond.liveOffsetValue) || 0,
+            };
+          }),
         }));
       }
 
@@ -315,6 +365,30 @@ router.post(
         }));
       }
 
+      // ── Persist foldAxes ────────────────────────────────────
+      if (foldAxes !== undefined) {
+        console.log("Saving fold axes to DB:", foldAxes); // Debug log
+        config.foldAxes = (foldAxes || []).map((fa) => ({
+          clientId: String(fa.clientId || `fa-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`),
+          name: fa.name || "Fold Axis",
+          n1: {
+            pathIdx: Number(fa.n1?.pathIdx ?? 0),
+            segIdx: Number(fa.n1?.segIdx ?? 0),
+            x: fa.n1?.x !== undefined ? Number(fa.n1.x) : undefined,
+            y: fa.n1?.y !== undefined ? Number(fa.n1.y) : undefined,
+          },
+          n2: {
+            pathIdx: Number(fa.n2?.pathIdx ?? 0),
+            segIdx: Number(fa.n2?.segIdx ?? 0),
+            x: fa.n2?.x !== undefined ? Number(fa.n2.x) : undefined,
+            y: fa.n2?.y !== undefined ? Number(fa.n2.y) : undefined,
+          },
+          seamAllowanceInches: Number(fa.seamAllowanceInches) || 0,
+          foldPathIdx: fa.foldPathIdx !== undefined ? Number(fa.foldPathIdx) : (fa._foldPathIdx !== undefined ? Number(fa._foldPathIdx) : null),
+          axisExplicit: !!fa._axisExplicit || !!fa.axisExplicit,
+        }));
+      }
+
       if (unitsPerInch !== undefined) config.unitsPerInch = unitsPerInch;
       if (basePatternSize !== undefined) config.basePatternSize = basePatternSize;
 
@@ -329,6 +403,11 @@ router.post(
             y: parseFloat(vp.y) || 0,
           };
         }
+      }
+
+      // ── Persist viewport position slots (Ctrl+1..9) ───────
+      if (viewportSlots && typeof viewportSlots === "object") {
+        config.viewportSlots = viewportSlots;
       }
 
       // ── Persist global rotation ───────────────────────────
@@ -369,6 +448,7 @@ router.post(
   }
 );
 
+// ─── GET: Employee CAD data ───────────────────────────────────
 // ─── GET: Employee CAD data ───────────────────────────────────
 router.get(
   "/pattern-grading/employee/:employeeId/cad-data",
@@ -478,6 +558,35 @@ router.get(
           outwardSign: se.outwardSign || 1,
         }));
 
+      // ── FIX: Always include foldAxes, even if empty array ────────────────
+      let foldAxesOut = [];
+      if (patternConfig && patternConfig.foldAxes && patternConfig.foldAxes.length > 0) {
+        foldAxesOut = patternConfig.foldAxes.map((fa) => ({
+          id: fa.clientId || fa._id?.toString(),
+          clientId: fa.clientId || fa._id?.toString(),
+          name: fa.name || "Fold Axis",
+          n1: {
+            pathIdx: fa.n1.pathIdx,
+            segIdx: fa.n1.segIdx,
+            x: fa.n1.x,
+            y: fa.n1.y
+          },
+          n2: {
+            pathIdx: fa.n2.pathIdx,
+            segIdx: fa.n2.segIdx,
+            x: fa.n2.x,
+            y: fa.n2.y
+          },
+          seamN1: fa.seamN1 || null,
+          seamN2: fa.seamN2 || null,
+          seamAllowanceInches: fa.seamAllowanceInches || 0,
+          foldPathIdx: fa.foldPathIdx ?? fa.n1?.pathIdx ?? 0,
+          axisExplicit: !!fa.axisExplicit,
+        }));
+      }
+
+      console.log(`Sending ${foldAxesOut.length} fold axes to cutting master`); // Debug log
+
       res.json({
         success: true,
         workOrder: {
@@ -495,6 +604,9 @@ router.get(
         patternConfig: patternConfig || null,
         computedGroupTargets,
         seamEdges,
+        foldAxes: foldAxesOut, // Always send this, even if empty
+        hasFoldAxes: foldAxesOut.length > 0,
+        viewportSlots: patternConfig?.viewportSlots || {}, // Named viewport positions
         globalRotation: patternConfig?.globalRotation || { angle: 0, pivotX: 0, pivotY: 0 },
         hasPatternConfig: !!patternConfig,
         hasSVGFile: !!patternConfig?.svgFileUrl,
@@ -509,6 +621,115 @@ router.get(
     }
   }
 );
+
+// ─── GET: Fetch keyboard shortcuts + pattern settings for a stock item ───────
+router.get("/pattern-grading/stock-item/:stockItemId/settings", async (req, res) => {
+  try {
+    const { stockItemId } = req.params;
+    const config = await PatternGradingConfig.findOne({ stockItemId, isActive: true })
+      .select("keyboardShortcuts patternTitle patternDescription patternNotes patternTags patternRevision patternDesigner stockItemName stockItemReference updatedAt")
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    if (!config) {
+      return res.json({ success: true, settings: null, keyboardShortcuts: {} });
+    }
+
+    res.json({
+      success: true,
+      settings: {
+        patternTitle: config.patternTitle || "",
+        patternDescription: config.patternDescription || "",
+        patternNotes: config.patternNotes || "",
+        patternTags: config.patternTags || [],
+        patternRevision: config.patternRevision || "1.0",
+        patternDesigner: config.patternDesigner || "",
+        stockItemName: config.stockItemName || "",
+        stockItemReference: config.stockItemReference || "",
+        updatedAt: config.updatedAt,
+      },
+      keyboardShortcuts: config.keyboardShortcuts || {},
+    });
+  } catch (error) {
+    console.error("Error fetching pattern settings:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─── POST: Save keyboard shortcuts + pattern settings for a stock item ────────
+router.post("/pattern-grading/stock-item/:stockItemId/settings", async (req, res) => {
+  try {
+    const { stockItemId } = req.params;
+    const {
+      keyboardShortcuts,
+      patternTitle,
+      patternDescription,
+      patternNotes,
+      patternTags,
+      patternRevision,
+      patternDesigner,
+    } = req.body;
+
+    const update = {};
+
+    if (keyboardShortcuts !== undefined) {
+      // Validate each shortcut entry
+      const sanitized = {};
+      for (const [actionId, binding] of Object.entries(keyboardShortcuts)) {
+        if (typeof binding === "object" && binding !== null) {
+          sanitized[actionId] = {
+            key: typeof binding.key === "string" ? binding.key : "",
+            ctrl: !!binding.ctrl,
+            shift: !!binding.shift,
+            alt: !!binding.alt,
+            meta: !!binding.meta,
+            label: typeof binding.label === "string" ? binding.label : actionId,
+            category: typeof binding.category === "string" ? binding.category : "general",
+            mouseButton: binding.mouseButton !== undefined ? Number(binding.mouseButton) : null,
+          };
+        }
+      }
+      update.keyboardShortcuts = sanitized;
+    }
+
+    if (patternTitle !== undefined) update.patternTitle = String(patternTitle).trim().slice(0, 200);
+    if (patternDescription !== undefined) update.patternDescription = String(patternDescription).trim().slice(0, 2000);
+    if (patternNotes !== undefined) update.patternNotes = String(patternNotes).trim().slice(0, 5000);
+    if (patternTags !== undefined) update.patternTags = Array.isArray(patternTags) ? patternTags.map(t => String(t).trim()).filter(Boolean).slice(0, 20) : [];
+    if (patternRevision !== undefined) update.patternRevision = String(patternRevision).trim().slice(0, 50);
+    if (patternDesigner !== undefined) update.patternDesigner = String(patternDesigner).trim().slice(0, 100);
+
+    update.lastConfiguredBy = req.user.id;
+    update.lastConfiguredAt = new Date();
+
+    const config = await PatternGradingConfig.findOneAndUpdate(
+      { stockItemId, isActive: true },
+      { $set: update },
+      { new: true, sort: { updatedAt: -1 } }
+    );
+
+    if (!config) {
+      return res.status(404).json({ success: false, message: "Pattern config not found — save the pattern first" });
+    }
+
+    res.json({
+      success: true,
+      message: "Settings saved successfully",
+      keyboardShortcuts: config.keyboardShortcuts || {},
+      settings: {
+        patternTitle: config.patternTitle,
+        patternDescription: config.patternDescription,
+        patternNotes: config.patternNotes,
+        patternTags: config.patternTags,
+        patternRevision: config.patternRevision,
+        patternDesigner: config.patternDesigner,
+      },
+    });
+  } catch (error) {
+    console.error("Error saving pattern settings:", error);
+    res.status(500).json({ success: false, message: "Server error: " + error.message });
+  }
+});
 
 // ─── GET: List all pattern configs ───────────────────────────
 router.get("/pattern-grading/configs", async (req, res) => {
