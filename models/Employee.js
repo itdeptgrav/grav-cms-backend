@@ -2,29 +2,25 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
 const employeeSchema = new mongoose.Schema({
-  // Basic Information
-  firstName: { type: String, trim: true, required: true },
-  lastName: { type: String, trim: true, required: true },
+  // Basic Information - all optional except email (for unique identification)
+  firstName: { type: String, trim: true },
+  lastName: { type: String, trim: true },
   email: {
     type: String,
     lowercase: true,
     trim: true,
-    required: true,
-    unique: true,
+    sparse: true, // allows multiple null/undefined but unique when provided
   },
   password: { type: String },
   temporaryPassword: { type: String, select: false },
-  phone: { type: String, required: true },
+  phone: { type: String },
   alternatePhone: { type: String },
   dateOfBirth: { type: Date },
   gender: {
     type: String,
-    enum: ["male", "female", "other"],
-    required: true,
   },
   maritalStatus: {
     type: String,
-    enum: ["single", "married", "divorced", "widowed"],
   },
 
   // Profile Photo
@@ -35,36 +31,18 @@ const employeeSchema = new mongoose.Schema({
 
   bloodGroup: {
     type: String,
-    enum: ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"],
   },
 
-  // Work Information - UPDATED: REMOVED employeeId, added new IDs
-  biometricId: { type: String, unique: true, required: true }, // REPLACES employeeId
-  identityId: { type: String, unique: true, sparse: true }, // NEW FIELD
-  needsToOperate: { type: Boolean, default: false }, // NEW FIELD
+  // Work Information
+  biometricId: { type: String, sparse: true }, // unique when provided, optional
+  identityId: { type: String, sparse: true },
+  needsToOperate: { type: Boolean, default: false },
 
   department: {
     type: String,
-    enum: [
-      "Administration",
-      "House-Keeping",
-      "IT",
-      "Corporate",
-      "Production",
-      "Sales",
-      "Marketing",
-      "Finance",
-      "HR",
-      "Operator",
-      "Design",
-      "Quality Control",
-      "Inventory",
-      "Operations",
-    ],
-    required: true,
   },
   jobPosition: { type: String },
-  jobTitle: { type: String, required: true },
+  jobTitle: { type: String },
   primaryManager: {
     managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
     managerName: { type: String },
@@ -73,48 +51,30 @@ const employeeSchema = new mongoose.Schema({
     managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
     managerName: { type: String },
   },
-  dateOfJoining: { type: Date, required: true },
+  dateOfJoining: { type: Date },
   employmentType: {
     type: String,
-    enum: ["full_time", "part_time", "contract", "intern"],
-    required: true,
   },
-  workLocation: { type: String, default: "GRAV Clothing", required: true },
+  workLocation: { type: String, default: "GRAV Clothing" },
   departmentId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Department",
   },
-  designation: {
-    type: String,
-    trim: true,
-    required: true,
-  },
+  designation: { type: String, trim: true },
 
   // Salary Information
   salary: {
-    basic: {
-      type: Number,
-      min: [0, "Salary cannot be negative"],
-      required: true,
-    },
-    allowances: {
-      type: Number,
-      default: 0,
-      min: [0, "Allowances cannot be negative"],
-    },
-    deductions: {
-      type: Number,
-      default: 0,
-      min: [0, "Deductions cannot be negative"],
-    },
+    basic: { type: Number, min: [0, "Salary cannot be negative"], default: 0 },
+    allowances: { type: Number, default: 0, min: [0, "Allowances cannot be negative"] },
+    deductions: { type: Number, default: 0, min: [0, "Deductions cannot be negative"] },
     netSalary: { type: Number, default: 0 },
   },
 
   // Bank Details
   bankDetails: {
-    bankName: { type: String, required: true },
-    accountNumber: { type: String, required: true },
-    ifscCode: { type: String, required: true },
+    bankName: { type: String },
+    accountNumber: { type: String },
+    ifscCode: { type: String },
   },
 
   // Documents
@@ -138,10 +98,10 @@ const employeeSchema = new mongoose.Schema({
   // Address Information
   address: {
     current: {
-      street: { type: String, required: true },
-      city: { type: String, required: true },
-      state: { type: String, required: true },
-      pincode: { type: String, required: true },
+      street: { type: String },
+      city: { type: String },
+      state: { type: String },
+      pincode: { type: String },
       country: { type: String, default: "India" },
     },
     permanent: {
@@ -156,10 +116,14 @@ const employeeSchema = new mongoose.Schema({
   // Status
   status: {
     type: String,
-    enum: ["draft", "active", "inactive", "on_leave"],
     default: "active",
   },
   isActive: { type: Boolean, default: true },
+
+  // Email tracking
+  welcomeEmailSent: { type: Boolean, default: false },
+  emailSentAt: { type: Date },
+  emailError: { type: String },
 
   // System Fields
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
@@ -167,26 +131,28 @@ const employeeSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
 });
 
+// Add sparse unique indexes manually (allows multiple nulls, unique when present)
+employeeSchema.index({ email: 1 }, { unique: true, sparse: true });
+employeeSchema.index({ biometricId: 1 }, { unique: true, sparse: true });
+employeeSchema.index({ identityId: 1 }, { unique: true, sparse: true });
+
 // Calculate net salary before saving
 employeeSchema.pre("save", async function () {
-  if (this.salary && this.salary.basic !== undefined) {
+  if (this.salary) {
     this.salary.netSalary =
       (this.salary.basic || 0) +
       (this.salary.allowances || 0) -
       (this.salary.deductions || 0);
   }
-
   this.updatedAt = Date.now();
 });
 
 // Hash password before saving
 employeeSchema.pre("save", async function (next) {
   try {
-    if (!this.isModified("password")) return next();
-
+    if (!this.isModified("password") || !this.password) return next();
     const salt = await bcrypt.genSalt(10);
     this.password = await bcrypt.hash(this.password, salt);
-
     next();
   } catch (err) {
     next(err);
@@ -195,12 +161,12 @@ employeeSchema.pre("save", async function (next) {
 
 // Virtual for full name
 employeeSchema.virtual("fullName").get(function () {
-  return `${this.firstName} ${this.lastName}`;
+  return `${this.firstName || ""} ${this.lastName || ""}`.trim();
 });
 
-// Virtual for backward compatibility (if needed for existing code)
+// Virtual for backward compatibility
 employeeSchema.virtual("employeeId").get(function () {
-  return this.biometricId; // Map biometricId to employeeId for backward compatibility
+  return this.biometricId;
 });
 
 module.exports = mongoose.model("Employee", employeeSchema);

@@ -7,7 +7,7 @@ const emailService = require("../../services/emailService");
 
 require("dotenv").config();
 
-// CREATE new employee - UPDATED for Cloudinary URLs from frontend
+// CREATE new employee - No required field validation, accept whatever is provided
 router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
@@ -16,89 +16,48 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     // Generate a temporary password for the employee
     const temporaryPassword = Math.random().toString(36).slice(-8);
 
-    // Validate required IDs
-    if (!employeeData.biometricId) {
-      return res.status(400).json({
-        success: false,
-        message: "Biometric ID is required",
-      });
-    }
-
-    // Create employee with the new fields
+    // Create employee with whatever data was provided
     const newEmployee = new Employee({
       ...employeeData,
-
-      // ✅ send plain password here (schema will hash automatically)
       password: temporaryPassword,
       temporaryPassword: temporaryPassword,
-
       createdBy: user.id,
       createdAt: new Date(),
     });
 
     await newEmployee.save();
+
     // Send welcome email asynchronously (only if email service is enabled)
     if (process.env.ENABLE_EMAILS === "true" && employeeData.email) {
       try {
         const emailData = {
-          name: `${employeeData.firstName} ${employeeData.lastName}`,
+          name: `${employeeData.firstName || ""} ${employeeData.lastName || ""}`.trim() || "Employee",
           email: employeeData.email,
-          employeeId: employeeData.employeeId,
+          employeeId: employeeData.biometricId,
           department: employeeData.department,
           designation: employeeData.designation || employeeData.jobPosition,
           temporaryPassword: temporaryPassword,
         };
 
-        // Send email in background
         emailService
           .sendWelcomeEmail(emailData)
-          .then((result) => {
-            console.log(
-              `✅ Welcome email sent successfully to ${employeeData.email}`,
-            );
-
-            // Update employee record with email sent status
-            Employee.findByIdAndUpdate(
-              newEmployee._id,
-              {
-                $set: {
-                  welcomeEmailSent: true,
-                  emailSentAt: new Date(),
-                  temporaryPassword: null, // Clear temporary password after email is sent
-                },
-              },
-              { new: true },
-            ).catch((updateErr) => {
-              console.error("Error updating email status:", updateErr);
-            });
+          .then(() => {
+            console.log(`✅ Welcome email sent to ${employeeData.email}`);
+            Employee.findByIdAndUpdate(newEmployee._id, {
+              $set: { welcomeEmailSent: true, emailSentAt: new Date(), temporaryPassword: null },
+            }).catch((err) => console.error("Error updating email status:", err));
           })
           .catch((emailError) => {
-            console.error(
-              `❌ Failed to send email to ${employeeData.email}:`,
-              emailError.message,
-            );
-
-            // Log the error but don't fail the employee creation
-            Employee.findByIdAndUpdate(
-              newEmployee._id,
-              {
-                $set: {
-                  welcomeEmailSent: false,
-                  emailError: emailError.message,
-                },
-              },
-              { new: true },
-            ).catch((updateErr) => {
-              console.error("Error updating email error status:", updateErr);
-            });
+            console.error(`❌ Failed to send email to ${employeeData.email}:`, emailError.message);
+            Employee.findByIdAndUpdate(newEmployee._id, {
+              $set: { welcomeEmailSent: false, emailError: emailError.message },
+            }).catch((err) => console.error("Error updating email error status:", err));
           });
       } catch (emailError) {
         console.error("Error in email sending process:", emailError);
-        // Don't throw error - employee should still be created
       }
     }
 
-    // Remove sensitive data from response
     const employeeResponse = newEmployee.toObject();
     delete employeeResponse.password;
     delete employeeResponse.temporaryPassword;
@@ -125,7 +84,7 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
       const field = Object.keys(error.keyPattern)[0];
       return res.status(400).json({
         success: false,
-        message: `${field} already exists`,
+        message: `${field} already exists. Please use a different value.`,
       });
     }
 
@@ -137,22 +96,13 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
-// UPDATE employee - UPDATED for Cloudinary URLs from frontend
+// UPDATE employee
 router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     const { id } = req.params;
     const updateData = req.body;
 
-    console.log("Updating employee with Cloudinary URLs:", {
-      employeeId: id,
-      hasProfilePhoto: !!updateData.profilePhoto,
-      profilePhotoType: updateData.profilePhoto?.url
-        ? "Cloudinary URL"
-        : "Other",
-    });
-
-    // Check if user has HR role or is updating their own profile
     const canUpdate = user.role === "hr_manager" || user.id === id;
     if (!canUpdate) {
       return res.status(403).json({
@@ -161,94 +111,41 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       });
     }
 
-    // Clean up profile photo data if it's a base64 string
+    // Clean up base64 profile photo
     if (
       updateData.profilePhoto &&
       typeof updateData.profilePhoto === "string" &&
       updateData.profilePhoto.startsWith("data:image")
     ) {
-      console.log(
-        "Warning: Received base64 profile photo in update. Frontend should upload to Cloudinary.",
-      );
       delete updateData.profilePhoto;
     }
 
-    // Clean up document URLs if they contain base64 data
+    // Clean up base64 document files
     if (updateData.documents) {
-      // Clean Aadhar file
-      if (
-        updateData.documents.aadharFile &&
-        typeof updateData.documents.aadharFile === "string" &&
-        updateData.documents.aadharFile.startsWith("data:image")
-      ) {
-        console.log("Warning: Received base64 Aadhar file in update.");
-        delete updateData.documents.aadharFile;
-      }
+      ["aadharFile", "panFile", "resumeFile"].forEach((field) => {
+        if (
+          updateData.documents[field] &&
+          typeof updateData.documents[field] === "string" &&
+          updateData.documents[field].startsWith("data:image")
+        ) {
+          delete updateData.documents[field];
+        }
+      });
 
-      // Clean PAN file
-      if (
-        updateData.documents.panFile &&
-        typeof updateData.documents.panFile === "string" &&
-        updateData.documents.panFile.startsWith("data:image")
-      ) {
-        console.log("Warning: Received base64 PAN file in update.");
-        delete updateData.documents.panFile;
-      }
-
-      // Clean resume file
-      if (
-        updateData.documents.resumeFile &&
-        typeof updateData.documents.resumeFile === "string" &&
-        updateData.documents.resumeFile.startsWith("data:image")
-      ) {
-        console.log("Warning: Received base64 resume file in update.");
-        delete updateData.documents.resumeFile;
-      }
-
-      // Clean additional documents
       if (updateData.documents.additionalDocuments) {
-        updateData.documents.additionalDocuments =
-          updateData.documents.additionalDocuments.filter((doc) => {
-            if (
-              doc.url &&
-              typeof doc.url === "string" &&
-              doc.url.startsWith("data:image")
-            ) {
-              console.log(
-                "Warning: Filtered out base64 additional document in update:",
-                doc.title,
-              );
-              return false;
-            }
-            return true;
-          });
+        updateData.documents.additionalDocuments = updateData.documents.additionalDocuments.filter(
+          (doc) => !(doc.url && typeof doc.url === "string" && doc.url.startsWith("data:image"))
+        );
       }
     }
 
     // Fields that should not be updated via this endpoint
-    const restrictedFields = [
-      "employeeId",
-      "email",
-      "password",
-      "temporaryPassword",
-      "createdBy",
-      "createdAt",
-    ];
-
-    // Remove restricted fields
-    restrictedFields.forEach((field) => {
-      delete updateData[field];
-    });
-
-    // Preserve existing password if not provided
-    if (updateData.password) {
-      // Only allow password updates through dedicated endpoint
-      delete updateData.password;
-    }
+    const restrictedFields = ["email", "password", "temporaryPassword", "createdBy", "createdAt"];
+    restrictedFields.forEach((field) => delete updateData[field]);
 
     const updatedEmployee = await Employee.findByIdAndUpdate(id, updateData, {
       new: true,
-      runValidators: true,
+      runValidators: false, // Don't run validators on update to allow partial data
     }).select("-password -temporaryPassword -__v");
 
     if (!updatedEmployee) {
@@ -278,7 +175,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     if (error.code === 11000) {
       return res.status(400).json({
         success: false,
-        message: "Duplicate key error",
+        message: "Duplicate key error - a value you entered already exists",
       });
     }
 
@@ -296,87 +193,44 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
-// UPDATE EMPLOYEE DOCUMENTS ONLY (for adding/updating documents separately)
+// UPDATE EMPLOYEE DOCUMENTS ONLY
 router.patch("/:id/documents", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     const { id } = req.params;
     const { documents } = req.body;
 
-    // Check permissions
     const canUpdate = user.role === "hr_manager" || user.id === id;
     if (!canUpdate) {
-      return res.status(403).json({
-        success: false,
-        message: "You don't have permission to update documents",
-      });
+      return res.status(403).json({ success: false, message: "You don't have permission to update documents" });
     }
 
-    // Clean base64 data from documents
     const cleanDocuments = { ...documents };
-
-    if (
-      cleanDocuments.aadharFile &&
-      typeof cleanDocuments.aadharFile === "string" &&
-      cleanDocuments.aadharFile.startsWith("data:image")
-    ) {
-      delete cleanDocuments.aadharFile;
-    }
-
-    if (
-      cleanDocuments.panFile &&
-      typeof cleanDocuments.panFile === "string" &&
-      cleanDocuments.panFile.startsWith("data:image")
-    ) {
-      delete cleanDocuments.panFile;
-    }
-
-    if (
-      cleanDocuments.resumeFile &&
-      typeof cleanDocuments.resumeFile === "string" &&
-      cleanDocuments.resumeFile.startsWith("data:image")
-    ) {
-      delete cleanDocuments.resumeFile;
-    }
-
+    ["aadharFile", "panFile", "resumeFile"].forEach((field) => {
+      if (cleanDocuments[field] && typeof cleanDocuments[field] === "string" && cleanDocuments[field].startsWith("data:image")) {
+        delete cleanDocuments[field];
+      }
+    });
     if (cleanDocuments.additionalDocuments) {
-      cleanDocuments.additionalDocuments =
-        cleanDocuments.additionalDocuments.filter((doc) => {
-          return !(
-            doc.url &&
-            typeof doc.url === "string" &&
-            doc.url.startsWith("data:image")
-          );
-        });
+      cleanDocuments.additionalDocuments = cleanDocuments.additionalDocuments.filter(
+        (doc) => !(doc.url && typeof doc.url === "string" && doc.url.startsWith("data:image"))
+      );
     }
 
     const updatedEmployee = await Employee.findByIdAndUpdate(
       id,
       { $set: { documents: cleanDocuments } },
-      {
-        new: true,
-        runValidators: true,
-      },
+      { new: true, runValidators: false }
     ).select("documents firstName lastName employeeId");
 
     if (!updatedEmployee) {
-      return res.status(404).json({
-        success: false,
-        message: "Employee not found",
-      });
+      return res.status(404).json({ success: false, message: "Employee not found" });
     }
 
-    res.status(200).json({
-      success: true,
-      message: "Documents updated successfully",
-      data: updatedEmployee.documents,
-    });
+    res.status(200).json({ success: true, message: "Documents updated successfully", data: updatedEmployee.documents });
   } catch (error) {
     console.error("Update documents error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error updating documents",
-    });
+    res.status(500).json({ success: false, message: "Error updating documents" });
   }
 });
 
@@ -387,81 +241,44 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
     const { id } = req.params;
     const { profilePhoto } = req.body;
 
-    // Check permissions
     const canUpdate = user.role === "hr_manager" || user.id === id;
     if (!canUpdate) {
-      return res.status(403).json({
-        success: false,
-        message: "You don't have permission to update profile photo",
-      });
+      return res.status(403).json({ success: false, message: "You don't have permission to update profile photo" });
     }
 
-    // Validate profile photo is a Cloudinary URL object
     if (!profilePhoto || !profilePhoto.url || !profilePhoto.publicId) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid profile photo with URL and publicId is required",
-      });
+      return res.status(400).json({ success: false, message: "Valid profile photo with URL and publicId is required" });
     }
 
-    // Ensure it's not base64
-    if (
-      typeof profilePhoto.url === "string" &&
-      profilePhoto.url.startsWith("data:image")
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Profile photo must be uploaded to Cloudinary first",
-      });
+    if (typeof profilePhoto.url === "string" && profilePhoto.url.startsWith("data:image")) {
+      return res.status(400).json({ success: false, message: "Profile photo must be uploaded to Cloudinary first" });
     }
 
     const updatedEmployee = await Employee.findByIdAndUpdate(
       id,
       { $set: { profilePhoto } },
-      {
-        new: true,
-        runValidators: true,
-      },
+      { new: true, runValidators: false }
     ).select("profilePhoto firstName lastName employeeId");
 
     if (!updatedEmployee) {
-      return res.status(404).json({
-        success: false,
-        message: "Employee not found",
-      });
+      return res.status(404).json({ success: false, message: "Employee not found" });
     }
 
-    res.status(200).json({
-      success: true,
-      message: "Profile photo updated successfully",
-      data: updatedEmployee.profilePhoto,
-    });
+    res.status(200).json({ success: true, message: "Profile photo updated successfully", data: updatedEmployee.profilePhoto });
   } catch (error) {
     console.error("Update profile photo error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error updating profile photo",
-    });
+    res.status(500).json({ success: false, message: "Error updating profile photo" });
   }
 });
 
-// Get all employees (with pagination and filters) - REMAINS THE SAME
+// Get all employees (with pagination and filters)
 router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    const { user } = req;
     const { page = 1, limit = 10, department, status, search } = req.query;
 
-    // Build filter query
     let filter = {};
-
-    if (department && department !== "all") {
-      filter.department = department;
-    }
-
-    if (status && status !== "all") {
-      filter.status = status;
-    }
-
+    if (department && department !== "all") filter.department = department;
+    if (status && status !== "all") filter.status = status;
     if (search) {
       filter.$or = [
         { firstName: { $regex: search, $options: "i" } },
@@ -472,10 +289,7 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
       ];
     }
 
-    // Calculate pagination
     const skip = (page - 1) * limit;
-
-    // Get employees with pagination
     const employees = await Employee.find(filter)
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -483,11 +297,9 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
       .select("-password -temporaryPassword -__v")
       .lean();
 
-    // Get total count for pagination
     const total = await Employee.countDocuments(filter);
     const totalPages = Math.ceil(total / limit);
 
-    // Get department statistics
     const departmentStats = await Employee.aggregate([
       { $group: { _id: "$department", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
@@ -504,18 +316,12 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
           hasNextPage: page < totalPages,
           hasPrevPage: page > 1,
         },
-        stats: {
-          total,
-          departmentStats,
-        },
+        stats: { total, departmentStats },
       },
     });
   } catch (error) {
     console.error("Get employees error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error fetching employees",
-    });
+    res.status(500).json({ success: false, message: "Error fetching employees" });
   }
 });
 
@@ -523,148 +329,85 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
 router.get("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { id } = req.params;
-
-    const employee = await Employee.findById(id)
-      .select("-password -temporaryPassword -__v")
-      .lean();
-
+    const employee = await Employee.findById(id).select("-password -temporaryPassword -__v").lean();
     if (!employee) {
-      return res.status(404).json({
-        success: false,
-        message: "Employee not found",
-      });
+      return res.status(404).json({ success: false, message: "Employee not found" });
     }
-
-    res.status(200).json({
-      success: true,
-      data: employee,
-    });
+    res.status(200).json({ success: true, data: employee });
   } catch (error) {
     console.error("Get employee error:", error);
-
     if (error.name === "CastError") {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid employee ID",
-      });
+      return res.status(400).json({ success: false, message: "Invalid employee ID" });
     }
-
-    res.status(500).json({
-      success: false,
-      message: "Error fetching employee",
-    });
+    res.status(500).json({ success: false, message: "Error fetching employee" });
   }
 });
 
-// Get single employee with detailed information - REMAINS THE SAME
+// Get single employee with detailed information
 router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Fetch employee with detailed information
     const employee = await Employee.findById(id)
       .select("-password -temporaryPassword -__v")
       .populate("departmentId", "name designations managers")
-      .populate(
-        "primaryManager.managerId",
-        "firstName lastName employeeId department jobTitle",
-      )
-      .populate(
-        "secondaryManager.managerId",
-        "firstName lastName employeeId department jobTitle",
-      )
+      .populate("primaryManager.managerId", "firstName lastName employeeId department jobTitle")
+      .populate("secondaryManager.managerId", "firstName lastName employeeId department jobTitle")
       .populate("createdBy", "name email")
       .lean();
 
     if (!employee) {
-      return res.status(404).json({
-        success: false,
-        message: "Employee not found",
-      });
+      return res.status(404).json({ success: false, message: "Employee not found" });
     }
 
-    // Fetch related data (managers, team members, etc.)
-    const [teamMembers, managerHierarchy, recentActivities] = await Promise.all(
-      [
-        // Get team members reporting to this employee
-        Employee.find({
-          $or: [
-            { "primaryManager.managerId": id },
-            { "secondaryManager.managerId": id },
-          ],
-        })
-          .select("firstName lastName employeeId department jobTitle status")
-          .limit(5)
-          .lean(),
+    const [teamMembers, managerHierarchy, recentActivities] = await Promise.all([
+      Employee.find({
+        $or: [{ "primaryManager.managerId": id }, { "secondaryManager.managerId": id }],
+      })
+        .select("firstName lastName employeeId department jobTitle status")
+        .limit(5)
+        .lean(),
+      getManagerHierarchy(id),
+      getRecentActivities(id),
+    ]);
 
-        // Get manager hierarchy
-        getManagerHierarchy(id),
-
-        // Get recent activities (you can integrate with activity log system)
-        getRecentActivities(id),
-      ],
-    );
-
-    // Format the response
     const formattedEmployee = {
-      // Basic Information
       basicInfo: {
         id: employee._id,
-        biometricId: employee.biometricId, // CHANGED from employeeId to biometricId
-        identityId: employee.identityId, // NEW
+        biometricId: employee.biometricId,
+        identityId: employee.identityId,
         firstName: employee.firstName,
         lastName: employee.lastName,
-        fullName: `${employee.firstName} ${employee.lastName}`,
+        fullName: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
         email: employee.email,
         phone: employee.phone,
         alternatePhone: employee.alternatePhone || "Not Provided",
-        dateOfBirth: employee.dateOfBirth
-          ? new Date(employee.dateOfBirth).toLocaleDateString()
-          : "Not Provided",
+        dateOfBirth: employee.dateOfBirth ? new Date(employee.dateOfBirth).toLocaleDateString() : "Not Provided",
         age: employee.dateOfBirth ? calculateAge(employee.dateOfBirth) : null,
-        gender: employee.gender
-          ? employee.gender.charAt(0).toUpperCase() + employee.gender.slice(1)
-          : "Not Provided",
-        maritalStatus: employee.maritalStatus
-          ? employee.maritalStatus.charAt(0).toUpperCase() +
-            employee.maritalStatus.slice(1)
-          : "Not Provided",
+        gender: employee.gender ? employee.gender.charAt(0).toUpperCase() + employee.gender.slice(1) : "Not Provided",
+        maritalStatus: employee.maritalStatus ? employee.maritalStatus.charAt(0).toUpperCase() + employee.maritalStatus.slice(1) : "Not Provided",
         profilePhoto: employee.profilePhoto,
       },
-
-      // Work Information
       workInfo: {
         department: employee.department,
         departmentId: employee.departmentId,
         designation: employee.designation || employee.jobPosition,
         jobTitle: employee.jobTitle,
-        biometricId: employee.biometricId, // CHANGED
-        identityId: employee.identityId, // NEW
-        needsToOperate: employee.needsToOperate || false, // NEW
-        dateOfJoining: employee.dateOfJoining
-          ? new Date(employee.dateOfJoining).toLocaleDateString()
-          : "Not Provided",
-        tenure: employee.dateOfJoining
-          ? calculateTenure(employee.dateOfJoining)
-          : null,
+        biometricId: employee.biometricId,
+        identityId: employee.identityId,
+        needsToOperate: employee.needsToOperate || false,
+        dateOfJoining: employee.dateOfJoining ? new Date(employee.dateOfJoining).toLocaleDateString() : "Not Provided",
+        tenure: employee.dateOfJoining ? calculateTenure(employee.dateOfJoining) : null,
         employmentType: formatEmploymentType(employee.employmentType),
         workLocation: employee.workLocation || "GRAV Clothing",
-        status: employee.status
-          ? employee.status.charAt(0).toUpperCase() + employee.status.slice(1)
-          : "Active",
+        status: employee.status ? employee.status.charAt(0).toUpperCase() + employee.status.slice(1) : "Active",
         isActive: employee.isActive ? "Yes" : "No",
       },
-
-      // Managers Information
       managers: {
         primary: employee.primaryManager
           ? {
               managerId: employee.primaryManager.managerId?._id,
-              name:
-                employee.primaryManager.managerName ||
-                (employee.primaryManager.managerId
-                  ? `${employee.primaryManager.managerId.firstName} ${employee.primaryManager.managerId.lastName}`
-                  : employee.primaryManager.managerName),
+              name: employee.primaryManager.managerName || (employee.primaryManager.managerId ? `${employee.primaryManager.managerId.firstName} ${employee.primaryManager.managerId.lastName}` : ""),
               employeeId: employee.primaryManager.managerId?.employeeId,
               department: employee.primaryManager.managerId?.department,
               jobTitle: employee.primaryManager.managerId?.jobTitle,
@@ -673,47 +416,24 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
         secondary: employee.secondaryManager
           ? {
               managerId: employee.secondaryManager.managerId?._id,
-              name:
-                employee.secondaryManager.managerName ||
-                (employee.secondaryManager.managerId
-                  ? `${employee.secondaryManager.managerId.firstName} ${employee.secondaryManager.managerId.lastName}`
-                  : employee.secondaryManager.managerName),
+              name: employee.secondaryManager.managerName || (employee.secondaryManager.managerId ? `${employee.secondaryManager.managerId.firstName} ${employee.secondaryManager.managerId.lastName}` : ""),
               employeeId: employee.secondaryManager.managerId?.employeeId,
               department: employee.secondaryManager.managerId?.department,
               jobTitle: employee.secondaryManager.managerId?.jobTitle,
             }
           : null,
       },
-
-      // Salary Information
       salaryInfo: {
-        basic: employee.salary?.basic
-          ? `₹${employee.salary.basic.toLocaleString("en-IN")}`
-          : "Not Provided",
-        allowances: employee.salary?.allowances
-          ? `₹${employee.salary.allowances.toLocaleString("en-IN")}`
-          : "₹0",
-        deductions: employee.salary?.deductions
-          ? `₹${employee.salary.deductions.toLocaleString("en-IN")}`
-          : "₹0",
-        netSalary: employee.salary?.netSalary
-          ? `₹${employee.salary.netSalary.toLocaleString("en-IN")}`
-          : "Not Provided",
-        monthlyTakeHome: employee.salary?.netSalary
-          ? `₹${employee.salary.netSalary.toLocaleString("en-IN")}`
-          : "Not Provided",
+        basic: employee.salary?.basic ? `₹${employee.salary.basic.toLocaleString("en-IN")}` : "Not Provided",
+        allowances: employee.salary?.allowances ? `₹${employee.salary.allowances.toLocaleString("en-IN")}` : "₹0",
+        deductions: employee.salary?.deductions ? `₹${employee.salary.deductions.toLocaleString("en-IN")}` : "₹0",
+        netSalary: employee.salary?.netSalary ? `₹${employee.salary.netSalary.toLocaleString("en-IN")}` : "Not Provided",
       },
-
-      // Bank Details
       bankDetails: {
         bankName: employee.bankDetails?.bankName || "Not Provided",
-        accountNumber: employee.bankDetails?.accountNumber
-          ? `XXXX${employee.bankDetails.accountNumber.slice(-4)}`
-          : "Not Provided",
+        accountNumber: employee.bankDetails?.accountNumber ? `XXXX${employee.bankDetails.accountNumber.slice(-4)}` : "Not Provided",
         ifscCode: employee.bankDetails?.ifscCode || "Not Provided",
       },
-
-      // Documents (now with Cloudinary URLs)
       documents: {
         aadharNumber: employee.documents?.aadharNumber || "Not Provided",
         panNumber: employee.documents?.panNumber || "Not Provided",
@@ -723,8 +443,6 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
         resumeFile: employee.documents?.resumeFile,
         additionalDocuments: employee.documents?.additionalDocuments || [],
       },
-
-      // Address Information
       address: {
         current: {
           street: employee.address?.current?.street || "Not Provided",
@@ -741,20 +459,11 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
           country: employee.address?.permanent?.country || "India",
         },
       },
-
-      // System Information
       systemInfo: {
         createdBy: employee.createdBy?.name || "HR System",
-        createdAt: employee.createdAt
-          ? new Date(employee.createdAt).toLocaleDateString()
-          : "Not Available",
-        updatedAt: employee.updatedAt
-          ? new Date(employee.updatedAt).toLocaleDateString()
-          : "Not Available",
-        lastLogin: "Today", // You can add login tracking later
+        createdAt: employee.createdAt ? new Date(employee.createdAt).toLocaleDateString() : "Not Available",
+        updatedAt: employee.updatedAt ? new Date(employee.updatedAt).toLocaleDateString() : "Not Available",
       },
-
-      // Related Data
       relatedData: {
         teamMembers: teamMembers.map((member) => ({
           id: member._id,
@@ -769,172 +478,105 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
       },
     };
 
-    res.status(200).json({
-      success: true,
-      data: formattedEmployee,
-    });
+    res.status(200).json({ success: true, data: formattedEmployee });
   } catch (error) {
     console.error("Get employee details error:", error);
-
     if (error.name === "CastError") {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid employee ID",
-      });
+      return res.status(400).json({ success: false, message: "Invalid employee ID" });
     }
-
-    res.status(500).json({
-      success: false,
-      message: "Error fetching employee details",
-    });
+    res.status(500).json({ success: false, message: "Error fetching employee details" });
   }
 });
 
-// Get employees by department and designation (for manager selection) - REMAINS THE SAME
-router.get(
-  "/department/employees",
-  EmployeeAuthMiddlewear,
-  async (req, res) => {
-    try {
-      const { departmentId, designation } = req.query;
+// Get employees by department and designation (for manager selection)
+router.get("/department/employees", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { departmentId, designation } = req.query;
 
-      if (!departmentId || !designation) {
-        return res.status(400).json({
-          success: false,
-          message: "Department ID and designation are required",
-        });
-      }
-
-      // Find employees with matching department and designation
-      const employees = await Employee.find({
-        departmentId: departmentId,
-        designation: designation,
-        status: "active",
-        isActive: true,
-      })
-        .select(
-          "firstName lastName employeeId email phone department designation jobTitle profilePhoto",
-        )
-        .sort({ firstName: 1 })
-        .lean();
-
-      // Format the response
-      const formattedEmployees = employees.map((emp) => ({
-        id: emp._id,
-        employeeId: emp.employeeId,
-        name: `${emp.firstName} ${emp.lastName}`,
-        fullName: `${emp.firstName} ${emp.lastName}`,
-        email: emp.email,
-        phone: emp.phone,
-        department: emp.department,
-        designation: emp.designation,
-        jobTitle: emp.jobTitle,
-        profilePhoto: emp.profilePhoto,
-      }));
-
-      res.status(200).json({
-        success: true,
-        data: formattedEmployees,
-        count: formattedEmployees.length,
-      });
-    } catch (error) {
-      console.error("Get department employees error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Error fetching employees",
-      });
+    if (!departmentId || !designation) {
+      return res.status(400).json({ success: false, message: "Department ID and designation are required" });
     }
-  },
-);
 
-// Delete employee (soft delete) - REMAINS THE SAME
+    const employees = await Employee.find({
+      departmentId: departmentId,
+      designation: designation,
+      status: "active",
+      isActive: true,
+    })
+      .select("firstName lastName employeeId email phone department designation jobTitle profilePhoto")
+      .sort({ firstName: 1 })
+      .lean();
+
+    const formattedEmployees = employees.map((emp) => ({
+      id: emp._id,
+      employeeId: emp.employeeId || emp.biometricId,
+      name: `${emp.firstName || ""} ${emp.lastName || ""}`.trim(),
+      fullName: `${emp.firstName || ""} ${emp.lastName || ""}`.trim(),
+      email: emp.email,
+      phone: emp.phone,
+      department: emp.department,
+      designation: emp.designation,
+      jobTitle: emp.jobTitle,
+      profilePhoto: emp.profilePhoto,
+    }));
+
+    res.status(200).json({ success: true, data: formattedEmployees, count: formattedEmployees.length });
+  } catch (error) {
+    console.error("Get department employees error:", error);
+    res.status(500).json({ success: false, message: "Error fetching employees" });
+  }
+});
+
+// Delete employee (soft delete)
 router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     const { id } = req.params;
 
-    // Check if user has HR role
     if (user.role !== "hr_manager") {
-      return res.status(403).json({
-        success: false,
-        message: "Only HR managers can delete employees",
-      });
+      return res.status(403).json({ success: false, message: "Only HR managers can delete employees" });
     }
 
     const employee = await Employee.findById(id);
-
     if (!employee) {
-      return res.status(404).json({
-        success: false,
-        message: "Employee not found",
-      });
+      return res.status(404).json({ success: false, message: "Employee not found" });
     }
 
-    // Soft delete by setting isActive to false
     employee.isActive = false;
     employee.status = "inactive";
     await employee.save();
 
-    res.status(200).json({
-      success: true,
-      message: "Employee deactivated successfully",
-    });
+    res.status(200).json({ success: true, message: "Employee deactivated successfully" });
   } catch (error) {
     console.error("Delete employee error:", error);
-
     if (error.name === "CastError") {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid employee ID",
-      });
+      return res.status(400).json({ success: false, message: "Invalid employee ID" });
     }
-
-    res.status(500).json({
-      success: false,
-      message: "Error deleting employee",
-    });
+    res.status(500).json({ success: false, message: "Error deleting employee" });
   }
 });
 
-// Helper functions - REMAIN THE SAME
+// Helper functions
 const calculateAge = (dateOfBirth) => {
   const today = new Date();
   const birthDate = new Date(dateOfBirth);
   let age = today.getFullYear() - birthDate.getFullYear();
   const monthDiff = today.getMonth() - birthDate.getMonth();
-
-  if (
-    monthDiff < 0 ||
-    (monthDiff === 0 && today.getDate() < birthDate.getDate())
-  ) {
-    age--;
-  }
-
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) age--;
   return age;
 };
 
 const calculateTenure = (dateOfJoining) => {
   const today = new Date();
   const joiningDate = new Date(dateOfJoining);
-
   let years = today.getFullYear() - joiningDate.getFullYear();
   let months = today.getMonth() - joiningDate.getMonth();
-
-  if (months < 0) {
-    years--;
-    months += 12;
-  }
-
+  if (months < 0) { years--; months += 12; }
   return { years, months };
 };
 
 const formatEmploymentType = (type) => {
-  const types = {
-    full_time: "Full Time",
-    part_time: "Part Time",
-    contract: "Contract",
-    intern: "Intern",
-  };
+  const types = { full_time: "Full Time", part_time: "Part Time", contract: "Contract", intern: "Intern" };
   return types[type] || type || "Not Provided";
 };
 
@@ -942,23 +584,12 @@ const getManagerHierarchy = async (employeeId) => {
   try {
     const hierarchy = [];
     let currentEmployee = await Employee.findById(employeeId)
-      .select("primaryManager secondaryManager")
-      .populate(
-        "primaryManager.managerId",
-        "firstName lastName employeeId department",
-      )
-      .populate(
-        "secondaryManager.managerId",
-        "firstName lastName employeeId department",
-      )
+      .select("primaryManager secondaryManager firstName lastName employeeId department")
+      .populate("primaryManager.managerId", "firstName lastName employeeId department")
       .lean();
-
     let visited = new Set();
-
     while (currentEmployee && !visited.has(currentEmployee._id.toString())) {
       visited.add(currentEmployee._id.toString());
-
-      // Add current employee to hierarchy
       hierarchy.push({
         id: currentEmployee._id,
         name: `${currentEmployee.firstName || ""} ${currentEmployee.lastName || ""}`.trim(),
@@ -966,26 +597,16 @@ const getManagerHierarchy = async (employeeId) => {
         department: currentEmployee.department,
         level: hierarchy.length + 1,
       });
-
-      // Move to primary manager if exists
       if (currentEmployee.primaryManager?.managerId) {
-        currentEmployee = await Employee.findById(
-          currentEmployee.primaryManager.managerId._id,
-        )
-          .select(
-            "primaryManager secondaryManager firstName lastName employeeId department",
-          )
-          .populate(
-            "primaryManager.managerId",
-            "firstName lastName employeeId department",
-          )
+        currentEmployee = await Employee.findById(currentEmployee.primaryManager.managerId._id)
+          .select("primaryManager secondaryManager firstName lastName employeeId department")
+          .populate("primaryManager.managerId", "firstName lastName employeeId department")
           .lean();
       } else {
         break;
       }
     }
-
-    return hierarchy.reverse(); // Return from top to bottom
+    return hierarchy.reverse();
   } catch (error) {
     console.error("Error fetching manager hierarchy:", error);
     return [];
@@ -993,15 +614,9 @@ const getManagerHierarchy = async (employeeId) => {
 };
 
 const getRecentActivities = async (employeeId) => {
-  // This is a placeholder - integrate with your activity logging system
   return [
     { id: 1, activity: "Profile updated", date: "2024-01-15", type: "update" },
-    {
-      id: 2,
-      activity: "Login from new device",
-      date: "2024-01-14",
-      type: "security",
-    },
+    { id: 2, activity: "Login from new device", date: "2024-01-14", type: "security" },
     { id: 3, activity: "Salary credited", date: "2024-01-10", type: "salary" },
   ];
 };

@@ -985,6 +985,74 @@ router.post("/share-to-vendor", async (req, res) => {
   }
 });
 
+router.get("/stats/overview", async (req, res) => {
+  try {
+    // Total Manufacturing Orders (all with sales approved status)
+    const totalMO = await CustomerRequest.countDocuments({
+      status: "quotation_sales_approved",
+    });
+
+    // Total Work Orders
+    const totalWO = await WorkOrder.countDocuments({});
+
+    // Ongoing Work Orders (in_progress)
+    const ongoingWO = await WorkOrder.countDocuments({
+      status: "in_progress",
+    });
+
+    // Completed Work Orders
+    const completedWO = await WorkOrder.countDocuments({
+      status: "completed",
+    });
+
+    // Pending Work Orders (pending + planned + scheduled)
+    const pendingWO = await WorkOrder.countDocuments({
+      status: { $in: ["pending", "planned", "scheduled", "ready_to_start"] },
+    });
+
+    // Forwarded Work Orders (to vendor)
+    const forwardedWO = await WorkOrder.countDocuments({
+      status: "forwarded",
+    });
+
+    // MOs created this month
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+
+    const newMOThisMonth = await CustomerRequest.countDocuments({
+      status: "quotation_sales_approved",
+      createdAt: { $gte: startOfMonth },
+    });
+
+    // WOs completed this month
+    const completedWOThisMonth = await WorkOrder.countDocuments({
+      status: "completed",
+      updatedAt: { $gte: startOfMonth },
+    });
+
+    res.json({
+      success: true,
+      stats: {
+        totalMO,
+        totalWO,
+        ongoingWO,
+        completedWO,
+        pendingWO,
+        forwardedWO,
+        newMOThisMonth,
+        completedWOThisMonth,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching production stats:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching production stats",
+    });
+  }
+});
+
 
 
 module.exports = router;
