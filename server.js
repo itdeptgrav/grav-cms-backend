@@ -293,7 +293,7 @@ app.use("/api/cms/vendors", vendorRoutes);
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
 app.use("/api/cms/raw-items", rawItemsRoutes);
 
-const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/StockItems");
+const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems.js");
 app.use("/api/cms/stock-items", stockItemsRoutes);
 
 // Operations Category
