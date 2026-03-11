@@ -28,10 +28,10 @@ const variantRawItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  variantId: { // New: To store which variant of raw item is used
+  variantId: {
     type: mongoose.Schema.Types.ObjectId
   },
-  variantCombination: [{ // New: Which variant combination of raw item
+  variantCombination: [{
     type: String,
     trim: true
   }],
@@ -99,9 +99,7 @@ const variantSchema = new mongoose.Schema({
     trim: true
   },
   images: [String],
-  // NEW: Raw items specific to this variant
   rawItems: [variantRawItemSchema],
-  // Status for this specific variant
   status: {
     type: String,
     enum: ["In Stock", "Low Stock", "Out of Stock"],
@@ -153,6 +151,17 @@ const stockItemSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
+
+  // ── Additional / Alternate Names ─────────────────────────────────────────
+  // Users can assign multiple alternate names to a product (e.g. trade names,
+  // regional names, client-specific names). The primary display name is always
+  // `name`; these are supplementary and shown on demand.
+  additionalNames: [{
+    type: String,
+    trim: true
+  }],
+  // ─────────────────────────────────────────────────────────────────────────
+
   reference: {
     type: String,
     required: true,
@@ -198,7 +207,7 @@ const stockItemSchema = new mongoose.Schema({
     trim: true
   },
 
-  // General Pricing (Base prices - can be overridden by variants)
+  // General Pricing
   unit: {
     type: String,
     required: true,
@@ -238,20 +247,20 @@ const stockItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   }],
-  
+
   numberOfPanels: {
     type: Number,
     min: 0,
     default: 0
   },
 
-  // Variants (REQUIRED - at least one variant)
+  // Variants
   variants: [variantSchema],
 
-  // Operations (common for all variants)
+  // Operations
   operations: [operationSchema],
-  
-  // Miscellaneous costs (common for all variants)
+
+  // Miscellaneous costs
   miscellaneousCosts: [{
     name: {
       type: String,
@@ -270,17 +279,17 @@ const stockItemSchema = new mongoose.Schema({
     }
   }],
 
-  // Images (common for all variants)
+  // Images
   images: [String],
 
-  // Overall Status (calculated from variants)
+  // Overall Status
   status: {
     type: String,
     enum: ["In Stock", "Low Stock", "Out of Stock"],
     default: "In Stock"
   },
 
-  // Calculated Fields (from all variants)
+  // Calculated Fields
   totalQuantityOnHand: {
     type: Number,
     min: 0,
