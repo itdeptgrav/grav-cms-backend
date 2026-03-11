@@ -378,6 +378,9 @@ app.use("/api/cms/sales/overview", salesOverview);
 const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
 app.use("/api/cms/sales", quotationRoutes);
 
+const googleTasksRoutes = require("./routes/googleTasksRoutes");
+app.use("/api/google", googleTasksRoutes);
+
 // HR Department Routes
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
