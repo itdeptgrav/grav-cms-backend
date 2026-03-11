@@ -10,7 +10,6 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation");
 const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup");
 
-// Categories for stock items
 const STOCK_ITEM_CATEGORIES = [
   "T-Shirts", "Shirts", "Jeans", "Bottoms", "Ethnic Wear",
   "Kids Wear", "Sportswear", "Sweatshirts", "Outerwear",
@@ -18,13 +17,11 @@ const STOCK_ITEM_CATEGORIES = [
   "Traditional Wear", "Winter Wear", "Summer Wear"
 ];
 
-// Operation types for clothing manufacturing
 const OPERATION_TYPES = [
   "Cutting", "Stitching", "Finishing", "Printing", "Embroidery",
   "Washing", "Ironing", "Quality Check", "Packing", "Labeling"
 ];
 
-// Apply auth middleware to all routes
 router.use(EmployeeAuthMiddleware);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,8 +204,7 @@ router.get("/data/create", async (req, res) => {
   }
 });
 
-// ✅ NEW: Tab-specific data endpoint to avoid loading everything at once
-// Usage: GET /api/cms/stock-items/:id/tab/:tabName
+// ✅ Tab-specific data endpoint
 router.get("/:id/tab/:tabName", async (req, res) => {
   try {
     const { id, tabName } = req.params;
@@ -218,7 +214,8 @@ router.get("/:id/tab/:tabName", async (req, res) => {
 
     switch (tabName) {
       case "general":
-        selectFields = "name productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images";
+        // ── additionalNames included in general tab ──
+        selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images";
         break;
       case "attributes":
         selectFields = "attributes";
@@ -239,7 +236,6 @@ router.get("/:id/tab/:tabName", async (req, res) => {
         selectFields = "miscellaneousCosts";
         break;
       default:
-        // For unknown tabs, return basic info
         selectFields = "name category";
     }
 
@@ -251,7 +247,6 @@ router.get("/:id/tab/:tabName", async (req, res) => {
 
     response = { success: true, tab: tabName, data: stockItem };
 
-    // For operations tab, also return registered operations and groups
     if (tabName === "operations") {
       const [registeredOperations, registeredGroups] = await Promise.all([
         Operation.find().sort({ name: 1 }),
@@ -282,7 +277,6 @@ router.get("/:id/tab/:tabName", async (req, res) => {
 });
 
 // ✅ GET all stock items with variants (with pagination)
-// FIX: Use aggregation for stats so we don't have to load all docs into memory
 router.get("/", async (req, res) => {
   try {
     const { search = "", status, category, page = 1, limit = 10 } = req.query;
@@ -291,31 +285,27 @@ router.get("/", async (req, res) => {
     const limitNum = parseInt(limit);
     const skip = (pageNum - 1) * limitNum;
 
-    // Build filter for paginated list
     let filter = {};
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: "i" } },
         { reference: { $regex: search, $options: "i" } },
-        { "variants.sku": { $regex: search, $options: "i" } }
+        { "variants.sku": { $regex: search, $options: "i" } },
+        // ── Also search across additional names ──
+        { additionalNames: { $regex: search, $options: "i" } }
       ];
     }
     if (category) filter.category = category;
-
-    // FIX: status filter — the DB status field may be stale; filter based on
-    // the stored status field but also recompute on the fly for display.
-    // We keep the DB-level filter for quick queries.
     if (status) filter.status = status;
 
-    // Run paginated query + stats aggregation in parallel for speed
     const [totalItems, stockItems, statsAgg] = await Promise.all([
       StockItem.countDocuments(filter),
       StockItem.find(filter)
-        .select("name reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations")
+        // ── additionalNames included in list select ──
+        .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum),
-      // Use aggregation for global stats — much faster than loading all docs
       StockItem.aggregate([
         {
           $group: {
@@ -427,7 +417,7 @@ router.get("/:stockItemId/variant/:variantId", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: process raw items for a variant (shared by POST and PUT)
+// Helper: process raw items for a variant
 // ─────────────────────────────────────────────────────────────────────────────
 async function processVariantRawItems(rawItemsInput) {
   const processedRawItems = [];
@@ -490,15 +480,12 @@ async function processVariantRawItems(rawItemsInput) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: compute and update aggregate fields on a StockItem doc
-// FIX: averageSalesPrice and averageCost calculated from variants, not base fields
 // ─────────────────────────────────────────────────────────────────────────────
 function updateStockItemAggregates(stockItem) {
   const variants = stockItem.variants || [];
 
-  // Total quantity
   stockItem.totalQuantityOnHand = variants.reduce((s, v) => s + (v.quantityOnHand || 0), 0);
 
-  // Average cost and sales price from variants (FIX: was using baseSalesPrice)
   if (variants.length > 0) {
     stockItem.averageCost = variants.reduce((s, v) => s + (v.cost || 0), 0) / variants.length;
     stockItem.averageSalesPrice = variants.reduce((s, v) => s + (v.salesPrice || 0), 0) / variants.length;
@@ -507,18 +494,15 @@ function updateStockItemAggregates(stockItem) {
     stockItem.averageSalesPrice = stockItem.baseSalesPrice || 0;
   }
 
-  // Profit margin
   if (stockItem.averageCost > 0 && stockItem.averageSalesPrice > 0) {
     stockItem.profitMargin = ((stockItem.averageSalesPrice - stockItem.averageCost) / stockItem.averageCost) * 100;
   } else {
     stockItem.profitMargin = 0;
   }
 
-  // Inventory/revenue value
   stockItem.inventoryValue = stockItem.averageCost * stockItem.totalQuantityOnHand;
   stockItem.potentialRevenue = stockItem.averageSalesPrice * stockItem.totalQuantityOnHand;
 
-  // Status: derived from variants
   const outOfStockCount = variants.filter(v => (v.quantityOnHand || 0) <= 0).length;
   const lowStockCount = variants.filter(v =>
     (v.quantityOnHand || 0) > 0 && (v.quantityOnHand || 0) <= (v.minStock || 10)
@@ -532,7 +516,6 @@ function updateStockItemAggregates(stockItem) {
     stockItem.status = "In Stock";
   }
 
-  // Update individual variant statuses
   stockItem.variants = variants.map(v => {
     if ((v.quantityOnHand || 0) <= 0) {
       v.status = "Out of Stock";
@@ -546,17 +529,15 @@ function updateStockItemAggregates(stockItem) {
 }
 
 // ✅ CREATE new stock item with variants
-// FIX: Removed baseSalesPrice required validation; hsnCode now saved
 router.post("/", async (req, res) => {
   try {
     const {
-      name, productType, category, unit, hsnCode,
+      name, additionalNames, productType, category, unit, hsnCode,
       baseSalesPrice, baseCost, internalNotes,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
     } = req.body;
 
-    // Validation — baseSalesPrice is now optional (removed restriction)
     if (!name || !name.trim()) {
       return res.status(400).json({ success: false, message: "Product name is required" });
     }
@@ -570,7 +551,6 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ success: false, message: "At least one variant is required" });
     }
 
-    // Generate reference
     const nameWords = name.trim().split(" ");
     const nameCode = nameWords.map(w => w.substring(0, 3).toUpperCase()).join("");
     const categoryCode = category.substring(0, 3).toUpperCase();
@@ -635,13 +615,19 @@ router.post("/", async (req, res) => {
         unit: c.unit || "Fixed"
       }));
 
+    // ── Process additionalNames: filter blanks, trim ──
+    const processedAdditionalNames = (Array.isArray(additionalNames) ? additionalNames : [])
+      .map(n => n?.trim())
+      .filter(n => n && n.length > 0);
+
     const newStockItem = new StockItem({
       name: name.trim(),
+      additionalNames: processedAdditionalNames,
       reference: reference.toUpperCase(),
       productType: productType || "Goods",
       category: category.trim(),
       unit: unit || "Units",
-      hsnCode: hsnCode || "",            // FIX: hsnCode now saved
+      hsnCode: hsnCode || "",
       internalNotes: internalNotes || "",
       baseSalesPrice: parseFloat(baseSalesPrice) || 0,
       baseCost: parseFloat(baseCost) || 0,
@@ -655,9 +641,7 @@ router.post("/", async (req, res) => {
       createdBy: req.user.id
     });
 
-    // Compute aggregated fields before saving
     updateStockItemAggregates(newStockItem);
-
     await newStockItem.save();
 
     res.status(201).json({
@@ -676,11 +660,10 @@ router.post("/", async (req, res) => {
 });
 
 // ✅ UPDATE stock item with variants
-// FIX: hsnCode, internalNotes now included; aggregates recomputed after save
 router.put("/:id", async (req, res) => {
   try {
     const {
-      name, productType, category, unit, hsnCode, internalNotes,
+      name, additionalNames, productType, category, unit, hsnCode, internalNotes,
       baseSalesPrice, baseCost,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
@@ -691,15 +674,21 @@ router.put("/:id", async (req, res) => {
       return res.status(404).json({ success: false, message: "Stock item not found" });
     }
 
-    // Update basic fields
     if (name !== undefined) stockItem.name = name.trim();
     if (productType !== undefined) stockItem.productType = productType;
     if (category !== undefined) stockItem.category = category.trim();
     if (unit !== undefined) stockItem.unit = unit;
-    if (hsnCode !== undefined) stockItem.hsnCode = hsnCode;             // FIX: was missing
-    if (internalNotes !== undefined) stockItem.internalNotes = internalNotes; // FIX: was missing
+    if (hsnCode !== undefined) stockItem.hsnCode = hsnCode;
+    if (internalNotes !== undefined) stockItem.internalNotes = internalNotes;
     if (baseSalesPrice !== undefined) stockItem.baseSalesPrice = parseFloat(baseSalesPrice) || 0;
     if (baseCost !== undefined) stockItem.baseCost = parseFloat(baseCost) || 0;
+
+    // ── Update additionalNames ──
+    if (additionalNames !== undefined) {
+      stockItem.additionalNames = (Array.isArray(additionalNames) ? additionalNames : [])
+        .map(n => n?.trim())
+        .filter(n => n && n.length > 0);
+    }
 
     if (attributes !== undefined) {
       stockItem.attributes = attributes
@@ -771,9 +760,7 @@ router.put("/:id", async (req, res) => {
 
     stockItem.updatedBy = req.user.id;
 
-    // Recompute aggregated fields before saving
     updateStockItemAggregates(stockItem);
-
     await stockItem.save();
 
     const updatedStockItem = await StockItem.findById(stockItem._id)
