@@ -162,7 +162,7 @@ const createDefaultAccountant = async () => {
 
 // Update the database connection section
 connectDB().then(async () => {
-  await createDefaultAccountant(); // ✅ ADD THIS
+  await assignMeasurementsToExistingProducts(); // Add this line
 });
 //changes
 
@@ -224,6 +224,55 @@ const overwriteExistingMeasurements = async () => {
     console.log("✅ Default HR Department created successfully");
   } catch (error) {
     console.error("❌ Measurement overwrite failed:", error.message);
+  }
+};
+
+
+const assignMeasurementsToExistingProducts = async () => {
+  try {
+    console.log("🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...");
+    
+    const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
+    
+    const CATEGORY_MEASUREMENTS = {
+      "Shirts": [
+        "Shoulder", "Chest", "Stomach", "Bottom hem/Hips", 
+        "Armhole", "Sleeve length", "Cuff", "Collar", "Length"
+      ],
+      "Bottoms": [
+        "Waist", "Hips", "Thigh", "Knee", "Bottom", "Croch", "Length"
+      ],
+      "Outerwear": [
+        "Collar", "Shoulder", "Chest", "Stomach", 
+        "Bottom hem", "Armhole", "Length"
+      ]
+    };
+
+    let totalUpdated = 0;
+
+    for (const [category, measurements] of Object.entries(CATEGORY_MEASUREMENTS)) {
+      // FORCE OVERRIDE - Update ALL products in this category regardless of existing measurements
+      const result = await StockItem.updateMany(
+        { category: category },
+        { 
+          $set: { 
+            measurements: measurements,
+            updatedAt: new Date()
+          } 
+        }
+      );
+
+      if (result.modifiedCount > 0 || result.matchedCount > 0) {
+        console.log(`✅ ${category}: Updated ${result.modifiedCount} products (matched: ${result.matchedCount}) with ${measurements.length} measurements`);
+        totalUpdated += result.modifiedCount;
+      } else {
+        console.log(`ℹ️ ${category}: No products found in this category`);
+      }
+    }
+
+    console.log(`✅ Measurement force override complete! Total products updated: ${totalUpdated}`);
+  } catch (error) {
+    console.error("❌ Error assigning measurements to existing products:", error.message);
   }
 };
 
