@@ -626,5 +626,8 @@ server.listen(PORT, () => {
 });
 
 
-
-
+// see the below code basically this is all about the raw-item of our company inventory ok.. which need to fix  because so many issue's are occouring ok..
+// -> in the raw-item lists page, if the pagination is not added yet then add that ok or else the server response time will goona too large ok, so fix it 
+// -> second thing is formal/nermal ui ok do not any colourful design ok/background ok..
+// -> the create/edit form is also not working means especially the edit form measn an serer error is occouring when doing the edit ok.. so fix it ok..
+// -> so let's fix these things ok

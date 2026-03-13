@@ -1622,5 +1622,184 @@ router.post("/:id/start-production", async (req, res) => {
   }
 });
 
+
+
+
+// Add these routes to your existing workOrderRoutes.js file
+
+// GET stock item operations for a work order (to get base operations)
+router.get("/:id/stock-item-operations", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const workOrder = await WorkOrder.findById(id)
+      .populate("stockItemId", "operations")
+      .lean();
+
+    if (!workOrder) {
+      return res.status(404).json({
+        success: false,
+        message: "Work order not found",
+      });
+    }
+
+    const stockItem = await StockItem.findById(workOrder.stockItemId)
+      .select("operations")
+      .lean();
+
+    res.json({
+      success: true,
+      operations: stockItem?.operations || [],
+    });
+  } catch (error) {
+    console.error("Error fetching stock item operations:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching stock item operations",
+    });
+  }
+});
+
+// ADD operation to work order
+router.post("/:id/operations", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { operationType, machineType, estimatedTimeSeconds } = req.body;
+
+    const workOrder = await WorkOrder.findById(id);
+    if (!workOrder) {
+      return res.status(404).json({
+        success: false,
+        message: "Work order not found",
+      });
+    }
+
+    // Create new operation
+    const newOperation = {
+      operationType,
+      machineType,
+      estimatedTimeSeconds: estimatedTimeSeconds || 0,
+      plannedTimeSeconds: estimatedTimeSeconds || 0,
+      maxAllowedSeconds: estimatedTimeSeconds ? Math.ceil(estimatedTimeSeconds / 0.7) : 0,
+      status: "pending",
+      assignedMachine: null,
+      assignedMachineName: null,
+      assignedMachineSerial: null,
+      additionalMachines: [],
+      notes: "",
+    };
+
+    workOrder.operations.push(newOperation);
+    await workOrder.save();
+
+    // Return the newly added operation with its _id
+    const addedOp = workOrder.operations[workOrder.operations.length - 1];
+
+    res.json({
+      success: true,
+      message: "Operation added successfully",
+      operation: addedOp,
+    });
+  } catch (error) {
+    console.error("Error adding operation:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while adding operation",
+    });
+  }
+});
+
+// REMOVE operation from work order
+router.delete("/:id/operations/:operationId", async (req, res) => {
+  try {
+    const { id, operationId } = req.params;
+
+    const workOrder = await WorkOrder.findById(id);
+    if (!workOrder) {
+      return res.status(404).json({
+        success: false,
+        message: "Work order not found",
+      });
+    }
+
+    // Find and remove the operation
+    const operationIndex = workOrder.operations.findIndex(
+      op => op._id.toString() === operationId
+    );
+
+    if (operationIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: "Operation not found",
+      });
+    }
+
+    workOrder.operations.splice(operationIndex, 1);
+    await workOrder.save();
+
+    res.json({
+      success: true,
+      message: "Operation removed successfully",
+    });
+  } catch (error) {
+    console.error("Error removing operation:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while removing operation",
+    });
+  }
+});
+
+// REORDER operations
+router.put("/:id/operations/reorder", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { operationIds } = req.body; // Array of operation IDs in new order
+
+    const workOrder = await WorkOrder.findById(id);
+    if (!workOrder) {
+      return res.status(404).json({
+        success: false,
+        message: "Work order not found",
+      });
+    }
+
+    // Create a map of existing operations by ID
+    const operationsMap = {};
+    workOrder.operations.forEach(op => {
+      operationsMap[op._id.toString()] = op;
+    });
+
+    // Reorder operations according to the provided IDs
+    const reorderedOperations = [];
+    for (const opId of operationIds) {
+      if (operationsMap[opId]) {
+        reorderedOperations.push(operationsMap[opId]);
+      }
+    }
+
+    // Add any operations that might have been missed (shouldn't happen)
+    workOrder.operations.forEach(op => {
+      if (!operationIds.includes(op._id.toString())) {
+        reorderedOperations.push(op);
+      }
+    });
+
+    workOrder.operations = reorderedOperations;
+    await workOrder.save();
+
+    res.json({
+      success: true,
+      message: "Operations reordered successfully",
+    });
+  } catch (error) {
+    console.error("Error reordering operations:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while reordering operations",
+    });
+  }
+});
+
 // Export the router
 module.exports = router;
