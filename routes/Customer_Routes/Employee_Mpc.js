@@ -84,9 +84,11 @@ router.get('/products/available', verifyCustomerToken, async (req, res) => {
   try {
     const { search = '' } = req.query;
     
-    let filter = {
-      status: { $in: ["In Stock", "Low Stock"] }
-    };
+    let filter = {};
+    // Remove the status filter to show all products regardless of stock
+    // let filter = {
+    //   status: { $in: ["In Stock", "Low Stock"] }
+    // };
     
     if (search) {
       filter.$or = [
