@@ -1,3 +1,5 @@
+// models/CMS_Models/Inventory/Products/StockItem.js
+
 const mongoose = require("mongoose");
 
 const attributeValueSchema = new mongoose.Schema({
@@ -40,9 +42,15 @@ const variantRawItemSchema = new mongoose.Schema({
     required: true,
     min: 0
   },
+  // ── The unit the user chose (may be a converted unit, e.g. "Piece" instead of "Gross") ──
   unit: {
     type: String,
     required: true,
+    trim: true
+  },
+  // ── The base/registered unit of the raw item, stored for deduction logic ──
+  baseUnit: {
+    type: String,
     trim: true
   },
   unitCost: {
@@ -153,14 +161,10 @@ const stockItemSchema = new mongoose.Schema({
   },
 
   // ── Additional / Alternate Names ─────────────────────────────────────────
-  // Users can assign multiple alternate names to a product (e.g. trade names,
-  // regional names, client-specific names). The primary display name is always
-  // `name`; these are supplementary and shown on demand.
   additionalNames: [{
     type: String,
     trim: true
   }],
-  // ─────────────────────────────────────────────────────────────────────────
 
   reference: {
     type: String,
@@ -189,6 +193,14 @@ const stockItemSchema = new mongoose.Schema({
     type: String,
     required: true,
     trim: true
+  },
+
+  // ── Gender Category ───────────────────────────────────────────────────────
+  // Indicates intended gender audience for the garment.
+  genderCategory: {
+    type: String,
+    enum: ["Male", "Female", "Unisex", "Kids", ""],
+    default: ""
   },
 
   // Barcode & HSN
@@ -348,3 +360,5 @@ const stockItemSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 module.exports = mongoose.model("StockItem", stockItemSchema);
+
+

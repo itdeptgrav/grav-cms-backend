@@ -6,6 +6,7 @@ const StockItem = require("../../../../models/CMS_Models/Inventory/Products/Stoc
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Employee = require("../../../../models/Employee");
 const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
+const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation");
 const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup");
@@ -25,10 +26,59 @@ const OPERATION_TYPES = [
 router.use(EmployeeAuthMiddleware);
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: Build a map of unitName → { baseUnit, conversions: [{toUnit, qty}] }
+// from the Units collection so the frontend can offer unit switching.
+// ─────────────────────────────────────────────────────────────────────────────
+async function buildUnitConversionsMap() {
+  try {
+    const units = await Unit.find({ status: "Active" }).populate("conversions.toUnit", "name")
+    const map = {}
+
+    // First pass — build forward entries exactly as stored in DB
+    // DB meaning: unit U has conversion { toUnit: T, quantity: Q } means 1 U = Q T
+    units.forEach(u => {
+      if (!map[u.name]) map[u.name] = { baseUnit: u.name, conversions: [] }
+      ;(u.conversions || []).forEach(c => {
+        const toUnitName = c.toUnit?.name || c.toUnit
+        if (!toUnitName) return
+        map[u.name].conversions.push({
+          toUnit: toUnitName,
+          factor: c.quantity   // 1 u.name = c.quantity toUnitName  →  cost per toUnit = cost per u.name / c.quantity
+        })
+      })
+    })
+
+    // Second pass — add reverse entries so every unit that appears as a toUnit
+    // also gets its own top-level entry, pointing back to its "parent".
+    // If 1 Gross = 156 Piece, then reverse: 1 Piece = 1/156 Gross
+    units.forEach(u => {
+      ;(u.conversions || []).forEach(c => {
+        const toUnitName = c.toUnit?.name || c.toUnit
+        if (!toUnitName || !c.quantity) return
+        if (!map[toUnitName]) map[toUnitName] = { baseUnit: toUnitName, conversions: [] }
+        // avoid duplicate reverse entry
+        const alreadyHas = map[toUnitName].conversions.some(x => x.toUnit === u.name)
+        if (!alreadyHas) {
+          map[toUnitName].conversions.push({
+            toUnit: u.name,
+            factor: 1 / c.quantity   // 1 toUnitName = (1/Q) u.name  →  cost per u.name = cost per toUnit * Q
+          })
+        }
+      })
+    })
+
+    return map
+  } catch (err) {
+    console.error("buildUnitConversionsMap:", err)
+    return {}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // IMPORTANT: Specific /data/* routes MUST be defined BEFORE /:id routes
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ✅ GET raw items with their variants for stock item form
+// ✅ GET raw items with their variants + unit conversions for stock item form
 router.get("/data/raw-items", async (req, res) => {
   try {
     const { search = "", limit = 50 } = req.query;
@@ -47,17 +97,22 @@ router.get("/data/raw-items", async (req, res) => {
       .limit(parseInt(limit))
       .sort({ name: 1 });
 
+    const unitConversionsMap = await buildUnitConversionsMap();
+
     const processedRawItems = rawItems.map(item => {
+      const baseUnitName = item.customUnit || item.unit || "Unit";
       const baseItem = {
         id: item._id,
         name: item.name,
         sku: item.sku,
         category: item.customCategory || item.category || "Uncategorized",
-        baseUnit: item.customUnit || item.unit || "Unit",
+        baseUnit: baseUnitName,
         baseQuantity: item.quantity || 0,
         baseSellingPrice: item.sellingPrice || 0,
         hasVariants: item.variants && item.variants.length > 0,
-        variants: []
+        variants: [],
+        // ── Unit conversion data for this raw item ──
+        unitConversions: unitConversionsMap[baseUnitName]?.conversions || []
       };
 
       if (item.variants && item.variants.length > 0) {
@@ -80,7 +135,7 @@ router.get("/data/raw-items", async (req, res) => {
             combination: variant.combination || [],
             combinationText: variant.combination?.join(" • ") || "Default",
             quantity: variant.quantity || 0,
-            unit: baseItem.baseUnit,
+            unit: baseUnitName,
             cost: latestCost,
             status: variant.status || "Out of Stock",
             sku: variant.sku || `${baseItem.sku}-var`
@@ -101,7 +156,7 @@ router.get("/data/raw-items", async (req, res) => {
           combination: [],
           combinationText: "Default",
           quantity: item.quantity || 0,
-          unit: baseItem.baseUnit,
+          unit: baseUnitName,
           cost: latestCost,
           status: item.status || "Out of Stock",
           sku: baseItem.sku
@@ -119,7 +174,7 @@ router.get("/data/raw-items", async (req, res) => {
   }
 });
 
-// ✅ GET data for creating stock item (includes registered operations & groups)
+// ✅ GET data for creating stock item (includes registered operations, groups & unit conversions)
 router.get("/data/create", async (req, res) => {
   try {
     const rawItemsResponse = await RawItem.find({})
@@ -127,15 +182,19 @@ router.get("/data/create", async (req, res) => {
       .limit(20)
       .sort({ name: 1 });
 
+    const unitConversionsMap = await buildUnitConversionsMap();
+
     const processedRawItems = rawItemsResponse.map(item => {
+      const baseUnit = item.unit || "Unit";
       const baseItem = {
         id: item._id,
         name: item.name,
         sku: item.sku,
         category: item.category || "Uncategorized",
-        baseUnit: item.unit || "Unit",
+        baseUnit,
         hasVariants: item.variants && item.variants.length > 0,
-        variants: []
+        variants: [],
+        unitConversions: unitConversionsMap[baseUnit]?.conversions || []
       };
       if (item.variants && item.variants.length > 0) {
         baseItem.variants = item.variants.map(variant => ({
@@ -143,7 +202,7 @@ router.get("/data/create", async (req, res) => {
           combination: variant.combination || [],
           combinationText: variant.combination?.join(" • ") || "Default",
           quantity: variant.quantity || 0,
-          unit: baseItem.baseUnit,
+          unit: baseUnit,
           cost: item.sellingPrice ? item.sellingPrice * 0.8 : 0,
           status: variant.status || "Out of Stock"
         }));
@@ -194,7 +253,9 @@ router.get("/data/create", async (req, res) => {
           _id: grp._id,
           name: grp.name,
           operations: grp.operations
-        }))
+        })),
+        // ── Full unit conversions map so frontend can offer unit switching ──
+        unitConversions: unitConversionsMap
       }
     });
 
@@ -214,8 +275,7 @@ router.get("/:id/tab/:tabName", async (req, res) => {
 
     switch (tabName) {
       case "general":
-        // ── additionalNames included in general tab ──
-        selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images";
+        selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images genderCategory";
         break;
       case "attributes":
         selectFields = "attributes";
@@ -291,7 +351,6 @@ router.get("/", async (req, res) => {
         { name: { $regex: search, $options: "i" } },
         { reference: { $regex: search, $options: "i" } },
         { "variants.sku": { $regex: search, $options: "i" } },
-        // ── Also search across additional names ──
         { additionalNames: { $regex: search, $options: "i" } }
       ];
     }
@@ -301,8 +360,7 @@ router.get("/", async (req, res) => {
     const [totalItems, stockItems, statsAgg] = await Promise.all([
       StockItem.countDocuments(filter),
       StockItem.find(filter)
-        // ── additionalNames included in list select ──
-        .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations")
+        .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations genderCategory")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum),
@@ -418,6 +476,8 @@ router.get("/:stockItemId/variant/:variantId", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: process raw items for a variant
+// Accepts an optional baseUnit so it can store the original unit for
+// deferred conversion when dispatching stock.
 // ─────────────────────────────────────────────────────────────────────────────
 async function processVariantRawItems(rawItemsInput) {
   const processedRawItems = [];
@@ -462,6 +522,11 @@ async function processVariantRawItems(rawItemsInput) {
 
     if (unitCost === 0 && rawItemData.sellingPrice) unitCost = rawItemData.sellingPrice * 0.8;
 
+    const registeredUnit = rawItemData.customUnit || rawItemData.unit || "Unit";
+    // The unit the user selected (may differ from registeredUnit via conversions)
+    const chosenUnit = rawItem.unit || registeredUnit;
+    const baseUnit = rawItem.baseUnit || registeredUnit;
+
     processedRawItems.push({
       rawItemId: rawItemData._id,
       rawItemName: rawItemData.name,
@@ -469,7 +534,8 @@ async function processVariantRawItems(rawItemsInput) {
       variantId,
       variantCombination,
       quantity: parseFloat(rawItem.quantity),
-      unit: rawItemData.customUnit || rawItemData.unit || "Unit",
+      unit: chosenUnit,
+      baseUnit,                              // stored so deduction logic knows the base
       unitCost,
       totalCost: parseFloat(rawItem.quantity) * unitCost
     });
@@ -532,7 +598,7 @@ function updateStockItemAggregates(stockItem) {
 router.post("/", async (req, res) => {
   try {
     const {
-      name, additionalNames, productType, category, unit, hsnCode,
+      name, additionalNames, productType, category, unit, hsnCode, genderCategory,
       baseSalesPrice, baseCost, internalNotes,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
@@ -615,7 +681,6 @@ router.post("/", async (req, res) => {
         unit: c.unit || "Fixed"
       }));
 
-    // ── Process additionalNames: filter blanks, trim ──
     const processedAdditionalNames = (Array.isArray(additionalNames) ? additionalNames : [])
       .map(n => n?.trim())
       .filter(n => n && n.length > 0);
@@ -628,6 +693,7 @@ router.post("/", async (req, res) => {
       category: category.trim(),
       unit: unit || "Units",
       hsnCode: hsnCode || "",
+      genderCategory: genderCategory || "",
       internalNotes: internalNotes || "",
       baseSalesPrice: parseFloat(baseSalesPrice) || 0,
       baseCost: parseFloat(baseCost) || 0,
@@ -660,11 +726,14 @@ router.post("/", async (req, res) => {
 });
 
 // ✅ UPDATE stock item with variants
+// ── Variant _id preservation: if the incoming variant carries an `_id` that
+// already exists in the document, we update that subdocument in-place instead
+// of replacing it. This ensures references from orders, WOs, etc. remain valid.
 router.put("/:id", async (req, res) => {
   try {
     const {
       name, additionalNames, productType, category, unit, hsnCode, internalNotes,
-      baseSalesPrice, baseCost,
+      baseSalesPrice, baseCost, genderCategory,
       attributes, variants, measurements, numberOfPanels,
       operations, miscellaneousCosts, images
     } = req.body;
@@ -682,8 +751,8 @@ router.put("/:id", async (req, res) => {
     if (internalNotes !== undefined) stockItem.internalNotes = internalNotes;
     if (baseSalesPrice !== undefined) stockItem.baseSalesPrice = parseFloat(baseSalesPrice) || 0;
     if (baseCost !== undefined) stockItem.baseCost = parseFloat(baseCost) || 0;
+    if (genderCategory !== undefined) stockItem.genderCategory = genderCategory;
 
-    // ── Update additionalNames ──
     if (additionalNames !== undefined) {
       stockItem.additionalNames = (Array.isArray(additionalNames) ? additionalNames : [])
         .map(n => n?.trim())
@@ -706,12 +775,35 @@ router.put("/:id", async (req, res) => {
     if (numberOfPanels !== undefined) stockItem.numberOfPanels = parseInt(numberOfPanels) || 0;
 
     if (variants !== undefined) {
+      // Build a lookup of existing variants by their _id string
+      const existingVariantsById = {};
+      stockItem.variants.forEach(v => {
+        existingVariantsById[v._id.toString()] = v;
+      });
+
       const processedVariants = await Promise.all(
         variants.map(async (variant, index) => {
           const variantSku = variant.sku || `${stockItem.reference}-V${(index + 1).toString().padStart(3, "0")}`;
-          const variantBarcode = variant.barcode || `${stockItem.barcode || ""}-${(index + 1).toString().padStart(3, "0")}`;
           const processedRawItems = await processVariantRawItems(variant.rawItems);
 
+          // ── Preserve existing _id if the variant already has one ──
+          if (variant._id && existingVariantsById[variant._id.toString()]) {
+            const existing = existingVariantsById[variant._id.toString()];
+            // Update fields in-place on the existing subdocument
+            existing.sku = variantSku;
+            existing.attributes = variant.attributes || existing.attributes;
+            existing.quantityOnHand = parseFloat(variant.quantityOnHand) ?? existing.quantityOnHand;
+            existing.minStock = parseFloat(variant.minStock) || existing.minStock || 10;
+            existing.maxStock = parseFloat(variant.maxStock) || existing.maxStock || 100;
+            existing.cost = parseFloat(variant.cost) || stockItem.baseCost || 0;
+            existing.salesPrice = parseFloat(variant.salesPrice) || stockItem.baseSalesPrice || 0;
+            existing.barcode = variant.barcode || existing.barcode || "";
+            existing.images = variant.images || stockItem.images || existing.images || [];
+            existing.rawItems = processedRawItems;
+            return existing;
+          }
+
+          // New variant — generate a fresh subdocument (gets a new _id automatically)
           return {
             sku: variantSku,
             attributes: variant.attributes || [],
@@ -720,7 +812,7 @@ router.put("/:id", async (req, res) => {
             maxStock: parseFloat(variant.maxStock) || 100,
             cost: parseFloat(variant.cost) || stockItem.baseCost || 0,
             salesPrice: parseFloat(variant.salesPrice) || stockItem.baseSalesPrice || 0,
-            barcode: variantBarcode,
+            barcode: variant.barcode || "",
             images: variant.images || stockItem.images || [],
             rawItems: processedRawItems
           };
@@ -776,6 +868,80 @@ router.put("/:id", async (req, res) => {
   } catch (error) {
     console.error("Error updating stock item:", error);
     res.status(500).json({ success: false, message: "Server error while updating stock item" });
+  }
+});
+
+// ✅ CLONE stock item
+// Creates an identical copy with name appended by "_Clone" and a fresh reference/barcode.
+router.post("/:id/clone", async (req, res) => {
+  try {
+    const original = await StockItem.findById(req.params.id);
+    if (!original) {
+      return res.status(404).json({ success: false, message: "Stock item not found" });
+    }
+
+    // Build a new reference for the clone
+    const clonedName = `${original.name}_Clone`;
+    const nameWords = clonedName.split(" ");
+    const nameCode = nameWords.map(w => w.substring(0, 3).toUpperCase()).join("");
+    const categoryCode = (original.category || "CAT").substring(0, 3).toUpperCase();
+    const randomNum = Math.floor(Math.random() * 9000 + 1000).toString();
+    const newReference = `PROD-${categoryCode}-${nameCode}-${randomNum}`.toUpperCase();
+
+    const newBarcode = "89" + Math.floor(Math.random() * 10000000000).toString().padStart(10, "0");
+
+    // Deep-copy variants — each gets a new SKU but same data (fresh _id via Mongoose)
+    const clonedVariants = original.variants.map((v, index) => ({
+      sku: `${newReference}-V${(index + 1).toString().padStart(3, "0")}`,
+      attributes: v.attributes,
+      quantityOnHand: v.quantityOnHand,
+      minStock: v.minStock,
+      maxStock: v.maxStock,
+      cost: v.cost,
+      salesPrice: v.salesPrice,
+      barcode: `${newBarcode}-${(index + 1).toString().padStart(3, "0")}`,
+      images: v.images,
+      rawItems: v.rawItems,
+      status: v.status
+    }));
+
+    const clonedItem = new StockItem({
+      name: clonedName,
+      additionalNames: original.additionalNames || [],
+      reference: newReference,
+      productType: original.productType,
+      category: original.category,
+      unit: original.unit,
+      hsnCode: original.hsnCode,
+      genderCategory: original.genderCategory || "",
+      internalNotes: original.internalNotes,
+      baseSalesPrice: original.baseSalesPrice,
+      baseCost: original.baseCost,
+      attributes: original.attributes,
+      measurements: original.measurements,
+      numberOfPanels: original.numberOfPanels,
+      variants: clonedVariants,
+      operations: original.operations,
+      miscellaneousCosts: original.miscellaneousCosts,
+      images: original.images,
+      createdBy: req.user.id
+    });
+
+    updateStockItemAggregates(clonedItem);
+    await clonedItem.save();
+
+    res.status(201).json({
+      success: true,
+      message: `Cloned successfully as "${clonedName}"`,
+      stockItem: clonedItem
+    });
+
+  } catch (error) {
+    console.error("Error cloning stock item:", error);
+    if (error.code === 11000) {
+      return res.status(400).json({ success: false, message: "Clone reference collision — please try again" });
+    }
+    res.status(500).json({ success: false, message: "Server error while cloning stock item" });
   }
 });
 
