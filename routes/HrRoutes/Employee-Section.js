@@ -9,55 +9,52 @@ const emailService = require("../../services/emailService");
 require("dotenv").config();
 
 // ─── SALARY CALCULATION HELPER ───────────────────────────────────────────────
-// Accepts a config object (from SalaryConfig model) so all rates are dynamic.
-// Falls back to statutory defaults if no config is passed.
 function recalculateSalary(salary = {}, cfg = {}) {
   const basicPct = (cfg.basicPct ?? 50) / 100;
-  const hraPct = (cfg.hraPct ?? 20) / 100;
+  const hraPct = (cfg.hraPct ?? 50) / 100;
   const eepfPct = (cfg.eepfPct ?? 12) / 100;
-  const epsPct = (cfg.epsPct ?? 8.33) / 100;
-  const epsCapAmount = cfg.epsCapAmount ?? 1250;
+  const epfCapAmount = cfg.epfCapAmount ?? 1800;
   const edliPct = (cfg.edliPct ?? 0.5) / 100;
-  const edliCapAmount = cfg.edliCapAmount ?? 75;
+  const edliCapAmount = cfg.edliCapAmount ?? 15000;
   const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
   const esiWageLimit = cfg.esiWageLimit ?? 21000;
   const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
   const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
+  const foodAllowance = cfg.foodAllowance ?? 1600;
 
   const gross = salary.gross || 0;
-  const calDays = salary.calendarDays || 0;
-  const workDays = salary.actualWorkingDays || 0;
+  const basic = Math.round(gross * basicPct);
+  const hra = Math.round(gross * hraPct);
 
-  const payableGross = (calDays > 0 && workDays > 0 && workDays <= calDays)
-    ? Math.round((gross / calDays) * workDays)
-    : gross;
+  // EPF: ROUND(MIN(basic * 12%, epfCapAmount)) — rupee cap of 1,800/mo
+  const epf = Math.round(Math.min(basic * eepfPct, epfCapAmount));
 
-  const basic = Math.round(payableGross * basicPct);
-  const hra = Math.round(payableGross * hraPct);
+  // EDLI & Admin — respect HR override
+  const edli = salary.edliOverride
+    ? (salary.edli || 0)
+    : Math.round(Math.min(basic * edliPct, edliCapAmount));
+  const adminCharges = salary.adminOverride
+    ? (salary.adminCharges || 0)
+    : Math.round(basic * adminPct);
 
-  const eepf = Math.round(basic * eepfPct);
-  const eps = Math.min(Math.round(basic * epsPct), epsCapAmount);
-  const epf = Math.round(basic * eepfPct) - eps;            // employer 12% - EPS
-  const edli = Math.min(Math.round(basic * edliPct), edliCapAmount);
-  const adminCharges = Math.round(basic * adminPct);
+  // ESI — calculated on Basic, applies when Basic <= esiWageLimit
+  const esiApplicable = basic <= esiWageLimit;
+  const eeesic = esiApplicable ? Math.ceil(basic * eeEsicPct) : 0;
+  const erEsic = esiApplicable ? Math.ceil(basic * erEsicPct) : 0;
 
-  const esiApplicable = gross <= esiWageLimit;
-  const eeesic = esiApplicable ? Math.round(payableGross * eeEsicPct) : 0;
-  const erEsic = esiApplicable ? Math.round(payableGross * erEsicPct) : 0;
+  // CTC = Gross + EPF + ESIC(ER) + Food Allowance
+  const employerCost = gross + epf + erEsic + foodAllowance;
 
-  const salaryAdvance = salary.salaryAdvance || 0;
-  const loan = salary.loan || 0;
-  const otherDeductions = salary.otherDeductions || 0;
-
-  const totalDeduction = eepf + eeesic + salaryAdvance + loan + otherDeductions;
-  const netSalary = Math.max(payableGross - totalDeduction, 0);
+  // Employee deductions = EPF + ESIC(EE)
+  const totalDeduction = epf + eeesic;
+  const netSalary = Math.max(gross - totalDeduction, 0);
 
   return {
-    gross, calendarDays: calDays, actualWorkingDays: workDays,
-    basic, hra,
-    eepf, eps, epf, edli, adminCharges,
-    eeesic, erEsic,
-    salaryAdvance, loan, otherDeductions,
+    gross, basic, hra,
+    epf, edli, adminCharges,
+    edliOverride: salary.edliOverride || false,
+    adminOverride: salary.adminOverride || false,
+    eeesic, erEsic, foodAllowance, employerCost,
     totalDeduction, netSalary,
     allowances: hra, deductions: totalDeduction,
   };
@@ -82,13 +79,15 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
 
     const allowed = [
       "basicPct", "hraPct",
-      "eepfPct", "epsPct", "epsCapAmount",
+      "eepfPct", "epfCapAmount", "foodAllowance",
       "edliPct", "edliCapAmount", "adminChargesPct",
       "esiWageLimit", "eeEsicPct", "erEsicPct",
     ];
 
     const updates = {};
-    allowed.forEach((k) => { if (req.body[k] !== undefined) updates[k] = Number(req.body[k]); });
+    allowed.forEach((k) => {
+      if (req.body[k] !== undefined) updates[k] = Number(req.body[k]);
+    });
     updates.updatedBy = user.id;
     updates.updatedAt = new Date();
 
@@ -108,6 +107,7 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to update salary config" });
   }
 });
+
 
 // ─── CREATE new employee ──────────────────────────────────────────────────────
 router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
@@ -139,6 +139,7 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     }
 
     const temporaryPassword = Math.random().toString(36).slice(-8);
+    console.log("Generated temporary password:", temporaryPassword);
 
     const newEmployee = new Employee({
       ...employeeData,
@@ -149,6 +150,7 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     });
 
     await newEmployee.save();
+    console.log("Employee saved with ID:", newEmployee._id);
 
     // Send welcome email asynchronously
     if (process.env.ENABLE_EMAILS === "true" && employeeData.email) {
@@ -159,20 +161,34 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
           employeeId: employeeData.biometricId,
           department: employeeData.department,
           designation: employeeData.designation || employeeData.jobPosition,
-          temporaryPassword,
+          // Don't include temporaryPassword here since it's passed separately
         };
-        emailService.sendWelcomeEmail(emailData)
+
+        console.log("Sending welcome email with data:", emailData);
+        console.log("With password:", temporaryPassword);
+
+        emailService.sendWelcomeEmail(emailData, temporaryPassword)
           .then(() => {
+            console.log("Welcome email sent successfully for employee:", newEmployee._id);
             Employee.findByIdAndUpdate(newEmployee._id, {
-              $set: { welcomeEmailSent: true, emailSentAt: new Date(), temporaryPassword: null },
+              $set: { welcomeEmailSent: true, emailSentAt: new Date() },
+              $unset: { temporaryPassword: 1, emailError: 1 }
             }).catch(console.error);
           })
           .catch((err) => {
+            console.error("Welcome email failed:", err);
             Employee.findByIdAndUpdate(newEmployee._id, {
-              $set: { welcomeEmailSent: false, emailError: err.message },
+              $set: {
+                welcomeEmailSent: false,
+                emailError: err.message
+              }
             }).catch(console.error);
           });
-      } catch (e) { console.error("Email error:", e); }
+      } catch (e) {
+        console.error("Email error:", e);
+      }
+    } else {
+      console.log("Emails disabled or no email provided");
     }
 
     const resp = newEmployee.toObject();
