@@ -1,3 +1,5 @@
+// 
+
 const express = require('express');
 const router = express.Router();
 const EmployeeMpc = require('../../models/Customer_Models/Employee_Mpc');
@@ -99,7 +101,7 @@ router.get('/products/available', verifyCustomerToken, async (req, res) => {
     }
 
     const products = await StockItem.find(filter)
-      .select('name reference category baseSalesPrice totalQuantityOnHand images variants')
+      .select('name reference category genderCategory baseSalesPrice totalQuantityOnHand images variants')
       .sort({ name: 1 })
       .limit(50) // Limit results
       .lean();
@@ -159,237 +161,173 @@ router.get('/products/:id/variants', verifyCustomerToken, async (req, res) => {
 // CREATE single employee
 router.post('/', verifyCustomerToken, async (req, res) => {
   try {
-    const { name, uin, gender, products } = req.body;
-
-    // Validation
+    const { name, uin, gender, department, designation, products } = req.body;
+ 
     if (!name || !name.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Name is required'
-      });
+      return res.status(400).json({ success: false, message: 'Name is required' });
     }
-
     if (!uin || !uin.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: 'UIN is required'
-      });
+      return res.status(400).json({ success: false, message: 'UIN is required' });
     }
-
     if (!gender) {
-      return res.status(400).json({
-        success: false,
-        message: 'Gender is required'
-      });
+      return res.status(400).json({ success: false, message: 'Gender is required' });
     }
-
-    if (!products || !Array.isArray(products) || products.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'At least one product is required'
-      });
-    }
-
-    // Check for existing UIN
-    const existingEmployee = await EmployeeMpc.findOne({ 
+ 
+    // ❌ REMOVED: mandatory products check — products are optional
+ 
+    const existingEmployee = await EmployeeMpc.findOne({
       uin: uin.toUpperCase(),
-      customerId: req.customerId 
-    });
-    
-    if (existingEmployee) {
-      return res.status(400).json({
-        success: false,
-        message: 'Employee with this UIN already exists'
-      });
-    }
-
-    // Validate products
-    const validProducts = [];
-    for (const product of products) {
-      if (!product.productId) {
-        return res.status(400).json({
-          success: false,
-          message: 'Product ID is required'
-        });
-      }
-
-      const stockItem = await StockItem.findById(product.productId);
-      if (!stockItem) {
-        return res.status(400).json({
-          success: false,
-          message: `Product not found: ${product.productId}`
-        });
-      }
-
-      if (product.variantId) {
-        const variant = stockItem.variants.find(v => v._id.toString() === product.variantId);
-        if (!variant) {
-          return res.status(400).json({
-            success: false,
-            message: `Variant not found: ${product.variantId}`
-          });
-        }
-      }
-
-      validProducts.push({
-        productId: product.productId,
-        variantId: product.variantId || null,
-        quantity: product.quantity || 1
-      });
-    }
-
-    const newEmployee = new EmployeeMpc({
-      customerId: req.customerId,
-      name: name.trim(),
-      uin: uin.trim().toUpperCase(),
-      gender: gender,
-      products: validProducts,
-      status: 'active',
-      createdBy: req.customerId
-    });
-
-    await newEmployee.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'Employee created successfully',
-      employee: newEmployee
-    });
-
-  } catch (error) {
-    console.error('Error creating employee:', error);
-
-    if (error.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        message: 'Employee with this UIN already exists'
-      });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: 'Server error while creating employee'
-    });
-  }
-});
-
-// CREATE multiple employees (batch)
-router.post('/batch', verifyCustomerToken, async (req, res) => {
-  try {
-    const { employees } = req.body;
-
-    if (!employees || !Array.isArray(employees) || employees.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Employee data is required'
-      });
-    }
-
-    const existingEmployees = await EmployeeMpc.find({
       customerId: req.customerId
-    }).select('uin').lean();
-
-    const existingUins = existingEmployees.map(emp => emp.uin.toUpperCase());
-
-    const validationErrors = [];
-    const employeesToCreate = [];
-    const skippedEmployees = [];
-
-    for (const [index, emp] of employees.entries()) {
-      const rowNumber = index + 1;
-
-      // Validate required fields
-      if (!emp.name || !emp.name.trim()) {
-        validationErrors.push(`Row ${rowNumber}: Name is required`);
-        continue;
-      }
-
-      if (!emp.uin || !emp.uin.trim()) {
-        validationErrors.push(`Row ${rowNumber}: UIN is required`);
-        continue;
-      }
-
-      if (!emp.gender) {
-        validationErrors.push(`Row ${rowNumber}: Gender is required`);
-        continue;
-      }
-
-      if (!emp.products || !Array.isArray(emp.products) || emp.products.length === 0) {
-        validationErrors.push(`Row ${rowNumber}: At least one product is required`);
-        continue;
-      }
-
-      const formattedUin = emp.uin.trim().toUpperCase();
-
-      // Check for duplicates
-      if (existingUins.includes(formattedUin)) {
-        skippedEmployees.push({
-          row: rowNumber,
-          name: emp.name.trim(),
-          uin: formattedUin,
-          reason: 'UIN already exists'
-        });
-        continue;
-      }
-
-      const isDuplicateInBatch = employeesToCreate.some(e => e.uin === formattedUin);
-      if (isDuplicateInBatch) {
-        skippedEmployees.push({
-          row: rowNumber,
-          name: emp.name.trim(),
-          uin: formattedUin,
-          reason: 'Duplicate UIN in this file'
-        });
-        continue;
-      }
-
-      // Validate products
-      const validProducts = [];
-      for (const product of emp.products) {
+    });
+    if (existingEmployee) {
+      return res.status(400).json({ success: false, message: 'Employee with this UIN already exists' });
+    }
+ 
+    // Validate products only if provided
+    const validProducts = [];
+    if (products && Array.isArray(products) && products.length > 0) {
+      for (const product of products) {
         if (!product.productId) {
-          validationErrors.push(`Row ${rowNumber}: Product ID is required`);
-          continue;
+          return res.status(400).json({ success: false, message: 'Product ID is required' });
         }
-
         const stockItem = await StockItem.findById(product.productId);
         if (!stockItem) {
-          validationErrors.push(`Row ${rowNumber}: Product not found`);
-          continue;
+          return res.status(400).json({ success: false, message: `Product not found: ${product.productId}` });
         }
-
         if (product.variantId) {
           const variant = stockItem.variants.find(v => v._id.toString() === product.variantId);
           if (!variant) {
-            validationErrors.push(`Row ${rowNumber}: Variant not found`);
-            continue;
+            return res.status(400).json({ success: false, message: `Variant not found: ${product.variantId}` });
           }
         }
-
         validProducts.push({
           productId: product.productId,
           variantId: product.variantId || null,
           quantity: product.quantity || 1
         });
       }
+    }
+ 
+    const newEmployee = new EmployeeMpc({
+      customerId: req.customerId,
+      name: name.trim(),
+      uin: uin.trim().toUpperCase(),
+      gender: gender,
+      department: department?.trim() || '',
+      designation: designation?.trim() || '',
+      products: validProducts,   // empty array is fine
+      status: 'active',
+      createdBy: req.customerId
+    });
+ 
+    await newEmployee.save();
+ 
+    res.status(201).json({
+      success: true,
+      message: 'Employee created successfully',
+      employee: newEmployee
+    });
+ 
+  } catch (error) {
+    console.error('Error creating employee:', error);
+    if (error.code === 11000) {
+      return res.status(400).json({ success: false, message: 'Employee with this UIN already exists' });
+    }
+    res.status(500).json({ success: false, message: 'Server error while creating employee' });
+  }
+});
 
-      if (validProducts.length === 0) {
-        validationErrors.push(`Row ${rowNumber}: No valid products to assign`);
+router.post('/batch', verifyCustomerToken, async (req, res) => {
+  try {
+    const { employees } = req.body;
+ 
+    if (!employees || !Array.isArray(employees) || employees.length === 0) {
+      return res.status(400).json({ success: false, message: 'Employee data is required' });
+    }
+ 
+    const existingEmployees = await EmployeeMpc.find({ customerId: req.customerId })
+      .select('uin').lean();
+    const existingUins = existingEmployees.map(emp => emp.uin.toUpperCase());
+ 
+    const validationErrors = [];
+    const employeesToCreate = [];
+    const skippedEmployees = [];
+ 
+    for (const [index, emp] of employees.entries()) {
+      const rowNumber = index + 1;
+ 
+      if (!emp.name || !emp.name.trim()) {
+        validationErrors.push(`Row ${rowNumber}: Name is required`);
         continue;
       }
-
+      if (!emp.uin || !emp.uin.trim()) {
+        validationErrors.push(`Row ${rowNumber}: UIN is required`);
+        continue;
+      }
+      if (!emp.gender) {
+        validationErrors.push(`Row ${rowNumber}: Gender is required`);
+        continue;
+      }
+ 
+      // ❌ REMOVED: mandatory products check
+      // Products are optional — employees can be registered first,
+      // then have products assigned later.
+ 
+      const formattedUin = emp.uin.trim().toUpperCase();
+ 
+      if (existingUins.includes(formattedUin)) {
+        skippedEmployees.push({ row: rowNumber, name: emp.name.trim(), uin: formattedUin, reason: 'UIN already exists' });
+        continue;
+      }
+      const isDuplicateInBatch = employeesToCreate.some(e => e.uin === formattedUin);
+      if (isDuplicateInBatch) {
+        skippedEmployees.push({ row: rowNumber, name: emp.name.trim(), uin: formattedUin, reason: 'Duplicate UIN in this file' });
+        continue;
+      }
+ 
+      // Validate products only if provided
+      const validProducts = [];
+      if (emp.products && Array.isArray(emp.products) && emp.products.length > 0) {
+        for (const product of emp.products) {
+          if (!product.productId) {
+            validationErrors.push(`Row ${rowNumber}: Product ID is required`);
+            continue;
+          }
+          const stockItem = await StockItem.findById(product.productId);
+          if (!stockItem) {
+            validationErrors.push(`Row ${rowNumber}: Product not found`);
+            continue;
+          }
+          if (product.variantId) {
+            const variant = stockItem.variants.find(v => v._id.toString() === product.variantId);
+            if (!variant) {
+              validationErrors.push(`Row ${rowNumber}: Variant not found`);
+              continue;
+            }
+          }
+          validProducts.push({
+            productId: product.productId,
+            variantId: product.variantId || null,
+            quantity: product.quantity || 1
+          });
+        }
+      }
+ 
       employeesToCreate.push({
         customerId: req.customerId,
         name: emp.name.trim(),
         uin: formattedUin,
         gender: emp.gender,
-        products: validProducts,
+        department: emp.department?.trim() || '',
+        designation: emp.designation?.trim() || '',
+        products: validProducts,   // empty array is fine
         status: 'active',
         createdBy: req.customerId
       });
-
+ 
       existingUins.push(formattedUin);
     }
-
+ 
     if (employeesToCreate.length === 0) {
       return res.status(400).json({
         success: false,
@@ -402,7 +340,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         skippedCount: skippedEmployees.length
       });
     }
-
+ 
     let createdEmployees = [];
     try {
       createdEmployees = await EmployeeMpc.insertMany(employeesToCreate, { ordered: false });
@@ -412,17 +350,13 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
           if (writeError.code === 11000) {
             const failedUin = writeError.err.op.uin;
             const failedRow = employees.findIndex(e => e.uin.toUpperCase() === failedUin) + 1;
-            skippedEmployees.push({
-              row: failedRow,
-              uin: failedUin,
-              reason: 'Duplicate UIN (database constraint)'
-            });
+            skippedEmployees.push({ row: failedRow, uin: failedUin, reason: 'Duplicate UIN (database constraint)' });
           }
         });
         createdEmployees = error.insertedDocs || [];
       }
     }
-
+ 
     res.status(201).json({
       success: true,
       message: `Processed ${employees.length} employees`,
@@ -439,13 +373,10 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         ? '... and more (only showing first 20 of each)'
         : null
     });
-
+ 
   } catch (error) {
     console.error('Error creating batch employees:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error while processing employees'
-    });
+    res.status(500).json({ success: false, message: 'Server error while processing employees' });
   }
 });
 
