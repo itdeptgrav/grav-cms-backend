@@ -74,6 +74,150 @@ async function buildUnitConversionsMap() {
   }
 }
 
+
+
+router.post("/:id/operations", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { type, machine, machineType, totalSeconds, minutes, seconds, operatorSalary, operatorCost } = req.body;
+ 
+    if (!type || !machineType) {
+      return res.status(400).json({ success: false, message: "type and machineType are required" });
+    }
+ 
+    const stockItem = await StockItem.findById(id);
+    if (!stockItem) {
+      return res.status(404).json({ success: false, message: "Stock item not found" });
+    }
+ 
+    // Avoid duplicate — if the exact same operation type + machineType already exists, skip
+    const alreadyExists = (stockItem.operations || []).some(
+      (op) => op.type === type && op.machineType === machineType
+    );
+    if (alreadyExists) {
+      return res.json({
+        success: true,
+        message: "Operation already exists on product (no duplicate added)",
+        skipped: true,
+      });
+    }
+ 
+    const newOp = {
+      type,
+      machine: machine || machineType,
+      machineType,
+      totalSeconds: totalSeconds || 0,
+      minutes: minutes || 0,
+      seconds: seconds || 0,
+      operatorSalary: operatorSalary || 0,
+      operatorCost: operatorCost || 0,
+    };
+ 
+    stockItem.operations.push(newOp);
+    stockItem.updatedBy = req.user?.id;
+    await stockItem.save();
+ 
+    return res.json({
+      success: true,
+      message: "Operation added to product successfully",
+      operation: stockItem.operations[stockItem.operations.length - 1],
+    });
+  } catch (error) {
+    console.error("Error adding operation to stock item:", error);
+    return res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+ 
+// ── DELETE /api/cms/stock-items/:id/operations/by-type ───────────────────────
+// Remove an operation from a StockItem by matching operationType + machineType.
+// Body: { operationType, machineType }
+// This is used when the planner removes an op during work order planning —
+// the change propagates to the product so future work orders reflect it.
+router.delete("/:id/operations/by-type", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { operationType, machineType } = req.body;
+ 
+    if (!operationType) {
+      return res.status(400).json({ success: false, message: "operationType is required" });
+    }
+ 
+    const stockItem = await StockItem.findById(id);
+    if (!stockItem) {
+      return res.status(404).json({ success: false, message: "Stock item not found" });
+    }
+ 
+    const originalCount = stockItem.operations.length;
+ 
+    // Remove matching operations (match by type; optionally also match machineType if provided)
+    stockItem.operations = stockItem.operations.filter((op) => {
+      const typeMatch = op.type === operationType;
+      const machineMatch = machineType ? op.machineType === machineType : true;
+      // Keep the op if it does NOT match both criteria
+      return !(typeMatch && machineMatch);
+    });
+ 
+    const removed = originalCount - stockItem.operations.length;
+    if (removed === 0) {
+      return res.json({
+        success: true,
+        message: "No matching operation found on product (nothing removed)",
+        removed: 0,
+      });
+    }
+ 
+    stockItem.updatedBy = req.user?.id;
+    await stockItem.save();
+ 
+    return res.json({
+      success: true,
+      message: `Removed ${removed} operation(s) from product`,
+      removed,
+    });
+  } catch (error) {
+    console.error("Error removing operation from stock item:", error);
+    return res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+ 
+// ── DELETE /api/cms/stock-items/:id/operations/:operationIndex ────────────────
+// Remove an operation from a StockItem by its array index (0-based).
+// Alternative to by-type if you have a direct index reference.
+router.delete("/:id/operations/:operationIndex", async (req, res) => {
+  try {
+    const { id, operationIndex } = req.params;
+    const idx = parseInt(operationIndex, 10);
+ 
+    if (isNaN(idx) || idx < 0) {
+      return res.status(400).json({ success: false, message: "operationIndex must be a non-negative integer" });
+    }
+ 
+    const stockItem = await StockItem.findById(id);
+    if (!stockItem) {
+      return res.status(404).json({ success: false, message: "Stock item not found" });
+    }
+ 
+    if (idx >= stockItem.operations.length) {
+      return res.status(400).json({
+        success: false,
+        message: `operationIndex ${idx} is out of range (product has ${stockItem.operations.length} operations)`,
+      });
+    }
+ 
+    stockItem.operations.splice(idx, 1);
+    stockItem.updatedBy = req.user?.id;
+    await stockItem.save();
+ 
+    return res.json({
+      success: true,
+      message: "Operation removed from product successfully",
+    });
+  } catch (error) {
+    console.error("Error removing operation from stock item:", error);
+    return res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // IMPORTANT: Specific /data/* routes MUST be defined BEFORE /:id routes
 // ─────────────────────────────────────────────────────────────────────────────
