@@ -237,14 +237,14 @@ const assignMeasurementsToExistingProducts = async () => {
     const CATEGORY_MEASUREMENTS = {
       "Shirts": [
         "Shoulder", "Chest", "Stomach", "Bottom hem/Hips", 
-        "Armhole", "Sleeve length", "Cuff", "Collar", "Length"
+         "Sleeve length", "Cuff", "Collar", "Length"
       ],
       "Bottoms": [
         "Waist", "Hips", "Thigh", "Knee", "Bottom", "Croch", "Length"
       ],
       "Outerwear": [
         "Collar", "Shoulder", "Chest", "Stomach", 
-        "Bottom hem", "Armhole", "Length"
+        "Bottom hem", "Length"
       ]
     };
 
