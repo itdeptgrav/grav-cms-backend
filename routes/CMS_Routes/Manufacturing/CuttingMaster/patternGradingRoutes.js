@@ -278,6 +278,7 @@ router.post(
               "change_by_percent",
               "change_by_ratio_of_trigger",
               "derive_from_source",
+              "db_measurement_formula",
               "multi_group_expression",
               "live_canvas_value",
             ];
@@ -324,6 +325,23 @@ router.post(
               liveOperator: ["plus", "minus", "multiply", "divide"].includes(cond.liveOperator)
                 ? cond.liveOperator : "plus",
               liveOffsetValue: Number(cond.liveOffsetValue) || 0,
+              // DB-formula expression fields (used by db_measurement_formula action)
+              // Reads exact work-order measurements — never stale localStorage values.
+              dbExpressionGroups: (cond.dbExpressionGroups || []).map((eg) => ({
+                type: ["group", "constant"].includes(eg.type) ? eg.type : "group",
+                groupId: String(eg.groupId || ""),
+                operator: ["plus", "minus", "multiply", "divide"].includes(eg.operator)
+                  ? eg.operator : "plus",
+                constantValue: eg.constantValue !== undefined ? Number(eg.constantValue) : undefined,
+              })),
+              dbExpressionOffset: cond.dbExpressionOffset !== undefined ? Number(cond.dbExpressionOffset) : 0,
+              dbExpressionScalarOp: ["none", "plus", "minus", "multiply", "divide"].includes(cond.dbExpressionScalarOp)
+                ? cond.dbExpressionScalarOp : "none",
+              // Legacy single-source db fields (backward compat)
+              dbSourceGroupId: cond.dbSourceGroupId || null,
+              dbOperator: ["plus", "minus", "multiply", "divide"].includes(cond.dbOperator)
+                ? cond.dbOperator : "plus",
+              dbOffsetValue: Number(cond.dbOffsetValue) || 0,
             };
           }),
         }));

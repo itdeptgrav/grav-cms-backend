@@ -120,37 +120,33 @@ const employeeSchema = new mongoose.Schema({
 
   // ─── SALARY INFORMATION ──────────────────────────────────────────────────────
   salary: {
-    // ── Inputs (HR fills these) ───────────────────────────────────────────────
-    gross: { type: Number, min: 0, default: 0 },  // CTC / gross monthly salary
-    calendarDays: { type: Number, default: 0 },          // total days in the month
-    actualWorkingDays: { type: Number, default: 0 },          // days employee actually worked
+    // ── HR Input ──────────────────────────────────────────────────────────────
+    gross: { type: Number, min: 0, default: 0 }, // Monthly gross salary
 
-    // ── Earnings (auto-calculated) ────────────────────────────────────────────
-    basic: { type: Number, default: 0 },  // 50% of gross
-    hra: { type: Number, default: 0 },  // 20% of gross (non-metro default)
+    // ── Earnings (auto) ───────────────────────────────────────────────────────
+    basic: { type: Number, default: 0 }, // basicPct % of gross
+    hra: { type: Number, default: 0 }, // hraPct % of gross
+    specialAllowance: { type: Number, default: 0 }, // gross − basic − hra
 
-    // ── Employer PF Contributions (auto-calculated) ───────────────────────────
-    // EPF = 12% of Basic — split: EPS 8.33% capped ₹1250, EEPF remainder
-    eepf: { type: Number, default: 0 },  // Employee share: 12% of basic
-    eps: { type: Number, default: 0 },  // Employer share: 8.33% of basic, max ₹1250
-    epf: { type: Number, default: 0 },  // Employer share: 3.67% of basic (EPF - EPS)
-    edli: { type: Number, default: 0 },  // 0.5% of basic, max ₹75/month
-    adminCharges: { type: Number, default: 0 },  // 0.5% of basic (EPF admin)
+    // ── PF (auto) ─────────────────────────────────────────────────────────────
+    epf: { type: Number, default: 0 }, // EPF: 12% of Basic, capped ₹1,800/mo
+    // EDLI & Admin — HR-editable; override flags prevent auto-recalculation
+    edli: { type: Number, default: 0 },
+    edliOverride: { type: Boolean, default: false },
+    adminCharges: { type: Number, default: 0 },
+    adminOverride: { type: Boolean, default: false },
 
-    // ── ESI (applicable only if gross ≤ ₹21,000) ─────────────────────────────
-    eeesic: { type: Number, default: 0 },  // Employee ESI: 0.75% of gross
-    erEsic: { type: Number, default: 0 },  // Employer ESI: 3.25% of gross
+    // ── ESI on Basic (if basic ≤ esiWageLimit) ───────────────────────────────
+    eeesic: { type: Number, default: 0 }, // eeEsicPct% of basic
+    erEsic: { type: Number, default: 0 }, // erEsicPct% of basic
+    foodAllowance: { type: Number, default: 1600 }, // Fixed food allowance (from config)
 
-    // ── Deductions ────────────────────────────────────────────────────────────
-    salaryAdvance: { type: Number, default: 0 },  // manual entry
-    loan: { type: Number, default: 0 },  // manual entry
-    otherDeductions: { type: Number, default: 0 },  // manual entry
+    // ── Totals (auto) ─────────────────────────────────────────────────────────
+    employerCost: { type: Number, default: 0 }, // gross + EPF + ESIC(ER) + foodAllowance = CTC
+    totalDeduction: { type: Number, default: 0 }, // epf + eeesic
+    netSalary: { type: Number, default: 0 }, // gross − totalDeduction
 
-    // ── Totals (auto-calculated) ──────────────────────────────────────────────
-    totalDeduction: { type: Number, default: 0 },  // eepf + eeesic + advance + loan + other
-    netSalary: { type: Number, default: 0 },  // payable gross - totalDeduction
-
-    // ── Legacy (kept for backward compat) ────────────────────────────────────
+    // ── Legacy ────────────────────────────────────────────────────────────────
     allowances: { type: Number, default: 0 },
     deductions: { type: Number, default: 0 },
   },
@@ -246,67 +242,62 @@ employeeSchema.index({ biometricId: 1 }, { unique: true, sparse: true });
 employeeSchema.index({ identityId: 1 }, { unique: true, sparse: true });
 
 // ─── PRE-SAVE HOOKS ──────────────────────────────────────────────────────────────
-// Auto-calculate all payroll fields using config rates stored in SalaryConfig collection
 employeeSchema.pre("save", async function (next) {
   if (!this.salary) { this.updatedAt = Date.now(); return next(); }
   try {
-    // Lazy-require to avoid circular dependency issues at startup
     const SalaryConfig = require("./Salaryconfig");
     const cfg = await SalaryConfig.getSingleton();
-
     const s = this.salary;
+
     const basicPct = (cfg.basicPct ?? 50) / 100;
-    const hraPct = (cfg.hraPct ?? 20) / 100;
+    const hraPct = (cfg.hraPct ?? 50) / 100;
     const eepfPct = (cfg.eepfPct ?? 12) / 100;
-    const epsPct = (cfg.epsPct ?? 8.33) / 100;
-    const epsCapAmount = cfg.epsCapAmount ?? 1250;
+    const epfCapAmount = cfg.epfCapAmount ?? 1800;   // rupee cap = 12% of PF wage ceiling 15000
     const edliPct = (cfg.edliPct ?? 0.5) / 100;
-    const edliCapAmount = cfg.edliCapAmount ?? 75;
+    const edliCapAmount = cfg.edliCapAmount ?? 15000;
     const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
     const esiWageLimit = cfg.esiWageLimit ?? 21000;
     const eeEsicPct = (cfg.eeEsicPct ?? 0.75) / 100;
     const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
 
     const gross = s.gross || 0;
-    const calDays = s.calendarDays || 0;
-    const workDays = s.actualWorkingDays || 0;
+    const basic = Math.round(gross * basicPct);
+    const hra = Math.round(gross * hraPct);
 
-    const payableGross = (calDays > 0 && workDays > 0 && workDays <= calDays)
-      ? Math.round((gross / calDays) * workDays)
-      : gross;
+    // EPF: ROUND(MIN(basic * eepfPct, epfCapAmount)) -- rupee cap of 1800/mo
+    const epf = Math.round(Math.min(basic * eepfPct, epfCapAmount));
 
-    const basic = Math.round(payableGross * basicPct);
-    const hra = Math.round(payableGross * hraPct);
+    // EDLI & Admin -- respect HR override, else auto-calculate
+    const edli = s.edliOverride ? (s.edli || 0) : Math.round(Math.min(basic * edliPct, edliCapAmount));
+    const adminCharges = s.adminOverride ? (s.adminCharges || 0) : Math.round(basic * adminPct);
 
-    const eepf = Math.round(basic * eepfPct);
-    const eps = Math.min(Math.round(basic * epsPct), epsCapAmount);
-    const epf = Math.round(basic * eepfPct) - eps;
-    const edli = Math.min(Math.round(basic * edliPct), edliCapAmount);
-    const adminCharges = Math.round(basic * adminPct);
+    // ESI -- calculated on Basic, applies when Basic <= esiWageLimit
+    const esiApplicable = basic <= esiWageLimit;
+    const eeesic = esiApplicable ? Math.ceil(basic * eeEsicPct) : 0;
+    const erEsic = esiApplicable ? Math.ceil(basic * erEsicPct) : 0;
 
-    const esiApplicable = gross <= esiWageLimit;
-    const eeesic = esiApplicable ? Math.round(payableGross * eeEsicPct) : 0;
-    const erEsic = esiApplicable ? Math.round(payableGross * erEsicPct) : 0;
+    // CTC = Gross + EPF + ESIC(ER) + Food Allowance
+    const foodAllowance = cfg.foodAllowance ?? 1600;
+    const employerCost = gross + epf + erEsic + foodAllowance;
 
-    const salaryAdvance = s.salaryAdvance || 0;
-    const loan = s.loan || 0;
-    const otherDeductions = s.otherDeductions || 0;
-
-    const totalDeduction = eepf + eeesic + salaryAdvance + loan + otherDeductions;
-    const netSalary = Math.max(payableGross - totalDeduction, 0);
+    // Employee deductions -- only statutory (EPF + ESIC)
+    const totalDeduction = epf + eeesic;
+    const netSalary = Math.max(gross - totalDeduction, 0);
 
     s.basic = basic; s.hra = hra;
-    s.eepf = eepf; s.eps = eps; s.epf = epf;
+    s.epf = epf;
     s.edli = edli; s.adminCharges = adminCharges;
     s.eeesic = eeesic; s.erEsic = erEsic;
-    s.totalDeduction = totalDeduction; s.netSalary = netSalary;
-    s.allowances = hra; s.deductions = totalDeduction;
+    s.foodAllowance = foodAllowance;
+    s.employerCost = employerCost;
+    s.totalDeduction = totalDeduction;
+    s.netSalary = netSalary;
+    s.allowances = hra;
+    s.deductions = totalDeduction;
 
     this.updatedAt = Date.now();
     next();
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
 // Hash password before saving

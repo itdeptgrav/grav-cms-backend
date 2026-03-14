@@ -1,10 +1,10 @@
 const dns = require("dns").setServers(["8.8.8.8", "8.8.4.4"]);
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
-require("dotenv").config();
 
 const http = require("http");
 const { Server } = require("socket.io");
@@ -391,11 +391,15 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
 app.use("/api/hr/payroll", payrollRoutes);
 
-const attendanceRoutes = require("./routes/HrRoutes/Attendance_section");
-app.use("/api/hr/attendance", attendanceRoutes);
+const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
+app.use("/hr/attendance", attendanceRouter);
+
 
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
+
+const employeeImportRoutes = require("./routes/HrRoutes/employeeImportExport.js");
+app.use("/api/employees/import-export", employeeImportRoutes);
 
 
 // Accountant Department Routes

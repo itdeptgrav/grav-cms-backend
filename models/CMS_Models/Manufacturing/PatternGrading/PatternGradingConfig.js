@@ -60,6 +60,7 @@ const nestedConditionSchema = new mongoose.Schema(
         "change_by_percent",
         "change_by_ratio_of_trigger",
         "derive_from_source",
+        "db_measurement_formula",   // expression using exact work-order DB measurements
         "multi_group_expression",
         "live_canvas_value",
       ],
@@ -90,6 +91,25 @@ const nestedConditionSchema = new mongoose.Schema(
     liveSourceGroupId: { type: String, default: null },
     liveOperator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
     liveOffsetValue: { type: Number, default: 0 },
+
+    // ── db_measurement_formula fields ─────────────────────────────────────────
+    // Full expression builder — same structure as multi_group_expression but values
+    // are read from the work-order DB (computedGroupTargets) rather than live canvas.
+    // This means the formula always uses the exact tailor-measured value (e.g. Crotch=22),
+    // never a stale localStorage or canvas-convergence value.
+    dbExpressionGroups: [{
+      type: { type: String, enum: ["group", "constant"], default: "group" },
+      groupId: { type: String },
+      operator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
+      constantValue: { type: Number },
+    }],
+    dbExpressionOffset: { type: Number, default: 0 },
+    dbExpressionScalarOp: { type: String, enum: ["none", "plus", "minus", "multiply", "divide"], default: "none" },
+
+    // Legacy single-source fields (kept for backward compat with old saved conditions)
+    dbSourceGroupId: { type: String, default: null },
+    dbOperator: { type: String, enum: ["plus", "minus", "multiply", "divide"], default: "plus" },
+    dbOffsetValue: { type: Number, default: 0 },
   },
   { _id: false }
 );
