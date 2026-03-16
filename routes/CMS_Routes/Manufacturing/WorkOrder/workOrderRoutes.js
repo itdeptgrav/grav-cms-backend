@@ -356,12 +356,15 @@ router.get("/:id", async (req, res) => {
     }
 
     const workOrder = await WorkOrder.findById(id)
-      .select("workOrderNumber status priority quantity stockItemName stockItemReference variantAttributes specialInstructions createdAt estimatedCost rawMaterials operations planningNotes")
+      .select("workOrderNumber status priority quantity stockItemName stockItemReference stockItemId variantAttributes specialInstructions createdAt estimatedCost rawMaterials operations planningNotes")
       .populate("plannedBy", "name").lean();
 
     if (!workOrder) return res.status(404).json({ success: false, message: "Work order not found" });
 
-    const panelCount = await getPanelCount(workOrder.stockItemId);
+    // Get stock item details using the helper
+    const stockItemDetails = await getStockItemDetails(workOrder.stockItemId);
+    const panelCount = stockItemDetails.panelCount;
+    const genderCategory = stockItemDetails.genderCategory;
 
     const optimizedRawMaterials = (workOrder.rawMaterials || []).map((rm) => ({
       name: rm.name, sku: rm.sku, unit: rm.unit, unitCost: rm.unitCost, totalCost: rm.totalCost,
@@ -405,6 +408,7 @@ router.get("/:id", async (req, res) => {
         estimatedCost: workOrder.estimatedCost || 0, createdAt: workOrder.createdAt,
         plannedBy: workOrder.plannedBy?.name || null,
         panelCount,
+        genderCategory,  // Add this line
         totalBarcodes: panelCount > 0
           ? workOrder.quantity * panelCount
           : workOrder.quantity * optimizedOperations.length,
@@ -421,6 +425,19 @@ router.get("/:id", async (req, res) => {
     res.status(500).json({ success: false, message: "Server error while fetching work order" });
   }
 });
+
+async function getStockItemDetails(stockItemId) {
+  try {
+    if (!stockItemId) return { panelCount: 0, genderCategory: "" };
+    const stockItem = await StockItem.findById(stockItemId).select("numberOfPanels genderCategory").lean();
+    return {
+      panelCount: stockItem?.numberOfPanels || 0,
+      genderCategory: stockItem?.genderCategory || ""
+    };
+  } catch {
+    return { panelCount: 0, genderCategory: "" };
+  }
+}
 
 async function getPanelCount(stockItemId) {
   try {

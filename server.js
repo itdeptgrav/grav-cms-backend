@@ -160,10 +160,10 @@ const createDefaultAccountant = async () => {
   }
 };
 
-// Update the database connection section
-connectDB().then(async () => {
-  await assignMeasurementsToExistingProducts(); // Add this line
-});
+// // Update the database connection section
+// connectDB().then(async () => {
+//   await assignMeasurementsToExistingProducts(); // Add this line
+// });
 //changes
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
