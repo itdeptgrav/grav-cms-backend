@@ -6,7 +6,7 @@ const fs = require('fs');
 const mongoose = require('mongoose');
 const BarcodeDevice = require('../../models/Barcode_Scanner_Device/BarcodeDevice');
 const Firmware = require('../../models/Barcode_Scanner_Device/Firmware');
-const Machine = require('../../models/Cms_Models/Inventory/Configurations/Machine');
+const Machine = require('../../models/CMS_Models/Inventory/Configurations/Machine');
 
 // ─── Multer (memory storage → written to disk after validation) ───────────────
 const storage = multer.memoryStorage();
