@@ -1,7 +1,4 @@
 // routes/CMS_Routes/Production/Tracking/trackingRoutes.js
-// UPDATED: Removed operationTracking sub-array. Each machine now has a flat
-// operators[] array and a single currentOperatorIdentityId.
-// Multiple WOs can run on the same machine simultaneously — barcodes carry all WO info.
 
 const express = require("express");
 const router = express.Router();
@@ -69,6 +66,10 @@ const extractEmployeeIdFromUrl = (value) => {
 
 router.post("/scan", async (req, res) => {
   try {
+
+    console.log("SCAN HIT - Body:", JSON.stringify(req.body));
+  console.log("SCAN HIT - Headers:", JSON.stringify(req.headers));
+  
     const { scanId: rawScanId, machineId, timeStamp } = req.body;
     const scanId = extractEmployeeIdFromUrl(rawScanId);
 

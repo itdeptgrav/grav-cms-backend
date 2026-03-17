@@ -1,6 +1,4 @@
 // models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking.js
-// UPDATED: Removed operationNumber/operationType from tracking schema.
-// Operation info is derived at query time from barcode IDs + WorkOrder data.
 
 const mongoose = require("mongoose");
 
