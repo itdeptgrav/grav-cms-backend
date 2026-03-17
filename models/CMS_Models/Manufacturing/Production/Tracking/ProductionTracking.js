@@ -1,6 +1,4 @@
 // models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking.js
-// UPDATED: Removed operationNumber/operationType from tracking schema.
-// Operation info is derived at query time from barcode IDs + WorkOrder data.
 
 const mongoose = require("mongoose");
 
@@ -15,7 +13,14 @@ const barcodeScanSchema = new mongoose.Schema(
       type: Date,
       required: true,
     },
-    // operationNumber REMOVED — derive from barcode + WO at query time
+    // Snapshot of which operations were active on this machine when the scan happened.
+    // Stored as a simple comma-separated string to keep it lightweight
+    // (e.g. "button attach,sleeve join"). Derived from the device's in-memory ops state.
+    activeOps: {
+      type: String,
+      default: "",
+      trim: true,
+    },
   },
   { _id: true },
 );
@@ -27,6 +32,10 @@ const operatorTrackingSchema = new mongoose.Schema(
       required: true,
       trim: true,
       index: true,
+    },
+    operatorName: {
+      type: String,
+      default: "",
     },
     signInTime: {
       type: Date,
@@ -41,8 +50,8 @@ const operatorTrackingSchema = new mongoose.Schema(
   { _id: true },
 );
 
-// Simplified: one slot per machine — no more operationNumber/operationType.
-// currentOperatorIdentityId tracks who is currently signed in on the machine.
+// One tracking slot per machine per day.
+// currentOperatorIdentityId: who is currently signed in (null if nobody).
 // Multiple WOs can happen on the same machine; the barcode encodes WO info.
 const machineTrackingSchema = new mongoose.Schema(
   {
@@ -51,12 +60,10 @@ const machineTrackingSchema = new mongoose.Schema(
       ref: "Machine",
       required: true,
     },
-    // Who is currently signed in on this machine (null if no one)
     currentOperatorIdentityId: {
       type: String,
       default: null,
     },
-    // All operator sessions on this machine today
     operators: [operatorTrackingSchema],
   },
   { _id: true },
