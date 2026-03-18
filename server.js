@@ -379,8 +379,8 @@ app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 const BarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/barcodeRoutes.js");
 app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 
-const ProductionTracking = require("./routes/CMS_Routes/Production/Tracking/trackingRoutes.js");
-app.use("/api/cms/production/tracking", ProductionTracking);
+const ProductionTracking = require("./routes/CMS_Routes/Production/Barcode_Scan_Punchings/trackingRoutes.js");
+app.use("/api/cms/production/barcode_punchings", ProductionTracking);
 
 // In your main server.js or app.js
 const workOrderProgressRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes");
