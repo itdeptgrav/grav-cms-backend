@@ -1,11 +1,11 @@
-// routes/CMS_Routes/Production/Tracking/trackingRoutes.js
+// routes/Barcode_Scan_Punchings/trackingRoutes.js
 
 const express = require("express");
 const router = express.Router();
-const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
-const Employee = require("../../../../models/Employee");
-const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
-const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const ProductionTracking = require("../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const Employee = require("../../models/Employee");
+const Machine = require("../../models/CMS_Models/Inventory/Configurations/Machine");
+const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 
 let io;
 
