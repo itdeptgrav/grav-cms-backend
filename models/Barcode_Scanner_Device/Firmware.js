@@ -1,5 +1,3 @@
-// models/Barcode_Scanner_Device/Firmware.js
-
 const mongoose = require('mongoose');
 
 const firmwareSchema = new mongoose.Schema({

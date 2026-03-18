@@ -66,10 +66,6 @@ const extractEmployeeIdFromUrl = (value) => {
 
 router.post("/scan", async (req, res) => {
   try {
-
-    console.log("SCAN HIT - Body:", JSON.stringify(req.body));
-  console.log("SCAN HIT - Headers:", JSON.stringify(req.headers));
-  
     const { scanId: rawScanId, machineId, timeStamp } = req.body;
     const scanId = extractEmployeeIdFromUrl(rawScanId);
 
