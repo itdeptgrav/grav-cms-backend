@@ -7,18 +7,6 @@ const barcodeDeviceSchema = new mongoose.Schema({
     unique: true,
     index: true
   },
-  // The MongoDB _id of the Machine document — set by the user during
-  // device configuration and sent with every check-update call.
-  machineId: {
-    type: String,
-    default: ''
-  },
-  // Cached copy of Machine.name, populated/refreshed on check-update
-  // so the admin dashboard doesn't need a separate join.
-  machineName: {
-    type: String,
-    default: ''
-  },
   currentFirmwareVersion: {
     type: String,
     default: '1.0.0'
@@ -42,8 +30,8 @@ const barcodeDeviceSchema = new mongoose.Schema({
   timestamps: true
 });
 
+// Index for efficient queries
 barcodeDeviceSchema.index({ lastSeen: -1 });
 barcodeDeviceSchema.index({ status: 1 });
-barcodeDeviceSchema.index({ machineId: 1 });
 
 module.exports = mongoose.model('BarcodeDevice', barcodeDeviceSchema);
