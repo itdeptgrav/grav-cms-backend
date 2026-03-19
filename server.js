@@ -138,7 +138,7 @@ const createDefaultCuttingMaster = async () => {
 };
 
 const backfillWorkOrderOperationCodes = async () => {
-  const flagKey = "backfill_workorder_operation_codes_v1";
+  const flagKey = "backfill_workorder_operation_codes_v3_fixess";
   const db = mongoose.connection.db;
   const flagsCol = db.collection("_migration_flags");
 
@@ -188,9 +188,7 @@ const backfillWorkOrderOperationCodes = async () => {
     let woModified = false;
     const updatedOps = wo.operations.map(op => {
       // Skip if operationCode already filled
-      if (op.operationCode && op.operationCode.trim() !== "") {
-        return op;
-      }
+      
 
       const key = (op.operationType || "").trim().toLowerCase().replace(/\s+/g, " ");
       const matchedCode = stockOpMap.get(key);
