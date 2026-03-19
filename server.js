@@ -11,7 +11,6 @@ const { Server } = require("socket.io");
 
 // IMPORT PRODUCTION SYNC SERVICE
 const productionSyncService = require("./services/productionSyncService");
-const Operation = require("./models/CMS_Models/Inventory/Configurations/Operation");
 
 const app = express();
 
@@ -73,10 +72,6 @@ io.on("connection", (socket) => {
   });
 });
 
-
-
-
-
 // Make io accessible to routes
 app.set("io", io);
 
@@ -87,12 +82,17 @@ const connectDB = async () => {
     );
     console.log("✅ MongoDB connected successfully");
 
+
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
 
-    runBackfillIfNeeded().catch((err) =>
-      console.error("❌ Backfill error (non-fatal):", err.message)
-    );
+
+    await Promise.allSettled([
+      
+      backfillStockItemOperationCodes().catch((err) =>
+        console.error("❌ StockItem backfill error (non-fatal):", err.message)
+      )
+    ]);
 
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
@@ -265,6 +265,210 @@ const assignMeasurementsToExistingProducts = async () => {
     console.log(`✅ Measurement force override complete! Total products updated: ${totalUpdated}`);
   } catch (error) {
     console.error("❌ Error assigning measurements to existing products:", error.message);
+  }
+};
+
+const backfillStockItemOperationCodes = async () => {
+  const flagKey = "backfill_stockitem_operation_codes_v3_fixed";
+  const db = mongoose.connection.db;
+  const flagsCol = db.collection("_migration_flags");
+
+  const alreadyRan = await flagsCol.findOne({ key: flagKey });
+  if (alreadyRan) {
+    console.log("✅ StockItem operation code force backfill already ran — skipping");
+    return;
+  }
+
+  console.log("🔄 Starting FORCE StockItem operationCode backfill with category matching (FIXED VERSION)...");
+
+  // Get all registered operations
+  const allOps = await Operation.find({}).select("name operationCode machineType").lean();
+  
+  // Create maps for each category prefix
+  const shirtOps = new Map();      // S0 prefix
+  const bottomOps = new Map();     // P0 prefix
+  const outerwearOps = new Map();  // MJ prefix
+  const otherOps = new Map();      // Any other codes
+
+  for (const op of allOps) {
+    const key = (op.name || "").trim().toLowerCase().replace(/\s+/g, " ");
+    const code = op.operationCode || "";
+    
+    // Categorize by operationCode prefix
+    if (code.startsWith("S0")) {
+      shirtOps.set(key, { code, machineType: op.machineType });
+    } else if (code.startsWith("P0")) {
+      bottomOps.set(key, { code, machineType: op.machineType });
+    } else if (code.startsWith("MJ")) {
+      outerwearOps.set(key, { code, machineType: op.machineType });
+    } else if (key) {
+      // Store others but with lower priority
+      otherOps.set(key, { code, machineType: op.machineType });
+    }
+  }
+
+  console.log(`   📋 Registry stats:
+     - Shirt operations (S0*): ${shirtOps.size}
+     - Bottom operations (P0*): ${bottomOps.size}
+     - Outerwear operations (MJ*): ${outerwearOps.size}
+     - Other operations: ${otherOps.size}`);
+
+  // Find all stock items with operations
+  const stockItems = await StockItem.find({ 
+    "operations.0": { $exists: true } 
+  }).select("name reference category operations").lean();
+
+  console.log(`   📦 Found ${stockItems.length} stock items with operations to process`);
+
+  let totalPatched = 0;
+  let totalNoMatch = 0;
+  let categoryStats = {
+    Shirts: { processed: 0, matched: 0, unmatched: 0 },
+    Bottoms: { processed: 0, matched: 0, unmatched: 0 },
+    Outerwear: { processed: 0, matched: 0, unmatched: 0 },
+    Other: { processed: 0, matched: 0, unmatched: 0 }
+  };
+
+  // Process each stock item individually (not using bulkOps with positional operator)
+  for (const item of stockItems) {
+    const category = item.category || "Unknown";
+    let categoryType = "Other";
+    
+    // Determine which operation map to use based on category
+    if (category === "Shirts") {
+      categoryType = "Shirts";
+    } else if (category === "Bottoms") {
+      categoryType = "Bottoms";
+    } else if (category === "Outerwear") {
+      categoryType = "Outerwear";
+    }
+    
+    categoryStats[categoryType].processed++;
+    
+    let itemModified = false;
+    const updatedOperations = [];
+
+    for (const op of item.operations) {
+      // Normalize the operation type name
+      const lookupKey = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
+      
+      let matchedInfo = null;
+      
+      // Try to match based on category first
+      if (categoryType === "Shirts") {
+        matchedInfo = shirtOps.get(lookupKey);
+        if (!matchedInfo) {
+          // Fallback to other ops if no shirt-specific match
+          matchedInfo = otherOps.get(lookupKey);
+        }
+      } else if (categoryType === "Bottoms") {
+        matchedInfo = bottomOps.get(lookupKey);
+        if (!matchedInfo) {
+          matchedInfo = otherOps.get(lookupKey);
+        }
+      } else if (categoryType === "Outerwear") {
+        matchedInfo = outerwearOps.get(lookupKey);
+        if (!matchedInfo) {
+          matchedInfo = otherOps.get(lookupKey);
+        }
+      } else {
+        // For unknown categories, try any match
+        matchedInfo = shirtOps.get(lookupKey) || 
+                      bottomOps.get(lookupKey) || 
+                      outerwearOps.get(lookupKey) || 
+                      otherOps.get(lookupKey);
+      }
+
+      if (matchedInfo) {
+        // Create updated operation with operationCode
+        const updatedOp = {
+          ...op,
+          operationCode: matchedInfo.code
+        };
+
+        // Update machineType if available (optional)
+        if (matchedInfo.machineType && (!op.machineType || op.machineType.trim() === "")) {
+          updatedOp.machineType = matchedInfo.machineType;
+        }
+
+        updatedOperations.push(updatedOp);
+        totalPatched++;
+        categoryStats[categoryType].matched++;
+        
+        console.log(`     ✓ Match: ${item.name} (${category}) - ${op.type} → ${matchedInfo.code}`);
+        itemModified = true;
+      } else {
+        // Keep original operation if no match found
+        updatedOperations.push(op);
+        
+        // Log unmatched operations
+        console.warn(`   ⚠️  NO MATCH — ${category} item "${item.name}" (${item.reference}): operation type="${op.type}" (normalized: "${lookupKey}")`);
+        totalNoMatch++;
+        categoryStats[categoryType].unmatched++;
+      }
+    }
+
+    // Update the entire stock item if modified
+    if (itemModified) {
+      await StockItem.updateOne(
+        { _id: item._id },
+        { $set: { operations: updatedOperations } }
+      );
+      console.log(`   📝 Updated ${updatedOperations.length} operations for "${item.name}"`);
+    }
+  }
+
+  // Log detailed category statistics
+  console.log("\n📊 Category-wise Statistics:");
+  console.log(`   Shirts:    Processed: ${categoryStats.Shirts.processed}, Matched: ${categoryStats.Shirts.matched}, Unmatched: ${categoryStats.Shirts.unmatched}`);
+  console.log(`   Bottoms:   Processed: ${categoryStats.Bottoms.processed}, Matched: ${categoryStats.Bottoms.matched}, Unmatched: ${categoryStats.Bottoms.unmatched}`);
+  console.log(`   Outerwear: Processed: ${categoryStats.Outerwear.processed}, Matched: ${categoryStats.Outerwear.matched}, Unmatched: ${categoryStats.Outerwear.unmatched}`);
+  console.log(`   Other:     Processed: ${categoryStats.Other.processed}, Matched: ${categoryStats.Other.matched}, Unmatched: ${categoryStats.Other.unmatched}`);
+
+  await flagsCol.insertOne({ 
+    key: flagKey, 
+    ranAt: new Date(),
+    stats: {
+      stockItemsProcessed: stockItems.length,
+      operationsPatched: totalPatched,
+      unmatchedOperations: totalNoMatch,
+      categoryStats
+    }
+  });
+
+  console.log(`\n✅ StockItem force backfill complete — ${totalPatched} operations patched, ${totalNoMatch} had no registry match`);
+  
+  // If there are unmatched operations, suggest checking operation registry
+  if (totalNoMatch > 0) {
+    console.log("\n⚠️  Some operations couldn't be matched. Please check:");
+    console.log("   1. Are all operation names correctly registered in the Operation model?");
+    console.log("   2. Do the registered operations have the correct operationCode prefixes (S0, P0, MJ)?");
+    console.log("   3. Check the unmatched logs above for specific operation names.");
+    
+    // Collect unique unmatched operation names for easier debugging
+    const unmatchedOps = new Set();
+    for (const item of stockItems) {
+      for (const op of item.operations) {
+        const lookupKey = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
+        let matched = false;
+        
+        // Check if it would have matched any category
+        if (item.category === "Shirts") {
+          matched = shirtOps.has(lookupKey) || otherOps.has(lookupKey);
+        } else if (item.category === "Bottoms") {
+          matched = bottomOps.has(lookupKey) || otherOps.has(lookupKey);
+        } else if (item.category === "Outerwear") {
+          matched = outerwearOps.has(lookupKey) || otherOps.has(lookupKey);
+        }
+        
+        if (!matched) {
+          unmatchedOps.add(`${op.type} (category: ${item.category})`);
+        }
+      }
+    }
+    
+    console.log("\n📋 Unique unmatched operation names:");
+    unmatchedOps.forEach(op => console.log(`   - ${op}`));
   }
 };
 
@@ -472,6 +676,7 @@ const ProductionTracking = require("./models/CMS_Models/Manufacturing/Production
 const Employee = require("./models/Employee");
 const Machine = require("./models/CMS_Models/Inventory/Configurations/Machine");
 const WorkOrder = require("./models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const Operation = require("./models/CMS_Models/Inventory/Configurations/Operation");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -520,299 +725,214 @@ const extractEmployeeIdFromUrl = (value) => {
 };
 
 
-// ── ONE-TIME BACKFILL: adds operationCode to old WO operations ───────────────
-// Uses a flag stored in MongoDB so it only runs ONCE even across restarts.
-const runBackfillIfNeeded = async () => {
-  const flagKey = "backfill_operation_codes_v2";
-  const db = mongoose.connection.db;
-  const flagsCol = db.collection("_migration_flags");
+// app.post("/api/cms/production/tracking/scan", async (req, res) => {
+//   try {
+//     const { scanId: rawScanId, machineId, timeStamp, activeOps = "" } = req.body;
+//     const scanId = extractEmployeeIdFromUrl(rawScanId);
 
-  const alreadyRan = await flagsCol.findOne({ key: flagKey });
-  if (alreadyRan) {
-    console.log("✅ Operation code backfill already ran — skipping");
-    return;
-  }
+//     if (!scanId || !machineId || !timeStamp) {
+//       return res.status(400).json({ success: false, message: "scanId, machineId, and timeStamp are required" });
+//     }
 
-  console.log("🔄 Running one-time operationCode backfill...");
+//     const scanTime = new Date(timeStamp);
+//     if (isNaN(scanTime.getTime())) {
+//       return res.status(400).json({ success: false, message: "Invalid timeStamp format" });
+//     }
 
-  const allOps = await Operation.find({}).select("name operationCode machineType").lean();
-  const opCodeByName = new Map();
-  for (const op of allOps) {
-    // Normalize: lowercase + collapse multiple spaces
-    const key = (op.name || "").trim().toLowerCase().replace(/\s+/g, " ");
-    if (key) opCodeByName.set(key, op.operationCode || "");
-  }
+//     const scanDate = new Date(scanTime);
+//     scanDate.setHours(0, 0, 0, 0);
 
-  console.log(`   📋 ${opCodeByName.size} operations in registry:`);
-  // Log ALL registry keys so you can see exactly what names exist
-  for (const [k, v] of opCodeByName) {
-    console.log(`      "${k}" → code: "${v}"`);
-  }
+//     let trackingDoc = await ProductionTracking.findOne({ date: scanDate });
+//     if (!trackingDoc) {
+//       trackingDoc = new ProductionTracking({ date: scanDate, machines: [] });
+//     }
 
-  const workOrders = await WorkOrder.find({ "operations.0": { $exists: true } })
-    .select("workOrderNumber operations").lean();
+//     const machine = await Machine.findById(machineId);
+//     if (!machine) {
+//       return res.status(400).json({ success: false, message: "Machine not found" });
+//     }
 
-  console.log(`   📦 ${workOrders.length} work orders to process`);
+//     let machineTracking = trackingDoc.machines.find(
+//       (m) => m.machineId.toString() === machineId,
+//     );
+//     if (!machineTracking) {
+//       trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+//       machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+//     }
 
-  let totalPatched = 0;
-  let totalNoMatch = 0;
+//     // ── BARCODE SCAN ──────────────────────────────────────────────────────────
+//     if (isBarcodeId(scanId)) {
+//       if (!machineTracking.currentOperatorIdentityId) {
+//         return res.status(400).json({
+//           success: false,
+//           message: "No operator is signed in on this machine",
+//           action: "error",
+//         });
+//       }
 
-  for (const wo of workOrders) {
-    const bulkOps = [];
-    for (const op of wo.operations) {
-      const alreadyHasCode = op.operationCode && op.operationCode.trim() !== "";
-      if (alreadyHasCode) continue;
+//       const operatorTracking = machineTracking.operators.find(
+//         (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+//       );
+//       if (!operatorTracking) {
+//         return res.status(400).json({ success: false, message: "Operator session not found" });
+//       }
 
-      // Normalize the WO operationType the same way
-      const lookupKey = (op.operationType || "").trim().toLowerCase().replace(/\s+/g, " ");
-      const matchedCode = opCodeByName.get(lookupKey);
+//       // Store scan with active operations snapshot
+//       operatorTracking.barcodeScans.push({
+//         barcodeId: scanId,
+//         timeStamp: scanTime,
+//         activeOps: activeOps || "",
+//       });
+//       await trackingDoc.save();
 
-      if (matchedCode === undefined) {
-        // Log EVERY unmatched one so you can see exactly what's failing
-        console.warn(`   ⚠️  NO MATCH — WO ${wo.workOrderNumber}: operationType="${op.operationType}" (normalized: "${lookupKey}")`);
-        totalNoMatch++;
-      }
+//       const employeeName = operatorTracking.operatorName || "Unknown";
+//       const scanCount = operatorTracking.barcodeScans.length;
 
-      bulkOps.push({
-        updateOne: {
-          filter: { _id: wo._id, "operations._id": op._id },
-          update: {
-            $set: { "operations.$.operationCode": matchedCode ?? "" },
-            $unset: {
-              "operations.$.assignedMachine":       "",
-              "operations.$.assignedMachineName":   "",
-              "operations.$.assignedMachineSerial": "",
-              "operations.$.estimatedTimeSeconds":  "",
-              "operations.$.maxAllowedSeconds":     "",
-              "operations.$.machineType":           "",
-              "operations.$.additionalMachines":    "",
-            },
-          },
-        },
-      });
-      totalPatched++;
-    }
-    if (bulkOps.length > 0) {
-      await WorkOrder.bulkWrite(bulkOps, { ordered: false });
-    }
-  }
+//       // WebSocket events
+//       try {
+//         const parsedBarcode = parseBarcode(scanId);
+//         if (parsedBarcode.success && io) {
+//           let workOrder = await findWorkOrderByShortId(parsedBarcode.workOrderShortId);
+//           if (!workOrder) {
+//             try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch { }
+//           }
+//           if (workOrder) {
+//             io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
+//               workOrderId: workOrder._id,
+//               workOrderNumber: workOrder.workOrderNumber,
+//               barcodeId: scanId,
+//               unitNumber: parsedBarcode.unitNumber,
+//               operationNumber: parsedBarcode.operationNumber,
+//               machineId,
+//               machineName: machine.name,
+//               timestamp: scanTime,
+//               employeeName,
+//               activeOps: activeOps || "",
+//               type: "scan",
+//               scanCount,
+//             });
+//           }
+//           io.emit("tracking-data-updated", {
+//             date: scanDate,
+//             timestamp: new Date(),
+//             message: "New scan recorded",
+//             workOrderId: workOrder?._id,
+//             unitNumber: parsedBarcode.unitNumber,
+//             activeOps: activeOps || "",
+//           });
+//         }
+//       } catch (wsError) {
+//         console.error("Error emitting WebSocket event:", wsError);
+//       }
 
-  await flagsCol.insertOne({ key: flagKey, ranAt: new Date() });
-  console.log(`✅ Backfill done — ${totalPatched} patched, ${totalNoMatch} had no registry match`);
-};
+//       return res.json({
+//         success: true,
+//         message: "Barcode scanned",
+//         employeeName,
+//         scanCount,
+//         barcodeData: { barcodeId: scanId, activeOps: activeOps || "" },
+//       });
+//     }
 
+//     // ── EMPLOYEE SIGN IN / OUT ────────────────────────────────────────────────
+//     if (isEmployeeId(scanId)) {
+//       const operator = await Employee.findOne({
+//         identityId: scanId,
+//         status: "active",
+//       }).select("firstName lastName identityId");
 
+//       if (!operator) {
+//         return res.status(400).json({
+//           success: false,
+//           message: `Employee with identityId ${scanId} not found`,
+//         });
+//       }
 
+//       const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
 
+//       // Sign out from any other machine
+//       for (const m of trackingDoc.machines) {
+//         if (
+//           m.currentOperatorIdentityId === scanId &&
+//           m.machineId.toString() !== machineId.toString()
+//         ) {
+//           const existingSession = m.operators.find(
+//             (op) => op.operatorIdentityId === scanId && !op.signOutTime,
+//           );
+//           if (existingSession) existingSession.signOutTime = scanTime;
+//           m.currentOperatorIdentityId = null;
+//         }
+//       }
 
-app.post("/api/cms/production/tracking/scan", async (req, res) => {
-  try {
-    const { scanId: rawScanId, machineId, timeStamp, activeOps = "" } = req.body;
-    const scanId = extractEmployeeIdFromUrl(rawScanId);
+//       // Same operator already on this machine → sign out
+//       if (machineTracking.currentOperatorIdentityId === scanId) {
+//         const session = machineTracking.operators.find(
+//           (op) => op.operatorIdentityId === scanId && !op.signOutTime,
+//         );
+//         if (session) {
+//           session.signOutTime = scanTime;
+//           machineTracking.currentOperatorIdentityId = null;
+//           await trackingDoc.save();
+//           try {
+//             if (io) io.emit("operator-status-update", {
+//               machineId, machineName: machine.name, employeeName,
+//               message: `${employeeName} signed out`, timestamp: new Date(),
+//             });
+//           } catch { }
+//           return res.json({
+//             success: true,
+//             message: `${employeeName} signed out`,
+//             employeeName,
+//             employeeId: scanId,
+//             action: "signout",
+//             scanCount: 0,
+//           });
+//         }
+//         return res.status(400).json({ success: false, message: "Operator session not found" });
+//       }
 
-    if (!scanId || !machineId || !timeStamp) {
-      return res.status(400).json({ success: false, message: "scanId, machineId, and timeStamp are required" });
-    }
+//       // Different operator signed in → sign out existing, sign in new
+//       if (machineTracking.currentOperatorIdentityId) {
+//         const existingSession = machineTracking.operators.find(
+//           (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+//         );
+//         if (existingSession) existingSession.signOutTime = scanTime;
+//       }
 
-    const scanTime = new Date(timeStamp);
-    if (isNaN(scanTime.getTime())) {
-      return res.status(400).json({ success: false, message: "Invalid timeStamp format" });
-    }
+//       machineTracking.operators.push({
+//         operatorIdentityId: scanId,
+//         operatorName: employeeName,
+//         signInTime: scanTime,
+//         signOutTime: null,
+//         barcodeScans: [],
+//       });
+//       machineTracking.currentOperatorIdentityId = scanId;
+//       await trackingDoc.save();
 
-    const scanDate = new Date(scanTime);
-    scanDate.setHours(0, 0, 0, 0);
+//       try {
+//         if (io) io.emit("operator-status-update", {
+//           machineId, machineName: machine.name, employeeName,
+//           status: `${employeeName} signed in to ${machine.name}`, timestamp: new Date(),
+//         });
+//       } catch { }
 
-    let trackingDoc = await ProductionTracking.findOne({ date: scanDate });
-    if (!trackingDoc) {
-      trackingDoc = new ProductionTracking({ date: scanDate, machines: [] });
-    }
+//       return res.json({
+//         success: true,
+//         message: `${employeeName} signed in`,
+//         employeeName,
+//         employeeId: scanId,
+//         action: "signin",
+//         scanCount: 0,
+//       });
+//     }
 
-    const machine = await Machine.findById(machineId);
-    if (!machine) {
-      return res.status(400).json({ success: false, message: "Machine not found" });
-    }
+//     return res.status(400).json({ success: false, message: "Invalid scan ID format" });
 
-    let machineTracking = trackingDoc.machines.find(
-      (m) => m.machineId.toString() === machineId,
-    );
-    if (!machineTracking) {
-      trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
-      machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
-    }
-
-    // ── BARCODE SCAN ──────────────────────────────────────────────────────────
-    if (isBarcodeId(scanId)) {
-      if (!machineTracking.currentOperatorIdentityId) {
-        return res.status(400).json({
-          success: false,
-          message: "No operator is signed in on this machine",
-          action: "error",
-        });
-      }
-
-      const operatorTracking = machineTracking.operators.find(
-        (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
-      );
-      if (!operatorTracking) {
-        return res.status(400).json({ success: false, message: "Operator session not found" });
-      }
-
-      // Store scan with active operations snapshot
-      operatorTracking.barcodeScans.push({
-        barcodeId: scanId,
-        timeStamp: scanTime,
-        activeOps: activeOps || "",
-      });
-      await trackingDoc.save();
-
-      const employeeName = operatorTracking.operatorName || "Unknown";
-      const scanCount = operatorTracking.barcodeScans.length;
-
-      // WebSocket events
-      try {
-        const parsedBarcode = parseBarcode(scanId);
-        if (parsedBarcode.success && io) {
-          let workOrder = await findWorkOrderByShortId(parsedBarcode.workOrderShortId);
-          if (!workOrder) {
-            try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch { }
-          }
-          if (workOrder) {
-            io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
-              workOrderId: workOrder._id,
-              workOrderNumber: workOrder.workOrderNumber,
-              barcodeId: scanId,
-              unitNumber: parsedBarcode.unitNumber,
-              operationNumber: parsedBarcode.operationNumber,
-              machineId,
-              machineName: machine.name,
-              timestamp: scanTime,
-              employeeName,
-              activeOps: activeOps || "",
-              type: "scan",
-              scanCount,
-            });
-          }
-          io.emit("tracking-data-updated", {
-            date: scanDate,
-            timestamp: new Date(),
-            message: "New scan recorded",
-            workOrderId: workOrder?._id,
-            unitNumber: parsedBarcode.unitNumber,
-            activeOps: activeOps || "",
-          });
-        }
-      } catch (wsError) {
-        console.error("Error emitting WebSocket event:", wsError);
-      }
-
-      return res.json({
-        success: true,
-        message: "Barcode scanned",
-        employeeName,
-        scanCount,
-        barcodeData: { barcodeId: scanId, activeOps: activeOps || "" },
-      });
-    }
-
-    // ── EMPLOYEE SIGN IN / OUT ────────────────────────────────────────────────
-    if (isEmployeeId(scanId)) {
-      const operator = await Employee.findOne({
-        identityId: scanId,
-        status: "active",
-      }).select("firstName lastName identityId");
-
-      if (!operator) {
-        return res.status(400).json({
-          success: false,
-          message: `Employee with identityId ${scanId} not found`,
-        });
-      }
-
-      const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
-
-      // Sign out from any other machine
-      for (const m of trackingDoc.machines) {
-        if (
-          m.currentOperatorIdentityId === scanId &&
-          m.machineId.toString() !== machineId.toString()
-        ) {
-          const existingSession = m.operators.find(
-            (op) => op.operatorIdentityId === scanId && !op.signOutTime,
-          );
-          if (existingSession) existingSession.signOutTime = scanTime;
-          m.currentOperatorIdentityId = null;
-        }
-      }
-
-      // Same operator already on this machine → sign out
-      if (machineTracking.currentOperatorIdentityId === scanId) {
-        const session = machineTracking.operators.find(
-          (op) => op.operatorIdentityId === scanId && !op.signOutTime,
-        );
-        if (session) {
-          session.signOutTime = scanTime;
-          machineTracking.currentOperatorIdentityId = null;
-          await trackingDoc.save();
-          try {
-            if (io) io.emit("operator-status-update", {
-              machineId, machineName: machine.name, employeeName,
-              message: `${employeeName} signed out`, timestamp: new Date(),
-            });
-          } catch { }
-          return res.json({
-            success: true,
-            message: `${employeeName} signed out`,
-            employeeName,
-            employeeId: scanId,
-            action: "signout",
-            scanCount: 0,
-          });
-        }
-        return res.status(400).json({ success: false, message: "Operator session not found" });
-      }
-
-      // Different operator signed in → sign out existing, sign in new
-      if (machineTracking.currentOperatorIdentityId) {
-        const existingSession = machineTracking.operators.find(
-          (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
-        );
-        if (existingSession) existingSession.signOutTime = scanTime;
-      }
-
-      machineTracking.operators.push({
-        operatorIdentityId: scanId,
-        operatorName: employeeName,
-        signInTime: scanTime,
-        signOutTime: null,
-        barcodeScans: [],
-      });
-      machineTracking.currentOperatorIdentityId = scanId;
-      await trackingDoc.save();
-
-      try {
-        if (io) io.emit("operator-status-update", {
-          machineId, machineName: machine.name, employeeName,
-          status: `${employeeName} signed in to ${machine.name}`, timestamp: new Date(),
-        });
-      } catch { }
-
-      return res.json({
-        success: true,
-        message: `${employeeName} signed in`,
-        employeeName,
-        employeeId: scanId,
-        action: "signin",
-        scanCount: 0,
-      });
-    }
-
-    return res.status(400).json({ success: false, message: "Invalid scan ID format" });
-
-  } catch (error) {
-    console.error("Error processing scan:", error);
-    res.status(500).json({ success: false, message: "Server error while processing scan", error: error.message });
-  }
-});
+//   } catch (error) {
+//     console.error("Error processing scan:", error);
+//     res.status(500).json({ success: false, message: "Server error while processing scan", error: error.message });
+//   }
+// });
 
 // ── POST /api/cms/production/tracking/bulk-scans ──────────────────────────────
 
