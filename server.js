@@ -88,9 +88,8 @@ const connectDB = async () => {
 
 
     await Promise.allSettled([
-      
-      backfillStockItemOperationCodes().catch((err) =>
-        console.error("❌ StockItem backfill error (non-fatal):", err.message)
+      backfillWorkOrderOperationCodes().catch((err) =>
+        console.error("❌ WorkOrder operationCode backfill error (non-fatal):", err.message)
       )
     ]);
 
@@ -136,6 +135,99 @@ const createDefaultCuttingMaster = async () => {
   } catch (error) {
     console.error("❌ Cutting Master creation failed:", error.message);
   }
+};
+
+const backfillWorkOrderOperationCodes = async () => {
+  const flagKey = "backfill_workorder_operation_codes_v1";
+  const db = mongoose.connection.db;
+  const flagsCol = db.collection("_migration_flags");
+
+  const alreadyRan = await flagsCol.findOne({ key: flagKey });
+  if (alreadyRan) {
+    console.log("✅ WorkOrder operationCode backfill already ran — skipping");
+    return;
+  }
+
+  console.log("🔄 Backfilling operationCode on WorkOrder operations from StockItem...");
+
+  // Fetch all work orders that have operations with missing operationCode
+  const workOrders = await WorkOrder.find({
+    "operations.0": { $exists: true }
+  }).select("workOrderNumber stockItemId operations").lean();
+
+  console.log(`   📦 Found ${workOrders.length} work orders to process`);
+
+  let totalPatched = 0;
+  let totalNoMatch = 0;
+  let totalWOsUpdated = 0;
+
+  for (const wo of workOrders) {
+    if (!wo.stockItemId) {
+      console.warn(`   ⚠️  WO ${wo.workOrderNumber} has no stockItemId — skipping`);
+      continue;
+    }
+
+    // Fetch the corresponding StockItem
+    const stockItem = await StockItem.findById(wo.stockItemId)
+      .select("name operations").lean();
+
+    if (!stockItem || !stockItem.operations?.length) {
+      console.warn(`   ⚠️  WO ${wo.workOrderNumber} — StockItem not found or has no operations`);
+      continue;
+    }
+
+    // Build a map of operationType (normalized) → operationCode from StockItem
+    const stockOpMap = new Map();
+    for (const op of stockItem.operations) {
+      const key = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
+      if (key && op.operationCode) {
+        stockOpMap.set(key, op.operationCode);
+      }
+    }
+
+    let woModified = false;
+    const updatedOps = wo.operations.map(op => {
+      // Skip if operationCode already filled
+      if (op.operationCode && op.operationCode.trim() !== "") {
+        return op;
+      }
+
+      const key = (op.operationType || "").trim().toLowerCase().replace(/\s+/g, " ");
+      const matchedCode = stockOpMap.get(key);
+
+      if (matchedCode) {
+        totalPatched++;
+        woModified = true;
+        console.log(`     ✓ WO ${wo.workOrderNumber} — "${op.operationType}" → ${matchedCode}`);
+        return { ...op, operationCode: matchedCode };
+      } else {
+        totalNoMatch++;
+        console.warn(`     ⚠️  WO ${wo.workOrderNumber} — no match for "${op.operationType}" in StockItem "${stockItem.name}"`);
+        return op;
+      }
+    });
+
+    if (woModified) {
+      await WorkOrder.updateOne(
+        { _id: wo._id },
+        { $set: { operations: updatedOps } }
+      );
+      totalWOsUpdated++;
+    }
+  }
+
+  await flagsCol.insertOne({
+    key: flagKey,
+    ranAt: new Date(),
+    stats: {
+      workOrdersProcessed: workOrders.length,
+      workOrdersUpdated: totalWOsUpdated,
+      operationsPatched: totalPatched,
+      operationsNoMatch: totalNoMatch,
+    }
+  });
+
+  console.log(`✅ WorkOrder operationCode backfill complete — ${totalWOsUpdated} WOs updated, ${totalPatched} operations patched, ${totalNoMatch} had no match`);
 };
 
 const createDefaultAccountant = async () => {
@@ -283,7 +375,7 @@ const backfillStockItemOperationCodes = async () => {
 
   // Get all registered operations
   const allOps = await Operation.find({}).select("name operationCode machineType").lean();
-  
+
   // Create maps for each category prefix
   const shirtOps = new Map();      // S0 prefix
   const bottomOps = new Map();     // P0 prefix
@@ -293,7 +385,7 @@ const backfillStockItemOperationCodes = async () => {
   for (const op of allOps) {
     const key = (op.name || "").trim().toLowerCase().replace(/\s+/g, " ");
     const code = op.operationCode || "";
-    
+
     // Categorize by operationCode prefix
     if (code.startsWith("S0")) {
       shirtOps.set(key, { code, machineType: op.machineType });
@@ -314,8 +406,8 @@ const backfillStockItemOperationCodes = async () => {
      - Other operations: ${otherOps.size}`);
 
   // Find all stock items with operations
-  const stockItems = await StockItem.find({ 
-    "operations.0": { $exists: true } 
+  const stockItems = await StockItem.find({
+    "operations.0": { $exists: true }
   }).select("name reference category operations").lean();
 
   console.log(`   📦 Found ${stockItems.length} stock items with operations to process`);
@@ -333,7 +425,7 @@ const backfillStockItemOperationCodes = async () => {
   for (const item of stockItems) {
     const category = item.category || "Unknown";
     let categoryType = "Other";
-    
+
     // Determine which operation map to use based on category
     if (category === "Shirts") {
       categoryType = "Shirts";
@@ -342,18 +434,18 @@ const backfillStockItemOperationCodes = async () => {
     } else if (category === "Outerwear") {
       categoryType = "Outerwear";
     }
-    
+
     categoryStats[categoryType].processed++;
-    
+
     let itemModified = false;
     const updatedOperations = [];
 
     for (const op of item.operations) {
       // Normalize the operation type name
       const lookupKey = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
-      
+
       let matchedInfo = null;
-      
+
       // Try to match based on category first
       if (categoryType === "Shirts") {
         matchedInfo = shirtOps.get(lookupKey);
@@ -373,10 +465,10 @@ const backfillStockItemOperationCodes = async () => {
         }
       } else {
         // For unknown categories, try any match
-        matchedInfo = shirtOps.get(lookupKey) || 
-                      bottomOps.get(lookupKey) || 
-                      outerwearOps.get(lookupKey) || 
-                      otherOps.get(lookupKey);
+        matchedInfo = shirtOps.get(lookupKey) ||
+          bottomOps.get(lookupKey) ||
+          outerwearOps.get(lookupKey) ||
+          otherOps.get(lookupKey);
       }
 
       if (matchedInfo) {
@@ -394,13 +486,13 @@ const backfillStockItemOperationCodes = async () => {
         updatedOperations.push(updatedOp);
         totalPatched++;
         categoryStats[categoryType].matched++;
-        
+
         console.log(`     ✓ Match: ${item.name} (${category}) - ${op.type} → ${matchedInfo.code}`);
         itemModified = true;
       } else {
         // Keep original operation if no match found
         updatedOperations.push(op);
-        
+
         // Log unmatched operations
         console.warn(`   ⚠️  NO MATCH — ${category} item "${item.name}" (${item.reference}): operation type="${op.type}" (normalized: "${lookupKey}")`);
         totalNoMatch++;
@@ -425,8 +517,8 @@ const backfillStockItemOperationCodes = async () => {
   console.log(`   Outerwear: Processed: ${categoryStats.Outerwear.processed}, Matched: ${categoryStats.Outerwear.matched}, Unmatched: ${categoryStats.Outerwear.unmatched}`);
   console.log(`   Other:     Processed: ${categoryStats.Other.processed}, Matched: ${categoryStats.Other.matched}, Unmatched: ${categoryStats.Other.unmatched}`);
 
-  await flagsCol.insertOne({ 
-    key: flagKey, 
+  await flagsCol.insertOne({
+    key: flagKey,
     ranAt: new Date(),
     stats: {
       stockItemsProcessed: stockItems.length,
@@ -437,21 +529,21 @@ const backfillStockItemOperationCodes = async () => {
   });
 
   console.log(`\n✅ StockItem force backfill complete — ${totalPatched} operations patched, ${totalNoMatch} had no registry match`);
-  
+
   // If there are unmatched operations, suggest checking operation registry
   if (totalNoMatch > 0) {
     console.log("\n⚠️  Some operations couldn't be matched. Please check:");
     console.log("   1. Are all operation names correctly registered in the Operation model?");
     console.log("   2. Do the registered operations have the correct operationCode prefixes (S0, P0, MJ)?");
     console.log("   3. Check the unmatched logs above for specific operation names.");
-    
+
     // Collect unique unmatched operation names for easier debugging
     const unmatchedOps = new Set();
     for (const item of stockItems) {
       for (const op of item.operations) {
         const lookupKey = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
         let matched = false;
-        
+
         // Check if it would have matched any category
         if (item.category === "Shirts") {
           matched = shirtOps.has(lookupKey) || otherOps.has(lookupKey);
@@ -460,13 +552,13 @@ const backfillStockItemOperationCodes = async () => {
         } else if (item.category === "Outerwear") {
           matched = outerwearOps.has(lookupKey) || otherOps.has(lookupKey);
         }
-        
+
         if (!matched) {
           unmatchedOps.add(`${op.type} (category: ${item.category})`);
         }
       }
     }
-    
+
     console.log("\n📋 Unique unmatched operation names:");
     unmatchedOps.forEach(op => console.log(`   - ${op}`));
   }
