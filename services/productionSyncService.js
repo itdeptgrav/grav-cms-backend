@@ -602,20 +602,116 @@ class ProductionSyncService {
   async cleanupOldTrackingData() {
     console.log(`\n🧹 [${new Date().toISOString()}] Cleaning up old tracking data...`);
     try {
-      const tenDaysAgo = new Date();
-      tenDaysAgo.setDate(tenDaysAgo.getDate() - 10);
-      tenDaysAgo.setHours(0, 0, 0, 0);
-      const result = await ProductionTracking.deleteMany({ date: { $lt: tenDaysAgo } });
-      console.log(`✅ Cleaned up ${result.deletedCount} old tracking docs\n`);
+      const fifteenDaysAgo = new Date();
+      fifteenDaysAgo.setDate(fifteenDaysAgo.getDate() - 15);
+      fifteenDaysAgo.setHours(0, 0, 0, 0);
+
+      // ── Find all completed WOs and extract their short IDs ────────────────
+      const completedWorkOrders = await WorkOrder.find({ status: "completed" })
+        .select("_id")
+        .lean();
+
+      if (completedWorkOrders.length === 0) {
+        console.log("✅ No completed work orders found — skipping cleanup\n");
+        return;
+      }
+
+      const completedShortIds = completedWorkOrders.map(wo =>
+        wo._id.toString().slice(-8)
+      );
+
+      console.log(`   📋 Found ${completedWorkOrders.length} completed WOs to check for stale scan data`);
+
+      // ── Build regex patterns for completed WO barcodes ────────────────────
+      // Each barcode starts with "WO-<shortId>-"
+      const barcodePatterns = completedShortIds.map(shortId => `WO-${shortId}-`);
+
+      // ── Find tracking docs older than 15 days that ONLY contain scans
+      //    from completed WOs — we don't touch docs that have active WO scans ──
+      const oldTrackingDocs = await ProductionTracking.find({
+        date: { $lt: fifteenDaysAgo }
+      }).lean();
+
+      if (oldTrackingDocs.length === 0) {
+        console.log("✅ No tracking docs older than 15 days found\n");
+        return;
+      }
+
+      console.log(`   📂 Found ${oldTrackingDocs.length} tracking docs older than 15 days`);
+
+      const docsToDelete = [];
+      const docsToPatch = [];
+
+      for (const doc of oldTrackingDocs) {
+        let docHasActiveScan = false;
+
+        for (const machine of doc.machines || []) {
+          for (const operator of machine.operators || []) {
+            for (const scan of operator.barcodeScans || []) {
+              const barcodeId = scan.barcodeId || "";
+              // Check if this scan belongs to a completed WO
+              const isCompletedWoScan = barcodePatterns.some(p =>
+                barcodeId.startsWith(p)
+              );
+              if (!isCompletedWoScan) {
+                // This scan belongs to a non-completed (active/pending) WO
+                docHasActiveScan = true;
+                break;
+              }
+            }
+            if (docHasActiveScan) break;
+          }
+          if (docHasActiveScan) break;
+        }
+
+        if (docHasActiveScan) {
+          // Doc has at least one scan from an active WO — only strip completed WO scans
+          docsToPatch.push(doc._id);
+        } else {
+          // All scans in this doc are from completed WOs — safe to delete entirely
+          docsToDelete.push(doc._id);
+        }
+      }
+
+      // ── Delete docs that are fully from completed WOs ─────────────────────
+      if (docsToDelete.length > 0) {
+        await ProductionTracking.deleteMany({ _id: { $in: docsToDelete } });
+        console.log(`   🗑️  Deleted ${docsToDelete.length} tracking docs (all scans from completed WOs)`);
+      }
+
+      // ── For mixed docs, strip out only completed WO scans ─────────────────
+      let patchedCount = 0;
+      for (const docId of docsToPatch) {
+        const doc = await ProductionTracking.findById(docId);
+        if (!doc) continue;
+
+        for (const machine of doc.machines) {
+          for (const operator of machine.operators) {
+            operator.barcodeScans = operator.barcodeScans.filter(scan => {
+              const barcodeId = scan.barcodeId || "";
+              // Keep scans that do NOT belong to a completed WO
+              return !barcodePatterns.some(p => barcodeId.startsWith(p));
+            });
+          }
+        }
+        await doc.save();
+        patchedCount++;
+      }
+
+      if (patchedCount > 0) {
+        console.log(`   ✂️  Stripped completed WO scans from ${patchedCount} mixed tracking docs`);
+      }
+
+      console.log(`✅ Cleanup complete — deleted: ${docsToDelete.length}, patched: ${patchedCount}\n`);
     } catch (error) {
       console.error("❌ Cleanup error:", error);
     }
   }
 
   stop() {
-    if (this.syncJob)        { this.syncJob.stop();        this.syncJob = null; }
-    if (this.cleanupJob)     { this.cleanupJob.stop();     this.cleanupJob = null; }
-    if (this.employeeSyncJob){ this.employeeSyncJob.stop(); this.employeeSyncJob = null; }
+    if (this.syncJob) { this.syncJob.stop(); this.syncJob = null; }
+    if (this.cleanupJob) { this.cleanupJob.stop(); this.cleanupJob = null; }
+    if (this.employeeSyncJob) { this.employeeSyncJob.stop(); this.employeeSyncJob = null; }
     this.isRunning = false;
     this.isEmpSyncRunning = false;
     this.syncCount = 0;
@@ -657,7 +753,7 @@ class ProductionSyncService {
     if (!workOrders.length) return;
 
     for (const wo of workOrders) {
-      const stockIdStr   = wo.stockItemId?.toString();
+      const stockIdStr = wo.stockItemId?.toString();
       const variantIdStr = wo.variantId?.toString() || null;
 
       const employeeEntries = [];
@@ -669,16 +765,16 @@ class ProductionSyncService {
         });
         if (!productEntry) continue;
         employeeEntries.push({
-          employeeId:   empM.employeeId,
+          employeeId: empM.employeeId,
           employeeName: empM.employeeName,
-          employeeUIN:  empM.employeeUIN,
-          gender:       empM.gender,
-          quantity:     productEntry.quantity || 1,
+          employeeUIN: empM.employeeUIN,
+          gender: empM.gender,
+          quantity: productEntry.quantity || 1,
         });
       }
       if (!employeeEntries.length) continue;
 
-      const woPrefix      = `${wo.workOrderNumber}-`;
+      const woPrefix = `${wo.workOrderNumber}-`;
       const escapedPrefix = woPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
       const trackingDocs = await ProductionTracking.find({
@@ -693,7 +789,7 @@ class ProductionSyncService {
           for (const operator of machine.operators || []) {
             for (const scan of operator.barcodeScans || []) {
               if (!scan.barcodeId.startsWith(woPrefix)) continue;
-              const suffix  = scan.barcodeId.slice(woPrefix.length);
+              const suffix = scan.barcodeId.slice(woPrefix.length);
               const unitNum = parseInt(suffix, 10);
               if (!isNaN(unitNum) && unitNum > 0) scannedUnits.add(unitNum);
             }
@@ -704,8 +800,8 @@ class ProductionSyncService {
       let cursor = 1;
       for (const emp of employeeEntries) {
         const unitStart = cursor;
-        const unitEnd   = cursor + emp.quantity - 1;
-        cursor          = unitEnd + 1;
+        const unitEnd = cursor + emp.quantity - 1;
+        cursor = unitEnd + 1;
 
         const completedUnitNumbers = [];
         for (let u = unitStart; u <= unitEnd; u++) {
@@ -720,18 +816,18 @@ class ProductionSyncService {
           { workOrderId: wo._id, employeeId: emp.employeeId },
           {
             $set: {
-              measurementId:        measurement._id,
+              measurementId: measurement._id,
               manufacturingOrderId: moId,
-              employeeName:         emp.employeeName,
-              employeeUIN:          emp.employeeUIN,
-              gender:               emp.gender,
+              employeeName: emp.employeeName,
+              employeeUIN: emp.employeeUIN,
+              gender: emp.gender,
               unitStart,
               unitEnd,
-              totalUnits:           emp.quantity,
+              totalUnits: emp.quantity,
               completedUnits,
               completedUnitNumbers,
               completionPercentage,
-              lastSyncedAt:         new Date(),
+              lastSyncedAt: new Date(),
             },
           },
           { upsert: true }
@@ -740,8 +836,8 @@ class ProductionSyncService {
     }
   }
 
-  async manualSync()         { await this.syncProductionToWorkOrders(); }
-  async manualCleanup()      { await this.cleanupOldTrackingData(); }
+  async manualSync() { await this.syncProductionToWorkOrders(); }
+  async manualCleanup() { await this.cleanupOldTrackingData(); }
   async manualEmployeeSync() { await this.syncEmployeeProgress(); }
 }
 
