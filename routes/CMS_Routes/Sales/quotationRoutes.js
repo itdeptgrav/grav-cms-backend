@@ -574,17 +574,17 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
       // Process each variant in the item
       for (const variant of item.variants) {
         console.log(`Processing variant: ${JSON.stringify(variant)}`);
-        
+
         // Find the correct variant in stockItem
         let variantData = null;
-        
+
         // Method 1: Try to match by variantId (if it's a MongoDB ObjectId string)
         if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
-          variantData = stockItem.variants.find(v => 
+          variantData = stockItem.variants.find(v =>
             v._id.toString() === variant.variantId
           );
         }
-        
+
         // Method 2: If no match by ID or variantId is not ObjectId, try to match by attributes
         if (!variantData && variant.attributes && variant.attributes.length > 0) {
           variantData = stockItem.variants.find(v => {
@@ -592,17 +592,17 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
             if (!v.attributes || v.attributes.length !== variant.attributes.length) {
               return false;
             }
-            
+
             // Check each attribute
             const allAttributesMatch = variant.attributes.every(reqAttr => {
               const stockAttr = v.attributes.find(a => a.name === reqAttr.name);
               return stockAttr && stockAttr.value === reqAttr.value;
             });
-            
+
             return allAttributesMatch;
           });
         }
-        
+
         // Method 3: Try to match by variantId as SKU (if variantId is actually SKU)
         if (!variantData && variant.variantId) {
           variantData = stockItem.variants.find(v => v.sku === variant.variantId);
@@ -621,24 +621,17 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
         console.log(`Found matching variant: ${variantData.sku}`);
 
         // Get operations from stockItem
+        // Get operations from stockItem — name + code + timing only
         const operations = stockItem.operations.map(op => ({
-          operationType: op.type,
-          machineType: op.machineType,
-          assignedMachine: null,
-          assignedMachineName: null,
-          estimatedTimeSeconds: op.totalSeconds || 0,
-          scheduledStartTime: null,
-          scheduledEndTime: null,
-          operatorAssigned: null,
-          operatorName: null,
-          actualStartTime: null,
-          actualEndTime: null,
-          status: "pending"
+          operationType: op.type || op.name || op.operationType,
+          operationCode: op.operationCode || op.code || "",
+          plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
+          status: "pending",
         }));
 
         // Get raw materials - FROM VARIANT-SPECIFIC RAW ITEMS
         let rawMaterials = [];
-        
+
         if (variantData.rawItems && variantData.rawItems.length > 0) {
           rawMaterials = variantData.rawItems.map(rawItem => ({
             rawItemId: rawItem.rawItemId,
@@ -712,8 +705,8 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 
     res.json({
       success: true,
-      message: createdWorkOrders.length > 0 
-        ? `Quotation approved by sales and ${createdWorkOrders.length} work order(s) created` 
+      message: createdWorkOrders.length > 0
+        ? `Quotation approved by sales and ${createdWorkOrders.length} work order(s) created`
         : "Quotation approved by sales but no work orders were created (check variant matching)",
       request: request,
       createdWorkOrders: createdWorkOrders

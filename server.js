@@ -11,6 +11,7 @@ const { Server } = require("socket.io");
 
 // IMPORT PRODUCTION SYNC SERVICE
 const productionSyncService = require("./services/productionSyncService");
+const Operation = require("./models/CMS_Models/Inventory/Configurations/Operation");
 
 const app = express();
 
@@ -72,6 +73,10 @@ io.on("connection", (socket) => {
   });
 });
 
+
+
+
+
 // Make io accessible to routes
 app.set("io", io);
 
@@ -84,6 +89,11 @@ const connectDB = async () => {
 
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
+
+    runBackfillIfNeeded().catch((err) =>
+      console.error("❌ Backfill error (non-fatal):", err.message)
+    );
+
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -510,6 +520,91 @@ const extractEmployeeIdFromUrl = (value) => {
 };
 
 
+// ── ONE-TIME BACKFILL: adds operationCode to old WO operations ───────────────
+// Uses a flag stored in MongoDB so it only runs ONCE even across restarts.
+const runBackfillIfNeeded = async () => {
+  const flagKey = "backfill_operation_codes_v2";
+  const db = mongoose.connection.db;
+  const flagsCol = db.collection("_migration_flags");
+
+  const alreadyRan = await flagsCol.findOne({ key: flagKey });
+  if (alreadyRan) {
+    console.log("✅ Operation code backfill already ran — skipping");
+    return;
+  }
+
+  console.log("🔄 Running one-time operationCode backfill...");
+
+  const allOps = await Operation.find({}).select("name operationCode machineType").lean();
+  const opCodeByName = new Map();
+  for (const op of allOps) {
+    // Normalize: lowercase + collapse multiple spaces
+    const key = (op.name || "").trim().toLowerCase().replace(/\s+/g, " ");
+    if (key) opCodeByName.set(key, op.operationCode || "");
+  }
+
+  console.log(`   📋 ${opCodeByName.size} operations in registry:`);
+  // Log ALL registry keys so you can see exactly what names exist
+  for (const [k, v] of opCodeByName) {
+    console.log(`      "${k}" → code: "${v}"`);
+  }
+
+  const workOrders = await WorkOrder.find({ "operations.0": { $exists: true } })
+    .select("workOrderNumber operations").lean();
+
+  console.log(`   📦 ${workOrders.length} work orders to process`);
+
+  let totalPatched = 0;
+  let totalNoMatch = 0;
+
+  for (const wo of workOrders) {
+    const bulkOps = [];
+    for (const op of wo.operations) {
+      const alreadyHasCode = op.operationCode && op.operationCode.trim() !== "";
+      if (alreadyHasCode) continue;
+
+      // Normalize the WO operationType the same way
+      const lookupKey = (op.operationType || "").trim().toLowerCase().replace(/\s+/g, " ");
+      const matchedCode = opCodeByName.get(lookupKey);
+
+      if (matchedCode === undefined) {
+        // Log EVERY unmatched one so you can see exactly what's failing
+        console.warn(`   ⚠️  NO MATCH — WO ${wo.workOrderNumber}: operationType="${op.operationType}" (normalized: "${lookupKey}")`);
+        totalNoMatch++;
+      }
+
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: wo._id, "operations._id": op._id },
+          update: {
+            $set: { "operations.$.operationCode": matchedCode ?? "" },
+            $unset: {
+              "operations.$.assignedMachine":       "",
+              "operations.$.assignedMachineName":   "",
+              "operations.$.assignedMachineSerial": "",
+              "operations.$.estimatedTimeSeconds":  "",
+              "operations.$.maxAllowedSeconds":     "",
+              "operations.$.machineType":           "",
+              "operations.$.additionalMachines":    "",
+            },
+          },
+        },
+      });
+      totalPatched++;
+    }
+    if (bulkOps.length > 0) {
+      await WorkOrder.bulkWrite(bulkOps, { ordered: false });
+    }
+  }
+
+  await flagsCol.insertOne({ key: flagKey, ranAt: new Date() });
+  console.log(`✅ Backfill done — ${totalPatched} patched, ${totalNoMatch} had no registry match`);
+};
+
+
+
+
+
 app.post("/api/cms/production/tracking/scan", async (req, res) => {
   try {
     const { scanId: rawScanId, machineId, timeStamp, activeOps = "" } = req.body;
@@ -623,7 +718,6 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
     if (isEmployeeId(scanId)) {
       const operator = await Employee.findOne({
         identityId: scanId,
-        needsToOperate: true,
         status: "active",
       }).select("firstName lastName identityId");
 
@@ -1049,3 +1143,5 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Production sync service is active`);
 });
+
+
