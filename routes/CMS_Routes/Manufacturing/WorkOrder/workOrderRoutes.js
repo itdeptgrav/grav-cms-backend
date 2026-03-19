@@ -665,66 +665,78 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
 // PUT /:id/plan-operations
 // Only updates plannedTimeSeconds + notes — no machine assignment.
 // ─────────────────────────────────────────────────────────────────────────────
+// PUT /:id/plan-operations
 router.put("/:id/plan-operations", async (req, res) => {
   try {
     const { id } = req.params;
     const { operations, totalPlannedSeconds, planningNotes } = req.body;
 
-    const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation");
-
     const workOrder = await WorkOrder.findById(id);
     if (!workOrder) return res.status(404).json({ success: false, message: "Work order not found" });
 
-    // Pre-fetch all Operation registry docs once — keyed by name (case-insensitive)
-    const allOps = await Operation.find({}).lean();
-    const opRegistryByName = new Map(
-      allOps.map(o => [o.name.trim().toLowerCase(), o])
-    );
-    // Also index by operationCode for reverse lookup
-    const opRegistryByCode = new Map(
-      allOps.filter(o => o.operationCode).map(o => [o.operationCode.trim().toLowerCase(), o])
-    );
+    // ── Fetch the corresponding StockItem and build a name→operationCode map ──
+    const stockItem = workOrder.stockItemId
+      ? await StockItem.findById(workOrder.stockItemId).select("name operations").lean()
+      : null;
+
+    const stockItemOpMap = new Map(); // normalized operationType → operationCode
+    if (stockItem?.operations?.length) {
+      for (const op of stockItem.operations) {
+        const key = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
+        if (key && op.operationCode) {
+          stockItemOpMap.set(key, op.operationCode);
+        }
+      }
+      console.log(
+        `[plan-operations] StockItem "${stockItem.name}" — built op map with ${stockItemOpMap.size} entries`
+      );
+    } else {
+      console.warn(
+        `[plan-operations] WO ${workOrder.workOrderNumber} — StockItem not found or has no operations, skipping code verification`
+      );
+    }
 
     for (const opUpdate of operations) {
       const operation = workOrder.operations.id(opUpdate._id);
       if (!operation) continue;
 
+      // Update plannedTimeSeconds and notes as before
       if (opUpdate.plannedTimeSeconds !== undefined)
         operation.plannedTimeSeconds = opUpdate.plannedTimeSeconds || operation.plannedTimeSeconds || 0;
       if (opUpdate.notes !== undefined) operation.notes = opUpdate.notes;
       operation.status = "scheduled";
 
-      // ── Cross-verify operationCode ────────────────────────────────────────
-      // If code is missing or empty, try to fill it from the registry by name.
-      // If code is already present, re-verify it matches the registry (correct
-      // any stale/wrong code that may have been saved during WO creation).
-      const nameLower = (operation.operationType || "").trim().toLowerCase();
-      const codeLower = (operation.operationCode || "").trim().toLowerCase();
+      // ── Cross-verify operationCode against StockItem ──────────────────────
+      if (stockItemOpMap.size > 0) {
+        const nameKey = (operation.operationType || "").trim().toLowerCase().replace(/\s+/g, " ");
+        const correctCode = stockItemOpMap.get(nameKey);
 
-      let registryOp = null;
-
-      if (nameLower) {
-        registryOp = opRegistryByName.get(nameLower);
-      }
-
-      // Fallback: if we couldn't find by name but have a code, try by code
-      if (!registryOp && codeLower) {
-        registryOp = opRegistryByCode.get(codeLower);
-      }
-
-      if (registryOp) {
-        // Always overwrite with the authoritative value from the registry
-        operation.operationCode = registryOp.operationCode || operation.operationCode || "";
-
-        // Also backfill plannedTimeSeconds from registry if still 0
-        if (!operation.plannedTimeSeconds && registryOp.durationSeconds) {
-          operation.plannedTimeSeconds = registryOp.durationSeconds;
+        if (correctCode) {
+          // Check if current code is wrong or missing — fix it
+          if (operation.operationCode !== correctCode) {
+            console.log(
+              `[plan-operations] WO ${workOrder.workOrderNumber} — fixing operationCode for ` +
+              `"${operation.operationType}": "${operation.operationCode || "(empty)"}" → "${correctCode}"`
+            );
+            operation.operationCode = correctCode;
+          }
+          // Also backfill plannedTimeSeconds from StockItem if still 0
+          if (!operation.plannedTimeSeconds) {
+            const siOp = stockItem.operations.find(
+              o => (o.type || "").trim().toLowerCase().replace(/\s+/g, " ") === nameKey
+            );
+            if (siOp) {
+              operation.plannedTimeSeconds =
+                siOp.totalSeconds || (siOp.minutes * 60 + (siOp.seconds || 0)) || 0;
+            }
+          }
+        } else {
+          // No match in StockItem — log warning but don't clear existing code
+          console.warn(
+            `[plan-operations] WO ${workOrder.workOrderNumber} — no StockItem match for ` +
+            `"${operation.operationType}" (current code: "${operation.operationCode || "(empty)"}")`
+          );
         }
-      } else {
-        console.warn(
-          `[plan-operations] No registry match for operation "${operation.operationType}" ` +
-          `(code: "${operation.operationCode}") on WO ${workOrder.workOrderNumber}`
-        );
       }
     }
 
