@@ -13,13 +13,13 @@ const barcodeScanSchema = new mongoose.Schema(
       type: Date,
       required: true,
     },
-    // Snapshot of which operations were active on this machine when the scan happened.
-    // Stored as a simple comma-separated string to keep it lightweight
-    // (e.g. "button attach,sleeve join"). Derived from the device's in-memory ops state.
+    // Snapshot of which operation CODES were active on this machine when the
+    // scan happened. Stored as an array of operation code strings
+    // (e.g. ["SJ-01", "BA-03"]).
+    // Sent by the device from its in-memory active-ops state.
     activeOps: {
-      type: String,
-      default: "",
-      trim: true,
+      type: [String],
+      default: [],
     },
   },
   { _id: true },
@@ -37,14 +37,8 @@ const operatorTrackingSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
-    signInTime: {
-      type: Date,
-      required: true,
-    },
-    signOutTime: {
-      type: Date,
-      default: null,
-    },
+    signInTime:   { type: Date, required: true },
+    signOutTime:  { type: Date, default: null },
     barcodeScans: [barcodeScanSchema],
   },
   { _id: true },
@@ -52,7 +46,6 @@ const operatorTrackingSchema = new mongoose.Schema(
 
 // One tracking slot per machine per day.
 // currentOperatorIdentityId: who is currently signed in (null if nobody).
-// Multiple WOs can happen on the same machine; the barcode encodes WO info.
 const machineTrackingSchema = new mongoose.Schema(
   {
     machineId: {
@@ -60,10 +53,7 @@ const machineTrackingSchema = new mongoose.Schema(
       ref: "Machine",
       required: true,
     },
-    currentOperatorIdentityId: {
-      type: String,
-      default: null,
-    },
+    currentOperatorIdentityId: { type: String, default: null },
     operators: [operatorTrackingSchema],
   },
   { _id: true },
@@ -71,16 +61,10 @@ const machineTrackingSchema = new mongoose.Schema(
 
 const productionTrackingSchema = new mongoose.Schema(
   {
-    date: {
-      type: Date,
-      required: true,
-      index: true,
-    },
+    date:     { type: Date, required: true, index: true },
     machines: [machineTrackingSchema],
   },
-  {
-    timestamps: true,
-  },
+  { timestamps: true },
 );
 
 productionTrackingSchema.index({ date: 1 });
