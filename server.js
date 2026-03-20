@@ -86,6 +86,8 @@ const connectDB = async () => {
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
 
+    await assignMeasurementsToExistingProducts();
+
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -276,40 +278,6 @@ const CATEGORY_MEASUREMENTS = {
   ],
 };
 
-const overwriteExistingMeasurements = async () => {
-  try {
-    const existingHR = await HRDepartment.findOne({
-      role: "hr_manager",
-      department: "Human Resources",
-    });
-    for (const [category, measurements] of Object.entries(
-      CATEGORY_MEASUREMENTS,
-    )) {
-      const result = await StockItem.updateMany(
-        { category },
-        { $set: { measurements } },
-      );
-      console.log(`✅ ${category}: ${result.modifiedCount} documents updated`);
-    }
-
-    const defaultHR = new HRDepartment({
-      name: "HR Admin",
-      email: "hr@grav.in",
-      password: "Hr@12345",
-      employeeId: "HR001",
-      phone: "9999999999",
-      department: "Human Resources",
-      role: "hr_manager",
-      isActive: true,
-    });
-
-    await defaultHR.save();
-    console.log("✅ Default HR Department created successfully");
-  } catch (error) {
-    console.error("❌ Measurement overwrite failed:", error.message);
-  }
-};
-
 const assignMeasurementsToExistingProducts = async () => {
   try {
     console.log("🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...");
@@ -318,15 +286,15 @@ const assignMeasurementsToExistingProducts = async () => {
 
     const CATEGORY_MEASUREMENTS = {
       Shirts: [
-        "Shoulder", "Chest", "Stomach", "Bottom hem/Hips",
-        "Sleeve length", "Cuff", "Collar", "Length",
+        "Length", "Chest", "Stomach", "Bottom hem",
+        "Shoulder", "Sleeve Length", "Cuff", "Coller",
       ],
       Bottoms: [
-        "Waist", "Hips", "Thigh", "Knee", "Bottom", "Croch", "Length",
+        "Length", "Waist", "Sheet", "Thigh", "Knee", "Buttom", "Crouch Kista Cut",
       ],
       Outerwear: [
-        "Collar", "Shoulder", "Chest", "Stomach",
-        "Bottom hem", "Length",
+        "Length", "Chest", "Stomach", "Buttom hem",
+        "Shoulder"
       ],
     };
 
@@ -348,210 +316,6 @@ const assignMeasurementsToExistingProducts = async () => {
     console.log(`✅ Measurement force override complete! Total products updated: ${totalUpdated}`);
   } catch (error) {
     console.error("❌ Error assigning measurements to existing products:", error.message);
-  }
-};
-
-const backfillStockItemOperationCodes = async () => {
-  const flagKey = "backfill_stockitem_operation_codes_v3_fixed";
-  const db = mongoose.connection.db;
-  const flagsCol = db.collection("_migration_flags");
-
-  const alreadyRan = await flagsCol.findOne({ key: flagKey });
-  if (alreadyRan) {
-    console.log("✅ StockItem operation code force backfill already ran — skipping");
-    return;
-  }
-
-  console.log("🔄 Starting FORCE StockItem operationCode backfill with category matching (FIXED VERSION)...");
-
-  // Get all registered operations
-  const allOps = await Operation.find({}).select("name operationCode machineType").lean();
-
-  // Create maps for each category prefix
-  const shirtOps = new Map();      // S0 prefix
-  const bottomOps = new Map();     // P0 prefix
-  const outerwearOps = new Map();  // MJ prefix
-  const otherOps = new Map();      // Any other codes
-
-  for (const op of allOps) {
-    const key = (op.name || "").trim().toLowerCase().replace(/\s+/g, " ");
-    const code = op.operationCode || "";
-
-    // Categorize by operationCode prefix
-    if (code.startsWith("S0")) {
-      shirtOps.set(key, { code, machineType: op.machineType });
-    } else if (code.startsWith("P0")) {
-      bottomOps.set(key, { code, machineType: op.machineType });
-    } else if (code.startsWith("MJ")) {
-      outerwearOps.set(key, { code, machineType: op.machineType });
-    } else if (key) {
-      // Store others but with lower priority
-      otherOps.set(key, { code, machineType: op.machineType });
-    }
-  }
-
-  console.log(`   📋 Registry stats:
-     - Shirt operations (S0*): ${shirtOps.size}
-     - Bottom operations (P0*): ${bottomOps.size}
-     - Outerwear operations (MJ*): ${outerwearOps.size}
-     - Other operations: ${otherOps.size}`);
-
-  // Find all stock items with operations
-  const stockItems = await StockItem.find({
-    "operations.0": { $exists: true }
-  }).select("name reference category operations").lean();
-
-  console.log(`   📦 Found ${stockItems.length} stock items with operations to process`);
-
-  let totalPatched = 0;
-  let totalNoMatch = 0;
-  let categoryStats = {
-    Shirts: { processed: 0, matched: 0, unmatched: 0 },
-    Bottoms: { processed: 0, matched: 0, unmatched: 0 },
-    Outerwear: { processed: 0, matched: 0, unmatched: 0 },
-    Other: { processed: 0, matched: 0, unmatched: 0 }
-  };
-
-  // Process each stock item individually (not using bulkOps with positional operator)
-  for (const item of stockItems) {
-    const category = item.category || "Unknown";
-    let categoryType = "Other";
-
-    // Determine which operation map to use based on category
-    if (category === "Shirts") {
-      categoryType = "Shirts";
-    } else if (category === "Bottoms") {
-      categoryType = "Bottoms";
-    } else if (category === "Outerwear") {
-      categoryType = "Outerwear";
-    }
-
-    categoryStats[categoryType].processed++;
-
-    let itemModified = false;
-    const updatedOperations = [];
-
-    for (const op of item.operations) {
-      // Normalize the operation type name
-      const lookupKey = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
-
-      let matchedInfo = null;
-
-      // Try to match based on category first
-      if (categoryType === "Shirts") {
-        matchedInfo = shirtOps.get(lookupKey);
-        if (!matchedInfo) {
-          // Fallback to other ops if no shirt-specific match
-          matchedInfo = otherOps.get(lookupKey);
-        }
-      } else if (categoryType === "Bottoms") {
-        matchedInfo = bottomOps.get(lookupKey);
-        if (!matchedInfo) {
-          matchedInfo = otherOps.get(lookupKey);
-        }
-      } else if (categoryType === "Outerwear") {
-        matchedInfo = outerwearOps.get(lookupKey);
-        if (!matchedInfo) {
-          matchedInfo = otherOps.get(lookupKey);
-        }
-      } else {
-        // For unknown categories, try any match
-        matchedInfo = shirtOps.get(lookupKey) ||
-          bottomOps.get(lookupKey) ||
-          outerwearOps.get(lookupKey) ||
-          otherOps.get(lookupKey);
-      }
-
-      if (matchedInfo) {
-        // Create updated operation with operationCode
-        const updatedOp = {
-          ...op,
-          operationCode: matchedInfo.code
-        };
-
-        // Update machineType if available (optional)
-        if (matchedInfo.machineType && (!op.machineType || op.machineType.trim() === "")) {
-          updatedOp.machineType = matchedInfo.machineType;
-        }
-
-        updatedOperations.push(updatedOp);
-        totalPatched++;
-        categoryStats[categoryType].matched++;
-
-        console.log(`     ✓ Match: ${item.name} (${category}) - ${op.type} → ${matchedInfo.code}`);
-        itemModified = true;
-      } else {
-        // Keep original operation if no match found
-        updatedOperations.push(op);
-
-        // Log unmatched operations
-        console.warn(`   ⚠️  NO MATCH — ${category} item "${item.name}" (${item.reference}): operation type="${op.type}" (normalized: "${lookupKey}")`);
-        totalNoMatch++;
-        categoryStats[categoryType].unmatched++;
-      }
-    }
-
-    // Update the entire stock item if modified
-    if (itemModified) {
-      await StockItem.updateOne(
-        { _id: item._id },
-        { $set: { operations: updatedOperations } }
-      );
-      console.log(`   📝 Updated ${updatedOperations.length} operations for "${item.name}"`);
-    }
-  }
-
-  // Log detailed category statistics
-  console.log("\n📊 Category-wise Statistics:");
-  console.log(`   Shirts:    Processed: ${categoryStats.Shirts.processed}, Matched: ${categoryStats.Shirts.matched}, Unmatched: ${categoryStats.Shirts.unmatched}`);
-  console.log(`   Bottoms:   Processed: ${categoryStats.Bottoms.processed}, Matched: ${categoryStats.Bottoms.matched}, Unmatched: ${categoryStats.Bottoms.unmatched}`);
-  console.log(`   Outerwear: Processed: ${categoryStats.Outerwear.processed}, Matched: ${categoryStats.Outerwear.matched}, Unmatched: ${categoryStats.Outerwear.unmatched}`);
-  console.log(`   Other:     Processed: ${categoryStats.Other.processed}, Matched: ${categoryStats.Other.matched}, Unmatched: ${categoryStats.Other.unmatched}`);
-
-  await flagsCol.insertOne({
-    key: flagKey,
-    ranAt: new Date(),
-    stats: {
-      stockItemsProcessed: stockItems.length,
-      operationsPatched: totalPatched,
-      unmatchedOperations: totalNoMatch,
-      categoryStats
-    }
-  });
-
-  console.log(`\n✅ StockItem force backfill complete — ${totalPatched} operations patched, ${totalNoMatch} had no registry match`);
-
-  // If there are unmatched operations, suggest checking operation registry
-  if (totalNoMatch > 0) {
-    console.log("\n⚠️  Some operations couldn't be matched. Please check:");
-    console.log("   1. Are all operation names correctly registered in the Operation model?");
-    console.log("   2. Do the registered operations have the correct operationCode prefixes (S0, P0, MJ)?");
-    console.log("   3. Check the unmatched logs above for specific operation names.");
-
-    // Collect unique unmatched operation names for easier debugging
-    const unmatchedOps = new Set();
-    for (const item of stockItems) {
-      for (const op of item.operations) {
-        const lookupKey = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
-        let matched = false;
-
-        // Check if it would have matched any category
-        if (item.category === "Shirts") {
-          matched = shirtOps.has(lookupKey) || otherOps.has(lookupKey);
-        } else if (item.category === "Bottoms") {
-          matched = bottomOps.has(lookupKey) || otherOps.has(lookupKey);
-        } else if (item.category === "Outerwear") {
-          matched = outerwearOps.has(lookupKey) || otherOps.has(lookupKey);
-        }
-
-        if (!matched) {
-          unmatchedOps.add(`${op.type} (category: ${item.category})`);
-        }
-      }
-    }
-
-    console.log("\n📋 Unique unmatched operation names:");
-    unmatchedOps.forEach(op => console.log(`   - ${op}`));
   }
 };
 
