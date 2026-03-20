@@ -86,8 +86,6 @@ const connectDB = async () => {
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
 
-    await assignMeasurementsToExistingProducts();
-
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
