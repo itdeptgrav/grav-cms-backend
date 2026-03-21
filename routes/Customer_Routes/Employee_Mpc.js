@@ -624,6 +624,20 @@ router.get('/:id', verifyCustomerToken, async (req, res) => {
   }
 });
 
+router.delete('/all', verifyCustomerToken, async (req, res) => {
+  try {
+    const result = await EmployeeMpc.deleteMany({ customerId: req.customerId });
+    res.status(200).json({
+      success: true,
+      message: `Deleted ${result.deletedCount} employee(s) successfully`,
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error('Error deleting all employees:', error);
+    res.status(500).json({ success: false, message: 'Server error while deleting all employees' });
+  }
+});
+
 // ─── UPDATE single employee ───────────────────────────────────────────────────
 router.put('/:id', verifyCustomerToken, async (req, res) => {
   try {
@@ -741,5 +755,7 @@ router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
+
+
 
 module.exports = router;
