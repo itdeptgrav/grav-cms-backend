@@ -22,6 +22,8 @@ const verifyCustomerToken = async (req, res, next) => {
 };
 
 // ─── Helper: validate & build product array ───────────────────────────────────
+// Now also accepts an optional `productName` per entry so callers can persist
+// the display-name that was shown in the popup (could be an additionalName alias).
 async function buildValidProducts(products, rowLabel = '') {
   const validProducts = [];
   const errors = [];
@@ -33,7 +35,7 @@ async function buildValidProducts(products, rowLabel = '') {
   // Batch-fetch all stock items at once to avoid N+1
   const productIds = [...new Set(products.map(p => p.productId).filter(Boolean))];
   const stockItems = await StockItem.find({ _id: { $in: productIds } })
-    .select('name variants')
+    .select('name additionalNames variants')
     .lean();
   const stockMap = Object.fromEntries(stockItems.map(s => [s._id.toString(), s]));
 
@@ -56,18 +58,28 @@ async function buildValidProducts(products, rowLabel = '') {
         continue;
       }
     }
+
+    // ── Determine the display name to persist ─────────────────────────────
+    // Priority:
+    //   1. Caller-supplied productName (e.g. the additionalName the user saw in the popup)
+    //   2. Canonical product name from the DB
+    const resolvedName = (product.productName && product.productName.trim())
+      ? product.productName.trim()
+      : stockItem.name;
+
     validProducts.push({
       productId: product.productId,
       variantId: product.variantId || null,
-      quantity: parseInt(product.quantity) || 1
+      quantity: parseInt(product.quantity) || 1,
+      productName: resolvedName
     });
   }
   return { validProducts, errors };
 }
 
 // ─── GET all employees (paginated, lightweight) ───────────────────────────────
-// Returns employee list WITHOUT resolving product names — the frontend handles that
-// only for the visible page, dramatically reducing load time.
+// Products now carry a persisted `productName` field — no need to re-resolve
+// them on the frontend for the visible page.
 router.get('/', verifyCustomerToken, async (req, res) => {
   try {
     const {
@@ -104,7 +116,7 @@ router.get('/', verifyCustomerToken, async (req, res) => {
         .lean(),
       EmployeeMpc.countDocuments(filter),
       EmployeeMpc.aggregate([
-        { $match: { customerId: req.customerId } },  // always count over full set
+        { $match: { customerId: req.customerId } },
         { $group: { _id: '$status', count: { $sum: 1 } } }
       ])
     ]);
@@ -146,7 +158,13 @@ router.get('/', verifyCustomerToken, async (req, res) => {
   }
 });
 
-// ─── GET available products (search-aware) ────────────────────────────────────
+// ─── GET available products (search-aware, additionalNames-aware) ─────────────
+// When a search term is supplied the query now also checks the `additionalNames`
+// array so that typing an alias surfaces the correct product.
+// Each returned product includes a `matchedName` field:
+//   • If the search matched an additionalName  → matchedName = that additionalName
+//   • Otherwise                                → matchedName = product.name (canonical)
+// The frontend uses matchedName as the label in the popup AND persists it on save.
 router.get('/products/available', verifyCustomerToken, async (req, res) => {
   try {
     const { search = '' } = req.query;
@@ -154,19 +172,42 @@ router.get('/products/available', verifyCustomerToken, async (req, res) => {
     let filter = {};
     if (search) {
       filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { reference: { $regex: search, $options: 'i' } },
-        { category: { $regex: search, $options: 'i' } }
+        { name:            { $regex: search, $options: 'i' } },
+        { reference:       { $regex: search, $options: 'i' } },
+        { category:        { $regex: search, $options: 'i' } },
+        // ── NEW: also search inside the additionalNames array ──────────────
+        { additionalNames: { $elemMatch: { $regex: search, $options: 'i' } } }
       ];
     }
 
     const products = await StockItem.find(filter)
-      .select('name reference category genderCategory baseSalesPrice totalQuantityOnHand images variants')
+      .select('name reference category genderCategory baseSalesPrice totalQuantityOnHand images variants additionalNames')
       .sort({ name: 1 })
       .limit(50)
       .lean();
 
-    res.status(200).json({ success: true, products });
+    // ── Attach matchedName ────────────────────────────────────────────────────
+    // For each product decide which label the popup should display.
+    const searchLower = search.toLowerCase();
+    const enriched = products.map(p => {
+      let matchedName = p.name; // default: canonical name
+
+      if (search) {
+        // Check if the canonical name does NOT match but an additionalName does
+        const canonicalMatches = p.name.toLowerCase().includes(searchLower);
+        if (!canonicalMatches && Array.isArray(p.additionalNames)) {
+          const hit = p.additionalNames.find(
+            an => an.toLowerCase().includes(searchLower)
+          );
+          if (hit) matchedName = hit;
+        }
+        // If canonical name itself matched, keep matchedName = p.name (already set)
+      }
+
+      return { ...p, matchedName };
+    });
+
+    res.status(200).json({ success: true, products: enriched });
   } catch (error) {
     console.error('Error fetching products:', error);
     res.status(500).json({ success: false, message: 'Server error while fetching products' });
@@ -177,7 +218,7 @@ router.get('/products/available', verifyCustomerToken, async (req, res) => {
 router.get('/products/:id/variants', verifyCustomerToken, async (req, res) => {
   try {
     const product = await StockItem.findById(req.params.id)
-      .select('name reference variants')
+      .select('name reference variants additionalNames')
       .lean();
 
     if (!product) {
@@ -187,6 +228,7 @@ router.get('/products/:id/variants', verifyCustomerToken, async (req, res) => {
     res.status(200).json({
       success: true,
       productName: product.name,
+      additionalNames: product.additionalNames || [],
       variants: (product.variants || []).map(v => ({
         _id: v._id,
         sku: v.sku,
@@ -206,7 +248,7 @@ router.get('/products/:id/variants', verifyCustomerToken, async (req, res) => {
 router.get('/products/details/:id', verifyCustomerToken, async (req, res) => {
   try {
     const product = await StockItem.findById(req.params.id)
-      .select('name images variants')
+      .select('name images variants additionalNames')
       .lean();
 
     if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
@@ -217,8 +259,11 @@ router.get('/products/details/:id', verifyCustomerToken, async (req, res) => {
   }
 });
 
-// ─── BATCH resolve product names (for pagination performance) ─────────────────
+// ─── BATCH resolve product names (fallback / migration helper) ────────────────
 // POST /products/resolve  body: { productIds: ["id1","id2",...] }
+// Still used by older code paths and the assignment-history sidebar.
+// Returns canonical name + image (not additionalNames — callers use persisted
+// productName on the employee record for the display label instead).
 router.post('/products/resolve', verifyCustomerToken, async (req, res) => {
   try {
     const { productIds = [] } = req.body;
@@ -265,6 +310,7 @@ router.get('/by-group', verifyCustomerToken, async (req, res) => {
 // ─── BULK UPDATE products for a dept/designation group ────────────────────────
 // PATCH /bulk-products
 // body: { department, designation, employees: [{ _id, products: [...] }] }
+// Each product entry may now include `productName` — persisted as-is.
 router.patch('/bulk-products', verifyCustomerToken, async (req, res) => {
   try {
     const { department, designation, employees } = req.body;
@@ -349,41 +395,41 @@ router.post('/', verifyCustomerToken, async (req, res) => {
 router.post('/batch', verifyCustomerToken, async (req, res) => {
   try {
     const { employees } = req.body;
- 
+
     if (!employees || !Array.isArray(employees) || employees.length === 0) {
       return res.status(400).json({ success: false, message: 'Employee data is required' });
     }
- 
+
     // ── Pre-fetch all existing employees for this customer ────────────────────
     const existingEmployees = await EmployeeMpc.find({ customerId: req.customerId })
       .select('uin name department designation')
       .lean();
- 
+
     // Map keyed by uppercase UIN for O(1) lookup
     const existingMap = Object.fromEntries(
       existingEmployees.map(emp => [emp.uin.toUpperCase(), emp])
     );
- 
+
     // ── Pre-fetch ALL unique product IDs in one query ─────────────────────────
     const allProductIds = [...new Set(
       employees.flatMap(emp => (emp.products || []).map(p => p.productId).filter(Boolean))
     )];
     const stockItems = await StockItem.find({ _id: { $in: allProductIds } })
-      .select('name variants')
+      .select('name additionalNames variants')
       .lean();
     const stockMap = Object.fromEntries(stockItems.map(s => [s._id.toString(), s]));
- 
+
     const validationErrors  = [];
     const employeesToCreate = [];
-    const skippedEmployees  = [];   // truly skipped (name mismatch, already complete, etc.)
-    const deptPatchOps      = [];   // { _id, patch } — existing employees needing dept/desig filled
- 
+    const skippedEmployees  = [];
+    const deptPatchOps      = [];
+
     // Track UINs queued for creation this batch to catch intra-batch duplicates
     const seenUins = new Set(Object.keys(existingMap));
- 
+
     for (const [index, emp] of employees.entries()) {
       const rowNumber = index + 1;
- 
+
       // ── Basic field validation ──────────────────────────────────────────────
       if (!emp.name?.trim()) {
         validationErrors.push(`Row ${rowNumber}: Name is required`);
@@ -397,15 +443,14 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         validationErrors.push(`Row ${rowNumber}: Gender is required`);
         continue;
       }
- 
+
       const formattedUin  = emp.uin.trim().toUpperCase();
       const formattedName = emp.name.trim();
- 
+
       // ── Check if UIN already exists ────────────────────────────────────────
       if (existingMap[formattedUin]) {
         const stored = existingMap[formattedUin];
- 
-        // Safety check: names must match (case-insensitive)
+
         if (stored.name.trim().toLowerCase() !== formattedName.toLowerCase()) {
           skippedEmployees.push({
             row: rowNumber,
@@ -415,18 +460,16 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
           });
           continue;
         }
- 
-        // Only patch if at least one of dept / desig is missing in the DB record
+
         const needsDeptPatch  = !stored.department?.trim()  && emp.department?.trim();
         const needsDesigPatch = !stored.designation?.trim() && emp.designation?.trim();
- 
+
         if (needsDeptPatch || needsDesigPatch) {
           const patch = { updatedBy: req.customerId };
           if (needsDeptPatch)  patch.department  = emp.department.trim();
           if (needsDesigPatch) patch.designation = emp.designation.trim();
           deptPatchOps.push({ _id: stored._id, patch });
         } else {
-          // Dept/desig already filled — nothing to do
           skippedEmployees.push({
             row: rowNumber,
             name: formattedName,
@@ -434,19 +477,19 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
             reason: 'Already exists with department & designation — no changes needed'
           });
         }
-        continue; // Either way, do not re-create
+        continue;
       }
- 
+
       // ── Intra-batch duplicate check ────────────────────────────────────────
       if (seenUins.has(formattedUin)) {
         skippedEmployees.push({ row: rowNumber, name: formattedName, uin: formattedUin, reason: 'Duplicate UIN in this import' });
         continue;
       }
- 
+
       // ── Validate products using pre-fetched map ────────────────────────────
       const validProducts = [];
       let hasProductError = false;
- 
+
       if (emp.products && Array.isArray(emp.products) && emp.products.length > 0) {
         for (const product of emp.products) {
           if (!product.productId) {
@@ -470,16 +513,22 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
               break;
             }
           }
+          // Persist whichever display name was supplied by the caller
+          const resolvedName = (product.productName && product.productName.trim())
+            ? product.productName.trim()
+            : stockItem.name;
+
           validProducts.push({
-            productId: product.productId,
-            variantId: product.variantId || null,
-            quantity:  parseInt(product.quantity) || 1
+            productId:   product.productId,
+            variantId:   product.variantId || null,
+            quantity:    parseInt(product.quantity) || 1,
+            productName: resolvedName
           });
         }
       }
- 
+
       if (hasProductError) continue;
- 
+
       employeesToCreate.push({
         customerId:  req.customerId,
         name:        formattedName,
@@ -491,10 +540,10 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         status:      'active',
         createdBy:   req.customerId
       });
- 
+
       seenUins.add(formattedUin);
     }
- 
+
     // ── Execute dept/desig patches in a single bulkWrite ──────────────────────
     let patchedCount = 0;
     if (deptPatchOps.length > 0) {
@@ -507,7 +556,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       const bulkResult = await EmployeeMpc.bulkWrite(bulkOps, { ordered: false });
       patchedCount = bulkResult.modifiedCount || 0;
     }
- 
+
     // ── Insert new employees ──────────────────────────────────────────────────
     let createdEmployees = [];
     if (employeesToCreate.length > 0) {
@@ -528,8 +577,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         }
       }
     }
- 
-    // ── Nothing at all was done ───────────────────────────────────────────────
+
     if (createdEmployees.length === 0 && patchedCount === 0) {
       return res.status(400).json({
         success:         false,
@@ -541,7 +589,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         patchedCount:    0
       });
     }
- 
+
     res.status(201).json({
       success:          true,
       message:          `Processed ${employees.length} employees`,
@@ -550,7 +598,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       validationErrors: validationErrors.slice(0, 20),
       skippedEmployees: skippedEmployees.slice(0, 20)
     });
- 
+
   } catch (error) {
     console.error('Error creating batch employees:', error);
     res.status(500).json({ success: false, message: 'Server error while processing employees' });
@@ -680,7 +728,7 @@ router.patch('/:id/status', verifyCustomerToken, async (req, res) => {
 router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
   try {
     const stockItem = await StockItem.findById(req.params.id)
-      .select('name reference images variants')
+      .select('name reference images variants additionalNames')
       .lean();
 
     if (!stockItem) {
