@@ -16,6 +16,16 @@ const productAssignmentSchema = new mongoose.Schema({
     required: true,
     min: 1,
     default: 1
+  },
+  // ── NEW: persist the display name at assignment time ──────────────────────
+  // Stores whichever name was shown in the popup when the product was assigned —
+  // this is either an additionalName (if the user searched/selected via an alias)
+  // or the product's canonical name.  Storing it here means the list view never
+  // needs to re-resolve names from the StockItem collection on every page load.
+  productName: {
+    type: String,
+    trim: true,
+    default: ""
   }
 }, { _id: false });
 
