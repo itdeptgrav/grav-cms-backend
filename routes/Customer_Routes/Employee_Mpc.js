@@ -349,17 +349,22 @@ router.post('/', verifyCustomerToken, async (req, res) => {
 router.post('/batch', verifyCustomerToken, async (req, res) => {
   try {
     const { employees } = req.body;
-
+ 
     if (!employees || !Array.isArray(employees) || employees.length === 0) {
       return res.status(400).json({ success: false, message: 'Employee data is required' });
     }
-
-    // Pre-fetch all existing UINs once
+ 
+    // ── Pre-fetch all existing employees for this customer ────────────────────
     const existingEmployees = await EmployeeMpc.find({ customerId: req.customerId })
-      .select('uin').lean();
-    const existingUins = new Set(existingEmployees.map(emp => emp.uin.toUpperCase()));
-
-    // Pre-fetch ALL unique product IDs in a single query
+      .select('uin name department designation')
+      .lean();
+ 
+    // Map keyed by uppercase UIN for O(1) lookup
+    const existingMap = Object.fromEntries(
+      existingEmployees.map(emp => [emp.uin.toUpperCase(), emp])
+    );
+ 
+    // ── Pre-fetch ALL unique product IDs in one query ─────────────────────────
     const allProductIds = [...new Set(
       employees.flatMap(emp => (emp.products || []).map(p => p.productId).filter(Boolean))
     )];
@@ -367,98 +372,185 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       .select('name variants')
       .lean();
     const stockMap = Object.fromEntries(stockItems.map(s => [s._id.toString(), s]));
-
-    const validationErrors = [];
+ 
+    const validationErrors  = [];
     const employeesToCreate = [];
-    const skippedEmployees = [];
-
+    const skippedEmployees  = [];   // truly skipped (name mismatch, already complete, etc.)
+    const deptPatchOps      = [];   // { _id, patch } — existing employees needing dept/desig filled
+ 
+    // Track UINs queued for creation this batch to catch intra-batch duplicates
+    const seenUins = new Set(Object.keys(existingMap));
+ 
     for (const [index, emp] of employees.entries()) {
       const rowNumber = index + 1;
-
-      if (!emp.name?.trim()) { validationErrors.push(`Row ${rowNumber}: Name is required`); continue; }
-      if (!emp.uin?.trim()) { validationErrors.push(`Row ${rowNumber}: UIN is required`); continue; }
-      if (!emp.gender) { validationErrors.push(`Row ${rowNumber}: Gender is required`); continue; }
-
-      const formattedUin = emp.uin.trim().toUpperCase();
-
-      if (existingUins.has(formattedUin)) {
-        skippedEmployees.push({ row: rowNumber, name: emp.name.trim(), uin: formattedUin, reason: 'UIN already exists' });
+ 
+      // ── Basic field validation ──────────────────────────────────────────────
+      if (!emp.name?.trim()) {
+        validationErrors.push(`Row ${rowNumber}: Name is required`);
         continue;
       }
-
-      // Build products using pre-fetched map (no extra DB calls)
+      if (!emp.uin?.trim()) {
+        validationErrors.push(`Row ${rowNumber}: UIN is required`);
+        continue;
+      }
+      if (!emp.gender) {
+        validationErrors.push(`Row ${rowNumber}: Gender is required`);
+        continue;
+      }
+ 
+      const formattedUin  = emp.uin.trim().toUpperCase();
+      const formattedName = emp.name.trim();
+ 
+      // ── Check if UIN already exists ────────────────────────────────────────
+      if (existingMap[formattedUin]) {
+        const stored = existingMap[formattedUin];
+ 
+        // Safety check: names must match (case-insensitive)
+        if (stored.name.trim().toLowerCase() !== formattedName.toLowerCase()) {
+          skippedEmployees.push({
+            row: rowNumber,
+            name: formattedName,
+            uin: formattedUin,
+            reason: `UIN exists but name mismatch (stored: "${stored.name}")`
+          });
+          continue;
+        }
+ 
+        // Only patch if at least one of dept / desig is missing in the DB record
+        const needsDeptPatch  = !stored.department?.trim()  && emp.department?.trim();
+        const needsDesigPatch = !stored.designation?.trim() && emp.designation?.trim();
+ 
+        if (needsDeptPatch || needsDesigPatch) {
+          const patch = { updatedBy: req.customerId };
+          if (needsDeptPatch)  patch.department  = emp.department.trim();
+          if (needsDesigPatch) patch.designation = emp.designation.trim();
+          deptPatchOps.push({ _id: stored._id, patch });
+        } else {
+          // Dept/desig already filled — nothing to do
+          skippedEmployees.push({
+            row: rowNumber,
+            name: formattedName,
+            uin: formattedUin,
+            reason: 'Already exists with department & designation — no changes needed'
+          });
+        }
+        continue; // Either way, do not re-create
+      }
+ 
+      // ── Intra-batch duplicate check ────────────────────────────────────────
+      if (seenUins.has(formattedUin)) {
+        skippedEmployees.push({ row: rowNumber, name: formattedName, uin: formattedUin, reason: 'Duplicate UIN in this import' });
+        continue;
+      }
+ 
+      // ── Validate products using pre-fetched map ────────────────────────────
       const validProducts = [];
       let hasProductError = false;
-
+ 
       if (emp.products && Array.isArray(emp.products) && emp.products.length > 0) {
         for (const product of emp.products) {
-          if (!product.productId) { validationErrors.push(`Row ${rowNumber}: Product ID is required`); hasProductError = true; break; }
+          if (!product.productId) {
+            validationErrors.push(`Row ${rowNumber}: Product ID is required`);
+            hasProductError = true;
+            break;
+          }
           const stockItem = stockMap[product.productId.toString()];
-          if (!stockItem) { validationErrors.push(`Row ${rowNumber}: Product not found`); hasProductError = true; break; }
+          if (!stockItem) {
+            validationErrors.push(`Row ${rowNumber}: Product not found`);
+            hasProductError = true;
+            break;
+          }
           if (product.variantId) {
-            const variant = (stockItem.variants || []).find(v => v._id.toString() === product.variantId.toString());
-            if (!variant) { validationErrors.push(`Row ${rowNumber}: Variant not found`); hasProductError = true; break; }
+            const variant = (stockItem.variants || []).find(
+              v => v._id.toString() === product.variantId.toString()
+            );
+            if (!variant) {
+              validationErrors.push(`Row ${rowNumber}: Variant not found`);
+              hasProductError = true;
+              break;
+            }
           }
           validProducts.push({
             productId: product.productId,
             variantId: product.variantId || null,
-            quantity: parseInt(product.quantity) || 1
+            quantity:  parseInt(product.quantity) || 1
           });
         }
       }
-
+ 
       if (hasProductError) continue;
-
+ 
       employeesToCreate.push({
-        customerId: req.customerId,
-        name: emp.name.trim(),
-        uin: formattedUin,
-        gender: emp.gender,
-        department: emp.department?.trim() || '',
+        customerId:  req.customerId,
+        name:        formattedName,
+        uin:         formattedUin,
+        gender:      emp.gender,
+        department:  emp.department?.trim()  || '',
         designation: emp.designation?.trim() || '',
-        products: validProducts,
-        status: 'active',
-        createdBy: req.customerId
+        products:    validProducts,
+        status:      'active',
+        createdBy:   req.customerId
       });
-
-      existingUins.add(formattedUin);
+ 
+      seenUins.add(formattedUin);
     }
-
-    if (employeesToCreate.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No valid employees to create',
-        validationErrors,
-        skippedEmployees,
-        totalProcessed: employees.length,
-        createdCount: 0
-      });
+ 
+    // ── Execute dept/desig patches in a single bulkWrite ──────────────────────
+    let patchedCount = 0;
+    if (deptPatchOps.length > 0) {
+      const bulkOps = deptPatchOps.map(({ _id, patch }) => ({
+        updateOne: {
+          filter: { _id, customerId: req.customerId },
+          update: { $set: patch }
+        }
+      }));
+      const bulkResult = await EmployeeMpc.bulkWrite(bulkOps, { ordered: false });
+      patchedCount = bulkResult.modifiedCount || 0;
     }
-
+ 
+    // ── Insert new employees ──────────────────────────────────────────────────
     let createdEmployees = [];
-    try {
-      createdEmployees = await EmployeeMpc.insertMany(employeesToCreate, { ordered: false });
-    } catch (error) {
-      if (error.writeErrors?.length > 0) {
-        error.writeErrors.forEach(writeError => {
-          if (writeError.code === 11000) {
-            const failedUin = writeError.err.op.uin;
-            const failedRow = employees.findIndex(e => e.uin?.toUpperCase() === failedUin) + 1;
-            skippedEmployees.push({ row: failedRow, uin: failedUin, reason: 'Duplicate UIN (database constraint)' });
-          }
-        });
-        createdEmployees = error.insertedDocs || [];
+    if (employeesToCreate.length > 0) {
+      try {
+        createdEmployees = await EmployeeMpc.insertMany(employeesToCreate, { ordered: false });
+      } catch (error) {
+        if (error.writeErrors?.length > 0) {
+          error.writeErrors.forEach(writeError => {
+            if (writeError.code === 11000) {
+              const failedUin = writeError.err.op.uin;
+              const failedRow = employees.findIndex(e => e.uin?.toUpperCase() === failedUin) + 1;
+              skippedEmployees.push({ row: failedRow, uin: failedUin, reason: 'Duplicate UIN (database constraint)' });
+            }
+          });
+          createdEmployees = error.insertedDocs || [];
+        } else {
+          throw error;
+        }
       }
     }
-
+ 
+    // ── Nothing at all was done ───────────────────────────────────────────────
+    if (createdEmployees.length === 0 && patchedCount === 0) {
+      return res.status(400).json({
+        success:         false,
+        message:         'No changes were made',
+        validationErrors,
+        skippedEmployees,
+        totalProcessed:  employees.length,
+        createdCount:    0,
+        patchedCount:    0
+      });
+    }
+ 
     res.status(201).json({
-      success: true,
-      message: `Processed ${employees.length} employees`,
-      createdCount: createdEmployees.length,
+      success:          true,
+      message:          `Processed ${employees.length} employees`,
+      createdCount:     createdEmployees.length,
+      patchedCount,
       validationErrors: validationErrors.slice(0, 20),
       skippedEmployees: skippedEmployees.slice(0, 20)
     });
-
+ 
   } catch (error) {
     console.error('Error creating batch employees:', error);
     res.status(500).json({ success: false, message: 'Server error while processing employees' });
