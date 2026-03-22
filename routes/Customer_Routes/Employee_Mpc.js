@@ -166,11 +166,11 @@ router.get('/export', verifyCustomerToken, async (req, res) => {
       .select('name uin gender department designation products status')
       .sort({ department: 1, name: 1 })
       .lean();
- 
+
     if (!employees.length) {
       return res.status(404).json({ success: false, message: 'No employees found' });
     }
- 
+
     // Batch-fetch all referenced StockItems
     const productIdSet = new Set();
     employees.forEach(emp => {
@@ -178,33 +178,33 @@ router.get('/export', verifyCustomerToken, async (req, res) => {
         if (p.productId) productIdSet.add(p.productId.toString());
       });
     });
- 
+
     const stockItems = productIdSet.size
       ? await StockItem.find({ _id: { $in: [...productIdSet] } })
-          .select('_id name images variants')
-          .lean()
+        .select('_id name images variants')
+        .lean()
       : [];
- 
+
     const stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
- 
+
     // ── Build rows grouped by department ─────────────────────────────────────
     const headers = [
       'Name', 'UIN', 'Gender', 'Department', 'Designation', 'Status',
       'Product Name', 'Variant', 'Quantity', 'Product Image'
     ];
- 
+
     const rows = [];
     let currentDept = null;
- 
+
     employees.forEach(emp => {
       const dept = emp.department || '';
- 
+
       // Insert blank separator row when department changes (not before first dept)
       if (currentDept !== null && dept !== currentDept) {
         rows.push(',,,,,,,,, ');
       }
       currentDept = dept;
- 
+
       const base = [
         `"${emp.name}"`,
         emp.uin,
@@ -213,18 +213,18 @@ router.get('/export', verifyCustomerToken, async (req, res) => {
         `"${emp.designation || ''}"`,
         emp.status,
       ];
- 
+
       if (!emp.products?.length) {
         rows.push([...base, '', '', '', ''].join(','));
         return;
       }
- 
+
       emp.products.forEach(p => {
-        const si         = stockMap.get(p.productId?.toString());
-        const prodName   = p.productName || si?.name || '';
+        const si = stockMap.get(p.productId?.toString());
+        const prodName = p.productName || si?.name || '';
         let variantLabel = 'Default';
-        let imageUrl     = '';
- 
+        let imageUrl = '';
+
         if (si) {
           imageUrl = si.images?.[0] || '';
           if (p.variantId && si.variants?.length) {
@@ -235,11 +235,11 @@ router.get('/export', verifyCustomerToken, async (req, res) => {
             }
           }
         }
- 
+
         // =IMAGE("url") renders inline in Excel / modern Google Sheets.
         // Doubles the inner quotes so they survive CSV quoting rules.
         const imageCell = imageUrl ? `"=IMAGE(""${imageUrl}"")"` : '';
- 
+
         rows.push([
           ...base,
           `"${prodName}"`,
@@ -249,13 +249,13 @@ router.get('/export', verifyCustomerToken, async (req, res) => {
         ].join(','));
       });
     });
- 
+
     const csv = ['\uFEFF', headers.join(','), ...rows].join('\n');
- 
+
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="employees_export.csv"');
     res.send(csv);
- 
+
   } catch (error) {
     console.error('Export error:', error);
     res.status(500).json({ success: false, message: 'Export failed' });
@@ -266,33 +266,33 @@ router.get('/export', verifyCustomerToken, async (req, res) => {
 
 router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
   const ExcelJS = require('exceljs');
-  const axios   = require('axios');
- 
+  const axios = require('axios');
+
   try {
     // ── 1. Fetch all employees sorted by dept → name ──────────────────────
     const employees = await EmployeeMpc.find({ customerId: req.customerId })
       .select('name uin gender department designation products')
       .sort({ department: 1, name: 1 })
       .lean();
- 
+
     if (!employees.length) {
       return res.status(404).json({ success: false, message: 'No employees found' });
     }
- 
+
     // ── 2. Batch-fetch StockItems ─────────────────────────────────────────
     const productIdSet = new Set();
     employees.forEach(emp =>
       (emp.products || []).forEach(p => { if (p.productId) productIdSet.add(p.productId.toString()); })
     );
- 
+
     const stockItems = productIdSet.size
       ? await StockItem.find({ _id: { $in: [...productIdSet] } })
-          .select('_id name images variants')
-          .lean()
+        .select('_id name images variants')
+        .lean()
       : [];
- 
+
     const stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
- 
+
     // ── 3. Pre-download all unique image URLs in parallel ─────────────────
     const imageUrlSet = new Set();
     employees.forEach(emp => {
@@ -307,57 +307,60 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
         if (url) imageUrlSet.add(url);
       });
     });
- 
+
     const imageBufferMap = new Map();
     await Promise.all([...imageUrlSet].map(async url => {
       try {
-        const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 8000 });
+        const toThumb = (u) => u?.includes('/image/upload/')
+          ? u.replace('/image/upload/', '/image/upload/w_80,h_80,c_fill,q_70,f_webp/')
+          : u;
+        const resp = await axios.get(toThumb(url), { responseType: 'arraybuffer', timeout: 8000 });
         imageBufferMap.set(url, Buffer.from(resp.data));
       } catch { /* skip failed images */ }
     }));
- 
+
     // ── 4. Build workbook ─────────────────────────────────────────────────
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Employees', { pageSetup: { fitToPage: true, fitToWidth: 1 } });
- 
+
     const IMG_HEIGHT = 60; // row height (pts) when images present
- 
+
     // Columns — NO Status, photo is col 9 (I)
     ws.columns = [
-      { header: 'Name',         key: 'name',        width: 24 },
-      { header: 'UIN',          key: 'uin',          width: 10 },
-      { header: 'Gender',       key: 'gender',       width: 9  },
-      { header: 'Department',   key: 'department',   width: 22 },
-      { header: 'Designation',  key: 'designation',  width: 22 },
-      { header: 'Product Name', key: 'productName',  width: 28 },
-      { header: 'Variant',      key: 'variant',      width: 14 },
-      { header: 'Quantity',     key: 'quantity',     width: 10 },
-      { header: 'Photo',        key: 'photo',        width: 12 },
+      { header: 'Name', key: 'name', width: 24 },
+      { header: 'UIN', key: 'uin', width: 10 },
+      { header: 'Gender', key: 'gender', width: 9 },
+      { header: 'Department', key: 'department', width: 22 },
+      { header: 'Designation', key: 'designation', width: 22 },
+      { header: 'Product Name', key: 'productName', width: 28 },
+      { header: 'Variant', key: 'variant', width: 14 },
+      { header: 'Quantity', key: 'quantity', width: 10 },
+      { header: 'Photo', key: 'photo', width: 12 },
     ];
- 
+
     // Header styling
     ws.getRow(1).height = 20;
     ws.getRow(1).eachCell(cell => {
-      cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Arial' };
-      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2D3748' } };
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Arial' };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2D3748' } };
       cell.alignment = { vertical: 'middle', horizontal: 'center' };
-      cell.border    = { bottom: { style: 'thin', color: { argb: 'FF4A5568' } }, right: { style: 'thin', color: { argb: 'FF4A5568' } } };
+      cell.border = { bottom: { style: 'thin', color: { argb: 'FF4A5568' } }, right: { style: 'thin', color: { argb: 'FF4A5568' } } };
     });
- 
+
     const styleCell = (cell, isAlt) => {
-      cell.font      = { size: 9, name: 'Arial' };
-      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: isAlt ? 'FFF7FAFC' : 'FFFFFFFF' } };
+      cell.font = { size: 9, name: 'Arial' };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isAlt ? 'FFF7FAFC' : 'FFFFFFFF' } };
       cell.alignment = { vertical: 'middle', wrapText: true };
-      cell.border    = { bottom: { style: 'hair', color: { argb: 'FFE2E8F0' } }, right: { style: 'hair', color: { argb: 'FFE2E8F0' } } };
+      cell.border = { bottom: { style: 'hair', color: { argb: 'FFE2E8F0' } }, right: { style: 'hair', color: { argb: 'FFE2E8F0' } } };
     };
- 
-    let currentDept  = null;
-    let rowIdx       = 2;   // 1-based; row 1 = header
-    let altRow       = false;
- 
+
+    let currentDept = null;
+    let rowIdx = 2;   // 1-based; row 1 = header
+    let altRow = false;
+
     for (const emp of employees) {
       const dept = emp.department || '';
- 
+
       // Blank separator between departments
       if (currentDept !== null && dept !== currentDept) {
         const sep = ws.getRow(rowIdx);
@@ -368,17 +371,17 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
         altRow = false;
       }
       currentDept = dept;
- 
+
       // ── Resolve all products for this employee ────────────────────────
       const productLines = [];   // strings for the text cell
-      const imageUrls    = [];   // one url per product (may repeat if same image)
- 
+      const imageUrls = [];   // one url per product (may repeat if same image)
+
       (emp.products || []).forEach((p, idx) => {
-        const si         = stockMap.get(p.productId?.toString());
-        const prodName   = p.productName || si?.name || '';
+        const si = stockMap.get(p.productId?.toString());
+        const prodName = p.productName || si?.name || '';
         let variantLabel = 'Default';
-        let imageUrl     = '';
- 
+        let imageUrl = '';
+
         if (si) {
           imageUrl = si.images?.[0] || '';
           if (p.variantId && si.variants?.length) {
@@ -389,16 +392,16 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
             }
           }
         }
- 
+
         const qty = p.quantity || 1;
         productLines.push(`${idx + 1}. ${prodName} | Qty: ${qty}`);
         imageUrls.push(imageUrl);
       });
- 
+
       const hasAnyImage = imageUrls.some(u => u && imageBufferMap.has(u));
-      const row         = ws.getRow(rowIdx);
-      row.height        = hasAnyImage ? IMG_HEIGHT * imageUrls.filter(u => u && imageBufferMap.has(u)).length : 18;
- 
+      const row = ws.getRow(rowIdx);
+      row.height = hasAnyImage ? IMG_HEIGHT * imageUrls.filter(u => u && imageBufferMap.has(u)).length : 18;
+
       // Write the 8 text columns (no photo text — images handle col 9)
       const textValues = [
         emp.name,
@@ -410,7 +413,7 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
         '',   // variant — already in productLines
         '',   // quantity — already in productLines
       ];
- 
+
       textValues.forEach((val, ci) => {
         const cell = row.getCell(ci + 1);
         cell.value = val;
@@ -419,19 +422,19 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
       // Style the photo cell too
       styleCell(row.getCell(9), altRow);
       row.commit();
- 
+
       // ── Embed images stacked in the Photo column ──────────────────────
       // Each image gets an equal slice of the row height
       const validImages = imageUrls.filter(u => u && imageBufferMap.has(u));
       if (validImages.length > 0) {
         const sliceHeight = 1 / validImages.length; // fraction of row in ExcelJS units
- 
+
         validImages.forEach((url, imgIdx) => {
-          const buf  = imageBufferMap.get(url);
-          const ext  = (url.match(/\.(png|jpg|jpeg|gif|webp)/i)?.[1] || 'png').toLowerCase();
+          const buf = imageBufferMap.get(url);
+          const ext = (url.match(/\.(png|jpg|jpeg|gif|webp)/i)?.[1] || 'png').toLowerCase();
           const type = (ext === 'jpg' || ext === 'jpeg') ? 'jpeg' : ext === 'gif' ? 'gif' : 'png';
-          const id   = wb.addImage({ buffer: buf, extension: type });
- 
+          const id = wb.addImage({ buffer: buf, extension: type });
+
           ws.addImage(id, {
             tl: { col: 8, row: rowIdx - 1 + imgIdx * sliceHeight },
             br: { col: 9, row: rowIdx - 1 + (imgIdx + 1) * sliceHeight },
@@ -439,19 +442,19 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
           });
         });
       }
- 
+
       rowIdx++;
       altRow = !altRow;
     }
- 
-    ws.views     = [{ state: 'frozen', ySplit: 1 }];
+
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
     ws.autoFilter = { from: 'A1', to: 'I1' };
- 
+
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="employees_${new Date().toISOString().split('T')[0]}.xlsx"`);
     await wb.xlsx.write(res);
     res.end();
- 
+
   } catch (error) {
     console.error('XLSX export error:', error);
     if (!res.headersSent) {
@@ -474,9 +477,9 @@ router.get('/products/available', verifyCustomerToken, async (req, res) => {
     let filter = {};
     if (search) {
       filter.$or = [
-        { name:            { $regex: search, $options: 'i' } },
-        { reference:       { $regex: search, $options: 'i' } },
-        { category:        { $regex: search, $options: 'i' } },
+        { name: { $regex: search, $options: 'i' } },
+        { reference: { $regex: search, $options: 'i' } },
+        { category: { $regex: search, $options: 'i' } },
         // ── NEW: also search inside the additionalNames array ──────────────
         { additionalNames: { $elemMatch: { $regex: search, $options: 'i' } } },
         // Also try direct array match for string arrays
@@ -760,10 +763,10 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       .lean();
     const stockMap = Object.fromEntries(stockItems.map(s => [s._id.toString(), s]));
 
-    const validationErrors  = [];
+    const validationErrors = [];
     const employeesToCreate = [];
-    const skippedEmployees  = [];
-    const deptPatchOps      = [];
+    const skippedEmployees = [];
+    const deptPatchOps = [];
 
     // Track UINs queued for creation this batch to catch intra-batch duplicates
     const seenUins = new Set(Object.keys(existingMap));
@@ -785,7 +788,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
         continue;
       }
 
-      const formattedUin  = emp.uin.trim().toUpperCase();
+      const formattedUin = emp.uin.trim().toUpperCase();
       const formattedName = emp.name.trim();
 
       // ── Check if UIN already exists ────────────────────────────────────────
@@ -802,12 +805,12 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
           continue;
         }
 
-        const needsDeptPatch  = !stored.department?.trim()  && emp.department?.trim();
+        const needsDeptPatch = !stored.department?.trim() && emp.department?.trim();
         const needsDesigPatch = !stored.designation?.trim() && emp.designation?.trim();
 
         if (needsDeptPatch || needsDesigPatch) {
           const patch = { updatedBy: req.customerId };
-          if (needsDeptPatch)  patch.department  = emp.department.trim();
+          if (needsDeptPatch) patch.department = emp.department.trim();
           if (needsDesigPatch) patch.designation = emp.designation.trim();
           deptPatchOps.push({ _id: stored._id, patch });
         } else {
@@ -860,9 +863,9 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
             : stockItem.name;
 
           validProducts.push({
-            productId:   product.productId,
-            variantId:   product.variantId || null,
-            quantity:    parseInt(product.quantity) || 1,
+            productId: product.productId,
+            variantId: product.variantId || null,
+            quantity: parseInt(product.quantity) || 1,
             productName: resolvedName
           });
         }
@@ -871,15 +874,15 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       if (hasProductError) continue;
 
       employeesToCreate.push({
-        customerId:  req.customerId,
-        name:        formattedName,
-        uin:         formattedUin,
-        gender:      emp.gender,
-        department:  emp.department?.trim()  || '',
+        customerId: req.customerId,
+        name: formattedName,
+        uin: formattedUin,
+        gender: emp.gender,
+        department: emp.department?.trim() || '',
         designation: emp.designation?.trim() || '',
-        products:    validProducts,
-        status:      'active',
-        createdBy:   req.customerId
+        products: validProducts,
+        status: 'active',
+        createdBy: req.customerId
       });
 
       seenUins.add(formattedUin);
@@ -921,20 +924,20 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
 
     if (createdEmployees.length === 0 && patchedCount === 0) {
       return res.status(400).json({
-        success:         false,
-        message:         'No changes were made',
+        success: false,
+        message: 'No changes were made',
         validationErrors,
         skippedEmployees,
-        totalProcessed:  employees.length,
-        createdCount:    0,
-        patchedCount:    0
+        totalProcessed: employees.length,
+        createdCount: 0,
+        patchedCount: 0
       });
     }
 
     res.status(201).json({
-      success:          true,
-      message:          `Processed ${employees.length} employees`,
-      createdCount:     createdEmployees.length,
+      success: true,
+      message: `Processed ${employees.length} employees`,
+      createdCount: createdEmployees.length,
       patchedCount,
       validationErrors: validationErrors.slice(0, 20),
       skippedEmployees: skippedEmployees.slice(0, 20)
