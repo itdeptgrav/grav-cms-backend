@@ -661,30 +661,28 @@ router.delete('/:measurementId', async (req, res) => {
 });
 
 // ASSIGN PRODUCT to a no-product employee within a measurement
-// This does two things atomically:
-//   1. Assigns the product on the EmployeeMpc document
-//   2. Converts the employee's entry in this measurement from category-based → product-based
+
 router.post('/:measurementId/assign-product', async (req, res) => {
     try {
         const { measurementId } = req.params;
-        const { employeeId, organizationId, product, measurements } = req.body;
-
+        // categoryName is informational — tells us which category this product is for
+        const { employeeId, organizationId, product, measurements, categoryName } = req.body;
+ 
         if (!mongoose.Types.ObjectId.isValid(measurementId)) {
             return res.status(400).json({ success: false, message: 'Valid measurement ID is required' });
         }
         if (!employeeId || !product?.productId) {
             return res.status(400).json({ success: false, message: 'employeeId and product.productId are required' });
         }
-
-        // ── 1. Fetch the stock item to get its name and measurement fields ────
+ 
+        // ── 1. Fetch stock item ───────────────────────────────────────────────
         const stockItem = await StockItem.findById(product.productId)
             .select('_id name reference measurements variants')
             .lean();
         if (!stockItem) {
             return res.status(404).json({ success: false, message: 'Product not found' });
         }
-
-        // Resolve variant name from variants array if variantId supplied
+ 
         let resolvedVariantName = product.variantName || 'Default';
         if (product.variantId && stockItem.variants?.length) {
             const v = stockItem.variants.find(v => v._id.toString() === product.variantId.toString());
@@ -692,20 +690,19 @@ router.post('/:measurementId/assign-product', async (req, res) => {
                 resolvedVariantName = v.attributes.map(a => a.value).join(' • ');
             }
         }
-
-        // ── 2. Update EmployeeMpc — push this product into the employee's products array
-        //       (avoid duplicates: only add if not already present for same productId+variantId)
+ 
+        // ── 2. Update EmployeeMpc — push product (avoid exact duplicates) ────
         const employeeDoc = await EmployeeMpc.findById(employeeId);
         if (!employeeDoc) {
             return res.status(404).json({ success: false, message: 'Employee not found' });
         }
-
+ 
         const alreadyAssigned = employeeDoc.products?.some(p => {
             if (p.productId.toString() !== product.productId.toString()) return false;
             if (product.variantId) return p.variantId?.toString() === product.variantId.toString();
             return !p.variantId;
         });
-
+ 
         if (!alreadyAssigned) {
             employeeDoc.products.push({
                 productId:   product.productId,
@@ -715,67 +712,82 @@ router.post('/:measurementId/assign-product', async (req, res) => {
             });
             await employeeDoc.save();
         }
-
-        // ── 3. Build the product measurement entry for the Measurement document ─
+ 
+        // ── 3. Build the product measurement entry ────────────────────────────
         const measurementsArray = (measurements || []).map(m => ({
             measurementName: m.measurementName,
             value:           m.value || '',
             unit:            m.unit  || '',
         }));
-
-        // If no measurements supplied from frontend, initialise empty slots from stock item
+ 
         const finalMeasurements = measurementsArray.length
             ? measurementsArray
             : (stockItem.measurements || []).map(field => ({
-                measurementName: field,
-                value: '',
-                unit:  '',
+                measurementName: field, value: '', unit: '',
             }));
-
+ 
         const newProductEntry = {
-            productId:   product.productId,
-            productName: product.productName || stockItem.name,
-            variantId:   product.variantId   || null,
-            variantName: resolvedVariantName,
-            quantity:    product.quantity    || 1,
+            productId:    product.productId,
+            productName:  product.productName || stockItem.name,
+            variantId:    product.variantId   || null,
+            variantName:  resolvedVariantName,
+            quantity:     product.quantity    || 1,
             measurements: finalMeasurements,
-            measuredAt:  new Date(),
+            measuredAt:   new Date(),
         };
-
-        // ── 4. Update the employee's entry inside the Measurement document ────
+ 
+        // ── 4. Update employee entry in Measurement document ──────────────────
         const measurement = await Measurement.findById(measurementId);
         if (!measurement) {
             return res.status(404).json({ success: false, message: 'Measurement not found' });
         }
-
+ 
         const empEntry = measurement.employeeMeasurements.find(
             e => e.employeeId.toString() === employeeId.toString()
         );
         if (!empEntry) {
             return res.status(404).json({ success: false, message: 'Employee not found in this measurement' });
         }
-
-        // Convert from category-based → product-based
-        empEntry.noProductAssigned = false;
-        empEntry.categoryMeasurements = [];   // clear category data
+ 
+        // Append this product — do NOT clear existing products or categoryMeasurements
         empEntry.products.push(newProductEntry);
-
+ 
+        // ── 5. Flip noProductAssigned only when ALL categories have a product ──
+        // Count how many distinct categories exist on this employee entry.
+        const totalCategories = empEntry.categoryMeasurements?.length || 0;
+ 
+        if (totalCategories === 0) {
+            // Employee had no categories — flip immediately (legacy path)
+            empEntry.noProductAssigned = false;
+            empEntry.categoryMeasurements = [];
+        } else if (empEntry.products.length >= totalCategories) {
+            // Every category now has a product assigned → fully convert to product-based
+            empEntry.noProductAssigned = false;
+            // Intentionally keep categoryMeasurements for audit trail
+        }
+        // If products.length < totalCategories: still more categories to assign,
+        // leave noProductAssigned = true so the table still shows "Assign product"
+ 
         const allFilled = empEntry.products.every(p =>
             p.measurements.every(m => m.value?.trim())
         );
         empEntry.isCompleted = allFilled;
         empEntry.completedAt = allFilled ? new Date() : empEntry.completedAt;
-
+ 
         measurement.updatedBy = req.user.id;
         await measurement.save();
-
+ 
         res.status(200).json({
-            success: true,
-            message: `Product "${stockItem.name}" assigned to ${empEntry.employeeName} successfully`,
-            employeeName: empEntry.employeeName,
-            productName:  stockItem.name,
+            success:                 true,
+            message:                 `Product "${stockItem.name}" assigned to ${empEntry.employeeName}`,
+            employeeName:            empEntry.employeeName,
+            productName:             stockItem.name,
+            categoryName:            categoryName || null,
+            totalCategoriesAssigned: empEntry.products.length,
+            totalCategoriesNeeded:   totalCategories,
+            allCategoriesAssigned:   empEntry.products.length >= totalCategories,
         });
-
+ 
     } catch (error) {
         console.error('Error assigning product:', error);
         res.status(500).json({ success: false, message: 'Server error while assigning product' });
