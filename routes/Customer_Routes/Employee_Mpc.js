@@ -176,7 +176,9 @@ router.get('/products/available', verifyCustomerToken, async (req, res) => {
         { reference:       { $regex: search, $options: 'i' } },
         { category:        { $regex: search, $options: 'i' } },
         // ── NEW: also search inside the additionalNames array ──────────────
-        { additionalNames: { $elemMatch: { $regex: search, $options: 'i' } } }
+        { additionalNames: { $elemMatch: { $regex: search, $options: 'i' } } },
+        // Also try direct array match for string arrays
+        { additionalNames: { $regex: search, $options: 'i' } }
       ];
     }
 
@@ -211,6 +213,43 @@ router.get('/products/available', verifyCustomerToken, async (req, res) => {
   } catch (error) {
     console.error('Error fetching products:', error);
     res.status(500).json({ success: false, message: 'Server error while fetching products' });
+  }
+});
+
+// ─── POST /products/available — fetch specific products by ID ─────────────────
+// Used by the popup when editing: guarantees the already-assigned products are
+// always present in the list regardless of search/limit.
+// Returns the same shape as GET /products/available (including matchedName).
+// matchedName is taken from the caller-supplied `persistedName` if provided
+// (i.e. the name that was stored when the product was originally assigned —
+//  could be an additionalName alias), otherwise falls back to canonical name.
+router.post('/products/available', verifyCustomerToken, async (req, res) => {
+  try {
+    const { productIds = [], persistedNames = {} } = req.body;
+    // persistedNames: { "productId": "storedName" }
+
+    if (!Array.isArray(productIds) || productIds.length === 0) {
+      return res.status(200).json({ success: true, products: [] });
+    }
+
+    const uniqueIds = [...new Set(productIds)].slice(0, 100);
+    const items = await StockItem.find({ _id: { $in: uniqueIds } })
+      .select('name reference category genderCategory baseSalesPrice totalQuantityOnHand images variants additionalNames')
+      .lean();
+
+    const enriched = items.map(p => {
+      const pidStr = p._id.toString();
+      // Use the persisted name (the name stored on the employee assignment).
+      // This is exactly what should be shown in the popup for this assignment.
+      const stored = persistedNames[pidStr];
+      const matchedName = (stored && stored.trim()) ? stored.trim() : p.name;
+      return { ...p, matchedName };
+    });
+
+    res.status(200).json({ success: true, products: enriched });
+  } catch (error) {
+    console.error('Error fetching products by id:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -624,20 +663,6 @@ router.get('/:id', verifyCustomerToken, async (req, res) => {
   }
 });
 
-router.delete('/all', verifyCustomerToken, async (req, res) => {
-  try {
-    const result = await EmployeeMpc.deleteMany({ customerId: req.customerId });
-    res.status(200).json({
-      success: true,
-      message: `Deleted ${result.deletedCount} employee(s) successfully`,
-      deletedCount: result.deletedCount,
-    });
-  } catch (error) {
-    console.error('Error deleting all employees:', error);
-    res.status(500).json({ success: false, message: 'Server error while deleting all employees' });
-  }
-});
-
 // ─── UPDATE single employee ───────────────────────────────────────────────────
 router.put('/:id', verifyCustomerToken, async (req, res) => {
   try {
@@ -755,7 +780,5 @@ router.get('/stock-items/:id', verifyCustomerToken, async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
-
-
 
 module.exports = router;
