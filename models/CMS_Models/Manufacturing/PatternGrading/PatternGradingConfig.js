@@ -27,6 +27,9 @@ const keyframeSchema = new mongoose.Schema(
     sizeTag: { type: String, default: null },
     deltas: [keyframeDeltaSchema],
     ts: { type: String },
+    // Auto-generated mirror KF metadata — set when system creates a negative-direction KF automatically
+    _autoMirror: { type: Boolean, default: false },
+    _mirrorOfId: { type: String, default: null },
   },
   { _id: true }
 );
@@ -37,6 +40,7 @@ const nestedConditionSchema = new mongoose.Schema(
     id: { type: String },
     enabled: { type: Boolean, default: true },
     label: { type: String, default: "Condition" },
+    priority: { type: Number, default: 5, min: 1, max: 10 },
     operator: {
       type: String,
       enum: ["greater_than", "less_than", "greater_equal", "less_equal", "equals"],

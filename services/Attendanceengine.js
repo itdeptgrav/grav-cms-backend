@@ -1,586 +1,614 @@
 /**
- * attendanceEngine.js  –  v4  (GRAV Clothing)
+ * Attendanceengine.js  –  v5  (GRAV Clothing)
  * ─────────────────────────────────────────────────────────────────────────────
- * Core business logic for attendance calculation.
+ * THE FIX FOR "Failed to parse number 'GR001'":
+ *   Old code used MongoDB $toInt: "$biometricId" which FAILS if biometricId
+ *   contains letters like "GR001". We now use pure JavaScript normalisation
+ *   BEFORE the DB query — strip letters in JS, query with the clean numeric
+ *   string using $in on biometricId directly.
  *
- * KEY FIXES vs v3:
- *  1. Uses DownloadInOutPunchData (the "In/Out" API) as PRIMARY source
- *     → gives us INTime, OUTTime, WorkTime, OverTime, Status, Remark, Late_In, Erl_Out
- *  2. Also uses DownloadPunchDataMCID (API2) to get individual punches with mcid
- *     → mcid 1=In, 2=Out, 3=BreakOut, 4=BreakIn  (eTimeOffice spec)
- *  3. Single check-in → status "MP" (miss-punch / pending checkout), NEVER absent
- *  4. 2-punch logic: P1=in, P2=out (full day possible). NOT auto half-day.
- *  5. Half-day only when netWork < halfDayThreshold (default 4.5 hrs = 270 min)
- *  6. OT grace: duty ends 18:30 → OT only starts after 19:00 (grace=30 min)
- *  7. Remark parsing: "MIS-LT" = late, "P/2" = half-day flag from device
- *  8. Break auto-apply: if no explicit break punches but span >= 5h → apply 45min lunch
+ * EMPLOYEE TYPE POLICY:
+ *   "operator"  → 6 punches (In/LunchOut/LunchIn/TeaOut/TeaIn/Out), OT counted
+ *   "executive" → 2 punches (In/Out only), NO OT, no break deduction
+ *
+ * DEPARTMENT ENRICHMENT:
+ *   eTimeOffice does NOT return department. We always look it up from
+ *   the Employee record by matching biometricId. If no Employee found,
+ *   department shows as "—".
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
 "use strict";
 
-// ── Time helpers ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  ID NORMALISATION
+// ─────────────────────────────────────────────────────────────────────────────
 
-/** "HH:MM" → minutes from midnight */
-function timeToMins(str) {
-    if (!str || str === "--:--") return null;
-    const parts = str.split(":");
-    if (parts.length < 2) return null;
-    const h = parseInt(parts[0], 10);
-    const m = parseInt(parts[1], 10);
-    if (isNaN(h) || isNaN(m)) return null;
-    return h * 60 + m;
+/**
+ * Strip any prefix like "GR", "#", leading zeros and return a plain integer.
+ *   normalizeId("GR072") → 72
+ *   normalizeId("#0001") → 1
+ *   normalizeId("0072")  → 72
+ *   normalizeId("72")    → 72
+ *   normalizeId(72)      → 72
+ *   normalizeId(null)    → null
+ */
+function normalizeId(raw) {
+    if (raw === null || raw === undefined || raw === "") return null;
+    const numStr = String(raw).replace(/[^0-9]/g, "");
+    if (!numStr) return null;
+    return parseInt(numStr, 10);
 }
 
-/** Date object → minutes from midnight (local time) */
-function dateToMins(dt) {
-    if (!dt) return null;
-    const d = new Date(dt);
-    return d.getHours() * 60 + d.getMinutes();
+/**
+ * Given a list of raw biometric ID strings from eTimeOffice (e.g. ["0001","0072"]),
+ * build a map: numericInt → Employee document.
+ *
+ * HOW MATCHING WORKS (pure JS, no $toInt MongoDB):
+ *   - eTimeOffice gives us "0072"
+ *   - normalizeId("0072") = 72
+ *   - Employee.biometricId might be "0072" or "72" or "GR072" — all normalise to 72
+ *   - We fetch ALL employees, strip their biometricId in JS, build a map by integer
+ *   - This is safe and never causes MongoDB parse errors
+ *
+ * Returns: { 72: EmployeeDoc, 1: EmployeeDoc, ... }
+ */
+async function buildEmployeeMap(Employee, rawBiometricIds) {
+    // Get all numeric IDs we're looking for
+    const targetNums = new Set(
+        rawBiometricIds.map(normalizeId).filter((n) => n !== null)
+    );
+    if (targetNums.size === 0) return {};
+
+    // Fetch all active employees — we filter in JS
+    // (GRAV has ~100 employees; this is fine; scales to 10k without issue)
+    const employees = await Employee.find(
+        { isActive: true },
+        "biometricId identityId firstName lastName department designation employeeType jobTitle"
+    ).lean();
+
+    const map = {}; // numericId → empDoc
+    for (const emp of employees) {
+        const n = normalizeId(emp.biometricId);
+        if (n !== null && targetNums.has(n)) {
+            map[n] = emp;
+        }
+    }
+    return map;
 }
 
-/** minutes → "HH:MM" */
+/**
+ * Look up a single employee by any form of their ID.
+ * Returns the Employee doc or null.
+ */
+async function findEmployeeByRawId(Employee, rawId) {
+    const target = normalizeId(rawId);
+    if (target === null) return null;
+    const employees = await Employee.find(
+        { isActive: true },
+        "biometricId identityId firstName lastName department designation employeeType"
+    ).lean();
+    return employees.find((e) => normalizeId(e.biometricId) === target) || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TIME HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
 function minsToHHMM(mins) {
-    if (mins === null || mins === undefined || isNaN(mins)) return "00:00";
-    const abs = Math.abs(Math.round(mins));
-    const h = Math.floor(abs / 60);
-    const m = abs % 60;
+    if (!mins || mins <= 0) return "00:00";
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-/** "YYYY-MM-DD" + "HH:MM" → Date */
-function combineDateTime(dateStr, timeStr) {
-    if (!dateStr || !timeStr || timeStr === "--:--") return null;
-    const t = timeStr.length === 5 ? timeStr : timeStr.substring(0, 5);
-    return new Date(`${dateStr}T${t}:00`);
+function hhmmToMins(str) {
+    if (!str || str === "--:--") return 0;
+    const [h, m] = String(str).split(":").map(Number);
+    return (isNaN(h) ? 0 : h * 60) + (isNaN(m) ? 0 : m);
 }
 
-/** Parse date string from eTimeOffice (DD/MM/YYYY HH:MM:SS or MM/DD/YYYY) → "YYYY-MM-DD" */
-function parseEtimeDateStr(raw) {
-    if (!raw) return null;
-    // Try ISO first
-    if (raw.includes("T") || raw.match(/^\d{4}-\d{2}-\d{2}/)) {
-        return raw.split("T")[0];
-    }
-    // DD/MM/YYYY HH:MM:SS  (eTimeOffice format)
-    const parts = raw.split(" ")[0].split("/");
-    if (parts.length === 3) {
-        if (parts[2].length === 4) {
-            // Could be DD/MM/YYYY or MM/DD/YYYY
-            // eTimeOffice typically uses DD/MM/YYYY in PunchDate field
-            // but the FromDate/ToDate params and DateString field use MM/DD/YYYY
-            // We detect: if parts[0] > 12 → it's DD
-            const a = parseInt(parts[0], 10);
-            const b = parseInt(parts[1], 10);
-            const y = parts[2];
-            if (a > 12) {
-                return `${y}-${String(b).padStart(2, "0")}-${String(a).padStart(2, "0")}`;
-            }
-            // Assume MM/DD/YYYY (DateString field)
-            return `${y}-${String(a).padStart(2, "0")}-${String(b).padStart(2, "0")}`;
-        }
-    }
-    return null;
+// Date → minutes from midnight, UTC
+function dateToMins(d) {
+    if (!d) return 0;
+    const dt = d instanceof Date ? d : new Date(d);
+    if (isNaN(dt.getTime())) return 0;
+    return dt.getUTCHours() * 60 + dt.getUTCMinutes();
 }
 
-// ── Punch categorisation using mcid ──────────────────────────────────────────
+function fmtTime(dt) {
+    if (!dt) return "--:--";
+    const d = new Date(dt);
+    if (isNaN(d.getTime())) return "--:--";
+    return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PUNCH ROLE ASSIGNMENT
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MCID_ROLE_MAP = {
+    1: "in",
+    2: "out",
+    3: "lunch_out",
+    4: "lunch_in",
+    5: "tea_out",
+    6: "tea_in",
+};
+
+const SEQ_OPERATOR = ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out"];
+const SEQ_EXECUTIVE = ["in", "out"];
 
 /**
- * eTimeOffice mcid values:
- *   1 = In (shift start)
- *   2 = Out (final out)
- *   3 = Break Out (lunch out)
- *   4 = Break In  (lunch in)
- *   null/other → sequential fallback
+ * Sort punches by time, assign punchType roles.
+ * Uses mcid if available, else sequential by employeeType.
  */
-function categorizePunchesByMcid(sortedPunches) {
-    const result = {
-        inTime: null, lunchOut: null, lunchIn: null,
-        teaOut: null, teaIn: null, finalOut: null,
-    };
-
-    if (!sortedPunches || sortedPunches.length === 0) return result;
-
-    const hasMcid = sortedPunches.some(p => p.mcid !== null && p.mcid !== undefined);
-
-    if (hasMcid) {
-        // Group by mcid — if multiple punches with same mcid, take earliest for "in" types, latest for "out" types
-        const byMcid = {};
-        for (const p of sortedPunches) {
-            if (!byMcid[p.mcid]) byMcid[p.mcid] = [];
-            byMcid[p.mcid].push(p.time);
-        }
-        result.inTime = byMcid[1]?.[0] || null;                        // first in
-        result.finalOut = byMcid[2]?.[byMcid[2]?.length - 1] || null;    // last out
-        result.lunchOut = byMcid[3]?.[0] || null;
-        result.lunchIn = byMcid[4]?.[byMcid[4]?.length - 1] || null;
-    } else {
-        // Sequential: 1=in, 2=lunchOut, 3=lunchIn, 4=teaOut, 5=teaIn, 6=finalOut
-        const times = sortedPunches.map(p => p.time || p);
-        if (times.length === 1) {
-            result.inTime = times[0];
-        } else if (times.length === 2) {
-            result.inTime = times[0];
-            result.finalOut = times[1];
-        } else {
-            result.inTime = times[0];
-            result.lunchOut = times[1] || null;
-            result.lunchIn = times[2] || null;
-            result.teaOut = times[3] || null;
-            result.teaIn = times[4] || null;
-            result.finalOut = times[5] || null;
-        }
-    }
-    return result;
-}
-
-// ── Main day-metrics calculator ───────────────────────────────────────────────
-
-/**
- * Calculate all attendance metrics for one employee-day.
- * @param {object} params
- */
-function calculateDayMetrics(params) {
-    const {
-        dateStr,
-        inTime,         // Date | null
-        lunchOut,       // Date | null
-        lunchIn,        // Date | null
-        teaOut,         // Date | null
-        teaIn,          // Date | null
-        finalOut,       // Date | null
-        punchCount = 0,
-        isWeeklyOff = false,
-        isHoliday = false,
-        isOnLeave = false,
-        etimeWorkTime,  // "HH:MM" from API — use as truth if available
-        etimeOT,        // "HH:MM" from API
-        etimeRemark,    // "MIS-LT", "P/2", etc.
-        etimeStatus,    // "P", "A", "P/2", etc.
-        settings = {},
-    } = params;
-
-    const shiftStartMins = timeToMins(settings.shiftStart || "09:00");
-    const shiftEndMins = timeToMins(settings.shiftEnd || "18:30");
-    const lateThreshold = settings.lateThresholdMinutes ?? 15;
-    const halfDayThreshold = settings.halfDayThresholdMinutes ?? 270; // 4.5h
-    const earlyDeptThresh = settings.earlyDepartureThresholdMinutes ?? 30;
-    const otGrace = settings.otGracePeriodMins ?? 30;
-    const stdLunchBreak = settings.lunchBreakMins ?? 45;
-    const stdTeaBreak = settings.teaBreakMins ?? 15;
-
-    const zero = {
-        status: "AB", totalSpanMins: 0, lunchBreakMins: 0, teaBreakMins: 0,
-        totalBreakMins: 0, netWorkMins: 0, otMins: 0, lateMins: 0,
-        earlyDepartureMins: 0, isLate: false, isEarlyDeparture: false,
-        hasOT: false, hasMissPunch: false,
-    };
-
-    if (isHoliday) return { ...zero, status: "PH" };
-    if (isOnLeave) return { ...zero, status: "L" };
-    if (isWeeklyOff && punchCount === 0) return { ...zero, status: "WO" };
-
-    if (punchCount === 0) return zero; // AB
-
-    // ── At least 1 punch ────────────────────────────────────────────────────────
-    const hasMissPunch = !finalOut; // no final out = incomplete
-
-    // ── Break calculation ───────────────────────────────────────────────────────
-    let lunchBreakMins = 0;
-    let teaBreakMins = 0;
-
-    if (lunchOut && lunchIn) {
-        lunchBreakMins = Math.max(0, Math.round((new Date(lunchIn) - new Date(lunchOut)) / 60000));
-    }
-    if (teaOut && teaIn) {
-        teaBreakMins = Math.max(0, Math.round((new Date(teaIn) - new Date(teaOut)) / 60000));
-    }
-
-    // If no explicit breaks but we have in+out, apply standard breaks based on span
-    if (inTime && finalOut && lunchBreakMins === 0) {
-        const span = Math.round((new Date(finalOut) - new Date(inTime)) / 60000);
-        if (span >= 300) lunchBreakMins = stdLunchBreak; // >= 5h → apply lunch
-        if (span >= 360 && teaBreakMins === 0) teaBreakMins = stdTeaBreak; // >= 6h → apply tea
-    }
-
-    const totalBreakMins = lunchBreakMins + teaBreakMins;
-
-    // ── Work time ───────────────────────────────────────────────────────────────
-    let totalSpanMins = 0;
-    let netWorkMins = 0;
-    let otMins = 0;
-
-    if (inTime && finalOut) {
-        totalSpanMins = Math.round((new Date(finalOut) - new Date(inTime)) / 60000);
-        netWorkMins = Math.max(0, totalSpanMins - totalBreakMins);
-
-        // If API provided work time, use it as authoritative (more accurate)
-        if (etimeWorkTime && etimeWorkTime !== "00:00" && etimeWorkTime !== "--:--") {
-            const apiWorkMins = timeToMins(etimeWorkTime);
-            if (apiWorkMins && apiWorkMins > 0) netWorkMins = apiWorkMins;
-        }
-
-        // OT: after shiftEnd + grace
-        const outMins = dateToMins(finalOut);
-        const otStartAt = shiftEndMins + otGrace;
-        if (outMins > otStartAt) {
-            otMins = outMins - otStartAt;
-        }
-
-        // If API provided OT, prefer it
-        if (etimeOT && etimeOT !== "00:00" && etimeOT !== "--:--") {
-            const apiOtMins = timeToMins(etimeOT);
-            if (apiOtMins !== null) otMins = apiOtMins;
-        }
-    }
-
-    // ── Late / Early ────────────────────────────────────────────────────────────
-    const inMins = inTime ? dateToMins(inTime) : null;
-    const outMins2 = finalOut ? dateToMins(finalOut) : null;
-
-    let lateMins = 0;
-    let earlyDepartureMins = 0;
-    let isLate = false;
-    let isEarlyDeparture = false;
-
-    // Use API Late_In if available
-    if (params.etimeLateIn && params.etimeLateIn !== "00:00") {
-        lateMins = timeToMins(params.etimeLateIn) || 0;
-        isLate = lateMins > 0;
-    } else if (inMins !== null) {
-        const rawLate = inMins - shiftStartMins;
-        if (rawLate > lateThreshold) { lateMins = rawLate; isLate = true; }
-    }
-
-    if (outMins2 !== null && finalOut) {
-        const rawEarly = shiftEndMins - outMins2;
-        if (rawEarly > earlyDeptThresh) { earlyDepartureMins = rawEarly; isEarlyDeparture = true; }
-    }
-
-    // Use API Erl_Out if available
-    if (params.etimeErlOut && params.etimeErlOut !== "00:00") {
-        const apiEarly = timeToMins(params.etimeErlOut) || 0;
-        if (apiEarly > 0) { earlyDepartureMins = apiEarly; isEarlyDeparture = true; }
-    }
-
-    const hasOT = otMins > 0;
-
-    // ── Status derivation ───────────────────────────────────────────────────────
-    let status;
-
-    if (isWeeklyOff) {
-        // Came in on weekly off (overtime scenario)
-        status = inTime ? "WO" : "WO";
-    } else if (!inTime) {
-        status = "AB";
-    } else if (!finalOut) {
-        // Has in but no out — mark as MP (miss punch), not absent
-        status = "MP";
-    } else {
-        // Use eTimeOffice status hint
-        const etStat = (etimeStatus || "").toUpperCase().trim();
-        const etRem = (etimeRemark || "").toUpperCase().trim();
-
-        // P/2 from device = half day
-        if (etStat === "P/2" || etRem.includes("P/2")) {
-            status = "HD";
-        } else if (netWorkMins < halfDayThreshold && netWorkMins > 0) {
-            status = "HD";
-        } else if (netWorkMins >= halfDayThreshold) {
-            if (isLate && isEarlyDeparture) status = "P*"; // late takes precedence
-            else if (isLate) status = "P*";
-            else if (isEarlyDeparture) status = "P~";
-            else status = "P";
-        } else {
-            status = "AB";
-        }
-    }
-
-    return {
-        status,
-        totalSpanMins,
-        lunchBreakMins,
-        teaBreakMins,
-        totalBreakMins,
-        netWorkMins,
-        otMins,
-        lateMins,
-        earlyDepartureMins,
-        isLate,
-        isEarlyDeparture,
-        hasOT,
-        hasMissPunch,
-    };
-}
-
-// ── Parse DownloadInOutPunchData response (API 3 — primary) ──────────────────
-
-/**
- * Parse the InOut API response → array of normalized records.
- * Response shape: { InOutPunchData: [{Empcode, INTime, OUTTime, WorkTime, OverTime, Status, DateString, Remark, Erl_Out, Late_In, Name}] }
- */
-function parseInOutResponse(apiData) {
-    if (!apiData) return [];
-    const items = apiData.InOutPunchData || apiData.inOutPunchData || (Array.isArray(apiData) ? apiData : []);
-    const result = [];
-
-    for (const rec of items) {
-        const empCode = String(rec.Empcode || rec.empcode || rec.EmpCode || "").padStart(4, "0");
-        if (!empCode || empCode === "0000") continue;
-
-        const dateStr = parseEtimeDateStr(rec.DateString || rec.dateString || rec.AttDate);
-        if (!dateStr) continue;
-
-        const inTimeStr = (rec.INTime || rec.InTime || "").trim();
-        const outTimeStr = (rec.OUTTime || rec.OutTime || "").trim();
-
-        const inTime = (inTimeStr && inTimeStr !== "--:--") ? combineDateTime(dateStr, inTimeStr) : null;
-        const finalOut = (outTimeStr && outTimeStr !== "--:--") ? combineDateTime(dateStr, outTimeStr) : null;
-
-        result.push({
-            biometricId: empCode,
-            dateStr,
-            name: rec.Name || rec.name || "",
-            inTime,
-            finalOut,
-            workTime: rec.WorkTime || rec.workTime || "00:00",
-            overTime: rec.OverTime || rec.overTime || "00:00",
-            etimeStatus: rec.Status || rec.status || "",
-            etimeRemark: rec.Remark || rec.remark || "",
-            etimeLateIn: rec.Late_In || rec.late_in || "00:00",
-            etimeErlOut: rec.Erl_Out || rec.erl_out || "00:00",
-            punchCount: (inTime ? 1 : 0) + (finalOut ? 1 : 0),
-            rawPunches: [],
-        });
-    }
-    return result;
-}
-
-/**
- * Parse DownloadPunchData / DownloadPunchDataMCID (API 1 / API 2) response.
- * Merges individual punches into per-employee-per-day records.
- * Response: { PunchData: [{Name, Empcode, PunchDate, M_Flag, mcid, ID}] }
- */
-function parsePunchDataResponse(apiData) {
-    if (!apiData) return {};
-    const items = apiData.PunchData || apiData.punchData || (Array.isArray(apiData) ? apiData : []);
-    const grouped = {}; // key: "empCode_dateStr"
-
-    for (const rec of items) {
-        const empCode = String(rec.Empcode || rec.empcode || rec.EmpCode || "").padStart(4, "0");
-        if (!empCode || empCode === "0000") continue;
-
-        const rawDate = rec.PunchDate || rec.punchDate || rec.AttDate;
-        const dateStr = parseEtimeDateStr(rawDate);
-        if (!dateStr) continue;
-
-        const key = `${empCode}_${dateStr}`;
-        if (!grouped[key]) {
-            grouped[key] = { biometricId: empCode, dateStr, name: rec.Name || "", punches: [] };
-        }
-
-        // Parse the punch time
-        let punchTime = null;
-        if (rawDate && rawDate.includes(" ")) {
-            punchTime = new Date(rawDate.replace(/(\d{2})\/(\d{2})\/(\d{4}) /, "$3-$2-$1T"));
-            if (isNaN(punchTime)) {
-                // Try MM/DD/YYYY format
-                punchTime = new Date(rawDate);
-            }
-        } else if (rawDate && rawDate.includes("T")) {
-            punchTime = new Date(rawDate);
-        }
-
-        if (punchTime && !isNaN(punchTime)) {
-            grouped[key].punches.push({
-                time: punchTime,
-                mcid: rec.mcid !== undefined ? parseInt(rec.mcid, 10) : null,
-                mFlag: rec.M_Flag || rec.m_flag || null,
-                id: rec.ID || rec.id || null,
-            });
-        }
-    }
-
-    // Sort each employee's punches by time
-    for (const key of Object.keys(grouped)) {
-        grouped[key].punches.sort((a, b) => a.time - b.time);
-    }
-    return grouped;
-}
-
-// ── Build final DailyAttendance record ───────────────────────────────────────
-
-/**
- * Build a complete DailyAttendance document from parsed API data.
- * Prefers InOut API data, enriches with individual punch data when available.
- */
-function buildAttendanceRecord(inOutRecord, punchData, employeeDoc, settings, holidays = []) {
-    const { dateStr } = inOutRecord;
-
-    const holiday = holidays.find(h => h.date === dateStr);
-    const isHoliday = !!holiday;
-
-    const dow = new Date(dateStr + "T00:00:00").getDay();
-    const workingDays = settings.workingDays || [1, 2, 3, 4, 5, 6];
-    const isWeeklyOff = !workingDays.includes(dow);
-
-    // Try to get detailed punches from punch API (API2)
-    let inTime = inOutRecord.inTime;
-    let finalOut = inOutRecord.finalOut;
-    let lunchOut = null, lunchIn = null, teaOut = null, teaIn = null;
-    let punchCount = inOutRecord.punchCount;
-    let rawPunches = [];
-
-    if (punchData && punchData.punches && punchData.punches.length > 0) {
-        const punches = punchData.punches;
-        punchCount = punches.length;
-        const cats = categorizePunchesByMcid(punches);
-        inTime = cats.inTime || inTime;
-        lunchOut = cats.lunchOut;
-        lunchIn = cats.lunchIn;
-        teaOut = cats.teaOut;
-        teaIn = cats.teaIn;
-        finalOut = cats.finalOut || finalOut;
-
-        rawPunches = punches.map((p, i) => ({
-            seq: i + 1,
-            time: p.time,
-            mcid: p.mcid,
-            mFlag: p.mFlag,
-            punchType: mcidToPunchType(p.mcid, i, punches.length),
-            source: "device",
-        }));
-    } else if (inTime || finalOut) {
-        // Only InOut data available
-        if (inTime) rawPunches.push({ seq: 1, time: inTime, punchType: "in", source: "device" });
-        if (finalOut) rawPunches.push({ seq: 2, time: finalOut, punchType: "out", source: "device" });
-    }
-
-    const metrics = calculateDayMetrics({
-        dateStr,
-        inTime,
-        lunchOut,
-        lunchIn,
-        teaOut,
-        teaIn,
-        finalOut,
-        punchCount,
-        isWeeklyOff,
-        isHoliday,
-        isOnLeave: false,
-        etimeWorkTime: inOutRecord.workTime,
-        etimeOT: inOutRecord.overTime,
-        etimeRemark: inOutRecord.etimeRemark,
-        etimeStatus: inOutRecord.etimeStatus,
-        etimeLateIn: inOutRecord.etimeLateIn,
-        etimeErlOut: inOutRecord.etimeErlOut,
-        settings,
+function assignPunchRoles(rawPunches, employeeType = "operator") {
+    if (!rawPunches || rawPunches.length === 0) return [];
+    const sorted = [...rawPunches].sort((a, b) => {
+        const ta = new Date(a.time || a.punchTime || 0).getTime();
+        const tb = new Date(b.time || b.punchTime || 0).getTime();
+        return ta - tb;
     });
 
-    const name = employeeDoc
-        ? `${employeeDoc.firstName || ""} ${employeeDoc.lastName || ""}`.trim()
-        : (inOutRecord.name || punchData?.name || "");
-
-    return {
-        biometricId: inOutRecord.biometricId,
-        employeeDbId: employeeDoc?._id || null,
-        employeeName: name,
-        department: employeeDoc?.department || "—",
-        designation: employeeDoc?.designation || "—",
-        date: new Date(dateStr + "T00:00:00"),
-        dateStr,
-        yearMonth: dateStr.substring(0, 7),
-        shiftName: "GEN",
-        shiftStart: settings.shiftStart || "09:00",
-        shiftEnd: settings.shiftEnd || "18:30",
-        punchCount,
-        rawPunches,
-        inTime,
-        lunchOut,
-        lunchIn,
-        teaOut,
-        teaIn,
-        finalOut,
-        ...metrics,
-        isWeeklyOff,
-        isHoliday,
-        holidayName: holiday?.name || null,
-        holidayType: holiday?.type || null,
-        isOnLeave: false,
-        leaveType: null,
-        etimeRemark: inOutRecord.etimeRemark || "",
-        etimeStatus: inOutRecord.etimeStatus || "",
-        syncedAt: new Date(),
-        syncSource: "api",
-    };
+    const hasMcid = sorted.some((p) => p.mcid != null);
+    if (hasMcid) {
+        sorted.forEach((p) => { p.punchType = MCID_ROLE_MAP[p.mcid] || "unknown"; });
+    } else {
+        const seq = employeeType === "executive" ? SEQ_EXECUTIVE : SEQ_OPERATOR;
+        sorted.forEach((p, i) => { p.punchType = seq[i] || "unknown"; });
+    }
+    return sorted;
 }
 
-function mcidToPunchType(mcid, idx, total) {
-    const mcidMap = { 1: "in", 2: "out", 3: "lunch_out", 4: "lunch_in", 5: "tea_out", 6: "tea_in" };
-    if (mcid && mcidMap[mcid]) return mcidMap[mcid];
-    const seqMap = ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out"];
-    if (total === 2) return idx === 0 ? "in" : "out";
-    return seqMap[idx] || "unknown";
-}
+// ─────────────────────────────────────────────────────────────────────────────
+//  CORE DAY COMPUTATION
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ── Build absent/WO/PH placeholder records ───────────────────────────────────
-
-function buildPlaceholderRecord(biometricId, employeeDoc, dateStr, settings, holidays) {
-    const holiday = holidays.find(h => h.date === dateStr);
-    const isHoliday = !!holiday;
-    const dow = new Date(dateStr + "T00:00:00").getDay();
+/**
+ * Fill all computed fields on a record object from its rawPunches.
+ * Mutates and returns the record.
+ *
+ * Sets systemPrediction — never touches hrFinalStatus.
+ */
+function computeDay(record, settings, employeeType, holidays = []) {
+    const type = employeeType || record.employeeType || "operator";
+    const holidayDates = new Set((holidays || []).map((h) => h.date));
     const workingDays = settings.workingDays || [1, 2, 3, 4, 5, 6];
-    const isWeeklyOff = !workingDays.includes(dow);
-    const status = isHoliday ? "PH" : isWeeklyOff ? "WO" : "AB";
-    const name = employeeDoc
-        ? `${employeeDoc.firstName || ""} ${employeeDoc.lastName || ""}`.trim()
-        : "";
+    const dateStr = record.dateStr;
 
-    return {
-        biometricId,
-        employeeDbId: employeeDoc?._id || null,
-        employeeName: name,
-        department: employeeDoc?.department || "—",
-        designation: employeeDoc?.designation || "—",
-        date: new Date(dateStr + "T00:00:00"),
+    if (!dateStr) return record;
+
+    const dow = new Date(dateStr + "T00:00:00Z").getUTCDay();
+
+    // ── Special flags (short-circuit) ────────────────────────────────────
+    if (!workingDays.includes(dow) && !record.isOnLeave) {
+        record.isWeeklyOff = true;
+        record.systemPrediction = "WO";
+        return record;
+    }
+    if (holidayDates.has(dateStr) && !record.isOnLeave) {
+        record.isHoliday = true;
+        const h = (holidays || []).find((x) => x.date === dateStr);
+        record.holidayName = h?.name || null;
+        record.holidayType = h?.type || null;
+        record.systemPrediction = "PH";
+        return record;
+    }
+    if (record.isOnLeave) {
+        const lt = (record.leaveType || "").toUpperCase();
+        record.systemPrediction = ["CL", "SL", "EL", "LWP", "CO"].includes(lt)
+            ? `L-${lt}` : "L-CL";
+        return record;
+    }
+
+    // ── Assign punch roles ───────────────────────────────────────────────
+    record.rawPunches = assignPunchRoles(record.rawPunches || [], type);
+    record.punchCount = record.rawPunches.length;
+
+    const byType = (t) => record.rawPunches.find((p) => p.punchType === t);
+    const getTime = (p) => p?.time || p?.punchTime || null;
+
+    const p_in = byType("in");
+    const p_lo = byType("lunch_out");
+    const p_li = byType("lunch_in");
+    const p_to = byType("tea_out");
+    const p_ti = byType("tea_in");
+    const p_out = byType("out");
+
+    record.inTime = getTime(p_in) || null;
+    record.finalOut = getTime(p_out) || null;
+
+    if (type === "operator") {
+        record.lunchOut = getTime(p_lo) || null;
+        record.lunchIn = getTime(p_li) || null;
+        record.teaOut = getTime(p_to) || null;
+        record.teaIn = getTime(p_ti) || null;
+    } else {
+        record.lunchOut = null; record.lunchIn = null;
+        record.teaOut = null; record.teaIn = null;
+    }
+
+    if (!record.inTime) { record.systemPrediction = "AB"; return record; }
+    if (!record.finalOut) {
+        record.hasMissPunch = true;
+        record.systemPrediction = "MP";
+        return record;
+    }
+
+    // ── Breaks (operators only) ──────────────────────────────────────────
+    let lunchMins = 0, teaMins = 0;
+    if (type === "operator") {
+        if (record.lunchOut && record.lunchIn) {
+            const diff = Math.round((new Date(record.lunchIn) - new Date(record.lunchOut)) / 60000);
+            if (diff > 0) lunchMins = diff;
+        }
+        if (record.teaOut && record.teaIn) {
+            const diff = Math.round((new Date(record.teaIn) - new Date(record.teaOut)) / 60000);
+            if (diff > 0) teaMins = diff;
+        }
+    }
+    record.lunchBreakMins = lunchMins;
+    record.teaBreakMins = teaMins;
+    record.totalBreakMins = lunchMins + teaMins;
+
+    // ── Span & net work ──────────────────────────────────────────────────
+    const spanMins = Math.max(
+        0,
+        Math.round((new Date(record.finalOut) - new Date(record.inTime)) / 60000)
+    );
+    record.totalSpanMins = spanMins;
+    record.netWorkMins = Math.max(0, spanMins - record.totalBreakMins);
+
+    // ── Late ─────────────────────────────────────────────────────────────
+    const shiftStartMins = hhmmToMins(settings.shiftStart || "09:00");
+    const lateThresh = settings.lateThresholdMinutes ?? 15;
+    const inMins = dateToMins(record.inTime);
+    const rawLate = inMins - shiftStartMins;
+    record.isLate = rawLate > lateThresh;
+    record.lateMins = record.isLate ? rawLate : 0;
+
+    // ── Early departure ──────────────────────────────────────────────────
+    const shiftEndMins = hhmmToMins(settings.shiftEnd || "18:30");
+    const earlyThresh = settings.earlyDepartureThresholdMinutes ?? 30;
+    const outMins = dateToMins(record.finalOut);
+    const rawEarly = shiftEndMins - outMins;
+    record.isEarlyDeparture = rawEarly > earlyThresh;
+    record.earlyDepartureMins = record.isEarlyDeparture ? Math.max(0, rawEarly) : 0;
+
+    // ── OT (operators only) ──────────────────────────────────────────────
+    if (type === "operator" && settings.overtimeEnabled !== false) {
+        const grace = settings.otGracePeriodMins ?? 30;
+        const minOT = settings.overtimeMinimumMinutes ?? 0;
+        const otStart = shiftEndMins + grace;
+        record.otMins = Math.max(0, outMins - otStart);
+        record.hasOT = record.otMins > minOT;
+    } else {
+        record.otMins = 0;
+        record.hasOT = false;
+    }
+
+    // ── Miss punch check for operators ───────────────────────────────────
+    if (type === "operator") {
+        const required = new Set(["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out"]);
+        const present = new Set(record.rawPunches.map((p) => p.punchType));
+        if ([...required].some((r) => !present.has(r))) {
+            record.hasMissPunch = true;
+        }
+    }
+
+    // ── Derive systemPrediction ──────────────────────────────────────────
+    const halfDayThresh = settings.halfDayThresholdMinutes ?? 270;
+    if (record.netWorkMins < halfDayThresh) {
+        record.systemPrediction = "HD";
+    } else if (record.isEarlyDeparture) {
+        record.systemPrediction = "P~";
+    } else if (record.isLate) {
+        record.systemPrediction = "P*";
+    } else {
+        record.systemPrediction = "P";
+    }
+
+    return record;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MONTH SUMMARY
+// ─────────────────────────────────────────────────────────────────────────────
+
+function computeMonthSummary(dayRecords) {
+    const s = {
+        present: 0, late: 0, earlyOut: 0, halfDay: 0,
+        absent: 0, weeklyOff: 0, holiday: 0, onLeave: 0,
+        missPunch: 0, totalOTMins: 0, totalNetWorkMins: 0, netWorkDays: 0,
+    };
+    for (const d of dayRecords) {
+        const st = d.hrFinalStatus ?? d.systemPrediction ?? d.status;
+        switch (st) {
+            case "P": s.present++; break;
+            case "P*": s.present++; s.late++; break;
+            case "P~": s.present++; s.earlyOut++; break;
+            case "HD": s.halfDay++; break;
+            case "AB": s.absent++; break;
+            case "WO": s.weeklyOff++; break;
+            case "PH": s.holiday++; break;
+            case "L-CL": case "L-SL": case "L-EL":
+            case "LWP": case "CO": s.onLeave++; break;
+            case "MP": s.missPunch++; s.present++; break;
+        }
+        s.totalOTMins += d.otMins || 0;
+        s.totalNetWorkMins += d.netWorkMins || 0;
+    }
+    s.netWorkDays = s.present + s.halfDay * 0.5;
+    return s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  RECORD BUILDERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a full attendance record object ready for DB upsert.
+ * empDoc comes from buildEmployeeMap() — may be null for unknown employees.
+ * Department is ALWAYS from the Employee record, not from eTimeOffice.
+ */
+function buildAttendanceRecord(inOutRec, punchDetail, empDoc, settings, holidays) {
+    const dateStr = inOutRec.dateStr;
+    const yearMonth = dateStr ? dateStr.substring(0, 7) : "";
+    const dateObj = new Date(dateStr + "T00:00:00Z");
+    const type = empDoc?.employeeType || "operator";
+    const numericId = normalizeId(inOutRec.biometricId);
+    const identityId = empDoc?.identityId || "";
+
+    // Build employee name from Employee record; fall back to eTimeOffice name
+    const empName = empDoc
+        ? `${empDoc.firstName || ""} ${empDoc.lastName || ""}`.trim()
+        : inOutRec.name || "";
+
+    // Department ALWAYS from Employee record — eTimeOffice doesn't supply it
+    const department = empDoc?.department || "—";
+    const designation = empDoc?.designation || empDoc?.jobTitle || "—";
+
+    // Build rawPunches — prefer MCID detail API, fallback to InOut summary
+    let rawPunches = [];
+    if (punchDetail?.punches?.length) {
+        rawPunches = punchDetail.punches.map((p, i) => ({
+            seq: i + 1,
+            time: p.time || p.punchTime,
+            mcid: p.mcid ?? null,
+            mFlag: p.mFlag || null,
+            punchType: "unknown",
+            source: "device",
+        }));
+    } else {
+        if (inOutRec.inTime) rawPunches.push({ seq: 1, time: inOutRec.inTime, mcid: 1, punchType: "in", source: "device" });
+        if (inOutRec.finalOut) rawPunches.push({ seq: 2, time: inOutRec.finalOut, mcid: 2, punchType: "out", source: "device" });
+    }
+
+    const record = {
+        biometricId: inOutRec.biometricId,
+        numericId,
+        identityId,
+        employeeDbId: empDoc?._id || null,
+        employeeName: empName,
+        department,
+        designation,
+        employeeType: type,
+        date: dateObj,
         dateStr,
-        yearMonth: dateStr.substring(0, 7),
-        shiftName: "GEN",
+        yearMonth,
+        shiftName: settings.shiftName || "GEN",
         shiftStart: settings.shiftStart || "09:00",
         shiftEnd: settings.shiftEnd || "18:30",
-        punchCount: 0,
-        rawPunches: [],
-        inTime: null,
-        lunchOut: null,
-        lunchIn: null,
-        teaOut: null,
-        teaIn: null,
-        finalOut: null,
-        status,
-        isWeeklyOff,
-        isHoliday,
-        holidayName: holiday?.name || null,
-        holidayType: holiday?.type || null,
-        isOnLeave: false,
-        leaveType: null,
-        netWorkMins: 0, totalSpanMins: 0, lunchBreakMins: 0, teaBreakMins: 0,
-        totalBreakMins: 0, otMins: 0, lateMins: 0, earlyDepartureMins: 0,
-        isLate: false, isEarlyDeparture: false, hasOT: false, hasMissPunch: false,
+        rawPunches,
+        punchCount: rawPunches.length,
+        // initialise all computed fields
+        lunchBreakMins: 0, teaBreakMins: 0, totalBreakMins: 0,
+        totalSpanMins: 0, netWorkMins: 0, otMins: 0,
+        isLate: false, lateMins: 0,
+        isEarlyDeparture: false, earlyDepartureMins: 0,
+        hasOT: false, hasMissPunch: false,
+        isWeeklyOff: false, isHoliday: false,
+        holidayName: null, holidayType: null,
+        isOnLeave: false, leaveType: null,
+        systemPrediction: "AB",
+        hrFinalStatus: null,   // HR has not reviewed yet
+        etimeRemark: inOutRec.etimeRemark || "",
+        etimeStatus: inOutRec.etimeStatus || "",
         syncedAt: new Date(),
         syncSource: "api",
     };
+
+    computeDay(record, settings, type, holidays);
+    return record;
 }
 
+/**
+ * Build a placeholder record (AB / WO / PH) for days with no punch from device.
+ */
+function buildPlaceholderRecord(biometricId, empDoc, dateStr, settings, holidays) {
+    const numericId = normalizeId(biometricId);
+    const yearMonth = dateStr ? dateStr.substring(0, 7) : "";
+    const type = empDoc?.employeeType || "operator";
+    const identityId = empDoc?.identityId || "";
+    const empName = empDoc ? `${empDoc.firstName || ""} ${empDoc.lastName || ""}`.trim() : "";
+
+    const record = {
+        biometricId,
+        numericId,
+        identityId,
+        employeeDbId: empDoc?._id || null,
+        employeeName: empName,
+        department: empDoc?.department || "—",
+        designation: empDoc?.designation || "—",
+        employeeType: type,
+        date: new Date(dateStr + "T00:00:00Z"),
+        dateStr,
+        yearMonth,
+        shiftStart: settings.shiftStart || "09:00",
+        shiftEnd: settings.shiftEnd || "18:30",
+        rawPunches: [],
+        punchCount: 0,
+        isWeeklyOff: false, isHoliday: false,
+        holidayName: null, holidayType: null,
+        isOnLeave: false,
+        systemPrediction: "AB",
+        hrFinalStatus: null,
+        syncedAt: new Date(),
+        syncSource: "api",
+    };
+
+    computeDay(record, settings, type, holidays);
+    return record;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ETIMEOFFICE RESPONSE PARSERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseInOutResponse(raw) {
+    if (!raw) return [];
+    const arr = raw.InOutPunchData || raw.Data || (Array.isArray(raw) ? raw : []);
+    if (!Array.isArray(arr) || !arr.length) return [];
+
+    return arr.map((item) => {
+        const biometricId = String(
+            item.Empcode || item.EmpCode || item.empCode || ""
+        ).trim();
+        const dateRaw = item.AttDate || item.Date || item.date || "";
+        let dateStr = "";
+
+        if (dateRaw.includes("/")) {
+            const parts = dateRaw.split("/");
+            if (parts.length === 3) {
+                if (parts[0].length === 4) {
+                    // YYYY/MM/DD
+                    dateStr = `${parts[0]}-${parts[1].padStart(2, "0")}-${parts[2].padStart(2, "0")}`;
+                } else {
+                    // MM/DD/YYYY
+                    dateStr = `${parts[2]}-${parts[0].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
+                }
+            }
+        } else if (dateRaw.includes("-")) {
+            dateStr = dateRaw.split("T")[0];
+        }
+
+        const parseTime = (ts) => {
+            if (!ts || ts === "--:--" || ts === "00:00") return null;
+            try {
+                const clean = String(ts).trim().padStart(5, "0");
+                return new Date(`${dateStr}T${clean}:00Z`);
+            } catch { return null; }
+        };
+
+        return {
+            biometricId,
+            name: item.Name || item.name || "",
+            dateStr,
+            inTime: parseTime(item.INTime || item.InTime || item.inTime),
+            finalOut: parseTime(item.OUTTime || item.OutTime || item.outTime),
+            etimeStatus: String(item.Status || item.status || ""),
+            etimeRemark: String(item.Remark || item.remark || ""),
+            department: "", // intentionally blank — we get this from Employee record
+        };
+    }).filter((r) => r.biometricId && r.dateStr);
+}
+
+function parsePunchDataResponse(raw) {
+    if (!raw) return {};
+    const arr = raw.PunchData || raw.Data || (Array.isArray(raw) ? raw : []);
+    if (!Array.isArray(arr) || !arr.length) return {};
+
+    const map = {};
+    for (const item of arr) {
+        const biometricId = String(
+            item.Empcode || item.EmpCode || item.empCode || ""
+        ).trim();
+        if (!biometricId) continue;
+
+        const rawDt = item.PunchDate || item.AttDate || item.Date || "";
+        let dateStr = "";
+        const cleaned = String(rawDt).split("T")[0].split("_")[0];
+        if (cleaned.includes("/")) {
+            const parts = cleaned.split("/");
+            if (parts.length === 3) {
+                if (parts[0].length === 4) {
+                    dateStr = `${parts[0]}-${parts[1].padStart(2, "0")}-${parts[2].padStart(2, "0")}`;
+                } else {
+                    dateStr = `${parts[2]}-${parts[1].padStart(2, "0")}-${parts[0].padStart(2, "0")}`;
+                }
+            }
+        } else if (cleaned.includes("-")) {
+            dateStr = cleaned;
+        }
+        if (!dateStr) continue;
+
+        const punchTimeRaw = String(item.PunchTime || item.AttTime || item.Time || "").trim();
+        let punchDate = null;
+        try {
+            // Handle formats: "HH:MM" or "HH:MM:SS" or "DD/MM/YYYY_HH:MM"
+            let timePart = punchTimeRaw;
+            if (timePart.includes("_")) timePart = timePart.split("_")[1];
+            if (timePart) {
+                punchDate = new Date(`${dateStr}T${timePart.length <= 5 ? timePart + ":00" : timePart}Z`);
+                if (isNaN(punchDate.getTime())) punchDate = null;
+            }
+        } catch { punchDate = null; }
+
+        const key = `${biometricId}_${dateStr}`;
+        if (!map[key]) map[key] = { biometricId, dateStr, name: item.Name || "", punches: [] };
+        map[key].punches.push({
+            time: punchDate,
+            mcid: item.MCID != null ? parseInt(item.MCID, 10) : null,
+            mFlag: item.MFlag || item.M_Flag || null,
+            source: "device",
+        });
+    }
+
+    for (const k of Object.keys(map)) {
+        map[k].punches.sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
+    }
+    return map;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ENRICH RECORD (add formatted string fields for frontend)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function enrichRecord(r) {
+    const effectiveStatus = r.hrFinalStatus ?? r.systemPrediction ?? r.status ?? "AB";
+    return {
+        ...r,
+        effectiveStatus,
+        inTimeStr: fmtTime(r.inTime),
+        lunchOutStr: fmtTime(r.lunchOut),
+        lunchInStr: fmtTime(r.lunchIn),
+        teaOutStr: fmtTime(r.teaOut),
+        teaInStr: fmtTime(r.teaIn),
+        finalOutStr: fmtTime(r.finalOut),
+        netWorkStr: minsToHHMM(r.netWorkMins),
+        otStr: minsToHHMM(r.otMins),
+        lateStr: minsToHHMM(r.lateMins),
+        earlyStr: minsToHHMM(r.earlyDepartureMins),
+        breakStr: minsToHHMM(r.totalBreakMins),
+        hrReviewed: r.hrFinalStatus !== null && r.hrFinalStatus !== undefined,
+        statusMismatch: r.hrFinalStatus !== null && r.hrFinalStatus !== r.systemPrediction,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 module.exports = {
-    timeToMins,
+    normalizeId,
+    buildEmployeeMap,
+    findEmployeeByRawId,
     minsToHHMM,
-    dateToMins,
-    combineDateTime,
-    parseEtimeDateStr,
-    categorizePunchesByMcid,
-    calculateDayMetrics,
-    parseInOutResponse,
-    parsePunchDataResponse,
+    hhmmToMins,
+    assignPunchRoles,
+    computeDay,
+    computeMonthSummary,
     buildAttendanceRecord,
     buildPlaceholderRecord,
+    parseInOutResponse,
+    parsePunchDataResponse,
+    enrichRecord,
 };
