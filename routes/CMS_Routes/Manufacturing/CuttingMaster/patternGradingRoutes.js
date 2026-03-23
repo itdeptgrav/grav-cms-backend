@@ -289,6 +289,7 @@ router.post(
               id: String(cond.id || ""),
               enabled: Boolean(cond.enabled !== false),
               label: cond.label || "Condition",
+              priority: Math.max(1, Math.min(10, Number(cond.priority) || 5)),
               operator: cond.operator || "greater_than",
               compareGroupId: cond.compareGroupId || null,
               compareValue: Number(cond.compareValue) || 0,
@@ -366,6 +367,9 @@ router.post(
             dc2y: Number(d.dc2y) || 0,
           })),
           ts: kf.ts || new Date().toISOString(),
+          // Preserve auto-mirror metadata so the UI can style/link these KFs correctly
+          _autoMirror: kf._autoMirror === true ? true : undefined,
+          _mirrorOfId: kf._mirrorOfId ? String(kf._mirrorOfId) : undefined,
         }));
       }
 
