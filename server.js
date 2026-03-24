@@ -253,29 +253,6 @@ const createDefaultAccountant = async () => {
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
 
-const CATEGORY_MEASUREMENTS = {
-  Shirts: [
-    "Length",
-    "Chest",
-    "Stomach",
-    "Button Hem",
-    "Shoulder",
-    "Sleeve Length",
-    "Cuff",
-    "Coller",
-  ],
-  Outerwear: ["Length", "Chest", "Stomach", "Button Hem", "Shoulder"],
-  Bottoms: [
-    "Length",
-    "Waist",
-    "Sheet",
-    "Thigh",
-    "Knee",
-    "Buttom",
-    "Crouch Kista Cut",
-  ],
-};
-
 const assignMeasurementsToExistingProducts = async () => {
   try {
     console.log("🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...");
@@ -510,6 +487,11 @@ app.use("/api/vendor", vendorAuthRoutes);
 
 const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js");
 app.use("/api/barcode-devices", barcodeScannerRoutes);
+
+
+
+const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
+app.use('/api/customer/employees/cross-org', crossOrgRoutes);
 
 /* =====================================================================
    INLINE: Barcode Scanner Tracking Routes

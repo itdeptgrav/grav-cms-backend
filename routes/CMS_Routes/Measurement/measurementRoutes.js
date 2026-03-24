@@ -63,7 +63,7 @@ router.get('/organization/:orgId/employees', async (req, res) => {
             .select('_id name uin gender products')
             .populate({
                 path: 'products.productId',
-                select: '_id name reference measurements variants'
+                select: '_id name reference measurements variants category'
             })
             .lean();
 
@@ -78,7 +78,7 @@ router.get('/organization/:orgId/employees', async (req, res) => {
 router.get('/stock-item/:productId', async (req, res) => {
     try {
         const stockItem = await StockItem.findById(req.params.productId)
-            .select('name reference measurements variants')
+            .select('name reference measurements variants category')
             .lean();
 
         if (!stockItem) return res.status(404).json({ success: false, message: 'Product not found' });
@@ -140,14 +140,14 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
     // Batch-fetch all stock items needed
     const stockItemIds = [...new Set((measurementData || []).map(d => d.productId).filter(Boolean))];
     const stockItems = stockItemIds.length
-        ? await StockItem.find({ _id: { $in: stockItemIds } }).select('_id name reference measurements variants').lean()
+        ? await StockItem.find({ _id: { $in: stockItemIds } }).select('_id name reference measurements variants category').lean()
         : [];
     const stockItemMap = new Map(stockItems.map(i => [i._id.toString(), i]));
 
     // Process product-based employees
     for (const data of (measurementData || [])) {
         if (!data.employeeId) continue;
-        const employeeId = data.employeeId.toString();
+        const employeeId = data.em0ployeeId.toString();
 
         if (!employeeMeasurementsMap.has(employeeId)) {
             const employee = await EmployeeMpc.findById(employeeId).select('name uin gender').lean();
