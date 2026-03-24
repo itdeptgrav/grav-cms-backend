@@ -1092,5 +1092,3 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Production sync service is active`);
 });
-
-
