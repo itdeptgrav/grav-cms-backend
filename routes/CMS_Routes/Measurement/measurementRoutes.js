@@ -134,87 +134,130 @@ router.get('/organization/:orgId', async (req, res) => {
 });
 
 // ─── Helper: build employee measurements map from measurementData ─────────────
+// ─── Helper: build employee measurements map from measurementData (OPTIMIZED) ─
 async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
     const employeeMeasurementsMap = new Map();
-
-    // Batch-fetch all stock items needed
+    
+    // ─── Collect all employee IDs ─────────────────────────────────────────────
+    const allEmployeeIds = new Set();
+    
+    if (measurementData?.length) {
+        measurementData.forEach(data => {
+            if (data.employeeId) allEmployeeIds.add(data.employeeId.toString());
+        });
+    }
+    if (categoryData?.length) {
+        categoryData.forEach(catEmp => {
+            if (catEmp.employeeId) allEmployeeIds.add(catEmp.employeeId.toString());
+        });
+    }
+    
+    // ─── OPTIMIZATION: Batch fetch ALL employees at once ──────────────────────
+    const employeesMap = new Map();
+    if (allEmployeeIds.size > 0) {
+        const employees = await EmployeeMpc.find({
+            _id: { $in: Array.from(allEmployeeIds) }
+        }).select('name uin gender').lean();
+        
+        employees.forEach(emp => {
+            employeesMap.set(emp._id.toString(), emp);
+        });
+    }
+    
+    // ─── Batch-fetch all stock items needed ───────────────────────────────────
     const stockItemIds = [...new Set((measurementData || []).map(d => d.productId).filter(Boolean))];
     const stockItems = stockItemIds.length
         ? await StockItem.find({ _id: { $in: stockItemIds } }).select('_id name reference measurements variants category').lean()
         : [];
     const stockItemMap = new Map(stockItems.map(i => [i._id.toString(), i]));
-
-    // Process product-based employees
-    for (const data of (measurementData || [])) {
-        if (!data.employeeId) continue;
-        const employeeId = data.em0ployeeId.toString();
-
-        if (!employeeMeasurementsMap.has(employeeId)) {
-            const employee = await EmployeeMpc.findById(employeeId).select('name uin gender').lean();
-            if (!employee) { console.warn(`Employee ${employeeId} not found`); continue; }
-            employeeMeasurementsMap.set(employeeId, {
-                employeeId: data.employeeId,
-                employeeName: employee.name,
-                employeeUIN: employee.uin,
-                gender: employee.gender,
-                remarks: data.remarks || "",
-                noProductAssigned: false,
-                products: [],
-                categoryMeasurements: []
+    
+    // ─── Process product-based employees ──────────────────────────────────────
+    if (measurementData?.length) {
+        for (const data of measurementData) {
+            if (!data.employeeId) continue;
+            const employeeId = data.employeeId.toString();
+            
+            if (!employeeMeasurementsMap.has(employeeId)) {
+                const employee = employeesMap.get(employeeId);
+                if (!employee) {
+                    console.warn(`Employee ${employeeId} not found`);
+                    continue;
+                }
+                employeeMeasurementsMap.set(employeeId, {
+                    employeeId: data.employeeId,
+                    employeeName: employee.name,
+                    employeeUIN: employee.uin,
+                    gender: employee.gender,
+                    remarks: data.remarks || "",
+                    noProductAssigned: false,
+                    products: [],
+                    categoryMeasurements: []
+                });
+            }
+            
+            const stockItem = stockItemMap.get(data.productId?.toString());
+            if (!stockItem) {
+                console.warn(`Product ${data.productId} not found`);
+                continue;
+            }
+            
+            let variantName = "Default";
+            if (data.variantId && stockItem.variants) {
+                const v = stockItem.variants.find(v => v._id.toString() === data.variantId.toString());
+                if (v?.attributes?.length) variantName = v.attributes.map(a => a.value).join(" • ");
+            }
+            
+            const measurementsArray = Array.isArray(data.measurements)
+                ? data.measurements
+                : Object.entries(data.measurements || {}).map(([measurementName, value]) => ({ 
+                    measurementName, 
+                    value: value || '', 
+                    unit: '' 
+                }));
+            
+            employeeMeasurementsMap.get(employeeId).products.push({
+                productId: data.productId,
+                productName: stockItem.name,
+                variantId: data.variantId || null,
+                variantName,
+                quantity: data.quantity || 1,
+                measurements: measurementsArray,
+                measuredAt: new Date()
             });
         }
-
-        const stockItem = stockItemMap.get(data.productId?.toString());
-        if (!stockItem) { console.warn(`Product ${data.productId} not found`); continue; }
-
-        let variantName = "Default";
-        if (data.variantId && stockItem.variants) {
-            const v = stockItem.variants.find(v => v._id.toString() === data.variantId.toString());
-            if (v?.attributes?.length) variantName = v.attributes.map(a => a.value).join(" • ");
-        }
-
-        const measurementsArray = Array.isArray(data.measurements)
-            ? data.measurements
-            : Object.entries(data.measurements || {}).map(([measurementName, value]) => ({ measurementName, value: value || '', unit: '' }));
-
-        employeeMeasurementsMap.get(employeeId).products.push({
-            productId: data.productId,
-            productName: stockItem.name,
-            variantId: data.variantId || null,
-            variantName,
-            quantity: data.quantity || 1,
-            measurements: measurementsArray,
-            measuredAt: new Date()
-        });
     }
-
-    // Process no-product / category employees
-    for (const catEmp of (categoryData || [])) {
-        if (!catEmp.employeeId) continue;
-        const eid = catEmp.employeeId.toString();
-
-        if (!employeeMeasurementsMap.has(eid)) {
-            const employee = await EmployeeMpc.findById(eid).select('name uin gender').lean();
-            if (!employee) { console.warn(`Employee ${eid} not found`); continue; }
-            employeeMeasurementsMap.set(eid, {
-                employeeId: catEmp.employeeId,
-                employeeName: employee.name,
-                employeeUIN: employee.uin,
-                gender: employee.gender,
-                remarks: catEmp.remarks || "",
-                noProductAssigned: true,
-                products: [],
-                categoryMeasurements: catEmp.categoryMeasurements || []
-            });
-        } else {
-            // Employee exists (maybe has products too), just add category data
-            const emp = employeeMeasurementsMap.get(eid);
-            emp.categoryMeasurements = catEmp.categoryMeasurements || [];
-            emp.noProductAssigned = true;
-            emp.remarks = catEmp.remarks || emp.remarks;
+    
+    // ─── Process no-product / category employees ─────────────────────────────
+    if (categoryData?.length) {
+        for (const catEmp of categoryData) {
+            if (!catEmp.employeeId) continue;
+            const eid = catEmp.employeeId.toString();
+            
+            if (!employeeMeasurementsMap.has(eid)) {
+                const employee = employeesMap.get(eid);
+                if (!employee) {
+                    console.warn(`Employee ${eid} not found`);
+                    continue;
+                }
+                employeeMeasurementsMap.set(eid, {
+                    employeeId: catEmp.employeeId,
+                    employeeName: employee.name,
+                    employeeUIN: employee.uin,
+                    gender: employee.gender,
+                    remarks: catEmp.remarks || "",
+                    noProductAssigned: true,
+                    products: [],
+                    categoryMeasurements: catEmp.categoryMeasurements || []
+                });
+            } else {
+                const emp = employeeMeasurementsMap.get(eid);
+                emp.categoryMeasurements = catEmp.categoryMeasurements || [];
+                emp.noProductAssigned = true;
+                emp.remarks = catEmp.remarks || emp.remarks;
+            }
         }
     }
-
+    
     return employeeMeasurementsMap;
 }
 
@@ -475,7 +518,7 @@ router.put('/:measurementId', async (req, res) => {
     }
 });
 
-// ADD NEW EMPLOYEES to existing measurement
+// ADD NEW EMPLOYEES to existing measurement (OPTIMIZED)
 router.put('/:measurementId/add-employees', async (req, res) => {
     try {
         const { measurementId } = req.params;
@@ -490,87 +533,189 @@ router.put('/:measurementId/add-employees', async (req, res) => {
 
         const existingIds = new Set(measurement.employeeMeasurements.map(e => e.employeeId.toString()));
 
-        // Process new product-based employees
+        // ─── OPTIMIZATION 1: Batch fetch ALL employees at once ─────────────────
+        const allNewEmployeeIds = new Set();
+        
+        // Collect all employee IDs from product-based data
         if (measurementData?.length) {
-            const productIds = [...new Set(measurementData.map(d => d.productId).filter(Boolean))];
-            const stockItems = productIds.length
-                ? await StockItem.find({ _id: { $in: productIds } }).select('_id name reference').lean()
-                : [];
-            const stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
+            measurementData.forEach(data => {
+                if (data.employeeId && !existingIds.has(data.employeeId.toString())) {
+                    allNewEmployeeIds.add(data.employeeId.toString());
+                }
+            });
+        }
+        
+        // Collect all employee IDs from category data
+        if (categoryData?.length) {
+            categoryData.forEach(catEmp => {
+                if (catEmp.employeeId && !existingIds.has(catEmp.employeeId.toString())) {
+                    allNewEmployeeIds.add(catEmp.employeeId.toString());
+                }
+            });
+        }
 
-            const newEmpMap = new Map();
+        // Batch fetch all employee details in ONE query
+        const employeesMap = new Map();
+        if (allNewEmployeeIds.size > 0) {
+            const employees = await EmployeeMpc.find({
+                _id: { $in: Array.from(allNewEmployeeIds) }
+            }).select('name uin gender').lean();
+            
+            employees.forEach(emp => {
+                employeesMap.set(emp._id.toString(), emp);
+            });
+        }
+
+        // ─── OPTIMIZATION 2: Batch fetch ALL stock items at once ──────────────
+        const productIds = [...new Set((measurementData || []).map(d => d.productId).filter(Boolean))];
+        let stockMap = new Map();
+        
+        if (productIds.length) {
+            const stockItems = await StockItem.find({ _id: { $in: productIds } })
+                .select('_id name reference measurements variants')
+                .lean();
+            stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
+        }
+
+        // ─── OPTIMIZATION 3: Process product-based employees in bulk ───────────
+        if (measurementData?.length) {
+            // Group by employee ID first
+            const groupedByEmployee = new Map();
+            
             for (const data of measurementData) {
                 if (!data.employeeId) continue;
                 const eid = data.employeeId.toString();
                 if (existingIds.has(eid)) continue;
-
-                if (!newEmpMap.has(eid)) {
-                    const employee = await EmployeeMpc.findById(eid).select('name uin gender').lean();
+                
+                if (!groupedByEmployee.has(eid)) {
+                    const employee = employeesMap.get(eid);
                     if (!employee) continue;
-                    newEmpMap.set(eid, {
-                        employeeId: data.employeeId, employeeName: employee.name,
-                        employeeUIN: employee.uin, gender: employee.gender,
-                        remarks: data.remarks || "", noProductAssigned: false,
-                        products: [], categoryMeasurements: []
+                    
+                    groupedByEmployee.set(eid, {
+                        employeeId: data.employeeId,
+                        employeeName: employee.name,
+                        employeeUIN: employee.uin,
+                        gender: employee.gender,
+                        remarks: data.remarks || "",
+                        noProductAssigned: false,
+                        products: [],
+                        categoryMeasurements: []
                     });
                 }
-
+                
                 const si = stockMap.get(data.productId?.toString());
                 if (!si) continue;
-
+                
                 let variantName = "Default";
-                if (data.variantId) {
-                    const full = await StockItem.findById(data.productId).select('variants').lean();
-                    const v = full?.variants?.find(v => v._id.toString() === data.variantId.toString());
-                    if (v?.attributes?.length) variantName = v.attributes.map(a => a.value).join(" • ");
+                if (data.variantId && si.variants) {
+                    const v = si.variants.find(v => v._id.toString() === data.variantId.toString());
+                    if (v?.attributes?.length) {
+                        variantName = v.attributes.map(a => a.value).join(" • ");
+                    }
                 }
-
+                
                 const measurementsArray = Array.isArray(data.measurements)
                     ? data.measurements
-                    : Object.entries(data.measurements || {}).map(([n, v]) => ({ measurementName: n, value: v || '', unit: '' }));
-
-                newEmpMap.get(eid).products.push({
-                    productId: data.productId, productName: si.name,
-                    variantId: data.variantId || null, variantName,
-                    quantity: data.quantity || 1, measurements: measurementsArray, measuredAt: new Date()
+                    : Object.entries(data.measurements || {}).map(([n, v]) => ({ 
+                        measurementName: n, 
+                        value: v || '', 
+                        unit: '' 
+                    }));
+                
+                groupedByEmployee.get(eid).products.push({
+                    productId: data.productId,
+                    productName: si.name,
+                    variantId: data.variantId || null,
+                    variantName,
+                    quantity: data.quantity || 1,
+                    measurements: measurementsArray,
+                    measuredAt: new Date()
                 });
             }
-
-            for (const empData of newEmpMap.values()) {
-                const isCompleted = empData.products.every(p => p.measurements.every(m => m.value?.trim()));
-                measurement.employeeMeasurements.push({ ...empData, isCompleted, completedAt: isCompleted ? new Date() : null });
+            
+            // Add all employees in one batch
+            for (const empData of groupedByEmployee.values()) {
+                const isCompleted = empData.products.every(p => 
+                    p.measurements.every(m => m.value?.trim())
+                );
+                measurement.employeeMeasurements.push({
+                    ...empData,
+                    isCompleted,
+                    completedAt: isCompleted ? new Date() : null
+                });
             }
         }
-
-        // Process new no-product / category employees
-        for (const catEmp of (categoryData || [])) {
-            if (!catEmp.employeeId) continue;
-            const eid = catEmp.employeeId.toString();
-            if (existingIds.has(eid)) continue;
-
-            const employee = await EmployeeMpc.findById(eid).select('name uin gender').lean();
-            if (!employee) continue;
-
-            const isCompleted = catEmp.categoryMeasurements?.every(cm =>
-                cm.measurements?.every(m => m.value?.trim())
-            ) || false;
-
-            measurement.employeeMeasurements.push({
-                employeeId: eid, employeeName: employee.name,
-                employeeUIN: employee.uin, gender: employee.gender,
-                remarks: catEmp.remarks || "", noProductAssigned: true,
-                products: [], categoryMeasurements: catEmp.categoryMeasurements || [],
-                isCompleted, completedAt: isCompleted ? new Date() : null
-            });
+        
+        // ─── OPTIMIZATION 4: Process category-based employees in bulk ─────────
+        if (categoryData?.length) {
+            const categoryEmployeesMap = new Map();
+            
+            for (const catEmp of categoryData) {
+                if (!catEmp.employeeId) continue;
+                const eid = catEmp.employeeId.toString();
+                if (existingIds.has(eid)) continue;
+                
+                const employee = employeesMap.get(eid);
+                if (!employee) continue;
+                
+                const isCompleted = catEmp.categoryMeasurements?.every(cm =>
+                    cm.measurements?.every(m => m.value?.trim())
+                ) || false;
+                
+                categoryEmployeesMap.set(eid, {
+                    employeeId: eid,
+                    employeeName: employee.name,
+                    employeeUIN: employee.uin,
+                    gender: employee.gender,
+                    remarks: catEmp.remarks || "",
+                    noProductAssigned: true,
+                    products: [],
+                    categoryMeasurements: catEmp.categoryMeasurements || [],
+                    isCompleted,
+                    completedAt: isCompleted ? new Date() : null
+                });
+            }
+            
+            // Add all category employees in one batch
+            for (const empData of categoryEmployeesMap.values()) {
+                measurement.employeeMeasurements.push(empData);
+            }
         }
-
+        
+        // Recalculate stats
+        measurement.totalRegisteredEmployees = measurement.registeredEmployeeIds?.length || 0;
+        measurement.measuredEmployees = measurement.employeeMeasurements.filter(e => e.isCompleted).length;
+        measurement.pendingEmployees = measurement.totalRegisteredEmployees - measurement.measuredEmployees;
+        measurement.completionRate = measurement.totalRegisteredEmployees > 0
+            ? Math.round((measurement.measuredEmployees / measurement.totalRegisteredEmployees) * 100)
+            : 0;
+            
+        let totalMeasurements = 0, completedMeasurements = 0;
+        measurement.employeeMeasurements.forEach(emp => {
+            if (emp.noProductAssigned) {
+                emp.categoryMeasurements?.forEach(cm => {
+                    totalMeasurements += cm.measurements?.length || 0;
+                    completedMeasurements += cm.measurements?.filter(m => m.value?.trim()).length || 0;
+                });
+            } else {
+                emp.products.forEach(p => {
+                    totalMeasurements += p.measurements.length;
+                    completedMeasurements += p.measurements.filter(m => m.value?.trim()).length;
+                });
+            }
+        });
+        
+        measurement.totalMeasurements = totalMeasurements;
+        measurement.completedMeasurements = completedMeasurements;
+        measurement.pendingMeasurements = totalMeasurements - completedMeasurements;
         measurement.updatedBy = req.user.id;
         measurement.updatedAt = new Date();
+        
         const saved = await measurement.save();
-
+        
         res.status(200).json({
             success: true,
-            message: `Added ${newEmployeeIds?.length || 0} new employee(s) to measurement`,
+            message: `Added ${allNewEmployeeIds.size} new employee(s) to measurement`,
             measurement: saved
         });
     } catch (error) {
