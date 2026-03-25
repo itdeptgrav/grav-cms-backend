@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const { getTasks } = require("../services/googleTasksService");
+const { getTasks } = require("./services/googleTasksService");
 
 router.get("/tasks", async (req, res) => {
   try {

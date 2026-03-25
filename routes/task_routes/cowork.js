@@ -1,0 +1,262 @@
+const express = require("express");
+const router = express.Router();
+const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
+const svc = require("../../services/cowork.service");
+const { auth, db, admin } = require("../../config/firebaseAdmin");
+
+// ── Seed CEO ──────────────────────────────────────────────
+router.post("/setup/seed-ceo", async (req, res) => {
+  try {
+    const { email, password, name, mobile = "", city = "" } = req.body;
+    if (!email || !password || !name) return res.status(400).json({ error: "email, password, name required" });
+    let ur;
+    try { ur = await auth.createUser({ email, password, displayName: name }); }
+    catch (e) { if (e.code === "auth/email-already-exists") ur = await auth.getUserByEmail(email); else throw e; }
+    await auth.setCustomUserClaims(ur.uid, { role: "ceo" });
+    await db.collection("cowork_employees").doc("E000").set({
+      employeeId: "E000", authUid: ur.uid, name, email, mobile, city,
+      department: "Management", role: "ceo", profilePicUrl: null, fcmTokens: [],
+      passwordChanged: true, tempPassword: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    await db.collection("cowork_meta").doc("counters").set(
+      { employeeSeq: 0, groupSeq: 0, taskSeq: 0, meetSeq: 0 }, { merge: true }
+    );
+    res.json({ success: true, uid: ur.uid, employeeId: "E000", message: "CEO seeded. Login now." });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Me ────────────────────────────────────────────────────
+router.get("/me", verifyCoworkToken, verifyEmployeeToken, (req, res) => {
+  const { authUid, employeeId, role, name, employeeData } = req.coworkUser;
+  res.json({
+    authUid, employeeId, role, name,
+    tempPassword: employeeData?.passwordChanged === false ? employeeData?.tempPassword : null,
+    passwordChanged: employeeData?.passwordChanged ?? true,
+  });
+});
+
+router.get("/employee/list-members", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const employees = await svc.listCoworkEmployees();
+    // Strip sensitive fields before sending to non-CEO users
+    const safe = employees.map(({ tempPassword, authUid, fcmTokens, ...emp }) => emp);
+    res.json({ employees: safe });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ── Change Password ──────────────────────────────
+router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+    await svc.changeEmployeePassword({ employeeId: req.coworkUser.employeeId, authUid: req.coworkUser.authUid, newPassword });
+    res.json({ success: true, message: "Password changed successfully." });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Employee ──────────────────────────────────────────────
+router.post("/employee/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const { name, email, mobile, city, department } = req.body;
+    if (!name || !email || !mobile || !city || !department) return res.status(400).json({ error: "All fields required." });
+    const result = await svc.createCoworkEmployee({ name, email, mobile, city, department });
+    res.status(201).json({ success: true, employeeId: result.employeeId, tempPassword: result.tempPassword });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/employee/list", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try { res.json({ employees: await svc.listCoworkEmployees() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get("/employee/:id", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const emp = await svc.getCoworkEmployee(req.params.id);
+    if (!emp) return res.status(404).json({ error: "Not found" });
+    res.json({ employee: emp });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post("/employee/fcm-token", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { await svc.saveFCMToken(req.coworkUser.employeeId, req.body.token); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Group ─────────────────────────────────────────────────
+router.post("/group/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const { name, description, memberIds } = req.body;
+    if (!name || !memberIds?.length) return res.status(400).json({ error: "name and memberIds required" });
+    const group = await svc.createCoworkGroup({
+      name,
+      description,
+      memberIds,
+      createdBy: req.coworkUser.employeeId,
+      createdByAuthUid: req.coworkUser.authUid
+    });
+    res.status(201).json({ group });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.delete("/group/:groupId", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try { await svc.deleteCoworkGroup(req.params.groupId, req.coworkUser.employeeId); res.json({ success: true }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/group/list", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const groups = await svc.listCoworkGroups(req.coworkUser.employeeId, req.coworkUser.role);
+    res.json({ groups });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get("/group/:groupId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const group = await svc.getCoworkGroup(req.params.groupId);
+    if (!group) return res.status(404).json({ error: "Group not found" });
+    res.json({ group });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get("/group/:groupId/members", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    console.log(`Fetching members for group: ${groupId}`);
+
+    const groupDoc = await db.collection("cowork_groups").doc(groupId).get();
+
+    if (!groupDoc.exists) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    const groupData = groupDoc.data();
+    const memberIds = groupData.memberIds || [];
+
+    const members = [];
+    for (const id of memberIds) {
+      const memberDoc = await db.collection("cowork_employees").doc(id).get();
+      if (memberDoc.exists) {
+        members.push({
+          employeeId: id,
+          ...memberDoc.data()
+        });
+      }
+    }
+
+    console.log(`Found ${members.length} members for group ${groupId}`);
+    res.json({ members });
+
+  } catch (error) {
+    console.error("Error fetching group members:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post("/group/:groupId/message", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const msg = await svc.sendGroupMessage({ groupId: req.params.groupId, senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, text: req.body.text, attachments: req.body.attachments || [] });
+    res.status(201).json({ message: msg });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/group/:groupId/messages", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ messages: await svc.getGroupMessages(req.params.groupId, req.query.limit) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Direct Messages ───────────────────────────────────────
+router.post("/direct-message/send", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { toEmployeeId, text, attachments } = req.body;
+    if (!toEmployeeId || !text) return res.status(400).json({ error: "toEmployeeId and text required" });
+    const result = await svc.sendDirectMessage({ fromEmployeeId: req.coworkUser.employeeId, toEmployeeId, senderName: req.coworkUser.name, text, attachments: attachments || [] });
+    res.status(201).json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/direct-message/conversations", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ conversations: await svc.listConversations(req.coworkUser.employeeId) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get("/direct-message/:convId/messages", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ messages: await svc.getDirectMessages(req.params.convId, req.query.limit) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Meets ─────────────────────────────────────────────────
+router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const { title, description, participants, dateTime, googleMeetLink } = req.body;
+    if (!title || !participants || !dateTime || !googleMeetLink) return res.status(400).json({ error: "All fields required." });
+    const meet = await svc.scheduleCoworkMeet({ title, description, createdBy: req.coworkUser.employeeId, participants, dateTime, googleMeetLink });
+    res.status(201).json({ meet });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/schedule-meet/list", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ meets: await svc.listCoworkMeets(req.coworkUser.employeeId, req.coworkUser.role) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get("/schedule-meet/:meetId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const meet = await svc.getCoworkMeet(req.params.meetId);
+    if (!meet) return res.status(404).json({ error: "Not found" });
+    res.json({ meet });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Tasks ─────────────────────────────────────────────────
+router.post("/task/assign", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try { res.status(201).json({ task: await svc.assignCoworkTask({ ...req.body, assignedBy: req.coworkUser.employeeId }) }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.patch("/task/:taskId/progress", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ result: await svc.updateTaskProgress({ taskId: req.params.taskId, employeeId: req.coworkUser.employeeId, progressPercent: req.body.progressPercent, note: req.body.note }) }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/task/list", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ tasks: await svc.listTasks(req.coworkUser.employeeId, req.coworkUser.role) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Notifications ─────────────────────────────────────────
+router.get("/notifications", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { employeeId } = req.coworkUser;
+    const unreadOnly = req.query.unreadOnly === "true";
+    console.log(`GET /notifications - employee: ${employeeId}, unreadOnly: ${unreadOnly}`);
+    const notifications = await svc.getNotifications(employeeId, unreadOnly);
+    res.json({ notifications: notifications || [] });
+  } catch (e) {
+    console.error('Error in /notifications endpoint:', e);
+    res.status(200).json({ notifications: [], error: e.message });
+  }
+});
+
+router.patch("/notifications/read-all", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { employeeId } = req.coworkUser;
+    console.log(`PATCH /notifications/read-all - employee: ${employeeId}`);
+    const result = await svc.markNotificationsRead(employeeId);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('Error in /notifications/read-all endpoint:', e);
+    res.status(200).json({ success: false, error: e.message });
+  }
+});
+
+module.exports = router;
