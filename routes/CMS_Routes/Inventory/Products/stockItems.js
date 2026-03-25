@@ -370,7 +370,7 @@ router.get("/data/create", async (req, res) => {
 
     const [registeredOperations, registeredGroups] = await Promise.all([
       Operation.find().sort({ name: 1 }),
-      OperationGroup.find().populate("operations", "name totalSam durationSeconds machineType").sort({ name: 1 })
+      OperationGroup.find().populate("operations", "name operationCode totalSam durationSeconds machineType").sort({ name: 1 })
     ]);
 
     res.json({
@@ -381,7 +381,7 @@ router.get("/data/create", async (req, res) => {
         rawItems: processedRawItems,
         machines: machines.map(m => ({ id: m._id, name: m.name, type: m.type, model: m.model, serialNumber: m.serialNumber })),
         averageOperatorSalary: Math.round(averageSalary),
-        registeredOperations: registeredOperations.map(op => ({ _id: op._id, name: op.name, totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType })),
+        registeredOperations: registeredOperations.map(op => ({ _id: op._id, name: op.name, operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType })),
         registeredGroups: registeredGroups.map(grp => ({ _id: grp._id, name: grp.name, operations: grp.operations })),
         unitConversions: unitConversionsMap
       }
@@ -417,9 +417,9 @@ router.get("/:id/tab/:tabName", async (req, res) => {
     if (tabName === "operations") {
       const [registeredOperations, registeredGroups] = await Promise.all([
         Operation.find().sort({ name: 1 }),
-        OperationGroup.find().populate("operations", "name totalSam durationSeconds machineType").sort({ name: 1 })
+        OperationGroup.find().populate("operations", "name operationCode totalSam durationSeconds machineType").sort({ name: 1 })
       ]);
-      response.registeredOperations = registeredOperations.map(op => ({ _id: op._id, name: op.name, totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType }));
+      response.registeredOperations = registeredOperations.map(op => ({ _id: op._id, name: op.name,operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType }));
       response.registeredGroups = registeredGroups.map(grp => ({ _id: grp._id, name: grp.name, operations: grp.operations }));
     }
 
@@ -552,6 +552,7 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
             const seconds = parseFloat(op.seconds) || 0;
             return {
               type: op.type || "",
+              operationCode: op.operationCode || "",
               machine: op.machine || "",
               machineType: op.machineType || "",
               minutes,
@@ -735,7 +736,7 @@ router.post("/", async (req, res) => {
 
     const processedOperations = (operations || []).map(op => {
       const minutes = parseFloat(op.minutes) || 0, seconds = parseFloat(op.seconds) || 0;
-      return { type: op.type || "", machine: op.machine || "", machineType: op.machineType || "", minutes, seconds, totalSeconds: minutes * 60 + seconds, operatorSalary: parseFloat(op.operatorSalary) || 0, operatorCost: parseFloat(op.operatorCost) || 0 };
+      return { type: op.type || "", operationCode: op.operationCode || "", machine: op.machine || "", machineType: op.machineType || "", minutes, seconds, totalSeconds: minutes * 60 + seconds, operatorSalary: parseFloat(op.operatorSalary) || 0, operatorCost: parseFloat(op.operatorCost) || 0 };
     });
 
     const processedMiscellaneousCosts = (miscellaneousCosts || [])

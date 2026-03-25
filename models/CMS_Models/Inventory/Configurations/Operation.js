@@ -9,7 +9,7 @@ const operationSchema = new mongoose.Schema(
       required: [true, "Operation name is required"],
       trim: true,
     },
-    // Optional code linked from OperationCode registry (stored as plain string for fast reads)
+    
     operationCode: {
       type: String,
       trim: true,

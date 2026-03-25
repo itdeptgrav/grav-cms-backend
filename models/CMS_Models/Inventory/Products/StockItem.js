@@ -121,6 +121,11 @@ const operationSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
+  operationCode: {
+    type: String,
+    trim: true,
+    default: ""
+  },
   machine: {
     type: String,
     trim: true
