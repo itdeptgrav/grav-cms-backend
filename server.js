@@ -143,8 +143,12 @@ const connectDB = async () => {
     );
     console.log("✅ MongoDB connected successfully");
 
+
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
+
+    await assignMeasurementsToExistingProducts();
+
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -191,6 +195,97 @@ const createDefaultCuttingMaster = async () => {
   }
 };
 
+// const backfillWorkOrderOperationCodes = async () => {
+//   const flagKey = "backfill_workorder_operation_codes_v3_fixess";
+//   const db = mongoose.connection.db;
+//   const flagsCol = db.collection("_migration_flags");
+
+//   const alreadyRan = await flagsCol.findOne({ key: flagKey });
+//   if (alreadyRan) {
+//     console.log("✅ WorkOrder operationCode backfill already ran — skipping");
+//     return;
+//   }
+
+//   console.log("🔄 Backfilling operationCode on WorkOrder operations from StockItem...");
+
+//   // Fetch all work orders that have operations with missing operationCode
+//   const workOrders = await WorkOrder.find({
+//     "operations.0": { $exists: true }
+//   }).select("workOrderNumber stockItemId operations").lean();
+
+//   console.log(`   📦 Found ${workOrders.length} work orders to process`);
+
+//   let totalPatched = 0;
+//   let totalNoMatch = 0;
+//   let totalWOsUpdated = 0;
+
+//   for (const wo of workOrders) {
+//     if (!wo.stockItemId) {
+//       console.warn(`   ⚠️  WO ${wo.workOrderNumber} has no stockItemId — skipping`);
+//       continue;
+//     }
+
+//     // Fetch the corresponding StockItem
+//     const stockItem = await StockItem.findById(wo.stockItemId)
+//       .select("name operations").lean();
+
+//     if (!stockItem || !stockItem.operations?.length) {
+//       console.warn(`   ⚠️  WO ${wo.workOrderNumber} — StockItem not found or has no operations`);
+//       continue;
+//     }
+
+//     // Build a map of operationType (normalized) → operationCode from StockItem
+//     const stockOpMap = new Map();
+//     for (const op of stockItem.operations) {
+//       const key = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
+//       if (key && op.operationCode) {
+//         stockOpMap.set(key, op.operationCode);
+//       }
+//     }
+
+//     let woModified = false;
+//     const updatedOps = wo.operations.map(op => {
+//       // Skip if operationCode already filled
+
+
+//       const key = (op.operationType || "").trim().toLowerCase().replace(/\s+/g, " ");
+//       const matchedCode = stockOpMap.get(key);
+
+//       if (matchedCode) {
+//         totalPatched++;
+//         woModified = true;
+//         console.log(`     ✓ WO ${wo.workOrderNumber} — "${op.operationType}" → ${matchedCode}`);
+//         return { ...op, operationCode: matchedCode };
+//       } else {
+//         totalNoMatch++;
+//         console.warn(`     ⚠️  WO ${wo.workOrderNumber} — no match for "${op.operationType}" in StockItem "${stockItem.name}"`);
+//         return op;
+//       }
+//     });
+
+//     if (woModified) {
+//       await WorkOrder.updateOne(
+//         { _id: wo._id },
+//         { $set: { operations: updatedOps } }
+//       );
+//       totalWOsUpdated++;
+//     }
+//   }
+
+//   await flagsCol.insertOne({
+//     key: flagKey,
+//     ranAt: new Date(),
+//     stats: {
+//       workOrdersProcessed: workOrders.length,
+//       workOrdersUpdated: totalWOsUpdated,
+//       operationsPatched: totalPatched,
+//       operationsNoMatch: totalNoMatch,
+//     }
+//   });
+
+//   console.log(`✅ WorkOrder operationCode backfill complete — ${totalWOsUpdated} WOs updated, ${totalPatched} operations patched, ${totalNoMatch} had no match`);
+// };
+
 const createDefaultAccountant = async () => {
   try {
     const existingAccountant = await AccountantDepartment.findOne({
@@ -223,57 +318,33 @@ const createDefaultAccountant = async () => {
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
 
-const CATEGORY_MEASUREMENTS = {
-  Shirts: [
-    "Shoulder",
-    "Chest",
-    "Stomach",
-    "Bottom hem/Hips",
-    "Sleeve length",
-    "Cuff",
-    "Collar",
-    "Length",
-  ],
-  Bottoms: [
-    "Waist",
-    "Hips",
-    "Thigh",
-    "Knee",
-    "Bottom",
-    "Croch",
-    "Length",
-  ],
-  Outerwear: [
-    "Collar",
-    "Shoulder",
-    "Chest",
-    "Stomach",
-    "Bottom hem",
-    "Length",
-  ],
-};
-
 const assignMeasurementsToExistingProducts = async () => {
   try {
-    console.log(
-      "🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...",
-    );
+    console.log("🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...");
+
+    const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
+
+    const CATEGORY_MEASUREMENTS = {
+      Shirts: [
+        "Length", "Chest", "Stomach", "Bottom hem",
+        "Shoulder", "Sleeve Length", "Cuff", "Coller",
+      ],
+      Bottoms: [
+        "Length", "Waist", "Sheet", "Thigh", "Knee", "Buttom", "Crouch Kista Cut",
+      ],
+      Outerwear: [
+        "Length", "Chest", "Stomach", "Buttom hem",
+        "Shoulder"
+      ],
+    };
 
     let totalUpdated = 0;
 
-    for (const [category, measurements] of Object.entries(
-      CATEGORY_MEASUREMENTS,
-    )) {
+    for (const [category, measurements] of Object.entries(CATEGORY_MEASUREMENTS)) {
       const result = await StockItem.updateMany(
-        { category: category },
-        {
-          $set: {
-            measurements: measurements,
-            updatedAt: new Date(),
-          },
-        },
+        { category },
+        { $set: { measurements, updatedAt: new Date() } },
       );
-
       if (result.modifiedCount > 0 || result.matchedCount > 0) {
         console.log(
           `✅ ${category}: Updated ${result.modifiedCount} products (matched: ${result.matchedCount}) with ${measurements.length} measurements`,
@@ -325,9 +396,7 @@ const assignMeasurementsToExistingProducts = async () => {
 const authRoutes = require("./routes/login");
 const employeeRoutes = require("./routes/HrRoutes/Employee-Section");
 
-// HR Profile Routes
 const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
-
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
@@ -362,7 +431,6 @@ app.use("/api/cms", productOperations);
 /* ===================
   CMS ROUTES
 ===================== */
-// Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
 
@@ -375,44 +443,32 @@ app.use("/api/cms/machines", machinesRoutes);
 const warehousesRoutes = require("./routes/CMS_Routes/Inventory/Configurations/warehouses");
 app.use("/api/cms/warehouses", warehousesRoutes);
 
-// Vendor-Buyer Category
 const vendorRoutes = require("./routes/CMS_Routes/Inventory/Vendor-Buyer/vendor");
 app.use("/api/cms/vendors", vendorRoutes);
 
-// Products Category
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
 app.use("/api/cms/raw-items", rawItemsRoutes);
 
 const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems.js");
 app.use("/api/cms/stock-items", stockItemsRoutes);
 
-// Operations Category
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
 
 const deliveryRoutes = require("./routes/CMS_Routes/Inventory/Operations/deliveries");
 app.use("/api/cms/inventory/operations/deliveries", deliveryRoutes);
 
-// Overview Section
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
 const RegisteredDepartments = require("./routes/CMS_Routes/Sales/Configuration/OrganizationDepartment/organizationDepartmentRoutes");
-app.use(
-  "/api/cms/configuration/organization-departments",
-  RegisteredDepartments,
-);
+app.use("/api/cms/configuration/organization-departments", RegisteredDepartments);
 
-// Measurement Routes
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
 app.use("/api/cms/measurements", measurementRoutes);
 
-// Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
-app.use(
-  "/api/cms/manufacturing/manufacturing-orders",
-  manufacturingOrderRoutes,
-);
+app.use("/api/cms/manufacturing/manufacturing-orders", manufacturingOrderRoutes);
 
 const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes");
 app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
@@ -420,14 +476,11 @@ app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 const BarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/barcodeRoutes.js");
 app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 
-const ProductionTracking = require("./routes/CMS_Routes/Production/Tracking/trackingRoutes.js");
-app.use("/api/cms/production/tracking", ProductionTracking);
+const ProductionTrackingBarcode = require("./routes/Barcode_Scan_Punchings/trackingRoutes.js");
+app.use("/api/cms/production/barcode_punchings", ProductionTrackingBarcode);
 
 const workOrderProgressRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes");
-app.use(
-  "/api/cms/manufacturing/work-orders/production-tracking",
-  workOrderProgressRoutes,
-);
+app.use("/api/cms/manufacturing/work-orders/production-tracking", workOrderProgressRoutes);
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
@@ -453,7 +506,6 @@ app.use("/api/cms/manufacturing/dispatch", dispatchRoutes);
 const markAsDoneRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/markAsDoneRoutes");
 app.use("/api/cms/manufacturing/mark-as-done", markAsDoneRoutes);
 
-// Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
 app.use("/api/cms/sales", salesRoutes);
 
@@ -467,7 +519,6 @@ app.use("/api/cms/sales", quotationRoutes);
 const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
 
-// HR Department Routes
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
 
@@ -492,11 +543,9 @@ app.use("/api/hr/attendance", attendanceRoutes);
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
 
-// Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
 
-// Accountant Vendor Routes
 const accountantVendorRoutes = require("./routes/Accountant_Routes/vendors");
 app.use("/api/accountant/vendors", accountantVendorRoutes);
 
@@ -509,7 +558,6 @@ app.use("/api/vendor/partner-employees", vendorEmployees);
 const vendorWO = require("./routes/Vendor_Routes/vendorWorkOrderRoutes.js");
 app.use("/api/vendor/work-orders", vendorWO);
 
-// Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
 
@@ -519,8 +567,6 @@ app.use("/api/employee", employeeAuthRoutes);
 const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
 app.use("/api/employee/tasks", TasksEmployee);
 
-
-// Cutting Master Routes
 const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
 app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
 
@@ -533,7 +579,6 @@ app.use("/api/cms/manufacturing/cutting-master", CuttingmeasurementRoutes);
 const bulkCuttingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/bulkCuttingRoutes.js");
 app.use("/api/cms/manufacturing/cutting-master", bulkCuttingRoutes);
 
-// Vendor Routes For Vendor Portal
 const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes");
 app.use("/api/vendor", vendorAuthRoutes);
 
@@ -544,21 +589,522 @@ app.use("/cowork", require("./routes/task_routes/taskForward.js"));
 // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
 app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
-// Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
-app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
 
-//new tree substack routes
-app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
+const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
+app.use('/api/customer/employees/cross-org', crossOrgRoutes);
+
+/* =====================================================================
+   INLINE: Barcode Scanner Tracking Routes
+   Base URL: /api/cms/production/tracking
+   Used by ESP32 firmware — keep socket.io wired up here directly.
+   ===================================================================== */
+
+const ProductionTracking = require("./models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const Employee = require("./models/Employee");
+const Machine = require("./models/CMS_Models/Inventory/Configurations/Machine");
+const WorkOrder = require("./models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const Operation = require("./models/CMS_Models/Inventory/Configurations/Operation");
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const isBarcodeId = (id) => id && typeof id === "string" && id.startsWith("WO-");
+const isEmployeeId = (id) => id && typeof id === "string" && id.startsWith("GR");
+
+const parseBarcode = (barcodeId) => {
+  try {
+    const parts = barcodeId.split("-");
+    if (parts.length >= 3 && parts[0] === "WO") {
+      return {
+        success: true,
+        workOrderShortId: parts[1],
+        unitNumber: parseInt(parts[2]),
+        operationNumber: parts[3] ? parseInt(parts[3]) : null,
+      };
+    }
+    return { success: false, error: "Invalid barcode format" };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+};
+
+const findWorkOrderByShortId = async (shortId) => {
+  try {
+    const workOrders = await WorkOrder.find({});
+    return workOrders.find((wo) => wo._id.toString().slice(-8) === shortId);
+  } catch {
+    return null;
+  }
+};
+
+const extractEmployeeIdFromUrl = (value) => {
+  try {
+    if (!value || typeof value !== "string") return value;
+    const trimmed = value.trim();
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      const url = new URL(trimmed);
+      const parts = url.pathname.split("/").filter(Boolean);
+      return parts[parts.length - 1] || value;
+    }
+    return value;
+  } catch {
+    return value;
+  }
+};
 
 
-/* =====================
-    COWORKING SPACE ROUTES (Firebase/Firestore only — no MongoDB)
-  ===================== */
-const coworkRoutes = require("./routes/task_routes/cowork.js");
-app.use("/cowork", coworkRoutes);
-console.log('✅ Cowork routes mounted at /cowork');
-console.log('   - GET /cowork/notifications');
-console.log('   - PATCH /cowork/notifications/read-all');
+app.post("/api/cms/production/tracking/scan", async (req, res) => {
+  try {
+    const { scanId: rawScanId, machineId, timeStamp, activeOps = "" } = req.body;
+    const scanId = extractEmployeeIdFromUrl(rawScanId);
+
+    if (!scanId || !machineId || !timeStamp) {
+      return res.status(400).json({ success: false, message: "scanId, machineId, and timeStamp are required" });
+    }
+
+    const scanTime = new Date(timeStamp);
+    if (isNaN(scanTime.getTime())) {
+      return res.status(400).json({ success: false, message: "Invalid timeStamp format" });
+    }
+
+    const scanDate = new Date(scanTime);
+    scanDate.setHours(0, 0, 0, 0);
+
+    let trackingDoc = await ProductionTracking.findOne({ date: scanDate });
+    if (!trackingDoc) {
+      trackingDoc = new ProductionTracking({ date: scanDate, machines: [] });
+    }
+
+    const machine = await Machine.findById(machineId);
+    if (!machine) {
+      return res.status(400).json({ success: false, message: "Machine not found" });
+    }
+
+    let machineTracking = trackingDoc.machines.find(
+      (m) => m.machineId.toString() === machineId,
+    );
+    if (!machineTracking) {
+      trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+      machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+    }
+
+    // ── BARCODE SCAN ──────────────────────────────────────────────────────────
+    if (isBarcodeId(scanId)) {
+      if (!machineTracking.currentOperatorIdentityId) {
+        return res.status(400).json({
+          success: false,
+          message: "No operator is signed in on this machine",
+          action: "error",
+        });
+      }
+
+      const operatorTracking = machineTracking.operators.find(
+        (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+      );
+      if (!operatorTracking) {
+        return res.status(400).json({ success: false, message: "Operator session not found" });
+      }
+
+      // Store scan with active operations snapshot
+      operatorTracking.barcodeScans.push({
+        barcodeId: scanId,
+        timeStamp: scanTime,
+        activeOps: activeOps || "",
+      });
+      await trackingDoc.save();
+
+      const employeeName = operatorTracking.operatorName || "Unknown";
+      const scanCount = operatorTracking.barcodeScans.length;
+
+      // WebSocket events
+      try {
+        const parsedBarcode = parseBarcode(scanId);
+        if (parsedBarcode.success && io) {
+          let workOrder = await findWorkOrderByShortId(parsedBarcode.workOrderShortId);
+          if (!workOrder) {
+            try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch { }
+          }
+          if (workOrder) {
+            io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
+              workOrderId: workOrder._id,
+              workOrderNumber: workOrder.workOrderNumber,
+              barcodeId: scanId,
+              unitNumber: parsedBarcode.unitNumber,
+              operationNumber: parsedBarcode.operationNumber,
+              machineId,
+              machineName: machine.name,
+              timestamp: scanTime,
+              employeeName,
+              activeOps: activeOps || "",
+              type: "scan",
+              scanCount,
+            });
+          }
+          io.emit("tracking-data-updated", {
+            date: scanDate,
+            timestamp: new Date(),
+            message: "New scan recorded",
+            workOrderId: workOrder?._id,
+            unitNumber: parsedBarcode.unitNumber,
+            activeOps: activeOps || "",
+          });
+        }
+      } catch (wsError) {
+        console.error("Error emitting WebSocket event:", wsError);
+      }
+
+      return res.json({
+        success: true,
+        message: "Barcode scanned",
+        employeeName,
+        scanCount,
+        barcodeData: { barcodeId: scanId, activeOps: activeOps || "" },
+      });
+    }
+
+    // ── EMPLOYEE SIGN IN / OUT ────────────────────────────────────────────────
+    if (isEmployeeId(scanId)) {
+      const operator = await Employee.findOne({
+        identityId: scanId,
+        status: "active",
+      }).select("firstName lastName identityId");
+
+      if (!operator) {
+        return res.status(400).json({
+          success: false,
+          message: `Employee with identityId ${scanId} not found`,
+        });
+      }
+
+      const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
+
+      // Sign out from any other machine
+      for (const m of trackingDoc.machines) {
+        if (
+          m.currentOperatorIdentityId === scanId &&
+          m.machineId.toString() !== machineId.toString()
+        ) {
+          const existingSession = m.operators.find(
+            (op) => op.operatorIdentityId === scanId && !op.signOutTime,
+          );
+          if (existingSession) existingSession.signOutTime = scanTime;
+          m.currentOperatorIdentityId = null;
+        }
+      }
+
+      // Same operator already on this machine → sign out
+      if (machineTracking.currentOperatorIdentityId === scanId) {
+        const session = machineTracking.operators.find(
+          (op) => op.operatorIdentityId === scanId && !op.signOutTime,
+        );
+        if (session) {
+          session.signOutTime = scanTime;
+          machineTracking.currentOperatorIdentityId = null;
+          await trackingDoc.save();
+          try {
+            if (io) io.emit("operator-status-update", {
+              machineId, machineName: machine.name, employeeName,
+              message: `${employeeName} signed out`, timestamp: new Date(),
+            });
+          } catch { }
+          return res.json({
+            success: true,
+            message: `${employeeName} signed out`,
+            employeeName,
+            employeeId: scanId,
+            action: "signout",
+            scanCount: 0,
+          });
+        }
+        return res.status(400).json({ success: false, message: "Operator session not found" });
+      }
+
+      // Different operator signed in → sign out existing, sign in new
+      if (machineTracking.currentOperatorIdentityId) {
+        const existingSession = machineTracking.operators.find(
+          (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+        );
+        if (existingSession) existingSession.signOutTime = scanTime;
+      }
+
+      machineTracking.operators.push({
+        operatorIdentityId: scanId,
+        operatorName: employeeName,
+        signInTime: scanTime,
+        signOutTime: null,
+        barcodeScans: [],
+      });
+      machineTracking.currentOperatorIdentityId = scanId;
+      await trackingDoc.save();
+
+      try {
+        if (io) io.emit("operator-status-update", {
+          machineId, machineName: machine.name, employeeName,
+          status: `${employeeName} signed in to ${machine.name}`, timestamp: new Date(),
+        });
+      } catch { }
+
+      return res.json({
+        success: true,
+        message: `${employeeName} signed in`,
+        employeeName,
+        employeeId: scanId,
+        action: "signin",
+        scanCount: 0,
+      });
+    }
+
+    return res.status(400).json({ success: false, message: "Invalid scan ID format" });
+
+  } catch (error) {
+    console.error("Error processing scan:", error);
+    res.status(500).json({ success: false, message: "Server error while processing scan", error: error.message });
+  }
+});
+
+// ── POST /api/cms/production/tracking/bulk-scans ──────────────────────────────
+
+app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
+  try {
+    const { scans } = req.body;
+    if (!scans || !Array.isArray(scans) || scans.length === 0) {
+      return res.status(400).json({ success: false, message: "Scans array is required" });
+    }
+
+    const results = { total: scans.length, successful: 0, failed: 0, errors: [] };
+    const scansByDate = {};
+
+    for (const scanData of scans) {
+      const { scanId, machineId, timeStamp } = scanData;
+      if (!scanId || !machineId || !timeStamp) {
+        results.failed++;
+        results.errors.push({ scanId, error: "Missing required fields" });
+        continue;
+      }
+      const scanTime = new Date(timeStamp);
+      if (isNaN(scanTime.getTime())) {
+        results.failed++;
+        results.errors.push({ scanId, error: "Invalid timestamp" });
+        continue;
+      }
+      const scanDate = new Date(scanTime);
+      scanDate.setHours(0, 0, 0, 0);
+      const dateKey = scanDate.toISOString();
+      if (!scansByDate[dateKey]) scansByDate[dateKey] = { date: scanDate, machines: {} };
+      if (!scansByDate[dateKey].machines[machineId]) scansByDate[dateKey].machines[machineId] = { machineId, scans: [] };
+      scansByDate[dateKey].machines[machineId].scans.push({ ...scanData, timeStamp: scanTime });
+    }
+
+    for (const dateKey in scansByDate) {
+      const dateGroup = scansByDate[dateKey];
+      let trackingDoc = await ProductionTracking.findOne({ date: dateGroup.date });
+      if (!trackingDoc) trackingDoc = new ProductionTracking({ date: dateGroup.date, machines: [] });
+
+      for (const machineId in dateGroup.machines) {
+        const machineData = dateGroup.machines[machineId];
+        const machine = await Machine.findById(machineId);
+        if (!machine) {
+          results.failed += machineData.scans.length;
+          results.errors.push({ machineId, error: "Machine not found" });
+          continue;
+        }
+
+        let machineTracking = trackingDoc.machines.find(
+          (m) => m.machineId && m.machineId.toString() === machineId,
+        );
+        if (!machineTracking) {
+          trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+          machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+        }
+
+        for (const scan of machineData.scans) {
+          try {
+            if (scan.isEmployeeScan) {
+              const { employeeName, employeeId, action } = scan;
+              if (action === "signout") {
+                const session = machineTracking.operators.find(
+                  (op) => op.operatorIdentityId === (employeeId || scan.scanId) && !op.signOutTime,
+                );
+                if (session) {
+                  session.signOutTime = scan.timeStamp;
+                  machineTracking.currentOperatorIdentityId = null;
+                }
+              } else {
+                if (machineTracking.currentOperatorIdentityId) {
+                  const existing = machineTracking.operators.find(
+                    (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+                  );
+                  if (existing) existing.signOutTime = scan.timeStamp;
+                }
+                machineTracking.operators.push({
+                  operatorIdentityId: employeeId || scan.scanId,
+                  operatorName: employeeName || "",
+                  signInTime: scan.timeStamp,
+                  signOutTime: null,
+                  barcodeScans: [],
+                });
+                machineTracking.currentOperatorIdentityId = employeeId || scan.scanId;
+              }
+            } else {
+              // Barcode scan — store with activeOps snapshot
+              if (!machineTracking.currentOperatorIdentityId) throw new Error("No operator signed in");
+              const operatorSession = machineTracking.operators.find(
+                (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+              );
+              if (!operatorSession) throw new Error("Operator session not found");
+              operatorSession.barcodeScans.push({
+                barcodeId: scan.scanId,
+                timeStamp: scan.timeStamp,
+                activeOps: scan.activeOps || "",
+              });
+            }
+            results.successful++;
+          } catch (scanError) {
+            results.failed++;
+            results.errors.push({ scanId: scan.scanId, error: scanError.message });
+          }
+        }
+      }
+      await trackingDoc.save();
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Processed ${results.successful} of ${results.total} scans`,
+      results,
+    });
+  } catch (error) {
+    console.error("Bulk scan error:", error);
+    res.status(500).json({ success: false, message: "Server error processing bulk scans", error: error.message });
+  }
+});
+
+// ── GET /api/cms/production/tracking/status/today ─────────────────────────────
+
+app.get("/api/cms/production/tracking/status/today", async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const trackingDoc = await ProductionTracking.findOne({ date: today })
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    if (!trackingDoc) {
+      return res.json({ success: true, message: "No tracking data for today", date: today, machines: [], totalScans: 0, totalMachines: 0 });
+    }
+
+    let totalScans = 0;
+    const machinesStatus = [];
+
+    for (const machine of trackingDoc.machines) {
+      let machineScans = 0;
+      const operatorsWithDetails = [];
+
+      for (const operator of machine.operators) {
+        const employeeDoc = await Employee.findOne({ identityId: operator.operatorIdentityId })
+          .select("firstName lastName identityId");
+        machineScans += operator.barcodeScans.length;
+        totalScans += operator.barcodeScans.length;
+        operatorsWithDetails.push({
+          identityId: operator.operatorIdentityId,
+          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          signInTime: operator.signInTime,
+          signOutTime: operator.signOutTime,
+          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp, activeOps: s.activeOps || "" })),
+          scanCount: operator.barcodeScans.length,
+          isActive: !operator.signOutTime,
+        });
+      }
+
+      let currentOperator = null;
+      if (machine.currentOperatorIdentityId) {
+        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
+        currentOperator = empDoc
+          ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
+          : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
+      }
+
+      machinesStatus.push({
+        machineId: machine.machineId?._id,
+        machineName: machine.machineId?.name || "Unknown Machine",
+        machineSerial: machine.machineId?.serialNumber || "Unknown",
+        currentOperator,
+        operators: operatorsWithDetails,
+        machineScans,
+      });
+    }
+
+    res.json({ success: true, date: trackingDoc.date, totalMachines: trackingDoc.machines.length, totalScans, machines: machinesStatus });
+  } catch (error) {
+    console.error("Error getting today's status:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+// ── GET /api/cms/production/tracking/status/:date ─────────────────────────────
+
+app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
+  try {
+    const { date } = req.params;
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+
+    const trackingDoc = await ProductionTracking.findOne({ date: queryDate })
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    if (!trackingDoc) {
+      return res.json({ success: true, message: `No tracking data for ${date}`, date: queryDate, machines: [], totalScans: 0, totalMachines: 0 });
+    }
+
+    let totalScans = 0;
+    const machinesStatus = [];
+
+    for (const machine of trackingDoc.machines) {
+      let machineScans = 0;
+      const operatorsWithDetails = [];
+
+      for (const operator of machine.operators) {
+        const employeeDoc = await Employee.findOne({ identityId: operator.operatorIdentityId })
+          .select("firstName lastName identityId");
+        machineScans += operator.barcodeScans.length;
+        totalScans += operator.barcodeScans.length;
+        operatorsWithDetails.push({
+          identityId: operator.operatorIdentityId,
+          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          signInTime: operator.signInTime,
+          signOutTime: operator.signOutTime,
+          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp, activeOps: s.activeOps || "" })),
+          scanCount: operator.barcodeScans.length,
+          isActive: !operator.signOutTime,
+        });
+      }
+
+      let currentOperator = null;
+      if (machine.currentOperatorIdentityId) {
+        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
+        currentOperator = empDoc
+          ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
+          : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
+      }
+
+      machinesStatus.push({
+        machineId: machine.machineId?._id,
+        machineName: machine.machineId?.name || "Unknown Machine",
+        machineSerial: machine.machineId?.serialNumber || "Unknown",
+        currentOperator,
+        operators: operatorsWithDetails,
+        machineScans,
+      });
+    }
+
+    res.json({ success: true, date: trackingDoc.date, totalMachines: trackingDoc.machines.length, totalScans, machines: machinesStatus });
+  } catch (error) {
+    console.error("Error getting date status:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
 /* =====================
     HEALTH CHECK
   ===================== */
@@ -566,16 +1112,11 @@ app.get("/api/health", (req, res) => {
   res.status(200).json({
     success: true,
     message: "Backend server is running 🚀",
-    database:
-      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+    database: mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
     productionSync: {
       enabled: true,
       syncInterval: "Every 20 minutes",
       cleanupSchedule: "Daily at 2 AM",
-    },
-    socketio: {
-      status: "running",
-      connections: io.engine.clientsCount,
     },
     timestamp: new Date().toISOString(),
   });
@@ -609,59 +1150,33 @@ app.get("/", (req, res) => {
 app.post("/api/cms/production/sync/manual", async (req, res) => {
   try {
     await productionSyncService.manualSync();
-    res.json({
-      success: true,
-      message: "Manual sync completed successfully",
-    });
+    res.json({ success: true, message: "Manual sync completed successfully" });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error during manual sync",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Error during manual sync", error: error.message });
   }
 });
 
 app.post("/api/cms/production/cleanup/manual", async (req, res) => {
   try {
     await productionSyncService.manualCleanup();
-    res.json({
-      success: true,
-      message: "Manual cleanup completed successfully",
-    });
+    res.json({ success: true, message: "Manual cleanup completed successfully" });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error during manual cleanup",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Error during manual cleanup", error: error.message });
   }
 });
 
-/* =====================
-    GRACEFUL SHUTDOWN
-  ===================== */
+// Graceful shutdown
 let isShuttingDown = false;
 
 const gracefulShutdown = (signal) => {
   if (isShuttingDown) return;
-
   isShuttingDown = true;
   console.log(`\n🛑 ${signal} received, starting graceful shutdown...`);
 
-  // Close Socket.IO connections
-  io.close(() => {
-    console.log("✅ Socket.IO closed");
-  });
-
-  // Stop production sync service
   productionSyncService.stop();
 
-  // Close server
   server.close(() => {
     console.log("✅ HTTP server closed");
-
-    // Close MongoDB connection
     mongoose.connection.close(false, () => {
       console.log("✅ MongoDB connection closed");
       console.log("👋 Shutdown complete");
@@ -669,7 +1184,6 @@ const gracefulShutdown = (signal) => {
     });
   });
 
-  // Force shutdown after 10 seconds
   setTimeout(() => {
     console.error("⚠️  Forcing shutdown after timeout");
     process.exit(1);
@@ -686,12 +1200,4 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
-  console.log(`✅ Coworking Space routes active at /cowork/*`);
-  console.log(`✅ Google Workspace routes active at /api/google/*`);
 });
-
-// see the below code basically this is all about the raw-item of our company inventory ok.. which need to fix  because so many issue's are occouring ok..
-// -> in the raw-item lists page, if the pagination is not added yet then add that ok or else the server response time will goona too large ok, so fix it
-// -> second thing is formal/nermal ui ok do not any colourful design ok/background ok..
-// -> the create/edit form is also not working means especially the edit form measn an serer error is occouring when doing the edit ok.. so fix it ok..
-// -> so let's fix these things ok

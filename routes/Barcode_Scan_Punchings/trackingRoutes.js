@@ -1,12 +1,11 @@
-// routes/CMS_Routes/Production/Tracking/trackingRoutes.js
-// UPDATED: activeOps is now an array of operation code strings, not a comma-separated string.
+// routes/Barcode_Scan_Punchings/trackingRoutes.js
 
 const express = require("express");
 const router = express.Router();
-const ProductionTracking = require("../models/ProductionTracking");
-const Employee = require("../models/Employee");
-const Machine = require("../models/Machine");
-const WorkOrder = require("../models/WorkOrder");
+const ProductionTracking = require("../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const Employee = require("../../models/Employee");
+const Machine = require("../../models/CMS_Models/Inventory/Configurations/Machine");
+const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 
 let io;
 
@@ -21,6 +20,7 @@ const isBarcodeId = (id) => id && typeof id === "string" && id.startsWith("WO-")
 
 const isEmployeeId = (id) => id && typeof id === "string" && id.startsWith("GR");
 
+// Format: WO-[shortId]-[unitNumber]-[operationNumber?]
 const parseBarcode = (barcodeId) => {
   try {
     const parts = barcodeId.split("-");
@@ -62,36 +62,15 @@ const extractEmployeeIdFromUrl = (value) => {
   }
 };
 
-// Normalise whatever the device sends for activeOps into a clean string[].
-// Accepts: string[] | string (comma-separated) | undefined/null → always returns string[]
-// AFTER — handles all cases including ["MJ030,MJ020,MJ032"]
-const normaliseActiveOps = (raw) => {
-  if (!raw) return [];
-  if (Array.isArray(raw)) {
-    // flatMap splits any element that is itself comma-separated e.g. ["MJ030,MJ020"]
-    return raw
-      .flatMap((s) => String(s).split(","))
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-  if (typeof raw === "string") {
-    return raw.split(",").map((s) => s.trim()).filter(Boolean);
-  }
-  return [];
-};
-
 // ─── POST /scan ────────────────────────────────────────────────────────────────
 
 router.post("/scan", async (req, res) => {
   try {
-    const { scanId: rawScanId, machineId, timeStamp, activeOps } = req.body;
+    const { scanId: rawScanId, machineId, timeStamp } = req.body;
     const scanId = extractEmployeeIdFromUrl(rawScanId);
 
     if (!scanId || !machineId || !timeStamp) {
-      return res.status(400).json({
-        success: false,
-        message: "scanId, machineId, and timeStamp are required",
-      });
+      return res.status(400).json({ success: false, message: "scanId, machineId, and timeStamp are required" });
     }
 
     const scanTime = new Date(timeStamp);
@@ -99,21 +78,22 @@ router.post("/scan", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid timeStamp format" });
     }
 
-    const activeOpsCodes = normaliseActiveOps(activeOps); // always string[]
-
     const scanDate = new Date(scanTime);
     scanDate.setHours(0, 0, 0, 0);
 
+    // Find or create tracking document for this date
     let trackingDoc = await ProductionTracking.findOne({ date: scanDate });
     if (!trackingDoc) {
       trackingDoc = new ProductionTracking({ date: scanDate, machines: [] });
     }
 
+    // Validate machine
     const machine = await Machine.findById(machineId);
     if (!machine) {
       return res.status(400).json({ success: false, message: "Machine not found" });
     }
 
+    // Find or create machine tracking
     let machineTracking = trackingDoc.machines.find(
       (m) => m.machineId.toString() === machineId
     );
@@ -124,6 +104,7 @@ router.post("/scan", async (req, res) => {
 
     // ─── BARCODE SCAN ──────────────────────────────────────────────────────────
     if (isBarcodeId(scanId)) {
+      // Must have a signed-in operator on this machine
       if (!machineTracking.currentOperatorIdentityId) {
         return res.status(400).json({
           success: false,
@@ -133,82 +114,74 @@ router.post("/scan", async (req, res) => {
       }
 
       const operatorTracking = machineTracking.operators.find(
-        (op) =>
-          op.operatorIdentityId === machineTracking.currentOperatorIdentityId &&
-          !op.signOutTime
+        (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime
       );
       if (!operatorTracking) {
-        return res.status(400).json({
-          success: false,
-          message: "Operator session not found",
-        });
+        return res.status(400).json({ success: false, message: "Operator session not found" });
       }
 
-      // Store scan with the array of active operation codes
-      operatorTracking.barcodeScans.push({
-        barcodeId: scanId,
-        timeStamp: scanTime,
-        activeOps: activeOpsCodes,
-      });
+      // Save the scan
+      operatorTracking.barcodeScans.push({ barcodeId: scanId, timeStamp: scanTime });
       await trackingDoc.save();
 
       const employeeName = operatorTracking.operatorName || "Unknown";
-      const scanCount    = operatorTracking.barcodeScans.length;
+      const scanCount = operatorTracking.barcodeScans.length;
 
-      // WebSocket events
+      // Emit WebSocket events
       try {
         const parsedBarcode = parseBarcode(scanId);
         if (parsedBarcode.success && io) {
+          // Try to find work order to emit to its room
           let workOrder = await findWorkOrderByShortId(parsedBarcode.workOrderShortId);
           if (!workOrder) {
+            // Try full MongoDB ID
             try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch { }
           }
 
           if (workOrder) {
             io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
-              workOrderId:     workOrder._id,
+              workOrderId: workOrder._id,
               workOrderNumber: workOrder.workOrderNumber,
-              barcodeId:       scanId,
-              unitNumber:      parsedBarcode.unitNumber,
+              barcodeId: scanId,
+              unitNumber: parsedBarcode.unitNumber,
               operationNumber: parsedBarcode.operationNumber,
               machineId,
               machineName: machine.name,
-              timestamp:   scanTime,
+              timestamp: scanTime,
               employeeName,
-              activeOps:   activeOpsCodes, // array
-              type:        "scan",
+              type: "scan",
               scanCount,
             });
           }
 
           io.emit("tracking-data-updated", {
-            date:        scanDate,
-            timestamp:   new Date(),
-            message:     "New scan recorded",
+            date: scanDate,
+            timestamp: new Date(),
+            message: "New scan recorded",
             workOrderId: workOrder?._id,
-            unitNumber:  parsedBarcode.unitNumber,
-            activeOps:   activeOpsCodes, // array
+            unitNumber: parsedBarcode.unitNumber,
           });
         }
       } catch (wsError) {
         console.error("Error emitting WebSocket event:", wsError);
+        // Don't fail the scan if WebSocket fails
       }
 
       return res.json({
-        success:      true,
-        message:      "Barcode scanned",
+        success: true,
+        message: "Barcode scanned",
         employeeName,
         scanCount,
-        barcodeData:  { barcodeId: scanId, activeOps: activeOpsCodes },
+        barcodeData: { barcodeId: scanId },
       });
     }
 
     // ─── EMPLOYEE SIGN IN / OUT ────────────────────────────────────────────────
     if (isEmployeeId(scanId)) {
       const operator = await Employee.findOne({
-        identityId:     scanId,
+        identityId: scanId,
         needsToOperate: true,
-        status:         "active",
+        status: "active",
       }).select("firstName lastName identityId");
 
       if (!operator) {
@@ -220,7 +193,6 @@ router.post("/scan", async (req, res) => {
 
       const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
 
-      // Sign out from any other machine they may be on
       for (const m of trackingDoc.machines) {
         if (
           m.currentOperatorIdentityId === scanId &&
@@ -229,12 +201,16 @@ router.post("/scan", async (req, res) => {
           const existingSession = m.operators.find(
             (op) => op.operatorIdentityId === scanId && !op.signOutTime
           );
-          if (existingSession) existingSession.signOutTime = scanTime;
+
+          if (existingSession) {
+            existingSession.signOutTime = scanTime;
+          }
+
           m.currentOperatorIdentityId = null;
         }
       }
 
-      // Same operator already signed in on THIS machine → sign out
+      // Case 1: Same operator already signed in → sign out
       if (machineTracking.currentOperatorIdentityId === scanId) {
         const session = machineTracking.operators.find(
           (op) => op.operatorIdentityId === scanId && !op.signOutTime
@@ -245,80 +221,51 @@ router.post("/scan", async (req, res) => {
           await trackingDoc.save();
 
           try {
-            if (io)
-              io.emit("operator-status-update", {
-                machineId,
-                machineName: machine.name,
-                employeeName,
-                message:   `${employeeName} signed out`,
-                timestamp: new Date(),
-              });
+            if (io) io.emit("operator-status-update", {
+              machineId, machineName: machine.name, employeeName,
+              message: `${employeeName} signed out`, timestamp: new Date(),
+            });
           } catch { }
 
-          return res.json({
-            success:     true,
-            message:     `${employeeName} signed out`,
-            employeeName,
-            employeeId:  scanId,
-            action:      "signout",
-            scanCount:   0,
-          });
+          return res.json({ success: true, message: `${employeeName} signed out`, employeeName, employeeId: scanId, action: "signout", scanCount: 0 });
         }
-        return res.status(400).json({
-          success: false,
-          message: "Operator session not found",
-        });
+        return res.status(400).json({ success: false, message: "Operator session not found" });
       }
 
-      // Different operator is signed in → sign out existing, sign in new
+      // Case 2: Different operator is signed in → sign out existing, sign in new
       if (machineTracking.currentOperatorIdentityId) {
         const existingSession = machineTracking.operators.find(
-          (op) =>
-            op.operatorIdentityId === machineTracking.currentOperatorIdentityId &&
-            !op.signOutTime
+          (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime
         );
         if (existingSession) existingSession.signOutTime = scanTime;
       }
 
+      // Sign in the new operator
       machineTracking.operators.push({
         operatorIdentityId: scanId,
-        operatorName:       employeeName,
-        signInTime:         scanTime,
-        signOutTime:        null,
-        barcodeScans:       [],
+        operatorName: employeeName,
+        signInTime: scanTime,
+        signOutTime: null,
+        barcodeScans: [],
       });
       machineTracking.currentOperatorIdentityId = scanId;
       await trackingDoc.save();
 
       try {
-        if (io)
-          io.emit("operator-status-update", {
-            machineId,
-            machineName: machine.name,
-            employeeName,
-            status:    `${employeeName} signed in to ${machine.name}`,
-            timestamp: new Date(),
-          });
+        if (io) io.emit("operator-status-update", {
+          machineId, machineName: machine.name, employeeName,
+          status: `${employeeName} signed in to ${machine.name}`, timestamp: new Date(),
+        });
       } catch { }
 
-      return res.json({
-        success:     true,
-        message:     `${employeeName} signed in`,
-        employeeName,
-        employeeId:  scanId,
-        action:      "signin",
-        scanCount:   0,
-      });
+      return res.json({ success: true, message: `${employeeName} signed in`, employeeName, employeeId: scanId, action: "signin", scanCount: 0 });
     }
 
     return res.status(400).json({ success: false, message: "Invalid scan ID format" });
+
   } catch (error) {
     console.error("Error processing scan:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while processing scan",
-      error:   error.message,
-    });
+    res.status(500).json({ success: false, message: "Server error while processing scan", error: error.message });
   }
 });
 
@@ -334,6 +281,7 @@ router.post("/bulk-scans", async (req, res) => {
     const results = { total: scans.length, successful: 0, failed: 0, errors: [] };
     const scansByDate = {};
 
+    // Group by date
     for (const scanData of scans) {
       const { scanId, machineId, timeStamp } = scanData;
       if (!scanId || !machineId || !timeStamp) {
@@ -351,24 +299,21 @@ router.post("/bulk-scans", async (req, res) => {
       scanDate.setHours(0, 0, 0, 0);
       const dateKey = scanDate.toISOString();
       if (!scansByDate[dateKey]) scansByDate[dateKey] = { date: scanDate, machines: {} };
-      if (!scansByDate[dateKey].machines[machineId])
-        scansByDate[dateKey].machines[machineId] = { machineId, scans: [] };
+      if (!scansByDate[dateKey].machines[machineId]) scansByDate[dateKey].machines[machineId] = { machineId, scans: [] };
       scansByDate[dateKey].machines[machineId].scans.push({
         ...scanData,
-        timeStamp:  scanTime,
-        activeOps:  normaliseActiveOps(scanData.activeOps), // always array
+        timeStamp: scanTime,
       });
     }
 
     for (const dateKey in scansByDate) {
       const dateGroup = scansByDate[dateKey];
       let trackingDoc = await ProductionTracking.findOne({ date: dateGroup.date });
-      if (!trackingDoc)
-        trackingDoc = new ProductionTracking({ date: dateGroup.date, machines: [] });
+      if (!trackingDoc) trackingDoc = new ProductionTracking({ date: dateGroup.date, machines: [] });
 
       for (const machineId in dateGroup.machines) {
         const machineData = dateGroup.machines[machineId];
-        const machine     = await Machine.findById(machineId);
+        const machine = await Machine.findById(machineId);
         if (!machine) {
           results.failed += machineData.scans.length;
           results.errors.push({ machineId, error: "Machine not found" });
@@ -386,49 +331,43 @@ router.post("/bulk-scans", async (req, res) => {
         for (const scan of machineData.scans) {
           try {
             if (scan.isEmployeeScan) {
+              // Employee sign in/out
               const { employeeName, employeeId, action } = scan;
               if (action === "signout") {
                 const session = machineTracking.operators.find(
-                  (op) =>
-                    op.operatorIdentityId === (employeeId || scan.scanId) && !op.signOutTime
+                  (op) => op.operatorIdentityId === (employeeId || scan.scanId) && !op.signOutTime
                 );
                 if (session) {
                   session.signOutTime = scan.timeStamp;
                   machineTracking.currentOperatorIdentityId = null;
                 }
               } else {
+                // sign in
                 if (machineTracking.currentOperatorIdentityId) {
                   const existing = machineTracking.operators.find(
-                    (op) =>
-                      op.operatorIdentityId === machineTracking.currentOperatorIdentityId &&
-                      !op.signOutTime
+                    (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime
                   );
                   if (existing) existing.signOutTime = scan.timeStamp;
                 }
                 machineTracking.operators.push({
                   operatorIdentityId: employeeId || scan.scanId,
-                  operatorName:       employeeName || "",
-                  signInTime:         scan.timeStamp,
-                  signOutTime:        null,
-                  barcodeScans:       [],
+                  operatorName: employeeName || "",
+                  signInTime: scan.timeStamp,
+                  signOutTime: null,
+                  barcodeScans: [],
                 });
                 machineTracking.currentOperatorIdentityId = employeeId || scan.scanId;
               }
             } else {
-              // Barcode scan — store with activeOps as array
-              if (!machineTracking.currentOperatorIdentityId)
+              // Barcode scan
+              if (!machineTracking.currentOperatorIdentityId) {
                 throw new Error("No operator signed in");
+              }
               const operatorSession = machineTracking.operators.find(
-                (op) =>
-                  op.operatorIdentityId === machineTracking.currentOperatorIdentityId &&
-                  !op.signOutTime
+                (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime
               );
               if (!operatorSession) throw new Error("Operator session not found");
-              operatorSession.barcodeScans.push({
-                barcodeId: scan.scanId,
-                timeStamp: scan.timeStamp,
-                activeOps: scan.activeOps, // already normalised above
-              });
+              operatorSession.barcodeScans.push({ barcodeId: scan.scanId, timeStamp: scan.timeStamp });
             }
             results.successful++;
           } catch (scanError) {
@@ -447,11 +386,7 @@ router.post("/bulk-scans", async (req, res) => {
     });
   } catch (error) {
     console.error("Bulk scan error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error processing bulk scans",
-      error:   error.message,
-    });
+    res.status(500).json({ success: false, message: "Server error processing bulk scans", error: error.message });
   }
 });
 
@@ -486,38 +421,30 @@ router.get("/status/:date", async (req, res) => {
           .select("firstName lastName identityId");
 
         machineScans += operator.barcodeScans.length;
-        totalScans   += operator.barcodeScans.length;
+        totalScans += operator.barcodeScans.length;
 
         operatorsWithDetails.push({
           identityId: operator.operatorIdentityId,
-          name:       employeeDoc
-            ? `${employeeDoc.firstName} ${employeeDoc.lastName}`
-            : "Unknown Operator",
-          signInTime:  operator.signInTime,
+          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          signInTime: operator.signInTime,
           signOutTime: operator.signOutTime,
-          barcodeScans: operator.barcodeScans.map((s) => ({
-            barcodeId: s.barcodeId,
-            timeStamp: s.timeStamp,
-            activeOps: s.activeOps || [], // array
-          })),
+          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp })),
           scanCount: operator.barcodeScans.length,
-          isActive:  !operator.signOutTime,
+          isActive: !operator.signOutTime,
         });
       }
 
       let currentOperator = null;
       if (machine.currentOperatorIdentityId) {
-        const empDoc = await Employee.findOne({
-          identityId: machine.currentOperatorIdentityId,
-        }).select("firstName lastName identityId");
+        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
           : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
       }
 
       machinesStatus.push({
-        machineId:     machine.machineId?._id,
-        machineName:   machine.machineId?.name   || "Unknown Machine",
+        machineId: machine.machineId?._id,
+        machineName: machine.machineId?.name || "Unknown Machine",
         machineSerial: machine.machineId?.serialNumber || "Unknown",
         currentOperator,
         operators: operatorsWithDetails,
@@ -526,10 +453,8 @@ router.get("/status/:date", async (req, res) => {
     }
 
     res.json({
-      success: true,
-      date:    trackingDoc.date,
-      totalMachines: trackingDoc.machines.length,
-      totalScans,
+      success: true, date: trackingDoc.date,
+      totalMachines: trackingDoc.machines.length, totalScans,
       machines: machinesStatus,
     });
   } catch (error) {
@@ -566,40 +491,31 @@ router.get("/status/today", async (req, res) => {
       for (const operator of machine.operators) {
         const employeeDoc = await Employee.findOne({ identityId: operator.operatorIdentityId })
           .select("firstName lastName identityId");
-
         machineScans += operator.barcodeScans.length;
-        totalScans   += operator.barcodeScans.length;
+        totalScans += operator.barcodeScans.length;
 
         operatorsWithDetails.push({
           identityId: operator.operatorIdentityId,
-          name:       employeeDoc
-            ? `${employeeDoc.firstName} ${employeeDoc.lastName}`
-            : "Unknown Operator",
-          signInTime:  operator.signInTime,
+          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          signInTime: operator.signInTime,
           signOutTime: operator.signOutTime,
-          barcodeScans: operator.barcodeScans.map((s) => ({
-            barcodeId: s.barcodeId,
-            timeStamp: s.timeStamp,
-            activeOps: s.activeOps || [], // array
-          })),
+          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp })),
           scanCount: operator.barcodeScans.length,
-          isActive:  !operator.signOutTime,
+          isActive: !operator.signOutTime,
         });
       }
 
       let currentOperator = null;
       if (machine.currentOperatorIdentityId) {
-        const empDoc = await Employee.findOne({
-          identityId: machine.currentOperatorIdentityId,
-        }).select("firstName lastName identityId");
+        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
           : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
       }
 
       machinesStatus.push({
-        machineId:     machine.machineId?._id,
-        machineName:   machine.machineId?.name   || "Unknown Machine",
+        machineId: machine.machineId?._id,
+        machineName: machine.machineId?.name || "Unknown Machine",
         machineSerial: machine.machineId?.serialNumber || "Unknown",
         currentOperator,
         operators: operatorsWithDetails,
@@ -608,10 +524,8 @@ router.get("/status/today", async (req, res) => {
     }
 
     res.json({
-      success: true,
-      date:    trackingDoc.date,
-      totalMachines: trackingDoc.machines.length,
-      totalScans,
+      success: true, date: trackingDoc.date,
+      totalMachines: trackingDoc.machines.length, totalScans,
       machines: machinesStatus,
     });
   } catch (error) {
@@ -621,6 +535,7 @@ router.get("/status/today", async (req, res) => {
 });
 
 // ─── GET /machine/:machineId/operations ───────────────────────────────────────
+// Now derives operations from barcodes scanned rather than stored operation numbers
 
 router.get("/machine/:machineId/operations", async (req, res) => {
   try {
@@ -634,27 +549,16 @@ router.get("/machine/:machineId/operations", async (req, res) => {
     }).populate("machines.machineId", "name serialNumber type");
 
     if (!trackingDoc) {
-      return res.json({
-        success: true,
-        message: "No tracking data for this machine today",
-        machineId,
-        operations: [],
-      });
+      return res.json({ success: true, message: "No tracking data for this machine today", machineId, operations: [] });
     }
 
-    const machine = trackingDoc.machines.find(
-      (m) => m.machineId.toString() === machineId
-    );
+    const machine = trackingDoc.machines.find((m) => m.machineId.toString() === machineId);
     if (!machine) {
-      return res.json({
-        success: true,
-        message: "Machine not found in today's tracking",
-        machineId,
-        operations: [],
-      });
+      return res.json({ success: true, message: "Machine not found in today's tracking", machineId, operations: [] });
     }
 
-    const operationMap = {};
+    // Derive operations from barcode scan patterns
+    const operationMap = {}; // { "WO-shortId": { scans, machineId } }
     let totalScans = 0;
 
     machine.operators.forEach((op) => {
@@ -663,8 +567,7 @@ router.get("/machine/:machineId/operations", async (req, res) => {
         const parts = scan.barcodeId?.split("-");
         if (parts?.[0] === "WO" && parts.length >= 3) {
           const woKey = parts[1];
-          if (!operationMap[woKey])
-            operationMap[woKey] = { shortId: woKey, scans: 0, operators: new Set() };
+          if (!operationMap[woKey]) operationMap[woKey] = { shortId: woKey, scans: 0, operators: new Set() };
           operationMap[woKey].scans++;
           operationMap[woKey].operators.add(op.operatorIdentityId);
         }
@@ -673,17 +576,17 @@ router.get("/machine/:machineId/operations", async (req, res) => {
 
     const operations = Object.values(operationMap).map((wo) => ({
       workOrderShortId: wo.shortId,
-      scansCount:       wo.scans,
-      operatorCount:    wo.operators.size,
-      isActive:         !!machine.currentOperatorIdentityId,
+      scansCount: wo.scans,
+      operatorCount: wo.operators.size,
+      isActive: !!machine.currentOperatorIdentityId,
     }));
 
     res.json({
-      success:         true,
+      success: true,
       machineId,
-      machineName:     machine.machineId?.name,
+      machineName: machine.machineId?.name,
       totalScans,
-      isActive:        !!machine.currentOperatorIdentityId,
+      isActive: !!machine.currentOperatorIdentityId,
       currentOperator: machine.currentOperatorIdentityId,
       operations,
     });
