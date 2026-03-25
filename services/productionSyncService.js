@@ -842,3 +842,9 @@ class ProductionSyncService {
 }
 
 module.exports = new ProductionSyncService();
+
+
+
+// ok so see basically an changes needed in this employee tab which is provided as below..
+// Basically in place of manually i need to do the mark as done button, let's keep one more functionality which is described as below ok...
+// Basically i want to keep an import via csv functionality ok.. So that i will import an csv consisting of person name , uin 

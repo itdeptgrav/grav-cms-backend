@@ -29,7 +29,7 @@ const operatorTrackingSchema = new mongoose.Schema(
   {
     operatorIdentityId: {
       type: String,
-      required: true,
+      required: false,
       trim: true,
       index: true,
     },
