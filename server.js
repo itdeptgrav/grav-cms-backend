@@ -318,57 +318,6 @@ const createDefaultAccountant = async () => {
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
 
-<<<<<<< HEAD
-const CATEGORY_MEASUREMENTS = {
-  Shirts: [
-    "Shoulder",
-    "Chest",
-    "Stomach",
-    "Bottom hem/Hips",
-    "Sleeve length",
-    "Cuff",
-    "Collar",
-    "Length",
-  ],
-  Bottoms: [
-    "Waist",
-    "Hips",
-    "Thigh",
-    "Knee",
-    "Bottom",
-    "Croch",
-    "Length",
-  ],
-  Outerwear: [
-    "Collar",
-    "Shoulder",
-    "Chest",
-    "Stomach",
-    "Bottom hem",
-    "Length",
-  ],
-};
-
-const assignMeasurementsToExistingProducts = async () => {
-  try {
-    console.log(
-      "🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...",
-    );
-
-    let totalUpdated = 0;
-
-    for (const [category, measurements] of Object.entries(
-      CATEGORY_MEASUREMENTS,
-    )) {
-      const result = await StockItem.updateMany(
-        { category: category },
-        {
-          $set: {
-            measurements: measurements,
-            updatedAt: new Date(),
-          },
-        },
-=======
 const assignMeasurementsToExistingProducts = async () => {
   try {
     console.log("🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...");
@@ -395,7 +344,6 @@ const assignMeasurementsToExistingProducts = async () => {
       const result = await StockItem.updateMany(
         { category },
         { $set: { measurements, updatedAt: new Date() } },
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
       );
       if (result.modifiedCount > 0 || result.matchedCount > 0) {
         console.log(
@@ -595,10 +543,6 @@ app.use("/api/hr/attendance", attendanceRoutes);
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
 
-<<<<<<< HEAD
-// Accountant Department Routes
-=======
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
 
@@ -623,11 +567,6 @@ app.use("/api/employee", employeeAuthRoutes);
 const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
 app.use("/api/employee/tasks", TasksEmployee);
 
-<<<<<<< HEAD
-
-// Cutting Master Routes
-=======
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
 const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
 app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
 
@@ -650,6 +589,15 @@ app.use("/cowork", require("./routes/task_routes/taskForward.js"));
 // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
 app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
+
+// Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
+app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
+
+//new tree substack routes
+app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
+
+const coworkRoutes = require("./routes//task_routes/cowork");
+app.use("/cowork", coworkRoutes);
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
 app.use('/api/customer/employees/cross-org', crossOrgRoutes);
@@ -1173,24 +1121,12 @@ app.get("/api/health", (req, res) => {
   res.status(200).json({
     success: true,
     message: "Backend server is running 🚀",
-<<<<<<< HEAD
-    database:
-      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
-=======
     database: mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
     productionSync: {
       enabled: true,
       syncInterval: "Every 20 minutes",
       cleanupSchedule: "Daily at 2 AM",
     },
-<<<<<<< HEAD
-    socketio: {
-      status: "running",
-      connections: io.engine.clientsCount,
-    },
-=======
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
     timestamp: new Date().toISOString(),
   });
 });
@@ -1238,13 +1174,7 @@ app.post("/api/cms/production/cleanup/manual", async (req, res) => {
   }
 });
 
-<<<<<<< HEAD
-/* =====================
-    GRACEFUL SHUTDOWN
-  ===================== */
-=======
 // Graceful shutdown
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
 let isShuttingDown = false;
 
 const gracefulShutdown = (signal) => {
@@ -1252,15 +1182,6 @@ const gracefulShutdown = (signal) => {
   isShuttingDown = true;
   console.log(`\n🛑 ${signal} received, starting graceful shutdown...`);
 
-<<<<<<< HEAD
-  // Close Socket.IO connections
-  io.close(() => {
-    console.log("✅ Socket.IO closed");
-  });
-
-  // Stop production sync service
-=======
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
   productionSyncService.stop();
 
   server.close(() => {
@@ -1288,16 +1209,4 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
-<<<<<<< HEAD
-  console.log(`✅ Coworking Space routes active at /cowork/*`);
-  console.log(`✅ Google Workspace routes active at /api/google/*`);
 });
-
-// see the below code basically this is all about the raw-item of our company inventory ok.. which need to fix  because so many issue's are occouring ok..
-// -> in the raw-item lists page, if the pagination is not added yet then add that ok or else the server response time will goona too large ok, so fix it
-// -> second thing is formal/nermal ui ok do not any colourful design ok/background ok..
-// -> the create/edit form is also not working means especially the edit form measn an serer error is occouring when doing the edit ok.. so fix it ok..
-// -> so let's fix these things ok
-=======
-});
->>>>>>> 7eeeec4c4d0e78909adfbc58e26c2daa81af4a70
