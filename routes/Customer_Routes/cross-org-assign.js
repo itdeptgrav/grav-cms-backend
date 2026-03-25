@@ -9,7 +9,7 @@ const Customer = require('../../models/Customer_Models/Customer');
 const EmployeeMpc = require('../../models/Customer_Models/Employee_Mpc');
 const StockItem = require('../../models/CMS_Models/Inventory/Products/StockItem');
 
-// ─── Auth middleware (same pattern as employees.js) ───────────────────────────
+// ─── Auth middleware ───────────────────────────────────────────────────────────
 const verifyCustomerToken = async (req, res, next) => {
   try {
     const token = req.cookies.customerToken;
@@ -22,7 +22,7 @@ const verifyCustomerToken = async (req, res, next) => {
   }
 };
 
-// ─── Helper: build & validate product array (identical to employees.js) ───────
+// ─── Helper: build & validate product array ────────────────────────────────────
 async function buildValidProducts(products) {
   const validProducts = [];
   const errors = [];
@@ -57,13 +57,9 @@ async function buildValidProducts(products) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /organisations
-// Returns all Customer organisations + their active employee counts.
-// The logged-in token is used to scope to the same sales portal that manages
-// employee records (EmployeeMpc.customerId references Customer._id).
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/organisations', verifyCustomerToken, async (req, res) => {
   try {
-    // Fetch all Customers (organisations)
     const customers = await Customer.find({})
       .select('_id name email phone')
       .sort({ name: 1 })
@@ -73,7 +69,6 @@ router.get('/organisations', verifyCustomerToken, async (req, res) => {
       return res.status(200).json({ success: true, organisations: [] });
     }
 
-    // Count active employees per customer in one aggregation
     const counts = await EmployeeMpc.aggregate([
       { $match: { status: 'active' } },
       { $group: { _id: '$customerId', employeeCount: { $sum: 1 } } }
@@ -94,8 +89,6 @@ router.get('/organisations', verifyCustomerToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /employees
-// Body: { orgIds: ["id1", "id2", ...] }
-// Returns all active employees from the given org IDs, enriched with orgName.
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/employees', verifyCustomerToken, async (req, res) => {
   try {
@@ -105,19 +98,16 @@ router.post('/employees', verifyCustomerToken, async (req, res) => {
       return res.status(400).json({ success: false, message: 'orgIds array is required' });
     }
 
-    // Validate all IDs are valid ObjectIds
     const validOrgIds = orgIds.filter(id => mongoose.Types.ObjectId.isValid(id));
     if (!validOrgIds.length) {
       return res.status(400).json({ success: false, message: 'No valid organisation IDs provided' });
     }
 
-    // Fetch org names for enrichment
     const orgs = await Customer.find({ _id: { $in: validOrgIds } })
       .select('_id name')
       .lean();
     const orgNameMap = Object.fromEntries(orgs.map(o => [o._id.toString(), o.name]));
 
-    // Fetch all active employees from these orgs
     const employees = await EmployeeMpc.find({
       customerId: { $in: validOrgIds },
       status: 'active',
@@ -147,31 +137,34 @@ router.post('/employees', verifyCustomerToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /assign-products
 // Body:
-//   orgIds       – array of org IDs to scope
-//   department   – filter by department (null = all depts)
-//   designation  – filter by designation (null = all desigs within dept)
-//   genderFilter – "All" | "Male" | "Female"
-//   products     – array of { productId, variantId, quantity, productName, genderCategory }
+//   orgIds            – array of org IDs to scope
+//   department        – filter (null = all depts)
+//   designation       – filter (null = all desigs)
+//   genderFilter      – "All" | "Male" | "Female"
+//   products          – array of { productId, variantId, quantity, productName, genderCategory }
+//   removedProductIds – array of productId strings that were explicitly unchecked
 //
-// Logic:
-//   1. Validate products
-//   2. Find all scoped employees (by orgIds + dept + desig + gender)
-//   3. For each employee:
-//      a. Remove any existing entries for the same productIds (replace, not duplicate)
-//      b. Apply gender restriction: Male product → skip Female employees, vice-versa
-//      c. Append/replace products
-//   4. BulkWrite all updates in one query per org
+// Logic per employee:
+//   1. Start with their current products array
+//   2. Strip out every pid in removedProductIds  ← THE FIX: was missing before
+//   3. Strip out every pid in the incoming products batch (to avoid duplicates)
+//   4. Re-append the incoming batch (with per-employee gender restriction)
+//   → net result: removed = gone, updated = replaced, untouched = kept
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/assign-products', verifyCustomerToken, async (req, res) => {
   try {
-    const { orgIds, department, designation, genderFilter = 'All', products } = req.body;
+    const {
+      orgIds,
+      department,
+      designation,
+      genderFilter = 'All',
+      products = [],                // may be empty if user removed everything
+      removedProductIds = [],       // ← pids the user explicitly unchecked
+    } = req.body;
 
-    // ── Validation ────────────────────────────────────────────────────────────
+    // ── Basic validation ──────────────────────────────────────────────────────
     if (!Array.isArray(orgIds) || !orgIds.length) {
       return res.status(400).json({ success: false, message: 'orgIds is required' });
-    }
-    if (!Array.isArray(products) || !products.length) {
-      return res.status(400).json({ success: false, message: 'products array is required' });
     }
 
     const validOrgIds = orgIds.filter(id => mongoose.Types.ObjectId.isValid(id));
@@ -179,33 +172,59 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
       return res.status(400).json({ success: false, message: 'No valid org IDs' });
     }
 
-    // Validate & resolve products (batch fetch StockItems once)
-    const { validProducts, errors: productErrors } = await buildValidProducts(products);
-    if (productErrors.length) {
-      return res.status(400).json({ success: false, message: productErrors.join('; ') });
+    // ── BUG FIX: allow empty products array ───────────────────────────────────
+    // Previously this returned 400 when products was empty, which meant you
+    // could never save a state where all products were removed. Now we allow it
+    // as long as removedProductIds has entries (or products is intentionally []).
+    if (!Array.isArray(products)) {
+      return res.status(400).json({ success: false, message: 'products must be an array' });
     }
-    if (!validProducts.length) {
-      return res.status(400).json({ success: false, message: 'No valid products after validation' });
+    if (!Array.isArray(removedProductIds)) {
+      return res.status(400).json({ success: false, message: 'removedProductIds must be an array' });
     }
 
-    // Keep genderCategory from original payload for restriction logic
-    // (buildValidProducts strips it — we re-attach from req body)
+    // Nothing to do at all
+    if (products.length === 0 && removedProductIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'No products to assign or remove' });
+    }
+
+    // ── Validate incoming products (skip if empty) ────────────────────────────
+    let validProducts = [];
+    if (products.length > 0) {
+      const { validProducts: vp, errors: productErrors } = await buildValidProducts(products);
+      if (productErrors.length) {
+        return res.status(400).json({ success: false, message: productErrors.join('; ') });
+      }
+      validProducts = vp;
+    }
+
+    // Build sets for fast lookup
+    // removedPidSet  — pids to unconditionally strip from every matched employee
+    // incomingPidSet — pids being re-added / updated (also needs stripping first to avoid dupes)
+    const removedPidSet  = new Set(removedProductIds.map(id => id.toString()));
+    const incomingPidSet = new Set(validProducts.map(p => p.productId.toString()));
+
+    // Combined set of pids to remove before re-adding incoming ones
+    const stripPidSet = new Set([...removedPidSet, ...incomingPidSet]);
+
+    // genderCategory map from original payload (buildValidProducts strips it)
     const productGenderMap = {};
     products.forEach(p => {
-      if (p.productId) productGenderMap[p.productId.toString()] = (p.genderCategory || '').toLowerCase().trim();
+      if (p.productId) {
+        productGenderMap[p.productId.toString()] = (p.genderCategory || '').toLowerCase().trim();
+      }
     });
 
-    // ── Build employee filter ─────────────────────────────────────────────────
+    // ── Build employee query ──────────────────────────────────────────────────
     const empFilter = {
       customerId: { $in: validOrgIds.map(id => new mongoose.Types.ObjectId(id)) },
       status: 'active',
     };
-    if (department) empFilter.department = department;
-    if (designation) empFilter.designation = designation;
+    if (department)              empFilter.department = department;
+    if (designation)             empFilter.designation = designation;
     if (genderFilter === 'Male') empFilter.gender = 'Male';
     if (genderFilter === 'Female') empFilter.gender = 'Female';
 
-    // Fetch all matching employees
     const employees = await EmployeeMpc.find(empFilter)
       .select('_id customerId gender products')
       .lean();
@@ -219,48 +238,46 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
       });
     }
 
-    // ── Build bulkWrite ops ───────────────────────────────────────────────────
-    // For each employee:
-    //   - keep all existing products whose productId is NOT in the new batch
-    //   - then add the new ones (with gender restriction per-employee)
-    const incomingPidSet = new Set(validProducts.map(p => p.productId.toString()));
-
-    const orgBreakdownMap = {};   // orgId → { orgName, updated }
-
-    // Fetch org names for breakdown
+    // ── Org breakdown setup ───────────────────────────────────────────────────
     const orgsForBreakdown = await Customer.find({ _id: { $in: validOrgIds } })
       .select('_id name')
       .lean();
+    const orgBreakdownMap = {};
     orgsForBreakdown.forEach(o => {
       orgBreakdownMap[o._id.toString()] = { orgName: o.name, updated: 0 };
     });
 
+    // ── Build bulkWrite ops ───────────────────────────────────────────────────
     const bulkOps = [];
 
     for (const emp of employees) {
-      const empGender = emp.gender; // "Male" or "Female"
+      const empGender = emp.gender; // "Male" | "Female"
 
-      // 1. Keep products not touched by this assignment
+      // Step 1: keep products that are not being touched at all
+      //         (neither removed nor part of the incoming batch)
       const retainedProducts = (emp.products || []).filter(p => {
         const pid = p.productId?.toString();
-        return pid && !incomingPidSet.has(pid);
+        // ── FIX: strip both explicitly removed pids AND incoming pids (dedup) ──
+        return pid && !stripPidSet.has(pid);
       });
 
-      // 2. Add new products with gender restriction
+      // Step 2: from the incoming batch, only add products whose gender matches
+      //         this employee (skip male products for female employees, vice versa)
       const addProducts = validProducts
         .filter(vp => {
           const gc = productGenderMap[vp.productId.toString()] || '';
-          if (gc === 'male' && empGender === 'Female') return false;
-          if (gc === 'female' && empGender === 'Male') return false;
+          if (gc === 'male'   && empGender === 'Female') return false;
+          if (gc === 'female' && empGender === 'Male')   return false;
           return true;
         })
         .map(vp => ({
-          productId: vp.productId,
-          variantId: vp.variantId || null,
-          quantity: vp.quantity || 1,
+          productId:   vp.productId,
+          variantId:   vp.variantId || null,
+          quantity:    vp.quantity  || 1,
           productName: vp.productName || '',
         }));
 
+      // Step 3: retained (untouched) + newly assigned
       const finalProducts = [...retainedProducts, ...addProducts];
 
       bulkOps.push({
@@ -268,19 +285,18 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
           filter: { _id: emp._id },
           update: {
             $set: {
-              products: finalProducts,
+              products:  finalProducts,
               updatedBy: req.customerId,
             }
           }
         }
       });
 
-      // Track per-org count
       const oid = emp.customerId.toString();
       if (orgBreakdownMap[oid]) orgBreakdownMap[oid].updated++;
     }
 
-    // ── Execute bulkWrite ─────────────────────────────────────────────────────
+    // ── Execute ───────────────────────────────────────────────────────────────
     let totalUpdated = 0;
     if (bulkOps.length > 0) {
       const result = await EmployeeMpc.bulkWrite(bulkOps, { ordered: false });
@@ -291,13 +307,14 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `Products assigned to ${totalUpdated} employee(s) across ${orgBreakdown.length} organisation(s)`,
+      message: `Products assigned/removed for ${totalUpdated} employee(s) across ${orgBreakdown.length} organisation(s)`,
       updated: totalUpdated,
       orgBreakdown,
       productsAssigned: validProducts.length,
+      productsRemoved:  removedPidSet.size,
       scope: {
-        orgs: validOrgIds.length,
-        department: department || null,
+        orgs:        validOrgIds.length,
+        department:  department  || null,
         designation: designation || null,
         genderFilter,
       }
