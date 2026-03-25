@@ -51,30 +51,91 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
   transports: ["websocket", "polling"],
-});
-
-// WebSocket connection handling
-io.on("connection", (socket) => {
-  console.log("✅ New WebSocket client connected:", socket.id);
-
-  socket.on("join-workorder", (workOrderId) => {
-    socket.join(`workorder-${workOrderId}`);
-    console.log(`Socket ${socket.id} joined room workorder-${workOrderId}`);
-  });
-
-  socket.on("leave-workorder", (workOrderId) => {
-    socket.leave(`workorder-${workOrderId}`);
-    console.log(`Socket ${socket.id} left room workorder-${workOrderId}`);
-  });
-
-  socket.on("disconnect", () => {
-    console.log("❌ WebSocket client disconnected:", socket.id);
-  });
+  pingTimeout: 60000,
 });
 
 // Make io accessible to routes
 app.set("io", io);
 
+// ─── WebSocket connection handling ────────────────────────────────────────────
+io.on("connection", (socket) => {
+  console.log("✅ New WebSocket client connected:", socket.id);
+
+  // Join cowork room
+  socket.on("join_cowork", (employeeId) => {
+    if (employeeId) {
+      socket.join(String(employeeId));
+      console.log(`✅ Employee ${employeeId} joined socket room`);
+
+      // Broadcast online status
+      socket.broadcast.emit("workspace-member-status", {
+        memberId: employeeId,
+        isOnline: true,
+      });
+    }
+  });
+
+  // Typing indicator
+  socket.on("typing", (data) => {
+    const { conversationId, isTyping } = data;
+    socket.to(`dm_${conversationId}`).emit("typing_indicator", {
+      conversationId,
+      isTyping,
+    });
+  });
+
+  // ── COWORKING SPACE: Group chat rooms ─────────────────────────────────
+  socket.on("join_group", (groupId) => {
+    if (groupId) {
+      socket.join(`group_${groupId}`);
+      console.log(`Socket ${socket.id} joined group_${groupId}`);
+    }
+  });
+
+  socket.on("leave_group", (groupId) => {
+    if (groupId) {
+      socket.leave(`group_${groupId}`);
+      console.log(`Socket ${socket.id} left group_${groupId}`);
+    }
+  });
+
+  // ── COWORKING SPACE: Direct message rooms ─────────────────────────────
+  socket.on("join_dm", (chatId) => {
+    // chatId = [senderId, receiverId].sort().join("_")
+    if (chatId) {
+      socket.join(`dm_${chatId}`);
+      console.log(`Socket ${socket.id} joined dm_${chatId}`);
+    }
+  });
+
+  socket.on("leave_dm", (chatId) => {
+    if (chatId) {
+      socket.leave(`dm_${chatId}`);
+    }
+  });
+
+  // ── COWORKING SPACE: Online presence tracking ─────────────────────────
+  socket.on("workspace-set-online", (memberId) => {
+    socket.workspaceMemberId = memberId;
+    socket.broadcast.emit("workspace-member-status", {
+      memberId,
+      isOnline: true,
+    });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("❌ WebSocket client disconnected:", socket.id);
+    // Broadcast offline status when a workspace member disconnects
+    if (socket.workspaceMemberId) {
+      socket.broadcast.emit("workspace-member-status", {
+        memberId: socket.workspaceMemberId,
+        isOnline: false,
+      });
+    }
+  });
+});
+
+// ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
   try {
     await mongoose.connect(
@@ -92,11 +153,13 @@ const connectDB = async () => {
 
 connectDB().then(async () => {
   await createDefaultCuttingMaster();
+  await createDefaultAccountant();
+  await assignMeasurementsToExistingProducts();
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
-const HRDepartment = require("./models/HRDepartment"); // make sure this exists in server.js also
-const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js"); // ✅ ADD THIS
+const HRDepartment = require("./models/HRDepartment");
+const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
 
 const createDefaultCuttingMaster = async () => {
   try {
@@ -113,7 +176,7 @@ const createDefaultCuttingMaster = async () => {
     const defaultCuttingMaster = new CuttingMaster({
       name: "Cutting Admin",
       email: "cutting@grav.in",
-      password: "Cut@12345", // will be hashed automatically
+      password: "Cut@12345",
       employeeId: "CUT001",
       phone: "9999999999",
       department: "Cutting",
@@ -122,7 +185,6 @@ const createDefaultCuttingMaster = async () => {
     });
 
     await defaultCuttingMaster.save();
-
     console.log("✅ Default Cutting Master created successfully");
   } catch (error) {
     console.error("❌ Cutting Master creation failed:", error.message);
@@ -144,7 +206,7 @@ const createDefaultAccountant = async () => {
     const defaultAccountant = new AccountantDepartment({
       name: "Accountant Admin",
       email: "accountant@grav.in",
-      password: "Account@12345", // will be hashed automatically
+      password: "Account@12345",
       employeeId: "ACC001",
       phone: "9999999999",
       department: "Accounting",
@@ -153,126 +215,107 @@ const createDefaultAccountant = async () => {
     });
 
     await defaultAccountant.save();
-
     console.log("✅ Default Accountant created successfully");
   } catch (error) {
     console.error("❌ Accountant creation failed:", error.message);
   }
 };
 
-// Update the database connection section
-connectDB().then(async () => {
-  await assignMeasurementsToExistingProducts(); // Add this line
-});
-//changes
-
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
 
 const CATEGORY_MEASUREMENTS = {
   Shirts: [
-    "Length",
+    "Shoulder",
     "Chest",
     "Stomach",
-    "Button Hem",
-    "Shoulder",
-    "Sleeve Length",
+    "Bottom hem/Hips",
+    "Sleeve length",
     "Cuff",
-    "Coller",
-  ],
-  Outerwear: ["Length", "Chest", "Stomach", "Button Hem", "Shoulder"],
-  Bottoms: [
+    "Collar",
     "Length",
+  ],
+  Bottoms: [
     "Waist",
-    "Sheet",
+    "Hips",
     "Thigh",
     "Knee",
-    "Buttom",
-    "Crouch Kista Cut",
+    "Bottom",
+    "Croch",
+    "Length",
+  ],
+  Outerwear: [
+    "Collar",
+    "Shoulder",
+    "Chest",
+    "Stomach",
+    "Bottom hem",
+    "Length",
   ],
 };
 
-const overwriteExistingMeasurements = async () => {
+const assignMeasurementsToExistingProducts = async () => {
   try {
-    const existingHR = await HRDepartment.findOne({
-      role: "hr_manager",
-      department: "Human Resources",
-    });
+    console.log(
+      "🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...",
+    );
+
+    let totalUpdated = 0;
+
     for (const [category, measurements] of Object.entries(
       CATEGORY_MEASUREMENTS,
     )) {
       const result = await StockItem.updateMany(
-        { category },
-        { $set: { measurements } },
-      );
-
-      console.log(`✅ ${category}: ${result.modifiedCount} documents updated`);
-    }
-
-    const defaultHR = new HRDepartment({
-      name: "HR Admin",
-      email: "hr@grav.in",
-      password: "Hr@12345", // will be hashed automatically
-      employeeId: "HR001",
-      phone: "9999999999",
-      department: "Human Resources",
-      role: "hr_manager",
-      isActive: true,
-    });
-
-    await defaultHR.save();
-
-    console.log("✅ Default HR Department created successfully");
-  } catch (error) {
-    console.error("❌ Measurement overwrite failed:", error.message);
-  }
-};
-
-
-const assignMeasurementsToExistingProducts = async () => {
-  try {
-    console.log("🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...");
-    
-    const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
-    
-    const CATEGORY_MEASUREMENTS = {
-      "Shirts": [
-        "Shoulder", "Chest", "Stomach", "Bottom hem/Hips", 
-         "Sleeve length", "Cuff", "Collar", "Length"
-      ],
-      "Bottoms": [
-        "Waist", "Hips", "Thigh", "Knee", "Bottom", "Croch", "Length"
-      ],
-      "Outerwear": [
-        "Collar", "Shoulder", "Chest", "Stomach", 
-        "Bottom hem", "Length"
-      ]
-    };
-
-    let totalUpdated = 0;
-
-    for (const [category, measurements] of Object.entries(CATEGORY_MEASUREMENTS)) {
-      // FORCE OVERRIDE - Update ALL products in this category regardless of existing measurements
-      const result = await StockItem.updateMany(
         { category: category },
-        { 
-          $set: { 
+        {
+          $set: {
             measurements: measurements,
-            updatedAt: new Date()
-          } 
-        }
+            updatedAt: new Date(),
+          },
+        },
       );
 
       if (result.modifiedCount > 0 || result.matchedCount > 0) {
-        console.log(`✅ ${category}: Updated ${result.modifiedCount} products (matched: ${result.matchedCount}) with ${measurements.length} measurements`);
+        console.log(
+          `✅ ${category}: Updated ${result.modifiedCount} products (matched: ${result.matchedCount}) with ${measurements.length} measurements`,
+        );
         totalUpdated += result.modifiedCount;
       } else {
-        console.log(`ℹ️ ${category}: No products found in this category`);
+        console.log(
+          `ℹ️ ${category}: No products found in this category`,
+        );
       }
     }
 
-    console.log(`✅ Measurement force override complete! Total products updated: ${totalUpdated}`);
+    console.log(
+      `✅ Measurement force override complete! Total products updated: ${totalUpdated}`,
+    );
+
+    // Create default HR
+    const existingHR = await HRDepartment.findOne({
+      role: "hr_manager",
+      department: "Human Resources",
+    });
+
+    if (!existingHR) {
+      const defaultHR = new HRDepartment({
+        name: "HR Admin",
+        email: "hr@grav.in",
+        password: "Hr@12345",
+        employeeId: "HR001",
+        phone: "9999999999",
+        department: "Human Resources",
+        role: "hr_manager",
+        isActive: true,
+      });
+
+      await defaultHR.save();
+      console.log("✅ Default HR Department created successfully");
+    }
   } catch (error) {
-    console.error("❌ Error assigning measurements to existing products:", error.message);
+    console.error(
+      "❌ Error assigning measurements to existing products:",
+      error.message,
+    );
   }
 };
 
@@ -301,7 +344,6 @@ app.use("/api/customer/requests", customerRequestsRoutes);
 const customerProfileRoutes = require("./routes/Customer_Routes/Profile.js");
 app.use("/api/customer/profile", customerProfileRoutes);
 
-// Add this to your server.js in the CMS ROUTES section
 const customerStockItemsRoutes = require("./routes/Customer_Routes/StockItems");
 app.use("/api/customer/stock-items", customerStockItemsRoutes);
 
@@ -312,7 +354,6 @@ const customerQuotationRoutes = require("./routes/Customer_Routes/QuotationRoute
 app.use("/api/customer", customerQuotationRoutes);
 
 const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
-// Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
@@ -382,7 +423,6 @@ app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 const ProductionTracking = require("./routes/CMS_Routes/Production/Tracking/trackingRoutes.js");
 app.use("/api/cms/production/tracking", ProductionTracking);
 
-// In your main server.js or app.js
 const workOrderProgressRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes");
 app.use(
   "/api/cms/manufacturing/work-orders/production-tracking",
@@ -395,13 +435,9 @@ app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
 app.use("/api/cms/production/dashboard", productionDashboardRoutes);
 
-
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionMachineLayout);
 
-
-
-// In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
 app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
 
@@ -427,8 +463,9 @@ app.use("/api/cms/sales/overview", salesOverview);
 const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
 app.use("/api/cms/sales", quotationRoutes);
 
-const googleTasksRoutes = require("./routes/googleTasksRoutes");
-app.use("/api/google", googleTasksRoutes);
+// ─── GOOGLE WORKSPACE ROUTES ────────────────────────────────
+const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
+app.use("/api/google", googleWorkspaceRoutes);
 
 // HR Department Routes
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
@@ -455,7 +492,6 @@ app.use("/api/hr/attendance", attendanceRoutes);
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
 
-
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
@@ -463,6 +499,7 @@ app.use("/api/accountant/customers", accountantCustomersRoutes);
 // Accountant Vendor Routes
 const accountantVendorRoutes = require("./routes/Accountant_Routes/vendors");
 app.use("/api/accountant/vendors", accountantVendorRoutes);
+
 const vendorProfileRoutes = require("./routes/Vendor_Routes/profile.js");
 app.use("/api/vendor/profile", vendorProfileRoutes);
 
@@ -482,31 +519,46 @@ app.use("/api/employee", employeeAuthRoutes);
 const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
 app.use("/api/employee/tasks", TasksEmployee);
 
-// Import the cutting master routes
+
+// Cutting Master Routes
 const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
 app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
 
 const patternGradingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/patternGradingRoutes");
 app.use("/api/cms/manufacturing/cutting-master", patternGradingRoutes);
 
-// Import measurement routes
 const CuttingmeasurementRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes");
 app.use("/api/cms/manufacturing/cutting-master", CuttingmeasurementRoutes);
 
-// Import the bulk cutting routes
 const bulkCuttingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/bulkCuttingRoutes.js");
-// Merge the routers
 app.use("/api/cms/manufacturing/cutting-master", bulkCuttingRoutes);
 
 // Vendor Routes For Vendor Portal
-const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes"); // NEW FILE
+const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes");
 app.use("/api/vendor", vendorAuthRoutes);
 
-
-const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
+const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js");
 app.use("/api/barcode-devices", barcodeScannerRoutes);
 
+app.use("/cowork", require("./routes/task_routes/taskForward.js"));
+// Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
+app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
+// Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
+app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
+
+//new tree substack routes
+app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
+
+
+/* =====================
+    COWORKING SPACE ROUTES (Firebase/Firestore only — no MongoDB)
+  ===================== */
+const coworkRoutes = require("./routes/task_routes/cowork.js");
+app.use("/cowork", coworkRoutes);
+console.log('✅ Cowork routes mounted at /cowork');
+console.log('   - GET /cowork/notifications');
+console.log('   - PATCH /cowork/notifications/read-all');
 /* =====================
     HEALTH CHECK
   ===================== */
@@ -516,7 +568,25 @@ app.get("/api/health", (req, res) => {
     message: "Backend server is running 🚀",
     database:
       mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+    productionSync: {
+      enabled: true,
+      syncInterval: "Every 20 minutes",
+      cleanupSchedule: "Daily at 2 AM",
+    },
+    socketio: {
+      status: "running",
+      connections: io.engine.clientsCount,
+    },
     timestamp: new Date().toISOString(),
+  });
+});
+
+// Simple health check for socket
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    socket: "running",
+    connections: io.engine.clientsCount
   });
 });
 
@@ -529,6 +599,7 @@ app.get("/", (req, res) => {
     message: "Welcome to GRAV Clothing Backend API",
     version: "1.0.0",
     departments: ["HR", "Project Management", "Sales"],
+    socketio: "enabled",
   });
 });
 
@@ -567,23 +638,9 @@ app.post("/api/cms/production/cleanup/manual", async (req, res) => {
   }
 });
 
-// Health check with sync service status
-app.get("/api/health", (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "Backend server is running 🚀",
-    database:
-      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
-    productionSync: {
-      enabled: true,
-      syncInterval: "Every 20 minutes",
-      cleanupSchedule: "Daily at 2 AM",
-    },
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// Graceful shutdown
+/* =====================
+    GRACEFUL SHUTDOWN
+  ===================== */
 let isShuttingDown = false;
 
 const gracefulShutdown = (signal) => {
@@ -591,6 +648,11 @@ const gracefulShutdown = (signal) => {
 
   isShuttingDown = true;
   console.log(`\n🛑 ${signal} received, starting graceful shutdown...`);
+
+  // Close Socket.IO connections
+  io.close(() => {
+    console.log("✅ Socket.IO closed");
+  });
 
   // Stop production sync service
   productionSyncService.stop();
@@ -622,12 +684,14 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
   console.log(`✅ WebSocket server is ready`);
+  console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
+  console.log(`✅ Coworking Space routes active at /cowork/*`);
+  console.log(`✅ Google Workspace routes active at /api/google/*`);
 });
 
-
 // see the below code basically this is all about the raw-item of our company inventory ok.. which need to fix  because so many issue's are occouring ok..
-// -> in the raw-item lists page, if the pagination is not added yet then add that ok or else the server response time will goona too large ok, so fix it 
+// -> in the raw-item lists page, if the pagination is not added yet then add that ok or else the server response time will goona too large ok, so fix it
 // -> second thing is formal/nermal ui ok do not any colourful design ok/background ok..
 // -> the create/edit form is also not working means especially the edit form measn an serer error is occouring when doing the edit ok.. so fix it ok..
 // -> so let's fix these things ok

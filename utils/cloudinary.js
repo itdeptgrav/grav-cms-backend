@@ -1,3 +1,6 @@
+//utils/ cloudinary.js
+/**
+ * GRAV-CMS-BACKEND/utils/cloudinary.js*/
 const cloudinary = require("cloudinary").v2;
 const streamifier = require("streamifier");
 
