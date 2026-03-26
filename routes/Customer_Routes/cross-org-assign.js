@@ -358,7 +358,6 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
     const productIdSet = new Set();
     allEmployees.forEach(emp =>
       (emp.products || []).forEach(p => {
-        // FIX 1: always coerce to string for consistent map keys
         const pid = p.productId?.toString();
         if (pid) productIdSet.add(pid);
       })
@@ -370,31 +369,37 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
           .lean()
       : [];
 
-    // FIX 1: stockMap keyed by string — guarantees lookup always works
     const stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
 
-    // ── Helper: resolve best image URL for a single product assignment ────────
-    //
-    // Priority chain:
-    //   1. Variant image (if variantId is set and variant has images)
-    //   2. Product-level image
-    //   3. Empty string (no image)
-    //
-    // FIX 2: both productId and variantId are coerced to string before lookup
-    // so ObjectId vs string mismatches never cause a miss.
+    // ── CRITICAL FIX: Get ANY image from ANY variant of the product ───────────
+    // This function will find the first available image from any variant
+    const getAnyVariantImage = (stockItem) => {
+      if (!stockItem || !stockItem.variants || !stockItem.variants.length) {
+        return null;
+      }
+      
+      // Loop through all variants and find the first one with an image
+      for (const variant of stockItem.variants) {
+        if (variant.images && variant.images.length > 0 && variant.images[0]) {
+          return variant.images[0];
+        }
+      }
+      
+      return null;
+    };
+
+    // ── Helper: resolve best image URL - NOW CHECKS ALL VARIANTS ──────────────
     const resolveImageUrl = (p) => {
-      // Always stringify before lookup — critical fix
       const pid = p.productId?.toString();
       if (!pid) return '';
 
       const si = stockMap.get(pid);
       if (!si) return '';
 
-      // Try variant image first
-      const vid = p.variantId?.toString();
-      if (vid && si.variants?.length) {
-        const variant = si.variants.find(v => v._id.toString() === vid); // FIX 2: string compare
-        if (variant?.images?.[0]) return variant.images[0];
+      // Try to get image from ANY variant first (regardless of which variant is assigned)
+      const anyVariantImage = getAnyVariantImage(si);
+      if (anyVariantImage) {
+        return anyVariantImage;
       }
 
       // Fallback to product-level image
@@ -402,12 +407,7 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
     };
 
     // ── Collect ALL image URLs that will be needed across all employees ────────
-    //
-    // We collect BOTH variant images AND product-level images for every
-    // product assignment, then download all unique URLs once.
-    // This ensures the backup/fallback URL is always in imageBufferMap.
-    //
-    // FIX 3 + FIX 4: collect fallback URLs separately so they're always available
+    // Now collects images from ALL variants of each product
     const imageUrlSet = new Set();
 
     allEmployees.forEach(emp => {
@@ -418,16 +418,19 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
         const si = stockMap.get(pid);
         if (!si) return;
 
-        // Collect variant image if applicable
-        const vid = p.variantId?.toString();
-        if (vid && si.variants?.length) {
-          const variant = si.variants.find(v => v._id.toString() === vid);
-          if (variant?.images?.[0]) imageUrlSet.add(variant.images[0]);
+        // CRITICAL: Collect images from ALL variants of this product
+        if (si.variants && si.variants.length) {
+          si.variants.forEach(variant => {
+            if (variant.images && variant.images.length > 0 && variant.images[0]) {
+              imageUrlSet.add(variant.images[0]);
+            }
+          });
         }
 
-        // ALWAYS also collect the product-level image as a backup
-        // FIX 4: this ensures even if variant image download fails, we have fallback
-        if (si.images?.[0]) imageUrlSet.add(si.images[0]);
+        // Also collect product-level images if any
+        if (si.images?.[0]) {
+          imageUrlSet.add(si.images[0]);
+        }
       });
     });
 
@@ -446,15 +449,11 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
         });
         imageBufferMap.set(url, Buffer.from(resp.data));
       } catch (err) {
-        // Log but don't fail the whole export — cell will be left blank for this URL
         console.warn(`[export] Failed to download image: ${url} — ${err.message}`);
       }
     }));
 
-    // ── Resolve image buffer for one product assignment with fallback ──────────
-    //
-    // FIX 4: explicit two-level fallback so a failed variant image download
-    // automatically uses the product-level image if it downloaded successfully.
+    // ── CRITICAL: Resolve image buffer by checking ALL variants ────────────────
     const resolveImageBuffer = (p) => {
       const pid = p.productId?.toString();
       if (!pid) return null;
@@ -462,25 +461,55 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
       const si = stockMap.get(pid);
       if (!si) return null;
 
-      // Try variant image first
-      const vid = p.variantId?.toString();
-      if (vid && si.variants?.length) {
-        const variant = si.variants.find(v => v._id.toString() === vid);
-        if (variant?.images?.[0]) {
-          const buf = imageBufferMap.get(variant.images[0]);
-          if (buf) return { buffer: buf, url: variant.images[0] };
-          // Variant image URL existed but download failed → fall through to product image
-          console.warn(`[export] Variant image not in buffer map for product ${pid}, variant ${vid} — using product image fallback`);
+      // Try to get image from ANY variant first
+      if (si.variants && si.variants.length) {
+        for (const variant of si.variants) {
+          if (variant.images && variant.images.length > 0 && variant.images[0]) {
+            const imgUrl = variant.images[0];
+            const imgBuffer = imageBufferMap.get(imgUrl);
+            if (imgBuffer) {
+              return { buffer: imgBuffer, url: imgUrl, variantId: variant._id };
+            }
+          }
         }
       }
 
-      // Fallback: product-level image
+      // Fallback to product-level image
       if (si.images?.[0]) {
-        const buf = imageBufferMap.get(si.images[0]);
-        if (buf) return { buffer: buf, url: si.images[0] };
+        const imgUrl = si.images[0];
+        const imgBuffer = imageBufferMap.get(imgUrl);
+        if (imgBuffer) {
+          return { buffer: imgBuffer, url: imgUrl, type: 'product' };
+        }
       }
 
       return null; // No image available at all
+    };
+
+    // ── Helper: Get status text for image column ──────────────────────────────
+    const getImageStatusText = (p) => {
+      const pid = p.productId?.toString();
+      if (!pid) return 'Product Not Found';
+      
+      const si = stockMap.get(pid);
+      if (!si) return 'Product Not Found';
+      
+      // Check if ANY variant has images
+      let hasAnyVariantImage = false;
+      if (si.variants && si.variants.length) {
+        hasAnyVariantImage = si.variants.some(v => v.images && v.images.length > 0);
+      }
+      
+      if (hasAnyVariantImage) {
+        return ''; // Has images from some variant
+      }
+      
+      // Check product-level images
+      if (si.images && si.images.length > 0) {
+        return ''; // Has product image
+      }
+      
+      return 'No Image Present';
     };
 
     // ── Helper: get image extension for ExcelJS ───────────────────────────────
@@ -520,11 +549,11 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
       // Fixed columns + one photo column per product slot
       const fixedCols = [
         { header: 'Name',        key: 'name',        width: 24 },
-        { header: 'UIN',         key: 'uin',          width: 10 },
-        { header: 'Gender',      key: 'gender',       width: 9  },
-        { header: 'Department',  key: 'department',   width: 22 },
-        { header: 'Designation', key: 'designation',  width: 22 },
-        { header: 'Products',    key: 'products',     width: 32 },
+        { header: 'UIN',         key: 'uin',         width: 10 },
+        { header: 'Gender',      key: 'gender',      width: 9  },
+        { header: 'Department',  key: 'department',  width: 22 },
+        { header: 'Designation', key: 'designation', width: 22 },
+        { header: 'Products',    key: 'products',    width: 32 },
       ];
       const FIXED_COUNT = fixedCols.length; // 6
 
@@ -584,7 +613,6 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
         // Build combined product-names string
         const productNamesText = empProducts
           .map(p => {
-            // FIX 1: always stringify for stockMap lookup
             const si   = stockMap.get(p.productId?.toString());
             const name = p.productName || si?.name || '(unknown)';
             const qty  = p.quantity || 1;
@@ -592,7 +620,7 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
           })
           .join('\n');
 
-        // Determine row height — check if ANY product slot has an image buffer
+        // Determine row height
         const hasAnyImage = empProducts.some(p => resolveImageBuffer(p) !== null);
         const row = ws.getRow(rowIdx);
         row.height = hasAnyImage ? ROW_HEIGHT : Math.max(18, empProducts.length * 14);
@@ -613,28 +641,31 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
         });
 
         // ── Write photo columns — one per product slot ────────────────────────
-        //
-        // FIX (core): we now call resolveImageBuffer(p) per employee per product,
-        // which correctly handles ObjectId/string coercion and has a fallback chain.
-        // Previously, resolveImageUrl was called for the pre-download pass but the
-        // lookup during rendering could silently differ, leaving some cells blank.
         for (let i = 0; i < orgMaxProducts; i++) {
-          const photoColIdx = FIXED_COUNT + i + 1; // 1-based Excel col index
+          const photoColIdx = FIXED_COUNT + i + 1;
           const photoCell   = row.getCell(photoColIdx);
           styleCell(photoCell, altRow);
 
           const p = empProducts[i];
-          if (!p) continue; // no product for this slot — leave cell blank
+          if (!p) continue;
 
-          // Resolve buffer with full fallback chain
+          // Check if product has any image at all (for "No Image Present" text)
+          const statusText = getImageStatusText(p);
+          
+          // Resolve buffer from ANY variant
           const imgData = resolveImageBuffer(p);
+          
           if (!imgData) {
-            // Debug info in cell so it's visible in the sheet during testing
-            // Remove the line below (or change to continue) in production
-            // photoCell.value = '(no img)';
+            // No image available - show status text
+            if (statusText) {
+              photoCell.value = statusText;
+              photoCell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+              photoCell.font = { size: 8, color: { argb: 'FF9CA3AF' } };
+            }
             continue;
           }
 
+          // We have an image - add it to the cell
           const ext   = getImageExtension(imgData.url);
           const imgId = wb.addImage({ buffer: imgData.buffer, extension: ext });
 
