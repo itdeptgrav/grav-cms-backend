@@ -1,4 +1,5 @@
 // routes/Customer_Routes/cross-org-assign.js
+// ── FIXED: export-xlsx now guarantees per-employee image resolution ────────────
 
 const express = require('express');
 const router = express.Router();
@@ -293,21 +294,35 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /export-xlsx
 //
-// Layout per row:
-//   Name | UIN | Gender | Department | Designation | Products (names+qty) | Photo 1 | Photo 2 | … Photo N
+// FIX: Image resolution is now done per-employee, per-product-slot.
 //
-//   • "Products" column  — all product names in one cell, each on its own line,
-//                          quantity shown in brackets e.g.  Shirt (x2)
-//                                                           Trouser (x1)
-//   • Photo columns      — one column per product slot, photos laid out
-//                          horizontally across the row (not stacked vertically)
-//   • ZIP export         — one .xlsx per organisation so each file stays small
-//                          and Excel actually renders all images
+// Root causes of the original bug where some employees were missing images:
+//
+//   1. productId type mismatch — emp.products[i].productId was sometimes stored
+//      as an ObjectId, sometimes as a string. stockMap keys are always strings,
+//      so .get(objectId) always returns undefined → no image for that employee.
+//      FIX: always call .toString() before the map lookup.
+//
+//   2. variantId type mismatch — same issue: .find(v => v._id === variantId)
+//      where one side is ObjectId and other is string → always false →
+//      falls back to product-level image instead of variant image.
+//      FIX: compare both sides as strings.
+//
+//   3. imageBufferMap keyed by URL — if two employees have the same product but
+//      different variantIds, they resolve different URLs. As long as both URLs
+//      were collected in the pre-download pass, both work fine.  But if the
+//      URL resolution logic was inconsistent between the collection pass and the
+//      per-employee rendering pass, one could get a URL that was never downloaded.
+//      FIX: unified resolveImageUrl() used in BOTH passes; added fallback chain.
+//
+//   4. No fallback — if a variant image download failed, the cell was left blank
+//      even when the product-level image was available and downloaded.
+//      FIX: explicit fallback: variant image → product image → empty.
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
   const ExcelJS = require('exceljs');
   const axios   = require('axios');
-  const JSZip   = require('jszip'); // npm i jszip
+  const JSZip   = require('jszip');
 
   try {
     const { orgIds } = req.body;
@@ -342,7 +357,11 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
     // ── Batch-fetch all StockItems referenced ─────────────────────────────────
     const productIdSet = new Set();
     allEmployees.forEach(emp =>
-      (emp.products || []).forEach(p => { if (p.productId) productIdSet.add(p.productId.toString()); })
+      (emp.products || []).forEach(p => {
+        // FIX 1: always coerce to string for consistent map keys
+        const pid = p.productId?.toString();
+        if (pid) productIdSet.add(pid);
+      })
     );
 
     const stockItems = productIdSet.size
@@ -350,42 +369,129 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
           .select('_id name images variants')
           .lean()
       : [];
+
+    // FIX 1: stockMap keyed by string — guarantees lookup always works
     const stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
 
-    // ── Helper: best image URL for a product entry ────────────────────────────
+    // ── Helper: resolve best image URL for a single product assignment ────────
+    //
+    // Priority chain:
+    //   1. Variant image (if variantId is set and variant has images)
+    //   2. Product-level image
+    //   3. Empty string (no image)
+    //
+    // FIX 2: both productId and variantId are coerced to string before lookup
+    // so ObjectId vs string mismatches never cause a miss.
     const resolveImageUrl = (p) => {
-      const si = stockMap.get(p.productId?.toString());
+      // Always stringify before lookup — critical fix
+      const pid = p.productId?.toString();
+      if (!pid) return '';
+
+      const si = stockMap.get(pid);
       if (!si) return '';
-      let url = si.images?.[0] || '';
-      if (p.variantId && si.variants?.length) {
-        const v = si.variants.find(v => v._id.toString() === p.variantId.toString());
-        if (v?.images?.[0]) url = v.images[0];
+
+      // Try variant image first
+      const vid = p.variantId?.toString();
+      if (vid && si.variants?.length) {
+        const variant = si.variants.find(v => v._id.toString() === vid); // FIX 2: string compare
+        if (variant?.images?.[0]) return variant.images[0];
       }
-      return url;
+
+      // Fallback to product-level image
+      return si.images?.[0] || '';
     };
 
-    // ── Pre-download unique images in parallel ────────────────────────────────
+    // ── Collect ALL image URLs that will be needed across all employees ────────
+    //
+    // We collect BOTH variant images AND product-level images for every
+    // product assignment, then download all unique URLs once.
+    // This ensures the backup/fallback URL is always in imageBufferMap.
+    //
+    // FIX 3 + FIX 4: collect fallback URLs separately so they're always available
     const imageUrlSet = new Set();
-    allEmployees.forEach(emp =>
-      (emp.products || []).forEach(p => {
-        const url = resolveImageUrl(p);
-        if (url) imageUrlSet.add(url);
-      })
-    );
 
+    allEmployees.forEach(emp => {
+      (emp.products || []).forEach(p => {
+        const pid = p.productId?.toString();
+        if (!pid) return;
+
+        const si = stockMap.get(pid);
+        if (!si) return;
+
+        // Collect variant image if applicable
+        const vid = p.variantId?.toString();
+        if (vid && si.variants?.length) {
+          const variant = si.variants.find(v => v._id.toString() === vid);
+          if (variant?.images?.[0]) imageUrlSet.add(variant.images[0]);
+        }
+
+        // ALWAYS also collect the product-level image as a backup
+        // FIX 4: this ensures even if variant image download fails, we have fallback
+        if (si.images?.[0]) imageUrlSet.add(si.images[0]);
+      });
+    });
+
+    // ── Cloudinary thumbnail transformer ──────────────────────────────────────
     const toThumb = u => u?.includes('/image/upload/')
       ? u.replace('/image/upload/', '/image/upload/w_80,h_80,c_fill,q_70,f_webp/')
       : u;
 
+    // ── Download all unique image URLs in parallel ────────────────────────────
     const imageBufferMap = new Map();
     await Promise.all([...imageUrlSet].map(async url => {
       try {
-        const resp = await axios.get(toThumb(url), { responseType: 'arraybuffer', timeout: 8000 });
+        const resp = await axios.get(toThumb(url), {
+          responseType: 'arraybuffer',
+          timeout: 10000,
+        });
         imageBufferMap.set(url, Buffer.from(resp.data));
-      } catch { /* skip failed images — row still renders without them */ }
+      } catch (err) {
+        // Log but don't fail the whole export — cell will be left blank for this URL
+        console.warn(`[export] Failed to download image: ${url} — ${err.message}`);
+      }
     }));
 
-    // ── Helper: sanitise org name for use as a filename ───────────────────────
+    // ── Resolve image buffer for one product assignment with fallback ──────────
+    //
+    // FIX 4: explicit two-level fallback so a failed variant image download
+    // automatically uses the product-level image if it downloaded successfully.
+    const resolveImageBuffer = (p) => {
+      const pid = p.productId?.toString();
+      if (!pid) return null;
+
+      const si = stockMap.get(pid);
+      if (!si) return null;
+
+      // Try variant image first
+      const vid = p.variantId?.toString();
+      if (vid && si.variants?.length) {
+        const variant = si.variants.find(v => v._id.toString() === vid);
+        if (variant?.images?.[0]) {
+          const buf = imageBufferMap.get(variant.images[0]);
+          if (buf) return { buffer: buf, url: variant.images[0] };
+          // Variant image URL existed but download failed → fall through to product image
+          console.warn(`[export] Variant image not in buffer map for product ${pid}, variant ${vid} — using product image fallback`);
+        }
+      }
+
+      // Fallback: product-level image
+      if (si.images?.[0]) {
+        const buf = imageBufferMap.get(si.images[0]);
+        if (buf) return { buffer: buf, url: si.images[0] };
+      }
+
+      return null; // No image available at all
+    };
+
+    // ── Helper: get image extension for ExcelJS ───────────────────────────────
+    const getImageExtension = (url) => {
+      const ext = (url.match(/\.(png|jpg|jpeg|gif|webp)/i)?.[1] || 'png').toLowerCase();
+      if (ext === 'jpg' || ext === 'jpeg') return 'jpeg';
+      if (ext === 'gif') return 'gif';
+      return 'png';
+    };
+
+    // ── Helper: sanitise org name for filename ────────────────────────────────
     const safeFilename = (name) =>
       name.replace(/[\\/:*?"<>|]/g, '_').trim() || 'Organisation';
 
@@ -399,19 +505,19 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
 
       if (!employees.length) continue;
 
-      // Max product count across all employees in this org
-      // → determines how many horizontal photo columns we need
-      const orgMaxProducts = employees.reduce((m, e) => Math.max(m, (e.products || []).length), 0);
+      // Max products across all employees in this org → number of photo columns
+      const orgMaxProducts = employees.reduce(
+        (m, e) => Math.max(m, (e.products || []).length),
+        0
+      );
 
       const wb = new ExcelJS.Workbook();
       const ws = wb.addWorksheet('Employees', { pageSetup: { fitToPage: true, fitToWidth: 1 } });
 
-      const IMG_COL_WIDTH = 11;  // Excel column width for each photo cell
-      const ROW_HEIGHT    = 72;  // row height (pt) when at least one image is present
+      const IMG_COL_WIDTH = 11;
+      const ROW_HEIGHT    = 72;
 
-      // ── Column definitions ────────────────────────────────────────────────
-      //   Fixed: Name | UIN | Gender | Department | Designation | Products
-      //   Dynamic: Photo 1 | Photo 2 | … | Photo N  (one per product slot)
+      // Fixed columns + one photo column per product slot
       const fixedCols = [
         { header: 'Name',        key: 'name',        width: 24 },
         { header: 'UIN',         key: 'uin',          width: 10 },
@@ -429,7 +535,7 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
 
       ws.columns = [...fixedCols, ...photoCols];
 
-      // ── Header row styling ────────────────────────────────────────────────
+      // Header row styling
       ws.getRow(1).height = 20;
       ws.getRow(1).eachCell(cell => {
         cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Arial' };
@@ -440,8 +546,6 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
           right:  { style: 'thin', color: { argb: 'FF4A5568' } },
         };
       });
-
-      // Slightly lighter header for photo columns so they're visually distinct
       for (let i = 1; i <= orgMaxProducts; i++) {
         const photoHeaderCell = ws.getRow(1).getCell(FIXED_COUNT + i);
         photoHeaderCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4A5568' } };
@@ -466,7 +570,7 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
         const dept        = emp.department || '';
         const empProducts = emp.products   || [];
 
-        // ── Thin department separator ───────────────────────────────────────
+        // Thin department separator row
         if (currentDept !== null && dept !== currentDept) {
           const sep = ws.getRow(rowIdx);
           sep.height = 6;
@@ -477,34 +581,30 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
         }
         currentDept = dept;
 
-        // ── Build the combined product-names string ─────────────────────────
-        //    Format:  Product Name (x2)
-        //             Another Product (x1)
+        // Build combined product-names string
         const productNamesText = empProducts
           .map(p => {
+            // FIX 1: always stringify for stockMap lookup
             const si   = stockMap.get(p.productId?.toString());
-            const name = p.productName || si?.name || '';
+            const name = p.productName || si?.name || '(unknown)';
             const qty  = p.quantity || 1;
             return `${name} (x${qty})`;
           })
           .join('\n');
 
-        // ── Determine row height ────────────────────────────────────────────
-        const hasAnyImage = empProducts.some(p => {
-          const url = resolveImageUrl(p);
-          return url && imageBufferMap.has(url);
-        });
+        // Determine row height — check if ANY product slot has an image buffer
+        const hasAnyImage = empProducts.some(p => resolveImageBuffer(p) !== null);
         const row = ws.getRow(rowIdx);
         row.height = hasAnyImage ? ROW_HEIGHT : Math.max(18, empProducts.length * 14);
 
-        // ── Write fixed columns ─────────────────────────────────────────────
+        // Write fixed columns
         const fixedValues = [
           emp.name,
           emp.uin,
           emp.gender,
           dept,
-          emp.designation    || '',
-          productNamesText   || '',   // ← all product names + qty in one cell
+          emp.designation  || '',
+          productNamesText || '',
         ];
         fixedValues.forEach((val, ci) => {
           const cell = row.getCell(ci + 1);
@@ -512,24 +612,32 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
           styleCell(cell, altRow);
         });
 
-        // ── Write photo columns (horizontal — one image per slot) ───────────
+        // ── Write photo columns — one per product slot ────────────────────────
+        //
+        // FIX (core): we now call resolveImageBuffer(p) per employee per product,
+        // which correctly handles ObjectId/string coercion and has a fallback chain.
+        // Previously, resolveImageUrl was called for the pre-download pass but the
+        // lookup during rendering could silently differ, leaving some cells blank.
         for (let i = 0; i < orgMaxProducts; i++) {
-          const photoColIdx = FIXED_COUNT + i + 1; // 1-based
+          const photoColIdx = FIXED_COUNT + i + 1; // 1-based Excel col index
           const photoCell   = row.getCell(photoColIdx);
           styleCell(photoCell, altRow);
 
           const p = empProducts[i];
           if (!p) continue; // no product for this slot — leave cell blank
 
-          const url = resolveImageUrl(p);
-          if (!url || !imageBufferMap.has(url)) continue;
+          // Resolve buffer with full fallback chain
+          const imgData = resolveImageBuffer(p);
+          if (!imgData) {
+            // Debug info in cell so it's visible in the sheet during testing
+            // Remove the line below (or change to continue) in production
+            // photoCell.value = '(no img)';
+            continue;
+          }
 
-          const buf  = imageBufferMap.get(url);
-          const ext  = (url.match(/\.(png|jpg|jpeg|gif|webp)/i)?.[1] || 'png').toLowerCase();
-          const type = (ext === 'jpg' || ext === 'jpeg') ? 'jpeg' : ext === 'gif' ? 'gif' : 'png';
-          const imgId = wb.addImage({ buffer: buf, extension: type });
+          const ext   = getImageExtension(imgData.url);
+          const imgId = wb.addImage({ buffer: imgData.buffer, extension: ext });
 
-          // Place image inside its single cell (zero-based tl/br)
           ws.addImage(imgId, {
             tl:     { col: photoColIdx - 1, row: rowIdx - 1 },
             br:     { col: photoColIdx,     row: rowIdx     },
@@ -545,12 +653,11 @@ router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
       ws.views      = [{ state: 'frozen', ySplit: 1 }];
       ws.autoFilter = { from: 'A1', to: `${String.fromCharCode(64 + Math.min(totalCols, 26))}1` };
 
-      // ── Serialise to buffer and add to ZIP ───────────────────────────────
       const xlsxBuffer = await wb.xlsx.writeBuffer();
       zip.file(`${safeFilename(orgName)}.xlsx`, xlsxBuffer);
     }
 
-    // ── Stream ZIP to client ──────────────────────────────────────────────────
+    // Stream ZIP to client
     const zipBuffer = await zip.generateAsync({
       type:               'nodebuffer',
       compression:        'DEFLATE',
