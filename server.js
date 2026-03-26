@@ -147,8 +147,6 @@ const connectDB = async () => {
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
 
-    await assignMeasurementsToExistingProducts();
-
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -585,19 +583,19 @@ app.use("/api/vendor", vendorAuthRoutes);
 const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js");
 app.use("/api/barcode-devices", barcodeScannerRoutes);
 
-// app.use("/cowork", require("./routes/task_routes/taskForward.js"));
-// // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
-// app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
+app.use("/cowork", require("./routes/task_routes/taskForward.js"));
+// Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
+app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
 
-// // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
-// app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
+// Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
+app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
 
-// //new tree substack routes
-// app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
+//new tree substack routes
+app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
 
-// const coworkRoutes = require("./routes//task_routes/cowork");
-// app.use("/cowork", coworkRoutes);
+const coworkRoutes = require("./routes//task_routes/cowork");
+app.use("/cowork", coworkRoutes);
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
 app.use('/api/customer/employees/cross-org', crossOrgRoutes);
