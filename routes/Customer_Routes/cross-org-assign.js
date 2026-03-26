@@ -201,7 +201,7 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
     // Build sets for fast lookup
     // removedPidSet  — pids to unconditionally strip from every matched employee
     // incomingPidSet — pids being re-added / updated (also needs stripping first to avoid dupes)
-    const removedPidSet  = new Set(removedProductIds.map(id => id.toString()));
+    const removedPidSet = new Set(removedProductIds.map(id => id.toString()));
     const incomingPidSet = new Set(validProducts.map(p => p.productId.toString()));
 
     // Combined set of pids to remove before re-adding incoming ones
@@ -220,8 +220,8 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
       customerId: { $in: validOrgIds.map(id => new mongoose.Types.ObjectId(id)) },
       status: 'active',
     };
-    if (department)              empFilter.department = department;
-    if (designation)             empFilter.designation = designation;
+    if (department) empFilter.department = department;
+    if (designation) empFilter.designation = designation;
     if (genderFilter === 'Male') empFilter.gender = 'Male';
     if (genderFilter === 'Female') empFilter.gender = 'Female';
 
@@ -266,14 +266,14 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
       const addProducts = validProducts
         .filter(vp => {
           const gc = productGenderMap[vp.productId.toString()] || '';
-          if (gc === 'male'   && empGender === 'Female') return false;
-          if (gc === 'female' && empGender === 'Male')   return false;
+          if (gc === 'male' && empGender === 'Female') return false;
+          if (gc === 'female' && empGender === 'Male') return false;
           return true;
         })
         .map(vp => ({
-          productId:   vp.productId,
-          variantId:   vp.variantId || null,
-          quantity:    vp.quantity  || 1,
+          productId: vp.productId,
+          variantId: vp.variantId || null,
+          quantity: vp.quantity || 1,
           productName: vp.productName || '',
         }));
 
@@ -285,7 +285,7 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
           filter: { _id: emp._id },
           update: {
             $set: {
-              products:  finalProducts,
+              products: finalProducts,
               updatedBy: req.customerId,
             }
           }
@@ -311,10 +311,10 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
       updated: totalUpdated,
       orgBreakdown,
       productsAssigned: validProducts.length,
-      productsRemoved:  removedPidSet.size,
+      productsRemoved: removedPidSet.size,
       scope: {
-        orgs:        validOrgIds.length,
-        department:  department  || null,
+        orgs: validOrgIds.length,
+        department: department || null,
         designation: designation || null,
         genderFilter,
       }
@@ -325,5 +325,247 @@ router.post('/assign-products', verifyCustomerToken, async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error while assigning products', error: error.message });
   }
 });
+
+
+
+router.post('/export-xlsx', verifyCustomerToken, async (req, res) => {
+  const ExcelJS = require('exceljs');
+  const axios = require('axios');
+
+  try {
+    const { orgIds } = req.body;
+
+    if (!Array.isArray(orgIds) || !orgIds.length) {
+      return res.status(400).json({ success: false, message: 'orgIds array is required' });
+    }
+
+    const validOrgIds = orgIds.filter(id => mongoose.Types.ObjectId.isValid(id));
+    if (!validOrgIds.length) {
+      return res.status(400).json({ success: false, message: 'No valid organisation IDs provided' });
+    }
+
+    // Org name map
+    const orgs = await Customer.find({ _id: { $in: validOrgIds } })
+      .select('_id name')
+      .lean();
+    const orgNameMap = Object.fromEntries(orgs.map(o => [o._id.toString(), o.name]));
+
+    // Fetch all employees across selected orgs, sorted org → dept → name
+    const employees = await EmployeeMpc.find({
+      customerId: { $in: validOrgIds.map(id => new mongoose.Types.ObjectId(id)) },
+    })
+      .select('name uin gender department designation products customerId')
+      .sort({ customerId: 1, department: 1, name: 1 })
+      .lean();
+
+    if (!employees.length) {
+      return res.status(404).json({ success: false, message: 'No employees found for selected organisations' });
+    }
+
+    // Batch-fetch all StockItems referenced
+    const productIdSet = new Set();
+    employees.forEach(emp =>
+      (emp.products || []).forEach(p => { if (p.productId) productIdSet.add(p.productId.toString()); })
+    );
+
+    const stockItems = productIdSet.size
+      ? await StockItem.find({ _id: { $in: [...productIdSet] } })
+        .select('_id name images variants')
+        .lean()
+      : [];
+    const stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
+
+    // Pre-download unique images in parallel
+    const imageUrlSet = new Set();
+    employees.forEach(emp => {
+      (emp.products || []).forEach(p => {
+        const si = stockMap.get(p.productId?.toString());
+        if (!si) return;
+        let url = si.images?.[0] || '';
+        if (p.variantId && si.variants?.length) {
+          const v = si.variants.find(v => v._id.toString() === p.variantId.toString());
+          if (v?.images?.[0]) url = v.images[0];
+        }
+        if (url) imageUrlSet.add(url);
+      });
+    });
+
+    const imageBufferMap = new Map();
+    await Promise.all([...imageUrlSet].map(async url => {
+      try {
+        const toThumb = u => u?.includes('/image/upload/')
+          ? u.replace('/image/upload/', '/image/upload/w_80,h_80,c_fill,q_70,f_webp/')
+          : u;
+        const resp = await axios.get(toThumb(url), { responseType: 'arraybuffer', timeout: 8000 });
+        imageBufferMap.set(url, Buffer.from(resp.data));
+      } catch { /* skip failed images */ }
+    }));
+
+    // Build workbook — same visual style as the single-org export
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Employees', { pageSetup: { fitToPage: true, fitToWidth: 1 } });
+
+    const IMG_HEIGHT = 60;
+
+    // 10 columns — adds Organisation before Name
+    ws.columns = [
+      { header: 'Organisation', key: 'org', width: 22 },
+      { header: 'Name', key: 'name', width: 24 },
+      { header: 'UIN', key: 'uin', width: 10 },
+      { header: 'Gender', key: 'gender', width: 9 },
+      { header: 'Department', key: 'department', width: 22 },
+      { header: 'Designation', key: 'designation', width: 22 },
+      { header: 'Product Name', key: 'productName', width: 28 },
+      { header: 'Variant', key: 'variant', width: 14 },
+      { header: 'Quantity', key: 'quantity', width: 10 },
+      { header: 'Photo', key: 'photo', width: 12 },
+    ];
+
+    // Header row styling
+    ws.getRow(1).height = 20;
+    ws.getRow(1).eachCell(cell => {
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Arial' };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2D3748' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+      cell.border = {
+        bottom: { style: 'thin', color: { argb: 'FF4A5568' } },
+        right: { style: 'thin', color: { argb: 'FF4A5568' } },
+      };
+    });
+
+    const styleCell = (cell, isAlt) => {
+      cell.font = { size: 9, name: 'Arial' };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isAlt ? 'FFF7FAFC' : 'FFFFFFFF' } };
+      cell.alignment = { vertical: 'middle', wrapText: true };
+      cell.border = {
+        bottom: { style: 'hair', color: { argb: 'FFE2E8F0' } },
+        right: { style: 'hair', color: { argb: 'FFE2E8F0' } },
+      };
+    };
+
+    let currentOrg = null;
+    let currentDept = null;
+    let rowIdx = 2;
+    let altRow = false;
+
+    for (const emp of employees) {
+      const orgId = emp.customerId.toString();
+      const orgName = orgNameMap[orgId] || 'Unknown';
+      const dept = emp.department || '';
+
+      // Blank separator row between organisations
+      if (currentOrg !== null && orgId !== currentOrg) {
+        const sep = ws.getRow(rowIdx);
+        sep.height = 12;
+        ws.mergeCells(rowIdx, 1, rowIdx, 10);
+        sep.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDBE4EE' } };
+        sep.getCell(1).value = orgName;
+        sep.getCell(1).font = { bold: true, size: 9, name: 'Arial', color: { argb: 'FF2D3748' } };
+        sep.getCell(1).alignment = { vertical: 'middle', indent: 1 };
+        rowIdx++;
+        currentDept = null;
+        altRow = false;
+      } else if (currentOrg !== null && dept !== currentDept) {
+        // Lighter separator between departments within the same org
+        const sep = ws.getRow(rowIdx);
+        sep.height = 6;
+        ws.mergeCells(rowIdx, 1, rowIdx, 10);
+        sep.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEDF2F7' } };
+        rowIdx++;
+        altRow = false;
+      }
+
+      currentOrg = orgId;
+      currentDept = dept;
+
+      // Resolve products
+      const productLines = [];
+      const imageUrls = [];
+
+      (emp.products || []).forEach((p, idx) => {
+        const si = stockMap.get(p.productId?.toString());
+        const prodName = p.productName || si?.name || '';
+        let variantLabel = 'Default';
+        let imageUrl = '';
+
+        if (si) {
+          imageUrl = si.images?.[0] || '';
+          if (p.variantId && si.variants?.length) {
+            const v = si.variants.find(v => v._id.toString() === p.variantId.toString());
+            if (v) {
+              variantLabel = v.attributes?.map(a => a.value).join(' / ') || 'Default';
+              if (v.images?.[0]) imageUrl = v.images[0];
+            }
+          }
+        }
+
+        productLines.push(`${idx + 1}. ${prodName} | Qty: ${p.quantity || 1}`);
+        imageUrls.push(imageUrl);
+      });
+
+      const hasAnyImage = imageUrls.some(u => u && imageBufferMap.has(u));
+      const validImages = imageUrls.filter(u => u && imageBufferMap.has(u));
+      const row = ws.getRow(rowIdx);
+      row.height = hasAnyImage ? IMG_HEIGHT * validImages.length : 18;
+
+      const textValues = [
+        orgName,
+        emp.name,
+        emp.uin,
+        emp.gender,
+        dept,
+        emp.designation || '',
+        productLines.join('\n') || '',
+        '',
+        '',
+      ];
+
+      textValues.forEach((val, ci) => {
+        const cell = row.getCell(ci + 1);
+        cell.value = val;
+        styleCell(cell, altRow);
+      });
+      styleCell(row.getCell(10), altRow);
+      row.commit();
+
+      // Embed images stacked in Photo column (col 10)
+      if (validImages.length > 0) {
+        const sliceHeight = 1 / validImages.length;
+        validImages.forEach((url, imgIdx) => {
+          const buf = imageBufferMap.get(url);
+          const ext = (url.match(/\.(png|jpg|jpeg|gif|webp)/i)?.[1] || 'png').toLowerCase();
+          const type = (ext === 'jpg' || ext === 'jpeg') ? 'jpeg' : ext === 'gif' ? 'gif' : 'png';
+          const id = wb.addImage({ buffer: buf, extension: type });
+          ws.addImage(id, {
+            tl: { col: 9, row: rowIdx - 1 + imgIdx * sliceHeight },
+            br: { col: 10, row: rowIdx - 1 + (imgIdx + 1) * sliceHeight },
+            editAs: 'oneCell',
+          });
+        });
+      }
+
+      rowIdx++;
+      altRow = !altRow;
+    }
+
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+    ws.autoFilter = { from: 'A1', to: 'J1' };
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="cross_org_employees_${new Date().toISOString().split('T')[0]}.xlsx"`
+    );
+    await wb.xlsx.write(res);
+    res.end();
+
+  } catch (error) {
+    console.error('cross-org export-xlsx error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: 'Export failed: ' + error.message });
+    }
+  }
+});
+
 
 module.exports = router;
