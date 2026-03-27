@@ -562,6 +562,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     );
 
     const createdWorkOrders = [];
+    const skippedVariants = []; // Track skipped variants for reporting
 
     // Process each item in the request
     for (const item of request.items) {
@@ -577,12 +578,18 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 
         // Find the correct variant in stockItem
         let variantData = null;
+        let variantFound = false;
+        let usedFallback = false;
 
         // Method 1: Try to match by variantId (if it's a MongoDB ObjectId string)
         if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
           variantData = stockItem.variants.find(v =>
             v._id.toString() === variant.variantId
           );
+          if (variantData) {
+            variantFound = true;
+            console.log(`Found variant by ObjectId: ${variantData.sku}`);
+          }
         }
 
         // Method 2: If no match by ID or variantId is not ObjectId, try to match by attributes
@@ -601,26 +608,58 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 
             return allAttributesMatch;
           });
+
+          if (variantData) {
+            variantFound = true;
+            console.log(`Found variant by attribute matching: ${variantData.sku}`);
+          }
         }
 
         // Method 3: Try to match by variantId as SKU (if variantId is actually SKU)
         if (!variantData && variant.variantId) {
           variantData = stockItem.variants.find(v => v.sku === variant.variantId);
+          if (variantData) {
+            variantFound = true;
+            console.log(`Found variant by SKU matching: ${variantData.sku}`);
+          }
         }
 
+        // NEW: Auto-fallback logic - if no variant found, use the first available variant
+        if (!variantData && stockItem.variants && stockItem.variants.length > 0) {
+          variantData = stockItem.variants[0]; // Use the first variant
+          usedFallback = true;
+          console.warn(`⚠️ Variant not found for product ${stockItem.name}. Auto-selected first variant: ${variantData.sku}`);
+          console.warn(`   Original variant info:`, variant);
+
+          // Log this for monitoring
+          skippedVariants.push({
+            productName: stockItem.name,
+            productReference: stockItem.reference,
+            originalVariantId: variant.variantId,
+            originalAttributes: variant.attributes,
+            selectedVariant: {
+              id: variantData._id,
+              sku: variantData.sku,
+              attributes: variantData.attributes
+            }
+          });
+        }
+
+        // If still no variant found (stock item has no variants at all), skip and log
         if (!variantData) {
-          console.warn(`Variant not found in stockItem. Request variant:`, variant);
-          console.warn(`Available variants in stockItem:`, stockItem.variants.map(v => ({
-            id: v._id,
-            sku: v.sku,
-            attributes: v.attributes
-          })));
+          console.error(`❌ No variants available for product ${stockItem.name}. Cannot create work order.`);
+          skippedVariants.push({
+            productName: stockItem.name,
+            productReference: stockItem.reference,
+            originalVariantId: variant.variantId,
+            originalAttributes: variant.attributes,
+            error: "No variants available in stock item"
+          });
           continue;
         }
 
-        console.log(`Found matching variant: ${variantData.sku}`);
+        console.log(`Using variant: ${variantData.sku}${usedFallback ? ' (AUTO-SELECTED)' : ''}`);
 
-        // Get operations from stockItem
         // Get operations from stockItem — name + code + timing only
         const operations = stockItem.operations.map(op => ({
           operationType: op.type || op.name || op.operationType,
@@ -652,7 +691,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           console.warn(`No raw items found for variant: ${variantData.sku}. Using empty BOM.`);
         }
 
-        // Get variant attributes
+        // Get variant attributes - use the selected variant's attributes if original didn't have any
         const variantAttributes = variant.attributes || [];
         if (variantAttributes.length === 0 && variantData.attributes) {
           variantAttributes.push(...variantData.attributes);
@@ -688,6 +727,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
         });
 
         await workOrder.save();
+
         createdWorkOrders.push({
           _id: workOrder._id,
           workOrderNumber: workOrder.workOrderNumber,
@@ -696,20 +736,34 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           variantAttributes: workOrder.variantAttributes,
           quantity: workOrder.quantity,
           rawMaterialCount: workOrder.rawMaterials.length,
-          status: workOrder.status
+          status: workOrder.status,
+          autoSelectedVariant: usedFallback // Flag to indicate if variant was auto-selected
         });
       }
     }
 
     await request.save();
 
+    // Prepare response message based on what happened
+    let responseMessage = "";
+    if (createdWorkOrders.length > 0) {
+      const autoSelectedCount = createdWorkOrders.filter(wo => wo.autoSelectedVariant).length;
+      if (autoSelectedCount > 0) {
+        responseMessage = `Quotation approved by sales and ${createdWorkOrders.length} work order(s) created (${autoSelectedCount} with auto-selected variants)`;
+      } else {
+        responseMessage = `Quotation approved by sales and ${createdWorkOrders.length} work order(s) created`;
+      }
+    } else {
+      responseMessage = "Quotation approved by sales but no work orders were created";
+    }
+
     res.json({
       success: true,
-      message: createdWorkOrders.length > 0
-        ? `Quotation approved by sales and ${createdWorkOrders.length} work order(s) created`
-        : "Quotation approved by sales but no work orders were created (check variant matching)",
+      message: responseMessage,
       request: request,
-      createdWorkOrders: createdWorkOrders
+      createdWorkOrders: createdWorkOrders,
+      // Include skipped variants info for debugging/monitoring
+      skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined
     });
 
   } catch (error) {
