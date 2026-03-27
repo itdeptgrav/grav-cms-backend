@@ -735,7 +735,6 @@ router.post('/', verifyCustomerToken, async (req, res) => {
   }
 });
 
-// ─── BATCH CREATE ─────────────────────────────────────────────────────────────
 router.post('/batch', verifyCustomerToken, async (req, res) => {
   try {
     const { employees } = req.body;
@@ -766,7 +765,6 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
     const validationErrors = [];
     const employeesToCreate = [];
     const skippedEmployees = [];
-    const deptPatchOps = [];
 
     // Track UINs queued for creation this batch to catch intra-batch duplicates
     const seenUins = new Set(Object.keys(existingMap));
@@ -793,40 +791,24 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
 
       // ── Check if UIN already exists ────────────────────────────────────────
       if (existingMap[formattedUin]) {
-        const stored = existingMap[formattedUin];
-
-        if (stored.name.trim().toLowerCase() !== formattedName.toLowerCase()) {
-          skippedEmployees.push({
-            row: rowNumber,
-            name: formattedName,
-            uin: formattedUin,
-            reason: `UIN exists but name mismatch (stored: "${stored.name}")`
-          });
-          continue;
-        }
-
-        const needsDeptPatch = !stored.department?.trim() && emp.department?.trim();
-        const needsDesigPatch = !stored.designation?.trim() && emp.designation?.trim();
-
-        if (needsDeptPatch || needsDesigPatch) {
-          const patch = { updatedBy: req.customerId };
-          if (needsDeptPatch) patch.department = emp.department.trim();
-          if (needsDesigPatch) patch.designation = emp.designation.trim();
-          deptPatchOps.push({ _id: stored._id, patch });
-        } else {
-          skippedEmployees.push({
-            row: rowNumber,
-            name: formattedName,
-            uin: formattedUin,
-            reason: 'Already exists with department & designation — no changes needed'
-          });
-        }
+        // Skip existing employees - no updates, no patches, just skip
+        skippedEmployees.push({
+          row: rowNumber,
+          name: formattedName,
+          uin: formattedUin,
+          reason: 'Employee already exists'
+        });
         continue;
       }
 
       // ── Intra-batch duplicate check ────────────────────────────────────────
       if (seenUins.has(formattedUin)) {
-        skippedEmployees.push({ row: rowNumber, name: formattedName, uin: formattedUin, reason: 'Duplicate UIN in this import' });
+        skippedEmployees.push({ 
+          row: rowNumber, 
+          name: formattedName, 
+          uin: formattedUin, 
+          reason: 'Duplicate UIN in this import' 
+        });
         continue;
       }
 
@@ -888,19 +870,6 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       seenUins.add(formattedUin);
     }
 
-    // ── Execute dept/desig patches in a single bulkWrite ──────────────────────
-    let patchedCount = 0;
-    if (deptPatchOps.length > 0) {
-      const bulkOps = deptPatchOps.map(({ _id, patch }) => ({
-        updateOne: {
-          filter: { _id, customerId: req.customerId },
-          update: { $set: patch }
-        }
-      }));
-      const bulkResult = await EmployeeMpc.bulkWrite(bulkOps, { ordered: false });
-      patchedCount = bulkResult.modifiedCount || 0;
-    }
-
     // ── Insert new employees ──────────────────────────────────────────────────
     let createdEmployees = [];
     if (employeesToCreate.length > 0) {
@@ -912,7 +881,11 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
             if (writeError.code === 11000) {
               const failedUin = writeError.err.op.uin;
               const failedRow = employees.findIndex(e => e.uin?.toUpperCase() === failedUin) + 1;
-              skippedEmployees.push({ row: failedRow, uin: failedUin, reason: 'Duplicate UIN (database constraint)' });
+              skippedEmployees.push({ 
+                row: failedRow, 
+                uin: failedUin, 
+                reason: 'Duplicate UIN (database constraint)' 
+              });
             }
           });
           createdEmployees = error.insertedDocs || [];
@@ -922,23 +895,29 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
       }
     }
 
-    if (createdEmployees.length === 0 && patchedCount === 0) {
+    // Always return success if we created at least one employee
+    if (createdEmployees.length === 0 && validationErrors.length > 0) {
       return res.status(400).json({
         success: false,
-        message: 'No changes were made',
-        validationErrors,
-        skippedEmployees,
+        message: `Registration failed. ${validationErrors.length} issue(s).`,
+        validationErrors: validationErrors.slice(0, 20),
+        skippedEmployees: skippedEmployees.slice(0, 20),
         totalProcessed: employees.length,
-        createdCount: 0,
-        patchedCount: 0
+        createdCount: 0
       });
     }
 
+    // Return success response
+    const responseMessage = createdEmployees.length > 0 
+      ? `Successfully created ${createdEmployees.length} new employee(s)`
+      : 'No new employees to create';
+
     res.status(201).json({
       success: true,
-      message: `Processed ${employees.length} employees`,
+      message: responseMessage,
       createdCount: createdEmployees.length,
-      patchedCount,
+      totalProcessed: employees.length,
+      skippedCount: skippedEmployees.length,
       validationErrors: validationErrors.slice(0, 20),
       skippedEmployees: skippedEmployees.slice(0, 20)
     });
