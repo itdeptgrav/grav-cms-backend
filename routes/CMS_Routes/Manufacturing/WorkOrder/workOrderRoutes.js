@@ -1005,4 +1005,243 @@ router.put("/:id/operations/reorder", async (req, res) => {
   }
 });
 
+
+
+router.post("/bulk-plan", async (req, res) => {
+  try {
+    const { workOrderIds } = req.body;
+    
+    if (!workOrderIds || !Array.isArray(workOrderIds) || workOrderIds.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "workOrderIds array is required" 
+      });
+    }
+
+    const results = {
+      success: [],
+      failed: [],
+      totalProcessed: 0,
+      totalSuccess: 0,
+      totalFailed: 0
+    };
+
+    for (const workOrderId of workOrderIds) {
+      try {
+        if (!mongoose.Types.ObjectId.isValid(workOrderId)) {
+          results.failed.push({ 
+            id: workOrderId, 
+            reason: "Invalid work order ID" 
+          });
+          results.totalFailed++;
+          continue;
+        }
+
+        const workOrder = await WorkOrder.findById(workOrderId);
+        
+        if (!workOrder) {
+          results.failed.push({ 
+            id: workOrderId, 
+            reason: "Work order not found" 
+          });
+          results.totalFailed++;
+          continue;
+        }
+
+        // Check if work order is in pending status
+        if (workOrder.status !== "pending") {
+          results.failed.push({ 
+            id: workOrderId, 
+            workOrderNumber: workOrder.workOrderNumber,
+            reason: `Cannot plan work order with status: ${workOrder.status}` 
+          });
+          results.totalFailed++;
+          continue;
+        }
+
+        // Check if raw materials are allocated
+        const insufficientAllocations = workOrder.rawMaterials.filter(
+          rm => rm.allocationStatus === "not_allocated"
+        );
+        
+        if (insufficientAllocations.length > 0) {
+          results.failed.push({ 
+            id: workOrderId, 
+            workOrderNumber: workOrder.workOrderNumber,
+            reason: `${insufficientAllocations.length} raw material(s) not allocated` 
+          });
+          results.totalFailed++;
+          continue;
+        }
+
+        // Check if any raw materials are partially allocated
+        const partiallyAllocated = workOrder.rawMaterials.filter(
+          rm => rm.allocationStatus === "partially_allocated"
+        );
+        
+        if (partiallyAllocated.length > 0) {
+          results.failed.push({ 
+            id: workOrderId, 
+            workOrderNumber: workOrder.workOrderNumber,
+            reason: `${partiallyAllocated.length} raw material(s) partially allocated` 
+          });
+          results.totalFailed++;
+          continue;
+        }
+
+        // Issue raw materials if not already issued
+        const stockTransactions = [];
+        
+        for (const rawMaterial of workOrder.rawMaterials) {
+          if (rawMaterial.allocationStatus !== "issued") {
+            const rawItem = await RawItem.findById(rawMaterial.rawItemId);
+            if (rawItem) {
+              const rawItemRegisteredUnit = rawItem.customUnit || rawItem.unit;
+              let deductionQty = rawMaterial.quantityAllocated;
+              
+              if (rawMaterial.unit && rawItemRegisteredUnit && rawMaterial.unit !== rawItemRegisteredUnit) {
+                deductionQty = await convertQuantity(
+                  rawMaterial.quantityAllocated, 
+                  rawMaterial.unit, 
+                  rawItemRegisteredUnit
+                );
+              }
+
+              let previousQuantity = rawItem.quantity;
+              let newQuantity = previousQuantity;
+              let transactionType = "CONSUME";
+              let variantInfo = "";
+              let variantPreviousQuantity = null;
+              let variantNewQuantity = null;
+
+              if (rawMaterial.rawItemVariantId || rawMaterial.rawItemVariantCombination?.length > 0) {
+                let variant = null;
+                if (rawMaterial.rawItemVariantId && rawItem.variants) {
+                  variant = rawItem.variants.id(rawMaterial.rawItemVariantId);
+                } else if (rawMaterial.rawItemVariantCombination?.length > 0 && rawItem.variants) {
+                  variant = rawItem.variants.find(v =>
+                    v.combination?.length === rawMaterial.rawItemVariantCombination.length &&
+                    v.combination.every((val, idx) => val === rawMaterial.rawItemVariantCombination[idx])
+                  );
+                }
+
+                if (variant) {
+                  variantPreviousQuantity = variant.quantity;
+                  variantNewQuantity = Math.max(0, variantPreviousQuantity - deductionQty);
+                  variant.quantity = variantNewQuantity;
+                  previousQuantity = rawItem.quantity;
+                  newQuantity = Math.max(0, rawItem.quantity - deductionQty);
+                  rawItem.quantity = newQuantity;
+                  transactionType = "VARIANT_REDUCE";
+                  variantInfo = rawMaterial.rawItemVariantCombination?.join(" • ") ||
+                    `Variant ID: ${rawMaterial.rawItemVariantId?.toString().slice(-6)}`;
+                } else {
+                  previousQuantity = rawItem.quantity;
+                  newQuantity = Math.max(0, previousQuantity - deductionQty);
+                  rawItem.quantity = newQuantity;
+                  variantInfo = "Variant not found, used total stock";
+                }
+              } else {
+                previousQuantity = rawItem.quantity;
+                newQuantity = Math.max(0, previousQuantity - deductionQty);
+                rawItem.quantity = newQuantity;
+              }
+
+              rawMaterial.quantityIssued = rawMaterial.quantityAllocated;
+              rawMaterial.allocationStatus = "issued";
+
+              const conversionNote = rawMaterial.unit !== rawItemRegisteredUnit
+                ? `, Deducted: ${deductionQty} ${rawItemRegisteredUnit} (from ${rawMaterial.quantityAllocated} ${rawMaterial.unit})`
+                : "";
+
+              const transactionData = {
+                type: transactionType,
+                quantity: deductionQty,
+                previousQuantity,
+                newQuantity,
+                reason: `Issued for Work Order: ${workOrder.workOrderNumber} (Bulk Plan)`,
+                notes: `Work Order: ${workOrder.workOrderNumber}, Product: ${workOrder.stockItemName}, ` +
+                  `Quantity: ${workOrder.quantity} units${conversionNote}${variantInfo ? `, ${variantInfo}` : ""}`,
+                performedBy: req.user.id,
+              };
+              
+              if (rawMaterial.rawItemVariantId) transactionData.variantId = rawMaterial.rawItemVariantId;
+              if (rawMaterial.rawItemVariantCombination?.length > 0) {
+                transactionData.variantCombination = rawMaterial.rawItemVariantCombination;
+              }
+              if (variantPreviousQuantity !== null) {
+                transactionData.variantPreviousQuantity = variantPreviousQuantity;
+                transactionData.variantNewQuantity = variantNewQuantity;
+              }
+
+              rawItem.stockTransactions.push(transactionData);
+              await rawItem.save();
+
+              stockTransactions.push({
+                rawItemId: rawItem._id,
+                name: rawItem.name,
+                sku: rawItem.sku,
+                variantId: rawMaterial.rawItemVariantId,
+                variantCombination: rawMaterial.rawItemVariantCombination,
+                quantityIssued: deductionQty,
+                quantityIssuedBomUnit: rawMaterial.quantityAllocated,
+                bomUnit: rawMaterial.unit,
+                registeredUnit: rawItemRegisteredUnit,
+                transactionType,
+              });
+            }
+          }
+        }
+
+        // Update work order status to scheduled
+        workOrder.status = "scheduled";
+        workOrder.plannedBy = req.user.id;
+        workOrder.plannedAt = new Date();
+        workOrder.planningNotes = workOrder.planningNotes || "Bulk planned from Manufacturing Order page";
+        
+        // Update operation statuses
+        workOrder.operations.forEach(op => {
+          op.status = "scheduled";
+        });
+        
+        await workOrder.save();
+
+        results.success.push({
+          id: workOrderId,
+          workOrderNumber: workOrder.workOrderNumber,
+          stockItemName: workOrder.stockItemName,
+          quantity: workOrder.quantity,
+          rawMaterialsIssued: stockTransactions.length
+        });
+        results.totalSuccess++;
+        
+      } catch (error) {
+        console.error(`Error planning work order ${workOrderId}:`, error);
+        results.failed.push({ 
+          id: workOrderId, 
+          reason: error.message || "Unknown error" 
+        });
+        results.totalFailed++;
+      }
+      
+      results.totalProcessed++;
+    }
+
+    res.json({
+      success: results.totalSuccess > 0,
+      message: `Planned ${results.totalSuccess} work order(s) successfully. ${results.totalFailed} failed.`,
+      results
+    });
+    
+  } catch (error) {
+    console.error("Error in bulk planning:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Server error while planning work orders",
+      error: error.message 
+    });
+  }
+});
+
+
 module.exports = router;
