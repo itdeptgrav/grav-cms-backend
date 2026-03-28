@@ -137,10 +137,10 @@ router.get('/organization/:orgId', async (req, res) => {
 // ─── Helper: build employee measurements map from measurementData (OPTIMIZED) ─
 async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
     const employeeMeasurementsMap = new Map();
-    
+
     // ─── Collect all employee IDs ─────────────────────────────────────────────
     const allEmployeeIds = new Set();
-    
+
     if (measurementData?.length) {
         measurementData.forEach(data => {
             if (data.employeeId) allEmployeeIds.add(data.employeeId.toString());
@@ -151,32 +151,32 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
             if (catEmp.employeeId) allEmployeeIds.add(catEmp.employeeId.toString());
         });
     }
-    
+
     // ─── OPTIMIZATION: Batch fetch ALL employees at once ──────────────────────
     const employeesMap = new Map();
     if (allEmployeeIds.size > 0) {
         const employees = await EmployeeMpc.find({
             _id: { $in: Array.from(allEmployeeIds) }
         }).select('name uin gender').lean();
-        
+
         employees.forEach(emp => {
             employeesMap.set(emp._id.toString(), emp);
         });
     }
-    
+
     // ─── Batch-fetch all stock items needed ───────────────────────────────────
     const stockItemIds = [...new Set((measurementData || []).map(d => d.productId).filter(Boolean))];
     const stockItems = stockItemIds.length
         ? await StockItem.find({ _id: { $in: stockItemIds } }).select('_id name reference measurements variants category').lean()
         : [];
     const stockItemMap = new Map(stockItems.map(i => [i._id.toString(), i]));
-    
+
     // ─── Process product-based employees ──────────────────────────────────────
     if (measurementData?.length) {
         for (const data of measurementData) {
             if (!data.employeeId) continue;
             const employeeId = data.employeeId.toString();
-            
+
             if (!employeeMeasurementsMap.has(employeeId)) {
                 const employee = employeesMap.get(employeeId);
                 if (!employee) {
@@ -194,27 +194,27 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
                     categoryMeasurements: []
                 });
             }
-            
+
             const stockItem = stockItemMap.get(data.productId?.toString());
             if (!stockItem) {
                 console.warn(`Product ${data.productId} not found`);
                 continue;
             }
-            
+
             let variantName = "Default";
             if (data.variantId && stockItem.variants) {
                 const v = stockItem.variants.find(v => v._id.toString() === data.variantId.toString());
                 if (v?.attributes?.length) variantName = v.attributes.map(a => a.value).join(" • ");
             }
-            
+
             const measurementsArray = Array.isArray(data.measurements)
                 ? data.measurements
-                : Object.entries(data.measurements || {}).map(([measurementName, value]) => ({ 
-                    measurementName, 
-                    value: value || '', 
-                    unit: '' 
+                : Object.entries(data.measurements || {}).map(([measurementName, value]) => ({
+                    measurementName,
+                    value: value || '',
+                    unit: ''
                 }));
-            
+
             employeeMeasurementsMap.get(employeeId).products.push({
                 productId: data.productId,
                 productName: stockItem.name,
@@ -226,13 +226,13 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
             });
         }
     }
-    
+
     // ─── Process no-product / category employees ─────────────────────────────
     if (categoryData?.length) {
         for (const catEmp of categoryData) {
             if (!catEmp.employeeId) continue;
             const eid = catEmp.employeeId.toString();
-            
+
             if (!employeeMeasurementsMap.has(eid)) {
                 const employee = employeesMap.get(eid);
                 if (!employee) {
@@ -257,7 +257,7 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
             }
         }
     }
-    
+
     return employeeMeasurementsMap;
 }
 
@@ -535,7 +535,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
 
         // ─── OPTIMIZATION 1: Batch fetch ALL employees at once ─────────────────
         const allNewEmployeeIds = new Set();
-        
+
         // Collect all employee IDs from product-based data
         if (measurementData?.length) {
             measurementData.forEach(data => {
@@ -544,7 +544,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                 }
             });
         }
-        
+
         // Collect all employee IDs from category data
         if (categoryData?.length) {
             categoryData.forEach(catEmp => {
@@ -560,7 +560,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
             const employees = await EmployeeMpc.find({
                 _id: { $in: Array.from(allNewEmployeeIds) }
             }).select('name uin gender').lean();
-            
+
             employees.forEach(emp => {
                 employeesMap.set(emp._id.toString(), emp);
             });
@@ -569,7 +569,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
         // ─── OPTIMIZATION 2: Batch fetch ALL stock items at once ──────────────
         const productIds = [...new Set((measurementData || []).map(d => d.productId).filter(Boolean))];
         let stockMap = new Map();
-        
+
         if (productIds.length) {
             const stockItems = await StockItem.find({ _id: { $in: productIds } })
                 .select('_id name reference measurements variants')
@@ -581,16 +581,16 @@ router.put('/:measurementId/add-employees', async (req, res) => {
         if (measurementData?.length) {
             // Group by employee ID first
             const groupedByEmployee = new Map();
-            
+
             for (const data of measurementData) {
                 if (!data.employeeId) continue;
                 const eid = data.employeeId.toString();
                 if (existingIds.has(eid)) continue;
-                
+
                 if (!groupedByEmployee.has(eid)) {
                     const employee = employeesMap.get(eid);
                     if (!employee) continue;
-                    
+
                     groupedByEmployee.set(eid, {
                         employeeId: data.employeeId,
                         employeeName: employee.name,
@@ -602,10 +602,10 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                         categoryMeasurements: []
                     });
                 }
-                
+
                 const si = stockMap.get(data.productId?.toString());
                 if (!si) continue;
-                
+
                 let variantName = "Default";
                 if (data.variantId && si.variants) {
                     const v = si.variants.find(v => v._id.toString() === data.variantId.toString());
@@ -613,15 +613,15 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                         variantName = v.attributes.map(a => a.value).join(" • ");
                     }
                 }
-                
+
                 const measurementsArray = Array.isArray(data.measurements)
                     ? data.measurements
-                    : Object.entries(data.measurements || {}).map(([n, v]) => ({ 
-                        measurementName: n, 
-                        value: v || '', 
-                        unit: '' 
+                    : Object.entries(data.measurements || {}).map(([n, v]) => ({
+                        measurementName: n,
+                        value: v || '',
+                        unit: ''
                     }));
-                
+
                 groupedByEmployee.get(eid).products.push({
                     productId: data.productId,
                     productName: si.name,
@@ -632,10 +632,10 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                     measuredAt: new Date()
                 });
             }
-            
+
             // Add all employees in one batch
             for (const empData of groupedByEmployee.values()) {
-                const isCompleted = empData.products.every(p => 
+                const isCompleted = empData.products.every(p =>
                     p.measurements.every(m => m.value?.trim())
                 );
                 measurement.employeeMeasurements.push({
@@ -645,23 +645,23 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                 });
             }
         }
-        
+
         // ─── OPTIMIZATION 4: Process category-based employees in bulk ─────────
         if (categoryData?.length) {
             const categoryEmployeesMap = new Map();
-            
+
             for (const catEmp of categoryData) {
                 if (!catEmp.employeeId) continue;
                 const eid = catEmp.employeeId.toString();
                 if (existingIds.has(eid)) continue;
-                
+
                 const employee = employeesMap.get(eid);
                 if (!employee) continue;
-                
+
                 const isCompleted = catEmp.categoryMeasurements?.every(cm =>
                     cm.measurements?.every(m => m.value?.trim())
                 ) || false;
-                
+
                 categoryEmployeesMap.set(eid, {
                     employeeId: eid,
                     employeeName: employee.name,
@@ -675,13 +675,13 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                     completedAt: isCompleted ? new Date() : null
                 });
             }
-            
+
             // Add all category employees in one batch
             for (const empData of categoryEmployeesMap.values()) {
                 measurement.employeeMeasurements.push(empData);
             }
         }
-        
+
         // Recalculate stats
         measurement.totalRegisteredEmployees = measurement.registeredEmployeeIds?.length || 0;
         measurement.measuredEmployees = measurement.employeeMeasurements.filter(e => e.isCompleted).length;
@@ -689,7 +689,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
         measurement.completionRate = measurement.totalRegisteredEmployees > 0
             ? Math.round((measurement.measuredEmployees / measurement.totalRegisteredEmployees) * 100)
             : 0;
-            
+
         let totalMeasurements = 0, completedMeasurements = 0;
         measurement.employeeMeasurements.forEach(emp => {
             if (emp.noProductAssigned) {
@@ -704,15 +704,15 @@ router.put('/:measurementId/add-employees', async (req, res) => {
                 });
             }
         });
-        
+
         measurement.totalMeasurements = totalMeasurements;
         measurement.completedMeasurements = completedMeasurements;
         measurement.pendingMeasurements = totalMeasurements - completedMeasurements;
         measurement.updatedBy = req.user.id;
         measurement.updatedAt = new Date();
-        
+
         const saved = await measurement.save();
-        
+
         res.status(200).json({
             success: true,
             message: `Added ${allNewEmployeeIds.size} new employee(s) to measurement`,
@@ -812,14 +812,14 @@ router.post('/:measurementId/assign-product', async (req, res) => {
         const { measurementId } = req.params;
         // categoryName is informational — tells us which category this product is for
         const { employeeId, organizationId, product, measurements, categoryName } = req.body;
- 
+
         if (!mongoose.Types.ObjectId.isValid(measurementId)) {
             return res.status(400).json({ success: false, message: 'Valid measurement ID is required' });
         }
         if (!employeeId || !product?.productId) {
             return res.status(400).json({ success: false, message: 'employeeId and product.productId are required' });
         }
- 
+
         // ── 1. Fetch stock item ───────────────────────────────────────────────
         const stockItem = await StockItem.findById(product.productId)
             .select('_id name reference measurements variants')
@@ -827,7 +827,7 @@ router.post('/:measurementId/assign-product', async (req, res) => {
         if (!stockItem) {
             return res.status(404).json({ success: false, message: 'Product not found' });
         }
- 
+
         let resolvedVariantName = product.variantName || 'Default';
         if (product.variantId && stockItem.variants?.length) {
             const v = stockItem.variants.find(v => v._id.toString() === product.variantId.toString());
@@ -835,72 +835,72 @@ router.post('/:measurementId/assign-product', async (req, res) => {
                 resolvedVariantName = v.attributes.map(a => a.value).join(' • ');
             }
         }
- 
+
         // ── 2. Update EmployeeMpc — push product (avoid exact duplicates) ────
         const employeeDoc = await EmployeeMpc.findById(employeeId);
         if (!employeeDoc) {
             return res.status(404).json({ success: false, message: 'Employee not found' });
         }
- 
+
         const alreadyAssigned = employeeDoc.products?.some(p => {
             if (p.productId.toString() !== product.productId.toString()) return false;
             if (product.variantId) return p.variantId?.toString() === product.variantId.toString();
             return !p.variantId;
         });
- 
+
         if (!alreadyAssigned) {
             employeeDoc.products.push({
-                productId:   product.productId,
-                variantId:   product.variantId || undefined,
-                quantity:    product.quantity || 1,
+                productId: product.productId,
+                variantId: product.variantId || undefined,
+                quantity: product.quantity || 1,
                 productName: product.productName || stockItem.name,
             });
             await employeeDoc.save();
         }
- 
+
         // ── 3. Build the product measurement entry ────────────────────────────
         const measurementsArray = (measurements || []).map(m => ({
             measurementName: m.measurementName,
-            value:           m.value || '',
-            unit:            m.unit  || '',
+            value: m.value || '',
+            unit: m.unit || '',
         }));
- 
+
         const finalMeasurements = measurementsArray.length
             ? measurementsArray
             : (stockItem.measurements || []).map(field => ({
                 measurementName: field, value: '', unit: '',
             }));
- 
+
         const newProductEntry = {
-            productId:    product.productId,
-            productName:  product.productName || stockItem.name,
-            variantId:    product.variantId   || null,
-            variantName:  resolvedVariantName,
-            quantity:     product.quantity    || 1,
+            productId: product.productId,
+            productName: product.productName || stockItem.name,
+            variantId: product.variantId || null,
+            variantName: resolvedVariantName,
+            quantity: product.quantity || 1,
             measurements: finalMeasurements,
-            measuredAt:   new Date(),
+            measuredAt: new Date(),
         };
- 
+
         // ── 4. Update employee entry in Measurement document ──────────────────
         const measurement = await Measurement.findById(measurementId);
         if (!measurement) {
             return res.status(404).json({ success: false, message: 'Measurement not found' });
         }
- 
+
         const empEntry = measurement.employeeMeasurements.find(
             e => e.employeeId.toString() === employeeId.toString()
         );
         if (!empEntry) {
             return res.status(404).json({ success: false, message: 'Employee not found in this measurement' });
         }
- 
+
         // Append this product — do NOT clear existing products or categoryMeasurements
         empEntry.products.push(newProductEntry);
- 
+
         // ── 5. Flip noProductAssigned only when ALL categories have a product ──
         // Count how many distinct categories exist on this employee entry.
         const totalCategories = empEntry.categoryMeasurements?.length || 0;
- 
+
         if (totalCategories === 0) {
             // Employee had no categories — flip immediately (legacy path)
             empEntry.noProductAssigned = false;
@@ -912,27 +912,27 @@ router.post('/:measurementId/assign-product', async (req, res) => {
         }
         // If products.length < totalCategories: still more categories to assign,
         // leave noProductAssigned = true so the table still shows "Assign product"
- 
+
         const allFilled = empEntry.products.every(p =>
             p.measurements.every(m => m.value?.trim())
         );
         empEntry.isCompleted = allFilled;
         empEntry.completedAt = allFilled ? new Date() : empEntry.completedAt;
- 
+
         measurement.updatedBy = req.user.id;
         await measurement.save();
- 
+
         res.status(200).json({
-            success:                 true,
-            message:                 `Product "${stockItem.name}" assigned to ${empEntry.employeeName}`,
-            employeeName:            empEntry.employeeName,
-            productName:             stockItem.name,
-            categoryName:            categoryName || null,
+            success: true,
+            message: `Product "${stockItem.name}" assigned to ${empEntry.employeeName}`,
+            employeeName: empEntry.employeeName,
+            productName: stockItem.name,
+            categoryName: categoryName || null,
             totalCategoriesAssigned: empEntry.products.length,
-            totalCategoriesNeeded:   totalCategories,
-            allCategoriesAssigned:   empEntry.products.length >= totalCategories,
+            totalCategoriesNeeded: totalCategories,
+            allCategoriesAssigned: empEntry.products.length >= totalCategories,
         });
- 
+
     } catch (error) {
         console.error('Error assigning product:', error);
         res.status(500).json({ success: false, message: 'Server error while assigning product' });
@@ -995,13 +995,16 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
 
         const employeeProductMap = new Map(measuredEmployees.map(e => [e._id.toString(), e]));
 
-        // Build product map
+        // ========== FIX: Build product map with auto-variant assignment ==========
         const productMap = new Map();
+        const autoAssignedLog = []; // Track auto-assigned variants for logging
+
         convertibleEmployees.forEach(emp => {
             const employeeData = employeeProductMap.get(emp.employeeId.toString());
             if (!employeeData) return;
 
             emp.products.forEach(measuredProduct => {
+                // Find matching product assignment in employee data
                 const pa = employeeData.products.find(p => {
                     if (p.productId?._id?.toString() !== measuredProduct.productId?._id?.toString()) return false;
                     if (p.variantId && measuredProduct.variantId) return p.variantId.toString() === measuredProduct.variantId.toString();
@@ -1012,18 +1015,74 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                 const si = pa.productId;
                 if (!si?._id) return;
 
-                const key = `${si._id}_${pa.variantId || 'default'}`;
-                if (!productMap.has(key)) {
-                    let variantName = 'Default', variantAttrs = [], variantPrice = si.baseSalesPrice || 0;
-                    if (pa.variantId && si.variants) {
-                        const v = si.variants.find(v => v._id.toString() === pa.variantId.toString());
-                        if (v) {
-                            variantName = v.attributes?.length ? v.attributes.map(a => a.value).join(' • ') : v.name || 'Default';
-                            variantAttrs = v.attributes?.map(a => ({ name: a.name || 'Attribute', value: a.value })) || [];
-                            if (v.salesPrice) variantPrice = v.salesPrice;
-                        }
+                // 🔧 CRITICAL FIX: Check if variantId is null/missing
+                let finalVariantId = pa.variantId;
+                let finalVariantName = pa.variantName || 'Default';
+                let finalVariantAttributes = [];
+                let finalUnitPrice = si.baseSalesPrice || 0;
+                let autoAssigned = false;
+
+                // If variantId is null/undefined/empty, auto-assign first available variant
+                const needsAutoAssign = !finalVariantId ||
+                    finalVariantId === 'null' ||
+                    finalVariantId === 'undefined' ||
+                    (typeof finalVariantId === 'string' && finalVariantId.trim() === '');
+
+                if (needsAutoAssign && si.variants && si.variants.length > 0) {
+                    // Auto-assign the first available variant
+                    const defaultVariant = si.variants[0];
+                    finalVariantId = defaultVariant._id.toString();
+                    finalVariantName = defaultVariant.attributes?.length
+                        ? defaultVariant.attributes.map(a => a.value).join(' • ')
+                        : defaultVariant.name || 'Default';
+                    finalVariantAttributes = defaultVariant.attributes?.map(a => ({
+                        name: a.name || 'Attribute',
+                        value: a.value
+                    })) || [];
+                    finalUnitPrice = defaultVariant.salesPrice || si.baseSalesPrice || 0;
+                    autoAssigned = true;
+
+                    autoAssignedLog.push({
+                        productName: si.name,
+                        employeeName: employeeData.name,
+                        originalVariantId: pa.variantId,
+                        assignedVariantId: finalVariantId,
+                        assignedVariantName: finalVariantName
+                    });
+
+                    console.log(`✅ Auto-assigned variant for ${si.name} (${employeeData.name}): ${finalVariantName}`);
+                } else if (finalVariantId && si.variants) {
+                    // Variant exists, use its price and attributes
+                    const variantData = si.variants.find(v => v._id.toString() === finalVariantId.toString());
+                    if (variantData) {
+                        finalVariantName = variantData.attributes?.length
+                            ? variantData.attributes.map(a => a.value).join(' • ')
+                            : variantData.name || finalVariantName;
+                        finalVariantAttributes = variantData.attributes?.map(a => ({
+                            name: a.name || 'Attribute',
+                            value: a.value
+                        })) || [];
+                        finalUnitPrice = variantData.salesPrice || si.baseSalesPrice || 0;
                     }
-                    productMap.set(key, { stockItemId: si._id, stockItemName: si.name, stockItemReference: si.reference || '', variantId: pa.variantId || null, variantName, variantAttributes: variantAttrs, unitPrice: variantPrice, employeeCount: 0, totalQuantity: 0, employeeNames: [] });
+                }
+
+                // Create unique key for grouping (productId + variantId)
+                const key = `${si._id}_${finalVariantId || 'default'}`;
+
+                if (!productMap.has(key)) {
+                    productMap.set(key, {
+                        stockItemId: si._id,
+                        stockItemName: si.name,
+                        stockItemReference: si.reference || '',
+                        variantId: finalVariantId,
+                        variantName: finalVariantName,
+                        variantAttributes: finalVariantAttributes,
+                        unitPrice: finalUnitPrice,
+                        employeeCount: 0,
+                        totalQuantity: 0,
+                        employeeNames: [],
+                        autoAssigned: autoAssigned
+                    });
                 }
 
                 const pd = productMap.get(key);
@@ -1033,36 +1092,81 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             });
         });
 
+        // Log auto-assigned variants summary
+        if (autoAssignedLog.length > 0) {
+            console.log(`🔧 Auto-assigned ${autoAssignedLog.length} variant(s) during PO conversion:`);
+            console.log(JSON.stringify(autoAssignedLog, null, 2));
+        }
+
         const products = Array.from(productMap.values());
         if (!products.length) return res.status(400).json({ success: false, message: 'No valid products found for PO' });
 
         const requestCount = await CustomerRequest.countDocuments();
         const requestId = `REQ-${new Date().getFullYear()}-${String(requestCount + 1).padStart(4, '0')}`;
 
+        // Build items with variants (now properly grouped)
         const validatedItems = products.map(p => ({
-            stockItemId: p.stockItemId, stockItemName: p.stockItemName, stockItemReference: p.stockItemReference,
-            variants: [{ variantId: p.variantId?.toString() || `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`, attributes: p.variantAttributes.length ? p.variantAttributes : (p.variantName !== 'Default' ? [{ name: 'Variant', value: p.variantName }] : []), quantity: p.totalQuantity, specialInstructions: [], estimatedPrice: p.totalQuantity * p.unitPrice }],
-            totalQuantity: p.totalQuantity, totalEstimatedPrice: p.totalQuantity * p.unitPrice,
-            employeeCount: p.employeeCount, employeeNames: p.employeeNames.join(', ')
+            stockItemId: p.stockItemId,
+            stockItemName: p.stockItemName,
+            stockItemReference: p.stockItemReference,
+            variants: [{
+                variantId: p.variantId?.toString() || `VAR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                attributes: p.variantAttributes.length ? p.variantAttributes : (p.variantName !== 'Default' ? [{ name: 'Variant', value: p.variantName }] : []),
+                quantity: p.totalQuantity,
+                specialInstructions: [],
+                estimatedPrice: p.totalQuantity * p.unitPrice
+            }],
+            totalQuantity: p.totalQuantity,
+            totalEstimatedPrice: p.totalQuantity * p.unitPrice,
+            employeeCount: p.employeeCount,
+            employeeNames: p.employeeNames.join(', ')
         }));
 
         const newRequest = new CustomerRequest({
-            requestId, customerId: measurement.organizationId,
-            customerInfo: { name: customer.name, email: customer.email || '', phone: customer.phone || '', address: customer.profile?.address?.street || '', city: customer.profile?.address?.city || '', postalCode: customer.profile?.address?.pincode || '', description: poDescription || `PO from measurement: ${measurement.name}`, deliveryDeadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), preferredContactMethod: 'phone' },
-            items: validatedItems, status: 'pending', priority: 'high',
-            measurementId: measurement._id, measurementName: measurement.name, requestType: 'measurement_conversion'
+            requestId,
+            customerId: measurement.organizationId,
+            customerInfo: {
+                name: customer.name,
+                email: customer.email || '',
+                phone: customer.phone || '',
+                address: customer.profile?.address?.street || '',
+                city: customer.profile?.address?.city || '',
+                postalCode: customer.profile?.address?.pincode || '',
+                description: poDescription || `PO from measurement: ${measurement.name}`,
+                deliveryDeadline: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+                preferredContactMethod: 'phone'
+            },
+            items: validatedItems,
+            status: 'pending',
+            priority: 'high',
+            measurementId: measurement._id,
+            measurementName: measurement.name,
+            requestType: 'measurement_conversion'
         });
         await newRequest.save();
 
+        // Helper to clean measurement data
         const cleanList = (list) => list.map(emp => ({
-            employeeId: emp.employeeId, employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
-            gender: emp.gender, remarks: emp.remarks || '', noProductAssigned: emp.noProductAssigned || false,
-            isCompleted: emp.isCompleted || false, completedAt: emp.completedAt || null,
+            employeeId: emp.employeeId,
+            employeeName: emp.employeeName,
+            employeeUIN: emp.employeeUIN,
+            gender: emp.gender,
+            remarks: emp.remarks || '',
+            noProductAssigned: emp.noProductAssigned || false,
+            isCompleted: emp.isCompleted || false,
+            completedAt: emp.completedAt || null,
             products: (emp.products || []).map(p => ({
-                productId: p.productId?._id || p.productId, productName: p.productName,
-                variantId: p.variantId || null, variantName: p.variantName || 'Default',
-                quantity: p.quantity || 1, measuredAt: p.measuredAt || new Date(),
-                measurements: p.measurements.map(m => ({ measurementName: m.measurementName, value: m.value || '', unit: m.unit || '' }))
+                productId: p.productId?._id || p.productId,
+                productName: p.productName,
+                variantId: p.variantId || null,
+                variantName: p.variantName || 'Default',
+                quantity: p.quantity || 1,
+                measuredAt: p.measuredAt || new Date(),
+                measurements: p.measurements.map(m => ({
+                    measurementName: m.measurementName,
+                    value: m.value || '',
+                    unit: m.unit || ''
+                }))
             })),
             categoryMeasurements: emp.categoryMeasurements || []
         }));
@@ -1073,14 +1177,18 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             const remName = `${measurement.name} - Part ${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
             const remCompleted = remainingEmployeeMeasurements.filter(e => e.isCompleted).length;
             const newMeasurementDoc = new Measurement({
-                organizationId: measurement.organizationId, organizationName: measurement.organizationName,
-                name: remName, description: `Continuation of "${measurement.name}". ${remainingEmployeeMeasurements.length} employee(s) not included in PO ${requestId}.`,
+                organizationId: measurement.organizationId,
+                organizationName: measurement.organizationName,
+                name: remName,
+                description: `Continuation of "${measurement.name}". ${remainingEmployeeMeasurements.length} employee(s) not included in PO ${requestId}.`,
                 registeredEmployeeIds: remainingEmployeeMeasurements.map(e => e.employeeId),
                 employeeMeasurements: cleanList(remainingEmployeeMeasurements),
                 totalRegisteredEmployees: remainingEmployeeMeasurements.length,
-                measuredEmployees: remCompleted, pendingEmployees: remainingEmployeeMeasurements.length - remCompleted,
+                measuredEmployees: remCompleted,
+                pendingEmployees: remainingEmployeeMeasurements.length - remCompleted,
                 completionRate: Math.round((remCompleted / remainingEmployeeMeasurements.length) * 100),
-                convertedToPO: false, createdBy: req.user?.id || measurement.createdBy
+                convertedToPO: false,
+                createdBy: req.user?.id || measurement.createdBy
             });
             await newMeasurementDoc.save();
             newMeasurementId = newMeasurementDoc._id;
@@ -1092,18 +1200,26 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             employeeMeasurements: cleanList(selectedEmployeeMeasurements),
             registeredEmployeeIds: selectedEmployeeMeasurements.map(e => e.employeeId),
             totalRegisteredEmployees: selectedEmployeeMeasurements.length,
-            measuredEmployees: selCompleted, pendingEmployees: selectedEmployeeMeasurements.length - selCompleted,
+            measuredEmployees: selCompleted,
+            pendingEmployees: selectedEmployeeMeasurements.length - selCompleted,
             completionRate: selectedEmployeeMeasurements.length > 0 ? Math.round((selCompleted / selectedEmployeeMeasurements.length) * 100) : 100,
-            convertedToPO: true, poRequestId: newRequest._id, poConversionDate: new Date(), convertedBy: req.user?.id || null
+            convertedToPO: true,
+            poRequestId: newRequest._id,
+            poConversionDate: new Date(),
+            convertedBy: req.user?.id || null
         });
 
         res.status(201).json({
             success: true,
             message: `PO created for ${convertibleEmployees.length} employee(s).${remainingEmployeeMeasurements.length > 0 ? ` ${remainingEmployeeMeasurements.length} employee(s) moved to new measurement.` : ''}`,
-            poRequestId: newRequest._id, requestId: newRequest.requestId,
+            poRequestId: newRequest._id,
+            requestId: newRequest.requestId,
             totalEstimatedPrice: validatedItems.reduce((s, i) => s + i.totalEstimatedPrice, 0),
-            totalItems: validatedItems.length, selectedEmployeeCount: convertibleEmployees.length,
-            remainingEmployeeCount: remainingEmployeeMeasurements.length, newMeasurementId
+            totalItems: validatedItems.length,
+            selectedEmployeeCount: convertibleEmployees.length,
+            remainingEmployeeCount: remainingEmployeeMeasurements.length,
+            newMeasurementId,
+            autoAssignedVariants: autoAssignedLog.length > 0 ? autoAssignedLog : undefined
         });
 
     } catch (error) {
