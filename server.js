@@ -257,10 +257,6 @@ const connectDB = async () => {
   }
 };
 
-connectDB().then(async () => {
-  await autoAssignMissingVariantsInMeasurements();
-});
-
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
 const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
