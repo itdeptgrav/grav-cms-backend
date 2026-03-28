@@ -133,6 +133,37 @@ router.get('/organization/:orgId', async (req, res) => {
     }
 });
 
+
+// Helper: Auto-assign variant if missing
+async function ensureVariantAssigned(productData, stockItemDoc) {
+    if (!stockItemDoc) return productData;
+    
+    let variantId = productData.variantId;
+    let variantName = productData.variantName || 'Default';
+    
+    // Check if variantId is null, undefined, or empty
+    const needsAutoAssign = !variantId || 
+                           variantId === 'null' || 
+                           variantId === 'undefined' ||
+                           (typeof variantId === 'string' && variantId.trim() === '');
+    
+    if (needsAutoAssign && stockItemDoc.variants && stockItemDoc.variants.length > 0) {
+        const defaultVariant = stockItemDoc.variants[0];
+        variantId = defaultVariant._id;
+        variantName = defaultVariant.attributes?.length 
+            ? defaultVariant.attributes.map(a => a.value).join(' • ') 
+            : defaultVariant.name || 'Default';
+        
+        console.log(`✅ Auto-assigned variant for ${stockItemDoc.name}: ${variantName}`);
+    }
+    
+    return {
+        ...productData,
+        variantId,
+        variantName
+    };
+}
+
 // ─── Helper: build employee measurements map from measurementData ─────────────
 // ─── Helper: build employee measurements map from measurementData (OPTIMIZED) ─
 async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
@@ -287,7 +318,27 @@ router.post('/', async (req, res) => {
         const customer = await Customer.findById(organizationId).select('_id name').lean();
         if (!customer) return res.status(404).json({ success: false, message: 'Organization not found' });
 
-        const employeeMeasurementsMap = await buildEmployeeMeasurementsMap(measurementData, categoryData);
+        // ========== FIX: Auto-assign variants in measurement data ==========
+        let processedMeasurementData = measurementData;
+        if (measurementData?.length) {
+            // Batch fetch stock items for all products
+            const productIds = [...new Set(measurementData.map(d => d.productId).filter(Boolean))];
+            const stockItems = await StockItem.find({ _id: { $in: productIds } })
+                .select('_id name variants')
+                .lean();
+            const stockItemMap = new Map(stockItems.map(s => [s._id.toString(), s]));
+            
+            processedMeasurementData = await Promise.all(measurementData.map(async (data) => {
+                const stockItem = stockItemMap.get(data.productId?.toString());
+                if (stockItem) {
+                    return await ensureVariantAssigned(data, stockItem);
+                }
+                return data;
+            }));
+        }
+        // ========== END OF FIX ==========
+
+        const employeeMeasurementsMap = await buildEmployeeMeasurementsMap(processedMeasurementData, categoryData);
 
         const employeeMeasurements = Array.from(employeeMeasurementsMap.values()).map(emp => {
             const isCompleted = computeIsCompleted(emp);
@@ -349,7 +400,6 @@ router.put('/:measurementId', async (req, res) => {
         if (!measurement) return res.status(404).json({ success: false, message: 'Measurement not found' });
 
         if (name !== undefined && name.trim()) measurement.name = name.trim();
-        // if name not sent or blank, keep existing name
         if (description !== undefined) measurement.description = description?.trim() || '';
 
         // Merge registered employee IDs (don't drop existing ones)
@@ -359,15 +409,35 @@ router.put('/:measurementId', async (req, res) => {
             measurement.registeredEmployeeIds = Array.from(existingSet);
         }
 
+        // ========== FIX: Auto-assign variants in measurement data ==========
+        let processedMeasurementData = measurementData;
+        if (measurementData?.length) {
+            // Batch fetch stock items for all products
+            const productIds = [...new Set(measurementData.map(d => d.productId).filter(Boolean))];
+            const stockItems = await StockItem.find({ _id: { $in: productIds } })
+                .select('_id name variants')
+                .lean();
+            const stockItemMap = new Map(stockItems.map(s => [s._id.toString(), s]));
+            
+            processedMeasurementData = await Promise.all(measurementData.map(async (data) => {
+                const stockItem = stockItemMap.get(data.productId?.toString());
+                if (stockItem) {
+                    return await ensureVariantAssigned(data, stockItem);
+                }
+                return data;
+            }));
+        }
+        // ========== END OF FIX ==========
+
         // Build a map of existing employee entries for quick lookup
         const existingMap = new Map(
             measurement.employeeMeasurements.map((emp, idx) => [emp.employeeId.toString(), { emp, idx }])
         );
 
         // ── Process product-based employees ───────────────────────────────────
-        if (measurementData?.length) {
+        if (processedMeasurementData?.length) {
             // Batch-fetch stock items
-            const productIds = [...new Set(measurementData.map(d => d.productId).filter(Boolean))];
+            const productIds = [...new Set(processedMeasurementData.map(d => d.productId).filter(Boolean))];
             const stockItems = productIds.length
                 ? await StockItem.find({ _id: { $in: productIds } }).select('_id name measurements variants').lean()
                 : [];
@@ -375,7 +445,7 @@ router.put('/:measurementId', async (req, res) => {
 
             // Group incoming data by employee
             const incomingByEmployee = new Map();
-            for (const data of measurementData) {
+            for (const data of processedMeasurementData) {
                 if (!data.employeeId) continue;
                 const eid = data.employeeId.toString();
                 if (!incomingByEmployee.has(eid)) {
@@ -533,12 +603,32 @@ router.put('/:measurementId/add-employees', async (req, res) => {
 
         const existingIds = new Set(measurement.employeeMeasurements.map(e => e.employeeId.toString()));
 
+        // ========== FIX: Auto-assign variants in measurement data ==========
+        let processedMeasurementData = measurementData;
+        if (measurementData?.length) {
+            // Batch fetch stock items for all products
+            const productIds = [...new Set(measurementData.map(d => d.productId).filter(Boolean))];
+            const stockItems = await StockItem.find({ _id: { $in: productIds } })
+                .select('_id name variants')
+                .lean();
+            const stockItemMap = new Map(stockItems.map(s => [s._id.toString(), s]));
+            
+            processedMeasurementData = await Promise.all(measurementData.map(async (data) => {
+                const stockItem = stockItemMap.get(data.productId?.toString());
+                if (stockItem) {
+                    return await ensureVariantAssigned(data, stockItem);
+                }
+                return data;
+            }));
+        }
+        // ========== END OF FIX ==========
+
         // ─── OPTIMIZATION 1: Batch fetch ALL employees at once ─────────────────
         const allNewEmployeeIds = new Set();
 
         // Collect all employee IDs from product-based data
-        if (measurementData?.length) {
-            measurementData.forEach(data => {
+        if (processedMeasurementData?.length) {
+            processedMeasurementData.forEach(data => {
                 if (data.employeeId && !existingIds.has(data.employeeId.toString())) {
                     allNewEmployeeIds.add(data.employeeId.toString());
                 }
@@ -567,7 +657,7 @@ router.put('/:measurementId/add-employees', async (req, res) => {
         }
 
         // ─── OPTIMIZATION 2: Batch fetch ALL stock items at once ──────────────
-        const productIds = [...new Set((measurementData || []).map(d => d.productId).filter(Boolean))];
+        const productIds = [...new Set((processedMeasurementData || []).map(d => d.productId).filter(Boolean))];
         let stockMap = new Map();
 
         if (productIds.length) {
@@ -578,11 +668,11 @@ router.put('/:measurementId/add-employees', async (req, res) => {
         }
 
         // ─── OPTIMIZATION 3: Process product-based employees in bulk ───────────
-        if (measurementData?.length) {
+        if (processedMeasurementData?.length) {
             // Group by employee ID first
             const groupedByEmployee = new Map();
 
-            for (const data of measurementData) {
+            for (const data of processedMeasurementData) {
                 if (!data.employeeId) continue;
                 const eid = data.employeeId.toString();
                 if (existingIds.has(eid)) continue;
