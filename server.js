@@ -135,6 +135,110 @@ io.on("connection", (socket) => {
   });
 });
 
+
+// ========== NEW SCRIPT: Auto-assign missing variants in measurements ==========
+const autoAssignMissingVariantsInMeasurements = async () => {
+  try {
+    console.log("🔄 Starting auto-assignment of missing variants in measurements...");
+
+    const Measurement = require("./models/Customer_Models/Measurement");
+    const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem");
+
+    // Find all measurements that are NOT converted to PO yet (or all measurements)
+    const measurements = await Measurement.find({}).lean();
+    
+    let totalMeasurementsUpdated = 0;
+    let totalProductsUpdated = 0;
+    let totalEmployeesUpdated = 0;
+
+    for (const measurement of measurements) {
+      let measurementModified = false;
+      let productsUpdatedInThisMeasurement = 0;
+
+      // Process each employee in the measurement
+      for (const emp of measurement.employeeMeasurements) {
+        if (!emp.products || emp.products.length === 0) continue;
+
+        let employeeModified = false;
+
+        for (const product of emp.products) {
+          // Check if variantId is null, undefined, or empty
+          const needsAutoAssign = !product.variantId ||
+            product.variantId === 'null' ||
+            product.variantId === 'undefined' ||
+            (typeof product.variantId === 'string' && product.variantId.trim() === '');
+
+          if (needsAutoAssign && product.productId) {
+            // Fetch the stock item to get available variants
+            const stockItem = await StockItem.findById(product.productId).lean();
+            
+            if (stockItem && stockItem.variants && stockItem.variants.length > 0) {
+              // Auto-assign the first available variant
+              const defaultVariant = stockItem.variants[0];
+              product.variantId = defaultVariant._id;
+              product.variantName = defaultVariant.attributes?.length
+                ? defaultVariant.attributes.map(a => a.value).join(' • ')
+                : defaultVariant.name || 'Default';
+              
+              employeeModified = true;
+              measurementModified = true;
+              productsUpdatedInThisMeasurement++;
+              
+              console.log(`   ✅ Auto-assigned variant for ${emp.employeeName}: ${stockItem.name} → ${product.variantName}`);
+            } else if (stockItem && (!stockItem.variants || stockItem.variants.length === 0)) {
+              console.warn(`   ⚠️ No variants available for product: ${stockItem.name} (${emp.employeeName})`);
+            }
+          }
+        }
+
+        if (employeeModified) {
+          totalEmployeesUpdated++;
+        }
+      }
+
+      if (measurementModified) {
+        // Save the updated measurement
+        await Measurement.updateOne(
+          { _id: measurement._id },
+          { $set: { employeeMeasurements: measurement.employeeMeasurements } }
+        );
+        totalMeasurementsUpdated++;
+        totalProductsUpdated += productsUpdatedInThisMeasurement;
+        console.log(`✅ Updated measurement: ${measurement.name} (${productsUpdatedInThisMeasurement} products updated)`);
+      }
+    }
+
+    console.log(`\n📊 SUMMARY:`);
+    console.log(`   ✅ Measurements updated: ${totalMeasurementsUpdated}`);
+    console.log(`   ✅ Employees affected: ${totalEmployeesUpdated}`);
+    console.log(`   ✅ Products auto-assigned: ${totalProductsUpdated}`);
+
+    // Update the flag in database to prevent re-running
+    const db = mongoose.connection.db;
+    const flagsCol = db.collection("_migration_flags");
+    await flagsCol.updateOne(
+      { key: "auto_assign_variants_measurements_v1" },
+      { 
+        $set: { 
+          key: "auto_assign_variants_measurements_v1",
+          ranAt: new Date(),
+          stats: {
+            measurementsUpdated: totalMeasurementsUpdated,
+            employeesUpdated: totalEmployeesUpdated,
+            productsUpdated: totalProductsUpdated
+          }
+        } 
+      },
+      { upsert: true }
+    );
+
+    console.log("✅ Auto-assignment of missing variants complete!");
+    
+  } catch (error) {
+    console.error("❌ Error auto-assigning missing variants:", error.message);
+  }
+};
+
 // ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
   try {
@@ -154,9 +258,7 @@ const connectDB = async () => {
 };
 
 connectDB().then(async () => {
-  await createDefaultCuttingMaster();
-  await createDefaultAccountant();
-  await assignMeasurementsToExistingProducts();
+  await autoAssignMissingVariantsInMeasurements();
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
