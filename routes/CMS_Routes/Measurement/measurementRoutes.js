@@ -1030,6 +1030,7 @@ router.post('/:measurementId/assign-product', async (req, res) => {
 });
 
 // CONVERT measurement to PO
+// CONVERT measurement to PO
 router.post('/:measurementId/convert-to-po', async (req, res) => {
     try {
         const { measurementId } = req.params;
@@ -1078,36 +1079,23 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
         const customer = await Customer.findById(measurement.organizationId);
         if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
 
-        // Get EmployeeMpc product assignments
-        const measuredEmployees = await EmployeeMpc.find({
-            _id: { $in: convertibleEmployees.map(e => e.employeeId) }, status: 'active'
-        }).select('_id name products').populate({ path: 'products.productId', select: 'name reference baseSalesPrice variants' }).lean();
-
-        const employeeProductMap = new Map(measuredEmployees.map(e => [e._id.toString(), e]));
-
-        // ========== FIX: Build product map with auto-variant assignment ==========
+        // ========== FIXED: Build product map directly from measurement data ==========
         const productMap = new Map();
-        const autoAssignedLog = []; // Track auto-assigned variants for logging
+        const autoAssignedLog = [];
 
-        convertibleEmployees.forEach(emp => {
-            const employeeData = employeeProductMap.get(emp.employeeId.toString());
-            if (!employeeData) return;
+        // Process each convertible employee
+        for (const emp of convertibleEmployees) {
+            for (const measuredProduct of emp.products) {
+                // Get product directly from the populated data
+                const si = measuredProduct.productId;
+                if (!si || !si._id) {
+                    console.warn(`Product not found for ${emp.employeeName}: ${measuredProduct.productName}`);
+                    continue;
+                }
 
-            emp.products.forEach(measuredProduct => {
-                // Find matching product assignment in employee data
-                const pa = employeeData.products.find(p => {
-                    if (p.productId?._id?.toString() !== measuredProduct.productId?._id?.toString()) return false;
-                    if (p.variantId && measuredProduct.variantId) return p.variantId.toString() === measuredProduct.variantId.toString();
-                    return !p.variantId && !measuredProduct.variantId;
-                });
-                if (!pa) return;
-
-                const si = pa.productId;
-                if (!si?._id) return;
-
-                // 🔧 CRITICAL FIX: Check if variantId is null/missing
-                let finalVariantId = pa.variantId;
-                let finalVariantName = pa.variantName || 'Default';
+                // 🔧 CRITICAL: Check if variantId is null/missing
+                let finalVariantId = measuredProduct.variantId;
+                let finalVariantName = measuredProduct.variantName || 'Default';
                 let finalVariantAttributes = [];
                 let finalUnitPrice = si.baseSalesPrice || 0;
                 let autoAssigned = false;
@@ -1134,13 +1122,13 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
 
                     autoAssignedLog.push({
                         productName: si.name,
-                        employeeName: employeeData.name,
-                        originalVariantId: pa.variantId,
+                        employeeName: emp.employeeName,
+                        originalVariantId: measuredProduct.variantId,
                         assignedVariantId: finalVariantId,
                         assignedVariantName: finalVariantName
                     });
 
-                    console.log(`✅ Auto-assigned variant for ${si.name} (${employeeData.name}): ${finalVariantName}`);
+                    console.log(`✅ Auto-assigned variant for ${si.name} (${emp.employeeName}): ${finalVariantName}`);
                 } else if (finalVariantId && si.variants) {
                     // Variant exists, use its price and attributes
                     const variantData = si.variants.find(v => v._id.toString() === finalVariantId.toString());
@@ -1155,6 +1143,9 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                         finalUnitPrice = variantData.salesPrice || si.baseSalesPrice || 0;
                     }
                 }
+
+                // Use quantity from measurement
+                const quantity = measuredProduct.quantity || 1;
 
                 // Create unique key for grouping (productId + variantId)
                 const key = `${si._id}_${finalVariantId || 'default'}`;
@@ -1177,10 +1168,10 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
 
                 const pd = productMap.get(key);
                 pd.employeeCount++;
-                pd.totalQuantity += pa.quantity || 1;
-                pd.employeeNames.push(employeeData.name);
-            });
-        });
+                pd.totalQuantity += quantity;
+                pd.employeeNames.push(emp.employeeName);
+            }
+        }
 
         // Log auto-assigned variants summary
         if (autoAssignedLog.length > 0) {
