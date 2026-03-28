@@ -1031,6 +1031,7 @@ router.post('/:measurementId/assign-product', async (req, res) => {
 
 // CONVERT measurement to PO
 // CONVERT measurement to PO
+// CONVERT measurement to PO
 router.post('/:measurementId/convert-to-po', async (req, res) => {
     try {
         const { measurementId } = req.params;
@@ -1064,6 +1065,12 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Selected employees have no product assignments. Cannot convert category-only measurements to PO.' });
         }
 
+        // ========== DEBUG: Log employee processing ==========
+        console.log(`\n📊 TOTAL EMPLOYEES IN MEASUREMENT: ${measurement.employeeMeasurements.length}`);
+        console.log(`📊 SELECTED EMPLOYEES: ${selectedEmployeeMeasurements.length}`);
+        console.log(`📊 CONVERTIBLE EMPLOYEES (with products): ${convertibleEmployees.length}`);
+        console.log(`\n📋 PROCESSING EMPLOYEES:`);
+
         // Validate completeness
         let totalFields = 0, completedFields = 0;
         convertibleEmployees.forEach(emp => {
@@ -1079,17 +1086,28 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
         const customer = await Customer.findById(measurement.organizationId);
         if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
 
-        // ========== FIXED: Build product map directly from measurement data ==========
+        // ========== Build product map directly from measurement data ==========
         const productMap = new Map();
         const autoAssignedLog = [];
+        const missingProductsLog = [];
 
         // Process each convertible employee
         for (const emp of convertibleEmployees) {
+            console.log(`\n👤 Employee: ${emp.employeeName} (${emp.employeeUIN})`);
+            console.log(`   Products in measurement: ${emp.products.length}`);
+
             for (const measuredProduct of emp.products) {
+                console.log(`   📦 Product: ${measuredProduct.productName || 'Unknown'}, Qty: ${measuredProduct.quantity || 1}`);
+
                 // Get product directly from the populated data
                 const si = measuredProduct.productId;
                 if (!si || !si._id) {
-                    console.warn(`Product not found for ${emp.employeeName}: ${measuredProduct.productName}`);
+                    console.warn(`   ⚠️ Product not found in StockItem for ${emp.employeeName}: ${measuredProduct.productName}`);
+                    missingProductsLog.push({
+                        employeeName: emp.employeeName,
+                        productName: measuredProduct.productName,
+                        reason: 'Product not found in StockItem'
+                    });
                     continue;
                 }
 
@@ -1107,7 +1125,6 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                     (typeof finalVariantId === 'string' && finalVariantId.trim() === '');
 
                 if (needsAutoAssign && si.variants && si.variants.length > 0) {
-                    // Auto-assign the first available variant
                     const defaultVariant = si.variants[0];
                     finalVariantId = defaultVariant._id.toString();
                     finalVariantName = defaultVariant.attributes?.length
@@ -1120,6 +1137,8 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                     finalUnitPrice = defaultVariant.salesPrice || si.baseSalesPrice || 0;
                     autoAssigned = true;
 
+                    console.log(`   ✅ Auto-assigned variant: ${finalVariantName} (price: ${finalUnitPrice})`);
+
                     autoAssignedLog.push({
                         productName: si.name,
                         employeeName: emp.employeeName,
@@ -1127,10 +1146,7 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                         assignedVariantId: finalVariantId,
                         assignedVariantName: finalVariantName
                     });
-
-                    console.log(`✅ Auto-assigned variant for ${si.name} (${emp.employeeName}): ${finalVariantName}`);
                 } else if (finalVariantId && si.variants) {
-                    // Variant exists, use its price and attributes
                     const variantData = si.variants.find(v => v._id.toString() === finalVariantId.toString());
                     if (variantData) {
                         finalVariantName = variantData.attributes?.length
@@ -1141,7 +1157,12 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
                             value: a.value
                         })) || [];
                         finalUnitPrice = variantData.salesPrice || si.baseSalesPrice || 0;
+                        console.log(`   📍 Using existing variant: ${finalVariantName} (price: ${finalUnitPrice})`);
+                    } else {
+                        console.warn(`   ⚠️ Variant not found for ID: ${finalVariantId}, using base price`);
                     }
+                } else {
+                    console.log(`   📍 No variant, using base price: ${finalUnitPrice}`);
                 }
 
                 // Use quantity from measurement
@@ -1173,9 +1194,53 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             }
         }
 
+        // ========== DEBUG: Log summary ==========
+        console.log(`\n📊 PROCESSING SUMMARY:`);
+        console.log(`   Total products in productMap: ${productMap.size}`);
+        
+        console.log(`\n📦 PRODUCT GROUPS:`);
+        for (const [key, value] of productMap) {
+            console.log(`   ${value.stockItemName} (${value.variantName}) -> ${value.totalQuantity} units, Employees: ${value.employeeCount}`);
+        }
+
+        // ========== DEBUG: Find missing Chef Trouser employees ==========
+        const chefEmployeesInPO = new Set();
+        for (const [key, value] of productMap) {
+            if (value.stockItemName?.toLowerCase().includes('chef trouser')) {
+                value.employeeNames.forEach(name => chefEmployeesInPO.add(name));
+            }
+        }
+
+        console.log(`\n👕 CHEF TROUSER EMPLOYEES IN PO:`);
+        console.log(`   Total: ${chefEmployeesInPO.size}`);
+        chefEmployeesInPO.forEach(name => console.log(`   ✅ ${name}`));
+
+        console.log(`\n❌ MISSING CHEF TROUSER EMPLOYEES (if any):`);
+        let missingCount = 0;
+        convertibleEmployees.forEach(emp => {
+            const hasChefTrouser = emp.products.some(p => 
+                (p.productName?.toLowerCase().includes('chef trouser') ||
+                p.productId?.name?.toLowerCase().includes('chef trouser'))
+            );
+            if (hasChefTrouser && !chefEmployeesInPO.has(emp.employeeName)) {
+                console.log(`   ❌ ${emp.employeeName} (${emp.employeeUIN}) - NOT included`);
+                missingCount++;
+            }
+        });
+        if (missingCount === 0) {
+            console.log(`   ✅ All Chef Trouser employees are included!`);
+        }
+
+        if (missingProductsLog.length > 0) {
+            console.log(`\n⚠️ MISSING PRODUCTS:`);
+            missingProductsLog.forEach(log => {
+                console.log(`   ❌ ${log.employeeName}: ${log.productName} - ${log.reason}`);
+            });
+        }
+
         // Log auto-assigned variants summary
         if (autoAssignedLog.length > 0) {
-            console.log(`🔧 Auto-assigned ${autoAssignedLog.length} variant(s) during PO conversion:`);
+            console.log(`\n🔧 Auto-assigned ${autoAssignedLog.length} variant(s) during PO conversion:`);
             console.log(JSON.stringify(autoAssignedLog, null, 2));
         }
 
@@ -1300,7 +1365,16 @@ router.post('/:measurementId/convert-to-po', async (req, res) => {
             selectedEmployeeCount: convertibleEmployees.length,
             remainingEmployeeCount: remainingEmployeeMeasurements.length,
             newMeasurementId,
-            autoAssignedVariants: autoAssignedLog.length > 0 ? autoAssignedLog : undefined
+            autoAssignedVariants: autoAssignedLog.length > 0 ? autoAssignedLog : undefined,
+            // Debug info
+            debugInfo: {
+                totalEmployeesInMeasurement: measurement.employeeMeasurements.length,
+                selectedEmployees: selectedEmployeeMeasurements.length,
+                convertibleEmployees: convertibleEmployees.length,
+                productsInPO: products.length,
+                chefTrouserEmployeesInPO: chefEmployeesInPO.size,
+                missingChefTrouserEmployees: missingCount
+            }
         });
 
     } catch (error) {
