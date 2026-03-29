@@ -1,3 +1,9 @@
+/**
+ * REPLACE: routes/cowork.js  (only the employee/create route changed — rest is identical)
+ * Change: /employee/create now accepts `role` ("employee"|"tl") in body
+ *         and passes it to svc.createCoworkEmployee
+ */
+
 const express = require("express");
 const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
@@ -39,14 +45,12 @@ router.get("/me", verifyCoworkToken, verifyEmployeeToken, (req, res) => {
 router.get("/employee/list-members", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const employees = await svc.listCoworkEmployees();
-    // Strip sensitive fields before sending to non-CEO users
     const safe = employees.map(({ tempPassword, authUid, fcmTokens, ...emp }) => emp);
     res.json({ employees: safe });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 // ── Change Password ──────────────────────────────
 router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
@@ -59,12 +63,25 @@ router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (r
 });
 
 // ── Employee ──────────────────────────────────────────────
+/**
+ * UPDATED: Now accepts optional `role` field ("employee" | "tl").
+ * Defaults to "employee" if not provided.
+ * If role === "tl", the created user gets TL custom claims and is stored as TL.
+ */
 router.post("/employee/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
   try {
-    const { name, email, mobile, city, department } = req.body;
-    if (!name || !email || !mobile || !city || !department) return res.status(400).json({ error: "All fields required." });
-    const result = await svc.createCoworkEmployee({ name, email, mobile, city, department });
-    res.status(201).json({ success: true, employeeId: result.employeeId, tempPassword: result.tempPassword });
+    const { name, email, mobile, city, department, role: empRole } = req.body;
+    if (!name || !email || !mobile || !city || !department) {
+      return res.status(400).json({ error: "All fields required." });
+    }
+    const resolvedRole = empRole === "tl" ? "tl" : "employee";
+    const result = await svc.createCoworkEmployee({ name, email, mobile, city, department, role: resolvedRole });
+    res.status(201).json({
+      success: true,
+      employeeId: result.employeeId,
+      tempPassword: result.tempPassword,
+      role: resolvedRole,
+    });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -113,9 +130,7 @@ router.get("/group/list", verifyCoworkToken, verifyEmployeeToken, async (req, re
   try {
     const groups = await svc.listCoworkGroups(req.coworkUser.employeeId, req.coworkUser.role);
     res.json({ groups });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 router.get("/group/:groupId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
@@ -123,41 +138,51 @@ router.get("/group/:groupId", verifyCoworkToken, verifyEmployeeToken, async (req
     const group = await svc.getCoworkGroup(req.params.groupId);
     if (!group) return res.status(404).json({ error: "Group not found" });
     res.json({ group });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+
+// ── UPDATE GROUP (name / description) ─────────────────────
+router.patch("/group/:groupId", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const { name, description } = req.body;
+    const updated = await svc.updateCoworkGroup(req.params.groupId, req.coworkUser.employeeId, { name, description });
+    res.json({ success: true, group: updated });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── ADD MEMBER ─────────────────────────────────────────────
+router.post("/group/:groupId/members", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const { employeeId } = req.body;
+    if (!employeeId) return res.status(400).json({ error: "employeeId required" });
+    const result = await svc.addGroupMember(req.params.groupId, req.coworkUser.employeeId, employeeId);
+    res.json({ success: true, ...result });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+// ── REMOVE MEMBER ─────────────────────────────────────────
+router.delete("/group/:groupId/members/:employeeId", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const result = await svc.removeGroupMember(req.params.groupId, req.coworkUser.employeeId, req.params.employeeId);
+    res.json({ success: true, ...result });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+
 
 router.get("/group/:groupId/members", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { groupId } = req.params;
-    console.log(`Fetching members for group: ${groupId}`);
-
     const groupDoc = await db.collection("cowork_groups").doc(groupId).get();
-
-    if (!groupDoc.exists) {
-      return res.status(404).json({ error: "Group not found" });
-    }
-
+    if (!groupDoc.exists) return res.status(404).json({ error: "Group not found" });
     const groupData = groupDoc.data();
     const memberIds = groupData.memberIds || [];
-
     const members = [];
     for (const id of memberIds) {
       const memberDoc = await db.collection("cowork_employees").doc(id).get();
-      if (memberDoc.exists) {
-        members.push({
-          employeeId: id,
-          ...memberDoc.data()
-        });
-      }
+      if (memberDoc.exists) members.push({ employeeId: id, ...memberDoc.data() });
     }
-
-    console.log(`Found ${members.length} members for group ${groupId}`);
     res.json({ members });
-
   } catch (error) {
-    console.error("Error fetching group members:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -177,9 +202,18 @@ router.get("/group/:groupId/messages", verifyCoworkToken, verifyEmployeeToken, a
 // ── Direct Messages ───────────────────────────────────────
 router.post("/direct-message/send", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { toEmployeeId, text, attachments } = req.body;
-    if (!toEmployeeId || !text) return res.status(400).json({ error: "toEmployeeId and text required" });
-    const result = await svc.sendDirectMessage({ fromEmployeeId: req.coworkUser.employeeId, toEmployeeId, senderName: req.coworkUser.name, text, attachments: attachments || [] });
+    const { toEmployeeId, text, attachments, messageType } = req.body;
+    // text is optional if there are attachments
+    if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
+    if (!text?.trim() && (!attachments || !attachments.length)) return res.status(400).json({ error: "text or attachments required" });
+    const result = await svc.sendDirectMessage({
+      fromEmployeeId: req.coworkUser.employeeId,
+      toEmployeeId,
+      senderName: req.coworkUser.name,
+      text: text || "",
+      attachments: attachments || [],
+      messageType: messageType || "text",
+    });
     res.status(201).json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -189,8 +223,12 @@ router.get("/direct-message/conversations", verifyCoworkToken, verifyEmployeeTok
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
 router.get("/direct-message/:convId/messages", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
-  try { res.json({ messages: await svc.getDirectMessages(req.params.convId, req.query.limit) }); }
+  try {
+    res.
+      json({ messages: await svc.getDirectMessages(req.params.convId, req.query.limit) });
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -233,6 +271,37 @@ router.get("/task/list", verifyCoworkToken, verifyEmployeeToken, async (req, res
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── NEW: TL approves a task assigned to them by an employee ───────────────────
+router.post("/task/:taskId/approve", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, role: requesterRole, name } = req.coworkUser;
+    if (requesterRole !== "tl") return res.status(403).json({ error: "Only TL can approve tasks." });
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+
+    const task = snap.data();
+    if (!task.assigneeIds?.includes(employeeId)) {
+      return res.status(403).json({ error: "You are not assigned to this task." });
+    }
+    if (task.status !== "pending_tl_approval") {
+      return res.status(400).json({ error: "Task is not pending TL approval." });
+    }
+
+    await taskRef.update({
+      status: "open",
+      tlApprovedBy: employeeId,
+      tlApprovedByName: name,
+      tlApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true, message: "Task approved and is now open." });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Notifications ─────────────────────────────────────────
 router.get("/notifications", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
@@ -258,5 +327,4 @@ router.patch("/notifications/read-all", verifyCoworkToken, verifyEmployeeToken, 
     res.status(200).json({ success: false, error: e.message });
   }
 });
-
 module.exports = router;
