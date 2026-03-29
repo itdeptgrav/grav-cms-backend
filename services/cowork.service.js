@@ -41,40 +41,60 @@ async function syncToRTDBWithExpiry(collection, docId, data, ttlHours = 24) {
 }
 
 // ── EMPLOYEE ─────────────────────────────────────────────
-async function createCoworkEmployee({ name, email, mobile, city, department }) {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789@#!";
-  const tempPassword = Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+// ── REPLACE this function in services/cowork.service.js ──────────────────────
+async function createCoworkEmployee({ name, email, mobile, city, department, role = "employee" }) {
+  const { auth, db, admin } = require("../config/firebaseAdmin");
 
-  let userRecord;
-  try {
-    userRecord = await auth.createUser({ email, password: tempPassword, displayName: name });
-  } catch (err) {
-    if (err.code === "auth/email-already-exists") throw new Error(`Email "${email}" already exists.`);
-    throw new Error("Firebase Auth: " + err.message);
-  }
-  await auth.setCustomUserClaims(userRecord.uid, { role: "employee" });
-  const employeeId = await generateCoworkId("employee");
+  // Validate role
+  const resolvedRole = role === "tl" ? "tl" : "employee";
 
-  const data = {
-    employeeId, authUid: userRecord.uid, name, email, mobile, city, department,
-    role: "employee", profilePicUrl: null, fcmTokens: [],
-    tempPassword,
-    passwordChanged: false,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  };
-
-  // Save to Firestore
-  await db.collection("cowork_employees").doc(employeeId).set(data);
-
-  // Sync to Realtime Database
-  await syncToRTDB('employees', employeeId, {
-    ...data,
-    createdAt: new Date().toISOString()
+  // Generate employee ID
+  const counterRef = db.collection("cowork_meta").doc("counters");
+  const empId = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(counterRef);
+    const seq = (snap.data()?.employeeSeq || 0) + 1;
+    tx.update(counterRef, { employeeSeq: seq });
+    return `E${String(seq).padStart(3, "0")}`;
   });
 
-  console.log(`✅ Employee ${employeeId} created (${email})`);
-  return { employeeId, tempPassword, employee: data };
+  // Generate temp password
+  const tempPassword = Math.random().toString(36).slice(-8) + Math.random().toString(36).slice(-4).toUpperCase();
+
+  // Create Firebase Auth user
+  let ur;
+  try {
+    ur = await auth.createUser({ email, password: tempPassword, displayName: name });
+  } catch (e) {
+    if (e.code === "auth/email-already-exists") {
+      ur = await auth.getUserByEmail(email);
+    } else {
+      throw e;
+    }
+  }
+
+  // Set custom claim with role (employee or tl)
+  await auth.setCustomUserClaims(ur.uid, { role: resolvedRole });
+
+  // Store in Firestore
+  await db.collection("cowork_employees").doc(empId).set({
+    employeeId: empId,
+    authUid: ur.uid,
+    name,
+    email,
+    mobile,
+    city,
+    department,
+    role: resolvedRole,        // "employee" | "tl"
+    profilePicUrl: null,
+    fcmTokens: [],
+    passwordChanged: false,
+    tempPassword,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return { employeeId: empId, tempPassword, role: resolvedRole };
 }
+
 
 // ── CHANGE EMPLOYEE PASSWORD ────────────────────────────
 async function changeEmployeePassword({ employeeId, authUid, newPassword }) {
@@ -128,12 +148,20 @@ async function saveFCMToken(employeeId, token) {
   await rtdb.ref(`cowork/employees/${employeeId}/fcmTokens`).push(token);
 }
 
+
 // ── GROUP ─────────────────────────────────────────────────
+// Make sure this is exactly how it appears in your file
 async function createCoworkGroup({ name, description, memberIds, createdBy, createdByAuthUid }) {
   const groupId = await generateCoworkId("group");
   const data = {
-    groupId, name, description: description || "", createdBy, createdByAuthUid,
-    memberIds, deleted: false, lastMessage: null,
+    groupId,
+    name,
+    description: description || "",
+    createdBy,
+    createdByAuthUid,
+    memberIds,
+    deleted: false,
+    lastMessage: null,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
@@ -147,7 +175,14 @@ async function createCoworkGroup({ name, description, memberIds, createdBy, crea
   });
 
   const recipients = memberIds.filter(id => id !== createdBy);
-  await _notifyMany({ recipientIds: recipients, type: "group_added", title: `Added to: ${name}`, body: `You were added to "${name}"`, data: { groupId } });
+  await _notifyMany({
+    recipientIds: recipients,
+    type: "group_added",
+    title: `Added to: ${name}`,
+    body: `You were added to "${name}"`,
+    data: { groupId }
+  });
+
   return data;
 }
 
@@ -158,6 +193,42 @@ async function deleteCoworkGroup(groupId, requestingEmployeeId) {
 
   await db.collection("cowork_groups").doc(groupId).update({ deleted: true });
   await rtdb.ref(`cowork/groups/${groupId}`).update({ deleted: true, deletedAt: new Date().toISOString() });
+}
+
+// ── UPDATE GROUP (name / description) ─────────────────────
+async function updateCoworkGroup(groupId, requestingEmployeeId, { name, description }) {
+  const snap = await db.collection("cowork_groups").doc(groupId).get();
+  if (!snap.exists) throw new Error("Group not found.");
+  if (snap.data().createdBy !== requestingEmployeeId) throw new Error("Only the creator can edit this group.");
+  const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+  if (name?.trim()) updates.name = name.trim();
+  if (description !== undefined) updates.description = description || "";
+  await db.collection("cowork_groups").doc(groupId).update(updates);
+  return { ...snap.data(), ...updates };
+}
+
+// ── ADD MEMBER ─────────────────────────────────────────────
+async function addGroupMember(groupId, requestingEmployeeId, employeeIdToAdd) {
+  const snap = await db.collection("cowork_groups").doc(groupId).get();
+  if (!snap.exists) throw new Error("Group not found.");
+  if (snap.data().createdBy !== requestingEmployeeId) throw new Error("Only the creator can add members.");
+  const memberIds = snap.data().memberIds || [];
+  if (memberIds.includes(employeeIdToAdd)) throw new Error("Employee is already a member.");
+  const updated = [...memberIds, employeeIdToAdd];
+  await db.collection("cowork_groups").doc(groupId).update({ memberIds: updated, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+  await _notifyMany({ recipientIds: [employeeIdToAdd], type: "group_added", title: `Added to: ${snap.data().name}`, body: `You were added to group "${snap.data().name}"`, data: { groupId } });
+  return { memberIds: updated };
+}
+
+// ── REMOVE MEMBER ─────────────────────────────────────────
+async function removeGroupMember(groupId, requestingEmployeeId, employeeIdToRemove) {
+  const snap = await db.collection("cowork_groups").doc(groupId).get();
+  if (!snap.exists) throw new Error("Group not found.");
+  if (snap.data().createdBy !== requestingEmployeeId) throw new Error("Only the creator can remove members.");
+  if (employeeIdToRemove === requestingEmployeeId) throw new Error("Creator cannot be removed.");
+  const memberIds = (snap.data().memberIds || []).filter(id => id !== employeeIdToRemove);
+  await db.collection("cowork_groups").doc(groupId).update({ memberIds, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+  return { memberIds };
 }
 
 
@@ -226,7 +297,7 @@ async function getCoworkGroup(groupId) {
 }
 
 // ── GROUP MESSAGES ────────────────────────────────────────
-async function sendGroupMessage({ groupId, senderId, senderName, text, attachments = [] }) {
+async function sendGroupMessage({ groupId, senderId, senderName, text, attachments = [], messageType = "text" }) {
   const groupDoc = await db.collection("cowork_groups").doc(groupId).get();
   if (!groupDoc.exists) throw new Error("Group not found.");
   const group = groupDoc.data();
@@ -236,11 +307,16 @@ async function sendGroupMessage({ groupId, senderId, senderName, text, attachmen
   const timestamp = admin.firestore.FieldValue.serverTimestamp();
   const isoTime = new Date().toISOString();
 
+  const resolvedType = messageType !== "text" ? messageType
+    : attachments.length > 0 ? (attachments[0].type || "image") : "text";
+
   const msg = {
     messageId, threadType: "group", threadId: groupId, senderId, senderName,
-    text, attachments, type: "text", readBy: [senderId],
+    text: text || "", attachments, messageType: resolvedType,
+    type: resolvedType, readBy: [senderId],
     createdAt: timestamp,
   };
+
 
   // Save to Firestore
   await db.collection("cowork_groups").doc(groupId).collection("messages").doc(messageId).set(msg);
@@ -282,7 +358,7 @@ async function getGroupMessages(groupId, limit = 60) {
 }
 
 // ── DIRECT MESSAGES ───────────────────────────────────────
-async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, text, attachments = [] }) {
+async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, text, attachments = [], messageType = "text" }) {
   const sorted = [fromEmployeeId, toEmployeeId].sort();
   const conversationId = `${sorted[0]}_${sorted[1]}`;
   const convRef = db.collection("cowork_direct_messages").doc(conversationId);
@@ -299,9 +375,14 @@ async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, tex
   const timestamp = admin.firestore.FieldValue.serverTimestamp();
   const isoTime = new Date().toISOString();
 
+  // Determine message type from attachments if not provided
+  const resolvedType = messageType !== "text" ? messageType
+    : attachments.length > 0 ? (attachments[0].type || "image") : "text";
+
   const msg = {
     messageId, threadType: "direct", threadId: conversationId, senderId: fromEmployeeId,
-    senderName, text, attachments, type: "text", readBy: [fromEmployeeId],
+    senderName, text: text || "", attachments, messageType: resolvedType,
+    type: resolvedType, readBy: [fromEmployeeId],
     createdAt: timestamp,
   };
 
@@ -705,6 +786,12 @@ module.exports = {
   scheduleCoworkMeet,
   listCoworkMeets,
   getCoworkMeet,
+
+
+
+  addGroupMember,
+  removeGroupMember,
+  updateCoworkGroup,
 
   assignCoworkTask,
   updateTaskProgress,
