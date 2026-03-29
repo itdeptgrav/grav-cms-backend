@@ -269,9 +269,8 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
   const axios = require('axios');
 
   try {
-    // ── 1. Fetch all employees sorted by dept → name ──────────────────────
     const employees = await EmployeeMpc.find({ customerId: req.customerId })
-      .select('name uin gender department designation products')
+      .select('name uin gender department designation products status')
       .sort({ department: 1, name: 1 })
       .lean();
 
@@ -279,10 +278,12 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
       return res.status(404).json({ success: false, message: 'No employees found' });
     }
 
-    // ── 2. Batch-fetch StockItems ─────────────────────────────────────────
+    // ── Batch-fetch StockItems ─────────────────────────────────────────────
     const productIdSet = new Set();
     employees.forEach(emp =>
-      (emp.products || []).forEach(p => { if (p.productId) productIdSet.add(p.productId.toString()); })
+      (emp.products || []).forEach(p => {
+        if (p.productId) productIdSet.add(p.productId.toString());
+      })
     );
 
     const stockItems = productIdSet.size
@@ -293,165 +294,266 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
 
     const stockMap = new Map(stockItems.map(s => [s._id.toString(), s]));
 
-    // ── 3. Pre-download all unique image URLs in parallel ─────────────────
+    // ── Max products across all employees → number of photo columns ───────
+    const maxProducts = employees.reduce(
+      (m, e) => Math.max(m, (e.products || []).length), 0
+    );
+
+    // ── Image helpers ─────────────────────────────────────────────────────
+    const toThumb = (u) => u?.includes('/image/upload/')
+      ? u.replace('/image/upload/', '/image/upload/w_80,h_80,c_fill,q_70,f_webp/')
+      : u;
+
+    const getImageExtension = (url) => {
+      const ext = (url.match(/\.(png|jpg|jpeg|gif|webp)/i)?.[1] || 'png').toLowerCase();
+      return (ext === 'jpg' || ext === 'jpeg') ? 'jpeg' : ext === 'gif' ? 'gif' : 'png';
+    };
+
+    // Resolve image: assigned variant first, then any variant, then product-level
+    const resolveImageUrl = (p) => {
+      const pid = p.productId?.toString();
+      if (!pid) return '';
+      const si = stockMap.get(pid);
+      if (!si) return '';
+
+      // 1. Try assigned variant's image
+      if (p.variantId && si.variants?.length) {
+        const v = si.variants.find(v => v._id.toString() === p.variantId.toString());
+        if (v?.images?.[0]) return v.images[0];
+      }
+
+      // 2. Fallback: any variant with an image
+      if (si.variants?.length) {
+        for (const v of si.variants) {
+          if (v.images?.[0]) return v.images[0];
+        }
+      }
+
+      // 3. Fallback: product-level image
+      return si.images?.[0] || '';
+    };
+
+    // Variant label for combined text
+    const getVariantLabel = (p) => {
+      const pid = p.productId?.toString();
+      if (!pid || !p.variantId) return '';
+      const si = stockMap.get(pid);
+      if (!si?.variants?.length) return '';
+      const v = si.variants.find(v => v._id.toString() === p.variantId.toString());
+      if (!v?.attributes?.length) return '';
+      return v.attributes.map(a => a.value).join('/');
+    };
+
+    // ── Collect and download all unique image URLs ────────────────────────
     const imageUrlSet = new Set();
     employees.forEach(emp => {
       (emp.products || []).forEach(p => {
-        const si = stockMap.get(p.productId?.toString());
+        const pid = p.productId?.toString();
+        if (!pid) return;
+        const si = stockMap.get(pid);
         if (!si) return;
-        let url = si.images?.[0] || '';
-        if (p.variantId && si.variants?.length) {
-          const v = si.variants.find(v => v._id.toString() === p.variantId.toString());
-          if (v?.images?.[0]) url = v.images[0];
-        }
-        if (url) imageUrlSet.add(url);
+
+        // Collect from all variants (so fallback works)
+        (si.variants || []).forEach(v => {
+          if (v.images?.[0]) imageUrlSet.add(v.images[0]);
+        });
+        if (si.images?.[0]) imageUrlSet.add(si.images[0]);
       });
     });
 
     const imageBufferMap = new Map();
     await Promise.all([...imageUrlSet].map(async url => {
       try {
-        const toThumb = (u) => u?.includes('/image/upload/')
-          ? u.replace('/image/upload/', '/image/upload/w_80,h_80,c_fill,q_70,f_webp/')
-          : u;
-        const resp = await axios.get(toThumb(url), { responseType: 'arraybuffer', timeout: 8000 });
+        const resp = await axios.get(toThumb(url), {
+          responseType: 'arraybuffer', timeout: 10000
+        });
         imageBufferMap.set(url, Buffer.from(resp.data));
       } catch { /* skip failed images */ }
     }));
 
-    // ── 4. Build workbook ─────────────────────────────────────────────────
+    // ── Build workbook ────────────────────────────────────────────────────
     const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet('Employees', { pageSetup: { fitToPage: true, fitToWidth: 1 } });
+    const ws = wb.addWorksheet('Employees', {
+      pageSetup: { fitToPage: true, fitToWidth: 1 }
+    });
 
-    const IMG_HEIGHT = 60; // row height (pts) when images present
+    const IMG_COL_WIDTH = 11;
+    const ROW_HEIGHT = 72;
 
-    // Columns — NO Status, photo is col 9 (I)
-    ws.columns = [
+    const fixedCols = [
       { header: 'Name', key: 'name', width: 24 },
-      { header: 'UIN', key: 'uin', width: 10 },
+      { header: 'UIN', key: 'uin', width: 12 },
       { header: 'Gender', key: 'gender', width: 9 },
       { header: 'Department', key: 'department', width: 22 },
       { header: 'Designation', key: 'designation', width: 22 },
-      { header: 'Product Name', key: 'productName', width: 28 },
-      { header: 'Variant', key: 'variant', width: 14 },
-      { header: 'Quantity', key: 'quantity', width: 10 },
-      { header: 'Photo', key: 'photo', width: 12 },
+      { header: 'Status', key: 'status', width: 10 },
+      { header: 'Products', key: 'products', width: 34 },
     ];
+    const FIXED_COUNT = fixedCols.length;
 
-    // Header styling
-    ws.getRow(1).height = 20;
+    const photoCols = [];
+    for (let i = 1; i <= maxProducts; i++) {
+      photoCols.push({ header: `Photo ${i}`, key: `photo_${i}`, width: IMG_COL_WIDTH });
+    }
+
+    ws.columns = [...fixedCols, ...photoCols];
+    const totalCols = FIXED_COUNT + maxProducts;
+
+    // ── Header styling ────────────────────────────────────────────────────
+    ws.getRow(1).height = 22;
     ws.getRow(1).eachCell(cell => {
       cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Arial' };
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2D3748' } };
       cell.alignment = { vertical: 'middle', horizontal: 'center' };
-      cell.border = { bottom: { style: 'thin', color: { argb: 'FF4A5568' } }, right: { style: 'thin', color: { argb: 'FF4A5568' } } };
+      cell.border = {
+        bottom: { style: 'thin', color: { argb: 'FF4A5568' } },
+        right: { style: 'thin', color: { argb: 'FF4A5568' } }
+      };
     });
+    // Slightly different header bg for photo columns
+    for (let i = 1; i <= maxProducts; i++) {
+      ws.getRow(1).getCell(FIXED_COUNT + i).fill = {
+        type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4A5568' }
+      };
+    }
 
     const styleCell = (cell, isAlt) => {
       cell.font = { size: 9, name: 'Arial' };
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isAlt ? 'FFF7FAFC' : 'FFFFFFFF' } };
+      cell.fill = {
+        type: 'pattern', pattern: 'solid',
+        fgColor: { argb: isAlt ? 'FFF7FAFC' : 'FFFFFFFF' }
+      };
       cell.alignment = { vertical: 'middle', wrapText: true };
-      cell.border = { bottom: { style: 'hair', color: { argb: 'FFE2E8F0' } }, right: { style: 'hair', color: { argb: 'FFE2E8F0' } } };
+      cell.border = {
+        bottom: { style: 'hair', color: { argb: 'FFE2E8F0' } },
+        right: { style: 'hair', color: { argb: 'FFE2E8F0' } }
+      };
     };
 
+    // ── Write rows ────────────────────────────────────────────────────────
     let currentDept = null;
-    let rowIdx = 2;   // 1-based; row 1 = header
+    let rowIdx = 2;
     let altRow = false;
 
     for (const emp of employees) {
       const dept = emp.department || '';
+      const empProducts = emp.products || [];
 
-      // Blank separator between departments
+      // Department separator
       if (currentDept !== null && dept !== currentDept) {
         const sep = ws.getRow(rowIdx);
-        sep.height = 8;
-        ws.mergeCells(rowIdx, 1, rowIdx, 9);
-        sep.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEDF2F7' } };
+        sep.height = 6;
+        if (totalCols > 1) ws.mergeCells(rowIdx, 1, rowIdx, totalCols);
+        sep.getCell(1).fill = {
+          type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEDF2F7' }
+        };
         rowIdx++;
         altRow = false;
       }
       currentDept = dept;
 
-      // ── Resolve all products for this employee ────────────────────────
-      const productLines = [];   // strings for the text cell
-      const imageUrls = [];   // one url per product (may repeat if same image)
-
-      (emp.products || []).forEach((p, idx) => {
+      // Build combined products text: "1. Chef Coat | Blue/XL (x2)"
+      const productNamesText = empProducts.map((p, idx) => {
         const si = stockMap.get(p.productId?.toString());
-        const prodName = p.productName || si?.name || '';
-        let variantLabel = 'Default';
-        let imageUrl = '';
-
-        if (si) {
-          imageUrl = si.images?.[0] || '';
-          if (p.variantId && si.variants?.length) {
-            const v = si.variants.find(v => v._id.toString() === p.variantId.toString());
-            if (v) {
-              variantLabel = v.attributes?.map(a => a.value).join(' / ') || 'Default';
-              if (v.images?.[0]) imageUrl = v.images[0];
-            }
-          }
-        }
-
+        const name = p.productName || si?.name || '(unknown)';
+        const variant = getVariantLabel(p);
         const qty = p.quantity || 1;
-        productLines.push(`${idx + 1}. ${prodName} | Qty: ${qty}`);
-        imageUrls.push(imageUrl);
+        const parts = [`${idx + 1}. ${name}`];
+        if (variant) parts.push(`| ${variant}`);
+        parts.push(`(x${qty})`);
+        return parts.join(' ');
+      }).join('\n');
+
+      // Determine if any product has an image
+      const hasAnyImage = empProducts.some(p => {
+        const url = resolveImageUrl(p);
+        return url && imageBufferMap.has(url);
       });
 
-      const hasAnyImage = imageUrls.some(u => u && imageBufferMap.has(u));
       const row = ws.getRow(rowIdx);
-      row.height = hasAnyImage ? IMG_HEIGHT * imageUrls.filter(u => u && imageBufferMap.has(u)).length : 18;
+      row.height = hasAnyImage ? ROW_HEIGHT : Math.max(18, empProducts.length * 14);
 
-      // Write the 8 text columns (no photo text — images handle col 9)
-      const textValues = [
+      // Status display
+      const statusText = emp.status === 'active' ? 'Active' : 'Inactive';
+
+      const fixedValues = [
         emp.name,
         emp.uin,
         emp.gender,
         dept,
         emp.designation || '',
-        productLines.join('\n') || '',   // all products in one cell, newline-separated
-        '',   // variant — already in productLines
-        '',   // quantity — already in productLines
+        statusText,
+        productNamesText || '',
       ];
 
-      textValues.forEach((val, ci) => {
+      fixedValues.forEach((val, ci) => {
         const cell = row.getCell(ci + 1);
         cell.value = val;
         styleCell(cell, altRow);
       });
-      // Style the photo cell too
-      styleCell(row.getCell(9), altRow);
-      row.commit();
 
-      // ── Embed images stacked in the Photo column ──────────────────────
-      // Each image gets an equal slice of the row height
-      const validImages = imageUrls.filter(u => u && imageBufferMap.has(u));
-      if (validImages.length > 0) {
-        const sliceHeight = 1 / validImages.length; // fraction of row in ExcelJS units
+      // Status cell coloring
+      const statusCell = row.getCell(6);
+      if (emp.status === 'active') {
+        statusCell.font = { size: 9, name: 'Arial', color: { argb: 'FF16A34A' } };
+      } else {
+        statusCell.font = { size: 9, name: 'Arial', color: { argb: 'FF9CA3AF' } };
+      }
 
-        validImages.forEach((url, imgIdx) => {
-          const buf = imageBufferMap.get(url);
-          const ext = (url.match(/\.(png|jpg|jpeg|gif|webp)/i)?.[1] || 'png').toLowerCase();
-          const type = (ext === 'jpg' || ext === 'jpeg') ? 'jpeg' : ext === 'gif' ? 'gif' : 'png';
-          const id = wb.addImage({ buffer: buf, extension: type });
+      // ── Photo columns — one per product slot ────────────────────────────
+      for (let i = 0; i < maxProducts; i++) {
+        const photoColIdx = FIXED_COUNT + i + 1;
+        const photoCell = row.getCell(photoColIdx);
+        styleCell(photoCell, altRow);
 
-          ws.addImage(id, {
-            tl: { col: 8, row: rowIdx - 1 + imgIdx * sliceHeight },
-            br: { col: 9, row: rowIdx - 1 + (imgIdx + 1) * sliceHeight },
-            editAs: 'oneCell',
-          });
+        const p = empProducts[i];
+        if (!p) continue;
+
+        const imgUrl = resolveImageUrl(p);
+        const imgBuffer = imgUrl ? imageBufferMap.get(imgUrl) : null;
+
+        if (!imgBuffer) {
+          // Show "No Image" placeholder text
+          photoCell.value = 'No Image';
+          photoCell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+          photoCell.font = { size: 8, name: 'Arial', color: { argb: 'FF9CA3AF' } };
+          continue;
+        }
+
+        const ext = getImageExtension(imgUrl);
+        const imgId = wb.addImage({ buffer: imgBuffer, extension: ext });
+        ws.addImage(imgId, {
+          tl: { col: photoColIdx - 1, row: rowIdx - 1 },
+          br: { col: photoColIdx, row: rowIdx },
+          editAs: 'oneCell',
         });
       }
 
+      row.commit();
       rowIdx++;
       altRow = !altRow;
     }
 
+    // ── Freeze header + auto-filter ───────────────────────────────────────
     ws.views = [{ state: 'frozen', ySplit: 1 }];
-    ws.autoFilter = { from: 'A1', to: 'I1' };
 
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="employees_${new Date().toISOString().split('T')[0]}.xlsx"`);
+    // Build auto-filter column letter (handles >26 columns)
+    const colToLetter = (col) => {
+      let letter = '';
+      while (col > 0) {
+        col--;
+        letter = String.fromCharCode(65 + (col % 26)) + letter;
+        col = Math.floor(col / 26);
+      }
+      return letter;
+    };
+    ws.autoFilter = { from: 'A1', to: `${colToLetter(totalCols)}1` };
+
+    // ── Stream response ───────────────────────────────────────────────────
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="employees_${new Date().toISOString().split('T')[0]}.xlsx"`);
     await wb.xlsx.write(res);
     res.end();
 
@@ -803,11 +905,11 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
 
       // ── Intra-batch duplicate check ────────────────────────────────────────
       if (seenUins.has(formattedUin)) {
-        skippedEmployees.push({ 
-          row: rowNumber, 
-          name: formattedName, 
-          uin: formattedUin, 
-          reason: 'Duplicate UIN in this import' 
+        skippedEmployees.push({
+          row: rowNumber,
+          name: formattedName,
+          uin: formattedUin,
+          reason: 'Duplicate UIN in this import'
         });
         continue;
       }
@@ -881,10 +983,10 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
             if (writeError.code === 11000) {
               const failedUin = writeError.err.op.uin;
               const failedRow = employees.findIndex(e => e.uin?.toUpperCase() === failedUin) + 1;
-              skippedEmployees.push({ 
-                row: failedRow, 
-                uin: failedUin, 
-                reason: 'Duplicate UIN (database constraint)' 
+              skippedEmployees.push({
+                row: failedRow,
+                uin: failedUin,
+                reason: 'Duplicate UIN (database constraint)'
               });
             }
           });
@@ -908,7 +1010,7 @@ router.post('/batch', verifyCustomerToken, async (req, res) => {
     }
 
     // Return success response
-    const responseMessage = createdEmployees.length > 0 
+    const responseMessage = createdEmployees.length > 0
       ? `Successfully created ${createdEmployees.length} new employee(s)`
       : 'No new employees to create';
 
