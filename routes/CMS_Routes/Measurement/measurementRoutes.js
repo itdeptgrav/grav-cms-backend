@@ -55,18 +55,19 @@ router.get('/organizations', async (req, res) => {
 router.get('/organization/:orgId/employees', async (req, res) => {
     try {
         const { orgId } = req.params;
-
+ 
         const customer = await Customer.findById(orgId).select('_id name email phone').lean();
         if (!customer) return res.status(404).json({ success: false, message: 'Organization not found' });
-
+ 
+        // FIXED: Added 'department designation' to select
         const employees = await EmployeeMpc.find({ customerId: orgId, status: 'active' })
-            .select('_id name uin gender products')
+            .select('_id name uin gender department designation products')
             .populate({
                 path: 'products.productId',
                 select: '_id name reference measurements variants category'
             })
             .lean();
-
+ 
         res.status(200).json({ success: true, organization: customer, employees });
     } catch (error) {
         console.error('Error fetching organization employees:', error);

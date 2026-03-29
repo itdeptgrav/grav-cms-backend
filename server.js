@@ -836,6 +836,17 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
   }
 });
 
+
+app.post("/api/cms/production/employee-sync/manual", async (req, res) => {
+  try {
+    await productionSyncService.manualEmployeeSync();
+    res.json({ success: true, message: "Employee sync completed successfully" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Error during employee sync", error: error.message });
+  }
+});
+
+
 // ── POST /api/cms/production/tracking/bulk-scans ──────────────────────────────
 
 app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
