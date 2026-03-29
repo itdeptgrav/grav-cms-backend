@@ -159,6 +159,35 @@ router.get('/', verifyCustomerToken, async (req, res) => {
 });
 
 
+router.post("/by-uins", async (req, res) => {
+  try {
+    const { uins } = req.body;
+    if (!Array.isArray(uins) || !uins.length) {
+      return res.json({ success: true, employees: [] });
+    }
+ 
+    const upperUins = uins.map(u => u.toString().toUpperCase());
+ 
+    const employees = await EmployeeMpc.find({ uin: { $in: upperUins } })
+      .select("uin department designation name")
+      .lean();
+ 
+    return res.json({
+      success: true,
+      employees: employees.map(e => ({
+        uin:         e.uin,
+        name:        e.name,
+        department:  e.department  || "",
+        designation: e.designation || "",
+      }))
+    });
+  } catch (err) {
+    console.error("by-uins error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+
 router.get('/export', verifyCustomerToken, async (req, res) => {
   try {
     // Fetch ALL employees sorted by department then name
