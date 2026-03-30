@@ -167,86 +167,138 @@ const Measurement = require("./models/Customer_Models/Measurement");
 const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
 
 
-
-
 const fixMeasurementVariants = async () => {
   try {
-    const flagKey = "fix_measurement_variants_v1";
+    const flagKey = "fix_measurement_variants_v3_proper_null_removal";
     const db = mongoose.connection.db;
     const flagsCol = db.collection("_migration_flags");
-
+ 
     const alreadyRan = await flagsCol.findOne({ key: flagKey });
     if (alreadyRan) {
-      console.log("✅ Measurement variant fix already ran — skipping");
+      console.log("✅ Measurement variant fix (v3) already ran — skipping");
       return;
     }
-
-    console.log("🔄 Starting measurement variant fix...");
-
+ 
+    console.log("🔄 Starting measurement variant fix v3 (proper null removal)...");
+ 
     const measurements = await Measurement.find({
       "employeeMeasurements.products": { $exists: true, $ne: [] }
     });
-
+ 
     let totalMeasurements = 0;
     let totalProductsFixed = 0;
+    let totalNullProductsRemoved = 0;
     let totalProductsSkipped = 0;
-
+    let measurementsWithErrors = 0;
+ 
     for (const measurement of measurements) {
       totalMeasurements++;
       let measurementModified = false;
-
+ 
       for (const empMeasurement of measurement.employeeMeasurements) {
         if (!empMeasurement.products || empMeasurement.products.length === 0) continue;
-
+ 
+        // ====== STEP 1: FILTER OUT NULL PRODUCTS ======
+        const validProducts = [];
+        let nullProductCount = 0;
+ 
         for (const product of empMeasurement.products) {
-          // Check if variant is invalid
-          const needsFix =
-            !product.variantId ||
-            product.variantName === "Default" ||
-            product.variantName === "" ||
+          if (!product.productId || product.productId === null) {
+            nullProductCount++;
+            totalNullProductsRemoved++;
+            console.log(`   🗑️  Removing null product from ${empMeasurement.employeeName} (${empMeasurement.employeeUIN})`);
+          } else {
+            validProducts.push(product);
+          }
+        }
+ 
+        // Replace the products array with only valid products
+        if (nullProductCount > 0) {
+          empMeasurement.products = validProducts;
+          measurementModified = true;
+          console.log(`   ✓ Removed ${nullProductCount} null product(s) from ${empMeasurement.employeeName}`);
+        }
+ 
+        // ====== STEP 2: FIX VARIANTS FOR VALID PRODUCTS ======
+        for (const product of empMeasurement.products) {
+          // Check if variant is invalid OR if variantName is "Default"
+          const needsFix = 
+            !product.variantId || 
+            product.variantId === 'null' ||
+            product.variantId === 'undefined' ||
+            product.variantName === "Default" || 
+            product.variantName === "" || 
             !product.variantName;
-
+ 
           if (needsFix) {
             // Fetch the actual StockItem
-            const stockItem = await StockItemForVariant.findById(product.productId);
-
+            const stockItem = await StockItemForVariant.findById(product.productId)
+              .select('_id name variants')
+              .lean();
+            
             if (!stockItem) {
               console.warn(`   ⚠️  Product ${product.productId} not found in StockItem collection`);
               totalProductsSkipped++;
               continue;
             }
-
+ 
             if (!stockItem.variants || stockItem.variants.length === 0) {
-              console.warn(`   ⚠️  Product "${stockItem.name}" has no variants - skipping`);
+              console.warn(`   ⚠️  Product "${stockItem.name}" has no variants - keeping as is`);
               totalProductsSkipped++;
               continue;
             }
-
+ 
             // Get first valid variant
             const firstVariant = stockItem.variants[0];
-
+            
             // Fix the variant data
+            const oldVariantId = product.variantId;
+            const oldVariantName = product.variantName;
+ 
             product.variantId = firstVariant._id;
-            product.variantName = firstVariant.attributes
-              .map(attr => attr.value)
-              .join(" / ") || "Default Variant";
-
+            product.variantName = firstVariant.attributes && firstVariant.attributes.length
+              ? firstVariant.attributes.map(attr => attr.value).join(" / ")
+              : "Default Variant";
+ 
             measurementModified = true;
             totalProductsFixed++;
-
-            console.log(`   ✓ Fixed variant for "${stockItem.name}" in measurement ${measurement._id}`);
-            console.log(`     Old: variantName="${product.variantName}", variantId=${product.variantId}`);
+ 
+            console.log(`   ✓ Fixed variant for "${stockItem.name}"`);
+            console.log(`     Employee: ${empMeasurement.employeeName} (${empMeasurement.employeeUIN})`);
+            console.log(`     Old: variantName="${oldVariantName}", variantId=${oldVariantId}`);
             console.log(`     New: variantName="${product.variantName}", variantId=${firstVariant._id}`);
           }
         }
+ 
+        // ====== STEP 3: HANDLE EMPLOYEES WITH NO VALID PRODUCTS ======
+        if (empMeasurement.products.length === 0 && !empMeasurement.noProductAssigned) {
+          empMeasurement.noProductAssigned = true;
+          measurementModified = true;
+          console.log(`   ℹ️  Employee ${empMeasurement.employeeName} has no valid products - marked as noProductAssigned`);
+        }
       }
-
-      // Save if modified
+ 
+      // ====== STEP 4: SAVE MEASUREMENT ======
       if (measurementModified) {
-        await measurement.save();
+        try {
+          await measurement.save();
+          console.log(`   💾 Saved measurement ${measurement._id} (${measurement.name})`);
+        } catch (saveError) {
+          console.error(`   ❌ Error saving measurement ${measurement._id}:`, saveError.message);
+          measurementsWithErrors++;
+          
+          // Log which employee entries have issues
+          measurement.employeeMeasurements.forEach((emp, idx) => {
+            emp.products.forEach((prod, prodIdx) => {
+              if (!prod.productId) {
+                console.error(`      ⚠️  employeeMeasurements[${idx}].products[${prodIdx}] has null productId`);
+              }
+            });
+          });
+        }
       }
     }
-
+ 
     // Mark as done
     await flagsCol.insertOne({
       key: flagKey,
@@ -254,17 +306,22 @@ const fixMeasurementVariants = async () => {
       stats: {
         totalMeasurements,
         productsFixed: totalProductsFixed,
-        productsSkipped: totalProductsSkipped
+        nullProductsRemoved: totalNullProductsRemoved,
+        productsSkipped: totalProductsSkipped,
+        measurementsWithErrors
       }
     });
-
-    console.log(`✅ Measurement variant fix complete!`);
+ 
+    console.log(`\n✅ Measurement variant fix v3 complete!`);
     console.log(`   📊 Total measurements processed: ${totalMeasurements}`);
-    console.log(`   ✓ Products fixed: ${totalProductsFixed}`);
-    console.log(`   ⚠️  Products skipped: ${totalProductsSkipped}`);
-
+    console.log(`   ✓ Products with variants fixed: ${totalProductsFixed}`);
+    console.log(`   🗑️  Null products removed: ${totalNullProductsRemoved}`);
+    console.log(`   ⚠️  Products skipped (no variants): ${totalProductsSkipped}`);
+    console.log(`   ❌ Measurements with save errors: ${measurementsWithErrors}`);
+ 
   } catch (error) {
     console.error("❌ Error fixing measurement variants:", error.message);
+    console.error(error.stack);
   }
 };
 
