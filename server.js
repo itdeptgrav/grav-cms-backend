@@ -156,11 +156,117 @@ const connectDB = async () => {
 
 connectDB().then(async () => {
   await createDefaultCuttingMaster();
+  await fixMeasurementVariants();
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
 const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
+
+const Measurement = require("./models/Customer_Models/Measurement");
+const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
+
+
+
+
+const fixMeasurementVariants = async () => {
+  try {
+    const flagKey = "fix_measurement_variants_v1";
+    const db = mongoose.connection.db;
+    const flagsCol = db.collection("_migration_flags");
+
+    const alreadyRan = await flagsCol.findOne({ key: flagKey });
+    if (alreadyRan) {
+      console.log("✅ Measurement variant fix already ran — skipping");
+      return;
+    }
+
+    console.log("🔄 Starting measurement variant fix...");
+
+    const measurements = await Measurement.find({
+      "employeeMeasurements.products": { $exists: true, $ne: [] }
+    });
+
+    let totalMeasurements = 0;
+    let totalProductsFixed = 0;
+    let totalProductsSkipped = 0;
+
+    for (const measurement of measurements) {
+      totalMeasurements++;
+      let measurementModified = false;
+
+      for (const empMeasurement of measurement.employeeMeasurements) {
+        if (!empMeasurement.products || empMeasurement.products.length === 0) continue;
+
+        for (const product of empMeasurement.products) {
+          // Check if variant is invalid
+          const needsFix =
+            !product.variantId ||
+            product.variantName === "Default" ||
+            product.variantName === "" ||
+            !product.variantName;
+
+          if (needsFix) {
+            // Fetch the actual StockItem
+            const stockItem = await StockItemForVariant.findById(product.productId);
+
+            if (!stockItem) {
+              console.warn(`   ⚠️  Product ${product.productId} not found in StockItem collection`);
+              totalProductsSkipped++;
+              continue;
+            }
+
+            if (!stockItem.variants || stockItem.variants.length === 0) {
+              console.warn(`   ⚠️  Product "${stockItem.name}" has no variants - skipping`);
+              totalProductsSkipped++;
+              continue;
+            }
+
+            // Get first valid variant
+            const firstVariant = stockItem.variants[0];
+
+            // Fix the variant data
+            product.variantId = firstVariant._id;
+            product.variantName = firstVariant.attributes
+              .map(attr => attr.value)
+              .join(" / ") || "Default Variant";
+
+            measurementModified = true;
+            totalProductsFixed++;
+
+            console.log(`   ✓ Fixed variant for "${stockItem.name}" in measurement ${measurement._id}`);
+            console.log(`     Old: variantName="${product.variantName}", variantId=${product.variantId}`);
+            console.log(`     New: variantName="${product.variantName}", variantId=${firstVariant._id}`);
+          }
+        }
+      }
+
+      // Save if modified
+      if (measurementModified) {
+        await measurement.save();
+      }
+    }
+
+    // Mark as done
+    await flagsCol.insertOne({
+      key: flagKey,
+      ranAt: new Date(),
+      stats: {
+        totalMeasurements,
+        productsFixed: totalProductsFixed,
+        productsSkipped: totalProductsSkipped
+      }
+    });
+
+    console.log(`✅ Measurement variant fix complete!`);
+    console.log(`   📊 Total measurements processed: ${totalMeasurements}`);
+    console.log(`   ✓ Products fixed: ${totalProductsFixed}`);
+    console.log(`   ⚠️  Products skipped: ${totalProductsSkipped}`);
+
+  } catch (error) {
+    console.error("❌ Error fixing measurement variants:", error.message);
+  }
+};
 
 const createDefaultCuttingMaster = async () => {
   try {
