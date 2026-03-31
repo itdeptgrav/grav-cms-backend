@@ -430,7 +430,7 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
   const meetId = await generateCoworkId("meet");
   const data = {
     meetId, title, description: description || "", createdBy, participants,
-    dateTime, googleMeetLink, isCancelled: false,
+    dateTime, googleMeetLink: googleMeetLink || "", isCancelled: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
   await db.collection("cowork_scheduled_meets").doc(meetId).set(data);

@@ -1,7 +1,7 @@
 const { initializeApp } = require("firebase/app");
 const { getAuth, createUserWithEmailAndPassword } = require("firebase/auth");
 const { getDatabase, ref, set } = require("firebase/database");
-require('dotenv').config();
+require('.env').config();
 
 const firebaseConfig = {
     apiKey: "AIzaSyDpswQ3pSlbxtmc-yWDgJD2GQWjfpK3ZXs",

@@ -730,6 +730,8 @@ app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
 const coworkRoutes = require("./routes//task_routes/cowork");
 app.use("/cowork", coworkRoutes);
 
+app.use("/cowork", require("./routes/task_routes/livekit.routes"));
+
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
 app.use('/api/customer/employees/cross-org', crossOrgRoutes);
 
