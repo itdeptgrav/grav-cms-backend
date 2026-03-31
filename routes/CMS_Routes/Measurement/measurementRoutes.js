@@ -1457,31 +1457,154 @@ router.get('/organization/:orgId/export-product-pricing', async (req, res) => {
 router.get('/:measurementId/export', async (req, res) => {
     try {
         const measurement = await Measurement.findById(req.params.measurementId)
-            .populate({ path: 'employeeMeasurements.products.productId', select: 'name reference' })
+            .populate({
+                // ⚠ Added `category` to the select so we can map product → category label
+                path: 'employeeMeasurements.products.productId',
+                select: 'name reference measurements category'
+            })
             .lean();
-        if (!measurement) return res.status(404).json({ success: false, message: 'Measurement not found' });
-
-        const allMeasurements = new Set();
-        measurement.employeeMeasurements.forEach(e => e.products?.forEach(p => p.measurements?.forEach(m => allMeasurements.add(m.measurementName))));
-        const measurementNames = Array.from(allMeasurements);
-
-        const headers = ['Employee Name', 'UIN', 'Gender', 'Remarks', 'Product', 'Variant', 'Quantity', ...measurementNames];
-        const rows = measurement.employeeMeasurements.flatMap(emp =>
-            emp.noProductAssigned
-                ? (emp.categoryMeasurements || []).map(cm => {
-                    const base = [`"${emp.employeeName}"`, emp.employeeUIN, emp.gender, `"${emp.remarks || ''}"`, `"[Category] ${cm.categoryName}"`, '', ''];
-                    return [...base, ...measurementNames.map(() => '')];
-                })
-                : (emp.products || []).map(p => {
-                    const base = [`"${emp.employeeName}"`, emp.employeeUIN, emp.gender, `"${emp.remarks || ''}"`, `"${p.productName}"`, p.variantName || 'Default', p.quantity || 1];
-                    return [...base, ...measurementNames.map(n => { const m = p.measurements?.find(m => m.measurementName === n); return m?.value || ''; })];
-                })
-        );
-
-        const csv = ['\uFEFF', headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+ 
+        if (!measurement) {
+            return res.status(404).json({ success: false, message: 'Measurement not found' });
+        }
+ 
+        // ── 1. Fetch department & designation for every employee ──────────────
+        const empIds = measurement.employeeMeasurements
+            .map(e => e.employeeId)
+            .filter(Boolean);
+ 
+        const empDocs = await EmployeeMpc.find({ _id: { $in: empIds } })
+            .select('_id department designation')
+            .lean();
+ 
+        const empDetailsMap = new Map(empDocs.map(e => [e._id.toString(), e]));
+ 
+        // ── 2. Category → column-prefix mapping & preferred column order ──────
+        //   Product category  →  prefix shown in CSV header
+        const CATEGORY_LABEL = {
+            Outerwear: 'Jacket',
+            Shirts:    'Shirt',
+            Bottoms:   'Trouser',
+        };
+        // Jacket columns come first, then Shirt, then Trouser — same as Excel
+        const CATEGORY_ORDER = ['Outerwear', 'Shirts', 'Bottoms'];
+ 
+        // ── 3. Collect all field names per category (first-seen order) ────────
+        //   Sources:
+        //     • product-based employees  → productId.category  +  measurements[].measurementName
+        //     • category-only employees  → categoryMeasurements[].categoryName + measurements[].fieldName
+        const categoryFieldsMap = new Map(); // category → string[]
+ 
+        measurement.employeeMeasurements.forEach(emp => {
+            // Product-based
+            (emp.products || []).forEach(p => {
+                const cat = p.productId?.category;
+                if (!cat) return;
+                if (!categoryFieldsMap.has(cat)) categoryFieldsMap.set(cat, []);
+                (p.measurements || []).forEach(m => {
+                    if (m.measurementName && !categoryFieldsMap.get(cat).includes(m.measurementName))
+                        categoryFieldsMap.get(cat).push(m.measurementName);
+                });
+            });
+            // Category-only
+            (emp.categoryMeasurements || []).forEach(cm => {
+                const cat = cm.categoryName;
+                if (!cat) return;
+                if (!categoryFieldsMap.has(cat)) categoryFieldsMap.set(cat, []);
+                (cm.measurements || []).forEach(m => {
+                    if (m.fieldName && !categoryFieldsMap.get(cat).includes(m.fieldName))
+                        categoryFieldsMap.get(cat).push(m.fieldName);
+                });
+            });
+        });
+ 
+        // ── 4. Apply preferred order; unknown categories go at the end ────────
+        const orderedCategories = [
+            ...CATEGORY_ORDER.filter(c => categoryFieldsMap.has(c)),
+            ...Array.from(categoryFieldsMap.keys()).filter(c => !CATEGORY_ORDER.includes(c)),
+        ];
+ 
+        // ── 5. Build header row & meta array for value lookup ─────────────────
+        //   headerMeta[i] = { category, field }  — parallel to measurement columns
+        const headerMeta = [];
+        orderedCategories.forEach(cat => {
+            const label = CATEGORY_LABEL[cat] || cat;
+            categoryFieldsMap.get(cat).forEach(field => {
+                headerMeta.push({ category: cat, field, col: `${label} ${field}` });
+            });
+        });
+ 
+        const headerRow = [
+            'Employee Name',
+            'UIN',
+            'Department',
+            'Designation',
+            'Gender',
+            ...headerMeta.map(h => h.col),
+            'Remarks',
+        ].join(',');
+ 
+        // ── 6. Build one CSV row per employee ─────────────────────────────────
+        const dataRows = measurement.employeeMeasurements.map(emp => {
+            const details  = empDetailsMap.get(emp.employeeId?.toString()) || {};
+ 
+            // Build { category → { field → value } } lookup for this employee
+            const catValMap = {};
+ 
+            // From assigned products (takes precedence)
+            (emp.products || []).forEach(p => {
+                const cat = p.productId?.category;
+                if (!cat) return;
+                if (!catValMap[cat]) catValMap[cat] = {};
+                (p.measurements || []).forEach(m => {
+                    if (m.measurementName)
+                        catValMap[cat][m.measurementName] = m.value || '';
+                });
+            });
+ 
+            // From category measurements (fill in only if not already set by a product)
+            (emp.categoryMeasurements || []).forEach(cm => {
+                const cat = cm.categoryName;
+                if (!cat) return;
+                if (!catValMap[cat]) catValMap[cat] = {};
+                (cm.measurements || []).forEach(m => {
+                    if (m.fieldName && catValMap[cat][m.fieldName] === undefined)
+                        catValMap[cat][m.fieldName] = m.value || '';
+                });
+            });
+ 
+            // Measurement cells — use '-' when the employee has no data for that category
+            const measCells = headerMeta.map(({ category, field }) => {
+                if (!catValMap[category]) return '-';          // employee has no entry for this category
+                const v = catValMap[category][field];
+                return (v !== undefined && v !== '') ? v : '-';
+            });
+ 
+            // Escape double-quotes inside quoted fields
+            const q = (s) => `"${String(s || '').replace(/"/g, '""')}"`;
+ 
+            return [
+                q(emp.employeeName),
+                emp.employeeUIN || '',
+                details.department  || '',
+                details.designation || '',
+                emp.gender || '',
+                ...measCells,
+                q(emp.remarks || ''),
+            ].join(',');
+        });
+ 
+        // ── 7. Send the CSV ───────────────────────────────────────────────────
+        const csv = ['\uFEFF', headerRow, ...dataRows].join('\n');
+ 
+        const safeFileName = measurement.name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="${measurement.name}_${req.params.measurementId}.csv"`);
+        res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${safeFileName}_measurements.csv"`
+        );
         res.send(csv);
+ 
     } catch (error) {
         console.error('Export error:', error);
         res.status(500).json({ success: false, message: 'Server error while exporting' });
