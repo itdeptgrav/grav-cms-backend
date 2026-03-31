@@ -1,349 +1,191 @@
-// routes/Cms_routes/Inventory/Configurations/units.js
+// routes/cms/units.js  (or wherever your unit routes live)
+// Make sure ALL routes that return unit data populate conversions.toUnit
 
 const express = require("express");
 const router = express.Router();
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
-const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 
-// Common GST UQC codes for clothing industry
-const GST_UQC_CODES = [
-  "BAG", "BAL", "BDL", "BKL", "BOU", "BOX", "BTL", "BUN", "CAN", "CBM", 
-  "CCM", "CMS", "CTN", "DOZ", "DRM", "GGK", "GMS", "GRS", "GYD", "KGS", 
-  "KLR", "KME", "LTR", "MLT", "MTR", "MTS", "NOS", "OTH", "PAC", "PCS", 
-  "PRS", "QTL", "ROL", "SET", "SQF", "SQM", "SQY", "TBS", "TGM", "THD", 
-  "TON", "TUB", "UGS", "UNT", "YDS"
-];
-
-// Apply auth middleware to all routes
-router.use(EmployeeAuthMiddleware);
-
-// ✅ GET all units with optional search/filter
+// ─── GET all units (list page) ───────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
-    const { search = "", status } = req.query;
-    
-    let filter = {};
-    
-    if (search) {
-      filter.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { gstUqc: { $regex: search, $options: "i" } }
-      ];
-    }
-    
-    if (status && ["Active", "Inactive"].includes(status)) {
-      filter.status = status;
-    }
-    
-    const units = await Unit.find(filter)
-      .populate("baseUnit", "name gstUqc")
-      .populate("createdBy", "name email")
+    const units = await Unit.find()
+      .populate("conversions.toUnit", "_id name") // ← MUST populate
       .sort({ createdAt: -1 });
-    
-    // Get stats
-    const total = await Unit.countDocuments();
-    const totalActive = await Unit.countDocuments({ status: "Active" });
-    const totalBaseUnits = await Unit.countDocuments({ baseUnit: null });
-    
-    res.json({
-      success: true,
-      units,
-      stats: { total, totalActive, totalBaseUnits }
-    });
-    
+
+    return res.json({ success: true, units });
   } catch (error) {
     console.error("Error fetching units:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error" 
-    });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ✅ GET all base units (for dropdown)
-router.get("/base-units", async (req, res) => {
+// ─── GET available units (for conversion dropdowns) ───────────────────────────
+router.get("/available-units", async (req, res) => {
   try {
-    const baseUnits = await Unit.find({ 
-      baseUnit: null,
-      status: "Active"
-    }).select("name gstUqc _id");
-    
-    res.json({
-      success: true,
-      baseUnits
-    });
-    
+    const units = await Unit.find({ status: "Active" })
+      .select("_id name")
+      .sort({ name: 1 });
+
+    return res.json({ success: true, units });
   } catch (error) {
-    console.error("Error fetching base units:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error" 
-    });
+    console.error("Error fetching available units:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ✅ GET GST UQC codes
-router.get("/gst-uqc-codes", async (req, res) => {
-  res.json({
-    success: true,
-    codes: GST_UQC_CODES
-  });
-});
-
-// ✅ GET unit by ID
+// ─── GET single unit by ID ────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {
   try {
     const unit = await Unit.findById(req.params.id)
-      .populate("baseUnit", "name gstUqc _id")
-      .populate("createdBy", "name email");
-    
+      .populate("conversions.toUnit", "_id name"); // ← MUST populate
+
     if (!unit) {
-      return res.status(404).json({
-        success: false,
-        message: "Unit not found"
-      });
+      return res.status(404).json({ success: false, message: "Unit not found" });
     }
-    
-    res.json({ success: true, unit });
-    
+
+    return res.json({ success: true, unit });
   } catch (error) {
     console.error("Error fetching unit:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error" 
-    });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ✅ CREATE new unit
+// ─── CREATE unit ──────────────────────────────────────────────────────────────
 router.post("/", async (req, res) => {
   try {
-    const { name, gstUqc, quantity, baseUnit, isBaseUnit } = req.body;
-    
-    // Validation
-    if (!name || !gstUqc || !quantity) {
-      return res.status(400).json({
-        success: false,
-        message: "Name, GST UQC, and quantity are required"
-      });
+    const { name, conversions } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: "Unit name is required" });
     }
-    
-    if (isNaN(quantity) || parseFloat(quantity) <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Quantity must be a positive number"
-      });
+
+    // Check duplicate name
+    const existing = await Unit.findOne({ name: name.trim() });
+    if (existing) {
+      return res.status(400).json({ success: false, message: "A unit with this name already exists" });
     }
-    
-    // Check if unit already exists
-    const existingUnit = await Unit.findOne({
-      $or: [
-        { name: new RegExp(`^${name}$`, "i") },
-        { gstUqc: gstUqc.toUpperCase() }
-      ]
-    });
-    
-    if (existingUnit) {
-      return res.status(400).json({
-        success: false,
-        message: "Unit with this name or GST UQC already exists"
-      });
-    }
-    
-    // Handle base unit (can be ObjectId or string name)
-    let baseUnitId = null;
-    if (baseUnit && baseUnit !== "") {
-      if (baseUnit.match(/^[0-9a-fA-F]{24}$/)) {
-        // It's an ObjectId
-        baseUnitId = baseUnit;
-      } else {
-        // It's a string name, find or create
-        const foundBaseUnit = await Unit.findOne({
-          name: new RegExp(`^${baseUnit}$`, "i"),
-          baseUnit: null
-        });
-        
-        if (!foundBaseUnit) {
+
+    // Validate & clean conversions
+    const cleanConversions = [];
+    if (Array.isArray(conversions) && conversions.length > 0) {
+      for (const conv of conversions) {
+        if (!conv.toUnit || !conv.quantity || parseFloat(conv.quantity) <= 0) continue;
+
+        // Verify the target unit actually exists
+        const targetUnit = await Unit.findById(conv.toUnit);
+        if (!targetUnit) {
           return res.status(400).json({
             success: false,
-            message: "Invalid base unit"
+            message: `Target unit not found: ${conv.toUnit}`
           });
         }
-        baseUnitId = foundBaseUnit._id;
+
+        cleanConversions.push({
+          toUnit: conv.toUnit,
+          quantity: parseFloat(conv.quantity)
+        });
       }
     }
-    
-    // Create new unit
-    const newUnit = new Unit({
+
+    const unit = new Unit({
       name: name.trim(),
-      gstUqc: gstUqc.toUpperCase().trim(),
-      quantity: parseFloat(quantity),
-      baseUnit: isBaseUnit ? null : baseUnitId,
-      createdBy: req.user.id,
-      status: "Active"
+      conversions: cleanConversions,
+      createdBy: req.user?._id // attach if you have auth middleware
     });
-    
-    await newUnit.save();
-    
-    const populatedUnit = await Unit.findById(newUnit._id)
-      .populate("baseUnit", "name gstUqc")
-      .populate("createdBy", "name email");
-    
-    res.status(201).json({
-      success: true,
-      message: "Unit created successfully",
-      unit: populatedUnit
-    });
-    
+
+    await unit.save();
+
+    // Return populated unit
+    const populated = await Unit.findById(unit._id)
+      .populate("conversions.toUnit", "_id name");
+
+    return res.status(201).json({ success: true, unit: populated });
   } catch (error) {
     console.error("Error creating unit:", error);
-    
-    if (error.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        message: "Unit with this name or GST UQC already exists"
-      });
-    }
-    
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error" 
-    });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ✅ UPDATE unit
+// ─── UPDATE unit ──────────────────────────────────────────────────────────────
 router.put("/:id", async (req, res) => {
   try {
-    const { name, gstUqc, quantity, baseUnit, status, isBaseUnit } = req.body;
-    
+    const { conversions, status } = req.body;
+
     const unit = await Unit.findById(req.params.id);
     if (!unit) {
-      return res.status(404).json({
-        success: false,
-        message: "Unit not found"
-      });
+      return res.status(404).json({ success: false, message: "Unit not found" });
     }
-    
-    // Check for duplicate name or GST UQC (excluding current unit)
-    if (name || gstUqc) {
-      const duplicateFilter = {
-        _id: { $ne: req.params.id }
-      };
-      
-      if (name) {
-        duplicateFilter.name = new RegExp(`^${name}$`, "i");
-      }
-      if (gstUqc) {
-        duplicateFilter.gstUqc = gstUqc.toUpperCase();
-      }
-      
-      const duplicateUnit = await Unit.findOne(duplicateFilter);
-      if (duplicateUnit) {
-        return res.status(400).json({
-          success: false,
-          message: "Another unit with this name or GST UQC already exists"
-        });
-      }
-    }
-    
-    // Handle base unit
-    let baseUnitId = unit.baseUnit;
-    if (isBaseUnit === true) {
-      baseUnitId = null;
-    } else if (baseUnit && baseUnit !== "") {
-      if (baseUnit.match(/^[0-9a-fA-F]{24}$/)) {
-        baseUnitId = baseUnit;
-      } else {
-        const foundBaseUnit = await Unit.findOne({
-          name: new RegExp(`^${baseUnit}$`, "i"),
-          baseUnit: null
-        });
-        
-        if (!foundBaseUnit) {
+
+    // Validate & clean conversions
+    const cleanConversions = [];
+    if (Array.isArray(conversions) && conversions.length > 0) {
+      for (const conv of conversions) {
+        if (!conv.toUnit || !conv.quantity || parseFloat(conv.quantity) <= 0) continue;
+
+        // Make sure we're not converting to itself
+        if (conv.toUnit.toString() === req.params.id.toString()) {
           return res.status(400).json({
             success: false,
-            message: "Invalid base unit"
+            message: "A unit cannot convert to itself"
           });
         }
-        baseUnitId = foundBaseUnit._id;
+
+        // Verify the target unit actually exists
+        const targetUnit = await Unit.findById(conv.toUnit);
+        if (!targetUnit) {
+          return res.status(400).json({
+            success: false,
+            message: `Target unit not found: ${conv.toUnit}`
+          });
+        }
+
+        cleanConversions.push({
+          toUnit: conv.toUnit,
+          quantity: parseFloat(conv.quantity)
+        });
       }
     }
-    
-    // Update fields
-    if (name) unit.name = name.trim();
-    if (gstUqc) unit.gstUqc = gstUqc.toUpperCase().trim();
-    if (quantity) unit.quantity = parseFloat(quantity);
-    unit.baseUnit = baseUnitId;
-    if (status) unit.status = status;
-    
-    unit.updatedBy = req.user.id;
+
+    // Replace conversions entirely with the new set
+    unit.conversions = cleanConversions;
+
+    if (status && ["Active", "Inactive"].includes(status)) {
+      unit.status = status;
+    }
+
+    unit.updatedBy = req.user?._id;
+
     await unit.save();
-    
-    const updatedUnit = await Unit.findById(unit._id)
-      .populate("baseUnit", "name gstUqc")
-      .populate("createdBy", "name email")
-      .populate("updatedBy", "name email");
-    
-    res.json({
-      success: true,
-      message: "Unit updated successfully",
-      unit: updatedUnit
-    });
-    
+
+    // Return populated unit
+    const populated = await Unit.findById(unit._id)
+      .populate("conversions.toUnit", "_id name");
+
+    return res.json({ success: true, unit: populated });
   } catch (error) {
     console.error("Error updating unit:", error);
-    
-    if (error.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        message: "Unit with this name or GST UQC already exists"
-      });
-    }
-    
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error" 
-    });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
-// ✅ DELETE unit (soft delete)
+// ─── DELETE unit ──────────────────────────────────────────────────────────────
 router.delete("/:id", async (req, res) => {
   try {
-    const unit = await Unit.findById(req.params.id);
+    const unit = await Unit.findByIdAndDelete(req.params.id);
     if (!unit) {
-      return res.status(404).json({
-        success: false,
-        message: "Unit not found"
-      });
+      return res.status(404).json({ success: false, message: "Unit not found" });
     }
-    
-    // Check if unit is used as base unit
-    const isUsedAsBase = await Unit.exists({ baseUnit: unit._id });
-    if (isUsedAsBase) {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot delete: Unit is used as base unit for other units"
-      });
-    }
-    
-    // Soft delete
-    unit.status = "Inactive";
-    unit.updatedBy = req.user.id;
-    await unit.save();
-    
-    res.json({
-      success: true,
-      message: "Unit marked as inactive"
-    });
-    
+
+    // Also remove this unit from any other unit's conversions
+    await Unit.updateMany(
+      { "conversions.toUnit": req.params.id },
+      { $pull: { conversions: { toUnit: req.params.id } } }
+    );
+
+    return res.json({ success: true, message: "Unit deleted successfully" });
   } catch (error) {
     console.error("Error deleting unit:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Server error" 
-    });
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
