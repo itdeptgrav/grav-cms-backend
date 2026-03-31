@@ -8,6 +8,14 @@ const operationGroupSchema = new mongoose.Schema(
       trim: true,
       unique: true,
     },
+    // Letter prefix keyword — operations whose code starts with this letter
+    // are automatically assigned to this group. E.g. "S" → codes like SNLS-01, SNS-02
+    keyword: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      default: "",
+    },
     operations: [
       {
         type: mongoose.Schema.Types.ObjectId,
