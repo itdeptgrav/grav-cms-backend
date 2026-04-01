@@ -1,10 +1,10 @@
 const dns = require("dns").setServers(["8.8.8.8", "8.8.4.4"]);
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
-require("dotenv").config();
 
 const http = require("http");
 const { Server } = require("socket.io");
@@ -22,6 +22,9 @@ const allowedOrigins = [
   "https://customer.grav.in",
   "https://cowork.grav.in",
   "http://192.168.1.30:3000",
+  "https://8ks0bflk-3000.inc1.devtunnels.ms",
+  "http://10.99.21.15:3000",
+  "https://8ks0bflk-5000.inc1.devtunnels.ms"
 ];
 
 app.use(
@@ -667,8 +670,9 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
 app.use("/api/hr/payroll", payrollRoutes);
 
-const attendanceRoutes = require("./routes/HrRoutes/Attendance_section");
-app.use("/api/hr/attendance", attendanceRoutes);
+const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
+app.use("/hr/attendance", attendanceRouter);
+
 
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
@@ -728,6 +732,8 @@ app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
 
 const coworkRoutes = require("./routes//task_routes/cowork");
 app.use("/cowork", coworkRoutes);
+
+app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
 app.use('/api/customer/employees/cross-org', crossOrgRoutes);
