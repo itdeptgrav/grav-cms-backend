@@ -236,7 +236,8 @@ router.get("/direct-message/:convId/messages", verifyCoworkToken, verifyEmployee
 router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
   try {
     const { title, description, participants, dateTime, googleMeetLink } = req.body;
-    if (!title || !participants || !dateTime || !googleMeetLink) return res.status(400).json({ error: "All fields required." });
+    if (!title || !participants || !dateTime)
+      return res.status(400).json({ error: "All fields required." });
     const meet = await svc.scheduleCoworkMeet({ title, description, createdBy: req.coworkUser.employeeId, participants, dateTime, googleMeetLink });
     res.status(201).json({ meet });
   } catch (e) { res.status(400).json({ error: e.message }); }
