@@ -1,10 +1,10 @@
 const dns = require("dns").setServers(["8.8.8.8", "8.8.4.4"]);
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
-require("dotenv").config();
 
 const http = require("http");
 const { Server } = require("socket.io");
@@ -20,7 +20,11 @@ const allowedOrigins = [
   "https://grav-cms.vercel.app",
   "https://cms.grav.in",
   "https://customer.grav.in",
+  "https://cowork.grav.in",
   "http://192.168.1.30:3000",
+  "https://8ks0bflk-3000.inc1.devtunnels.ms",
+  "http://10.99.21.15:3000",
+  "https://8ks0bflk-5000.inc1.devtunnels.ms"
 ];
 
 app.use(
@@ -147,8 +151,6 @@ const connectDB = async () => {
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
 
-    await assignMeasurementsToExistingProducts();
-
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -157,13 +159,174 @@ const connectDB = async () => {
 
 connectDB().then(async () => {
   await createDefaultCuttingMaster();
-  await createDefaultAccountant();
-  await assignMeasurementsToExistingProducts();
+  await fixMeasurementVariants();
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
 const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
+
+const Measurement = require("./models/Customer_Models/Measurement");
+const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
+
+
+const fixMeasurementVariants = async () => {
+  try {
+    const flagKey = "fix_measurement_variants_v3_proper_null_removal";
+    const db = mongoose.connection.db;
+    const flagsCol = db.collection("_migration_flags");
+
+    const alreadyRan = await flagsCol.findOne({ key: flagKey });
+    if (alreadyRan) {
+      console.log("✅ Measurement variant fix (v3) already ran — skipping");
+      return;
+    }
+
+    console.log("🔄 Starting measurement variant fix v3 (proper null removal)...");
+
+    const measurements = await Measurement.find({
+      "employeeMeasurements.products": { $exists: true, $ne: [] }
+    });
+
+    let totalMeasurements = 0;
+    let totalProductsFixed = 0;
+    let totalNullProductsRemoved = 0;
+    let totalProductsSkipped = 0;
+    let measurementsWithErrors = 0;
+
+    for (const measurement of measurements) {
+      totalMeasurements++;
+      let measurementModified = false;
+
+      for (const empMeasurement of measurement.employeeMeasurements) {
+        if (!empMeasurement.products || empMeasurement.products.length === 0) continue;
+
+        // ====== STEP 1: FILTER OUT NULL PRODUCTS ======
+        const validProducts = [];
+        let nullProductCount = 0;
+
+        for (const product of empMeasurement.products) {
+          if (!product.productId || product.productId === null) {
+            nullProductCount++;
+            totalNullProductsRemoved++;
+            console.log(`   🗑️  Removing null product from ${empMeasurement.employeeName} (${empMeasurement.employeeUIN})`);
+          } else {
+            validProducts.push(product);
+          }
+        }
+
+        // Replace the products array with only valid products
+        if (nullProductCount > 0) {
+          empMeasurement.products = validProducts;
+          measurementModified = true;
+          console.log(`   ✓ Removed ${nullProductCount} null product(s) from ${empMeasurement.employeeName}`);
+        }
+
+        // ====== STEP 2: FIX VARIANTS FOR VALID PRODUCTS ======
+        for (const product of empMeasurement.products) {
+          // Check if variant is invalid OR if variantName is "Default"
+          const needsFix =
+            !product.variantId ||
+            product.variantId === 'null' ||
+            product.variantId === 'undefined' ||
+            product.variantName === "Default" ||
+            product.variantName === "" ||
+            !product.variantName;
+
+          if (needsFix) {
+            // Fetch the actual StockItem
+            const stockItem = await StockItemForVariant.findById(product.productId)
+              .select('_id name variants')
+              .lean();
+
+            if (!stockItem) {
+              console.warn(`   ⚠️  Product ${product.productId} not found in StockItem collection`);
+              totalProductsSkipped++;
+              continue;
+            }
+
+            if (!stockItem.variants || stockItem.variants.length === 0) {
+              console.warn(`   ⚠️  Product "${stockItem.name}" has no variants - keeping as is`);
+              totalProductsSkipped++;
+              continue;
+            }
+
+            // Get first valid variant
+            const firstVariant = stockItem.variants[0];
+
+            // Fix the variant data
+            const oldVariantId = product.variantId;
+            const oldVariantName = product.variantName;
+
+            product.variantId = firstVariant._id;
+            product.variantName = firstVariant.attributes && firstVariant.attributes.length
+              ? firstVariant.attributes.map(attr => attr.value).join(" / ")
+              : "Default Variant";
+
+            measurementModified = true;
+            totalProductsFixed++;
+
+            console.log(`   ✓ Fixed variant for "${stockItem.name}"`);
+            console.log(`     Employee: ${empMeasurement.employeeName} (${empMeasurement.employeeUIN})`);
+            console.log(`     Old: variantName="${oldVariantName}", variantId=${oldVariantId}`);
+            console.log(`     New: variantName="${product.variantName}", variantId=${firstVariant._id}`);
+          }
+        }
+
+        // ====== STEP 3: HANDLE EMPLOYEES WITH NO VALID PRODUCTS ======
+        if (empMeasurement.products.length === 0 && !empMeasurement.noProductAssigned) {
+          empMeasurement.noProductAssigned = true;
+          measurementModified = true;
+          console.log(`   ℹ️  Employee ${empMeasurement.employeeName} has no valid products - marked as noProductAssigned`);
+        }
+      }
+
+      // ====== STEP 4: SAVE MEASUREMENT ======
+      if (measurementModified) {
+        try {
+          await measurement.save();
+          console.log(`   💾 Saved measurement ${measurement._id} (${measurement.name})`);
+        } catch (saveError) {
+          console.error(`   ❌ Error saving measurement ${measurement._id}:`, saveError.message);
+          measurementsWithErrors++;
+
+          // Log which employee entries have issues
+          measurement.employeeMeasurements.forEach((emp, idx) => {
+            emp.products.forEach((prod, prodIdx) => {
+              if (!prod.productId) {
+                console.error(`      ⚠️  employeeMeasurements[${idx}].products[${prodIdx}] has null productId`);
+              }
+            });
+          });
+        }
+      }
+    }
+
+    // Mark as done
+    await flagsCol.insertOne({
+      key: flagKey,
+      ranAt: new Date(),
+      stats: {
+        totalMeasurements,
+        productsFixed: totalProductsFixed,
+        nullProductsRemoved: totalNullProductsRemoved,
+        productsSkipped: totalProductsSkipped,
+        measurementsWithErrors
+      }
+    });
+
+    console.log(`\n✅ Measurement variant fix v3 complete!`);
+    console.log(`   📊 Total measurements processed: ${totalMeasurements}`);
+    console.log(`   ✓ Products with variants fixed: ${totalProductsFixed}`);
+    console.log(`   🗑️  Null products removed: ${totalNullProductsRemoved}`);
+    console.log(`   ⚠️  Products skipped (no variants): ${totalProductsSkipped}`);
+    console.log(`   ❌ Measurements with save errors: ${measurementsWithErrors}`);
+
+  } catch (error) {
+    console.error("❌ Error fixing measurement variants:", error.message);
+    console.error(error.stack);
+  }
+};
 
 const createDefaultCuttingMaster = async () => {
   try {
@@ -195,7 +358,7 @@ const createDefaultCuttingMaster = async () => {
   }
 };
 
-// const backfillWorkOrderOperationCodes = async () => {
+
 //   const flagKey = "backfill_workorder_operation_codes_v3_fixess";
 //   const db = mongoose.connection.db;
 //   const flagsCol = db.collection("_migration_flags");
@@ -285,36 +448,6 @@ const createDefaultCuttingMaster = async () => {
 
 //   console.log(`✅ WorkOrder operationCode backfill complete — ${totalWOsUpdated} WOs updated, ${totalPatched} operations patched, ${totalNoMatch} had no match`);
 // };
-
-const createDefaultAccountant = async () => {
-  try {
-    const existingAccountant = await AccountantDepartment.findOne({
-      role: "accountant",
-      department: "Accounting",
-    });
-
-    if (existingAccountant) {
-      console.log("✅ Accountant already exists, skipping creation");
-      return;
-    }
-
-    const defaultAccountant = new AccountantDepartment({
-      name: "Accountant Admin",
-      email: "accountant@grav.in",
-      password: "Account@12345",
-      employeeId: "ACC001",
-      phone: "9999999999",
-      department: "Accounting",
-      role: "accountant",
-      isActive: true,
-    });
-
-    await defaultAccountant.save();
-    console.log("✅ Default Accountant created successfully");
-  } catch (error) {
-    console.error("❌ Accountant creation failed:", error.message);
-  }
-};
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
 
@@ -537,8 +670,9 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
 app.use("/api/hr/payroll", payrollRoutes);
 
-const attendanceRoutes = require("./routes/HrRoutes/Attendance_section");
-app.use("/api/hr/attendance", attendanceRoutes);
+const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
+app.use("/hr/attendance", attendanceRouter);
+
 
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
@@ -598,6 +732,8 @@ app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
 
 const coworkRoutes = require("./routes//task_routes/cowork");
 app.use("/cowork", coworkRoutes);
+
+app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
 app.use('/api/customer/employees/cross-org', crossOrgRoutes);
@@ -869,6 +1005,17 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
     res.status(500).json({ success: false, message: "Server error while processing scan", error: error.message });
   }
 });
+
+
+app.post("/api/cms/production/employee-sync/manual", async (req, res) => {
+  try {
+    await productionSyncService.manualEmployeeSync();
+    res.json({ success: true, message: "Employee sync completed successfully" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Error during employee sync", error: error.message });
+  }
+});
+
 
 // ── POST /api/cms/production/tracking/bulk-scans ──────────────────────────────
 
