@@ -4,7 +4,7 @@ const admin = require("./config/firebaseAdmin");
 const CoworkEmployee = require("./models/Workspace_Models/CoworkEmployee");
 const CoworkCounter = require("./models/Workspace_Models/CoworkCounter");
 
-//ceo id and pw
+//ceo id  and pw
 const CEO_EMAIL = "ceo@grav.com";
 const CEO_PASSWORD = "CEO@Sgrav2024!";
 const CEO_NAME = "Admin CEO";
