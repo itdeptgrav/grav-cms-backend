@@ -138,38 +138,37 @@ router.get(
 //
 // Schedule: every hour at minute 0  →  "0 * * * *"
 // Finds all documents where deleteAtMs <= Date.now() and deletes them.
-// Firestore batch delete (max 500 per batch — transcripts won't hit this limit).
+// Also deletes the lines subcollection for each expired meeting.
 // ─────────────────────────────────────────────────────────────────────────────
 function startCron() {
-    // Run every hour
     cron.schedule("0 * * * *", async () => {
         console.log("[TranscriptCron] Running cleanup at", new Date().toISOString());
-
         try {
             const now = Date.now();
-            const snapshot = await db
-                .collection(COLLECTION)
-                .where("deleteAtMs", "<=", now)
-                .get();
+            const snapshot = await db.collection(COLLECTION).where("deleteAtMs", "<=", now).get();
 
             if (snapshot.empty) {
                 console.log("[TranscriptCron] No expired transcripts to delete.");
                 return;
             }
 
-            // Batch delete (Firestore max 500 per batch)
-            const batch = db.batch();
             let count = 0;
-
-            snapshot.forEach((doc) => {
-                console.log(`[TranscriptCron] Deleting transcript: ${doc.id} (expired ${doc.data().deleteAt})`);
-                batch.delete(doc.ref);
+            for (const docSnap of snapshot.docs) {
+                const meetId = docSnap.id;
+                // Delete all lines in the subcollection first
+                const linesSnap = await db.collection(COLLECTION).doc(meetId).collection("lines").get();
+                if (!linesSnap.empty) {
+                    const linesBatch = db.batch();
+                    linesSnap.forEach(l => linesBatch.delete(l.ref));
+                    await linesBatch.commit();
+                }
+                // Delete the parent document
+                await db.collection(COLLECTION).doc(meetId).delete();
+                console.log(`[TranscriptCron] Deleted transcript + ${linesSnap.size} lines for meeting ${meetId}`);
                 count++;
-            });
+            }
 
-            await batch.commit();
-            console.log(`[TranscriptCron] Deleted ${count} expired transcript(s).`);
-
+            console.log(`[TranscriptCron] Deleted ${count} expired meeting transcript(s).`);
         } catch (err) {
             console.error("[TranscriptCron] Cleanup error:", err);
         }
