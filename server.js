@@ -139,6 +139,15 @@ io.on("connection", (socket) => {
   });
 });
 
+
+// 1. At the top with your other requires:
+const transcriptModule = require("./routes/task_routes/transcript.routes");
+
+// 2. With your other app.use() route registrations:
+app.use("/cowork", transcriptModule.router);
+
+
+
 // ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
   try {
@@ -734,6 +743,10 @@ const coworkRoutes = require("./routes//task_routes/cowork");
 app.use("/cowork", coworkRoutes);
 
 app.use("/cowork", require("./routes/task_routes/livekit.routes"));
+
+
+
+
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
 app.use('/api/customer/employees/cross-org', crossOrgRoutes);
@@ -1356,4 +1369,6 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
+  console.log(`Server running on port ${PORT}`);
+  transcriptModule.startCron();
 });
