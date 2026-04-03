@@ -9,6 +9,8 @@ const CustomerEmailService = require('../../../services/CustomerEmailService');
 const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const Measurement = require("../../../models/Customer_Models/Measurement");
 const EmployeeProductionProgress = require("../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");  
+
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
@@ -249,22 +251,18 @@ router.get("/requests/:requestId/quotation/:quotationId/payment-submissions", as
 });
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SALES APPROVAL — Creates WOs + EmployeeProductionProgress docs
-// FIX: Tightened employee-product matching to prevent ghost/wrong assignments
-// ═══════════════════════════════════════════════════════════════════════════════
 router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => {
   try {
     const { requestId } = req.params;
     const { notes } = req.body;
-
+ 
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });
-
+ 
     const quotation = request.quotations[0];
     if (quotation.status !== 'customer_approved') return res.status(400).json({ success: false, message: "Quotation is not approved by customer" });
-
+ 
     quotation.status = 'sales_approved';
     quotation.salesApproval = { approved: true, approvedAt: new Date(), approvedBy: req.user.id, notes: notes || '' };
     quotation.updatedAt = new Date();
@@ -272,37 +270,62 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     request.finalOrderPrice = quotation.grandTotal;
     request.updatedAt = new Date();
     request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== 'sales_approval_required');
-
-    // ── Determine order type ─────────────────────────────────────────────
+ 
+    // ── Determine order type ─────────────────────────────────────────────────
     const isMeasurementOrder = !!(request.requestType === 'measurement_conversion' || request.measurementId);
     const orderType = isMeasurementOrder ? 'measurement_conversion' : 'customer_request';
-
-    // ── Load measurement if this is a measurement order ──────────────────
-    let measurement = null;
+ 
+    // ── For measurement orders: load measurement (employee IDs only) ──────────
+    // We only need the measurement to know WHICH employee IDs are part of this PO.
+    // All product/variant/quantity data will come from EmployeeMpc directly.
+    let measurementEmployeeIds = [];   // flat list of ObjectIds in this measurement
+    let measurementId = null;
+ 
     if (isMeasurementOrder && request.measurementId) {
-      measurement = await Measurement.findById(request.measurementId)
-        .select('_id employeeMeasurements')
+      const measurement = await Measurement.findById(request.measurementId)
+        .select('_id employeeMeasurements.employeeId employeeMeasurements.employeeUIN')
         .lean();
+ 
       if (measurement) {
-        console.log(`[sales-approve] Loaded measurement ${measurement._id} with ${measurement.employeeMeasurements?.length || 0} employees`);
+        measurementId = measurement._id;
+        measurementEmployeeIds = (measurement.employeeMeasurements || [])
+          .map(e => e.employeeId)
+          .filter(Boolean);
+ 
+        console.log(`[sales-approve] Measurement ${measurementId} — ${measurementEmployeeIds.length} employee IDs found`);
       } else {
-        console.warn(`[sales-approve] Measurement ${request.measurementId} not found — will skip employee tracking creation`);
+        console.warn(`[sales-approve] Measurement ${request.measurementId} not found — skipping employee tracking`);
       }
     }
-
+ 
+    // ── Batch-fetch EmployeeMpc docs for all employees in the measurement ─────
+    // This gives us the REAL current product/variant/quantity for each employee.
+    // Map: employeeId (string) → EmployeeMpc doc
+    const mpcByEmployeeId = new Map();
+ 
+    if (measurementEmployeeIds.length > 0) {
+      const mpcDocs = await EmployeeMpc.find({
+        _id: { $in: measurementEmployeeIds },
+        status: 'active'
+      }).select('_id name uin gender products').lean();
+ 
+      mpcDocs.forEach(doc => mpcByEmployeeId.set(doc._id.toString(), doc));
+      console.log(`[sales-approve] Fetched ${mpcDocs.length} EmployeeMpc records`);
+    }
+ 
     const createdWorkOrders = [];
     const skippedVariants = [];
     const createdProgressDocs = [];
-
-    // ── Create Work Orders ───────────────────────────────────────────────
+ 
+    // ── Create Work Orders (unchanged — driven by CustomerRequest items) ───────
     for (const item of request.items) {
       const stockItem = await StockItem.findById(item.stockItemId);
       if (!stockItem) { console.warn(`StockItem not found: ${item.stockItemId}`); continue; }
-
+ 
       for (const variant of item.variants) {
         let variantData = null;
         let usedFallback = false;
-
+ 
         if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
           variantData = stockItem.variants.find(v => v._id.toString() === variant.variantId);
         }
@@ -327,14 +350,14 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, error: "No variants available" });
           continue;
         }
-
+ 
         const operations = stockItem.operations.map(op => ({
           operationType: op.type || op.name || op.operationType,
           operationCode: op.operationCode || op.code || "",
           plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
           status: "pending",
         }));
-
+ 
         let rawMaterials = [];
         if (variantData.rawItems?.length > 0) {
           rawMaterials = variantData.rawItems.map(rawItem => ({
@@ -348,10 +371,10 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
             allocationStatus: "not_allocated"
           }));
         }
-
+ 
         const variantAttributes = variant.attributes || [];
         if (variantAttributes.length === 0 && variantData.attributes) variantAttributes.push(...variantData.attributes);
-
+ 
         const workOrder = new WorkOrder({
           customerRequestId: request._id, stockItemId: item.stockItemId,
           stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
@@ -365,7 +388,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           actualCost: 0, createdBy: req.user.id
         });
         await workOrder.save();
-
+ 
         createdWorkOrders.push({
           _id: workOrder._id, workOrderNumber: workOrder.workOrderNumber,
           stockItemName: workOrder.stockItemName, stockItemId: item.stockItemId,
@@ -373,95 +396,88 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           quantity: workOrder.quantity, rawMaterialCount: workOrder.rawMaterials.length,
           autoSelectedVariant: usedFallback
         });
-
-        // ─────────────────────────────────────────────────────────────────
-        // CREATE EmployeeProductionProgress docs for measurement orders
-        // ─────────────────────────────────────────────────────────────────
-        if (isMeasurementOrder && measurement) {
+ 
+        // ── EmployeeProductionProgress — measurement orders only ──────────────
+        if (isMeasurementOrder && measurementId && measurementEmployeeIds.length > 0) {
+ 
           const stockIdStr = item.stockItemId.toString();
           const woVariantIdStr = variantData._id.toString();
-
-          // ── FIXED: Find employees assigned to THIS specific product+variant ──
+ 
+          // ── Build employee entries using EmployeeMpc as source of truth ──────
+          // For each employee in the measurement, check their EmployeeMpc record
+          // to see if they are assigned to THIS stockItem+variant, and read the
+          // real quantity from there.
           const employeeEntries = [];
-          for (const empM of measurement.employeeMeasurements || []) {
-
-            const productEntry = (empM.products || []).find((p) => {
-              // ── Step 1: Match by productId ──────────────────────────────
-              const pIdMatch = p.productId?.toString() === stockIdStr;
-
-              if (!pIdMatch) {
-                // ── Step 2: productId exists but doesn't match → hard reject ──
-                // Only fall through to name match if this product entry has
-                // NO productId stored at all (legacy/older measurement data)
-                if (p.productId) return false;
-
-                // Legacy fallback: match by name
-                if (p.productName !== item.stockItemName) return false;
-
-                // Name matched — also check variant if both sides have it
-                if (woVariantIdStr && p.variantId) {
-                  return p.variantId.toString() === woVariantIdStr;
-                }
-                // Name matched, variant info missing on one side → accept
+ 
+          for (const empId of measurementEmployeeIds) {
+            const mpcDoc = mpcByEmployeeId.get(empId.toString());
+            if (!mpcDoc) {
+              // Employee not in EmployeeMpc (inactive / not found) — skip
+              continue;
+            }
+ 
+            // Find the matching product assignment in EmployeeMpc
+            const mpcProduct = (mpcDoc.products || []).find(p => {
+              // Step 1: must match stockItemId
+              if (p.productId?.toString() !== stockIdStr) return false;
+ 
+              // Step 2: check variant
+              const mpcVariantId = p.variantId?.toString();
+ 
+              if (woVariantIdStr && mpcVariantId) {
+                // Both sides have variant info → must match exactly
+                return mpcVariantId === woVariantIdStr;
+              }
+ 
+              if (woVariantIdStr && !mpcVariantId) {
+                // WO has variant, EmployeeMpc entry doesn't — accept (old data)
                 return true;
               }
-
-              // ── Step 3: productId matched — now check variant ────────────
-              if (woVariantIdStr && p.variantId) {
-                // Both sides have variant info → must match exactly
-                return p.variantId.toString() === woVariantIdStr;
-              }
-
-              if (woVariantIdStr && !p.variantId) {
-                // WO has a variant but measurement entry doesn't store variantId
-                // (older measurement data) — fall back to name confirm
-                return p.productName === item.stockItemName;
-              }
-
-              // productId matched, no variant to disambiguate → accept
+ 
+              // productId matched, no variant disambiguation needed
               return true;
             });
-
-            if (!productEntry) continue;
-
+ 
+            if (!mpcProduct) continue;   // this employee is not assigned to this product/variant
+ 
             employeeEntries.push({
-              employeeId: empM.employeeId,
-              employeeName: empM.employeeName,
-              employeeUIN: empM.employeeUIN,
-              gender: empM.gender,
-              quantity: productEntry.quantity || variant.quantity,
+              employeeId: mpcDoc._id,
+              employeeName: mpcDoc.name,
+              employeeUIN: mpcDoc.uin,
+              gender: mpcDoc.gender,
+              quantity: mpcProduct.quantity || 1,   // ← REAL qty from EmployeeMpc
             });
           }
-
+ 
           if (employeeEntries.length > 0) {
             const woNumber = workOrder.workOrderNumber;
-
-            // Safety check: total assigned units must not exceed WO quantity
+ 
+            // Safety check
             const totalAssigned = employeeEntries.reduce((sum, e) => sum + e.quantity, 0);
             if (totalAssigned > workOrder.quantity) {
               console.warn(
                 `[sales-approve] WO ${woNumber} (${workOrder.stockItemName}): ` +
-                `employee total units (${totalAssigned}) exceeds WO quantity (${workOrder.quantity}). ` +
-                `Check measurement data.`
+                `EmployeeMpc total units (${totalAssigned}) exceeds WO quantity (${workOrder.quantity}). ` +
+                `Check EmployeeMpc product assignments.`
               );
             }
-
+ 
             let unitCursor = 1;
             for (const emp of employeeEntries) {
               const unitStart = unitCursor;
               const unitEnd = unitCursor + emp.quantity - 1;
-
+ 
               const assignedBarcodeIds = [];
               for (let u = unitStart; u <= unitEnd; u++) {
                 assignedBarcodeIds.push(`${woNumber}-${u.toString().padStart(3, '0')}`);
               }
-
+ 
               try {
                 await EmployeeProductionProgress.findOneAndUpdate(
                   { workOrderId: workOrder._id, employeeId: emp.employeeId },
                   {
                     $set: {
-                      measurementId: measurement._id,
+                      measurementId,
                       manufacturingOrderId: request._id,
                       orderType,
                       employeeName: emp.employeeName,
@@ -479,7 +495,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
                   },
                   { upsert: true, new: true }
                 );
-
+ 
                 createdProgressDocs.push({
                   employeeName: emp.employeeName,
                   employeeUIN: emp.employeeUIN,
@@ -491,35 +507,33 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
               } catch (progressErr) {
                 console.error(`[sales-approve] Error creating progress doc for ${emp.employeeName}:`, progressErr.message);
               }
-
+ 
               unitCursor = unitEnd + 1;
             }
-
+ 
             console.log(`[sales-approve] Created ${employeeEntries.length} progress doc(s) for WO ${woNumber} (${workOrder.stockItemName})`);
           } else {
-            // No employees matched this WO — log clearly so it's easy to spot
             console.warn(
-              `[sales-approve] No employees matched WO for "${workOrder.stockItemName}" ` +
-              `(stockItemId: ${stockIdStr}, variantId: ${woVariantIdStr}). ` +
-              `Check measurement.employeeMeasurements[].products entries.`
+              `[sales-approve] No EmployeeMpc matches for WO "${workOrder.stockItemName}" ` +
+              `(stockItemId: ${stockIdStr}, variantId: ${woVariantIdStr})`
             );
           }
         }
-        // ─────────────────────────────────────────────────────────────────
+        // ─────────────────────────────────────────────────────────────────────
       }
     }
-
+ 
     await request.save();
-
+ 
     const autoCount = createdWorkOrders.filter(wo => wo.autoSelectedVariant).length;
     let msg = createdWorkOrders.length > 0
       ? `Quotation approved and ${createdWorkOrders.length} work order(s) created${autoCount > 0 ? ` (${autoCount} with auto-selected variants)` : ''}`
       : "Quotation approved but no work orders were created";
-
+ 
     if (createdProgressDocs.length > 0) {
       msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
     }
-
+ 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
