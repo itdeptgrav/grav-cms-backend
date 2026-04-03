@@ -200,11 +200,12 @@ router.get("/requests", async (req, res) => {
 });
 
 // GET single customer request by ID
+// GET single customer request by ID
 router.get("/requests/:requestId", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId)
             .populate('salesPersonAssigned', 'name email phone')
-            .populate('items.stockItemId', 'name reference category images')
+            .populate('items.stockItemId', 'name reference category images genderCategory') // ← add genderCategory here
             .select('-__v');
         if (!request) return res.status(404).json({ success: false, message: "Request not found" });
         res.json({ success: true, request });

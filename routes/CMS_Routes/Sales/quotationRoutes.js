@@ -592,4 +592,49 @@ router.get("/requests/:requestId/quotations/:quotationId/download", async (req, 
   }
 });
 
+
+
+router.delete("/requests/:requestId", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+ 
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+ 
+    // ── If this request originated from a measurement, clear its PO fields ──
+    if (request.measurementId) {
+      await Measurement.findByIdAndUpdate(request.measurementId, {
+        $set: {
+          convertedToPO: false,
+          poRequestId: null,
+          poConversionDate: null,
+          convertedBy: null,
+          poCreatedForEmployeeIds: [],
+        },
+      });
+      console.log(`[delete-request] Reset PO fields on measurement ${request.measurementId}`);
+    }
+ 
+    // ── Delete associated work orders if any ────────────────────────────────
+    if (WorkOrder) {
+      const woResult = await WorkOrder.deleteMany({ customerRequestId: request._id });
+      if (woResult.deletedCount) {
+        console.log(`[delete-request] Deleted ${woResult.deletedCount} work order(s) for request ${requestId}`);
+      }
+    }
+ 
+    // ── Delete the CustomerRequest itself ────────────────────────────────────
+    await CustomerRequest.findByIdAndDelete(requestId);
+ 
+    res.json({
+      success: true,
+      message: "PO/Quotation removed successfully",
+      measurementReset: !!request.measurementId,
+    });
+  } catch (error) {
+    console.error("Error deleting request:", error);
+    res.status(500).json({ success: false, message: "Server error while removing PO/Quotation" });
+  }
+});
+
 module.exports = router;
