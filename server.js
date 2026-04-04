@@ -46,7 +46,7 @@ app.use(cookieParser());
 
 // Create HTTP server
 const server = http.createServer(app);
-
+console.log("Drive key loaded:", !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 // Initialize Socket.IO with CORS configuration
 const io = new Server(server, {
   cors: {
@@ -117,6 +117,45 @@ io.on("connection", (socket) => {
       socket.leave(`dm_${chatId}`);
     }
   });
+
+  // ── COWORKING SPACE: Meeting room (for audio recording signals) ───────────
+  socket.on("join_meeting_room", (meetId) => {
+    if (meetId) {
+      socket.join(`meeting_${meetId}`);
+      console.log(`Socket ${socket.id} joined meeting_${meetId}`);
+    }
+  });
+
+  socket.on("leave_meeting_room", (meetId) => {
+    if (meetId) {
+      socket.leave(`meeting_${meetId}`);
+    }
+  });
+  // CEO/TL starts recording → broadcast to all in meeting room
+  socket.on("recording_start", ({ meetId, startedBy, startedByName }) => {
+    if (!meetId) return;
+    console.log(`[Recording] START signal for meeting ${meetId} by ${startedByName}`);
+    // Broadcast to all OTHER participants in this meeting room
+    socket.to(`meeting_${meetId}`).emit("recording_started", {
+      meetId,
+      startedBy,
+      startedByName,
+      startedAt: new Date().toISOString(),
+    });
+  });
+
+  // CEO/TL stops recording → broadcast to all in meeting room
+  socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
+    if (!meetId) return;
+    console.log(`[Recording] STOP signal for meeting ${meetId} by ${stoppedByName}`);
+    socket.to(`meeting_${meetId}`).emit("recording_stopped", {
+      meetId,
+      stoppedBy,
+      stoppedByName,
+      stoppedAt: new Date().toISOString(),
+    });
+  });
+
 
   // ── COWORKING SPACE: Online presence tracking ─────────────────────────
   socket.on("workspace-set-online", (memberId) => {
@@ -744,7 +783,9 @@ app.use("/cowork", coworkRoutes);
 
 app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 
+app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
 
+app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
 
 
 
