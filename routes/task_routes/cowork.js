@@ -6,7 +6,8 @@
 
 const express = require("express");
 const router = express.Router();
-const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
+const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } = require("../../Middlewear/coworkAuth");
+
 const svc = require("../../services/cowork.service");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
 const { sendWelcomeEmail, sendMeetingScheduledEmail } = require("../../services/emailNotifications.service");
@@ -69,7 +70,7 @@ router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (r
  * Defaults to "employee" if not provided.
  * If role === "tl", the created user gets TL custom claims and is stored as TL.
  */
-router.post("/employee/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { name, email, mobile, city, department, role: empRole } = req.body;
     if (!name || !email || !mobile || !city || !department) {
@@ -93,7 +94,7 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoToken, async (req, r
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-router.get("/employee/list", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.get("/employee/list", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try { res.json({ employees: await svc.listCoworkEmployees() }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -112,7 +113,7 @@ router.post("/employee/fcm-token", verifyCoworkToken, verifyEmployeeToken, async
 });
 
 // ── Group ─────────────────────────────────────────────────
-router.post("/group/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/group/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { name, description, memberIds } = req.body;
     if (!name || !memberIds?.length) return res.status(400).json({ error: "name and memberIds required" });
@@ -150,7 +151,7 @@ router.get("/group/:groupId", verifyCoworkToken, verifyEmployeeToken, async (req
 });
 
 // ── CEO resets any employee's password ───────────────────
-router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { newPassword } = req.body;
     const { id: employeeId } = req.params;
@@ -288,7 +289,7 @@ router.get("/direct-message/:convId/messages", verifyCoworkToken, verifyEmployee
 });
 
 // ── Meets ─────────────────────────────────────────────────
-router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { title, description, participants, dateTime, googleMeetLink } = req.body;
     if (!title || !participants || !dateTime)
@@ -395,7 +396,7 @@ router.patch("/notifications/read-all", verifyCoworkToken, verifyEmployeeToken, 
 });
 
 // ── DELETE EMPLOYEE (CEO only) ────────────────────────────────────────────────
-router.delete("/employee/:id", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.delete("/employee/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { id: employeeId } = req.params;
 

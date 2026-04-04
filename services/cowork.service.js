@@ -447,9 +447,26 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
 }
 
 async function listCoworkMeets(employeeId, role) {
-  const snap = role === "ceo"
-    ? await db.collection("cowork_scheduled_meets").where("isCancelled", "==", false).get()
-    : await db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).where("isCancelled", "==", false).get();
+  if (role === "ceo") {
+    // CEO sees all meetings
+    const snap = await db.collection("cowork_scheduled_meets").where("isCancelled", "==", false).get();
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  }
+
+  if (role === "tl") {
+    // TL sees meetings they CREATED + meetings they are a PARTICIPANT in
+    const [createdSnap, participantSnap] = await Promise.all([
+      db.collection("cowork_scheduled_meets").where("createdBy", "==", employeeId).where("isCancelled", "==", false).get(),
+      db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).where("isCancelled", "==", false).get(),
+    ]);
+    // Merge and deduplicate by meetId
+    const map = new Map();
+    [...createdSnap.docs, ...participantSnap.docs].forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
+    return Array.from(map.values());
+  }
+
+  // Employee — only meetings they are a participant in
+  const snap = await db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).where("isCancelled", "==", false).get();
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
