@@ -825,7 +825,7 @@ router.get('/:measurementId', async (req, res) => {
         }
 
         const measurement = await Measurement.findById(measurementId)
-            .populate({ path: 'employeeMeasurements.products.productId', select: 'name reference measurements' })
+            .populate({ path: 'employeeMeasurements.products.productId', select: 'name reference measurements genderCategory' })
             .populate('convertedBy', 'name email')
             .lean();
 
