@@ -1031,8 +1031,6 @@ router.post('/:measurementId/assign-product', async (req, res) => {
 });
 
 
-
-
 router.post('/:measurementId/po-confirmation', async (req, res) => {
     try {
         const { measurementId } = req.params;
@@ -1042,23 +1040,33 @@ router.post('/:measurementId/po-confirmation', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Valid measurement ID is required' });
         }
  
-        // Fetch measurement with variant/price data from StockItem
         const measurement = await Measurement.findById(measurementId)
-            .populate({
-                path: 'employeeMeasurements.products.productId',
-                select: '_id name baseSalesPrice variants'
-            })
+            .populate({ path: 'employeeMeasurements.products.productId', select: '_id name baseSalesPrice variants' })
             .lean();
  
-        if (!measurement) {
-            return res.status(404).json({ success: false, message: 'Measurement not found' });
-        }
+        if (!measurement) return res.status(404).json({ success: false, message: 'Measurement not found' });
  
-        // Fetch dept/designation for selected employees
-        const empDocs = await EmployeeMpc.find({ _id: { $in: selectedEmployeeIds } })
-            .select('_id department designation')
+        // ── Batch-fetch ALL MPC employees for this measurement ────────────────
+        const allEmpIds = measurement.employeeMeasurements.map(e => e.employeeId).filter(Boolean);
+ 
+        const mpcEmployees = await EmployeeMpc.find({ _id: { $in: allEmpIds } })
+            .select('_id products department designation')
             .lean();
-        const empDetailsMap = new Map(empDocs.map(e => [e._id.toString(), e]));
+ 
+        // empId → Map<productId(string), mpcProductName>
+        const mpcNameMap  = new Map();
+        const empDetailsMap = new Map();
+ 
+        mpcEmployees.forEach(emp => {
+            const eid = emp._id.toString();
+            empDetailsMap.set(eid, { department: emp.department || '', designation: emp.designation || '' });
+            const prodMap = new Map();
+            (emp.products || []).forEach(p => {
+                const pid = p.productId?.toString();
+                if (pid && p.productName?.trim()) prodMap.set(pid, p.productName.trim());
+            });
+            mpcNameMap.set(eid, prodMap);
+        });
  
         const selectedSet = new Set(selectedEmployeeIds.map(id => id.toString()));
         const excludedSet = new Set(excludedProductKeys);
@@ -1069,55 +1077,53 @@ router.post('/:measurementId/po-confirmation', async (req, res) => {
         for (const emp of (measurement.employeeMeasurements || [])) {
             if (!selectedSet.has(emp.employeeId?.toString())) continue;
  
-            const details = empDetailsMap.get(emp.employeeId?.toString()) || {};
+            const eid     = emp.employeeId?.toString();
+            const details = empDetailsMap.get(eid) || {};
+            const prodMap = mpcNameMap.get(eid) || new Map();
+ 
             const productRows = [];
             let empTotal = 0;
  
             for (const p of (emp.products || [])) {
-                const si = p.productId; // populated object
+                const si = p.productId;
                 if (!si || !si._id) continue;
  
                 const pid = si._id.toString();
                 const vid = p.variantId?.toString() || 'default';
                 const key = `${pid}_${vid}`;
- 
                 if (excludedSet.has(key)) continue;
  
-                // Resolve price from variant → fall back to baseSalesPrice
-                let unitPrice = si.baseSalesPrice || 0;
+                // Prefer MPC alias → fall back to measurement productName → StockItem name
+                const displayName = prodMap.get(pid) || p.productName || si.name;
+ 
+                let unitPrice  = si.baseSalesPrice || 0;
                 let variantName = p.variantName || 'Default';
  
                 if (p.variantId && si.variants?.length) {
                     const variant = si.variants.find(v => v._id.toString() === p.variantId.toString());
                     if (variant) {
-                        unitPrice = variant.salesPrice ?? si.baseSalesPrice ?? 0;
+                        unitPrice   = variant.salesPrice ?? si.baseSalesPrice ?? 0;
                         variantName = variant.attributes?.map(a => a.value).join(' • ') || variantName;
                     }
                 }
  
-                const qty = p.quantity || 1;
+                const qty   = p.quantity || 1;
                 const total = qty * unitPrice;
-                empTotal += total;
+                empTotal   += total;
  
-                productRows.push({
-                    productName: p.productName || si.name,
-                    variantName,
-                    qty,
-                    unitPrice,
-                    total
-                });
+                productRows.push({ productName: displayName, variantName, qty, unitPrice, total });
             }
  
             if (productRows.length === 0) continue;
  
             grandTotal += empTotal;
             rows.push({
-                name: emp.employeeName,
-                uin: emp.employeeUIN,
-                department: details.department || '',
-                designation: details.designation || '',
-                products: productRows,
-                total: empTotal
+                name:        emp.employeeName,
+                uin:         emp.employeeUIN,
+                department:  details.department,
+                designation: details.designation,
+                products:    productRows,
+                total:       empTotal
             });
         }
  
