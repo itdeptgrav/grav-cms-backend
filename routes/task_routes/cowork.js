@@ -6,9 +6,11 @@
 
 const express = require("express");
 const router = express.Router();
-const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
+const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } = require("../../Middlewear/coworkAuth");
+
 const svc = require("../../services/cowork.service");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
+const { sendWelcomeEmail, sendMeetingScheduledEmail } = require("../../services/emailNotifications.service");
 
 // ── Seed CEO ──────────────────────────────────────────────
 router.post("/setup/seed-ceo", async (req, res) => {
@@ -68,7 +70,7 @@ router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (r
  * Defaults to "employee" if not provided.
  * If role === "tl", the created user gets TL custom claims and is stored as TL.
  */
-router.post("/employee/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { name, email, mobile, city, department, role: empRole } = req.body;
     if (!name || !email || !mobile || !city || !department) {
@@ -76,6 +78,13 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoToken, async (req, r
     }
     const resolvedRole = empRole === "tl" ? "tl" : "employee";
     const result = await svc.createCoworkEmployee({ name, email, mobile, city, department, role: resolvedRole });
+
+    // Send welcome email with credentials (non-blocking)
+    sendWelcomeEmail(
+      { name, email, employeeId: result.employeeId, role: resolvedRole, department },
+      result.tempPassword
+    ).catch(err => console.error("[cowork/create-employee] Email error:", err.message));
+
     res.status(201).json({
       success: true,
       employeeId: result.employeeId,
@@ -85,7 +94,7 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoToken, async (req, r
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-router.get("/employee/list", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.get("/employee/list", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try { res.json({ employees: await svc.listCoworkEmployees() }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -104,7 +113,7 @@ router.post("/employee/fcm-token", verifyCoworkToken, verifyEmployeeToken, async
 });
 
 // ── Group ─────────────────────────────────────────────────
-router.post("/group/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/group/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { name, description, memberIds } = req.body;
     if (!name || !memberIds?.length) return res.status(400).json({ error: "name and memberIds required" });
@@ -142,7 +151,7 @@ router.get("/group/:groupId", verifyCoworkToken, verifyEmployeeToken, async (req
 });
 
 // ── CEO resets any employee's password ───────────────────
-router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { newPassword } = req.body;
     const { id: employeeId } = req.params;
@@ -280,13 +289,23 @@ router.get("/direct-message/:convId/messages", verifyCoworkToken, verifyEmployee
 });
 
 // ── Meets ─────────────────────────────────────────────────
-router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
     const { title, description, participants, dateTime, googleMeetLink } = req.body;
     if (!title || !participants || !dateTime)
       return res.status(400).json({ error: "All fields required." });
     const meet = await svc.scheduleCoworkMeet({ title, description, createdBy: req.coworkUser.employeeId, participants, dateTime, googleMeetLink });
     res.status(201).json({ meet });
+
+    // Send meeting invitation email to all participants (non-blocking)
+    Promise.all(participants.map(id =>
+      db.collection("cowork_employees").doc(id).get()
+        .then(s => s.exists ? { name: s.data().name, email: s.data().email } : null)
+        .catch(() => null)
+    )).then(contacts => sendMeetingScheduledEmail(
+      { meetId: meet.meetId, title, description, dateTime, createdByName: req.coworkUser.name, googleMeetLink },
+      contacts.filter(Boolean)
+    )).catch(err => console.error("[cowork/schedule-meet] Email error:", err.message));
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -375,4 +394,61 @@ router.patch("/notifications/read-all", verifyCoworkToken, verifyEmployeeToken, 
     res.status(200).json({ success: false, error: e.message });
   }
 });
+
+// ── DELETE EMPLOYEE (CEO only) ────────────────────────────────────────────────
+router.delete("/employee/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+  try {
+    const { id: employeeId } = req.params;
+
+    if (employeeId === "E000" || employeeId === req.coworkUser.employeeId) {
+      return res.status(400).json({ error: "You cannot delete your own account." });
+    }
+
+    const empDoc = await db.collection("cowork_employees").doc(employeeId).get();
+    if (!empDoc.exists) return res.status(404).json({ error: "Employee not found." });
+
+    const empData = empDoc.data();
+    const authUid = empData.authUid;
+
+    // Delete from Firebase Auth
+    if (authUid) {
+      try {
+        await auth.deleteUser(authUid);
+        console.log(`[DeleteEmployee] Auth deleted: ${authUid} (${empData.email})`);
+      } catch (authErr) {
+        if (authErr.code !== "auth/user-not-found") throw authErr;
+      }
+    }
+
+    // Delete from Firestore
+    await db.collection("cowork_employees").doc(employeeId).delete();
+    console.log(`[DeleteEmployee] Firestore deleted: ${employeeId} (${empData.email})`);
+
+    return res.json({
+      success: true,
+      message: `${empData.name} has been deleted. Email ${empData.email} can now be re-used.`,
+    });
+  } catch (e) {
+    console.error("[DeleteEmployee]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── TEST EMAIL (CEO only) — hit this to verify Brevo is working ──────────────
+// GET /cowork/test-email?to=your@email.com
+router.get("/test-email", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
+  const toEmail = req.query.to || req.coworkUser.employeeData?.email;
+  if (!toEmail) return res.status(400).json({ error: "Pass ?to=email in query" });
+  try {
+    await sendWelcomeEmail(
+      { name: "Test User", email: toEmail, employeeId: "E_TEST", role: "employee", department: "Testing" },
+      "TestPass123"
+    );
+    res.json({ success: true, message: `Test email sent to ${toEmail}` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;
