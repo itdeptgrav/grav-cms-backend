@@ -45,6 +45,7 @@ async function verifyCoworkToken(req, res, next) {
 }
 
 const verifyCeoToken = (req, res, next) => req.coworkUser?.role === "ceo" ? next() : res.status(403).json({ error: "CEO only" });
+const verifyCeoOrTL = (req, res, next) => ["ceo", "tl"].includes(req.coworkUser?.role) ? next() : res.status(403).json({ error: "CEO or TL only" });
 const verifyEmployeeToken = (req, res, next) => req.coworkUser ? next() : res.status(401).json({ error: "Unauthorized" });
 
-module.exports = { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken };
+module.exports = { verifyCoworkToken, verifyCeoToken, verifyCeoOrTL, verifyEmployeeToken };
