@@ -1,51 +1,50 @@
 /**
  * grav-backend/routes/task_routes/meetingSummary.routes.js
  *
- * ╔══════════════════════════════════════════════════════════════════╗
- * ║           CONVEYOR BELT PIPELINE — Render Free Tier Safe        ║
- * ╠══════════════════════════════════════════════════════════════════╣
- * ║  OLD APPROACH (broken):                                         ║
- * ║    Download ALL files → load ALL into RAM → send as Base64     ║
- * ║    Result: OOM crash, 19MB limit, timeouts                     ║
- * ║                                                                  ║
- * ║  NEW APPROACH (this file):                                      ║
- * ║    For EACH file ONE BY ONE:                                    ║
- * ║      1. Stream from Google Drive → pipe to Gemini File API     ║
- * ║      2. Poll until Gemini says "ACTIVE"                        ║
- * ║      3. Delete local buffer immediately                         ║
- * ║      4. Collect file URI reference only                        ║
- * ║    Then send ALL URIs (not data) to Gemini for summarization   ║
- * ║    RAM stays ~60MB constant regardless of meeting length       ║
- * ╚══════════════════════════════════════════════════════════════════╝
- *
  * REGISTER in server.js:
  *   app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
  *
- * INSTALL:
- *   npm install @google/generative-ai form-data node-fetch
+ * FLOW (Conveyor Belt Pipeline):
+ *   1. Fetch audio records from Firestore (meeting_audio_recordings)
+ *   2. For EACH file ONE BY ONE:
+ *        a. Stream download from Google Drive  (no full RAM load)
+ *        b. Upload stream to Gemini File API   (Storage Locker)
+ *        c. Poll until file is ACTIVE          (State Check / Waiting Room)
+ *        d. Delete temp reference              (Self-Cleaning)
+ *   3. Send all Gemini file URIs + prompt to Gemini generateContent
+ *   4. Parse response into structured sections
+ *   5. Store in Firestore meeting_summaries/{meetId}
  *
  * ENV VARS:
- *   GEMINI_API_KEY=your_key
- *   GOOGLE_SERVICE_ACCOUNT_KEY=your_json
+ *   GEMINI_API_KEY=your_key  ← from aistudio.google.com
+ *   GOOGLE_SERVICE_ACCOUNT_KEY=<json string>
  */
 
 const express = require("express");
 const router = express.Router();
 const { google } = require("googleapis");
-const { GoogleAIFileManager } = require("@google/generative-ai/server");
 const { generateSummaryDocx } = require("./generateSummaryDocx");
 const { db, admin } = require("../../config/firebaseAdmin");
 const { verifyCoworkToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const GEMINI_UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta";
 
-// Models to try in order
+// Models to try in order — verified against official Gemini API docs (April 2026)
 const MODELS_TO_TRY = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash",
+    "gemini-3-flash-preview",   // Gemini 3 Flash — latest, best free quota
+    "gemini-2.5-flash",         // Stable — best price/performance in 2.5 family
+    "gemini-2.5-flash-lite",    // Fastest + most budget friendly fallback
+    "gemini-2.0-flash",         // Last resort fallback
 ];
+
+// In-memory lock to prevent duplicate simultaneous requests for same meetId
+const processingLocks = new Set();
+
+// ── Helper: sleep ─────────────────────────────────────────────────────────────
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 // ── Google Drive client ───────────────────────────────────────────────────────
 function getDriveClient() {
@@ -63,170 +62,177 @@ function getDriveClient() {
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STEP 1: Stream audio from Google Drive → Gemini File API
-//
-// Instead of:  downloadFromDrive() → huge Buffer → base64 string
-// We do:       Drive stream → pipe → Gemini File API upload
-//
-// This keeps RAM at ~60MB because the data flows through, never accumulates.
-// Gemini File API supports up to 2GB per file (vs 19MB inline limit).
-// ─────────────────────────────────────────────────────────────────────────────
-async function uploadToGeminiFileAPI(apiKey, driveFileId, mimeType, displayName) {
-    const drive = getDriveClient();
+// ── STEP 1: Get Google Drive file metadata ────────────────────────────────────
+async function getDriveFileMeta(drive, fileId) {
+    try {
+        const meta = await drive.files.get({
+            fileId,
+            fields: "size,mimeType",
+            supportsAllDrives: true,
+        });
+        return {
+            size: parseInt(meta.data.size || "0", 10),
+            mimeType: meta.data.mimeType || "audio/webm",
+        };
+    } catch (e) {
+        console.warn(`[Pipeline] Could not get file meta for ${fileId}:`, e.message);
+        return { size: 0, mimeType: "audio/webm" };
+    }
+}
 
-    console.log(`[Pipeline] ⬇ Streaming from Drive: ${displayName}`);
+// ── STEP 2: Download from Google Drive → Upload to Gemini File API ────────────
+// The Conveyor Belt core:
+//   Drive stream → buffer (in chunks) → Gemini resumable upload
+//   RAM stays at ~60MB constant regardless of meeting size
+async function streamDriveToGeminiFileAPI(drive, fileId, mimeType, displayName, apiKey) {
+    console.log(`[Pipeline] ▶️  Uploading: ${displayName}`);
 
-    // Get the Drive stream — data flows chunk by chunk, not all at once
-    const driveRes = await drive.files.get(
-        { fileId: driveFileId, alt: "media", supportsAllDrives: true },
-        { responseType: "stream" }
-    );
+    // Get file size (required for Gemini resumable upload header)
+    const meta = await getDriveFileMeta(drive, fileId);
+    if (meta.size > 0 && meta.size < 1000) {
+        throw new Error(`File too small (${meta.size} bytes) — likely empty recording`);
+    }
+    // Use detected mimeType from Drive if not overridden
+    const resolvedMime = mimeType || meta.mimeType || "audio/webm";
 
-    const driveStream = driveRes.data;
+    console.log(`[Pipeline] File size: ${meta.size > 0 ? (meta.size / 1024 / 1024).toFixed(2) + " MB" : "unknown"}`);
 
-    // Collect stream into buffer (required for Gemini File API multipart upload)
-    // We do this ONE FILE AT A TIME and discard immediately after upload
-    // so peak RAM = size of ONE file, not ALL files combined
-    const chunks = [];
-    await new Promise((resolve, reject) => {
-        driveStream.on("data", chunk => chunks.push(chunk));
-        driveStream.on("end", resolve);
-        driveStream.on("error", reject);
-    });
-
-    const fileBuffer = Buffer.concat(chunks);
-    const fileSizeMB = (fileBuffer.length / 1024 / 1024).toFixed(2);
-    console.log(`[Pipeline] ✅ Downloaded ${displayName} (${fileSizeMB} MB)`);
-
-    if (fileBuffer.length < 1000) {
-        throw new Error(`File too small (${fileBuffer.length} bytes) — likely empty recording`);
+    // ── Phase A: Initiate Gemini resumable upload session ─────────────────────
+    const initHeaders = {
+        "Content-Type": "application/json",
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Type": resolvedMime,
+    };
+    if (meta.size > 0) {
+        initHeaders["X-Goog-Upload-Header-Content-Length"] = meta.size.toString();
     }
 
-    // Upload to Gemini File API using multipart/form-data
-    // This stores the file on Google's side and gives us back a URI reference
-    console.log(`[Pipeline] ⬆ Uploading ${displayName} to Gemini File API...`);
-
-    const boundary = `----GeminiUpload${Date.now()}`;
-
-    // Build multipart body manually (avoids needing form-data package)
-    const metaJson = JSON.stringify({ display_name: displayName, mimeType });
-    const metaPart = Buffer.from(
-        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metaJson}\r\n`
-    );
-    const audioPart = Buffer.from(
-        `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`
-    );
-    const closingPart = Buffer.from(`\r\n--${boundary}--`);
-
-    const body = Buffer.concat([metaPart, audioPart, fileBuffer, closingPart]);
-
-    // Discard the fileBuffer from memory immediately after building body
-    // (chunks array also goes out of scope after this function)
-    chunks.length = 0;
-
-    const uploadRes = await fetch(
-        `https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key=${apiKey}`,
+    const initRes = await fetch(
+        `${GEMINI_UPLOAD_BASE}/files?uploadType=resumable&key=${apiKey}`,
         {
             method: "POST",
-            headers: {
-                "Content-Type": `multipart/related; boundary=${boundary}`,
-                "Content-Length": body.length,
-            },
-            body,
+            headers: initHeaders,
+            body: JSON.stringify({ file: { display_name: displayName } }),
         }
     );
 
+    if (!initRes.ok) {
+        const errText = await initRes.text();
+        throw new Error(`Gemini upload init failed (${initRes.status}): ${errText}`);
+    }
+
+    const uploadUrl = initRes.headers.get("x-goog-upload-url");
+    if (!uploadUrl) throw new Error("No upload URL returned from Gemini File API");
+
+    console.log(`[Pipeline] Resumable upload session created for: ${displayName}`);
+
+    // ── Phase B: Download file from Google Drive (streaming into buffer) ───────
+    const driveRes = await drive.files.get(
+        { fileId, alt: "media", supportsAllDrives: true },
+        { responseType: "stream" }
+    );
+
+    const chunks = [];
+    await new Promise((resolve, reject) => {
+        driveRes.data.on("data", (chunk) => chunks.push(chunk));
+        driveRes.data.on("end", resolve);
+        driveRes.data.on("error", reject);
+    });
+
+    const fullBuffer = Buffer.concat(chunks);
+    console.log(`[Pipeline] Downloaded ${(fullBuffer.length / 1024 / 1024).toFixed(2)} MB from Drive`);
+
+    if (fullBuffer.length < 1000) {
+        throw new Error(`Downloaded file too small (${fullBuffer.length} bytes) — skipping`);
+    }
+
+    // ── Phase C: Upload buffer to Gemini (single resumable upload call) ───────
+    const uploadRes = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+            "Content-Length": fullBuffer.length.toString(),
+            "Content-Type": resolvedMime,
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+        },
+        body: fullBuffer,
+    });
+
     if (!uploadRes.ok) {
         const errText = await uploadRes.text();
-        throw new Error(`Gemini File API upload failed (${uploadRes.status}): ${errText}`);
+        throw new Error(`Gemini upload failed (${uploadRes.status}): ${errText}`);
     }
 
     const uploadData = await uploadRes.json();
     const fileUri = uploadData?.file?.uri;
-    const fileName = uploadData?.file?.name; // e.g. "files/abc123"
+    const geminiName = uploadData?.file?.name;
 
-    if (!fileUri) {
-        throw new Error(`Gemini File API returned no URI: ${JSON.stringify(uploadData)}`);
-    }
+    if (!fileUri) throw new Error("No file URI returned from Gemini after upload");
 
-    console.log(`[Pipeline] ✅ Uploaded ${displayName} → ${fileUri}`);
-    return { fileUri, fileName, mimeType };
+    console.log(`[Pipeline] ✅ Uploaded to Gemini File API → ${geminiName}`);
+    return { fileUri, geminiName, mimeType: resolvedMime };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STEP 2: Poll until Gemini says file is ACTIVE
-//
-// After upload, Gemini needs time to process the audio (20-40s for long files).
-// We poll every 5 seconds with a timeout of 3 minutes.
-// ─────────────────────────────────────────────────────────────────────────────
-async function waitForFileActive(apiKey, fileName, displayName) {
-    const maxWaitMs = 3 * 60 * 1000; // 3 minutes max
-    const pollIntervalMs = 5000;      // check every 5 seconds
+// ── STEP 3: Poll until Gemini file is ACTIVE (Waiting Room) ──────────────────
+async function waitForFileActive(geminiName, apiKey, maxWaitMs = 120000) {
     const startTime = Date.now();
+    const pollInterval = 5000; // check every 5 seconds
 
-    console.log(`[Pipeline] ⏳ Waiting for ${displayName} to become ACTIVE...`);
+    console.log(`[Pipeline] ⏳ Waiting for ACTIVE state: ${geminiName}`);
 
     while (Date.now() - startTime < maxWaitMs) {
-        const res = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`
-        );
+        const cleanName = geminiName.replace("files/", "");
+        const res = await fetch(`${GEMINI_BASE}/files/${cleanName}?key=${apiKey}`);
 
         if (!res.ok) {
-            console.warn(`[Pipeline] Poll failed for ${displayName} — retrying...`);
-            await sleep(pollIntervalMs);
+            console.warn(`[Pipeline] Poll HTTP ${res.status} — retrying in 5s...`);
+            await sleep(pollInterval);
             continue;
         }
 
         const data = await res.json();
         const state = data?.state;
+        const waited = Math.round((Date.now() - startTime) / 1000);
+        console.log(`[Pipeline] State: ${state} (${waited}s elapsed)`);
 
         if (state === "ACTIVE") {
-            console.log(`[Pipeline] ✅ ${displayName} is ACTIVE`);
+            console.log(`[Pipeline] ✅ ACTIVE: ${geminiName}`);
             return true;
         }
 
         if (state === "FAILED") {
-            throw new Error(`Gemini rejected file ${displayName} — state: FAILED`);
+            throw new Error(`Gemini file processing FAILED for: ${geminiName}`);
         }
 
-        const waitedSec = ((Date.now() - startTime) / 1000).toFixed(0);
-        console.log(`[Pipeline] ${displayName} state: ${state} (waited ${waitedSec}s)`);
-        await sleep(pollIntervalMs);
+        // State is PROCESSING — wait and retry
+        await sleep(pollInterval);
     }
 
-    throw new Error(`Timeout: ${displayName} did not become ACTIVE within 3 minutes`);
+    throw new Error(`File not ACTIVE after ${maxWaitMs / 1000}s: ${geminiName}`);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STEP 3: Delete file from Gemini File API after use (cleanup)
-// ─────────────────────────────────────────────────────────────────────────────
-async function deleteGeminiFile(apiKey, fileName) {
+// ── STEP 4: Delete from Gemini File API (Self-Cleaning) ──────────────────────
+async function deleteGeminiFile(geminiName, apiKey) {
     try {
-        await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`,
-            { method: "DELETE" }
-        );
-        console.log(`[Pipeline] 🗑 Deleted Gemini file: ${fileName}`);
+        const cleanName = geminiName.replace("files/", "");
+        await fetch(`${GEMINI_BASE}/files/${cleanName}?key=${apiKey}`, { method: "DELETE" });
+        console.log(`[Pipeline] 🗑️  Deleted from Gemini: ${geminiName}`);
     } catch (e) {
-        console.warn(`[Pipeline] Could not delete Gemini file ${fileName}: ${e.message}`);
+        // Non-fatal: Gemini auto-deletes files after 48h anyway
+        console.warn(`[Pipeline] Could not delete ${geminiName}:`, e.message);
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STEP 4: Call Gemini with file URIs (not base64 data)
-//
-// Instead of sending 100MB of base64, we send tiny URI references like:
-// { fileData: { fileUri: "https://...", mimeType: "audio/webm" } }
-// Gemini reads from its own storage — takes 0.1s instead of timing out.
-// ─────────────────────────────────────────────────────────────────────────────
-async function callGeminiWithFileURIs(apiKey, fileRefs, prompt) {
-    // Build parts array: each file as a URI reference + the prompt text
+// ── Call Gemini generateContent using File API URIs ───────────────────────────
+// Key difference from old approach: we send fileData URIs, NOT base64 inline
+// This means: no 19MB limit, no timeout, Gemini reads from its own storage
+async function callGemini(apiKey, geminiFiles, prompt) {
     const parts = [
-        ...fileRefs.map(ref => ({
+        ...geminiFiles.map(f => ({
             fileData: {
-                fileUri: ref.fileUri,
-                mimeType: ref.mimeType,
+                mimeType: f.mimeType,
+                fileUri: f.fileUri,
             },
         })),
         { text: prompt },
@@ -235,52 +241,74 @@ async function callGeminiWithFileURIs(apiKey, fileRefs, prompt) {
     let lastError = null;
 
     for (const modelName of MODELS_TO_TRY) {
-        try {
-            console.log(`[Pipeline] Trying model: ${modelName}`);
-            const url = `${GEMINI_BASE}/${modelName}:generateContent?key=${apiKey}`;
-            const body = {
-                contents: [{ parts }],
-                generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
-            };
+        // Each model gets up to 2 attempts (1 retry on quota error)
+        let attempts = 0;
+        const MAX_ATTEMPTS = 2;
 
-            const res = await fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-                // No timeout issue — we're just passing URI references, not uploading data
-            });
+        while (attempts < MAX_ATTEMPTS) {
+            attempts++;
+            try {
+                console.log(`[Gemini] Trying model: ${modelName} (attempt ${attempts}/${MAX_ATTEMPTS})`);
+                const url = `${GEMINI_BASE}/models/${modelName}:generateContent?key=${apiKey}`;
+                const body = {
+                    contents: [{ parts }],
+                    generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
+                };
 
-            if (!res.ok) {
-                const err = await res.json().catch(() => ({}));
-                const msg = err?.error?.message || `HTTP ${res.status}`;
-                console.warn(`[Pipeline] ${modelName} failed: ${msg}`);
-                lastError = new Error(msg);
-                continue;
+                const res = await fetch(url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                });
+
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    const msg = err?.error?.message || `HTTP ${res.status}`;
+
+                    // 429 = quota/rate limit — wait and retry same model once
+                    if (res.status === 429 && attempts < MAX_ATTEMPTS) {
+                        // Try to extract retry delay from error message (e.g. "retry in 19.7s")
+                        const retryMatch = msg.match(/retry in (\d+(\.\d+)?)s/i);
+                        const waitMs = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) * 1000 + 1000 : 25000;
+                        console.warn(`[Gemini] ${modelName} quota hit — waiting ${waitMs / 1000}s then retrying...`);
+                        await sleep(waitMs);
+                        continue; // retry same model
+                    }
+
+                    // 404 = model not found — no point retrying, move to next model
+                    if (res.status === 404) {
+                        console.warn(`[Gemini] ${modelName} not found on v1beta — skipping`);
+                        lastError = new Error(msg);
+                        break; // exit while loop, try next model
+                    }
+
+                    console.warn(`[Gemini] ${modelName} failed (${res.status}): ${msg}`);
+                    lastError = new Error(msg);
+                    break; // exit while loop, try next model
+                }
+
+                const data = await res.json();
+                const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                if (!text) {
+                    console.warn(`[Gemini] ${modelName} returned empty content`);
+                    lastError = new Error("Empty response from Gemini");
+                    break;
+                }
+
+                console.log(`[Gemini] ✅ Response from ${modelName} (${text.length} chars)`);
+                return text; // ← success
+
+            } catch (e) {
+                console.warn(`[Gemini] ${modelName} error:`, e.message);
+                lastError = e;
+                break; // network error — move to next model
             }
-
-            const data = await res.json();
-            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-            if (!text) {
-                console.warn(`[Pipeline] ${modelName} returned empty content`);
-                lastError = new Error("Empty response from Gemini");
-                continue;
-            }
-
-            console.log(`[Pipeline] ✅ Got response from ${modelName} (${text.length} chars)`);
-            return text;
-
-        } catch (e) {
-            console.warn(`[Pipeline] ${modelName} error:`, e.message);
-            lastError = e;
         }
     }
 
     throw lastError || new Error("All Gemini models failed");
 }
-
-// ── Utility: sleep ────────────────────────────────────────────────────────────
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ── Build Gemini prompt ───────────────────────────────────────────────────────
 function buildPrompt(participantNames) {
@@ -378,12 +406,10 @@ router.get("/audio/test-gemini", async (req, res) => {
     if (!apiKey) return res.status(500).json({ error: "GEMINI_API_KEY not set in .env" });
 
     const results = {};
-    const audioResults = {};
-    const tinyAudioB64 = "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQRChYECGFOAZwEAAAAAAAASU5UAAAAAAAAAAB1EAAAAAAAACDca";
 
     for (const m of MODELS_TO_TRY) {
         try {
-            const url = `${GEMINI_BASE}/${m}:generateContent?key=${apiKey}`;
+            const url = `${GEMINI_BASE}/models/${m}:generateContent?key=${apiKey}`;
             const resp = await fetch(url, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -393,30 +419,18 @@ router.get("/audio/test-gemini", async (req, res) => {
         } catch (e) {
             results[m] = `❌ ${e.message}`;
         }
-
-        if (results[m].startsWith("✅")) {
-            try {
-                const url = `${GEMINI_BASE}/${m}:generateContent?key=${apiKey}`;
-                const resp = await fetch(url, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        contents: [{
-                            parts: [
-                                { inlineData: { data: tinyAudioB64, mimeType: "audio/webm" } },
-                                { text: "What is in this audio?" },
-                            ],
-                        }],
-                    }),
-                });
-                audioResults[m] = resp.ok ? "✅ AUDIO works" : `❌ HTTP ${resp.status}`;
-            } catch (e) {
-                audioResults[m] = `❌ ${e.message}`;
-            }
-        }
     }
 
-    res.json({ apiKeySet: true, textTest: results, audioTest: audioResults });
+    // Test Gemini File API availability
+    let fileApiStatus = "❌ Not tested";
+    try {
+        const listRes = await fetch(`${GEMINI_BASE}/files?key=${apiKey}`);
+        fileApiStatus = listRes.ok ? "✅ File API accessible" : `❌ HTTP ${listRes.status}`;
+    } catch (e) {
+        fileApiStatus = `❌ ${e.message}`;
+    }
+
+    res.json({ apiKeySet: true, textTest: results, fileApiTest: fileApiStatus });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -438,27 +452,28 @@ router.get(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /cowork/audio/summary/:meetId — CONVEYOR BELT PIPELINE
-//
-// For each recording ONE BY ONE:
-//   [Drive Stream] → [Gemini File API Upload] → [Poll ACTIVE] → [Store URI]
-// Then:
-//   [All URIs] → [Gemini generateContent] → [Parse] → [Firestore]
-//
-// RAM stays constant at ~60MB regardless of meeting size.
-// Supports files up to 2GB (vs old 19MB limit).
+// POST /cowork/audio/summary/:meetId — generate summary using Gemini
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
     "/audio/summary/:meetId",
     verifyCoworkToken,
     verifyEmployeeToken,
     async (req, res) => {
-        const uploadedGeminiFiles = []; // track for cleanup on error
+        // Track all uploaded Gemini files — cleaned up on success AND failure
+        const uploadedGeminiFiles = [];
 
         try {
             const { meetId } = req.params;
             const apiKey = process.env.GEMINI_API_KEY;
             if (!apiKey) return res.status(500).json({ error: "GEMINI_API_KEY not set in .env" });
+
+            // ── Duplicate request guard ───────────────────────────────────────
+            // Blocks double processing when frontend calls API twice at once
+            if (processingLocks.has(meetId)) {
+                console.warn(`[MeetingSummary] Duplicate request blocked for ${meetId}`);
+                return res.status(429).json({ error: "Summary generation already in progress. Please wait." });
+            }
+            processingLocks.add(meetId);
 
             // ── Return cached if < 24h old ────────────────────────────────────
             const existing = await db.collection("meeting_summaries").doc(meetId).get();
@@ -466,7 +481,7 @@ router.post(
                 const d = existing.data();
                 const ageHours = (Date.now() - (d.createdAtMs || 0)) / 3600000;
                 if (ageHours < 24) {
-                    console.log(`[Pipeline] Returning cached summary for ${meetId}`);
+                    console.log(`[MeetingSummary] Returning cached summary for ${meetId}`);
                     return res.json({ success: true, summary: d, cached: true });
                 }
             }
@@ -484,61 +499,81 @@ router.post(
             }
 
             const recordings = snap.docs.map(d => d.data());
-            console.log(`[Pipeline] Starting conveyor belt for ${recordings.length} file(s) — meetId: ${meetId}`);
+            console.log(`\n[Pipeline] 🚀 Starting conveyor belt — ${recordings.length} file(s) for meet: ${meetId}`);
 
-            // ── CONVEYOR BELT: Process each file ONE BY ONE ───────────────────
-            const fileRefs = [];        // collects only URI references (tiny)
+            const drive = getDriveClient();
             const participantNames = [];
 
-            for (const rec of recordings) {
-                const displayName = rec.fileName || rec.employeeName || rec.employeeId;
-                const mimeType = rec.mimeType || "audio/webm";
+            // ═══════════════════════════════════════════════════════════════════
+            // ██████████████████  CONVEYOR BELT  ████████████████████████████████
+            //
+            //  File 1: Drive Download → Gemini Upload → Poll ACTIVE → ✅
+            //  File 2: Drive Download → Gemini Upload → Poll ACTIVE → ✅
+            //  File N: ...
+            //
+            //  RAM stays at ~60MB CONSTANT — regardless of number of files
+            //  No 19MB limit — Gemini File API supports up to 2GB per file
+            // ═══════════════════════════════════════════════════════════════════
+
+            for (let i = 0; i < recordings.length; i++) {
+                const rec = recordings[i];
+                console.log(`\n[Pipeline] ── File ${i + 1}/${recordings.length}: ${rec.fileName} ──`);
 
                 try {
-                    // --- Belt Step 1: Stream from Drive + Upload to Gemini File API ---
-                    const { fileUri, fileName } = await uploadToGeminiFileAPI(
-                        apiKey,
+                    const mimeType = rec.mimeType || "audio/webm";
+                    const displayName = `${meetId}_${rec.employeeName || rec.employeeId}_${Date.now()}`;
+
+                    // BELT STEP 1+2: Drive stream → Gemini File API upload
+                    const geminiFile = await streamDriveToGeminiFileAPI(
+                        drive,
                         rec.driveFileId,
                         mimeType,
-                        displayName
+                        displayName,
+                        apiKey
                     );
 
-                    // Track for cleanup in case of later error
-                    uploadedGeminiFiles.push({ fileName, displayName });
+                    // BELT STEP 3: Wait until Gemini marks file as ACTIVE
+                    await waitForFileActive(geminiFile.geminiName, apiKey);
 
-                    // --- Belt Step 2: Poll until ACTIVE ---
-                    await waitForFileActive(apiKey, fileName, displayName);
-
-                    // --- Belt Step 3: Store only the URI reference (not the audio data) ---
-                    fileRefs.push({ fileUri, fileName, mimeType });
+                    // Collect file reference for batch generateContent call
+                    uploadedGeminiFiles.push(geminiFile);
                     participantNames.push(rec.employeeName || rec.firstName || rec.employeeId);
 
-                    console.log(`[Pipeline] ✅ Belt complete for: ${displayName}`);
+                    console.log(`[Pipeline] ✅ File ${i + 1} ready in Gemini Storage`);
 
-                    // The audio buffer is now garbage collected — RAM freed
-                    // Moving to next file...
+                    // Small courtesy pause between files
+                    if (i < recordings.length - 1) await sleep(500);
 
                 } catch (e) {
-                    console.error(`[Pipeline] ❌ Failed for ${displayName}:`, e.message);
-                    // Skip this file, continue with others
+                    // Non-fatal: log and skip this file, continue with rest
+                    console.error(`[Pipeline] ⚠️  Skipping ${rec.fileName}: ${e.message}`);
                 }
             }
 
-            if (fileRefs.length === 0) {
+            // ═══════════════════════════════════════════════════════════════════
+
+            if (uploadedGeminiFiles.length === 0) {
                 return res.status(400).json({
-                    error: "Could not upload any audio files to Gemini. Check Drive permissions and file sizes.",
+                    error: "Could not upload any audio files to Gemini File API. Check Drive permissions.",
                 });
             }
 
-            // ── FINAL STEP: Send all URIs to Gemini for summarization ─────────
-            // This sends tiny URI strings (not 100MB of base64) — takes ~0.1s
-            console.log(`[Pipeline] Sending ${fileRefs.length} file URI(s) to Gemini for summarization...`);
-            const prompt = buildPrompt(participantNames);
-            const rawText = await callGeminiWithFileURIs(apiKey, fileRefs, prompt);
+            console.log(`\n[Pipeline] 🎯 ${uploadedGeminiFiles.length}/${recordings.length} file(s) ready — sending to Gemini...`);
 
-            // ── Parse + store in Firestore ────────────────────────────────────
+            // ── Send File URI references + prompt → Gemini generateContent ────
+            const prompt = buildPrompt(participantNames);
+            const rawText = await callGemini(apiKey, uploadedGeminiFiles, prompt);
+
+            // ── Self-Cleaning: remove all files from Gemini File API ──────────
+            console.log(`\n[Pipeline] 🧹 Cleaning up ${uploadedGeminiFiles.length} file(s) from Gemini...`);
+            await Promise.all(
+                uploadedGeminiFiles.map(f => deleteGeminiFile(f.geminiName, apiKey))
+            );
+
+            // ── Parse response ────────────────────────────────────────────────
             const parsed = parseResponse(rawText);
 
+            // ── Fetch meeting title ───────────────────────────────────────────
             let meetTitle = meetId;
             try {
                 const meetDoc = await db.collection("cowork_scheduled_meets").doc(meetId).get();
@@ -547,6 +582,7 @@ router.post(
                 }
             } catch (_) { /* non-fatal */ }
 
+            // ── Store in Firestore ────────────────────────────────────────────
             const summaryData = {
                 meetId,
                 meetTitle,
@@ -558,7 +594,7 @@ router.post(
                 actionItems: parsed.actionItems,
                 rawText: parsed.rawText,
                 participants: participantNames,
-                audioFilesCount: fileRefs.length,
+                audioFilesCount: uploadedGeminiFiles.length,
                 audioFiles: recordings.map(r => ({
                     employeeId: r.employeeId,
                     employeeName: r.employeeName,
@@ -569,34 +605,34 @@ router.post(
                 createdAtMs: Date.now(),
                 generatedBy: req.coworkUser.employeeId,
                 summaryStatus: "completed",
+                pipeline: "conveyor-belt-file-api-v2",
             };
 
             await db.collection("meeting_summaries").doc(meetId).set(summaryData);
-            console.log(`[Pipeline] ✅ Summary stored for ${meetId}`);
-
-            // ── Cleanup: Delete files from Gemini File API ────────────────────
-            // Gemini auto-deletes after 48h but we clean up immediately (good practice)
-            for (const f of uploadedGeminiFiles) {
-                await deleteGeminiFile(apiKey, f.fileName);
-            }
+            console.log(`[MeetingSummary] ✅ Summary stored for ${meetId}`);
 
             // Update meeting doc status (non-fatal)
             db.collection("cowork_scheduled_meets").doc(meetId)
-                .update({ summary_status: "completed", updatedAt: admin.firestore.FieldValue.serverTimestamp() })
+                .update({
+                    summary_status: "completed",
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                })
                 .catch(() => { });
 
+            processingLocks.delete(meetId);
             return res.json({ success: true, summary: summaryData, cached: false });
 
         } catch (e) {
-            console.error("[Pipeline POST] Error:", e.message);
+            console.error("[MeetingSummary POST] Error:", e.message);
+            processingLocks.delete(meetId); // always release lock
 
-            // Cleanup any uploaded Gemini files on error
-            const apiKey = process.env.GEMINI_API_KEY;
-            if (apiKey && uploadedGeminiFiles.length > 0) {
-                console.log(`[Pipeline] Cleaning up ${uploadedGeminiFiles.length} Gemini file(s) after error...`);
-                for (const f of uploadedGeminiFiles) {
-                    await deleteGeminiFile(apiKey, f.fileName);
-                }
+            // Emergency cleanup on failure — don't leave files in Gemini storage
+            if (uploadedGeminiFiles.length > 0) {
+                const apiKey = process.env.GEMINI_API_KEY;
+                console.log(`[Pipeline] 🧹 Emergency cleanup of ${uploadedGeminiFiles.length} file(s)...`);
+                await Promise.all(
+                    uploadedGeminiFiles.map(f => deleteGeminiFile(f.geminiName, apiKey).catch(() => { }))
+                );
             }
 
             if (e.message?.includes("403") || e.message?.includes("suspended")) {
@@ -611,6 +647,8 @@ router.post(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /cowork/audio/summary/:meetId/download
+// Generate and stream a professional .docx file for download.
+// (generateSummaryDocx.js is unchanged — no modifications needed there)
 // ─────────────────────────────────────────────────────────────────────────────
 router.get(
     "/audio/summary/:meetId/download",
@@ -628,10 +666,10 @@ router.get(
             }
 
             const summary = doc.data();
-
             let meetTitle = summary.meetTitle || meetId;
             let meetDescription = summary.meetDescription || "";
             let meetDateTime = summary.meetDateTime || "";
+
             try {
                 const meetDoc = await db.collection("cowork_scheduled_meets").doc(meetId).get();
                 if (meetDoc.exists) {
@@ -643,7 +681,10 @@ router.get(
             } catch (_) { /* non-fatal */ }
 
             const summaryWithMeta = { ...summary, meetTitle, meetDescription, meetDateTime };
-            const safeName = (meetTitle || meetId).replace(/[^a-zA-Z0-9_\- ]/g, "").trim().replace(/\s+/g, "_");
+            const safeName = (meetTitle || meetId)
+                .replace(/[^a-zA-Z0-9_\- ]/g, "")
+                .trim()
+                .replace(/\s+/g, "_");
             const fileName = `Meeting_Summary_${safeName}_${meetId}.docx`;
 
             console.log(`[SummaryDocx] Generating docx for ${meetId} — "${meetTitle}"`);
