@@ -467,23 +467,19 @@ router.post(
             const apiKey = process.env.GEMINI_API_KEY;
             if (!apiKey) return res.status(500).json({ error: "GEMINI_API_KEY not set in .env" });
 
-            // ── Duplicate request guard ───────────────────────────────────────
-            // Blocks double processing when frontend calls API twice at once
-            if (processingLocks.has(meetId)) {
-                console.warn(`[MeetingSummary] Duplicate request blocked for ${meetId}`);
-                return res.status(429).json({ error: "Summary generation already in progress. Please wait." });
-            }
-            processingLocks.add(meetId);
-
-            // ── Return cached if < 24h old ────────────────────────────────────
+            // ── Return cached if < 24h old — UNLESS ?force=true is passed ─────
+            const forceRegenerate = req.query.force === "true";
             const existing = await db.collection("meeting_summaries").doc(meetId).get();
-            if (existing.exists) {
+            if (existing.exists && !forceRegenerate) {
                 const d = existing.data();
                 const ageHours = (Date.now() - (d.createdAtMs || 0)) / 3600000;
                 if (ageHours < 24) {
                     console.log(`[MeetingSummary] Returning cached summary for ${meetId}`);
                     return res.json({ success: true, summary: d, cached: true });
                 }
+            }
+            if (forceRegenerate) {
+                console.log(`[MeetingSummary] Force regenerate requested for ${meetId} — bypassing cache`);
             }
 
             // ── Get audio records from Firestore ──────────────────────────────
@@ -573,8 +569,8 @@ router.post(
             // ── Parse response ────────────────────────────────────────────────
             const parsed = parseResponse(rawText);
 
-            // ── Fetch meeting title ───────────────────────────────────────────
-            let meetTitle = meetId;
+            // ── Fetch meeting title from cowork_scheduled_meets ───────────────
+            let meetTitle = meetId; // fallback
             try {
                 const meetDoc = await db.collection("cowork_scheduled_meets").doc(meetId).get();
                 if (meetDoc.exists) {
