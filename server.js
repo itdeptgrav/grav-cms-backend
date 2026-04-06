@@ -627,7 +627,7 @@ app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
 
 app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
-
+app.use("/cowork", require("./routes/task_routes/askAI.routes"));
 
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
