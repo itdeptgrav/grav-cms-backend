@@ -87,6 +87,7 @@ const operationCompletionSchema = new mongoose.Schema(
     operationType:        { type: String, trim: true },
     operationCode:        { type: String, trim: true, default: "" },
     completedQuantity:    { type: Number, default: 0, min: 0 },
+    completedUnitNumbers: [{ type: Number }],
     totalQuantity:        { type: Number, required: true },
     completionPercentage: { type: Number, default: 0, min: 0, max: 100 },
     status: {
