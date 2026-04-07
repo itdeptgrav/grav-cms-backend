@@ -1,5 +1,3 @@
-// models/Customer_Models/Employee_Mpc.js
-
 const mongoose = require("mongoose");
 
 const productAssignmentSchema = new mongoose.Schema({
@@ -16,16 +14,6 @@ const productAssignmentSchema = new mongoose.Schema({
     required: true,
     min: 1,
     default: 1
-  },
-  // ── NEW: persist the display name at assignment time ──────────────────────
-  // Stores whichever name was shown in the popup when the product was assigned —
-  // this is either an additionalName (if the user searched/selected via an alias)
-  // or the product's canonical name.  Storing it here means the list view never
-  // needs to re-resolve names from the StockItem collection on every page load.
-  productName: {
-    type: String,
-    trim: true,
-    default: ""
   }
 }, { _id: false });
 
@@ -62,19 +50,7 @@ const employeeMpcSchema = new mongoose.Schema({
     }
   },
 
-  department: {
-    type: String,
-    trim: true,
-    default: ""
-  },
-
-  designation: {
-    type: String,
-    trim: true,
-    default: ""
-  },
-
-  // Product assignments
+  // Product assignments (replacing department/designation)
   products: [productAssignmentSchema],
 
   status: {
@@ -107,6 +83,5 @@ employeeMpcSchema.index({ customerId: 1, status: 1 });
 employeeMpcSchema.index({ customerId: 1, createdAt: -1 });
 employeeMpcSchema.index({ customerId: 1, "products.productId": 1 });
 employeeMpcSchema.index({ customerId: 1, uin: 1 }, { unique: true });
-employeeMpcSchema.index({ customerId: 1, department: 1, designation: 1 });
 
 module.exports = mongoose.model("EmployeeMpc", employeeMpcSchema);
