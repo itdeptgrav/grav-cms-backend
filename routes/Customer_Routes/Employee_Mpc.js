@@ -169,12 +169,13 @@ router.post("/by-uins", async (req, res) => {
     const upperUins = uins.map(u => u.toString().toUpperCase());
  
     const employees = await EmployeeMpc.find({ uin: { $in: upperUins } })
-      .select("uin department designation name gender")
+      .select("_id uin department designation name gender")
       .lean();
  
     return res.json({
       success: true,
       employees: employees.map(e => ({
+        _id:         e._id,  
         uin:         e.uin,
         name:        e.name,
         gender:      e.gender      || "",
@@ -189,10 +190,24 @@ router.post("/by-uins", async (req, res) => {
 });
 
 
+
+const buildExportFilter = (req) => {
+  const filter = { customerId: req.customerId };
+  const ids = req.query.ids; // single string or array of strings
+  if (ids) {
+    const idArray = Array.isArray(ids) ? ids : [ids];
+    if (idArray.length) {
+      filter._id = { $in: idArray };
+    }
+  }
+  return filter;
+};
+
+
 router.get('/export', verifyCustomerToken, async (req, res) => {
   try {
     // Fetch ALL employees sorted by department then name
-    const employees = await EmployeeMpc.find({ customerId: req.customerId })
+    const employees = await EmployeeMpc.find(buildExportFilter(req))
       .select('name uin gender department designation products status')
       .sort({ department: 1, name: 1 })
       .lean();
@@ -299,7 +314,7 @@ router.get('/export-xlsx', verifyCustomerToken, async (req, res) => {
   const axios = require('axios');
 
   try {
-    const employees = await EmployeeMpc.find({ customerId: req.customerId })
+    const employees = await EmployeeMpc.find(buildExportFilter(req))
       .select('name uin gender department designation products status')
       .sort({ department: 1, name: 1 })
       .lean();
