@@ -156,46 +156,39 @@ router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, as
     const { newPassword } = req.body;
     const { id: employeeId } = req.params;
 
-    if (!newPassword || newPassword.length < 6) {
+    if (!newPassword || newPassword.length < 6)
       return res.status(400).json({ error: "Password must be at least 6 characters." });
-    }
 
-    // 1. Look up the employee's Firebase Auth UID from Firestore
     const empDoc = await db.collection("cowork_employees").doc(employeeId).get();
-    if (!empDoc.exists) {
-      return res.status(404).json({ error: "Employee not found." });
-    }
+    if (!empDoc.exists) return res.status(404).json({ error: "Employee not found." });
 
     const empData = empDoc.data();
     const authUid = empData.authUid;
+    if (!authUid) return res.status(400).json({ error: "Employee has no linked auth account." });
 
-    if (!authUid) {
-      return res.status(400).json({ error: "Employee has no linked auth account." });
-    }
-
-    // 2. Update the password in Firebase Auth
+    // Update password in Firebase Auth
     await auth.updateUser(authUid, { password: newPassword });
 
-    // 3. Mark passwordChanged = false so employee is prompted to change on next login
+    // Update Firestore
     await db.collection("cowork_employees").doc(employeeId).update({
       passwordChanged: false,
       tempPassword: newPassword,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    console.log(`[CEO] Password reset for employee ${employeeId} by ${req.coworkUser.employeeId}`);
+    // ← Force logout — revoke all their tokens instantly
+    await auth.revokeRefreshTokens(authUid);
 
+    console.log(`[ResetPassword] ${employeeId} session revoked by ${req.coworkUser.employeeId}`);
     return res.json({
       success: true,
-      message: `Password reset successfully for ${empData.name || employeeId}.`,
+      message: `Password reset for ${empData.name || employeeId}. They have been logged out automatically.`,
     });
-
   } catch (e) {
     console.error("[reset-password]", e);
     return res.status(500).json({ error: e.message });
   }
 });
-
 
 
 // ── UPDATE GROUP (name / description) ─────────────────────
@@ -450,5 +443,42 @@ router.get("/test-email", verifyCoworkToken, verifyCeoToken, async (req, res) =>
     res.status(500).json({ error: e.message });
   }
 });
+
+
+// ── CHANGE ROLE (CEO only) ────────────────────────────────────────────────────
+router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const { role } = req.body;
+
+    if (!["employee", "tl"].includes(role))
+      return res.status(400).json({ error: "Invalid role. Must be 'employee' or 'tl'" });
+    if (req.coworkUser?.role !== "ceo")
+      return res.status(403).json({ error: "Only CEO can change roles" });
+
+    const empDoc = await db.collection("cowork_employees").doc(employeeId).get();
+    if (!empDoc.exists) return res.status(404).json({ error: "Employee not found" });
+    const authUid = empDoc.data().authUid;
+    if (!authUid) return res.status(400).json({ error: "Employee has no linked auth account" });
+
+    // Update custom claims
+    await auth.setCustomUserClaims(authUid, { role });
+
+    // Update Firestore
+    await db.collection("cowork_employees").doc(employeeId).update({
+      role,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // ← Force logout — revoke all their tokens instantly
+    await auth.revokeRefreshTokens(authUid);
+
+    console.log(`[ChangeRole] ${employeeId} → ${role} | session revoked`);
+    res.json({ success: true, employeeId, role });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 module.exports = router;
