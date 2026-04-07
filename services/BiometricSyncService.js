@@ -1,332 +1,462 @@
-/**
- * BiometricSyncService.js
- *
- * Handles ALL communication with eTimeOffice biometric API.
- * Credentials come ONLY from .env — never from frontend, never hardcoded.
- *
- * Required .env keys:
- *   ETIMEOFFICE_URL=https://api.etimeoffice.com/api/DownloadPunchData
- *   ETIMEOFFICE_USERNAME=gsawavec:gr334eav
- *   ETIMEOFFICE_PASSWORD=geewav@202325
- *   BIOMETRIC_SYNC_INTERVAL_MINUTES=30   (default 30)
- *   SHIFT_START=09:00
- *   SHIFT_END=18:00
- *   LATE_THRESHOLD_MINS=15
- *   HALF_DAY_THRESHOLD_MINS=270
- *   EARLY_OUT_THRESHOLD_MINS=30
- *
- * FIX: The unique index on { employeeId, dateString } caused E11000 when
- *      multiple biometric employees aren't linked to any Employee doc (employeeId=null).
- *      Solution: upsert on { biometricId, dateString } — biometricId is always present.
- *      We remove the compound unique index on employeeId+dateString and rely on
- *      biometricId+dateString uniqueness instead (see Attendance model note).
- */
+"use strict";
 
 const axios = require("axios");
-const cron = require("node-cron");
-const Attendance = require("../models/HR_Models/Attendance");
-const Employee = require("../models/Employee");
 
-// ── Read all config from env ──────────────────────────────────────────────────
-const BIO_URL = process.env.ETIMEOFFICE_URL || "https://api.etimeoffice.com/api/DownloadPunchData";
-const BIO_USER = process.env.ETIMEOFFICE_USERNAME || "";
-const BIO_PASS = process.env.ETIMEOFFICE_PASSWORD || "";
-const SYNC_INTERVAL = parseInt(process.env.BIOMETRIC_SYNC_INTERVAL_MINUTES || "30", 10);
-const SHIFT_START = process.env.SHIFT_START || "09:00";
-const SHIFT_END = process.env.SHIFT_END || "18:00";
-const LATE_THRESH = parseInt(process.env.LATE_THRESHOLD_MINS || "15", 10);
-const HALF_THRESH = parseInt(process.env.HALF_DAY_THRESHOLD_MINS || "270", 10);
-const EARLY_THRESH = parseInt(process.env.EARLY_OUT_THRESHOLD_MINS || "30", 10);
+const BASE_URL = (process.env.TEAMOFFICE_BASE_URL || "https://api.etimeoffice.com/api").replace(/\/+$/, "");
+const CORP_ID = process.env.TEAMOFFICE_CORP_ID || "gravc";
+const USERNAME = process.env.TEAMOFFICE_USERNAME || "grav";
+const PASSWORD = process.env.TEAMOFFICE_PASSWORD || "grav@2025";
 
-// ── Internal state ────────────────────────────────────────────────────────────
-let lastSyncTime = null;
-let lastSyncResult = null;
-let isSyncing = false;
-let cronJob = null;
+const AUTH_USERNAME = `${CORP_ID}:${USERNAME}`;  // "gravc:grav"
+const AUTH_PASSWORD = `${PASSWORD}:true`;         // "grav@2025:true"
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function toDateString(d) {
-    const dt = new Date(d);
-    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+let syncStatus = { lastSync: null, status: "idle", message: "" };
+
+function formatDateForAPI(isoDate, isEndOfDay = false) {
+    const [year, month, day] = isoDate.split("-");
+    const time = isEndOfDay ? "23:59" : "00:00";
+    return `${day}/${month}/${year}_${time}`;
 }
 
-function formatTime(date) {
-    if (!date) return null;
-    return new Date(date).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
-}
-
-function parseHHMM(str) {
-    const [h, m] = (str || "09:00").split(":").map(Number);
-    return h * 60 + (m || 0);
-}
-
-/** eTimeOffice date format: DD/MM/YYYY_HH:MM */
-function fmtBioDate(date, endOfDay = false) {
-    const d = new Date(date);
-    const dd = String(d.getDate()).padStart(2, "0");
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    return `${dd}/${mm}/${d.getFullYear()}_${endOfDay ? "23:59" : "00:00"}`;
-}
-
-/** Parse "10/03/2026 21:17:00" → Date */
-function parseBioDate(str) {
-    const [dp, tp] = str.trim().split(" ");
-    const [d, m, y] = dp.split("/");
-    return new Date(`${y}-${m}-${d}T${tp}`);
-}
-
-// ── Step 1: Fetch raw punches from eTimeOffice ────────────────────────────────
-async function fetchRawPunches(fromDate, toDate) {
-    if (!BIO_USER || !BIO_PASS) throw new Error("Biometric credentials not set in .env (ETIMEOFFICE_USERNAME / ETIMEOFFICE_PASSWORD)");
-
-    const url = `${BIO_URL}?Empcode=ALL&FromDate=${fmtBioDate(fromDate)}&ToDate=${fmtBioDate(toDate, true)}`;
-    console.log("[Biometric] Fetching:", url);
-
-    const resp = await axios.get(url, {
-        auth: { username: BIO_USER, password: BIO_PASS },
+async function fetchPunchDetailData(fromDate, toDate, empCode = "ALL") {
+    const from = formatDateForAPI(fromDate, false);
+    const to = formatDateForAPI(toDate, true);
+    
+    const url = `${BASE_URL}/DownloadPunchData?Empcode=${empCode}&FromDate=${from}&ToDate=${to}`;
+    
+    console.log(`📡 Fetching: ${url}`);
+    
+    const response = await axios.get(url, {
+        auth: { username: AUTH_USERNAME, password: AUTH_PASSWORD },
+        headers: { 'User-Agent': 'PostmanRuntime/7.42.0', 'Accept': '*/*' },
         timeout: 30000,
     });
-
-    const data = resp.data;
-    if (!data.PunchData) throw new Error(`eTimeOffice returned: ${JSON.stringify(data).slice(0, 200)}`);
-    return data.PunchData;
+    
+    return response.data;
 }
 
-// ── Step 2: Process raw punches into structured daily records ─────────────────
-/**
- * Logic (from device documentation):
- *   - Sort all punches for an employee on a day chronologically
- *   - First punch  = check-in
- *   - Last punch   = check-out
- *   - Middle pairs = break-out / break-in (tea breaks, lunch, etc.)
- */
-function processPunches(rawPunches) {
-    const groups = {};
-
-    for (const p of rawPunches) {
-        const dt = parseBioDate(p.PunchDate);
-        const key = `${p.Empcode}_${toDateString(dt)}`;
-        if (!groups[key]) groups[key] = { name: p.Name, empcode: p.Empcode, date: toDateString(dt), punches: [] };
-        groups[key].punches.push(dt);
-    }
-
-    const results = [];
-
-    for (const g of Object.values(groups)) {
-        const sorted = g.punches.slice().sort((a, b) => a - b);
-        const checkIn = sorted[0];
-        const checkOut = sorted.length > 1 ? sorted[sorted.length - 1] : null;
-
-        const workingMins = checkOut ? Math.round((checkOut - checkIn) / 60000) : 0;
-
-        // Detect breaks from middle punch pairs
-        const middle = sorted.slice(1, sorted.length - 1);
-        const breaks = [];
-        for (let i = 0; i + 1 < middle.length; i += 2) {
-            const breakOut = middle[i];
-            const breakIn = middle[i + 1];
-            const dur = Math.round((breakIn - breakOut) / 60000);
-            if (dur > 0 && dur < 180) {
-                breaks.push({
-                    out: breakOut,
-                    in: breakIn,
-                    durationMins: dur,
-                    type: dur <= 20 ? "tea_break" : dur <= 45 ? "lunch_break" : "extended_break",
+async function syncDateRange(fromDate, toDate, empCode = "ALL", deps) {
+    syncStatus = { lastSync: new Date(), status: "running", message: `Syncing ${fromDate} to ${toDate}` };
+    
+    try {
+        const engine = require("./Attendanceengine");
+        
+        // Fetch punch data from API
+        const data = await fetchPunchDetailData(fromDate, toDate, empCode);
+        
+        if (data.Error === true) {
+            throw new Error(data.Msg || "API returned error");
+        }
+        
+        const punchData = data.PunchData || [];
+        console.log(`✅ Fetched ${punchData.length} punch records`);
+        
+        // Parse punch data into map
+        const punchMap = engine.parsePunchDataResponse(data);
+        console.log(`📊 Parsed into ${Object.keys(punchMap).length} employee-days`);
+        
+        // Get all unique empcodes from punch data
+        const uniqueEmpcodes = [...new Set(punchData.map(p => p.Empcode || p.empcode).filter(Boolean))];
+        console.log(`👥 Unique employee codes: ${uniqueEmpcodes.length}`);
+        
+        // Extract name map for employee matching
+        const nameMap = engine.extractNameMap(data);
+        
+        // Build employee map (matches device codes to employee records)
+        const employeeMap = await engine.buildEmployeeMap(deps.Employee, uniqueEmpcodes, nameMap);
+        console.log(`🔗 Matched ${Object.keys(employeeMap).length} employees`);
+        
+        // Get settings
+        const settings = await deps.AttendanceSettings.getSingleton();
+        const holidays = settings.holidays || [];
+        
+        // Process each day's punches
+        let created = 0, updated = 0;
+        
+        for (const [key, punchDetail] of Object.entries(punchMap)) {
+            const { biometricId, dateStr, name, punches } = punchDetail;
+            
+            // Skip if no punches
+            if (!punches || punches.length === 0) continue;
+            
+            // Find employee match
+            const numericId = engine.normalizeId(biometricId);
+            const empDoc = employeeMap[numericId];
+            
+            if (!empDoc) {
+                console.warn(`⚠️ No employee match for biometricId: ${biometricId} (${name})`);
+                continue;
+            }
+            
+            // Build inOutRec structure for the record factory
+            const inOutRec = {
+                biometricId: empDoc.biometricId,
+                dateStr,
+                name: empDoc.name,
+                inTime: null,
+                finalOut: null,
+                etimeRemark: "",
+                etimeStatus: "",
+            };
+            
+            // Build attendance record
+            const record = engine.buildAttendanceRecord(inOutRec, punchDetail, empDoc, settings, holidays);
+            
+            // Check if record already exists
+            const existing = await deps.DailyAttendance.findOne({
+                biometricId: record.biometricId,
+                dateStr: record.dateStr,
+            });
+            
+            if (existing) {
+                // Update existing record
+                Object.assign(existing, {
+                    rawPunches: record.rawPunches,
+                    punchCount: record.punchCount,
+                    inTime: record.inTime,
+                    lunchOut: record.lunchOut,
+                    lunchIn: record.lunchIn,
+                    teaOut: record.teaOut,
+                    teaIn: record.teaIn,
+                    finalOut: record.finalOut,
+                    totalSpanMins: record.totalSpanMins,
+                    lunchBreakMins: record.lunchBreakMins,
+                    teaBreakMins: record.teaBreakMins,
+                    totalBreakMins: record.totalBreakMins,
+                    netWorkMins: record.netWorkMins,
+                    otMins: record.otMins,
+                    lateMins: record.lateMins,
+                    earlyDepartureMins: record.earlyDepartureMins,
+                    isLate: record.isLate,
+                    isEarlyDeparture: record.isEarlyDeparture,
+                    hasOT: record.hasOT,
+                    hasMissPunch: record.hasMissPunch,
+                    systemPrediction: record.systemPrediction,
+                    syncedAt: new Date(),
+                    syncSource: "api",
                 });
+                await existing.save();
+                updated++;
+            } else {
+                // Create new record
+                await deps.DailyAttendance.create(record);
+                created++;
             }
         }
-
-        const breakMins = breaks.reduce((s, b) => s + b.durationMins, 0);
-        const effectiveMins = Math.max(0, workingMins - breakMins);
-
-        const shiftStartMins = parseHHMM(SHIFT_START);
-        const shiftEndMins = parseHHMM(SHIFT_END);
-        const ciMins = checkIn.getHours() * 60 + checkIn.getMinutes();
-        const coMins = checkOut ? checkOut.getHours() * 60 + checkOut.getMinutes() : 0;
-
-        const lateBy = Math.max(0, ciMins - shiftStartMins);
-        const isLate = lateBy > LATE_THRESH;
-        const isEarlyOut = checkOut ? coMins < shiftEndMins - EARLY_THRESH : false;
-        const overtimeMins = checkOut ? Math.max(0, coMins - shiftEndMins) : 0;
-
-        let status = "present";
-        if (effectiveMins <= 0) status = "absent";
-        else if (effectiveMins < HALF_THRESH) status = "half_day";
-        else if (isLate && !isEarlyOut) status = "late";
-        else if (isEarlyOut) status = "early_departure";
-
-        results.push({
-            name: g.name,
-            empcode: g.empcode,
-            date: g.date,
-            checkIn,
-            checkOut,
-            checkInTime: formatTime(checkIn),
-            checkOutTime: checkOut ? formatTime(checkOut) : null,
-            workingMinutes: workingMins,
-            breakMinutes: breakMins,
-            effectiveMinutes: effectiveMins,
-            overtimeMinutes: overtimeMins,
-            hasOvertime: overtimeMins > 0,
-            lateByMinutes: lateBy,
-            isLate,
-            isEarlyOut,
-            status,
-            allPunches: sorted.map(p => p.toISOString()),
-            breaks: breaks.map(b => ({
-                out: b.out.toISOString(),
-                in: b.in.toISOString(),
-                durationMins: b.durationMins,
-                type: b.type,
-            })),
-            totalPunches: sorted.length,
-        });
+        
+        // Fill missing days for employees who have no punches
+        const allDates = getDatesInRange(fromDate, toDate);
+        const allBiometricIds = Object.keys(employeeMap);
+        
+        for (const numericIdStr of allBiometricIds) {
+            const numericId = parseInt(numericIdStr, 10);
+            const empDoc = employeeMap[numericId];
+            
+            for (const dateStr of allDates) {
+                const existing = await deps.DailyAttendance.findOne({
+                    biometricId: empDoc.biometricId,
+                    dateStr,
+                });
+                
+                if (!existing) {
+                    const placeholder = engine.buildPlaceholderRecord(empDoc.biometricId, empDoc, dateStr, settings, holidays);
+                    await deps.DailyAttendance.create(placeholder);
+                }
+            }
+        }
+        
+        console.log(`✅ Sync complete: ${created} created, ${updated} updated`);
+        
+        syncStatus = { 
+            lastSync: new Date(), 
+            status: "success", 
+            message: `Synced ${created + updated} records (${created} new, ${updated} updated)` 
+        };
+        
+        return { success: true, created, updated, total: created + updated };
+        
+    } catch (err) {
+        console.error("❌ Sync failed:", err.message);
+        syncStatus = { lastSync: new Date(), status: "error", message: err.message };
+        throw err;
     }
+}
 
+// Helper: Get all dates between fromDate and toDate
+function getDatesInRange(fromDate, toDate) {
+    const dates = [];
+    const start = new Date(fromDate + "T00:00:00Z");
+    const end = new Date(toDate + "T00:00:00Z");
+    
+    for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+        dates.push(d.toISOString().split("T")[0]);
+    }
+    return dates;
+}
+
+function getStatus() {
+    return syncStatus;
+}
+
+// ============================================================
+// NORMALIZATION FUNCTIONS
+// ============================================================
+
+function normalizeName(name) {
+    if (!name) return "";
+    return name.toLowerCase().replace(/[^a-z]/g, "").trim();
+}
+
+function nameSimilarity(a, b) {
+    if (!a || !b) return 0;
+    const na = normalizeName(a);
+    const nb = normalizeName(b);
+    if (na === nb) return 1.0;
+    if (na.includes(nb) || nb.includes(na)) return 0.9;
+    let matches = 0;
+    const shorter = na.length < nb.length ? na : nb;
+    const longer = na.length < nb.length ? nb : na;
+    for (let i = 0; i < shorter.length; i++) {
+        if (longer.includes(shorter[i])) matches++;
+    }
+    return matches / longer.length;
+}
+
+// ============================================================
+// EMPLOYEE LINKING FUNCTIONS
+// ============================================================
+
+async function autoLinkEmployees(Employee, apiPunchData) {
+    const employees = await Employee.find({ status: "active" }).lean();
+    const apiNames = {};
+    for (const punch of apiPunchData) {
+        const code = punch.Empcode || punch.empcode;
+        const name = punch.Name || punch.name;
+        if (code && name && !apiNames[code]) {
+            apiNames[code] = name;
+        }
+    }
+    const results = { linked: [], unlinked: [], conflicts: [], alreadyLinked: [] };
+    const usedEmpcodes = new Set();
+    for (const emp of employees) {
+        const empName = `${emp.firstName || ""} ${emp.lastName || ""}`.trim() || emp.name || "";
+        const currentBioId = emp.workInfo?.biometricId || "";
+        if (currentBioId && /^\d{1,6}$/.test(currentBioId.trim())) {
+            results.alreadyLinked.push({
+                employeeId: emp._id,
+                name: empName,
+                identityId: emp.workInfo?.identityId || "",
+                biometricId: currentBioId,
+            });
+            usedEmpcodes.add(currentBioId);
+            continue;
+        }
+        let bestMatch = null;
+        let bestScore = 0;
+        for (const [empcode, apiName] of Object.entries(apiNames)) {
+            if (usedEmpcodes.has(empcode)) continue;
+            const score = nameSimilarity(empName, apiName);
+            if (score > bestScore && score >= 0.7) {
+                bestMatch = { empcode, apiName, score };
+                bestScore = score;
+            }
+        }
+        if (bestMatch) {
+            if (bestScore >= 0.85) {
+                results.linked.push({
+                    employeeId: emp._id,
+                    name: empName,
+                    identityId: emp.workInfo?.identityId || currentBioId,
+                    matchedEmpcode: bestMatch.empcode,
+                    matchedName: bestMatch.apiName,
+                    confidence: bestMatch.score,
+                });
+                usedEmpcodes.add(bestMatch.empcode);
+            } else {
+                results.conflicts.push({
+                    employeeId: emp._id,
+                    name: empName,
+                    identityId: emp.workInfo?.identityId || currentBioId,
+                    suggestedEmpcode: bestMatch.empcode,
+                    suggestedName: bestMatch.apiName,
+                    confidence: bestMatch.score,
+                });
+            }
+        } else {
+            results.unlinked.push({
+                employeeId: emp._id,
+                name: empName,
+                identityId: emp.workInfo?.identityId || currentBioId,
+            });
+        }
+    }
     return results;
 }
 
-// ── Step 3: Upsert records into MongoDB ──────────────────────────────────────
-/**
- * KEY FIX: We now upsert on { biometricId, dateString } instead of
- * { employeeId, dateString }. This avoids E11000 duplicate key errors when
- * multiple employees are NOT yet linked to an Employee document (employeeId=null).
- *
- * IMPORTANT: Also drop the old unique index on employeeId+dateString in MongoDB:
- *   db.attendances.dropIndex("employeeId_1_dateString_1")
- *   db.attendances.createIndex({ biometricId: 1, dateString: 1 }, { unique: true })
- */
-async function upsertRecords(records) {
-    let upserted = 0, failed = 0;
-
-    // Pre-fetch all employees with biometricIds in one query for performance
-    const allEmpcodes = [...new Set(records.map(r => r.empcode))];
-    const employees = await Employee.find({ biometricId: { $in: allEmpcodes } })
-        .select("_id department designation gender biometricId firstName lastName")
-        .lean();
-
-    const empMap = {};
-    for (const e of employees) {
-        empMap[e.biometricId] = e;
+async function applyLinks(Employee, linkedResults) {
+    let updated = 0;
+    for (const link of linkedResults) {
+        const emp = await Employee.findById(link.employeeId);
+        if (!emp) continue;
+        const currentBioId = emp.workInfo?.biometricId || "";
+        const currentIdentityId = emp.workInfo?.identityId || "";
+        if (/[a-zA-Z]/.test(currentBioId) && !currentIdentityId) {
+            emp.workInfo = emp.workInfo || {};
+            emp.workInfo.identityId = currentBioId;
+        }
+        emp.workInfo = emp.workInfo || {};
+        emp.workInfo.biometricId = link.matchedEmpcode;
+        await emp.save();
+        updated++;
     }
+    return { updated };
+}
 
-    for (const r of records) {
-        try {
-            const emp = empMap[r.empcode] || null;
-
-            const doc = {
-                // Link employee if found
-                ...(emp ? { employeeId: emp._id } : {}),
-                employeeName: emp
-                    ? `${emp.firstName || ""} ${emp.lastName || ""}`.trim() || r.name
-                    : r.name,
-                biometricId: r.empcode,
-                department: emp?.department || null,
-                designation: emp?.designation || null,
-                date: new Date(r.date),
-                dateString: r.date,
-                checkIn: r.checkIn,
-                checkOut: r.checkOut,
-                checkInTime: r.checkInTime,
-                checkOutTime: r.checkOutTime,
-                workingMinutes: r.workingMinutes,
-                breakMinutes: r.breakMinutes,
-                effectiveMinutes: r.effectiveMinutes,
-                overtimeMinutes: r.overtimeMinutes,
-                hasOvertime: r.hasOvertime,
-                isLate: r.isLate,
-                isEarlyCheckout: r.isEarlyOut,
-                status: r.status,
-                shiftStart: SHIFT_START,
-                shiftEnd: SHIFT_END,
-                // Store full punch detail for timeline view
-                remarks: JSON.stringify({
-                    allPunches: r.allPunches,
-                    breaks: r.breaks,
-                    totalPunches: r.totalPunches,
-                    lateByMinutes: r.lateByMinutes,
-                }),
-            };
-
-            // ── THE FIX: upsert on biometricId + dateString ──
-            await Attendance.findOneAndUpdate(
-                { biometricId: r.empcode, dateString: r.date },
-                { $set: doc },
-                { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: false }
-            );
-            upserted++;
-        } catch (err) {
-            console.error(`[Biometric] Failed ${r.empcode} ${r.date}:`, err.message);
-            failed++;
+async function buildEmployeeMap(EmployeeModel, rawCodes = [], punchNameMap = {}) {
+    const employees = await EmployeeModel.find({
+        $or: [
+            { "workInfo.biometricId": { $exists: true, $ne: null, $ne: "" } },
+            { biometricId: { $exists: true, $ne: null, $ne: "" } },
+        ]
+    }).lean();
+    
+    const map = {};
+    const byNumericId = {};
+    
+    for (const emp of employees) {
+        const bioId = (emp.workInfo?.biometricId || emp.biometricId || "").trim();
+        if (!bioId) continue;
+        
+        const numericId = parseInt(bioId.replace(/\D/g, ""), 10);
+        if (!isNaN(numericId)) {
+            byNumericId[numericId] = emp;
         }
     }
-    return { upserted, failed };
-}
-
-// ── Main sync function ────────────────────────────────────────────────────────
-async function syncBiometricData(fromDate, toDate) {
-    if (isSyncing) { console.log("[Biometric] Already syncing, skipping"); return { skipped: true }; }
-
-    isSyncing = true;
-    const from = fromDate ? new Date(fromDate) : new Date();
-    const to = toDate ? new Date(toDate) : new Date();
-
-    console.log(`[Biometric] Sync start: ${toDateString(from)} → ${toDateString(to)}`);
-    try {
-        const raw = await fetchRawPunches(from, to);
-        const processed = processPunches(raw);
-        const result = await upsertRecords(processed);
-
-        lastSyncTime = new Date().toISOString();
-        lastSyncResult = {
-            success: true,
-            rawPunches: raw.length,
-            records: processed.length,
-            ...result,
-        };
-        console.log("[Biometric] Sync done:", lastSyncResult);
-        return lastSyncResult;
-    } catch (err) {
-        lastSyncResult = { success: false, error: err.message };
-        console.error("[Biometric] Sync failed:", err.message);
-        return lastSyncResult;
-    } finally {
-        isSyncing = false;
+    
+    for (const rawCode of rawCodes) {
+        const numericId = parseInt(rawCode.replace(/\D/g, ""), 10);
+        if (isNaN(numericId)) continue;
+        
+        const emp = byNumericId[numericId];
+        if (emp) {
+            const empName = `${emp.firstName || ""} ${emp.lastName || ""}`.trim() || emp.name || "Unknown";
+            const dept = (emp.department || emp.workInfo?.department || "").toLowerCase();
+            const prodDepts = ["production", "manufacturing", "factory", "cutting", "sewing", "finishing", "packing"];
+            const explicitType = (emp.workInfo?.employeeType || emp.employeeType || "").toLowerCase();
+            const employeeType = explicitType === "operator" || explicitType === "executive"
+                ? explicitType
+                : prodDepts.some(d => dept.includes(d)) ? "operator" : "executive";
+            
+            map[numericId] = {
+                _id: emp._id,
+                name: empName,
+                biometricId: rawCode.padStart(4, "0"),
+                numericId,
+                identityId: emp.workInfo?.identityId || bioId,
+                department: emp.department || emp.workInfo?.department || "—",
+                designation: emp.workInfo?.jobTitle || emp.designation || "—",
+                employeeType,
+                shiftCode: emp.workInfo?.shiftCode || null,
+            };
+        }
     }
+    
+    return map;
 }
 
-// ── Auto-sync: runs on startup + every N minutes ──────────────────────────────
-function startAutoSync() {
-    if (!BIO_USER || !BIO_PASS) {
-        console.warn("[Biometric] No credentials in .env — auto-sync disabled");
-        return;
+async function cleanupDuplicates(DailyAttendance, Employee) {
+    const grRecords = await DailyAttendance.find({ biometricId: /[a-zA-Z]/ }).lean();
+    if (!grRecords.length) return { removed: 0, message: "No GR-code ghost records found" };
+    const idsToRemove = [];
+    for (const rec of grRecords) {
+        if (rec.punchCount === 0 && !rec.hrFinalStatus) {
+            idsToRemove.push(rec._id);
+        }
     }
-
-    const runNow = async () => {
-        const today = new Date();
-        const yesterday = new Date(today);
-        yesterday.setDate(today.getDate() - 1);
-        await syncBiometricData(yesterday, today);
-    };
-
-    runNow().catch(console.error);
-    cronJob = cron.schedule(`*/${SYNC_INTERVAL} * * * *`, runNow, { timezone: "Asia/Kolkata" });
-    console.log(`[Biometric] Auto-sync scheduled every ${SYNC_INTERVAL}min`);
+    if (idsToRemove.length) {
+        const result = await DailyAttendance.deleteMany({ _id: { $in: idsToRemove } });
+        return { removed: result.deletedCount, totalGrRecords: grRecords.length, message: `Removed ${result.deletedCount} ghost GR-code records` };
+    }
+    return { removed: 0, totalGrRecords: grRecords.length, message: "No ghost records to remove" };
 }
 
-function stopAutoSync() {
-    if (cronJob) { cronJob.destroy(); cronJob = null; }
+function registerLinkRoutes(router, Employee, DailyAttendance, EmployeeAuthMiddlewear, syncService, deps) {
+    router.post("/link-employees", EmployeeAuthMiddlewear, async (req, res) => {
+        try {
+            const today = new Date().toISOString().split("T")[0];
+            const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0];
+            const punchData = await syncService.fetchPunchDetailData(weekAgo, today, "ALL");
+            const rows = punchData?.PunchData || [];
+            if (!rows.length) {
+                return res.status(400).json({ success: false, message: "No punch data from biometric API." });
+            }
+            const results = await autoLinkEmployees(Employee, rows);
+            if (req.body.autoApply !== false) {
+                const applied = await applyLinks(Employee, results.linked);
+                results.applied = applied;
+            }
+            res.json({ success: true, message: `Linked ${results.linked.length} employees`, data: results });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+    
+    router.get("/unlinked", EmployeeAuthMiddlewear, async (req, res) => {
+        try {
+            const employees = await Employee.find({ status: "active" }).lean();
+            const unlinked = employees.filter(emp => {
+                const bioId = (emp.workInfo?.biometricId || "").trim();
+                return !bioId || /[a-zA-Z]/.test(bioId);
+            }).map(emp => ({
+                _id: emp._id,
+                name: `${emp.firstName || ""} ${emp.lastName || ""}`.trim(),
+                identityId: emp.workInfo?.identityId || emp.workInfo?.biometricId || "",
+                department: emp.department || emp.workInfo?.department || "",
+                biometricId: emp.workInfo?.biometricId || "",
+            }));
+            res.json({ success: true, data: unlinked, count: unlinked.length });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+    
+    router.put("/link-employee/:id", EmployeeAuthMiddlewear, async (req, res) => {
+        try {
+            const { biometricDeviceCode } = req.body;
+            if (!biometricDeviceCode) return res.status(400).json({ success: false, message: "biometricDeviceCode required" });
+            const emp = await Employee.findById(req.params.id);
+            if (!emp) return res.status(404).json({ success: false, message: "Employee not found" });
+            const currentBioId = emp.workInfo?.biometricId || "";
+            if (/[a-zA-Z]/.test(currentBioId)) {
+                emp.workInfo.identityId = emp.workInfo.identityId || currentBioId;
+            }
+            emp.workInfo.biometricId = biometricDeviceCode.padStart(4, "0");
+            await emp.save();
+            res.json({ success: true, message: `Linked to biometric code ${emp.workInfo.biometricId}` });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+    
+    router.post("/cleanup-duplicates", EmployeeAuthMiddlewear, async (req, res) => {
+        try {
+            const result = await cleanupDuplicates(DailyAttendance, Employee);
+            res.json({ success: true, ...result });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
 }
 
-function getSyncStatus() {
-    return {
-        lastSyncTime,
-        lastSyncResult,
-        isSyncing,
-        syncIntervalMinutes: SYNC_INTERVAL,
-        credentialsConfigured: !!(BIO_USER && BIO_PASS),
-        shiftConfig: { SHIFT_START, SHIFT_END, LATE_THRESH, HALF_THRESH, EARLY_THRESH },
-    };
-}
-
-module.exports = { syncBiometricData, startAutoSync, stopAutoSync, getSyncStatus };
+module.exports = {
+    syncDateRange,
+    getStatus,
+    fetchPunchDetailData,
+    normalizeName,
+    nameSimilarity,
+    autoLinkEmployees,
+    applyLinks,
+    buildEmployeeMap,
+    cleanupDuplicates,
+    registerLinkRoutes,
+};

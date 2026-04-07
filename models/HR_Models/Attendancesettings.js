@@ -1,10 +1,14 @@
 /**
- * Attendancesettings.js (v2)
- * Singleton attendance config + Shift collection.
- * Added:
- *  - otGracePeriodMins (grace after shiftEnd before OT counts)
- *  - Holiday categories: "national" | "company" | "optional"
- *  - Full break type config (lunch + tea)
+ * Attendancesettings.js (v3) — GRAV Clothing
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Singleton attendance configuration + Shift collection.
+ *
+ * v3 Changes:
+ *  - executiveLateThresholdMinutes (45 mins grace for core employees)
+ *  - latePenalty config (4 lates = 1 half-day deduction)
+ *  - Leave entitlement defaults
+ *  - Sync schedule config
+ *  - Break type config (lunch + tea)
  */
 
 const mongoose = require("mongoose");
@@ -16,13 +20,13 @@ const shiftSchema = new mongoose.Schema(
         code: { type: String, required: true, uppercase: true, trim: true, maxlength: 6 },
         startTime: { type: String, default: "09:00" },
         endTime: { type: String, default: "18:30" },
-        breakMins: { type: Number, default: 60 },           // total standard break
-        lunchMins: { type: Number, default: 45 },           // lunch portion
-        teaMins: { type: Number, default: 15 },             // tea portion
-        workingDays: { type: [Number], default: [1, 2, 3, 4, 5, 6] },
+        breakMins: { type: Number, default: 60 },
+        lunchMins: { type: Number, default: 45 },
+        teaMins: { type: Number, default: 15 },
+        workingDays: { type: [Number], default: [1, 2, 3, 4, 5, 6] },  // Mon-Sat
         color: { type: String, default: "#8b5cf6" },
         isDefault: { type: Boolean, default: false },
-        otGracePeriodMins: { type: Number, default: 30 },   // grace before OT
+        otGracePeriodMins: { type: Number, default: 30 },
     },
     { timestamps: true }
 );
@@ -38,7 +42,7 @@ const holidaySchema = new mongoose.Schema(
             default: "company",
         },
         description: { type: String },
-        isRecurring: { type: Boolean, default: false },     // repeat every year
+        isRecurring: { type: Boolean, default: false },
     },
     { _id: true }
 );
@@ -46,36 +50,65 @@ const holidaySchema = new mongoose.Schema(
 // ── AttendanceSettings (singleton) ───────────────────────────────────────────
 const settingsSchema = new mongoose.Schema(
     {
-        // Default shift times (when employee has no shift assigned)
+        // ── Default shift times ──────────────────────────────────────────
         shiftStart: { type: String, default: "09:00" },
         shiftEnd: { type: String, default: "18:30" },
 
-        // Thresholds
+        // ── Late thresholds ──────────────────────────────────────────────
+        // Operators (production): late if arrival > shiftStart + this
         lateThresholdMinutes: { type: Number, default: 15 },
-        halfDayThresholdMinutes: { type: Number, default: 270 },  // 4.5 hrs net work = full day
-        earlyDepartureThresholdMinutes: { type: Number, default: 30 },
-        otGracePeriodMins: { type: Number, default: 30 },         // minutes after shiftEnd before OT starts
+        // Executives (core/office): late if arrival > shiftStart + this
+        executiveLateThresholdMinutes: { type: Number, default: 45 },
 
-        // Working days (0=Sun, 6=Sat)
+        // ── Half-day threshold ───────────────────────────────────────────
+        // Net work < this → marked as half day
+        halfDayThresholdMinutes: { type: Number, default: 270 },  // 4.5 hrs
+
+        // ── Early departure ──────────────────────────────────────────────
+        earlyDepartureThresholdMinutes: { type: Number, default: 30 },
+
+        // ── OT grace ─────────────────────────────────────────────────────
+        // Minutes after shiftEnd before OT starts counting
+        otGracePeriodMins: { type: Number, default: 30 },
+
+        // ── Working days (0=Sun, 6=Sat) ──────────────────────────────────
         workingDays: { type: [Number], default: [1, 2, 3, 4, 5, 6] },
 
-        // Break config
+        // ── Break config ─────────────────────────────────────────────────
         lunchBreakMins: { type: Number, default: 45 },
         teaBreakMins: { type: Number, default: 15 },
 
-        // Overtime
+        // ── Overtime ─────────────────────────────────────────────────────
         overtimeEnabled: { type: Boolean, default: true },
         overtimeMinimumMinutes: { type: Number, default: 30 },
-        overtimeMaxPerDay: { type: Number, default: 240 },
+        overtimeMaxPerDay: { type: Number, default: 240 },       // 4 hrs max
         overtimeRateMultiplier: { type: Number, default: 1.5 },
+        // OT only for operators — this is enforced in AttendanceEngine, not here
 
-        // Biometric
+        // ── Late penalty rule ────────────────────────────────────────────
+        // "4 lates in a month = 1 half-day deduction"
+        latePenalty: {
+            enabled: { type: Boolean, default: true },
+            lateCountThreshold: { type: Number, default: 4 },     // every N lates...
+            penaltyType: { type: String, enum: ["half_day", "full_day", "lwp"], default: "half_day" },
+            // penaltyValue: 0.5 for half_day, 1 for full_day
+        },
+
+        // ── Leave defaults ───────────────────────────────────────────────
+        leaveEntitlements: {
+            CL: { type: Number, default: 12 },   // Casual Leave per year
+            SL: { type: Number, default: 12 },   // Sick Leave per year
+            EL: { type: Number, default: 15 },   // Earned Leave per year
+        },
+
+        // ── Biometric sync ───────────────────────────────────────────────
         biometricSyncIntervalMinutes: { type: Number, default: 30 },
-        biometricAutoSync: { type: Boolean, default: false },      // no cron — on-demand only
+        biometricAutoSync: { type: Boolean, default: true },
 
-        // Holidays
+        // ── Holidays ─────────────────────────────────────────────────────
         holidays: { type: [holidaySchema], default: [] },
 
+        // ── Audit ────────────────────────────────────────────────────────
         updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
     },
     { timestamps: true }

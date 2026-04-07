@@ -1,21 +1,12 @@
 /**
- * Dailyattendance.js  –  v5  (GRAV Clothing)
- * ─────────────────────────────────────────────────────────────────────────────
- * WHAT CHANGED FROM v4:
- *  1. Added employeeType: "operator" | "executive"
- *     → operators: 6 punches + OT counted
- *     → executives: 2 punches, OT always 0
- *  2. Added systemPrediction (auto-computed) + hrFinalStatus (HR override)
- *     → effectiveStatus = hrFinalStatus ?? systemPrediction
- *  3. Added hrFinalised flag per day + per month summary support
- *  4. Removed old standalone `status` field — replaced by the two above
- *     (status field kept as virtual alias for backward compat)
- *  5. normalizeId stored so matching is traceable
- *
- * Punch sequence:
- *   Operator:  punch1=In  punch2=LunchOut  punch3=LunchIn
- *              punch4=TeaOut  punch5=TeaIn  punch6=FinalOut
- *   Executive: punch1=In  punch2=FinalOut
+ * Dailyattendance.js  –  v6  (GRAV Clothing)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * CHANGES FROM v5:
+ *  1. Aligned field naming with AttendanceEngine.js
+ *  2. Added executiveLateThresholdMins snapshot
+ *  3. Added latePenaltyApplied flag for monthly penalty tracking
+ *  4. Cleaner virtual definitions
+ *  5. Added syncHash for deduplication
  *
  * Status codes:
  *   P   – Present (on time)        P*  – Present (late)
@@ -29,7 +20,10 @@
 "use strict";
 const mongoose = require("mongoose");
 
-const STATUS_ENUM = ["P", "P*", "P~", "HD", "AB", "WO", "PH", "L-CL", "L-SL", "L-EL", "LWP", "MP", "WFH", "CO"];
+const STATUS_ENUM = [
+    "P", "P*", "P~", "HD", "AB", "WO", "PH",
+    "L-CL", "L-SL", "L-EL", "LWP", "MP", "WFH", "CO"
+];
 
 // ── Raw punch ────────────────────────────────────────────────────────────────
 const rawPunchSchema = new mongoose.Schema({
@@ -70,17 +64,15 @@ const missPunchRequestSchema = new mongoose.Schema({
 const dailyAttendanceSchema = new mongoose.Schema({
 
     // ── Identity ──────────────────────────────────────────────────────────
-    biometricId: { type: String, required: true, index: true },  // raw from device e.g. "0072"
-    numericId: { type: Number, index: true },                   // parseInt(biometricId) = 72 — THE MATCH KEY
-    identityId: { type: String },                                // HR code e.g. "GR072"
+    biometricId: { type: String, required: true, index: true },
+    numericId: { type: Number, index: true },
+    identityId: { type: String },
     employeeDbId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", index: true },
     employeeName: { type: String, default: "" },
     department: { type: String, default: "—" },
     designation: { type: String, default: "—" },
 
-    // ── Employee type — drives punch and OT policy ────────────────────────
-    // "operator"  → 6 punches, OT counted
-    // "executive" → 2 punches, OT always 0
+    // ── Employee type — drives punch model and OT policy ──────────────────
     employeeType: {
         type: String,
         enum: ["operator", "executive"],
@@ -89,8 +81,8 @@ const dailyAttendanceSchema = new mongoose.Schema({
 
     // ── Date ──────────────────────────────────────────────────────────────
     date: { type: Date, required: true },
-    dateStr: { type: String, required: true, index: true },  // "YYYY-MM-DD"
-    yearMonth: { type: String, required: true, index: true },  // "YYYY-MM"
+    dateStr: { type: String, required: true, index: true },
+    yearMonth: { type: String, required: true, index: true },
 
     // ── Shift snapshot ────────────────────────────────────────────────────
     shiftName: { type: String, default: "GEN" },
@@ -103,10 +95,10 @@ const dailyAttendanceSchema = new mongoose.Schema({
 
     // ── Named punch times ─────────────────────────────────────────────────
     inTime: { type: Date, default: null },
-    lunchOut: { type: Date, default: null },  // operators only
-    lunchIn: { type: Date, default: null },  // operators only
-    teaOut: { type: Date, default: null },  // operators only
-    teaIn: { type: Date, default: null },  // operators only
+    lunchOut: { type: Date, default: null },
+    lunchIn: { type: Date, default: null },
+    teaOut: { type: Date, default: null },
+    teaIn: { type: Date, default: null },
     finalOut: { type: Date, default: null },
 
     // ── Computed durations (minutes) ──────────────────────────────────────
@@ -115,7 +107,7 @@ const dailyAttendanceSchema = new mongoose.Schema({
     teaBreakMins: { type: Number, default: 0 },
     totalBreakMins: { type: Number, default: 0 },
     netWorkMins: { type: Number, default: 0 },
-    otMins: { type: Number, default: 0 },  // always 0 for executives
+    otMins: { type: Number, default: 0 },
 
     // ── Flags ─────────────────────────────────────────────────────────────
     lateMins: { type: Number, default: 0 },
@@ -125,12 +117,9 @@ const dailyAttendanceSchema = new mongoose.Schema({
     hasOT: { type: Boolean, default: false },
     hasMissPunch: { type: Boolean, default: false },
 
-    // ── TWO-TIER STATUS — this is the key change ──────────────────────────
-    // systemPrediction: auto-computed from punches, never touched by HR
-    // hrFinalStatus:    HR override — null until HR reviews
-    // effectiveStatus (virtual) = hrFinalStatus ?? systemPrediction
+    // ── TWO-TIER STATUS ───────────────────────────────────────────────────
     systemPrediction: { type: String, enum: STATUS_ENUM, default: "AB" },
-    hrFinalStatus: { type: String, enum: STATUS_ENUM, default: null },
+    hrFinalStatus: { type: String, enum: [...STATUS_ENUM, null], default: null },
     hrRemarks: { type: String, default: null },
     hrUpdatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
     hrUpdatedAt: { type: Date },
@@ -147,6 +136,9 @@ const dailyAttendanceSchema = new mongoose.Schema({
     // ── Miss punch requests ───────────────────────────────────────────────
     missPunchRequests: { type: [missPunchRequestSchema], default: [] },
 
+    // ── Late penalty tracking ─────────────────────────────────────────────
+    latePenaltyApplied: { type: Boolean, default: false },
+
     // ── eTimeOffice raw fields ────────────────────────────────────────────
     etimeRemark: { type: String, default: "" },
     etimeStatus: { type: String, default: "" },
@@ -155,15 +147,14 @@ const dailyAttendanceSchema = new mongoose.Schema({
     syncedAt: { type: Date, default: Date.now },
     syncSource: { type: String, default: "api" },
 
-}, { timestamps: true });
+}, { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } });
 
 // ── Virtual: effectiveStatus ─────────────────────────────────────────────────
-// This is what ALL reports, exports, and payroll must use
 dailyAttendanceSchema.virtual("effectiveStatus").get(function () {
     return this.hrFinalStatus ?? this.systemPrediction;
 });
 
-// ── Virtual: status (backward compat with old code) ──────────────────────────
+// ── Virtual: status (backward compat) ────────────────────────────────────────
 dailyAttendanceSchema.virtual("status").get(function () {
     return this.hrFinalStatus ?? this.systemPrediction;
 });
@@ -176,5 +167,6 @@ dailyAttendanceSchema.index({ dateStr: 1, department: 1 });
 dailyAttendanceSchema.index({ employeeDbId: 1, yearMonth: 1 });
 dailyAttendanceSchema.index({ yearMonth: 1, systemPrediction: 1 });
 dailyAttendanceSchema.index({ yearMonth: 1, hrFinalStatus: 1 });
+dailyAttendanceSchema.index({ dateStr: 1, employeeType: 1, isLate: 1 });
 
 module.exports = mongoose.model("DailyAttendance", dailyAttendanceSchema);
