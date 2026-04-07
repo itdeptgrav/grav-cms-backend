@@ -1,4 +1,4 @@
-// routes/customer/employees.js
+// routes/customer/Employee_Mpc.js
 
 const express = require('express');
 const router = express.Router();
@@ -169,7 +169,7 @@ router.post("/by-uins", async (req, res) => {
     const upperUins = uins.map(u => u.toString().toUpperCase());
  
     const employees = await EmployeeMpc.find({ uin: { $in: upperUins } })
-      .select("uin department designation name")
+      .select("uin department designation name gender")
       .lean();
  
     return res.json({
@@ -177,6 +177,7 @@ router.post("/by-uins", async (req, res) => {
       employees: employees.map(e => ({
         uin:         e.uin,
         name:        e.name,
+        gender:      e.gender      || "",
         department:  e.department  || "",
         designation: e.designation || "",
       }))
