@@ -76,10 +76,23 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, re
     if (!name || !email || !mobile || !city || !department) {
       return res.status(400).json({ error: "All fields required." });
     }
+
+    // ── CHECK: email must not already exist in Firebase Auth ────────────────
+    try {
+      await auth.getUserByEmail(email.trim().toLowerCase());
+      // If we reach here → user exists → reject
+      return res.status(400).json({
+        error: "This email address is already in use. Please use a different email.",
+      });
+    } catch (authErr) {
+      // auth/user-not-found = email is free → continue
+      if (authErr.code !== "auth/user-not-found") throw authErr;
+    }
+
     const resolvedRole = empRole === "tl" ? "tl" : "employee";
     const result = await svc.createCoworkEmployee({ name, email, mobile, city, department, role: resolvedRole });
 
-    // Send welcome email with credentials (non-blocking)
+    // Send welcome email (non-blocking)
     sendWelcomeEmail(
       { name, email, employeeId: result.employeeId, role: resolvedRole, department },
       result.tempPassword
@@ -91,7 +104,15 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, re
       tempPassword: result.tempPassword,
       role: resolvedRole,
     });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) {
+    // Firebase also throws this if race condition hits after our check
+    if (e.code === "auth/email-already-exists") {
+      return res.status(400).json({
+        error: "This email address is already in use. Please use a different email.",
+      });
+    }
+    res.status(400).json({ error: e.message });
+  }
 });
 
 router.get("/employee/list", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
