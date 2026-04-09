@@ -187,11 +187,22 @@ async function createCoworkGroup({ name, description, memberIds, createdBy, crea
 }
 
 async function deleteCoworkGroup(groupId, requestingEmployeeId) {
-  const doc = await db.collection("cowork_groups").doc(groupId).get();
-  if (!doc.exists) throw new Error("Group not found.");
-  if (doc.data().createdBy !== requestingEmployeeId) throw new Error("Only creator can delete.");
+  const docRef = db.collection("cowork_groups").doc(groupId);
+  const docSnap = await docRef.get();
+  if (!docSnap.exists) throw new Error("Group not found.");
 
-  await db.collection("cowork_groups").doc(groupId).update({ deleted: true });
+  // CEO (E000) can delete ANY group. Creators can delete their own groups.
+  const isCeo = requestingEmployeeId === "E000";
+  if (!isCeo) {
+    // Also check Firestore role in case CEO has a different ID
+    const empSnap = await db.collection("cowork_employees").doc(requestingEmployeeId).get();
+    const empRole = empSnap.exists ? empSnap.data().role : null;
+    if (empRole !== "ceo" && docSnap.data().createdBy !== requestingEmployeeId) {
+      throw new Error("Only the group creator or CEO can delete this group.");
+    }
+  }
+
+  await docRef.update({ deleted: true, deletedAt: admin.firestore.FieldValue.serverTimestamp() });
   await rtdb.ref(`cowork/groups/${groupId}`).update({ deleted: true, deletedAt: new Date().toISOString() });
 }
 
