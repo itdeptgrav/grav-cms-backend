@@ -1,97 +1,151 @@
+// googleDrivePatternUpload.js
 const { google } = require("googleapis");
 const stream = require("stream");
 
-// ── Auth (OAuth2) ────────────────────────────────────────────────
+// ── Auth (Service Account) ───────────────────────────────────────
 let _driveClient = null;
-let _oauth2Client = null;
-
-function getOAuth2Client() {
-  if (_oauth2Client) return _oauth2Client;
-
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
-  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
-
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error(
-      "Google Drive OAuth2 not configured. " +
-      "Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, and GOOGLE_REFRESH_TOKEN in .env"
-    );
-  }
-
-  _oauth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-  _oauth2Client.setCredentials({ refresh_token: refreshToken });
-
-  return _oauth2Client;
-}
 
 function getDriveClient() {
   if (_driveClient) return _driveClient;
-  const auth = getOAuth2Client();
+
+  const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!keyJson) {
+    throw new Error(
+      "Google Drive not configured. Set GOOGLE_SERVICE_ACCOUNT_KEY in .env"
+    );
+  }
+
+  const key = JSON.parse(keyJson);
+
+  const auth = new google.auth.GoogleAuth({
+    credentials: key,
+    scopes: ["https://www.googleapis.com/auth/drive"],
+  });
+
   _driveClient = google.drive({ version: "v3", auth });
   return _driveClient;
 }
 
+// ── Folder cache + mutex ─────────────────────────────────────────
+// Prevents race conditions where multiple simultaneous uploads all
+// create "GRAV Patterns" before any of them finish — resulting in
+// 6+ duplicate folders.
+//
+// Key = "parentId::folderName"  →  Value = folderId (string)
+// While a folder is being created, we store a Promise so other callers
+// await the same creation instead of starting their own.
+
+const _folderCache = new Map();   // key → folderId (resolved)
+const _folderLocks = new Map();   // key → Promise<folderId> (in-flight)
+
+function folderCacheKey(name, parentId) {
+  return `${parentId || "root"}::${name}`;
+}
+
 // ── Folder helpers ───────────────────────────────────────────────
+// Escape single quotes in Drive query strings (name field uses single-quote delimiters)
+function escQ(str) {
+  return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
 async function findOrCreateFolder(drive, name, parentId) {
-  const q = parentId
-    ? `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
-    : `name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const cacheKey = folderCacheKey(name, parentId);
 
-  const list = await drive.files.list({
-    q,
-    fields: "files(id, name)",
-    spaces: "drive",
-    pageSize: 1,
-  });
-
-  if (list.data.files.length > 0) {
-    return list.data.files[0].id;
+  // 1. Already resolved — return immediately
+  if (_folderCache.has(cacheKey)) {
+    return _folderCache.get(cacheKey);
   }
 
-  const meta = {
-    name,
-    mimeType: "application/vnd.google-apps.folder",
-  };
-  if (parentId) meta.parents = [parentId];
-
-  const folder = await drive.files.create({
-    resource: meta,
-    fields: "id",
-  });
-
-  try {
-    await drive.permissions.create({
-      fileId: folder.data.id,
-      resource: { role: "reader", type: "anyone" },
-    });
-  } catch (e) {
-    console.warn("Could not set folder permissions:", e.message);
+  // 2. Another call is already creating this folder — wait for it
+  if (_folderLocks.has(cacheKey)) {
+    return _folderLocks.get(cacheKey);
   }
 
-  return folder.data.id;
+  // 3. We are the first — create a promise that others can await
+  const promise = (async () => {
+    try {
+      const escaped = escQ(name);
+      const q = parentId
+        ? `name='${escaped}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
+        : `name='${escaped}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+
+      const list = await drive.files.list({
+        q,
+        fields: "files(id, name)",
+        spaces: "drive",
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        pageSize: 1,
+      });
+
+      if (list.data.files.length > 0) {
+        const id = list.data.files[0].id;
+        _folderCache.set(cacheKey, id);
+        return id;
+      }
+
+      // Create the folder
+      const meta = {
+        name,
+        mimeType: "application/vnd.google-apps.folder",
+      };
+      if (parentId) meta.parents = [parentId];
+
+      const folder = await drive.files.create({
+        resource: meta,
+        fields: "id",
+        supportsAllDrives: true,
+      });
+
+      const folderId = folder.data.id;
+
+      // Make folder publicly readable so SVG URLs work in the browser
+      try {
+        await drive.permissions.create({
+          fileId: folderId,
+          supportsAllDrives: true,
+          resource: { role: "reader", type: "anyone" },
+        });
+      } catch (e) {
+        console.warn("Could not set folder permissions:", e.message);
+      }
+
+      _folderCache.set(cacheKey, folderId);
+      return folderId;
+    } finally {
+      // Release lock whether we succeeded or failed
+      _folderLocks.delete(cacheKey);
+    }
+  })();
+
+  _folderLocks.set(cacheKey, promise);
+  return promise;
 }
 
 // ── Upload ───────────────────────────────────────────────────────
 async function uploadPatternToDrive(fileBuffer, originalFilename, mimeType, stockItemId, sizeName, stockItemName) {
   const drive = getDriveClient();
 
-  const configuredParent = process.env.GOOGLE_DRIVE_PARENT_FOLDER_ID || null;
-  const parentFolderId = await findOrCreateFolder(drive, "GRAV Patterns", configuredParent);
+  // Folder structure: [GOOGLE_DRIVE_FOLDER_ID] / GRAV Patterns / <Product Name (id)> / <size>.svg
+  const configuredParent = process.env.GOOGLE_DRIVE_FOLDER_ID || null;
+  const gravFolderId = await findOrCreateFolder(drive, "GRAV Patterns", configuredParent);
 
-  const folderName = stockItemName
+  const productFolderName = stockItemName
     ? `${stockItemName} (${stockItemId.slice(-6)})`
     : stockItemId;
-  const stockFolderId = await findOrCreateFolder(drive, folderName, parentFolderId);
+  const productFolderId = await findOrCreateFolder(drive, productFolderName, gravFolderId);
 
   const ext = originalFilename.match(/\.(svg|ai|eps)$/i)?.[0] || ".svg";
   const driveFilename = `${sizeName}${ext}`;
 
-  const existingQ = `name='${driveFilename}' and '${stockFolderId}' in parents and trashed=false`;
+  // Check if file already exists (update instead of duplicate)
+  const escapedFilename = escQ(driveFilename);
+  const existingQ = `name='${escapedFilename}' and '${productFolderId}' in parents and trashed=false`;
   const existing = await drive.files.list({
     q: existingQ,
     fields: "files(id)",
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
     pageSize: 1,
   });
 
@@ -104,6 +158,7 @@ async function uploadPatternToDrive(fileBuffer, originalFilename, mimeType, stoc
     fileId = existing.data.files[0].id;
     await drive.files.update({
       fileId,
+      supportsAllDrives: true,
       media: {
         mimeType: mimeType || "image/svg+xml",
         body: bufferStream,
@@ -113,20 +168,23 @@ async function uploadPatternToDrive(fileBuffer, originalFilename, mimeType, stoc
     const res = await drive.files.create({
       resource: {
         name: driveFilename,
-        parents: [stockFolderId],
+        parents: [productFolderId],
       },
       media: {
         mimeType: mimeType || "image/svg+xml",
         body: bufferStream,
       },
       fields: "id",
+      supportsAllDrives: true,
     });
 
     fileId = res.data.id;
 
+    // Make file publicly readable
     try {
       await drive.permissions.create({
         fileId,
+        supportsAllDrives: true,
         resource: { role: "reader", type: "anyone" },
       });
     } catch (e) {
@@ -134,11 +192,7 @@ async function uploadPatternToDrive(fileBuffer, originalFilename, mimeType, stoc
     }
   }
 
-  // Use Google Drive API's webContentLink for direct download.
-  // The alt=media URL works with the API auth but the simpler approach
-  // for public files is the export URL with confirm parameter.
   const directUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-  // Also build the API-based content URL for server-side fetching
   const apiContentUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
 
   return {
@@ -152,12 +206,10 @@ async function uploadPatternToDrive(fileBuffer, originalFilename, mimeType, stoc
 }
 
 // ── Fetch file content from Drive (server-side) ──────────────────
-// Used when basePaths aren't saved yet and we need to get the SVG content
-// on the backend to parse and return to the cutting master.
 async function fetchFileContentFromDrive(fileId) {
   const drive = getDriveClient();
   const res = await drive.files.get(
-    { fileId, alt: "media" },
+    { fileId, alt: "media", supportsAllDrives: true },
     { responseType: "text" }
   );
   return res.data;
@@ -166,7 +218,13 @@ async function fetchFileContentFromDrive(fileId) {
 // ── Delete ───────────────────────────────────────────────────────
 async function deletePatternFromDrive(fileId) {
   const drive = getDriveClient();
-  await drive.files.delete({ fileId });
+  await drive.files.delete({ fileId, supportsAllDrives: true });
+}
+
+// ── Clear folder cache (useful after deletions or during tests) ──
+function clearFolderCache() {
+  _folderCache.clear();
+  _folderLocks.clear();
 }
 
 // ── Test ─────────────────────────────────────────────────────────
@@ -177,13 +235,10 @@ async function testDriveConnection() {
     return { ok: true, email: res.data.user?.emailAddress || "connected" };
   } catch (err) {
     const msg = err.message || "";
-    if (msg.includes("invalid_grant")) {
+    if (msg.includes("invalid_grant") || msg.includes("JWT")) {
       throw new Error(
-        "Refresh token expired. Re-authorize at https://developers.google.com/oauthplayground and update GOOGLE_REFRESH_TOKEN"
+        "Service account auth failed. Check GOOGLE_SERVICE_ACCOUNT_KEY in .env"
       );
-    }
-    if (msg.includes("invalid_client")) {
-      throw new Error("GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET is wrong");
     }
     throw err;
   }
@@ -195,4 +250,5 @@ module.exports = {
   fetchFileContentFromDrive,
   testDriveConnection,
   getDriveClient,
+  clearFolderCache,
 };

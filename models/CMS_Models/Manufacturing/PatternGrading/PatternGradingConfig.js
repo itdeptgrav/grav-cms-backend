@@ -149,7 +149,20 @@ const measureGroupSchema = new mongoose.Schema(
     ruleProfile: ruleProfileSchema,
     nestedConditions: { type: [nestedConditionSchema], default: [] },
     loosingEnabled: { type: Boolean, default: false },
-    loosingValueInches: { type: Number, default: 0, min: 0, max: 20 },
+    loosingValueInches: { type: Number, default: 0, min: -20, max: 20 },
+    // Which side of the measurement gets the ease/loosing translation.
+    // "ref1"  → only the ref1-side anchor moves outward (or inward if value is negative)
+    // "ref2"  → only the ref2-side anchor moves
+    // "both"  → legacy behavior: loosing is added to the keyframe target so both sides scale
+    loosingSide: { type: String, enum: ["ref1", "ref2", "both"], default: "both" },
+    // ── Per-side loosing (preferred over the legacy single-value model) ────
+    // These let the designer add/remove ease on each side independently and
+    // simultaneously: e.g. +0.5" on ref1 and -0.3" on ref2 in the same group.
+    // When either is non-zero, the grading core applies a directional
+    // translation to that ref's anchor (and bezier handles) in addition to
+    // the normal keyframe interpolation. Negative values pull inward.
+    loosingValueRef1Inches: { type: Number, default: 0, min: -20, max: 20 },
+    loosingValueRef2Inches: { type: Number, default: 0, min: -20, max: 20 },
     conditionsFollowLoosing: { type: Boolean, default: false },
     // Keyframes stored INSIDE each group (new concept)
     keyframes: { type: [keyframeSchema], default: [] },
@@ -165,6 +178,8 @@ const seamEdgeSchema = new mongoose.Schema(
     pathIdx: { type: Number, required: true },
     fromSegIdx: { type: Number, required: true },
     toSegIdx: { type: Number, required: true },
+    toPathIdx: { type: Number, default: null },
+    fullPath: { type: Boolean, default: false },
     width: { type: Number, required: true, default: 0.5, min: 0.0625, max: 10 },
     visible: { type: Boolean, default: true },
     outwardSign: { type: Number, default: 1 },
