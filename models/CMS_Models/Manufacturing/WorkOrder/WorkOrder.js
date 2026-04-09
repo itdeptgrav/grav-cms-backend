@@ -205,6 +205,7 @@ const timelineSchema = new mongoose.Schema({
 // NEW: Production Completion Tracking Schema
 const operationCompletionSchema = new mongoose.Schema(
   {
+<<<<<<< HEAD
     operationNumber: {
       type: Number,
       required: true,
@@ -232,6 +233,15 @@ const operationCompletionSchema = new mongoose.Schema(
       min: 0,
       max: 100,
     },
+=======
+    operationNumber:      { type: Number, required: true },
+    operationType:        { type: String, trim: true },
+    operationCode:        { type: String, trim: true, default: "" },
+    completedQuantity:    { type: Number, default: 0, min: 0 },
+    completedUnitNumbers: [{ type: Number }],
+    totalQuantity:        { type: Number, required: true },
+    completionPercentage: { type: Number, default: 0, min: 0, max: 100 },
+>>>>>>> origin/main
     status: {
       type: String,
       enum: ["pending", "in_progress", "completed"],

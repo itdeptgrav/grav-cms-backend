@@ -21,23 +21,18 @@ const employeeMpcSchema = new mongoose.Schema({
   customerId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Customer",
-    required: true,
     index: true
   },
 
   name: {
     type: String,
-    required: true,
     trim: true
   },
 
   uin: {
     type: String,
-    required: true,
-    unique: true,
     trim: true,
     uppercase: true,
-    index: true
   },
 
   gender: {
@@ -81,7 +76,10 @@ const employeeMpcSchema = new mongoose.Schema({
 // Index for better query performance
 employeeMpcSchema.index({ customerId: 1, status: 1 });
 employeeMpcSchema.index({ customerId: 1, createdAt: -1 });
+<<<<<<< HEAD
 employeeMpcSchema.index({ customerId: 1, "products.productId": 1 });
 employeeMpcSchema.index({ customerId: 1, uin: 1 }, { unique: true });
+=======
+>>>>>>> origin/main
 
 module.exports = mongoose.model("EmployeeMpc", employeeMpcSchema);
