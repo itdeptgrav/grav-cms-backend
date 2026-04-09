@@ -203,7 +203,6 @@ const transcriptModule = require("./routes/task_routes/transcript.routes");
 app.use("/cowork", transcriptModule.router);
 
 
-
 // ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
   try {
@@ -464,9 +463,6 @@ app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 const BarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/barcodeRoutes.js");
 app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 
-const ProductionTracking = require("./models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking.js");
-app.use("/api/cms/production/tracking", ProductionTracking);
-
 // In your main server.js or app.js
 const workOrderProgressRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes");
 app.use(
@@ -586,18 +582,20 @@ app.use("/api/vendor", vendorAuthRoutes);
 const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
 app.use("/api/barcode-devices", barcodeScannerRoutes);
 
+
+
 app.use("/cowork", require("./routes/task_routes/taskForward.js"));
 // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
 app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
-
 
 // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
 app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
 
 //new tree substack routes
-app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
+const taskTreeModule = require("./routes/task_routes/taskTree.routes.js");
+app.use("/cowork", taskTreeModule); // ✅ Fix: use .router
 
-const coworkRoutes = require("./routes//task_routes/cowork");
+const coworkRoutes = require("./routes/task_routes/cowork");
 app.use("/cowork", coworkRoutes);
 
 app.use("/cowork", require("./routes/task_routes/livekit.routes"));
@@ -605,7 +603,11 @@ app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
 
 app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
-app.use("/cowork", require("./routes/task_routes/askAI.routes"));
+
+// Fix: askAI.routes exports an object, use .router
+const askAITest = require("./routes/task_routes/askAI.routes");
+console.log('askAI.routes exports:', Object.keys(askAITest));
+app.use("/cowork", askAITest);
 
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
@@ -617,6 +619,7 @@ app.use('/api/customer/employees/cross-org', crossOrgRoutes);
    Used by ESP32 firmware — keep socket.io wired up here directly.
    ===================================================================== */
 
+const ProductionTracking = require("./models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
 const Employee = require("./models/Employee");
 const Machine = require("./models/CMS_Models/Inventory/Configurations/Machine");
 const WorkOrder = require("./models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
@@ -1140,9 +1143,22 @@ app.get("/api/health", (req, res) => {
   res.status(200).json({
     success: true,
     message: "Backend server is running 🚀",
-    database:
-      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+    database: mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+    productionSync: {
+      enabled: true,
+      syncInterval: "Every 20 minutes",
+      cleanupSchedule: "Daily at 2 AM",
+    },
     timestamp: new Date().toISOString(),
+  });
+});
+
+// Simple health check for socket
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    socket: "running",
+    connections: io.engine.clientsCount
   });
 });
 
@@ -1155,6 +1171,7 @@ app.get("/", (req, res) => {
     message: "Welcome to GRAV Clothing Backend API",
     version: "1.0.0",
     departments: ["HR", "Project Management", "Sales"],
+    socketio: "enabled",
   });
 });
 
@@ -1164,89 +1181,19 @@ app.get("/", (req, res) => {
 app.post("/api/cms/production/sync/manual", async (req, res) => {
   try {
     await productionSyncService.manualSync();
-    res.json({
-      success: true,
-      message: "Manual sync completed successfully",
-    });
+    res.json({ success: true, message: "Manual sync completed successfully" });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error during manual sync",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Error during manual sync", error: error.message });
   }
 });
-
-const accountantDashboardRoutes = require("./routes/Accountant_Routes/dashboard");
-app.use("/api/accountant/dashboard", accountantDashboardRoutes);
-
-// Accountant Expense Management
-const accountantExpenseRoutes = require("./routes/Accountant_Routes/expenses");
-app.use("/api/accountant/expenses", accountantExpenseRoutes);
-
-// Accountant Invoice Management
-const accountantInvoiceRoutes = require("./routes/Accountant_Routes/invoices");
-app.use("/api/accountant/invoices", accountantInvoiceRoutes);
-
-// Accountant Payroll View
-const accountantPayrollRoutes = require("./routes/Accountant_Routes/payroll");
-app.use("/api/accountant/payroll", accountantPayrollRoutes);
-
-// Accountant Tax Filings
-const accountantTaxRoutes = require("./routes/Accountant_Routes/taxFilings");
-app.use("/api/accountant/tax", accountantTaxRoutes);
-
-// Accountant Bank Transactions
-const accountantBankRoutes = require("./routes/Accountant_Routes/bankTransactions");
-app.use("/api/accountant/bank", accountantBankRoutes);
-
-// Accountant Budgets
-const accountantBudgetRoutes = require("./routes/Accountant_Routes/budgets");
-app.use("/api/accountant/budgets", accountantBudgetRoutes);
-
-// Accountant Journal Entries
-const accountantJournalRoutes = require("./routes/Accountant_Routes/journalEntries");
-app.use("/api/accountant/journal", accountantJournalRoutes);
-
-// Accountant Reports
-const accountantReportRoutes = require("./routes/Accountant_Routes/reports");
-app.use("/api/accountant/reports", accountantReportRoutes);
-
-// Accountant Settings
-const accountantSettingsRoutes = require("./routes/Accountant_Routes/settings");
-app.use("/api/accountant/settings", accountantSettingsRoutes);
-
 
 app.post("/api/cms/production/cleanup/manual", async (req, res) => {
   try {
     await productionSyncService.manualCleanup();
-    res.json({
-      success: true,
-      message: "Manual cleanup completed successfully",
-    });
+    res.json({ success: true, message: "Manual cleanup completed successfully" });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error during manual cleanup",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Error during manual cleanup", error: error.message });
   }
-});
-
-// Health check with sync service status
-app.get("/api/health", (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "Backend server is running 🚀",
-    database:
-      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
-    productionSync: {
-      enabled: true,
-      syncInterval: "Every 20 minutes",
-      cleanupSchedule: "Daily at 2 AM",
-    },
-    timestamp: new Date().toISOString(),
-  });
 });
 
 // Graceful shutdown
@@ -1254,18 +1201,13 @@ let isShuttingDown = false;
 
 const gracefulShutdown = (signal) => {
   if (isShuttingDown) return;
-
   isShuttingDown = true;
   console.log(`\n🛑 ${signal} received, starting graceful shutdown...`);
 
-  // Stop production sync service
   productionSyncService.stop();
 
-  // Close server
   server.close(() => {
     console.log("✅ HTTP server closed");
-
-    // Close MongoDB connection
     mongoose.connection.close(false, () => {
       console.log("✅ MongoDB connection closed");
       console.log("👋 Shutdown complete");
@@ -1273,7 +1215,6 @@ const gracefulShutdown = (signal) => {
     });
   });
 
-  // Force shutdown after 10 seconds
   setTimeout(() => {
     console.error("⚠️  Forcing shutdown after timeout");
     process.exit(1);
@@ -1288,6 +1229,7 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
   console.log(`✅ WebSocket server is ready`);
+  console.log(`✅ Socket.IO connections available at ws://localhost:${PORT}`);
   console.log(`✅ Production sync service is active`);
   console.log(`Server running on port ${PORT}`);
   transcriptModule.startCron();
