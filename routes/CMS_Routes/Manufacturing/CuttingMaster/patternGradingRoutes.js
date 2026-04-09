@@ -112,7 +112,10 @@ function normaliseGroup(g) {
     gradingMode: g.gradingMode || (g.ruleProfile?.enabled ? "rule" : "keyframe"),
     ruleProfile: g.ruleProfile || null,
     loosingEnabled: Boolean(g.loosingEnabled),
-    loosingValueInches: Math.max(0, Number(g.loosingValueInches) || 0),
+    loosingValueInches: Number(g.loosingValueInches) || 0,
+    loosingSide: ["ref1", "ref2", "both"].includes(g.loosingSide) ? g.loosingSide : "both",
+    loosingValueRef1Inches: Number(g.loosingValueRef1Inches) || 0,
+    loosingValueRef2Inches: Number(g.loosingValueRef2Inches) || 0,
     conditionsFollowLoosing: Boolean(g.conditionsFollowLoosing),
     nestedConditions: (g.nestedConditions || []).map(normaliseCondition),
     keyframes: (g.keyframes || []).map(normaliseKeyframe),
@@ -341,45 +344,53 @@ router.post("/pattern-grading/stock-item/:stockItemId/designated-group", async (
 router.post("/pattern-grading/stock-item/:stockItemId/size-pattern", async (req, res) => {
   try {
     const { stockItemId } = req.params;
-    const { sizeName, sizeValue, svgFileUrl, svgPublicId, originalFilename, bytes, baseMeasurements } = req.body;
+    const { sizeName, sizeValue, svgFileUrl, svgPublicId, originalFilename, bytes, baseMeasurements, unitsPerInch } = req.body;
 
     if (!sizeName || !sizeValue || !svgFileUrl)
       return res.status(400).json({ success: false, message: "sizeName, sizeValue, and svgFileUrl are required" });
 
-    let config = await PatternGradingConfig.findOne({ stockItemId, isActive: true });
-    if (!config) {
-      const stockItem = await StockItem.findById(stockItemId).select("name reference").lean();
-      config = new PatternGradingConfig({
-        stockItemId,
-        stockItemName: stockItem?.name,
-        stockItemReference: stockItem?.reference,
-        isActive: true,
-        sizePatterns: [],
-      });
-    }
+    const doc = await saveWithRetry(
+      async () => {
+        let config = await PatternGradingConfig.findOne({ stockItemId, isActive: true });
+        if (!config) {
+          const stockItem = await StockItem.findById(stockItemId).select("name reference").lean();
+          config = new PatternGradingConfig({
+            stockItemId,
+            stockItemName: stockItem?.name,
+            stockItemReference: stockItem?.reference,
+            isActive: true,
+            sizePatterns: [],
+          });
+        }
+        return config;
+      },
+      (config) => {
+        const existingIndex = config.sizePatterns.findIndex((p) => p.sizeName === sizeName);
+        const sizePattern = {
+          sizeName,
+          sizeValue,
+          svgFileUrl,
+          svgPublicId,
+          originalFilename,
+          bytes,
+          baseMeasurements: baseMeasurements || {},
+          unitsPerInch: (unitsPerInch && Number.isFinite(Number(unitsPerInch)) && Number(unitsPerInch) > 0) ? Number(unitsPerInch) : 25.4,
+          keyframeGroups: existingIndex >= 0 ? (config.sizePatterns[existingIndex].keyframeGroups || []) : [],
+          seamEdges: existingIndex >= 0 ? (config.sizePatterns[existingIndex].seamEdges || []) : [],
+          foldAxes: existingIndex >= 0 ? (config.sizePatterns[existingIndex].foldAxes || []) : [],
+        };
 
-    const existingIndex = config.sizePatterns.findIndex((p) => p.sizeName === sizeName);
-    const sizePattern = {
-      sizeName,
-      sizeValue,
-      svgFileUrl,
-      svgPublicId,
-      originalFilename,
-      bytes,
-      baseMeasurements: baseMeasurements || {},
-      keyframeGroups: existingIndex >= 0 ? (config.sizePatterns[existingIndex].keyframeGroups || []) : [],
-      seamEdges: existingIndex >= 0 ? (config.sizePatterns[existingIndex].seamEdges || []) : [],
-      foldAxes: existingIndex >= 0 ? (config.sizePatterns[existingIndex].foldAxes || []) : [],
-    };
+        if (existingIndex >= 0) {
+          config.sizePatterns[existingIndex] = sizePattern;
+        } else {
+          config.sizePatterns.push(sizePattern);
+        }
+        config.markModified("sizePatterns");
+      },
+      5
+    );
 
-    if (existingIndex >= 0) {
-      config.sizePatterns[existingIndex] = sizePattern;
-    } else {
-      config.sizePatterns.push(sizePattern);
-    }
-    config.markModified("sizePatterns");
-    await config.save();
-
+    const sizePattern = doc.sizePatterns.find((p) => p.sizeName === sizeName);
     res.json({ success: true, message: `Size pattern ${sizeName} saved successfully`, sizePattern });
   } catch (error) {
     console.error("Error saving size pattern:", error);
@@ -391,16 +402,22 @@ router.post("/pattern-grading/stock-item/:stockItemId/size-pattern", async (req,
 router.delete("/pattern-grading/stock-item/:stockItemId/size-pattern/:sizeName", async (req, res) => {
   try {
     const { stockItemId, sizeName } = req.params;
-    const config = await PatternGradingConfig.findOne({ stockItemId, isActive: true });
-    if (!config) return res.status(404).json({ success: false, message: "No pattern config found" });
 
-    config.sizePatterns = config.sizePatterns.filter((p) => p.sizeName !== sizeName);
-    config.markModified("sizePatterns");
-    await config.save();
+    await saveWithRetry(
+      () => PatternGradingConfig.findOne({ stockItemId, isActive: true }),
+      (config) => {
+        if (!config) throw Object.assign(new Error("No pattern config found"), { statusCode: 404 });
+        config.sizePatterns = config.sizePatterns.filter((p) => p.sizeName !== sizeName);
+        config.markModified("sizePatterns");
+      },
+      5
+    );
+
     res.json({ success: true, message: `Size pattern ${sizeName} deleted` });
   } catch (error) {
     console.error("Error deleting size pattern:", error);
-    res.status(500).json({ success: false, message: error.message });
+    const status = error.statusCode || 500;
+    res.status(status).json({ success: false, message: error.message });
   }
 });
 
@@ -469,20 +486,24 @@ router.put("/pattern-grading/stock-item/:stockItemId/size-pattern/:sizeName", as
     const { stockItemId, sizeName } = req.params;
     const { baseMeasurements } = req.body;
 
-    const config = await PatternGradingConfig.findOne({ stockItemId, isActive: true });
-    if (!config) return res.status(404).json({ success: false, message: "Pattern config not found" });
+    const doc = await saveWithRetry(
+      () => PatternGradingConfig.findOne({ stockItemId, isActive: true }),
+      (config) => {
+        if (!config) throw Object.assign(new Error("Pattern config not found"), { statusCode: 404 });
+        const sizePattern = config.sizePatterns.find((p) => p.sizeName === sizeName);
+        if (!sizePattern) throw Object.assign(new Error("Size pattern not found"), { statusCode: 404 });
+        sizePattern.baseMeasurements = baseMeasurements || {};
+        config.markModified("sizePatterns");
+      },
+      5
+    );
 
-    const sizePattern = config.sizePatterns.find((p) => p.sizeName === sizeName);
-    if (!sizePattern) return res.status(404).json({ success: false, message: "Size pattern not found" });
-
-    sizePattern.baseMeasurements = baseMeasurements || {};
-    config.markModified("sizePatterns");
-    await config.save();
-
+    const sizePattern = doc.sizePatterns.find((p) => p.sizeName === sizeName);
     res.json({ success: true, message: `Measurements updated for ${sizeName}`, sizePattern });
   } catch (error) {
     console.error("Error updating size pattern measurements:", error);
-    res.status(500).json({ success: false, message: error.message });
+    const status = error.statusCode || 500;
+    res.status(status).json({ success: false, message: error.message });
   }
 });
 
@@ -554,7 +575,7 @@ router.post(
       const {
         keyframes, groupName, partKey, multiplier, ref1, ref2, color, ruleProfile,
         assignedSize, baseFullInches, targetFullInches, measurementOffset, gradingMode,
-        loosingEnabled, loosingValueInches, conditionsFollowLoosing, nestedConditions,
+        loosingEnabled, loosingValueInches, loosingSide, loosingValueRef1Inches, loosingValueRef2Inches, conditionsFollowLoosing, nestedConditions,
       } = req.body;
 
       let retries = 0;
@@ -576,7 +597,7 @@ router.post(
             const newGroup = normaliseGroup({
               groupId, groupName, partKey, multiplier, ref1, ref2, color, ruleProfile,
               assignedSize, baseFullInches, targetFullInches, measurementOffset, gradingMode,
-              loosingEnabled, loosingValueInches, conditionsFollowLoosing,
+              loosingEnabled, loosingValueInches, loosingSide, loosingValueRef1Inches, loosingValueRef2Inches, conditionsFollowLoosing,
               nestedConditions: nestedConditions || [],
               keyframes: [],
             });
@@ -597,6 +618,9 @@ router.post(
           g.gradingMode = gradingMode || g.gradingMode || "keyframe";
           g.loosingEnabled = Boolean(loosingEnabled);
           g.loosingValueInches = Number(loosingValueInches) || 0;
+          if (["ref1", "ref2", "both"].includes(loosingSide)) g.loosingSide = loosingSide;
+          if (loosingValueRef1Inches !== undefined) g.loosingValueRef1Inches = Number(loosingValueRef1Inches) || 0;
+          if (loosingValueRef2Inches !== undefined) g.loosingValueRef2Inches = Number(loosingValueRef2Inches) || 0;
           g.conditionsFollowLoosing = Boolean(conditionsFollowLoosing);
           if (ref1) g.ref1 = ref1;
           if (ref2) g.ref2 = ref2;
@@ -771,6 +795,12 @@ router.post(
         const n = Number(unitsPerInch);
         if (Number.isFinite(n) && n > 0) sizePattern.unitsPerInch = n;
       }
+      // ── Safeguard: if basePaths are being saved, the editor has already
+      //    normalized coordinates to 25.4 (mm) space. Force UPI to match
+      //    so the next load doesn't create a mismatch.
+      if (pathsToSave && pathsToSave.length > 0 && sizePattern.unitsPerInch !== 25.4) {
+        sizePattern.unitsPerInch = 25.4;
+      }
 
       if (Array.isArray(seamEdges)) sizePattern.seamEdges = seamEdges.map((se) => ({
         clientId: String(se.id || se.clientId || `seam-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`),
@@ -778,6 +808,8 @@ router.post(
         pathIdx: Number(se.pathIdx) || 0,
         fromSegIdx: Number(se.fromSegIdx) || 0,
         toSegIdx: Number(se.toSegIdx) || 0,
+        toPathIdx: se.toPathIdx != null ? Number(se.toPathIdx) : null,
+        fullPath: !!se.fullPath,
         width: Math.max(0.0625, Math.min(10, Number(se.width) || 0.5)),
         visible: se.visible !== false,
         outwardSign: Number(se.outwardSign) || 1,
@@ -794,6 +826,10 @@ router.post(
       }));
 
       if (viewportSlots !== undefined) { config.viewportSlots = viewportSlots; config.markModified("viewportSlots"); }
+      if (req.body.viewport?.scale > 0) {
+        config.savedViewport = { scale: parseFloat(req.body.viewport.scale), x: parseFloat(req.body.viewport.x) || 0, y: parseFloat(req.body.viewport.y) || 0 };
+        config.markModified("savedViewport");
+      }
       if (measurementPartRules !== undefined) { config.measurementPartRules = measurementPartRules; config.markModified("measurementPartRules"); }
       if (Array.isArray(customMeasurements)) { config.customMeasurements = customMeasurements; config.markModified("customMeasurements"); }
 
@@ -1062,6 +1098,8 @@ router.post("/pattern-grading/stock-item/:stockItemId/save-config", async (req, 
         pathIdx: Number(se.pathIdx) || 0,
         fromSegIdx: Number(se.fromSegIdx) || 0,
         toSegIdx: Number(se.toSegIdx) || 0,
+        toPathIdx: se.toPathIdx != null ? Number(se.toPathIdx) : null,
+        fullPath: !!se.fullPath,
         width: Math.max(0.0625, Math.min(10, Number(se.width) || 0.5)),
         visible: se.visible !== false,
         outwardSign: Number(se.outwardSign) || 1,
@@ -1081,6 +1119,11 @@ router.post("/pattern-grading/stock-item/:stockItemId/save-config", async (req, 
     }
 
     if (unitsPerInch !== undefined) config.unitsPerInch = unitsPerInch;
+    // ── Safeguard: editor normalizes all coords to 25.4 (mm) space.
+    //    Force UPI to 25.4 when basePaths are being saved.
+    if (basePaths !== undefined && Array.isArray(basePaths) && basePaths.length > 0 && config.unitsPerInch !== 25.4) {
+      config.unitsPerInch = 25.4;
+    }
     if (basePatternSize !== undefined) config.basePatternSize = basePatternSize;
     if (req.body.viewport?.scale > 0) {
       config.savedViewport = { scale: parseFloat(req.body.viewport.scale), x: parseFloat(req.body.viewport.x) || 0, y: parseFloat(req.body.viewport.y) || 0 };
@@ -1229,6 +1272,16 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
       }
     }
 
+    // ── Debug logging ──
+    console.log("[cad-data] DEBUG:",
+      "stockItemId:", workOrder.stockItemId,
+      "| stockItemName:", workOrder.stockItemName,
+      "| patternConfig found:", !!patternConfig,
+      "| sizePatterns:", patternConfig?.sizePatterns?.length || 0,
+      "| designatedGroup:", patternConfig?.designatedGroup || "none",
+      "| measurementMap:", JSON.stringify(measurementMap)
+    );
+
     // ── NEW: size-based pattern matching ────────────────────────────────────
     let selectedSizePattern = null;
     let resolvedPaths = null;
@@ -1245,14 +1298,52 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
         null;
 
       if (empDesignatedValue) {
-        // Find closest size pattern by sizeValue
-        let closestPattern = null;
-        let minDiff = Infinity;
+        // ── Size matching: always round DOWN to the lower size ──
+        // Pick the largest size whose compareVal <= empValue.
+        // This ensures grading always goes UP (adds inches) from the base.
+        // e.g., employee chest=39.3 with sizes 38(L) and 40(XL) → pick L (38)
+        //        so grading adds 1.3" rather than subtracting 0.7"
+        const sizeComparisonLog = [];
+        const sizeEntries = [];
         for (const sp of patternConfig.sizePatterns) {
-          const diff = Math.abs(sp.sizeValue - empDesignatedValue);
-          if (diff < minDiff) { minDiff = diff; closestPattern = sp; }
+          const designerVal =
+            sp.baseMeasurements?.[designatedGroup] ??
+            sp.baseMeasurements?.[designatedGroup.toLowerCase()] ??
+            sp.baseMeasurements?.[designatedGroup.charAt(0).toUpperCase() + designatedGroup.slice(1)] ??
+            null;
+          const compareVal = (designerVal !== null && designerVal !== undefined && designerVal !== "")
+            ? parseFloat(designerVal)
+            : sp.sizeValue;
+          sizeEntries.push({ sp, compareVal, designerVal });
+          sizeComparisonLog.push(`${sp.sizeName}: designerVal=${designerVal} sizeValue=${sp.sizeValue} using=${compareVal}`);
         }
-        selectedSizePattern = closestPattern;
+
+        // Sort by compareVal ascending
+        sizeEntries.sort((a, b) => a.compareVal - b.compareVal);
+
+        // Check for exact match first
+        let selectedEntry = sizeEntries.find(e => Math.abs(e.compareVal - empDesignatedValue) < 0.001);
+
+        if (!selectedEntry) {
+          // Find the LARGEST size whose compareVal <= employee value (round DOWN / floor)
+          // Filter to sizes that are <= empValue, then pick the last (largest) one
+          const candidates = sizeEntries.filter(e => e.compareVal <= empDesignatedValue);
+          if (candidates.length > 0) {
+            selectedEntry = candidates[candidates.length - 1];
+          }
+        }
+
+        if (!selectedEntry) {
+          // Employee is SMALLER than all sizes — pick the smallest available
+          selectedEntry = sizeEntries[0];
+        }
+
+        selectedSizePattern = selectedEntry.sp;
+
+        console.log("[cad-data] SIZE MATCHING (round-down):");
+        console.log("  designatedGroup:", designatedGroup, "| empValue:", empDesignatedValue);
+        sizeComparisonLog.forEach(l => console.log("  ", l));
+        console.log("  RESULT:", selectedSizePattern?.sizeName, "(compareVal:", selectedEntry.compareVal, ")");
       } else {
         // No measurement found — use first pattern
         selectedSizePattern = patternConfig.sizePatterns[0];
@@ -1261,7 +1352,11 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
       if (selectedSizePattern) {
         // Paths
         resolvedPaths = selectedSizePattern.basePaths || null;
-        resolvedUpi = selectedSizePattern.unitsPerInch || 25.4;
+        // If basePaths exist they were normalized to 25.4 (mm) space by the editor.
+        // Always use 25.4 in that case to prevent mismatched coordinates/UPI.
+        resolvedUpi = (resolvedPaths && resolvedPaths.length > 0)
+          ? 25.4
+          : (selectedSizePattern.unitsPerInch || 25.4);
 
         // Seam / fold
         resolvedSeamEdges = (selectedSizePattern.seamEdges || [])
@@ -1271,6 +1366,8 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
             clientId: se.clientId || se._id?.toString(),
             name: se.name || "Seam", pathIdx: se.pathIdx,
             fromSegIdx: se.fromSegIdx, toSegIdx: se.toSegIdx,
+            toPathIdx: se.toPathIdx != null ? se.toPathIdx : undefined,
+            fullPath: !!se.fullPath,
             width: se.width, visible: se.visible !== false, outwardSign: se.outwardSign || 1,
           }));
 
@@ -1288,17 +1385,83 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
         computedGroupTargets = (selectedSizePattern.keyframeGroups || []).map((group) => {
           const gid = group.groupId || group.clientId;
           const pKey = group.partKey;
-          const empVal = pKey ? (measurementMap[pKey] || measurementMap[pKey?.toLowerCase()] || null) : null;
+          // Skip __dup__ prefixed partKeys when looking up employee measurements
+          const cleanPartKey = pKey?.startsWith("__dup__") ? pKey.slice(7) : pKey;
+          const empVal = cleanPartKey
+            ? (measurementMap[cleanPartKey] || measurementMap[cleanPartKey?.toLowerCase()] || null)
+            : null;
+
+          // ── Fallback for missing employee measurements ──
+          // If the employee doesn't have this measurement (field missing or empty),
+          // use the designer's baseMeasurements for this size pattern.
+          // e.g., employee matched to Size L but has no Knee → use L's baseMeasurements.knee
+          let fallbackVal = null;
+          if (empVal === null && cleanPartKey && selectedSizePattern.baseMeasurements) {
+            fallbackVal =
+              selectedSizePattern.baseMeasurements[cleanPartKey] ??
+              selectedSizePattern.baseMeasurements[cleanPartKey?.toLowerCase()] ??
+              selectedSizePattern.baseMeasurements[cleanPartKey?.charAt(0).toUpperCase() + cleanPartKey?.slice(1)] ??
+              null;
+            if (fallbackVal !== null && fallbackVal !== undefined && fallbackVal !== "") {
+              fallbackVal = parseFloat(fallbackVal);
+              console.log(`[cad-data] Missing measurement "${cleanPartKey}" for employee — using size ${selectedSizePattern.sizeName} baseMeasurement: ${fallbackVal}`);
+            } else {
+              fallbackVal = null;
+            }
+          }
+
+          // The effective employee value: actual measurement > designer fallback > null
+          const effectiveEmpVal = empVal !== null ? empVal : fallbackVal;
+
+          // ── Check keyframe coverage ──
+          // Collect all targetFullInches values from this group's keyframes
+          const keyframes = group.keyframes || [];
+          const kfValues = keyframes.map(kf => kf.targetFullInches).filter(v => v != null && !isNaN(v));
+          const baseVal = group.baseFullInches || 0;
+          const hasKeyframes = kfValues.length > 0;
+
+          // The grading range is from baseFullInches through all keyframe targets
+          let gradingMin = baseVal;
+          let gradingMax = baseVal;
+          if (hasKeyframes) {
+            const allVals = [baseVal, ...kfValues];
+            gradingMin = Math.min(...allVals);
+            gradingMax = Math.max(...allVals);
+          }
+
+          // Determine if grading can be applied for this group
+          let gradingApplicable = true;
+          let gradingWarning = null;
+
+          if (effectiveEmpVal !== null && hasKeyframes) {
+            if (effectiveEmpVal < gradingMin || effectiveEmpVal > gradingMax) {
+              gradingApplicable = false;
+              gradingWarning = `Employee ${cleanPartKey} (${effectiveEmpVal}") is outside the graded range (${gradingMin}" – ${gradingMax}"). No grading applied.`;
+            }
+          } else if (effectiveEmpVal !== null && !hasKeyframes) {
+            gradingApplicable = false;
+            gradingWarning = `No keyframes recorded for ${group.groupName || group.name || cleanPartKey}. Grading cannot be applied.`;
+          }
+
           return {
             groupClientId: gid,
             groupName: group.groupName || group.name,
             partKey: pKey,
             assignedSize: group.assignedSize || selectedSizePattern.sizeName,
             multiplier: group.multiplier || 1,
-            baseFullInches: group.baseFullInches || 0,
-            targetFullInches: empVal !== null ? empVal : (group.baseFullInches || 0),
-            hasEmployeeData: empVal !== null,
-            employeeValue: empVal,
+            baseFullInches: baseVal,
+            targetFullInches: effectiveEmpVal !== null ? effectiveEmpVal : baseVal,
+            hasEmployeeData: effectiveEmpVal !== null,
+            employeeValue: effectiveEmpVal,
+            usedFallback: empVal === null && fallbackVal !== null,
+            fallbackSource: empVal === null && fallbackVal !== null ? `Size ${selectedSizePattern.sizeName} default` : null,
+            // New fields for grading status
+            hasKeyframes,
+            keyframeCount: kfValues.length,
+            gradingMin,
+            gradingMax,
+            gradingApplicable,
+            gradingWarning,
           };
         });
       }
@@ -1329,6 +1492,8 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
           clientId: se.clientId || se._id?.toString(),
           name: se.name || "Seam", pathIdx: se.pathIdx,
           fromSegIdx: se.fromSegIdx, toSegIdx: se.toSegIdx,
+          toPathIdx: se.toPathIdx != null ? se.toPathIdx : undefined,
+          fullPath: !!se.fullPath,
           width: se.width, visible: se.visible !== false, outwardSign: se.outwardSign || 1,
         }));
 
@@ -1364,6 +1529,7 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
       foldAxes: resolvedFoldAxes,
       hasFoldAxes: resolvedFoldAxes.length > 0,
       viewportSlots: patternConfig?.viewportSlots || {},
+      savedViewport: patternConfig?.savedViewport || null,
       globalRotation: patternConfig?.globalRotation || { angle: 0, pivotX: 0, pivotY: 0 },
       hasPatternConfig: !!patternConfig,
       hasSVGFile: selectedSizePattern ? !!selectedSizePattern.svgFileUrl : !!patternConfig?.svgFileUrl,
@@ -1379,6 +1545,82 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
   } catch (error) {
     console.error("Error fetching CAD data:", error);
     res.status(500).json({ success: false, message: "Server error: " + error.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET: Bulk resolve matched sizes for ALL employees in a work order
+// Returns a lightweight map of employeeId → matchedSizeName without loading full CAD data
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/pattern-grading/work-order/:woId/employee-sizes", async (req, res) => {
+  try {
+    const { woId } = req.params;
+    const workOrder = await WorkOrder.findById(woId)
+      .select("stockItemId stockItemName customerRequestId")
+      .lean();
+    if (!workOrder) return res.status(404).json({ success: false, message: "Work order not found" });
+
+    const patternConfig = await PatternGradingConfig.findOne({
+      stockItemId: workOrder.stockItemId,
+      isActive: true,
+    }).sort({ updatedAt: -1 }).lean();
+
+    if (!patternConfig || !patternConfig.sizePatterns?.length) {
+      return res.json({ success: true, employeeSizes: {}, hasConfig: false });
+    }
+
+    const designatedGroup = patternConfig.designatedGroup || "chest";
+
+    // Build sorted size entries once
+    const sizeEntries = patternConfig.sizePatterns.map(sp => {
+      const designerVal =
+        sp.baseMeasurements?.[designatedGroup] ??
+        sp.baseMeasurements?.[designatedGroup.toLowerCase()] ??
+        sp.baseMeasurements?.[designatedGroup.charAt(0).toUpperCase() + designatedGroup.slice(1)] ??
+        null;
+      const compareVal = (designerVal !== null && designerVal !== undefined && designerVal !== "")
+        ? parseFloat(designerVal) : sp.sizeValue;
+      return { sizeName: sp.sizeName, compareVal };
+    }).sort((a, b) => a.compareVal - b.compareVal);
+
+    // Get all employee measurements
+    const measurement = await Measurement.findOne({ poRequestId: workOrder.customerRequestId }).lean();
+    if (!measurement) return res.json({ success: true, employeeSizes: {}, hasConfig: true });
+
+    const employeeSizes = {};
+    for (const emp of measurement.employeeMeasurements) {
+      const product = emp.products?.find(p => p.productName === workOrder.stockItemName);
+      if (!product) continue;
+
+      // Find the designated group measurement
+      let empDesignatedValue = null;
+      for (const m of product.measurements || []) {
+        if (m.measurementName === designatedGroup ||
+          m.measurementName?.toLowerCase() === designatedGroup.toLowerCase()) {
+          empDesignatedValue = parseFloat(m.value) || null;
+          break;
+        }
+      }
+
+      if (!empDesignatedValue) {
+        // No measurement — assign first size
+        employeeSizes[String(emp.employeeId)] = sizeEntries[0]?.sizeName || null;
+        continue;
+      }
+
+      // Same round-down logic as cad-data endpoint
+      let matched = sizeEntries.find(e => Math.abs(e.compareVal - empDesignatedValue) < 0.001);
+      if (!matched) {
+        const candidates = sizeEntries.filter(e => e.compareVal <= empDesignatedValue);
+        matched = candidates.length > 0 ? candidates[candidates.length - 1] : sizeEntries[0];
+      }
+      employeeSizes[String(emp.employeeId)] = matched?.sizeName || null;
+    }
+
+    res.json({ success: true, employeeSizes, designatedGroup, hasConfig: true });
+  } catch (error) {
+    console.error("Error resolving employee sizes:", error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -1532,11 +1774,10 @@ router.get("/pattern-grading/test-drive", async (req, res) => {
       success: false,
       message: error.message,
       envCheck: {
-        hasEmail: !!process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL,
-        emailValue: process.env.GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL || "(not set)",
-        hasKey: !!process.env.GOOGLE_DRIVE_PRIVATE_KEY,
-        keyLength: (process.env.GOOGLE_DRIVE_PRIVATE_KEY || "").length,
-        keyStartsWith: (process.env.GOOGLE_DRIVE_PRIVATE_KEY || "").substring(0, 30),
+        hasServiceAccountKey: !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY,
+        keyLength: (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || "").length,
+        hasFolderId: !!process.env.GOOGLE_DRIVE_FOLDER_ID,
+        folderIdValue: process.env.GOOGLE_DRIVE_FOLDER_ID || "(not set)",
       },
     });
   }
@@ -1567,16 +1808,56 @@ router.post(
           stockItemName
         );
       } catch (driveError) {
-        // If Google Drive is not configured, fall back to Cloudinary-style response
-        // by just returning the file info without actually storing it externally.
-        // This allows the system to work even without Drive credentials during development.
         console.warn("[Pattern Upload] Google Drive upload failed, check configuration:", driveError.message);
         return res.status(500).json({
           success: false,
           message: "Google Drive not configured: " + driveError.message,
-          hint: "Set GOOGLE_DRIVE_SERVICE_ACCOUNT_EMAIL and GOOGLE_DRIVE_PRIVATE_KEY env vars. Also run: npm install googleapis",
+          hint: "Set GOOGLE_SERVICE_ACCOUNT_KEY (JSON) and GOOGLE_DRIVE_FOLDER_ID env vars. Also run: npm install googleapis",
         });
       }
+
+      // ── Detect UPI from SVG content so the correct value is stored in DB ──
+      // Adobe Illustrator always uses 72 pt/inch internally. When it exports
+      // SVGs with a unitless width="1234" attribute, that value is in points,
+      // NOT CSS pixels (96). We detect Adobe signatures first so the correct
+      // divisor (72) is used instead of the CSS default (96).
+      let detectedUpi = 25.4;
+      try {
+        const svgText = req.file.buffer.toString("utf-8");
+        const svgMatch = svgText.match(/<svg([^>]*)>([\s\S]*?)<\/svg>/i);
+        if (svgMatch) {
+          const svgAttr = svgMatch[1];
+          const svgBody = (svgMatch[2] || "").substring(0, 2000);
+          const fullTag = svgAttr + svgBody;
+          const isAdobe = /illustrator|adobe|data-name/i.test(fullTag);
+          const isInkscape = /inkscape/i.test(fullTag);
+
+          const wm = svgAttr.match(/\bwidth=["']([0-9.]+)(mm|cm|in|pt|px)?["']/i);
+          const vbm = svgAttr.match(/viewBox=["'][^"']*["']/i);
+          if (wm && vbm) {
+            const physW = parseFloat(wm[1]);
+            const unit = (wm[2] || "").toLowerCase(); // "" when no unit suffix
+            const pts = vbm[0].match(/-?[\d.]+/g), vbW = pts ? parseFloat(pts[2]) : 0;
+            if (physW && vbW) {
+              if (unit) {
+                // Explicit CSS unit — trust it
+                const inchW = unit === "mm" ? physW / 25.4 : unit === "cm" ? physW / 2.54 : unit === "in" ? physW : unit === "pt" ? physW / 72 : physW / 96;
+                detectedUpi = vbW / inchW;
+              } else {
+                // No unit suffix — use tool signature to decide
+                if (isAdobe) detectedUpi = vbW / (physW / 72);  // Adobe = points
+                else if (isInkscape) detectedUpi = vbW / (physW / 96);  // Inkscape = CSS px
+                else detectedUpi = vbW / (physW / 96);  // Unknown = assume CSS px
+              }
+            }
+          } else {
+            // No width/height — check for tool signatures
+            if (isAdobe) detectedUpi = 72;
+            else if (isInkscape) detectedUpi = 96;
+            else if (vbm) detectedUpi = 72;
+          }
+        }
+      } catch (_) { /* ignore parse errors */ }
 
       res.json({
         success: true,
@@ -1586,6 +1867,7 @@ router.post(
         originalFilename: req.file.originalname,
         bytes: req.file.size,
         mimeType: req.file.mimetype,
+        unitsPerInch: Math.round(detectedUpi * 100) / 100,
       });
     } catch (error) {
       console.error("[Pattern Upload] Error:", error);
@@ -1608,6 +1890,89 @@ router.post("/pattern-grading/delete-pattern-svg", async (req, res) => {
     console.error("[Pattern Delete] Error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
+});
+
+// GET: Proxy SVG content from Google Drive (service account auth)
+// GET: Proxy SVG content from Google Drive (service account auth)
+router.get("/pattern-grading/svg-content/:fileId", async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    if (!fileId || fileId === "undefined") {
+      return res.status(400).json({ success: false, message: "fileId is required" });
+    }
+
+    const { fetchFileContentFromDrive } = require("../../../../utils/googleDrivePatternUpload");
+    const svgContent = await fetchFileContentFromDrive(fileId);
+
+    res.set("Content-Type", "image/svg+xml");
+    res.set("Cache-Control", "public, max-age=3600");
+    res.send(svgContent);
+  } catch (error) {
+    console.error("[SVG Proxy] Error fetching file:", error.message);
+    res.status(500).json({ success: false, message: "Failed to fetch SVG: " + error.message });
+  }
+});
+
+// GET: Debug — inspect SVG headers for all size patterns of a stock item
+router.get("/pattern-grading/debug-svg-headers/:stockItemId", async (req, res) => {
+  try {
+    const { stockItemId } = req.params;
+    const config = await PatternGradingConfig.findOne({ stockItemId, isActive: true }).lean();
+    if (!config) return res.status(404).json({ success: false, message: "Config not found" });
+
+    const { fetchFileContentFromDrive } = require("../../../../utils/googleDrivePatternUpload");
+    const results = [];
+
+    for (const sp of (config.sizePatterns || [])) {
+      const fileId = sp.svgPublicId;
+      if (!fileId) { results.push({ sizeName: sp.sizeName, error: "no fileId" }); continue; }
+      try {
+        const svgText = await fetchFileContentFromDrive(fileId);
+        const svgMatch = svgText.match(/<svg([^>]*)>/i);
+        const svgAttr = svgMatch ? svgMatch[1] : "(no svg tag)";
+
+        const widthMatch = svgAttr.match(/\bwidth=["']([^"']+)["']/i);
+        const heightMatch = svgAttr.match(/\bheight=["']([^"']+)["']/i);
+        const viewBoxMatch = svgAttr.match(/viewBox=["']([^"']+)["']/i);
+
+        const wm = svgAttr.match(/\bwidth=["']([0-9.]+)(mm|cm|in|pt|px)?["']/i);
+        const vbm = svgAttr.match(/viewBox=["'][^"']*["']/i);
+        let computedUpi = 25.4, upiDetail = "fallback";
+        if (wm && vbm) {
+          const physW = parseFloat(wm[1]), unit = (wm[2] || "px").toLowerCase();
+          const pts = vbm[0].match(/-?[\d.]+/g), vbW = pts ? parseFloat(pts[2]) : 0;
+          if (physW && vbW) {
+            const inchW = unit === "mm" ? physW / 25.4 : unit === "cm" ? physW / 2.54 : unit === "in" ? physW : unit === "pt" ? physW / 72 : physW / 96;
+            computedUpi = vbW / inchW;
+            upiDetail = `w=${physW}${unit} vbW=${vbW} inW=${inchW.toFixed(3)}`;
+          }
+        }
+
+        // Rough bounding box from path d attributes
+        const pathDs = [...svgText.matchAll(/\bd="([^"]+)"/gi)].map(m => m[1]);
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (const d of pathDs) {
+          const nums = d.match(/-?[\d.]+/g)?.map(Number) || [];
+          for (let i = 0; i < nums.length; i += 2) {
+            if (!isNaN(nums[i])) { minX = Math.min(minX, nums[i]); maxX = Math.max(maxX, nums[i]); }
+            if (!isNaN(nums[i + 1])) { minY = Math.min(minY, nums[i + 1]); maxY = Math.max(maxY, nums[i + 1]); }
+          }
+        }
+
+        results.push({
+          sizeName: sp.sizeName, sizeValue: sp.sizeValue, bytes: sp.bytes,
+          svgTag: svgAttr.substring(0, 300),
+          width: widthMatch?.[1], height: heightMatch?.[1], viewBox: viewBoxMatch?.[1],
+          computedUpi: Math.round(computedUpi * 100) / 100, upiDetail,
+          approxBBox: minX !== Infinity ? {
+            minX: Math.round(minX * 10) / 10, maxX: Math.round(maxX * 10) / 10, minY: Math.round(minY * 10) / 10, maxY: Math.round(maxY * 10) / 10,
+            widthUnits: Math.round((maxX - minX) * 10) / 10, heightUnits: Math.round((maxY - minY) * 10) / 10
+          } : null,
+        });
+      } catch (err) { results.push({ sizeName: sp.sizeName, error: err.message }); }
+    }
+    res.json({ success: true, results });
+  } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
 module.exports = router;
