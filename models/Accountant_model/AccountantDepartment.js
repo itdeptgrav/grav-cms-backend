@@ -3,6 +3,8 @@
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
+
+
 const accountantDepartmentSchema = new mongoose.Schema(
   {
     email: {
