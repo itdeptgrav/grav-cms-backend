@@ -539,6 +539,15 @@ const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
 app.use("/api/cms/sales", quotationRoutes);
 
 // HR Department Routes
+
+// HR Leave Routes (HR side — manage all applications, config, holidays)
+const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
+app.use("/api/hr/leaves", hrLeaveRoutes);
+
+// Employee Leave Routes (employee side — apply, balance, calendar, manager actions)
+const employeeLeaveRoutes = require("./routes/Employee_Routes/leaveRoutes");
+app.use("/api/employee/leave-applications", employeeLeaveRoutes);
+
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
 
@@ -566,6 +575,8 @@ app.use("/api/hr/password-management", passwordMgmt);
 
 const employeeImportRoutes = require("./routes/HrRoutes/employeeImportExport.js");
 app.use("/api/employees/import-export", employeeImportRoutes);
+
+
 
 
 // Accountant Department Routes
