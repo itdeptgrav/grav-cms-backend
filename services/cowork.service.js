@@ -447,32 +447,113 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
 }
 
 async function listCoworkMeets(employeeId, role) {
+  // NOTE: We now return cancelled meetings too — participants need to see the
+  // "Cancelled" blurred state on their meetings page. The frontend handles display.
   if (role === "ceo") {
-    // CEO sees all meetings
-    const snap = await db.collection("cowork_scheduled_meets").where("isCancelled", "==", false).get();
+    // CEO sees all meetings (active + cancelled)
+    const snap = await db.collection("cowork_scheduled_meets").get();
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
   }
 
   if (role === "tl") {
-    // TL sees meetings they CREATED + meetings they are a PARTICIPANT in
+    // TL sees meetings they CREATED + meetings they are a PARTICIPANT in (active + cancelled)
     const [createdSnap, participantSnap] = await Promise.all([
-      db.collection("cowork_scheduled_meets").where("createdBy", "==", employeeId).where("isCancelled", "==", false).get(),
-      db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).where("isCancelled", "==", false).get(),
+      db.collection("cowork_scheduled_meets").where("createdBy", "==", employeeId).get(),
+      db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).get(),
     ]);
-    // Merge and deduplicate by meetId
     const map = new Map();
     [...createdSnap.docs, ...participantSnap.docs].forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
     return Array.from(map.values());
   }
 
-  // Employee — only meetings they are a participant in
-  const snap = await db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).where("isCancelled", "==", false).get();
+  // Employee — only meetings they are a participant in (active + cancelled so they see the blur)
+  const snap = await db.collection("cowork_scheduled_meets").where("participants", "array-contains", employeeId).get();
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
 async function getCoworkMeet(meetId) {
   const doc = await db.collection("cowork_scheduled_meets").doc(meetId).get();
   return doc.exists ? { id: doc.id, ...doc.data() } : null;
+}
+
+// ── CANCEL MEETING ────────────────────────────────────────
+async function cancelCoworkMeet({ meetId, cancelledBy, cancelledByName }) {
+  const ref = db.collection("cowork_scheduled_meets").doc(meetId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Meeting not found.");
+
+  const meet = snap.data();
+  if (meet.isCancelled) throw new Error("Meeting is already cancelled.");
+
+  // Only the creator (or CEO) can cancel
+  if (meet.createdBy !== cancelledBy) throw new Error("Only the meeting organiser can cancel it.");
+
+  await ref.update({
+    isCancelled: true,
+    cancelledBy,
+    cancelledByName,
+    cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // Notify all participants (excluding the canceller)
+  const recipients = (meet.participants || []).filter(id => id !== cancelledBy);
+
+  // Real-time socket push
+  socket.emitToMany(recipients, "meet_cancelled", { meetId, title: meet.title, cancelledByName });
+
+  // Persistent in-app notification
+  await _notifyMany({
+    recipientIds: recipients,
+    type: "meet_cancelled",
+    title: `Meeting Cancelled: ${meet.title}`,
+    body: `Cancelled by ${cancelledByName}`,
+    data: { meetId },
+  });
+
+  return { success: true, meetId };
+}
+
+// ── UPDATE / EDIT MEETING ─────────────────────────────────
+async function updateCoworkMeet({ meetId, updatedBy, title, description, dateTime, googleMeetLink, participants }) {
+  const ref = db.collection("cowork_scheduled_meets").doc(meetId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Meeting not found.");
+
+  const meet = snap.data();
+  if (meet.isCancelled) throw new Error("Cannot edit a cancelled meeting.");
+  // Only the creator (or CEO) can edit
+  if (meet.createdBy !== updatedBy) throw new Error("Only the meeting organiser can edit it.");
+
+  const updates = {};
+  if (title !== undefined && title !== null) updates.title = title.trim();
+  if (description !== undefined) updates.description = description || "";
+  if (dateTime !== undefined && dateTime !== null) updates.dateTime = dateTime;
+  if (googleMeetLink !== undefined) updates.googleMeetLink = googleMeetLink || null;
+  if (participants !== undefined && Array.isArray(participants)) updates.participants = participants;
+  updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+  updates.updatedBy = updatedBy;
+
+  await ref.update(updates);
+
+  // Notify all participants (old + new) except the editor
+  const allParticipants = [...new Set([...(meet.participants || []), ...(participants || meet.participants || [])])];
+  const recipients = allParticipants.filter(id => id !== updatedBy);
+
+  socket.emitToMany(recipients, "meet_updated", {
+    meetId,
+    title: updates.title || meet.title,
+    dateTime: updates.dateTime || meet.dateTime,
+  });
+
+  await _notifyMany({
+    recipientIds: recipients,
+    type: "meet_updated",
+    title: `Meeting Updated: ${updates.title || meet.title}`,
+    body: `New time: ${new Date(updates.dateTime || meet.dateTime).toLocaleString("en-IN")}`,
+    data: { meetId },
+  });
+
+  return { success: true, meetId };
 }
 
 // ── TASKS ─────────────────────────────────────────────────
@@ -587,26 +668,48 @@ async function updateTaskProgress({ taskId, employeeId, progressPercent, note })
 }
 
 async function listTasks(employeeId, role) {
+  // ── FALLBACK task list (used when list-hierarchy fails) ──────────────────
+  // Must apply the SAME visibility rules as listTasksWithHierarchy:
+  //   CEO    : only tasks they personally created
+  //   TL     : tasks they created + tasks assigned to them
+  //   Employee: only tasks directly assigned to them
   let tasks = [];
 
   if (role === "ceo") {
-    const snap = await db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get();
-    tasks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // CEO sees ONLY tasks they personally created — NOT TL-created tasks
+    const snap = await db.collection("cowork_tasks")
+      .where("assignedBy", "==", employeeId).get();
+    tasks = snap.docs
+      .map(d => ({ id: d.id, ...d.data() }))
+      // Second-layer filter: drop any task that is flagged as TL-created
+      .filter(t => t.createdByTl !== true);
+
+  } else if (role === "tl") {
+    // TL: tasks they created
+    const snap1 = await db.collection("cowork_tasks")
+      .where("assignedBy", "==", employeeId).get();
+    // TL: tasks assigned to them
+    const snap2 = await db.collection("cowork_tasks")
+      .where("assigneeIds", "array-contains", employeeId).get();
+    const seen = new Set();
+    [...snap1.docs, ...snap2.docs].forEach(d => {
+      if (!seen.has(d.id)) { seen.add(d.id); tasks.push({ id: d.id, ...d.data() }); }
+    });
+
   } else {
+    // Employee: ONLY tasks directly assigned to them
     const directSnap = await db.collection("cowork_tasks")
       .where("assigneeIds", "array-contains", employeeId).get();
     tasks = directSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
+    // Group tasks: tasks scoped to a group the employee is a member of
     const groupsSnap = await db.collection("cowork_groups")
       .where("memberIds", "array-contains", employeeId).get();
-
     const groupIds = groupsSnap.docs.map(d => d.data().groupId);
-
     if (groupIds.length > 0) {
       const groupTasksSnap = await db.collection("cowork_tasks")
         .where("scopeType", "==", "group")
         .where("scopeId", "in", groupIds).get();
-
       const groupTasks = groupTasksSnap.docs.map(d => ({ id: d.id, ...d.data() }));
       tasks = [...tasks, ...groupTasks];
     }
@@ -801,7 +904,9 @@ module.exports = {
   listConversations,
 
   scheduleCoworkMeet,
+  updateCoworkMeet,
   listCoworkMeets,
+  cancelCoworkMeet,
   getCoworkMeet,
 
 
