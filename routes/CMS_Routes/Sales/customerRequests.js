@@ -7,6 +7,9 @@ const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest
 const Customer = require("../../../models/Customer_Models/Customer");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem")
 
+const Measurement = require('../../../models/Customer_Models/Measurement');
+const EmployeeMpc = require('../../../models/Customer_Models/Employee_Mpc');
+
 const CustomerEmailService = require('../../../services/CustomerEmailService');
 
 // Apply auth middleware
@@ -347,26 +350,88 @@ router.get("/requests/:requestId", async (req, res) => {
 
         const request = await CustomerRequest.findById(requestId)
             .populate('salesPersonAssigned', 'name email phone')
-            .populate('items.stockItemId', 'name reference category images')
+            .populate('items.stockItemId', 'name reference category images genderCategory')
             .select('-__v');
 
         if (!request) {
-            return res.status(404).json({
-                success: false,
-                message: "Request not found"
-            });
+            return res.status(404).json({ success: false, message: "Request not found" });
         }
 
-        res.json({
-            success: true,
-            request
-        });
+        // ── For measurement_conversion POs, enrich each item with the MPC
+        //    display name so the PDF can show the alias the employee recognises.
+        //    This is READ-ONLY — nothing stored in the DB changes.
+        if (
+            request.measurementId &&
+            request.requestType === 'measurement_conversion'
+        ) {
+            try {
+                const measurement = await Measurement.findById(request.measurementId)
+                    .select('employeeMeasurements')
+                    .lean();
 
+                if (measurement) {
+                    // Collect employee IDs present in the measurement
+                    const employeeIds = measurement.employeeMeasurements
+                        .map(e => e.employeeId)
+                        .filter(Boolean);
+
+                    // Batch-fetch MPC records (only products field needed)
+                    const mpcEmployees = await EmployeeMpc.find({
+                        _id: { $in: employeeIds },
+                    })
+                        .select('_id products')
+                        .lean();
+
+                    // Build: stockItemId (string) → first non-empty MPC productName
+                    // "first found" is fine because every employee that has the same
+                    // productId was assigned via the same name.
+                    const mpcNameMap = new Map();
+                    for (const emp of mpcEmployees) {
+                        for (const prod of (emp.products || [])) {
+                            const pidStr = prod.productId?.toString();
+                            if (
+                                pidStr &&
+                                !mpcNameMap.has(pidStr) &&
+                                prod.productName?.trim()
+                            ) {
+                                mpcNameMap.set(pidStr, prod.productName.trim());
+                            }
+                        }
+                    }
+
+                    // Attach mpcDisplayName to each item (plain object, not stored)
+                    const enrichedRequest = request.toObject();
+                    enrichedRequest.items = enrichedRequest.items.map(item => {
+                        const stockId = (
+                            item.stockItemId?._id || item.stockItemId
+                        )?.toString();
+
+                        // Only override when the MPC name actually differs from the
+                        // canonical StockItem name to avoid unnecessary changes.
+                        const mpcName = stockId ? mpcNameMap.get(stockId) : null;
+
+                        return {
+                            ...item,
+                            // null when no MPC alias exists → frontend falls back to stockItemName
+                            mpcDisplayName: mpcName || null,
+                        };
+                    });
+
+                    return res.json({ success: true, request: enrichedRequest });
+                }
+            } catch (enrichError) {
+                // Non-fatal: log and fall through to return without enrichment
+                console.error('[salesRoutes] MPC name enrichment failed:', enrichError.message);
+            }
+        }
+
+        // Default path (non-measurement requests, or enrichment failed)
+        res.json({ success: true, request });
     } catch (error) {
         console.error("Error fetching customer request:", error);
         res.status(500).json({
             success: false,
-            message: "Server error while fetching customer request"
+            message: "Server error while fetching customer request",
         });
     }
 });

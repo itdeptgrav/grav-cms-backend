@@ -730,6 +730,81 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 });
 
 
+
+router.get('/:measurementId/po-persons-export', async (req, res) => {
+    try {
+        const { measurementId } = req.params;
+ 
+        if (!mongoose.Types.ObjectId.isValid(measurementId)) {
+            return res.status(400).json({ success: false, message: 'Valid measurement ID required' });
+        }
+ 
+        const measurement = await Measurement.findById(measurementId)
+            .populate({ path: 'employeeMeasurements.products.productId', select: '_id name' })
+            .lean();
+ 
+        if (!measurement) {
+            return res.status(404).json({ success: false, message: 'Measurement not found' });
+        }
+ 
+        // Fetch MPC employees to get their display product names
+        const empIds = measurement.employeeMeasurements.map(e => e.employeeId).filter(Boolean);
+ 
+        const mpcEmployees = await EmployeeMpc.find({ _id: { $in: empIds } })
+            .select('_id products department designation')
+            .lean();
+ 
+        // Build map: employeeId → productId → mpcProductName
+        const mpcNameMap = new Map();
+        const mpcDetailsMap = new Map();
+        mpcEmployees.forEach(emp => {
+            const eid = emp._id.toString();
+            mpcDetailsMap.set(eid, { department: emp.department || '', designation: emp.designation || '' });
+            const prodMap = new Map();
+            (emp.products || []).forEach(p => {
+                const pid = p.productId?.toString();
+                if (pid && p.productName?.trim()) prodMap.set(pid, p.productName.trim());
+            });
+            mpcNameMap.set(eid, prodMap);
+        });
+ 
+        // Build CSV
+        const headers = ['#', 'Employee Name', 'UIN', 'Gender', 'Department', 'Designation', 'Products'];
+        const rows = measurement.employeeMeasurements.map((emp, idx) => {
+            const eid = emp.employeeId?.toString();
+            const mpcDets = mpcDetailsMap.get(eid) || {};
+            const prodMap = mpcNameMap.get(eid) || new Map();
+ 
+            const productsStr = (emp.products || []).map(p => {
+                const pid = (p.productId?._id || p.productId)?.toString();
+                const displayName = (pid && prodMap.get(pid)) || p.productName || p.productId?.name || 'Unknown';
+                return `${displayName} x${p.quantity || 1}`;
+            }).join(' | ');
+ 
+            return [
+                idx + 1,
+                `"${emp.employeeName || ''}"`,
+                emp.employeeUIN || '',
+                emp.gender || '',
+                `"${mpcDets.department || ''}"`,
+                `"${mpcDets.designation || ''}"`,
+                `"${productsStr}"`,
+            ].join(',');
+        });
+ 
+        const csv = ['\uFEFF', headers.join(','), ...rows].join('\n');
+        const safeName = (measurement.name || 'measurement').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
+ 
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}_persons.csv"`);
+        res.send(csv);
+    } catch (error) {
+        console.error('po-persons-export error:', error);
+        res.status(500).json({ success: false, message: 'Export failed' });
+    }
+});
+
+
 // REJECT quotation
 router.post("/requests/:requestId/quotation/reject", async (req, res) => {
   try {
@@ -902,5 +977,52 @@ router.get("/requests/:requestId/quotations/:quotationId/download", async (req, 
     });
   }
 });
+
+
+
+router.delete("/requests/:requestId", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+ 
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+ 
+    // ── If this request originated from a measurement, clear its PO fields ──
+    if (request.measurementId) {
+      await Measurement.findByIdAndUpdate(request.measurementId, {
+        $set: {
+          convertedToPO: false,
+          poRequestId: null,
+          poConversionDate: null,
+          convertedBy: null,
+          poCreatedForEmployeeIds: [],
+        },
+      });
+      console.log(`[delete-request] Reset PO fields on measurement ${request.measurementId}`);
+    }
+ 
+    // ── Delete associated work orders if any ────────────────────────────────
+    if (WorkOrder) {
+      const woResult = await WorkOrder.deleteMany({ customerRequestId: request._id });
+      if (woResult.deletedCount) {
+        console.log(`[delete-request] Deleted ${woResult.deletedCount} work order(s) for request ${requestId}`);
+      }
+    }
+ 
+    // ── Delete the CustomerRequest itself ────────────────────────────────────
+    await CustomerRequest.findByIdAndDelete(requestId);
+ 
+    res.json({
+      success: true,
+      message: "PO/Quotation removed successfully",
+      measurementReset: !!request.measurementId,
+    });
+  } catch (error) {
+    console.error("Error deleting request:", error);
+    res.status(500).json({ success: false, message: "Server error while removing PO/Quotation" });
+  }
+});
+
+
 
 module.exports = router;

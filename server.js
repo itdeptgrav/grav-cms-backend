@@ -21,6 +21,9 @@ const allowedOrigins = [
   "https://cms.grav.in",
   "https://customer.grav.in",
   "http://192.168.1.30:3000",
+  "https://8ks0bflk-3000.inc1.devtunnels.ms",
+  "http://10.99.21.15:3000",
+  "https://8ks0bflk-5000.inc1.devtunnels.ms"
 ];
 
 app.use(
@@ -42,7 +45,7 @@ app.use(cookieParser());
 
 // Create HTTP server
 const server = http.createServer(app);
-
+console.log("Drive key loaded:", !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
 // Initialize Socket.IO with CORS configuration
 const io = new Server(server, {
   cors: {
@@ -75,6 +78,133 @@ io.on("connection", (socket) => {
 // Make io accessible to routes
 app.set("io", io);
 
+// ─── WebSocket connection handling ────────────────────────────────────────────
+io.on("connection", (socket) => {
+  console.log("✅ New WebSocket client connected:", socket.id);
+
+  // Join cowork room
+  socket.on("join_cowork", (employeeId) => {
+    if (employeeId) {
+      socket.join(String(employeeId));
+      console.log(`✅ Employee ${employeeId} joined socket room`);
+
+      // Broadcast online status
+      socket.broadcast.emit("workspace-member-status", {
+        memberId: employeeId,
+        isOnline: true,
+      });
+    }
+  });
+
+  // Typing indicator
+  socket.on("typing", (data) => {
+    const { conversationId, isTyping } = data;
+    socket.to(`dm_${conversationId}`).emit("typing_indicator", {
+      conversationId,
+      isTyping,
+    });
+  });
+
+  // ── COWORKING SPACE: Group chat rooms ─────────────────────────────────
+  socket.on("join_group", (groupId) => {
+    if (groupId) {
+      socket.join(`group_${groupId}`);
+      console.log(`Socket ${socket.id} joined group_${groupId}`);
+    }
+  });
+
+  socket.on("leave_group", (groupId) => {
+    if (groupId) {
+      socket.leave(`group_${groupId}`);
+      console.log(`Socket ${socket.id} left group_${groupId}`);
+    }
+  });
+
+  // ── COWORKING SPACE: Direct message rooms ─────────────────────────────
+  socket.on("join_dm", (chatId) => {
+    // chatId = [senderId, receiverId].sort().join("_")
+    if (chatId) {
+      socket.join(`dm_${chatId}`);
+      console.log(`Socket ${socket.id} joined dm_${chatId}`);
+    }
+  });
+
+  socket.on("leave_dm", (chatId) => {
+    if (chatId) {
+      socket.leave(`dm_${chatId}`);
+    }
+  });
+
+  // ── COWORKING SPACE: Meeting room (for audio recording signals) ───────────
+  socket.on("join_meeting_room", (meetId) => {
+    if (meetId) {
+      socket.join(`meeting_${meetId}`);
+      console.log(`Socket ${socket.id} joined meeting_${meetId}`);
+    }
+  });
+
+  socket.on("leave_meeting_room", (meetId) => {
+    if (meetId) {
+      socket.leave(`meeting_${meetId}`);
+    }
+  });
+  // CEO/TL starts recording → broadcast to all in meeting room
+  socket.on("recording_start", ({ meetId, startedBy, startedByName }) => {
+    if (!meetId) return;
+    console.log(`[Recording] START signal for meeting ${meetId} by ${startedByName}`);
+    // Broadcast to all OTHER participants in this meeting room
+    socket.to(`meeting_${meetId}`).emit("recording_started", {
+      meetId,
+      startedBy,
+      startedByName,
+      startedAt: new Date().toISOString(),
+    });
+  });
+
+  // CEO/TL stops recording → broadcast to all in meeting room
+  socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
+    if (!meetId) return;
+    console.log(`[Recording] STOP signal for meeting ${meetId} by ${stoppedByName}`);
+    socket.to(`meeting_${meetId}`).emit("recording_stopped", {
+      meetId,
+      stoppedBy,
+      stoppedByName,
+      stoppedAt: new Date().toISOString(),
+    });
+  });
+
+
+  // ── COWORKING SPACE: Online presence tracking ─────────────────────────
+  socket.on("workspace-set-online", (memberId) => {
+    socket.workspaceMemberId = memberId;
+    socket.broadcast.emit("workspace-member-status", {
+      memberId,
+      isOnline: true,
+    });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("❌ WebSocket client disconnected:", socket.id);
+    // Broadcast offline status when a workspace member disconnects
+    if (socket.workspaceMemberId) {
+      socket.broadcast.emit("workspace-member-status", {
+        memberId: socket.workspaceMemberId,
+        isOnline: false,
+      });
+    }
+  });
+});
+
+
+// 1. At the top with your other requires:
+const transcriptModule = require("./routes/task_routes/transcript.routes");
+
+// 2. With your other app.use() route registrations:
+app.use("/cowork", transcriptModule.router);
+
+
+
+// ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
   try {
     await mongoose.connect(
@@ -95,8 +225,12 @@ connectDB().then(async () => {
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
-const HRDepartment = require("./models/HRDepartment"); // make sure this exists in server.js also
-const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js"); // ✅ ADD THIS
+const HRDepartment = require("./models/HRDepartment");
+const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
+
+const Measurement = require("./models/Customer_Models/Measurement");
+const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
+
 
 const createDefaultCuttingMaster = async () => {
   try {
@@ -452,6 +586,553 @@ app.use("/api/vendor", vendorAuthRoutes);
 const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
 app.use("/api/barcode-devices", barcodeScannerRoutes);
 
+app.use("/cowork", require("./routes/task_routes/taskForward.js"));
+// Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
+app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
+
+
+// Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
+app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
+
+//new tree substack routes
+app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
+
+const coworkRoutes = require("./routes//task_routes/cowork");
+app.use("/cowork", coworkRoutes);
+
+app.use("/cowork", require("./routes/task_routes/livekit.routes"));
+
+app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
+
+app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
+app.use("/cowork", require("./routes/task_routes/askAI.routes"));
+
+
+const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
+app.use('/api/customer/employees/cross-org', crossOrgRoutes);
+
+/* =====================================================================
+   INLINE: Barcode Scanner Tracking Routes
+   Base URL: /api/cms/production/tracking
+   Used by ESP32 firmware — keep socket.io wired up here directly.
+   ===================================================================== */
+
+const ProductionTracking = require("./models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const Employee = require("./models/Employee");
+const Machine = require("./models/CMS_Models/Inventory/Configurations/Machine");
+const WorkOrder = require("./models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const Operation = require("./models/CMS_Models/Inventory/Configurations/Operation");
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const isBarcodeId = (id) => id && typeof id === "string" && id.startsWith("WO-");
+const isEmployeeId = (id) => id && typeof id === "string" && id.startsWith("GR");
+
+const parseBarcode = (barcodeId) => {
+  try {
+    const parts = barcodeId.split("-");
+    if (parts.length >= 3 && parts[0] === "WO") {
+      return {
+        success: true,
+        workOrderShortId: parts[1],
+        unitNumber: parseInt(parts[2]),
+        operationNumber: parts[3] ? parseInt(parts[3]) : null,
+      };
+    }
+    return { success: false, error: "Invalid barcode format" };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+};
+
+const findWorkOrderByShortId = async (shortId) => {
+  try {
+    const workOrders = await WorkOrder.find({});
+    return workOrders.find((wo) => wo._id.toString().slice(-8) === shortId);
+  } catch {
+    return null;
+  }
+};
+
+const extractEmployeeIdFromUrl = (value) => {
+  try {
+    if (!value || typeof value !== "string") return value;
+    const trimmed = value.trim();
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      const url = new URL(trimmed);
+      const parts = url.pathname.split("/").filter(Boolean);
+      return parts[parts.length - 1] || value;
+    }
+    return value;
+  } catch {
+    return value;
+  }
+};
+
+
+app.post("/api/cms/production/tracking/scan", async (req, res) => {
+  try {
+    const { scanId: rawScanId, machineId, timeStamp, activeOps = "" } = req.body;
+    const scanId = extractEmployeeIdFromUrl(rawScanId);
+
+    if (!scanId || !machineId || !timeStamp) {
+      return res.status(400).json({ success: false, message: "scanId, machineId, and timeStamp are required" });
+    }
+
+    const scanTime = new Date(timeStamp);
+    if (isNaN(scanTime.getTime())) {
+      return res.status(400).json({ success: false, message: "Invalid timeStamp format" });
+    }
+
+    const scanDate = new Date(scanTime);
+    scanDate.setHours(0, 0, 0, 0);
+
+    let trackingDoc = await ProductionTracking.findOne({ date: scanDate });
+    if (!trackingDoc) {
+      trackingDoc = new ProductionTracking({ date: scanDate, machines: [] });
+    }
+
+    const machine = await Machine.findById(machineId);
+    if (!machine) {
+      return res.status(400).json({ success: false, message: "Machine not found" });
+    }
+
+    let machineTracking = trackingDoc.machines.find(
+      (m) => m.machineId.toString() === machineId,
+    );
+    if (!machineTracking) {
+      trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+      machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+    }
+
+    // ── BARCODE SCAN ──────────────────────────────────────────────────────────
+    if (isBarcodeId(scanId)) {
+      if (!machineTracking.currentOperatorIdentityId) {
+        return res.status(400).json({
+          success: false,
+          message: "No operator is signed in on this machine",
+          action: "error",
+        });
+      }
+
+      const operatorTracking = machineTracking.operators.find(
+        (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+      );
+      if (!operatorTracking) {
+        return res.status(400).json({ success: false, message: "Operator session not found" });
+      }
+
+      // Store scan with active operations snapshot
+      operatorTracking.barcodeScans.push({
+        barcodeId: scanId,
+        timeStamp: scanTime,
+        activeOps: activeOps || "",
+      });
+      await trackingDoc.save();
+
+      const employeeName = operatorTracking.operatorName || "Unknown";
+      const scanCount = operatorTracking.barcodeScans.length;
+
+      // WebSocket events
+      try {
+        const parsedBarcode = parseBarcode(scanId);
+        if (parsedBarcode.success && io) {
+          let workOrder = await findWorkOrderByShortId(parsedBarcode.workOrderShortId);
+          if (!workOrder) {
+            try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch { }
+          }
+          if (workOrder) {
+            io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
+              workOrderId: workOrder._id,
+              workOrderNumber: workOrder.workOrderNumber,
+              barcodeId: scanId,
+              unitNumber: parsedBarcode.unitNumber,
+              operationNumber: parsedBarcode.operationNumber,
+              machineId,
+              machineName: machine.name,
+              timestamp: scanTime,
+              employeeName,
+              activeOps: activeOps || "",
+              type: "scan",
+              scanCount,
+            });
+          }
+          io.emit("tracking-data-updated", {
+            date: scanDate,
+            timestamp: new Date(),
+            message: "New scan recorded",
+            workOrderId: workOrder?._id,
+            unitNumber: parsedBarcode.unitNumber,
+            activeOps: activeOps || "",
+          });
+        }
+      } catch (wsError) {
+        console.error("Error emitting WebSocket event:", wsError);
+      }
+
+      return res.json({
+        success: true,
+        message: "Barcode scanned",
+        employeeName,
+        scanCount,
+        barcodeData: { barcodeId: scanId, activeOps: activeOps || "" },
+      });
+    }
+
+    // ── EMPLOYEE SIGN IN / OUT ────────────────────────────────────────────────
+    if (isEmployeeId(scanId)) {
+      const operator = await Employee.findOne({
+        identityId: scanId,
+        status: "active",
+      }).select("firstName lastName identityId");
+
+      if (!operator) {
+        return res.status(400).json({
+          success: false,
+          message: `Employee with identityId ${scanId} not found`,
+        });
+      }
+
+      const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
+
+      // Sign out from any other machine
+      for (const m of trackingDoc.machines) {
+        if (
+          m.currentOperatorIdentityId === scanId &&
+          m.machineId.toString() !== machineId.toString()
+        ) {
+          const existingSession = m.operators.find(
+            (op) => op.operatorIdentityId === scanId && !op.signOutTime,
+          );
+          if (existingSession) existingSession.signOutTime = scanTime;
+          m.currentOperatorIdentityId = null;
+        }
+      }
+
+      // Same operator already on this machine → sign out
+      if (machineTracking.currentOperatorIdentityId === scanId) {
+        const session = machineTracking.operators.find(
+          (op) => op.operatorIdentityId === scanId && !op.signOutTime,
+        );
+        if (session) {
+          session.signOutTime = scanTime;
+          machineTracking.currentOperatorIdentityId = null;
+          await trackingDoc.save();
+          try {
+            if (io) io.emit("operator-status-update", {
+              machineId, machineName: machine.name, employeeName,
+              message: `${employeeName} signed out`, timestamp: new Date(),
+            });
+          } catch { }
+          return res.json({
+            success: true,
+            message: `${employeeName} signed out`,
+            employeeName,
+            employeeId: scanId,
+            action: "signout",
+            scanCount: 0,
+          });
+        }
+        return res.status(400).json({ success: false, message: "Operator session not found" });
+      }
+
+      // Different operator signed in → sign out existing, sign in new
+      if (machineTracking.currentOperatorIdentityId) {
+        const existingSession = machineTracking.operators.find(
+          (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+        );
+        if (existingSession) existingSession.signOutTime = scanTime;
+      }
+
+      machineTracking.operators.push({
+        operatorIdentityId: scanId,
+        operatorName: employeeName,
+        signInTime: scanTime,
+        signOutTime: null,
+        barcodeScans: [],
+      });
+      machineTracking.currentOperatorIdentityId = scanId;
+      await trackingDoc.save();
+
+      try {
+        if (io) io.emit("operator-status-update", {
+          machineId, machineName: machine.name, employeeName,
+          status: `${employeeName} signed in to ${machine.name}`, timestamp: new Date(),
+        });
+      } catch { }
+
+      return res.json({
+        success: true,
+        message: `${employeeName} signed in`,
+        employeeName,
+        employeeId: scanId,
+        action: "signin",
+        scanCount: 0,
+      });
+    }
+
+    return res.status(400).json({ success: false, message: "Invalid scan ID format" });
+
+  } catch (error) {
+    console.error("Error processing scan:", error);
+    res.status(500).json({ success: false, message: "Server error while processing scan", error: error.message });
+  }
+});
+
+
+app.post("/api/cms/production/employee-sync/manual", async (req, res) => {
+  try {
+    await productionSyncService.manualEmployeeSync();
+    res.json({ success: true, message: "Employee sync completed successfully" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Error during employee sync", error: error.message });
+  }
+});
+
+
+// ── POST /api/cms/production/tracking/bulk-scans ──────────────────────────────
+
+app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
+  try {
+    const { scans } = req.body;
+    if (!scans || !Array.isArray(scans) || scans.length === 0) {
+      return res.status(400).json({ success: false, message: "Scans array is required" });
+    }
+
+    const results = { total: scans.length, successful: 0, failed: 0, errors: [] };
+    const scansByDate = {};
+
+    for (const scanData of scans) {
+      const { scanId, machineId, timeStamp } = scanData;
+      if (!scanId || !machineId || !timeStamp) {
+        results.failed++;
+        results.errors.push({ scanId, error: "Missing required fields" });
+        continue;
+      }
+      const scanTime = new Date(timeStamp);
+      if (isNaN(scanTime.getTime())) {
+        results.failed++;
+        results.errors.push({ scanId, error: "Invalid timestamp" });
+        continue;
+      }
+      const scanDate = new Date(scanTime);
+      scanDate.setHours(0, 0, 0, 0);
+      const dateKey = scanDate.toISOString();
+      if (!scansByDate[dateKey]) scansByDate[dateKey] = { date: scanDate, machines: {} };
+      if (!scansByDate[dateKey].machines[machineId]) scansByDate[dateKey].machines[machineId] = { machineId, scans: [] };
+      scansByDate[dateKey].machines[machineId].scans.push({ ...scanData, timeStamp: scanTime });
+    }
+
+    for (const dateKey in scansByDate) {
+      const dateGroup = scansByDate[dateKey];
+      let trackingDoc = await ProductionTracking.findOne({ date: dateGroup.date });
+      if (!trackingDoc) trackingDoc = new ProductionTracking({ date: dateGroup.date, machines: [] });
+
+      for (const machineId in dateGroup.machines) {
+        const machineData = dateGroup.machines[machineId];
+        const machine = await Machine.findById(machineId);
+        if (!machine) {
+          results.failed += machineData.scans.length;
+          results.errors.push({ machineId, error: "Machine not found" });
+          continue;
+        }
+
+        let machineTracking = trackingDoc.machines.find(
+          (m) => m.machineId && m.machineId.toString() === machineId,
+        );
+        if (!machineTracking) {
+          trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+          machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+        }
+
+        for (const scan of machineData.scans) {
+          try {
+            if (scan.isEmployeeScan) {
+              const { employeeName, employeeId, action } = scan;
+              if (action === "signout") {
+                const session = machineTracking.operators.find(
+                  (op) => op.operatorIdentityId === (employeeId || scan.scanId) && !op.signOutTime,
+                );
+                if (session) {
+                  session.signOutTime = scan.timeStamp;
+                  machineTracking.currentOperatorIdentityId = null;
+                }
+              } else {
+                if (machineTracking.currentOperatorIdentityId) {
+                  const existing = machineTracking.operators.find(
+                    (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+                  );
+                  if (existing) existing.signOutTime = scan.timeStamp;
+                }
+                machineTracking.operators.push({
+                  operatorIdentityId: employeeId || scan.scanId,
+                  operatorName: employeeName || "",
+                  signInTime: scan.timeStamp,
+                  signOutTime: null,
+                  barcodeScans: [],
+                });
+                machineTracking.currentOperatorIdentityId = employeeId || scan.scanId;
+              }
+            } else {
+              // Barcode scan — store with activeOps snapshot
+              if (!machineTracking.currentOperatorIdentityId) throw new Error("No operator signed in");
+              const operatorSession = machineTracking.operators.find(
+                (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+              );
+              if (!operatorSession) throw new Error("Operator session not found");
+              operatorSession.barcodeScans.push({
+                barcodeId: scan.scanId,
+                timeStamp: scan.timeStamp,
+                activeOps: scan.activeOps || "",
+              });
+            }
+            results.successful++;
+          } catch (scanError) {
+            results.failed++;
+            results.errors.push({ scanId: scan.scanId, error: scanError.message });
+          }
+        }
+      }
+      await trackingDoc.save();
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Processed ${results.successful} of ${results.total} scans`,
+      results,
+    });
+  } catch (error) {
+    console.error("Bulk scan error:", error);
+    res.status(500).json({ success: false, message: "Server error processing bulk scans", error: error.message });
+  }
+});
+
+// ── GET /api/cms/production/tracking/status/today ─────────────────────────────
+
+app.get("/api/cms/production/tracking/status/today", async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const trackingDoc = await ProductionTracking.findOne({ date: today })
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    if (!trackingDoc) {
+      return res.json({ success: true, message: "No tracking data for today", date: today, machines: [], totalScans: 0, totalMachines: 0 });
+    }
+
+    let totalScans = 0;
+    const machinesStatus = [];
+
+    for (const machine of trackingDoc.machines) {
+      let machineScans = 0;
+      const operatorsWithDetails = [];
+
+      for (const operator of machine.operators) {
+        const employeeDoc = await Employee.findOne({ identityId: operator.operatorIdentityId })
+          .select("firstName lastName identityId");
+        machineScans += operator.barcodeScans.length;
+        totalScans += operator.barcodeScans.length;
+        operatorsWithDetails.push({
+          identityId: operator.operatorIdentityId,
+          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          signInTime: operator.signInTime,
+          signOutTime: operator.signOutTime,
+          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp, activeOps: s.activeOps || "" })),
+          scanCount: operator.barcodeScans.length,
+          isActive: !operator.signOutTime,
+        });
+      }
+
+      let currentOperator = null;
+      if (machine.currentOperatorIdentityId) {
+        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
+        currentOperator = empDoc
+          ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
+          : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
+      }
+
+      machinesStatus.push({
+        machineId: machine.machineId?._id,
+        machineName: machine.machineId?.name || "Unknown Machine",
+        machineSerial: machine.machineId?.serialNumber || "Unknown",
+        currentOperator,
+        operators: operatorsWithDetails,
+        machineScans,
+      });
+    }
+
+    res.json({ success: true, date: trackingDoc.date, totalMachines: trackingDoc.machines.length, totalScans, machines: machinesStatus });
+  } catch (error) {
+    console.error("Error getting today's status:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+// ── GET /api/cms/production/tracking/status/:date ─────────────────────────────
+
+app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
+  try {
+    const { date } = req.params;
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+
+    const trackingDoc = await ProductionTracking.findOne({ date: queryDate })
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    if (!trackingDoc) {
+      return res.json({ success: true, message: `No tracking data for ${date}`, date: queryDate, machines: [], totalScans: 0, totalMachines: 0 });
+    }
+
+    let totalScans = 0;
+    const machinesStatus = [];
+
+    for (const machine of trackingDoc.machines) {
+      let machineScans = 0;
+      const operatorsWithDetails = [];
+
+      for (const operator of machine.operators) {
+        const employeeDoc = await Employee.findOne({ identityId: operator.operatorIdentityId })
+          .select("firstName lastName identityId");
+        machineScans += operator.barcodeScans.length;
+        totalScans += operator.barcodeScans.length;
+        operatorsWithDetails.push({
+          identityId: operator.operatorIdentityId,
+          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          signInTime: operator.signInTime,
+          signOutTime: operator.signOutTime,
+          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp, activeOps: s.activeOps || "" })),
+          scanCount: operator.barcodeScans.length,
+          isActive: !operator.signOutTime,
+        });
+      }
+
+      let currentOperator = null;
+      if (machine.currentOperatorIdentityId) {
+        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
+        currentOperator = empDoc
+          ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
+          : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
+      }
+
+      machinesStatus.push({
+        machineId: machine.machineId?._id,
+        machineName: machine.machineId?.name || "Unknown Machine",
+        machineSerial: machine.machineId?.serialNumber || "Unknown",
+        currentOperator,
+        operators: operatorsWithDetails,
+        machineScans,
+      });
+    }
+
+    res.json({ success: true, date: trackingDoc.date, totalMachines: trackingDoc.machines.length, totalScans, machines: machinesStatus });
+  } catch (error) {
+    console.error("Error getting date status:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
 
 /* =====================
     HEALTH CHECK
@@ -609,4 +1290,6 @@ server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
   console.log(`✅ WebSocket server is ready`);
   console.log(`✅ Production sync service is active`);
+  console.log(`Server running on port ${PORT}`);
+  transcriptModule.startCron();
 });
