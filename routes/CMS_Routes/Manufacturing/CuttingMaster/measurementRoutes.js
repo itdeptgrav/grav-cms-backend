@@ -5,7 +5,7 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const Measurement = require("../../../../models/Customer_Models/Measurement");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
-const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);

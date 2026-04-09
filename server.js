@@ -464,7 +464,7 @@ app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 const BarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/barcodeRoutes.js");
 app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 
-const ProductionTracking = require("./routes/CMS_Routes/Production/Tracking/trackingRoutes.js");
+const ProductionTracking = require("./models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking.js");
 app.use("/api/cms/production/tracking", ProductionTracking);
 
 // In your main server.js or app.js
@@ -617,7 +617,6 @@ app.use('/api/customer/employees/cross-org', crossOrgRoutes);
    Used by ESP32 firmware — keep socket.io wired up here directly.
    ===================================================================== */
 
-const ProductionTracking = require("./models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
 const Employee = require("./models/Employee");
 const Machine = require("./models/CMS_Models/Inventory/Configurations/Machine");
 const WorkOrder = require("./models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
