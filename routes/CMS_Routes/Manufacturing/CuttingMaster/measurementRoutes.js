@@ -5,7 +5,7 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const Measurement = require("../../../../models/Customer_Models/Measurement");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
-const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
@@ -87,18 +87,18 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
 
       // Measurements/sizes come from measurement doc; unit ranges from progress doc
       employeeMeasurements.push({
-        employeeId:   empIdStr,
+        employeeId: empIdStr,
         employeeName: emp.employeeName,
-        employeeUIN:  emp.employeeUIN,
-        gender:       emp.gender,
-        quantity:     progress.totalUnits,
-        unitStart:    progress.unitStart,
-        unitEnd:      progress.unitEnd,
+        employeeUIN: emp.employeeUIN,
+        gender: emp.gender,
+        quantity: progress.totalUnits,
+        unitStart: progress.unitStart,
+        unitEnd: progress.unitEnd,
         measurements: productEntry?.measurements || [],
-        qrGenerated:  productEntry?.qrGenerated || false,
-        completedUnits:       progress.completedUnits || 0,
+        qrGenerated: productEntry?.qrGenerated || false,
+        completedUnits: progress.completedUnits || 0,
         completionPercentage: progress.completionPercentage || 0,
-        isDispatched:         progress.isDispatched || false,
+        isDispatched: progress.isDispatched || false,
       });
     }
 
@@ -114,18 +114,18 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
     res.json({
       success: true,
       workOrder: {
-        _id:                workOrder._id,
-        workOrderNumber:    workOrder.workOrderNumber,
-        workOrderId:        workOrder._id.toString(),
-        stockItemName:      workOrder.stockItemName,
+        _id: workOrder._id,
+        workOrderNumber: workOrder.workOrderNumber,
+        workOrderId: workOrder._id.toString(),
+        stockItemName: workOrder.stockItemName,
         stockItemReference: workOrder.stockItemReference,
-        quantity:           workOrder.quantity,
+        quantity: workOrder.quantity,
         panelCount,
         genderCategory,
         variantAttributes: workOrder.variantAttributes || [],
       },
       measurement: {
-        _id:  measurement._id,
+        _id: measurement._id,
         name: measurement.name,
       },
       employeeMeasurements,
