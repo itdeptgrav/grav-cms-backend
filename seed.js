@@ -8,7 +8,7 @@ const CEO_NAME = "Admin CEO";
 
 async function seed() {
   try {
-    console.log("\n🚀 Pushing CEO to Firebase Auth & Firestore...\n");
+    console.log("\n🚀 Pushing CEO to Firebase Auth & Firestore..\n");
 
     // Check if CEO already exists in Firebase
     let userRecord;
