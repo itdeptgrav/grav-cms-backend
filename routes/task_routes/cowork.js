@@ -336,6 +336,31 @@ router.get("/schedule-meet/:meetId", verifyCoworkToken, verifyEmployeeToken, asy
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Edit / Update Meeting (CEO or TL who created it) ─────────
+router.patch("/schedule-meet/:meetId/edit", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+  try {
+    const { meetId } = req.params;
+    const { employeeId } = req.coworkUser;
+    const { title, description, dateTime, googleMeetLink, participants } = req.body;
+    const result = await svc.updateCoworkMeet({
+      meetId,
+      updatedBy: employeeId,
+      title, description, dateTime, googleMeetLink, participants,
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── Cancel Meeting (CEO or TL who created it) ─────────────
+router.patch("/schedule-meet/:meetId/cancel", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+  try {
+    const { meetId } = req.params;
+    const { employeeId, name } = req.coworkUser;
+    const result = await svc.cancelCoworkMeet({ meetId, cancelledBy: employeeId, cancelledByName: name });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // ── Tasks ─────────────────────────────────────────────────
 router.post("/task/assign", verifyCoworkToken, verifyCeoToken, async (req, res) => {
   try { res.status(201).json({ task: await svc.assignCoworkTask({ ...req.body, assignedBy: req.coworkUser.employeeId }) }); }

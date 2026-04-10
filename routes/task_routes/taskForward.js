@@ -358,19 +358,27 @@ router.get("/task/list-hierarchy", verifyCoworkToken, verifyEmployeeToken, async
     let filtered = allTasks;
 
     if (role === "ceo") {
-      // CEO sees ONLY root tasks created by CEO.
-      // Subtasks created by TL are hidden from CEO's tree.
-      // But CEO still sees subtasks they personally created.
+      // ── CEO VISIBILITY FILTER (defence-in-depth, second layer after service) ──
+      // A task is visible to CEO if and only if:
+      //   1. CEO personally created it (assignedBy === CEO employeeId), OR
+      //   2. It carries the createdByCeo flag (set at creation time), OR
+      //   3. assignedByRole === "ceo" (legacy fallback for older tasks)
+      // Tasks created by TL are ALWAYS hidden from CEO.
       filtered = allTasks.filter(t => {
-        if (!t.parentTaskId) {
-          // Root task: show only if created by CEO
-          return t.assignedBy === employeeId || t.createdByCeo === true;
-        }
-        // Subtask: show only if created by CEO (not by TL)
-        return t.createdByCeo === true || (t.assignedBy === employeeId && !t.createdByTl);
+        // If the task was created by a TL (not CEO), hide it from CEO entirely
+        if (t.createdByTl === true && t.assignedBy !== employeeId) return false;
+        // Show if CEO created it
+        if (t.assignedBy === employeeId) return true;
+        // Show if flagged as CEO-created
+        if (t.createdByCeo === true) return true;
+        // Show if assignedByRole marks it as a CEO creation (legacy)
+        if (t.assignedByRole === "ceo") return true;
+        // Default: hide (safe fallback)
+        return false;
       });
+    } else if (role === "tl") {
+      // TL: sees tasks they created OR tasks assigned to them — handled in service
     }
-    // TL: sees everything (no filter)
     // Employee: sees their own assigned tasks only (handled in svc.listTasksWithHierarchy)
 
     res.json({ tasks: filtered });
