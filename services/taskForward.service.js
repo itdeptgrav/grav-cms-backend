@@ -42,17 +42,11 @@ async function _notifyMany({ recipientIds, type, title, body, data }) {
   });
   await batch.commit();
   socket.emitToMany(recipientIds, "new_notification", { type, title, body, data });
+  // Send push notification via fcmPush.service (reads cowork_fcm_tokens collection)
   try {
-    const snaps = await Promise.all(recipientIds.map(id => db.collection("cowork_employees").doc(id).get()));
-    const tokens = snaps.filter(s => s.exists).flatMap(s => s.data().fcmTokens || []);
-    if (tokens.length) {
-      await messaging.sendEachForMulticast({
-        notification: { title, body },
-        data: Object.fromEntries(Object.entries(data || {}).map(([k, v]) => [k, String(v)])),
-        tokens,
-      });
-    }
-  } catch (e) { /* FCM non-critical */ }
+    const { sendPushToEmployees } = require("./fcmPush.service");
+    await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
+  } catch (e) { console.error("[FCM taskForward]", e.message); }
 }
 
 // ─── ID generator ─────────────────────────────────────────
