@@ -14,7 +14,7 @@ router.get("/tasks", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to fetch Google tasks",
+      message: "Failed to fetch tasks from Google ",
       error: error.message,
     });
   }
