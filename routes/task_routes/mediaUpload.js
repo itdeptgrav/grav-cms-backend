@@ -62,13 +62,16 @@ router.post(
         try {
             if (!req.file) return res.status(400).json({ error: "No file provided" });
 
-            if (req.file.mimetype !== "application/pdf") {
-                return res.status(400).json({ error: "Only PDF files allowed" });
+            // Accept all document/file types — images are handled separately via /upload/image
+            // Blocked only: executable files (.exe, .bat, .sh, .cmd)
+            const blocked = ["application/x-msdownload", "application/x-executable", "application/x-sh", "application/x-bat"];
+            if (blocked.includes(req.file.mimetype)) {
+                return res.status(400).json({ error: "Executable files are not allowed." });
             }
 
             const result = await uploadToGoogleDrive(req.file.buffer, {
-                fileName: req.file.originalname || "document.pdf",
-                mimeType: "application/pdf",
+                fileName: req.file.originalname || "document",
+                mimeType: req.file.mimetype || "application/octet-stream",
             });
 
             res.json({ success: true, ...result });

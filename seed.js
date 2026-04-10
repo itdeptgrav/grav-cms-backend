@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { auth, db, admin } = require("./config/firebaseAdmin"); // ← Add db and admin
+const { auth, db, admin } = require("./config/firebaseAdmin");
 
 // CEO credentials
 const CEO_EMAIL = "ceo@grav.com";
@@ -8,7 +8,7 @@ const CEO_NAME = "Admin CEO";
 
 async function seed() {
   try {
-    console.log("\n🚀 Pushing CEO to Firebase Auth & Firestore...\n");
+    console.log("\n🚀 Pushing CEO to Firebase Auth & Firestore..\n");
 
     // Check if CEO already exists in Firebase
     let userRecord;
