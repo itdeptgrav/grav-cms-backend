@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { auth, db, admin } = require("./config/firebaseAdmin"); // ← Add db and admin
+const { auth, db, admin } = require("./config/firebaseAdmin");
 
 // CEO credentials
 const CEO_EMAIL = "ceo@grav.com";
