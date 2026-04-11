@@ -815,11 +815,11 @@ async function _notifyMany({ recipientIds, type, title, body, data }) {
 
   socket.emitToMany(recipientIds, "new_notification", { type, title, body });
 
+  // Send FCM push notification — reads tokens from cowork_fcm_tokens/{employeeId}
   try {
-    const snaps = await Promise.all(recipientIds.map(id => db.collection("cowork_employees").doc(id).get()));
-    const tokens = snaps.filter(s => s.exists).flatMap(s => s.data().fcmTokens || []);
-    if (tokens.length) await messaging.sendEachForMulticast({ notification: { title, body }, data: Object.fromEntries(Object.entries(data || {}).map(([k, v]) => [k, String(v)])), tokens });
-  } catch (e) { console.error("FCM:", e.message); }
+    const { sendPushToEmployees } = require("./fcmPush.service");
+    await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
+  } catch (e) { console.error("FCM push:", e.message); }
 }
 
 // ── GET WITH FALLBACK ────────────────────────────────────
