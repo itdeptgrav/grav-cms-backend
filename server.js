@@ -8,7 +8,7 @@ const bcrypt = require("bcryptjs");
 
 const http = require("http");
 const { Server } = require("socket.io");
-
+const activeMeetingRecordings = new Map();
 // IMPORT PRODUCTION SYNC SERVICE
 const productionSyncService = require("./services/productionSyncService");
 
@@ -123,6 +123,11 @@ io.on("connection", (socket) => {
     if (meetId) {
       socket.join(`meeting_${meetId}`);
       console.log(`Socket ${socket.id} joined meeting_${meetId}`);
+      if (activeMeetingRecordings.has(meetId)) {
+        const info = activeMeetingRecordings.get(meetId);
+        socket.emit("recording_started", { meetId, startedBy: info.startedBy, startedByName: info.startedByName, startedAt: info.startedAt, lateJoin: true });
+        console.log(`[Recording] Late joiner auto-notified for meeting_${meetId}`);
+      }
     }
   });
 
@@ -134,28 +139,17 @@ io.on("connection", (socket) => {
   // CEO/TL starts recording → broadcast to all in meeting room
   socket.on("recording_start", ({ meetId, startedBy, startedByName }) => {
     if (!meetId) return;
-    console.log(`[Recording] START signal for meeting ${meetId} by ${startedByName}`);
-    // Broadcast to all OTHER participants in this meeting room
-    socket.to(`meeting_${meetId}`).emit("recording_started", {
-      meetId,
-      startedBy,
-      startedByName,
-      startedAt: new Date().toISOString(),
-    });
+    const startedAt = new Date().toISOString();
+    activeMeetingRecordings.set(meetId, { startedBy, startedByName, startedAt });
+    io.to(`meeting_${meetId}`).emit("recording_started", { meetId, startedBy, startedByName, startedAt });
   });
 
   // CEO/TL stops recording → broadcast to all in meeting room
   socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
     if (!meetId) return;
-    console.log(`[Recording] STOP signal for meeting ${meetId} by ${stoppedByName}`);
-    socket.to(`meeting_${meetId}`).emit("recording_stopped", {
-      meetId,
-      stoppedBy,
-      stoppedByName,
-      stoppedAt: new Date().toISOString(),
-    });
+    activeMeetingRecordings.delete(meetId);
+    io.to(`meeting_${meetId}`).emit("recording_stopped", { meetId, stoppedBy, stoppedByName, stoppedAt: new Date().toISOString() });
   });
-
 
   // ── COWORKING SPACE: Online presence tracking ─────────────────────────
   socket.on("workspace-set-online", (memberId) => {
