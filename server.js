@@ -541,6 +541,8 @@ app.use("/api/cms/sales", quotationRoutes);
 const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
 
+
+// HR Department Routes
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
 
@@ -565,6 +567,10 @@ app.use("/hr/attendance", attendanceRouter);
 
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
+
+const employeeImportRoutes = require("./routes/HrRoutes/employeeImportExport.js");
+app.use("/api/employees/import-export", employeeImportRoutes);
+
 
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);

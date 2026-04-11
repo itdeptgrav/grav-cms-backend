@@ -229,7 +229,7 @@ candidateSchema.methods.addInterviewQuestion = function (questionData) {
       !(
         q.stage === questionData.stage &&
         q.evaluatedBy?.employeeId?.toString() ===
-          questionData.evaluatedBy?.employeeId?.toString() &&
+        questionData.evaluatedBy?.employeeId?.toString() &&
         q.question === questionData.question
       ),
   );
