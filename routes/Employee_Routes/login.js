@@ -40,7 +40,7 @@ router.post("/login", async (req, res) => {
         type: "employee",
       },
       process.env.JWT_SECRET,
-      { expiresIn: "24h" },
+      { expiresIn: "7d" },
     );
 
     const isProduction = process.env.NODE_ENV === "production";
@@ -49,7 +49,7 @@ router.post("/login", async (req, res) => {
       httpOnly: true,
       secure: isProduction, // ✅ must be true only in https production
       sameSite: isProduction ? "none" : "lax", // ✅ Fix for localhost
-      maxAge: 24 * 60 * 60 * 1000,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // ✅ 7 days
     });
 
     res.status(200).json({
