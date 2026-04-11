@@ -502,6 +502,11 @@ app.use("/api/cms/sales/overview", salesOverview);
 const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
 app.use("/api/cms/sales", quotationRoutes);
 
+// ─── GOOGLE WORKSPACE ROUTES ────────────────────────────────
+const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
+app.use("/api/google", googleWorkspaceRoutes);
+
+
 // HR Department Routes
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);

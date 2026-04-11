@@ -6,14 +6,13 @@ const Measurement = require("../../../../models/Customer_Models/Measurement");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+// Add this import at the top
+const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
+
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET employee measurements for a specific work order
-// Unit ranges come from EmployeeProductionProgress (single source of truth).
-// ─────────────────────────────────────────────────────────────────────────────
 router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
   try {
     const { woId } = req.params;
@@ -26,21 +25,17 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
       return res.status(404).json({ success: false, message: "Work order not found" });
     }
 
-    // ── StockItem: panel count + gender category ──────────────────────────
     const stockItem = await StockItem.findById(workOrder.stockItemId)
       .select("numberOfPanels genderCategory gender category")
       .lean();
 
     const panelCount = stockItem?.numberOfPanels || 1;
-
-    // Derive gender category — field names vary across older/newer StockItem docs
     const genderCategory =
       stockItem?.genderCategory ||
       stockItem?.gender ||
       stockItem?.category ||
       null;
 
-    // ── Measurement doc (for measurements/sizes per employee) ─────────────
     const measurement = await Measurement.findOne({
       poRequestId: workOrder.customerRequestId,
     }).lean();
@@ -49,34 +44,40 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
       return res.status(404).json({ success: false, message: "No measurement data found" });
     }
 
-    // ── EmployeeProductionProgress: source of truth for unit assignment ───
     const progressDocs = await EmployeeProductionProgress.find({
       workOrderId: workOrder._id,
     })
       .select("employeeId employeeName employeeUIN gender unitStart unitEnd totalUnits completedUnits completionPercentage assignedBarcodeIds isDispatched")
       .lean();
 
-    // Build a map: employeeId → progress doc
     const progressByEmployee = new Map();
     for (const doc of progressDocs) {
       progressByEmployee.set(doc.employeeId.toString(), doc);
     }
 
-    // ── Build employee measurement list ───────────────────────────────────
-    // Merge measurement data with progress doc unit ranges.
-    // Only include employees that have a progress doc for this WO
-    // (ensures we never silently fall back to wrong sequential logic).
+    // ── Fetch dept/designation from EmployeeMpc ───────────────────────────
+    const employeeIds = (measurement.employeeMeasurements || [])
+      .map((e) => e.employeeId)
+      .filter(Boolean);
+
+    const mpcDocs = await EmployeeMpc.find({ _id: { $in: employeeIds } })
+      .select("_id department designation")
+      .lean();
+
+    const mpcById = new Map();
+    for (const doc of mpcDocs) {
+      mpcById.set(doc._id.toString(), doc);
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     const employeeMeasurements = [];
 
     for (const emp of measurement.employeeMeasurements || []) {
       const empIdStr = emp.employeeId?.toString();
       const progress = progressByEmployee.get(empIdStr);
 
-      // Skip if no progress doc exists for this employee on this WO
-      // (means they're not assigned to this product)
       if (!progress) continue;
 
-      // Find the product entry for this WO's stock item
       const productEntry = (emp.products || []).find((p) => {
         const pIdStr = p.productId?.toString();
         return (
@@ -85,7 +86,6 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
         );
       });
 
-      // Measurements/sizes come from measurement doc; unit ranges from progress doc
       employeeMeasurements.push({
         employeeId: empIdStr,
         employeeName: emp.employeeName,
@@ -94,6 +94,13 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
         quantity: progress.totalUnits,
         unitStart: progress.unitStart,
         unitEnd: progress.unitEnd,
+        employeeUIN:  emp.employeeUIN,
+        gender:       emp.gender,
+        department:   mpcById.get(empIdStr)?.department || "",
+        designation:  mpcById.get(empIdStr)?.designation || "",
+        quantity:     progress.totalUnits,
+        unitStart:    progress.unitStart,
+        unitEnd:      progress.unitEnd,
         measurements: productEntry?.measurements || [],
         qrGenerated: productEntry?.qrGenerated || false,
         completedUnits: progress.completedUnits || 0,
@@ -102,8 +109,6 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
       });
     }
 
-    // ── Sort: group by gender (M together, F together, others last) ───────
-    // Within each gender group, preserve measurement doc order.
     const genderOrder = { M: 0, Male: 0, m: 0, F: 1, Female: 1, f: 1 };
     employeeMeasurements.sort((a, b) => {
       const ga = genderOrder[a.gender] ?? 2;
