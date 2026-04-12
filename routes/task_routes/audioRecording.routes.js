@@ -313,7 +313,8 @@ module.exports = function (io) {
 
                 // File name: {employeeId}_{firstName}_audio_{meetingId}.{ext}
                 // uploadAudioToDrive handles (1),(2)... suffix if file already exists
-                const safeName = (firstName || name || "user").split(" ")[0].replace(/[^a-zA-Z0-9]/g, "");
+                // Use sanitized full name — avoids collision between participants with same first name
+                const safeName = (firstName || name || "user").replace(/[^a-zA-Z0-9]/g, "").slice(0, 20) || employeeId;
                 const baseFileName = `${employeeId}_${safeName}_audio_${meetId}.${ext}`;
 
                 console.log(`[AudioFinalize] Merging ${merged.length} bytes for ${employeeId} → ${baseFileName}`);
