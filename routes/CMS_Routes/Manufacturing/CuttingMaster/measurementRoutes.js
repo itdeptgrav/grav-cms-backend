@@ -6,13 +6,15 @@ const Measurement = require("../../../../models/Customer_Models/Measurement");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
-// Add this import at the top
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
+// ============================================================================
+// GET: Employee measurements for a work order
+// ============================================================================
 router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
   try {
     const { woId } = req.params;
@@ -55,7 +57,6 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
       progressByEmployee.set(doc.employeeId.toString(), doc);
     }
 
-    // ── Fetch dept/designation from EmployeeMpc ───────────────────────────
     const employeeIds = (measurement.employeeMeasurements || [])
       .map((e) => e.employeeId)
       .filter(Boolean);
@@ -68,7 +69,6 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
     for (const doc of mpcDocs) {
       mpcById.set(doc._id.toString(), doc);
     }
-    // ─────────────────────────────────────────────────────────────────────
 
     const employeeMeasurements = [];
 
@@ -138,11 +138,9 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
   }
 });
 
-
-// ─────────────────────────────────────────────────────────────────────────────
+// ============================================================================
 // GET: Search employees by name / UIN / department across an MO
-// /manufacturing-orders/:moId/search-employees?q=searchTerm
-// ─────────────────────────────────────────────────────────────────────────────
+// ============================================================================
 router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
   try {
     const { moId } = req.params;
@@ -152,7 +150,6 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       return res.json({ success: true, employees: [] });
     }
 
-    // ── Find the measurement doc linked to this MO ────────────────────────
     const measurement = await Measurement.findOne({ poRequestId: moId })
       .select("_id name organizationName employeeMeasurements")
       .lean();
@@ -161,7 +158,6 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       return res.json({ success: true, employees: [] });
     }
 
-    // ── Filter matching employees first ───────────────────────────────────
     const matched = (measurement.employeeMeasurements || []).filter((emp) => {
       return (
         emp.employeeName?.toLowerCase().includes(q) ||
@@ -173,7 +169,6 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       return res.json({ success: true, employees: [] });
     }
 
-    // ── Fetch dept/designation from EmployeeMpc ───────────────────────────
     const employeeIds = matched.map((e) => e.employeeId).filter(Boolean);
 
     const mpcDocs = await EmployeeMpc.find({ _id: { $in: employeeIds } })
@@ -185,8 +180,6 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       mpcById.set(doc._id.toString(), doc);
     }
 
-    // ── Re-check department match (now we have it) ────────────────────────
-    // If q didn't match name/UIN but matches dept, include those too
     const allEmployeeIds = (measurement.employeeMeasurements || [])
       .filter((emp) => {
         const empIdStr = emp.employeeId?.toString();
@@ -207,7 +200,6 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       finalEmployeeSet.has(emp.employeeId?.toString())
     );
 
-    // ── Fetch all WOs for this MO to get progress + product names ─────────
     const workOrders = await WorkOrder.find({ customerRequestId: moId })
       .select("_id workOrderNumber stockItemName stockItemId")
       .lean();
@@ -219,7 +211,6 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       .select("employeeId workOrderId unitStart unitEnd totalUnits completedUnits completionPercentage qrGenerated isDispatched")
       .lean();
 
-    // Key: employeeId_workOrderId
     const progressMap = new Map();
     for (const p of progressDocs) {
       const key = `${p.employeeId.toString()}_${p.workOrderId.toString()}`;
@@ -231,7 +222,6 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       woById.set(wo._id.toString(), wo);
     }
 
-    // ── Build response ─────────────────────────────────────────────────────
     const employees = finalMatched.map((emp) => {
       const empIdStr = emp.employeeId?.toString();
       const mpc = mpcById.get(empIdStr);
@@ -285,9 +275,10 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ============================================================================
 // POST: Update QR generated status
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Also stamps qrGeneratedAt so cutting-history can filter by date ──────────
+// ============================================================================
 router.post("/employee-measurements/:measurementId/update-status", async (req, res) => {
   try {
     const { measurementId } = req.params;
@@ -303,11 +294,14 @@ router.post("/employee-measurements/:measurementId/update-status", async (req, r
     }
 
     let updated = false;
+    const now = new Date();
+
     measurement.employeeMeasurements.forEach((emp) => {
       if (emp.employeeId.toString() === employeeId) {
         emp.products.forEach((product) => {
           if (product.productName === productName) {
-            product.qrGenerated = true;
+            product.qrGenerated  = true;
+            product.qrGeneratedAt = now; // ← NEW: stamp the cut date/time
             updated = true;
           }
         });
@@ -323,6 +317,133 @@ router.post("/employee-measurements/:measurementId/update-status", async (req, r
   } catch (error) {
     console.error("Error updating status:", error);
     res.status(500).json({ success: false, message: "Server error while updating status" });
+  }
+});
+
+// ============================================================================
+// GET: Daily cutting history  (used by the overview dashboard)
+// /cutting-history?from=YYYY-MM-DD&to=YYYY-MM-DD&q=searchTerm
+//
+// Returns employees grouped by organizationName whose barcode (QR) was
+// generated within the requested date range, with stats for the stats bar.
+// ============================================================================
+router.get("/cutting-history", async (req, res) => {
+  try {
+    const { from, to, q } = req.query;
+
+    // ── Build date window (defaults to today in IST) ─────────────────────
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const todayIST  = new Date(Date.now() + istOffset);
+    const todayStr  = todayIST.toISOString().split("T")[0];
+
+    const fromDate = new Date(from || todayStr);
+    fromDate.setHours(0, 0, 0, 0);
+
+    const toDate = new Date(to || todayStr);
+    toDate.setHours(23, 59, 59, 999);
+
+    const searchLower = q ? q.trim().toLowerCase() : null;
+
+    // ── Fetch all measurements (only fields we need) ─────────────────────
+    const measurements = await Measurement.find({})
+      .select("organizationName employeeMeasurements")
+      .lean();
+
+    // ── Batch-fetch EmployeeMpc for dept/designation ─────────────────────
+    const allEmpIds = new Set();
+    measurements.forEach((m) =>
+      (m.employeeMeasurements || []).forEach((e) => {
+        if (e.employeeId) allEmpIds.add(e.employeeId.toString());
+      })
+    );
+
+    const mpcDocs = await EmployeeMpc.find({ _id: { $in: Array.from(allEmpIds) } })
+      .select("_id department designation")
+      .lean();
+
+    const mpcById = new Map();
+    for (const doc of mpcDocs) mpcById.set(doc._id.toString(), doc);
+
+    // ── Build grouped result ─────────────────────────────────────────────
+    const groupsMap  = new Map(); // orgName → employee[]
+    let totalEmployees = 0;
+    let totalPieces    = 0;
+    const productSet   = new Set();
+
+    for (const measurement of measurements) {
+      const orgName = measurement.organizationName || "Unknown";
+
+      for (const emp of measurement.employeeMeasurements || []) {
+        // ── Search filter (name or UIN) ───────────────────────────────
+        if (searchLower) {
+          const nameHit = emp.employeeName?.toLowerCase().includes(searchLower);
+          const uinHit  = emp.employeeUIN?.toLowerCase().includes(searchLower);
+          if (!nameHit && !uinHit) continue;
+        }
+
+        // ── Only include products whose QR was generated in range ─────
+        const cutProducts = (emp.products || []).filter((p) => {
+          if (!p.qrGenerated || !p.qrGeneratedAt) return false;
+          const d = new Date(p.qrGeneratedAt);
+          return d >= fromDate && d <= toDate;
+        });
+
+        if (cutProducts.length === 0) continue;
+
+        const empIdStr = emp.employeeId?.toString();
+        const mpc      = mpcById.get(empIdStr) || {};
+
+        cutProducts.forEach((p) => {
+          productSet.add(p.productName);
+          totalPieces += p.quantity || 0;
+        });
+        totalEmployees++;
+
+        if (!groupsMap.has(orgName)) groupsMap.set(orgName, []);
+        groupsMap.get(orgName).push({
+          employeeId:  empIdStr,
+          employeeName: emp.employeeName,
+          employeeUIN:  emp.employeeUIN,
+          gender:        emp.gender,
+          department:    mpc.department   || "",
+          designation:   mpc.designation  || "",
+          products: cutProducts.map((p) => ({
+            productName:   p.productName,
+            quantity:      p.quantity,
+            qrGeneratedAt: p.qrGeneratedAt,
+          })),
+        });
+      }
+    }
+
+    // ── Sort each org's employees: Male first, then Female ──────────────
+    const genderOrder = { Male: 0, M: 0, m: 0, Female: 1, F: 1, f: 1 };
+    const groups = Array.from(groupsMap.entries()).map(([orgName, employees]) => {
+      employees.sort((a, b) => (genderOrder[a.gender] ?? 2) - (genderOrder[b.gender] ?? 2));
+      const orgPieces = employees.reduce(
+        (s, e) => s + e.products.reduce((ps, p) => ps + (p.quantity || 0), 0),
+        0
+      );
+      return { organizationName: orgName, employeeCount: employees.length, totalPieces: orgPieces, employees };
+    });
+
+    // Sort orgs alphabetically
+    groups.sort((a, b) => a.organizationName.localeCompare(b.organizationName));
+
+    res.json({
+      success: true,
+      dateRange: { from: fromDate, to: toDate },
+      stats: {
+        totalEmployees,
+        totalPieces,
+        totalProducts:      productSet.size,
+        totalOrganizations: groups.length,
+      },
+      groups,
+    });
+  } catch (error) {
+    console.error("Error fetching cutting history:", error);
+    res.status(500).json({ success: false, message: "Server error while fetching cutting history" });
   }
 });
 
