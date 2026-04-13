@@ -23,7 +23,8 @@ const allowedOrigins = [
   "http://192.168.1.30:3000",
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
   "http://10.99.21.15:3000",
-  "https://8ks0bflk-5000.inc1.devtunnels.ms"
+  "https://8ks0bflk-5000.inc1.devtunnels.ms",
+  "https://grav-cms-dncs.vercel.app"
 ];
 
 app.use(
