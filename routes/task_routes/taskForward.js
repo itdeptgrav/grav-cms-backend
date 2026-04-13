@@ -15,7 +15,6 @@ const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 const svc = require("../../services/taskForward.service");
 const { db, admin } = require("../../config/firebaseAdmin");
-const { sendTaskAssignedEmail } = require("../../services/emailNotifications.service");
 
 // ── Helper: get employee info (name + email) from Firestore ──────────────────
 async function getAssigneeContacts(assigneeIds) {
@@ -116,20 +115,7 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     }
 
     res.status(201).json({ success: true, task });
-
-    // Send task assignment email to all assignees (non-blocking)
-    getAssigneeContacts(assigneeIds).then(contacts =>
-      sendTaskAssignedEmail({
-        taskId: task.taskId,
-        title: task.title,
-        description: task.description,
-        assignedByName: req.coworkUser.name,
-        dueDate: task.dueDate || null,
-        priority: task.priority || "medium",
-        type: parentTaskId ? "subtask" : "task",
-        parentTitle: null,
-      }, contacts)
-    ).catch(err => console.error("[taskForward/create] Email error:", err.message));
+    // Email is now handled inside svc.createTask() via _notifyMany → sendNotificationEmail
 
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -217,24 +203,8 @@ router.post("/task/:taskId/forward", verifyCoworkToken, verifyEmployeeToken, asy
       assignments,
     });
     res.status(201).json({ success: true, ...result });
+    // Email handled inside svc.forwardTask() via _notifyMany → sendNotificationEmail
 
-    // Send assignment emails for each forwarded subtask (non-blocking)
-    if (result.subtasks?.length) {
-      for (const subtask of result.subtasks) {
-        getAssigneeContacts(subtask.assigneeIds || []).then(contacts =>
-          sendTaskAssignedEmail({
-            taskId: subtask.taskId,
-            title: subtask.title,
-            description: subtask.description,
-            assignedByName: req.coworkUser.name,
-            dueDate: subtask.dueDate || null,
-            priority: subtask.priority || "medium",
-            type: "forwarded",
-            parentTitle: null,
-          }, contacts)
-        ).catch(err => console.error("[taskForward/forward] Email error:", err.message));
-      }
-    }
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -278,20 +248,7 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
     );
 
     res.status(201).json({ success: true, subtask });
-
-    // Send assignment email to subtask assignees (non-blocking)
-    getAssigneeContacts(assigneeIds).then(contacts =>
-      sendTaskAssignedEmail({
-        taskId: subtask.taskId,
-        title: subtask.title || title.trim(),
-        description: subtask.description,
-        assignedByName: name,
-        dueDate: subtask.dueDate || dueDate || null,
-        priority: subtask.priority || priority || "medium",
-        type: "subtask",
-        parentTitle: parent.title || null,
-      }, contacts)
-    ).catch(err => console.error("[taskForward/subtask] Email error:", err.message));
+    // Email handled inside svc.createTask() via _notifyMany → sendNotificationEmail
 
   } catch (e) { res.status(400).json({ error: e.message }); }
 });

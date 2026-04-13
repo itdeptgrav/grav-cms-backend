@@ -30,7 +30,7 @@ function deadlineColor(dueDate) {
 }
 
 // ─── Notify helper ────────────────────────────────────────
-async function _notifyMany({ recipientIds, type, title, body, data }) {
+async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
   const batch = db.batch();
   recipientIds.forEach(id => {
@@ -42,11 +42,33 @@ async function _notifyMany({ recipientIds, type, title, body, data }) {
   });
   await batch.commit();
   socket.emitToMany(recipientIds, "new_notification", { type, title, body, data });
-  // Send push notification via fcmPush.service (reads cowork_fcm_tokens collection)
+
+  // FCM push — always fires immediately, no cooldown
   try {
     const { sendPushToEmployees } = require("./fcmPush.service");
     await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
   } catch (e) { console.error("[FCM taskForward]", e.message); }
+
+  // Email — 20-min cooldown per sender→receiver pair
+  try {
+    const { sendNotificationEmail } = require("./emailNotifications.service");
+    const empDocs = await Promise.all(
+      recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
+    );
+    for (const empDoc of empDocs) {
+      if (!empDoc.exists) continue;
+      const emp = empDoc.data();
+      if (!emp.email) continue;
+      await sendNotificationEmail({
+        senderId: senderId || "system",
+        senderName: senderName || "CoWork",
+        receiverId: emp.employeeId || empDoc.id,
+        receiverName: emp.name || empDoc.id,
+        receiverEmail: emp.email,
+        type, title, body, data: data || {},
+      });
+    }
+  } catch (e) { console.error("[Email taskForward]", e.message); }
 }
 
 // ─── ID generator ─────────────────────────────────────────
@@ -80,10 +102,16 @@ async function _buildPath(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
-async function createTask({ title, description, notes, assignedBy, assignedByName, assigneeIds, dueDate, priority = "medium", parentTaskId = null }) {
+async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = "medium", parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null }) {
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
   const path = await _buildPath(parentTaskId);
+
+  // rootCreatedByRole = who is the root creator for the completion review flow.
+  // RULE: use what's explicitly passed (forwardTask passes parent's root role),
+  //       OR the immediate creator's own role. NEVER inherit from parent automatically —
+  //       a TL directly creating a subtask is TL's own task (tl_final), not CEO's (tl_then_ceo).
+  const resolvedRootRole = rootCreatedByRole || assignedByRole || null;
 
   const task = {
     taskId,
@@ -92,6 +120,8 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     notes: notes || "",
     assignedBy,
     assignedByName: assignedByName || "",
+    assignedByRole: assignedByRole || null,
+    rootCreatedByRole: resolvedRootRole,
     assigneeIds: assigneeIds || [],
     dueDate: dueDate || null,
     priority,
@@ -99,18 +129,21 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     deadlineColor: deadlineColor(dueDate),
     progressPercent: 0,
     status: "open",
+    groupId: groupId || null,
     // Hierarchy
     parentTaskId: parentTaskId || null,
-    isRoot: !parentTaskId,          // true only for top-level tasks
-    depth: path.length,              // 0 = root, 1 = subtask, 2 = sub-subtask, ...
-    path,                            // breadcrumb: [{taskId, title}, ...]
+    isRoot: !parentTaskId,
+    depth: path.length,
+    path,
     subtaskIds: [],
-    // Workflow
+    // Workflow flags
     confirmedBy: [],
     forwardedBy: null,
     forwardedByName: null,
     originalAssignedBy: assignedBy,
-    // Reports & thread (in subcollections, not embedded)
+    createdByTl: createdByTl || assignedByRole === "tl",
+    createdByCeo: createdByCeo || assignedByRole === "ceo",
+    // Reports & thread
     dailyReportCount: 0,
     chatMessageCount: 0,
     // Completion
@@ -141,7 +174,9 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
       type: "task_assigned",
       title: parentTaskId ? `New subtask: ${title}` : `New task: ${title}`,
       body: notes?.slice(0, 80) || description?.slice(0, 80) || "You have been assigned a task.",
-      data: { taskId, parentTaskId: parentTaskId || "" },
+      data: { taskId, taskTitle: title, priority, dueDate, description, parentTaskId: parentTaskId || "" },
+      senderId: assignedBy,
+      senderName: assignedByName || assignedBy,
     });
     socket.emitToMany(assigneeIds, "new_task", {
       taskId, task: { ...task, createdAt: now }, title, assignedBy, parentTaskId,
@@ -169,7 +204,7 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
   });
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
-  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `${employeeName} confirmed: ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId } });
+  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `${employeeName} confirmed: ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
   socket.emitToMany([...new Set(notifyIds)], "task_confirmed", { taskId, employeeId, employeeName });
   return { success: true };
 }
@@ -192,7 +227,7 @@ async function markTaskStarted({ taskId, employeeId, employeeName }) {
   });
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
-  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_started", title: `${employeeName} started: ${task.title}`, body: `Work has begun on "${task.title}"`, data: { taskId } });
+  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_started", title: `${employeeName} started: ${task.title}`, body: `Work has begun on "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
   socket.emitToMany([...new Set(notifyIds)], "task_started", { taskId, employeeId, employeeName });
   return { success: true };
 }
@@ -224,10 +259,13 @@ async function forwardTask({ parentTaskId, forwardedBy, forwardedByName, assignm
       notes: assignment.notes,
       assignedBy: forwardedBy,
       assignedByName: forwardedByName,
+      assignedByRole: forwarderRole,
       assigneeIds: [assignment.employeeId],
       dueDate: assignment.dueDate || parent.dueDate || null,
       priority: assignment.priority || parent.priority || "medium",
       parentTaskId,
+      // Inherit root creator role so _reviewFlow stays correct down the chain
+      rootCreatedByRole: parent.rootCreatedByRole || parent.assignedByRole || null,
     });
     newTaskIds.push(newTask.taskId);
   }
@@ -293,7 +331,9 @@ async function submitDailyReport({ taskId, employeeId, employeeName, message, im
     type: "daily_report",
     title: `Daily report: ${task.title}`,
     body: `${employeeName}: ${message.slice(0, 60)} · ${progressPercent}%`,
-    data: { taskId },
+    data: { taskId, taskTitle: task.title },
+    senderId: employeeId,
+    senderName: employeeName,
   });
   socket.emitToMany([...new Set(notifyIds)], "task_report", { taskId, report, progressPercent, status: newStatus });
 
@@ -315,13 +355,21 @@ async function _syncParentProgress(parentTaskId) {
   if (!subtasks.length) return;
 
   const avg = Math.round(subtasks.reduce((sum, s) => sum + (s.progressPercent || 0), 0) / subtasks.length);
-  const allDone = subtasks.every(s => s.status === "done");
 
-  await db.collection("cowork_tasks").doc(parentTaskId).update({
-    progressPercent: avg,
-    status: allDone ? "done" : avg > 0 ? "in_progress" : parent.status,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  // NEVER auto-complete the parent task based on subtask completion.
+  // The parent has its own review flow (TL submits → CEO approves, etc.)
+  // Only update progressPercent and move to in_progress if work has started.
+  // Status "done" can only be set through the proper completion review flow.
+  const alreadyDone = ["done", "ceo_approved", "tl_final_approved"].includes(parent.status)
+    || ["ceo_approved", "tl_final_approved"].includes(parent.completionStatus);
+
+  if (!alreadyDone) {
+    await db.collection("cowork_tasks").doc(parentTaskId).update({
+      progressPercent: avg,
+      status: avg > 0 ? "in_progress" : parent.status,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
 
   // Recurse up if grandparent exists
   if (parent.parentTaskId) await _syncParentProgress(parent.parentTaskId);
@@ -375,7 +423,9 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
         type: "task_chat",
         title: `${senderName} in ${task.title} (${taskId})`,
         body: (text || "📎 attachment").slice(0, 80),
-        data: { taskId },
+        data: { taskId, taskTitle: task.title },
+        senderId,
+        senderName,
       });
     }
   }
@@ -605,7 +655,9 @@ async function editTaskDeadline({ taskId, newDueDate, reason, editedBy, editedBy
     type: "deadline_changed",
     title: `Deadline updated: ${task.title}`,
     body: `${reason.trim()}`,
-    data: { taskId },
+    data: { taskId, taskTitle: task.title },
+    senderId: editedBy,
+    senderName: editedByName,
   });
 
   return { success: true };
@@ -655,7 +707,79 @@ async function deleteTask({ taskId, deletedBy }) {
   }
 
   socket.emitToMany(task.assigneeIds || [], "task_deleted", { taskId, title: task.title });
+
+  // Notify all assignees that the task was deleted
+  if (task.assigneeIds?.length) {
+    await _notifyMany({
+      recipientIds: task.assigneeIds,
+      type: "task_deleted",
+      title: `Task deleted: ${task.title}`,
+      body: `The task "${task.title}" has been deleted.`,
+      data: { taskId, taskTitle: task.title },
+      senderId: deletedBy,
+      senderName: deletedBy,
+    });
+  }
+
   return { success: true, taskId };
+}
+
+// ═════════════════════════════════════════════════════════
+//  HELPER: determine review flow for a task
+//  Returns: "tl_then_ceo" | "ceo_direct" | "tl_final"
+// ═════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════
+//  _reviewFlow — async, queries Firestore if needed for old tasks
+//  Returns: "tl_then_ceo" | "ceo_direct" | "tl_final"
+// ═════════════════════════════════════════════════════════
+async function _reviewFlow(task) {
+  // ── Fast path: use stored fields (new tasks have all these) ──────────────
+  const rootRole = task.rootCreatedByRole || task.assignedByRole;
+
+  if (rootRole === "tl") return "tl_final";
+
+  if (rootRole === "ceo") {
+    if (!task.parentTaskId && !task.forwardedBy) return "ceo_direct";
+    return "tl_then_ceo";
+  }
+
+  // Legacy flags (old tasks may have these)
+  if (task.createdByTl === true) return "tl_final";
+  if (task.createdByCeo === true && !task.forwardedBy) return "ceo_direct";
+  if (task.createdByCeo === true && task.forwardedBy) return "tl_then_ceo";
+
+  // ── Fallback: query Firestore for old tasks without stored flow fields ────
+  // For old tasks, just check the IMMEDIATE assignedBy's role.
+  // forwardTask already passes rootCreatedByRole explicitly, so those tasks
+  // never reach this fallback. Only directly-created tasks land here.
+  if (task.assignedBy) {
+    try {
+      const empDoc = await db.collection("cowork_employees").doc(task.assignedBy).get();
+      if (empDoc.exists) {
+        const assignerRole = empDoc.data().role;
+
+        // Self-heal: write back so next call is instant (no DB hit)
+        const updateId = task.taskId || task.id;
+        if (updateId) {
+          await db.collection("cowork_tasks").doc(updateId).update({
+            rootCreatedByRole: assignerRole,
+            assignedByRole: assignerRole,
+            createdByTl: assignerRole === "tl",
+            createdByCeo: assignerRole === "ceo",
+          }).catch(() => { });
+        }
+
+        if (assignerRole === "tl") return "tl_final";
+        if (assignerRole === "ceo") {
+          return task.parentTaskId ? "tl_then_ceo" : "ceo_direct";
+        }
+      }
+    } catch (e) {
+      console.warn("[_reviewFlow] Fallback query failed:", e.message);
+    }
+  }
+
+  return "tl_then_ceo"; // safe default
 }
 
 // ═════════════════════════════════════════════════════════
@@ -667,11 +791,12 @@ async function submitCompletionRequest({ taskId, employeeId, employeeName, messa
   if (!doc.exists) throw new Error("Task not found.");
   const task = doc.data();
   if (!task.assigneeIds?.includes(employeeId)) throw new Error("Not assigned to this task.");
-  if (["tl_approved", "ceo_approved"].includes(task.completionStatus)) throw new Error("Already approved.");
+  if (["tl_approved", "ceo_approved", "tl_final_approved"].includes(task.completionStatus)) throw new Error("Already approved.");
 
+  const flow = await _reviewFlow(task);
   const submission = { submittedBy: employeeId, submittedByName: employeeName, message, imageUrls, pdfAttachments, submittedAt: new Date().toISOString() };
 
-  await ref.update({ completionStatus: "submitted", completionSubmission: submission, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+  await ref.update({ completionStatus: "submitted", completionSubmission: submission, reviewFlow: flow, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
   const attachments = [
     ...imageUrls.map(url => ({ type: "image", url, name: "Proof" })),
@@ -685,14 +810,35 @@ async function submitCompletionRequest({ taskId, employeeId, employeeName, messa
     messageType: imageUrls.length > 0 ? "image" : pdfAttachments.length > 0 ? "pdf" : "text",
   });
 
-  const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
-  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "completion_submitted", title: `Work submitted: ${task.title}`, body: `${employeeName} submitted for review`, data: { taskId } });
+  // Notify the right reviewer(s) based on flow
+  let notifyIds = [];
+  if (flow === "tl_final" || flow === "tl_then_ceo") {
+    // Notify TL (assignedBy or originalAssignedBy who is TL)
+    notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
+  } else if (flow === "ceo_direct") {
+    // Notify CEO directly
+    const ceoSnap = await db.collection("cowork_employees").where("role", "==", "ceo").limit(1).get();
+    notifyIds = ceoSnap.docs.map(d => d.data().employeeId).filter(Boolean);
+  }
+
+  await _notifyMany({
+    recipientIds: [...new Set(notifyIds)],
+    type: "completion_submitted",
+    title: `Work submitted: ${task.title}`,
+    body: `${employeeName} submitted for review`,
+    data: { taskId, taskTitle: task.title },
+    senderId: employeeId,
+    senderName: employeeName,
+  });
   socket.emitToMany([...new Set(notifyIds)], "task_completion_submitted", { taskId, submission });
-  return { success: true, taskId, completionStatus: "submitted" };
+  return { success: true, taskId, completionStatus: "submitted", reviewFlow: flow };
 }
 
 // ═════════════════════════════════════════════════════════
-//  13. TL REVIEWS COMPLETION
+//  13. TL / INTERMEDIATE REVIEW
+//  Handles: tl_then_ceo (TL approves → awaits CEO)
+//           tl_final    (TL approves → task complete)
+//           ceo_direct  (CEO is reviewing directly → task complete)
 // ═════════════════════════════════════════════════════════
 async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
@@ -701,47 +847,89 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
   const task = doc.data();
   if (task.completionStatus !== "submitted") throw new Error("No pending submission.");
 
+  const flow = task.reviewFlow || await _reviewFlow(task);
+  const submitterId = task.completionSubmission?.submittedBy;
+
   if (approved) {
     const tlReview = { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: true, reviewedAt: new Date().toISOString() };
-    await ref.update({ completionStatus: "tl_approved", tlReview, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
-    await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `✅ TL ${reviewerName} approved. Forwarding to CEO for final review.`, messageType: "system" });
+    if (flow === "tl_final") {
+      // ── TL is the final approver — task complete ──────────────────────────
+      await ref.update({
+        completionStatus: "tl_final_approved", status: "done", progressPercent: 100,
+        tlReview, updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `🎉 ${reviewerName} approved! Task "${task.title}" is complete.`, messageType: "system" });
 
-    const ceoSnap = await db.collection("cowork_employees").where("role", "==", "ceo").limit(1).get();
-    const ceoIds = ceoSnap.docs.map(d => d.data().employeeId).filter(Boolean);
-    if (ceoIds.length) {
-      await _notifyMany({ recipientIds: ceoIds, type: "completion_tl_approved", title: `TL approved: ${task.title}`, body: `${reviewerName} approved. Your review needed.`, data: { taskId } });
-      socket.emitToMany(ceoIds, "task_completion_tl_approved", { taskId, tlReview });
+      const allIds = [...new Set([...(task.assigneeIds || []), task.assignedBy, submitterId].filter(id => id && id !== reviewerId))];
+      await _notifyMany({ recipientIds: allIds, type: "completion_ceo_approved", title: `✅ Complete: ${task.title}`, body: `${reviewerName} approved. Task is done!`, data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
+      socket.emitToMany(allIds, "task_completed", { taskId });
+      if (task.parentTaskId) await _syncParentProgress(task.parentTaskId);
+
+    } else if (flow === "ceo_direct") {
+      // ── CEO reviewing directly (no TL in chain) — task complete ──────────
+      await ref.update({
+        completionStatus: "ceo_approved", status: "done", progressPercent: 100,
+        ceoReview: { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: true, reviewedAt: new Date().toISOString() },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `🎉 CEO approved! Task "${task.title}" is complete.`, messageType: "system" });
+
+      const allIds = [...new Set([...(task.assigneeIds || []), submitterId].filter(id => id && id !== reviewerId))];
+      await _notifyMany({ recipientIds: allIds, type: "completion_ceo_approved", title: `✅ Complete: ${task.title}`, body: "CEO approved. Task is done!", data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
+      socket.emitToMany(allIds, "task_completed", { taskId });
+      if (task.parentTaskId) await _syncParentProgress(task.parentTaskId);
+
+    } else {
+      // ── tl_then_ceo: TL approves → forward to CEO ────────────────────────
+      await ref.update({ completionStatus: "tl_approved", tlReview, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `✅ TL ${reviewerName} approved. Forwarding to CEO for final review.`, messageType: "system" });
+
+      const ceoSnap = await db.collection("cowork_employees").where("role", "==", "ceo").limit(1).get();
+      const ceoIds = ceoSnap.docs.map(d => d.data().employeeId).filter(Boolean);
+      if (ceoIds.length) {
+        await _notifyMany({ recipientIds: ceoIds, type: "completion_tl_approved", title: `TL approved: ${task.title}`, body: `${reviewerName} approved. Your review needed.`, data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
+        socket.emitToMany(ceoIds, "task_completion_tl_approved", { taskId, tlReview });
+      }
+      if (submitterId && submitterId !== reviewerId) {
+        await _notifyMany({ recipientIds: [submitterId], type: "completion_tl_approved", title: `Work approved by TL: ${task.title}`, body: `${reviewerName} approved. CEO review pending.`, data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
+      }
     }
-    const submitterId = task.completionSubmission?.submittedBy;
-    if (submitterId && submitterId !== reviewerId) {
-      await _notifyMany({ recipientIds: [submitterId], type: "completion_tl_approved", title: `Work approved by TL: ${task.title}`, body: `${reviewerName} approved. CEO review pending.`, data: { taskId } });
-    }
+
   } else {
+    // ── Rejected (all flows) — back to in_progress ────────────────────────
     if (!rejectionReason?.trim()) throw new Error("Rejection reason required.");
     const tlReview = { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: false, rejectionReason: rejectionReason.trim(), reviewedAt: new Date().toISOString() };
     await ref.update({ completionStatus: "tl_rejected", tlReview, status: "in_progress", updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ ${reviewerName} rejected.\n📝 Reason: ${rejectionReason.trim()}`, messageType: "system" });
 
-    await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ TL ${reviewerName} rejected.\n📝 Reason: ${rejectionReason.trim()}`, messageType: "system" });
-
-    const submitterId = task.completionSubmission?.submittedBy;
     if (submitterId) {
-      await _notifyMany({ recipientIds: [submitterId], type: "completion_rejected", title: `Work rejected: ${task.title}`, body: `Reason: ${rejectionReason.trim()}`, data: { taskId } });
+      await _notifyMany({ recipientIds: [submitterId], type: "completion_rejected", title: `Work rejected: ${task.title}`, body: `Reason: ${rejectionReason.trim()}`, data: { taskId, taskTitle: task.title, reason: rejectionReason.trim() }, senderId: reviewerId, senderName: reviewerName });
       socket.emitToMany([submitterId], "task_completion_rejected", { taskId, tlReview });
     }
   }
 
-  return { success: true, taskId, approved, completionStatus: approved ? "tl_approved" : "tl_rejected" };
+  const finalStatus = approved
+    ? (flow === "tl_final" ? "tl_final_approved" : flow === "ceo_direct" ? "ceo_approved" : "tl_approved")
+    : "tl_rejected";
+  return { success: true, taskId, approved, completionStatus: finalStatus, reviewFlow: flow };
 }
 
 // ═════════════════════════════════════════════════════════
-//  14. CEO FINAL REVIEW
+//  14. CEO FINAL REVIEW (only for tl_then_ceo flow)
+//  Called after TL has already approved (completionStatus === "tl_approved")
 // ═════════════════════════════════════════════════════════
 async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
   const task = doc.data();
+
+  const flow = task.reviewFlow || await _reviewFlow(task);
+
+  // Only valid for tl_then_ceo flow
+  if (flow === "tl_final") throw new Error("This task only requires TL approval — CEO review not needed.");
+  if (flow === "ceo_direct") throw new Error("This task is handled via reviewCompletion — use that endpoint.");
   if (task.completionStatus !== "tl_approved") throw new Error("Must be TL-approved first.");
 
   if (approved) {
@@ -752,7 +940,7 @@ async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved,
     });
     await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `🎉 CEO approved! Task "${task.title}" is complete.`, messageType: "system" });
     const allIds = [...new Set([...(task.assigneeIds || []), task.assignedBy, task.completionSubmission?.submittedBy].filter(id => id && id !== reviewerId))];
-    await _notifyMany({ recipientIds: allIds, type: "completion_ceo_approved", title: `✅ Complete: ${task.title}`, body: "CEO approved. Task is done!", data: { taskId } });
+    await _notifyMany({ recipientIds: allIds, type: "completion_ceo_approved", title: `✅ Complete: ${task.title}`, body: "CEO approved. Task is done!", data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
     socket.emitToMany(allIds, "task_completed", { taskId });
     if (task.parentTaskId) await _syncParentProgress(task.parentTaskId);
   } else {
@@ -764,7 +952,7 @@ async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved,
     });
     await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ CEO rejected.\n📝 Reason: ${rejectionReason.trim()}\nTask is back to pending.`, messageType: "system" });
     const allIds = [...new Set([...(task.assigneeIds || []), task.completionSubmission?.submittedBy].filter(id => id && id !== reviewerId))];
-    await _notifyMany({ recipientIds: allIds, type: "completion_ceo_rejected", title: `❌ Rejected: ${task.title}`, body: `CEO: ${rejectionReason.trim()}`, data: { taskId } });
+    await _notifyMany({ recipientIds: allIds, type: "completion_ceo_rejected", title: `❌ Rejected: ${task.title}`, body: `CEO: ${rejectionReason.trim()}`, data: { taskId, taskTitle: task.title, reason: rejectionReason.trim() }, senderId: reviewerId, senderName: reviewerName });
     socket.emitToMany(allIds, "task_completion_rejected", { taskId });
   }
   return { success: true, taskId, approved, completionStatus: approved ? "ceo_approved" : "ceo_rejected" };

@@ -180,7 +180,9 @@ async function createCoworkGroup({ name, description, memberIds, createdBy, crea
     type: "group_added",
     title: `Added to: ${name}`,
     body: `You were added to "${name}"`,
-    data: { groupId }
+    data: { groupId, groupName: name },
+    senderId: createdBy,
+    senderName: "CoWork",
   });
 
   return data;
@@ -202,8 +204,25 @@ async function deleteCoworkGroup(groupId, requestingEmployeeId) {
     }
   }
 
+  const memberIds = docSnap.data().memberIds || [];
+  const groupName = docSnap.data().name || "Unknown Group";
+
   await docRef.update({ deleted: true, deletedAt: admin.firestore.FieldValue.serverTimestamp() });
   await rtdb.ref(`cowork/groups/${groupId}`).update({ deleted: true, deletedAt: new Date().toISOString() });
+
+  // Notify all members that the group was deleted
+  const othersToNotify = memberIds.filter(id => id !== requestingEmployeeId);
+  if (othersToNotify.length) {
+    await _notifyMany({
+      recipientIds: othersToNotify,
+      type: "group_deleted",
+      title: `Group deleted: ${groupName}`,
+      body: `The group "${groupName}" has been deleted.`,
+      data: { groupId, groupName },
+      senderId: requestingEmployeeId,
+      senderName: "CoWork",
+    });
+  }
 }
 
 // ── UPDATE GROUP (name / description) ─────────────────────
@@ -227,7 +246,7 @@ async function addGroupMember(groupId, requestingEmployeeId, employeeIdToAdd) {
   if (memberIds.includes(employeeIdToAdd)) throw new Error("Employee is already a member.");
   const updated = [...memberIds, employeeIdToAdd];
   await db.collection("cowork_groups").doc(groupId).update({ memberIds: updated, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-  await _notifyMany({ recipientIds: [employeeIdToAdd], type: "group_added", title: `Added to: ${snap.data().name}`, body: `You were added to group "${snap.data().name}"`, data: { groupId } });
+  await _notifyMany({ recipientIds: [employeeIdToAdd], type: "group_added", title: `Added to: ${snap.data().name}`, body: `You were added to group "${snap.data().name}"`, data: { groupId, groupName: snap.data().name }, senderId: requestingEmployeeId, senderName: "CoWork" });
   return { memberIds: updated };
 }
 
@@ -239,6 +258,18 @@ async function removeGroupMember(groupId, requestingEmployeeId, employeeIdToRemo
   if (employeeIdToRemove === requestingEmployeeId) throw new Error("Creator cannot be removed.");
   const memberIds = (snap.data().memberIds || []).filter(id => id !== employeeIdToRemove);
   await db.collection("cowork_groups").doc(groupId).update({ memberIds, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+  // Notify the removed person
+  await _notifyMany({
+    recipientIds: [employeeIdToRemove],
+    type: "group_removed",
+    title: `Removed from: ${snap.data().name}`,
+    body: `You have been removed from "${snap.data().name}"`,
+    data: { groupId, groupName: snap.data().name },
+    senderId: requestingEmployeeId,
+    senderName: "CoWork",
+  });
+
   return { memberIds };
 }
 
@@ -358,7 +389,7 @@ async function sendGroupMessage({ groupId, senderId, senderName, text, attachmen
     temp: false
   });
 
-  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `${senderName} in ${group.name}`, body: text.slice(0, 80), data: { groupId, messageId } });
+  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `${senderName} in ${group.name}`, body: text.slice(0, 80), data: { groupId, messageId, groupName: group.name }, senderId, senderName });
   return msg;
 }
 
@@ -421,7 +452,7 @@ async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, tex
     temp: false
   });
 
-  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `${senderName}`, body: text.slice(0, 80), data: { conversationId, messageId } });
+  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `${senderName}`, body: text.slice(0, 80), data: { conversationId, messageId }, senderId: fromEmployeeId, senderName });
   return { messageData: msg, conversationId };
 }
 
@@ -453,7 +484,7 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
 
   const recipients = participants.filter(id => id !== createdBy);
   socket.emitToMany(recipients, "new_meet", { meetId, title, dateTime, googleMeetLink });
-  await _notifyMany({ recipientIds: recipients, type: "meet_scheduled", title: `Meeting: ${title}`, body: new Date(dateTime).toLocaleString("en-IN"), data: { meetId } });
+  await _notifyMany({ recipientIds: recipients, type: "meet_scheduled", title: `Meeting: ${title}`, body: new Date(dateTime).toLocaleString("en-IN"), data: { meetId, meetTitle: title, dateTime }, senderId: createdBy, senderName: createdBy });
   return data;
 }
 
@@ -518,7 +549,9 @@ async function cancelCoworkMeet({ meetId, cancelledBy, cancelledByName }) {
     type: "meet_cancelled",
     title: `Meeting Cancelled: ${meet.title}`,
     body: `Cancelled by ${cancelledByName}`,
-    data: { meetId },
+    data: { meetId, meetTitle: meet.title },
+    senderId: cancelledBy,
+    senderName: cancelledByName,
   });
 
   return { success: true, meetId };
@@ -561,7 +594,9 @@ async function updateCoworkMeet({ meetId, updatedBy, title, description, dateTim
     type: "meet_updated",
     title: `Meeting Updated: ${updates.title || meet.title}`,
     body: `New time: ${new Date(updates.dateTime || meet.dateTime).toLocaleString("en-IN")}`,
-    data: { meetId },
+    data: { meetId, meetTitle: updates.title || meet.title, dateTime: updates.dateTime || meet.dateTime },
+    senderId: updatedBy,
+    senderName: updatedBy,
   });
 
   return { success: true, meetId };
@@ -606,7 +641,9 @@ async function assignCoworkTask({ title, description, assignedBy, assigneeIds, a
     type: "task_assigned",
     title: `New task: ${title}`,
     body: description?.slice(0, 80) || "New task assigned.",
-    data: { taskId }
+    data: { taskId, taskTitle: title, description },
+    senderId: assignedBy,
+    senderName: assignedBy,
   });
   return data;
 }
@@ -672,7 +709,9 @@ async function updateTaskProgress({ taskId, employeeId, progressPercent, note })
     type: "task_update",
     title: `Task: ${task.title}`,
     body: `${employeeId} → ${progressPercent}%`,
-    data: { taskId }
+    data: { taskId, taskTitle: task.title, progressPercent },
+    senderId: employeeId,
+    senderName: employeeId,
   });
 
   return { taskId, progressPercent, status };
@@ -801,7 +840,7 @@ async function markNotificationsRead(employeeId) {
 }
 
 // ── INTERNAL ──────────────────────────────────────────────
-async function _notifyMany({ recipientIds, type, title, body, data }) {
+async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
   const batch = db.batch();
   recipientIds.forEach(id => {
@@ -814,11 +853,32 @@ async function _notifyMany({ recipientIds, type, title, body, data }) {
 
   socket.emitToMany(recipientIds, "new_notification", { type, title, body });
 
-  // Send FCM push notification — reads tokens from cowork_fcm_tokens/{employeeId}
+  // FCM push — always fires, no cooldown
   try {
     const { sendPushToEmployees } = require("./fcmPush.service");
     await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
   } catch (e) { console.error("FCM push:", e.message); }
+
+  // Email — 20-min cooldown per sender→receiver pair
+  try {
+    const { sendNotificationEmail } = require("./emailNotifications.service");
+    const empDocs = await Promise.all(
+      recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
+    );
+    for (const empDoc of empDocs) {
+      if (!empDoc.exists) continue;
+      const emp = empDoc.data();
+      if (!emp.email) continue;
+      await sendNotificationEmail({
+        senderId: senderId || "system",
+        senderName: senderName || "CoWork",
+        receiverId: emp.employeeId || empDoc.id,
+        receiverName: emp.name || empDoc.id,
+        receiverEmail: emp.email,
+        type, title, body, data: data || {},
+      });
+    }
+  } catch (e) { console.error("Email notify:", e.message); }
 }
 
 // ── GET WITH FALLBACK ────────────────────────────────────
