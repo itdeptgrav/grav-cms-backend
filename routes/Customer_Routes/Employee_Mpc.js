@@ -1149,6 +1149,21 @@ router.put('/:id', verifyCustomerToken, async (req, res) => {
   }
 });
 
+
+router.delete('/all', verifyCustomerToken, async (req, res) => {
+  try {
+    const result = await EmployeeMpc.deleteMany({ customerId: req.customerId });
+    res.status(200).json({
+      success: true,
+      message: `Deleted ${result.deletedCount} employee(s)`,
+      deletedCount: result.deletedCount
+    });
+  } catch (error) {
+    console.error('Error deleting all employees:', error);
+    res.status(500).json({ success: false, message: 'Server error while deleting employees' });
+  }
+});
+
 // ─── DELETE employee ──────────────────────────────────────────────────────────
 router.delete('/:id', verifyCustomerToken, async (req, res) => {
   try {
