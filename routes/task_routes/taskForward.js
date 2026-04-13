@@ -70,7 +70,7 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, dueDate, priority, parentTaskId } = req.body;
+    const { title, description, notes, assigneeIds, dueDate, priority, parentTaskId, groupId, createdByTl } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
@@ -97,6 +97,8 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       dueDate: dueDate || null,
       priority: priority || "medium",
       parentTaskId: parentTaskId || null,
+      groupId: groupId || null,
+      createdByTl: createdByTl || false,
       status: initialStatus,
       // Mark whether this is a CEO-created root task (for visibility filtering)
       createdByCeo: requesterRole === "ceo" && !parentTaskId,
@@ -358,23 +360,11 @@ router.get("/task/list-hierarchy", verifyCoworkToken, verifyEmployeeToken, async
     let filtered = allTasks;
 
     if (role === "ceo") {
-      // ── CEO VISIBILITY FILTER (defence-in-depth, second layer after service) ──
-      // A task is visible to CEO if and only if:
-      //   1. CEO personally created it (assignedBy === CEO employeeId), OR
-      //   2. It carries the createdByCeo flag (set at creation time), OR
-      //   3. assignedByRole === "ceo" (legacy fallback for older tasks)
-      // Tasks created by TL are ALWAYS hidden from CEO.
+      // CEO sees tasks they created OR tasks assigned to them (e.g. TL assigned to CEO)
       filtered = allTasks.filter(t => {
-        // If the task was created by a TL (not CEO), hide it from CEO entirely
-        if (t.createdByTl === true && t.assignedBy !== employeeId) return false;
-        // Show if CEO created it
-        if (t.assignedBy === employeeId) return true;
-        // Show if flagged as CEO-created
-        if (t.createdByCeo === true) return true;
-        // Show if assignedByRole marks it as a CEO creation (legacy)
-        if (t.assignedByRole === "ceo") return true;
-        // Default: hide (safe fallback)
-        return false;
+        const assignedToMe = (t.assigneeIds || []).includes(employeeId);
+        const createdByMe = t.assignedBy === employeeId || t.createdByCeo === true || t.assignedByRole === "ceo";
+        return assignedToMe || createdByMe;
       });
     } else if (role === "tl") {
       // TL: sees tasks they created OR tasks assigned to them — handled in service

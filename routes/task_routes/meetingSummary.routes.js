@@ -40,6 +40,8 @@ const MODELS_TO_TRY = [
 
 // In-memory lock to prevent duplicate simultaneous requests for same meetId
 const processingLocks = new Set();
+const processingLockTimestamps = new Map(); // meetId -> timestamp when lock was acquired
+const LOCK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max — auto-expire stale locks
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 function sleep(ms) {
@@ -467,13 +469,21 @@ router.post(
             const apiKey = process.env.GEMINI_API_KEY;
             if (!apiKey) return res.status(500).json({ error: "GEMINI_API_KEY not set in .env" });
 
-            // ── Duplicate request guard ───────────────────────────────────────
-            // Blocks double processing when frontend calls API twice at once
+            // ── Duplicate request guard ─────────────────────────────────────────
+            // Auto-expire stale locks (prevents stuck locks from crashes/timeouts)
             if (processingLocks.has(meetId)) {
-                console.warn(`[MeetingSummary] Duplicate request blocked for ${meetId}`);
-                return res.status(429).json({ error: "Summary generation already in progress. Please wait." });
+                const lockAge = Date.now() - (processingLockTimestamps.get(meetId) || 0);
+                if (lockAge < LOCK_TIMEOUT_MS) {
+                    console.warn(`[MeetingSummary] Duplicate request blocked for ${meetId} (age: ${Math.round(lockAge / 1000)}s)`);
+                    return res.status(429).json({ error: "Summary generation already in progress. Please wait." });
+                }
+                // Stale lock — auto-release and continue
+                console.warn(`[MeetingSummary] Stale lock auto-released for ${meetId}`);
+                processingLocks.delete(meetId);
+                processingLockTimestamps.delete(meetId);
             }
             processingLocks.add(meetId);
+            processingLockTimestamps.set(meetId, Date.now());
 
             // ── Return cached if < 24h old — UNLESS ?force=true is passed ─────
             const forceRegenerate = req.query.force === "true";
@@ -484,6 +494,7 @@ router.post(
                 if (ageHours < 24) {
                     console.log(`[MeetingSummary] Returning cached summary for ${meetId}`);
                     processingLocks.delete(meetId);
+                    processingLockTimestamps.delete(meetId);
                     return res.json({ success: true, summary: d, cached: true });
                 }
             }
@@ -625,11 +636,13 @@ router.post(
                 .catch(() => { });
 
             processingLocks.delete(meetId);
+            processingLockTimestamps.delete(meetId);
             return res.json({ success: true, summary: summaryData, cached: false });
 
         } catch (e) {
             console.error("[MeetingSummary POST] Error:", e.message);
-            processingLocks.delete(meetId); // always release lock
+            processingLocks.delete(meetId);
+            processingLockTimestamps.delete(meetId); // always release lock
 
             // Emergency cleanup on failure — don't leave files in Gemini storage
             if (uploadedGeminiFiles.length > 0) {
