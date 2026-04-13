@@ -687,14 +687,13 @@ async function listTasks(employeeId, role) {
   let tasks = [];
 
   if (role === "ceo") {
-    // CEO sees ONLY tasks they personally created — NOT TL-created tasks
-    const snap = await db.collection("cowork_tasks")
-      .where("assignedBy", "==", employeeId).get();
-    tasks = snap.docs
-      .map(d => ({ id: d.id, ...d.data() }))
-      // Second-layer filter: drop any task that is flagged as TL-created
-      .filter(t => t.createdByTl !== true);
-
+    // CEO sees tasks they created OR tasks assigned to them (by TL etc.)
+    const ceoSnap1 = await db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get();
+    const ceoSnap2 = await db.collection("cowork_tasks").where("assigneeIds", "array-contains", employeeId).get();
+    const ceoSeen = new Set();
+    [...ceoSnap1.docs, ...ceoSnap2.docs].forEach(d => {
+      if (!ceoSeen.has(d.id)) { ceoSeen.add(d.id); tasks.push({ id: d.id, ...d.data() }); }
+    });
   } else if (role === "tl") {
     // TL: tasks they created
     const snap1 = await db.collection("cowork_tasks")
