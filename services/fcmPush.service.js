@@ -15,8 +15,16 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             recipientIds.map(id => db.collection("cowork_fcm_tokens").doc(id).get())
         );
 
-        const validDocs = tokenDocs.filter(d => d.exists && d.data()?.token);
-        const tokens = validDocs.map(d => d.data().token);
+        const validDocs = tokenDocs.filter(d => d.exists && (d.data()?.tokens?.length || d.data()?.token));
+        // Support both new (tokens array) and legacy (single token) format
+        const tokens = [...new Set(
+            validDocs.flatMap(d => {
+                const data = d.data();
+                if (data.tokens?.length) return data.tokens;        // new: array
+                if (data.token) return [data.token];                 // legacy: single
+                return [];
+            })
+        )];
 
         if (!tokens.length) return; // no devices registered yet
 
