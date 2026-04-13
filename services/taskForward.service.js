@@ -452,8 +452,8 @@ async function getTaskDailyReports(taskId) {
 // ═════════════════════════════════════════════════════════
 async function listTasksWithHierarchy(employeeId, role) {
   // ── VISIBILITY RULES ──────────────────────────────────────────────────────
-  // CEO    : sees ONLY tasks they personally created (assignedBy === CEO).
-  //          TL-created tasks (even under CEO root tasks) are NOT shown to CEO.
+  // CEO    : sees tasks they created (assignedBy === CEO) + tasks assigned TO them by TL/others.
+  //          TL-created subtasks under CEO's tasks are visible when CEO is an assignee.
   // TL     : sees tasks they created (assignedBy === TL) + tasks assigned to them.
   // Employee: sees ONLY tasks directly assigned to them (assigneeIds contains them).
   //           No walkUp — employees must not see parent tasks they weren't assigned to.
@@ -470,12 +470,12 @@ async function listTasksWithHierarchy(employeeId, role) {
   };
 
   if (role === "ceo") {
-    // CEO: ONLY tasks the CEO personally created (assignedBy === CEO)
-    // Do NOT pull tasks where CEO is an assignee — CEO does not get assigned tasks by TL
-    const snap = await db.collection("cowork_tasks")
-      .where("assignedBy", "==", employeeId)
-      .get();
-    snap.docs.forEach(addDoc);
+    // CEO: tasks they created (assignedBy === CEO) + tasks assigned TO them by TL/others
+    const [snap1, snap2] = await Promise.all([
+      db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get(),
+      db.collection("cowork_tasks").where("assigneeIds", "array-contains", employeeId).get(),
+    ]);
+    [...snap1.docs, ...snap2.docs].forEach(addDoc);
 
   } else if (role === "tl") {
     // TL: tasks they created + tasks assigned to them
