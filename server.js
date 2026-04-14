@@ -530,6 +530,15 @@ app.use("/api/hr/payroll", payrollRoutes);
 const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
 app.use("/hr/attendance", attendanceRouter);
 
+const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
+app.use("/api/hr/leaves", hrLeaveRoutes);
+
+app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
+
+// Employee Leave Routes (employee side — apply, balance, calendar, manager actions)
+const employeeLeaveRoutes = require("./routes/Employee_Routes/leaveRoutes");
+app.use("/api/employee/leave-applications", employeeLeaveRoutes);
+
 
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
