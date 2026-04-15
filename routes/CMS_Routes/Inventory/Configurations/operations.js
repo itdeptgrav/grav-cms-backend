@@ -6,35 +6,13 @@
 
 const express = require("express")
 const router = express.Router()
-const Operation      = require("../../../../models/CMS_Models/Inventory/Configurations/Operation")
-const OperationCode  = require("../../../../models/CMS_Models/Inventory/Configurations/OperationCode")
+const Operation     = require("../../../../models/CMS_Models/Inventory/Configurations/Operation")
+const OperationCode = require("../../../../models/CMS_Models/Inventory/Configurations/OperationCode")
 const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup")
-const MachineType    = require("../../../../models/CMS_Models/Inventory/Configurations/MachineType")
+const MachineType   = require("../../../../models/CMS_Models/Inventory/Configurations/MachineType")
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear")
 
 router.use(EmployeeAuthMiddleware)
-
-/* ─────────────────────────────────────────────────────────────────────────────
-   HELPER — after saving an operation, check every group's keyword and
-   auto-assign this operation if its code starts with that keyword letter.
-───────────────────────────────────────────────────────────────────────────── */
-async function autoAssignToGroups(operation) {
-  if (!operation.operationCode) return          // no code → nothing to match
-  const code = operation.operationCode.toUpperCase()
-
-  // Find all groups that have a keyword and whose keyword is a prefix of the code
-  const groups = await OperationGroup.find({ keyword: { $ne: "" } })
-  for (const group of groups) {
-    if (!group.keyword) continue
-    if (code.startsWith(group.keyword.toUpperCase())) {
-      // Add only if not already in the list
-      if (!group.operations.map(id => id.toString()).includes(operation._id.toString())) {
-        group.operations.push(operation._id)
-        await group.save()
-      }
-    }
-  }
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    OPERATIONS
@@ -61,19 +39,16 @@ router.get("/operations/:id", async (req, res) => {
   }
 })
 
-// POST create single operation
+// POST create operation
 router.post("/operations", async (req, res) => {
   try {
     const { name, operationCode, totalSam, durationSeconds, machineType } = req.body
     if (!name || totalSam == null || !machineType) {
       return res.status(400).json({ success: false, message: "name, totalSam, and machineType are required" })
     }
-
-    const codeUpper = (operationCode || "").trim().toUpperCase()
-
     const op = new Operation({
       name: name.trim(),
-      operationCode: codeUpper,
+      operationCode: (operationCode || "").trim().toUpperCase(),
       totalSam: parseFloat(totalSam),
       durationSeconds: durationSeconds ?? Math.round(parseFloat(totalSam) * 60),
       machineType: machineType.trim(),
@@ -87,18 +62,6 @@ router.post("/operations", async (req, res) => {
       { name: machineType.trim(), createdBy: req.user.id },
       { upsert: true, new: true }
     )
-
-    // Auto-register operation code if provided and not exists
-    if (codeUpper) {
-      await OperationCode.findOneAndUpdate(
-        { code: codeUpper },
-        { code: codeUpper, createdBy: req.user.id },
-        { upsert: true }
-      )
-    }
-
-    // Auto-assign to matching groups
-    await autoAssignToGroups(op)
 
     res.status(201).json({ success: true, message: "Operation created", operation: op })
   } catch (err) {
@@ -127,22 +90,8 @@ router.put("/operations/:id", async (req, res) => {
         { upsert: true }
       )
     }
-
-    // Auto-register updated code
-    if (op.operationCode) {
-      await OperationCode.findOneAndUpdate(
-        { code: op.operationCode },
-        { code: op.operationCode },
-        { upsert: true }
-      )
-    }
-
     op.updatedBy = req.user.id
     await op.save()
-
-    // Re-run auto-assign in case code changed
-    await autoAssignToGroups(op)
-
     res.json({ success: true, message: "Operation updated", operation: op })
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to update operation" })
@@ -166,7 +115,7 @@ router.delete("/operations/:id", async (req, res) => {
   }
 })
 
-// POST bulk import via CSV  (also handles the multi-row save from the UI)
+// POST bulk import via CSV
 router.post("/operations/import", async (req, res) => {
   try {
     const { operations } = req.body
@@ -177,10 +126,9 @@ router.post("/operations/import", async (req, res) => {
     const inserted = []
     for (const row of operations) {
       if (!row.name || row.totalSam == null) continue
-      const codeUpper = (row.operationCode || "").trim().toUpperCase()
       const op = new Operation({
         name: row.name.trim(),
-        operationCode: codeUpper,
+        operationCode: (row.operationCode || "").trim().toUpperCase(),
         totalSam: parseFloat(row.totalSam),
         durationSeconds: row.durationSeconds ?? Math.round(parseFloat(row.totalSam) * 60),
         machineType: (row.machineType || "").trim(),
@@ -199,16 +147,13 @@ router.post("/operations/import", async (req, res) => {
       }
 
       // Auto-register operation code
-      if (codeUpper) {
+      if (row.operationCode && row.operationCode.trim()) {
         await OperationCode.findOneAndUpdate(
-          { code: codeUpper },
-          { code: codeUpper, createdBy: req.user.id },
+          { code: row.operationCode.trim().toUpperCase() },
+          { code: row.operationCode.trim().toUpperCase(), createdBy: req.user.id },
           { upsert: true }
         )
       }
-
-      // Auto-assign to matching groups
-      await autoAssignToGroups(op)
     }
 
     res.status(201).json({
@@ -312,12 +257,17 @@ router.post("/operation-codes/import", async (req, res) => {
       return res.status(400).json({ success: false, message: "No codes provided" })
     }
 
-    let inserted = 0, skipped = 0
+    let inserted = 0
+    let skipped = 0
     for (const row of codes) {
       if (!row.code || !row.code.trim()) { skipped++; continue }
       const result = await OperationCode.findOneAndUpdate(
         { code: row.code.trim().toUpperCase() },
-        { code: row.code.trim().toUpperCase(), description: (row.description || "").trim(), createdBy: req.user.id },
+        {
+          code: row.code.trim().toUpperCase(),
+          description: (row.description || "").trim(),
+          createdBy: req.user.id,
+        },
         { upsert: true, new: true }
       )
       if (result) inserted++
@@ -350,91 +300,42 @@ router.get("/operation-groups", async (req, res) => {
 })
 
 // POST create group
-// Body: { name, keyword, operations }
-// keyword: single letter prefix — any existing & future operations whose code
-//          starts with this letter are auto-assigned.
 router.post("/operation-groups", async (req, res) => {
   try {
-    const { name, keyword, operations } = req.body
-    if (!name) {
-      return res.status(400).json({ success: false, message: "Group name is required" })
+    const { name, operations } = req.body
+    if (!name || !Array.isArray(operations) || operations.length === 0) {
+      return res.status(400).json({ success: false, message: "Group name and at least one operation are required" })
     }
     const existing = await OperationGroup.findOne({ name: name.trim() })
     if (existing) {
       return res.status(400).json({ success: false, message: "Group with this name already exists" })
     }
-
-    const keywordUpper = (keyword || "").trim().toUpperCase()
-
-    // Start with manually selected operations
-    let opIds = Array.isArray(operations) ? [...operations] : []
-
-    // If a keyword is given, also find all existing operations that match
-    if (keywordUpper) {
-      const matched = await Operation.find({
-        operationCode: { $regex: `^${keywordUpper}`, $options: "i" }
-      }).select("_id")
-      matched.forEach(op => {
-        if (!opIds.includes(op._id.toString())) {
-          opIds.push(op._id)
-        }
-      })
-    }
-
-    const group = new OperationGroup({
-      name: name.trim(),
-      keyword: keywordUpper,
-      operations: opIds,
-      createdBy: req.user.id,
-    })
+    const group = new OperationGroup({ name: name.trim(), operations, createdBy: req.user.id })
     await group.save()
-
     const populated = await OperationGroup.findById(group._id)
       .populate("operations", "name operationCode totalSam durationSeconds machineType")
     res.status(201).json({ success: true, message: "Group created", group: populated })
   } catch (err) {
-    res.status(500).json({ success: false, message: "Failed to create group: " + err.message })
+    res.status(500).json({ success: false, message: "Failed to create group" })
   }
 })
 
 // PUT update group
 router.put("/operation-groups/:id", async (req, res) => {
   try {
-    const { name, keyword, operations } = req.body
+    const { name, operations } = req.body
     const group = await OperationGroup.findById(req.params.id)
     if (!group) return res.status(404).json({ success: false, message: "Group not found" })
 
     if (name) group.name = name.trim()
-
-    const keywordUpper = keyword !== undefined
-      ? (keyword || "").trim().toUpperCase()
-      : group.keyword
-
-    group.keyword = keywordUpper
-
-    let opIds = Array.isArray(operations) ? [...operations] : group.operations.map(id => id.toString())
-
-    // Re-apply keyword matching against current operations DB
-    if (keywordUpper) {
-      const matched = await Operation.find({
-        operationCode: { $regex: `^${keywordUpper}`, $options: "i" }
-      }).select("_id")
-      matched.forEach(op => {
-        if (!opIds.map(id => id.toString()).includes(op._id.toString())) {
-          opIds.push(op._id)
-        }
-      })
-    }
-
-    group.operations = opIds
+    if (Array.isArray(operations)) group.operations = operations
     group.updatedBy = req.user.id
     await group.save()
-
     const populated = await OperationGroup.findById(group._id)
       .populate("operations", "name operationCode totalSam durationSeconds machineType")
     res.json({ success: true, message: "Group updated", group: populated })
   } catch (err) {
-    res.status(500).json({ success: false, message: "Failed to update group: " + err.message })
+    res.status(500).json({ success: false, message: "Failed to update group" })
   }
 })
 
@@ -514,7 +415,8 @@ router.post("/machine-types/import", async (req, res) => {
       return res.status(400).json({ success: false, message: "No machine types provided" })
     }
 
-    let inserted = 0, skipped = 0
+    let inserted = 0
+    let skipped = 0
     for (const row of machineTypes) {
       if (!row.name || !row.name.trim()) { skipped++; continue }
       const result = await MachineType.findOneAndUpdate(

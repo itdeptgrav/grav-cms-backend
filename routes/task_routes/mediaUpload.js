@@ -1,13 +1,3 @@
-/**
- * GRAV-CMS-BACKEND/routes/mediaUpload.routes.js
- *
- * Handles multipart file uploads for the CoWork system.
- * Supports: images → Cloudinary, PDFs → Google Drive, audio → Cloudinary
- *
- * Register in server.js:
- *   app.use("/cowork", require("./routes/mediaUpload.routes"));
- */
-
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");

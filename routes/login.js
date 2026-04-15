@@ -85,7 +85,7 @@ router.post("/login", async (req, res) => {
         userType: userModel,
       },
       process.env.JWT_SECRET || "grav_clothing_secret_key",
-      { expiresIn: "24h" },
+      { expiresIn: "7d" },
     );
 
     const isProduction = process.env.NODE_ENV === "production";
@@ -95,7 +95,7 @@ router.post("/login", async (req, res) => {
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? "none" : "lax",
-      maxAge: 24 * 60 * 60 * 1000,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // ✅ 7 days
     });
 
     // ✅ Determine redirect path based on role
