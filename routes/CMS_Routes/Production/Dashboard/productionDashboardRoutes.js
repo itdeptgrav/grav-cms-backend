@@ -270,97 +270,88 @@ const calculateEmployeeEfficiency = (scans, plannedTimePerUnit) => {
 };
 
 
-
 router.get("/search", async (req, res) => {
   try {
-    const { q } = req.query; // search query
-    
+    const { q } = req.query;
+ 
     if (!q || q.trim().length < 2) {
       return res.json({
         success: true,
-        workOrders: [],
-        message: "Enter at least 2 characters to search"
+        products: [],
+        message: "Enter at least 2 characters to search",
       });
     }
  
     const searchTerm = q.trim();
-    console.log(`🔍 Searching work orders for: "${searchTerm}"`);
+    console.log(`🔍 Searching products for: "${searchTerm}"`);
  
-    // Find work orders matching the product name
-    const workOrders = await WorkOrder.find({
-      stockItemName: { $regex: searchTerm, $options: "i" },
-      status: { $in: ["scheduled", "ready_to_start", "in_progress", "pending", "planned"] }
+    // Search by name OR additionalNames
+    const products = await StockItem.find({
+      $or: [
+        { name: { $regex: searchTerm, $options: "i" } },
+        { additionalNames: { $elemMatch: { $regex: searchTerm, $options: "i" } } },
+      ],
     })
-      .select("_id workOrderNumber stockItemId stockItemName quantity status priority operations")
-      .limit(10)
+      .select("_id name reference additionalNames genderCategory operations status")
+      .limit(15)
       .lean();
  
-    console.log(`Found ${workOrders.length} work orders matching "${searchTerm}"`);
+    console.log(`Found ${products.length} products matching "${searchTerm}"`);
  
-    // Fetch gender category for each product
-    const stockItemIds = [...new Set(workOrders.map(wo => wo.stockItemId).filter(Boolean))];
-    const stockItems = await StockItem.find({ _id: { $in: stockItemIds } })
-      .select("_id genderCategory")
-      .lean();
-    
-    const genderMap = new Map(
-      stockItems.map(item => [item._id.toString(), item.genderCategory || ""])
-    );
+    const enrichedProducts = products.map((p) => {
+      // Only include ops that have an operationCode
+      const ops = (p.operations || [])
+        .filter((op) => op.operationCode)
+        .map((op, idx) => ({
+          _id: op._id || `${p._id}-op-${idx}`,
+          operationType: op.type || op.operationType || `Operation ${idx + 1}`,
+          operationCode: op.operationCode,
+          // StockItem operations use minutes/seconds/totalSeconds fields
+          plannedTimeSeconds:
+            op.totalSeconds ||
+            (op.minutes || 0) * 60 + (op.seconds || 0) ||
+            0,
+          status: "active",
+        }));
  
-    // Enrich work orders with gender and operation count
-    const enrichedWorkOrders = workOrders.map(wo => {
-      const gender = genderMap.get(wo.stockItemId?.toString()) || "";
-      const operationCount = wo.operations?.filter(op => op.operationCode).length || 0;
-      
+      // Which alt name matched the query (for display hint under result)
+      const matchedAltName =
+        (p.additionalNames || []).find((n) =>
+          n.toLowerCase().includes(searchTerm.toLowerCase())
+        ) || null;
+ 
       return {
-        _id: wo._id,
-        workOrderNumber: wo.workOrderNumber,
-        workOrderShortId: wo._id.toString().slice(-8),
-        stockItemName: wo.stockItemName,
-        genderCategory: gender,
-        quantity: wo.quantity,
-        status: wo.status,
-        priority: wo.priority,
-        operationCount,
-        operations: wo.operations
-          .filter(op => op.operationCode) // Only include ops with codes
-          .map(op => ({
-            _id: op._id,
-            operationType: op.operationType,
-            operationCode: op.operationCode,
-            plannedTimeSeconds: op.plannedTimeSeconds || 0,
-            status: op.status
-          }))
+        _id: p._id,
+        name: p.name,
+        reference: p.reference,
+        additionalNames: p.additionalNames || [],
+        matchedAltName,
+        genderCategory: p.genderCategory || "",
+        operationCount: ops.length,
+        operations: ops,
+        status: p.status || "In Stock",
       };
     });
  
-    // Sort by status priority and then by creation
-    const statusPriority = {
-      in_progress: 1,
-      ready_to_start: 2,
-      scheduled: 3,
-      planned: 4,
-      pending: 5
-    };
- 
-    enrichedWorkOrders.sort((a, b) => {
-      const aPriority = statusPriority[a.status] || 999;
-      const bPriority = statusPriority[b.status] || 999;
-      return aPriority - bPriority;
+    // Sort: exact name match → alt-name match → partial
+    enrichedProducts.sort((a, b) => {
+      const aExact = a.name.toLowerCase() === searchTerm.toLowerCase() ? 0 : 1;
+      const bExact = b.name.toLowerCase() === searchTerm.toLowerCase() ? 0 : 1;
+      if (aExact !== bExact) return aExact - bExact;
+      return (a.matchedAltName ? 0 : 1) - (b.matchedAltName ? 0 : 1);
     });
  
     res.json({
       success: true,
-      workOrders: enrichedWorkOrders,
-      total: enrichedWorkOrders.length
+      products: enrichedProducts,
+      total: enrichedProducts.length,
     });
- 
   } catch (error) {
-    console.error("Error searching work orders:", error);
+    console.error("Error searching products:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while searching work orders",
-      error: error.message
+      message: "Server error while searching products",
+      error: error.message,
     });
   }
 });
