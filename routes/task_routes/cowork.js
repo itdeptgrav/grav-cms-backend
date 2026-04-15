@@ -10,7 +10,7 @@ const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } 
 
 const svc = require("../../services/cowork.service");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
-const { sendWelcomeEmail, sendMeetingScheduledEmail } = require("../../services/emailNotifications.service");
+const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
 
 // ── Seed CEO ──────────────────────────────────────────────
 router.post("/setup/seed-ceo", async (req, res) => {
@@ -62,6 +62,50 @@ router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (r
     await svc.changeEmployeePassword({ employeeId: req.coworkUser.employeeId, authUid: req.coworkUser.authUid, newPassword });
     res.json({ success: true, message: "Password changed successfully." });
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── CEO: change own email (and optionally password) ───────────────────────────
+router.post("/change-email", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const { newEmail, newPassword } = req.body;
+    if (!newEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail))
+      return res.status(400).json({ error: "Valid email required." });
+
+    const employeeId = req.coworkUser.employeeId;
+    const authUid = req.coworkUser.authUid;
+    if (!authUid) return res.status(400).json({ error: "No auth account linked." });
+
+    // Check new email not already taken by another employee
+    const existing = await db.collection("cowork_employees")
+      .where("email", "==", newEmail.toLowerCase().trim()).limit(1).get();
+    if (!existing.empty && existing.docs[0].id !== employeeId)
+      return res.status(400).json({ error: "This email is already in use by another account." });
+
+    // Update Firebase Auth
+    const authUpdates = { email: newEmail.toLowerCase().trim() };
+    if (newPassword) {
+      if (newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+      authUpdates.password = newPassword;
+    }
+    await auth.updateUser(authUid, authUpdates);
+
+    // Update Firestore employee doc
+    const firestoreUpdates = {
+      email: newEmail.toLowerCase().trim(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (newPassword) {
+      firestoreUpdates.passwordChanged = true;
+      firestoreUpdates.tempPassword = null;
+    }
+    await db.collection("cowork_employees").doc(employeeId).update(firestoreUpdates);
+
+    console.log(`[ChangeEmail] ${employeeId} changed email to ${newEmail}`);
+    res.json({ success: true, message: "Email updated successfully." + (newPassword ? " Password also changed." : "") });
+  } catch (e) {
+    console.error("[change-email]", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Employee ──────────────────────────────────────────────
@@ -200,6 +244,22 @@ router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, as
     // ← Force logout — revoke all their tokens instantly
     await auth.revokeRefreshTokens(authUid);
 
+    // Notify employee via email
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      await sendNotificationEmail({
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.employeeName || "Admin",
+        receiverId: employeeId,
+        receiverName: empData.name || employeeId,
+        receiverEmail: empData.email,
+        type: "password_reset",
+        title: "Your CoWork password was reset",
+        body: "Your password has been reset. Please log in with your new password.",
+        data: {},
+      });
+    } catch (e) { console.error("[password_reset email]", e.message); }
+
     console.log(`[ResetPassword] ${employeeId} session revoked by ${req.coworkUser.employeeId}`);
     return res.json({
       success: true,
@@ -257,6 +317,52 @@ router.get("/group/:groupId/members", verifyCoworkToken, verifyEmployeeToken, as
   }
 });
 
+// ── Notify-only endpoints (frontend already wrote to Firestore, just need push+email) ──
+router.post("/direct-message/notify", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { toEmployeeId, text, messageType } = req.body;
+    if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
+    // Only send push notification + email — do NOT write to Firestore again
+    const { sendPushToEmployees } = require("../../services/fcmPush.service");
+    await sendPushToEmployees([toEmployeeId], req.coworkUser.name, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const empDoc = await db.collection("cowork_employees").doc(toEmployeeId).get();
+      if (empDoc.exists && empDoc.data().email) {
+        const emp = empDoc.data();
+        await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: toEmployeeId, receiverName: emp.name, receiverEmail: emp.email, type: "direct_message", title: req.coworkUser.name, body: (text || "📎 Attachment").slice(0, 80), data: {} });
+      }
+    } catch (e) { console.error("[dm notify email]", e.message); }
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { text, messageType } = req.body;
+    const groupDoc = await db.collection("cowork_groups").doc(groupId).get();
+    if (!groupDoc.exists) return res.status(404).json({ error: "Group not found" });
+    const group = groupDoc.data();
+    const recipients = (group.memberIds || []).filter(id => id !== req.coworkUser.employeeId);
+    if (!recipients.length) return res.json({ success: true });
+    // Only send push notification + email — do NOT write to Firestore again
+    const { sendPushToEmployees } = require("../../services/fcmPush.service");
+    await sendPushToEmployees(recipients, `${req.coworkUser.name} in ${group.name}`, (text || "📎 Attachment").slice(0, 80), { type: "group_message", groupId });
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const empDocs = await Promise.all(recipients.map(id => db.collection("cowork_employees").doc(id).get()));
+      for (const empDoc of empDocs) {
+        if (!empDoc.exists) continue;
+        const emp = empDoc.data();
+        if (!emp.email) continue;
+        await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: emp.employeeId || empDoc.id, receiverName: emp.name, receiverEmail: emp.email, type: "group_message", title: `${req.coworkUser.name} in ${group.name}`, body: (text || "📎 Attachment").slice(0, 80), data: { groupId, groupName: group.name } });
+      }
+    } catch (e) { console.error("[group notify email]", e.message); }
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 router.post("/group/:groupId/message", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const msg = await svc.sendGroupMessage({ groupId: req.params.groupId, senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, text: req.body.text, attachments: req.body.attachments || [] });
@@ -310,16 +416,8 @@ router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoOrTL, async (re
       return res.status(400).json({ error: "Title and dateTime are required." });
     const meet = await svc.scheduleCoworkMeet({ title, description, createdBy: req.coworkUser.employeeId, participants, dateTime, googleMeetLink });
     res.status(201).json({ meet });
+    // Email is handled inside svc.scheduleCoworkMeet() via _notifyMany → sendNotificationEmail
 
-    // Send meeting invitation email to all participants (non-blocking)
-    Promise.all(participants.map(id =>
-      db.collection("cowork_employees").doc(id).get()
-        .then(s => s.exists ? { name: s.data().name, email: s.data().email } : null)
-        .catch(() => null)
-    )).then(contacts => sendMeetingScheduledEmail(
-      { meetId: meet.meetId, title, description, dateTime, createdByName: req.coworkUser.name, googleMeetLink },
-      contacts.filter(Boolean)
-    )).catch(err => console.error("[cowork/schedule-meet] Email error:", err.message));
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -519,6 +617,27 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
     // ← Force logout — revoke all their tokens instantly
     await auth.revokeRefreshTokens(authUid);
 
+    // Notify employee via push + email
+    try {
+      const { sendPushToEmployees } = require("../../services/fcmPush.service");
+      await sendPushToEmployees([employeeId], "Your role has been updated", `Your CoWork role is now ${role === "tl" ? "Team Lead" : "Employee"}`, { type: "role_changed" });
+    } catch (e) { console.error("[role_changed push]", e.message); }
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const empData = empDoc.data();
+      await sendNotificationEmail({
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.employeeName || "Admin CEO",
+        receiverId: employeeId,
+        receiverName: empData.name || employeeId,
+        receiverEmail: empData.email,
+        type: "role_changed",
+        title: "Your CoWork role has been updated",
+        body: `Your role is now ${role === "tl" ? "Team Lead" : "Employee"}`,
+        data: { newRole: role },
+      });
+    } catch (e) { console.error("[role_changed email]", e.message); }
+
     console.log(`[ChangeRole] ${employeeId} → ${role} | session revoked`);
     res.json({ success: true, employeeId, role });
   } catch (e) {
@@ -526,5 +645,43 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
   }
 });
 
+
+// ── NOTIFY REQUEST RESPONSE (FCM push + email to request sender) ──────────────
+router.post("/notify-request-response", verifyCoworkToken, async (req, res) => {
+  try {
+    const { recipientId, title, body, type, subject, responseMessage } = req.body;
+    if (!recipientId) return res.status(400).json({ error: "recipientId required" });
+
+    // FCM push — works on closed iPhone
+    try {
+      const { sendPushToEmployees } = require("../../services/fcmPush.service");
+      await sendPushToEmployees([recipientId], title, body, { type });
+    } catch (e) { console.error("[request response push]", e.message); }
+
+    // Email with cooldown
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const empDoc = await db.collection("cowork_employees").doc(recipientId).get();
+      if (empDoc.exists() && empDoc.data().email) {
+        const emp = empDoc.data();
+        await sendNotificationEmail({
+          senderId: req.coworkUser.employeeId,
+          senderName: req.coworkUser.employeeName || "CoWork",
+          receiverId: recipientId,
+          receiverName: emp.name || recipientId,
+          receiverEmail: emp.email,
+          type,
+          title,
+          body,
+          data: { subject: subject || "", responseMessage: responseMessage || "" },
+        });
+      }
+    } catch (e) { console.error("[request response email]", e.message); }
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 module.exports = router;

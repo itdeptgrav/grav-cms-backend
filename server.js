@@ -151,6 +151,111 @@ io.on("connection", (socket) => {
     io.to(`meeting_${meetId}`).emit("recording_stopped", { meetId, stoppedBy, stoppedByName, stoppedAt: new Date().toISOString() });
   });
 
+  // ── DM AUDIO CALLS ────────────────────────────────────────────────────
+  // Legacy relay — old DMCallManager emits call_invite, relay as call_incoming to receiver
+  socket.on("call_invite", ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
+    if (!toEmployeeId || !fromEmployeeId) return;
+    console.log(`[Call-legacy] ${fromEmployeeId} → ${toEmployeeId}`);
+    io.to(String(toEmployeeId)).emit("call_incoming", { fromEmployeeId, fromName, convId });
+  });
+
+  // STEP 1 — Caller initiates: create LiveKit room + generate CALLER token
+  // then ring the callee via socket
+  socket.on("call_request", async ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
+    if (!toEmployeeId || !fromEmployeeId || !convId) return;
+    try {
+      const { AccessToken, RoomServiceClient } = require("livekit-server-sdk");
+      const LK_URL = process.env.LIVEKIT_URL || "";
+      const LK_KEY = process.env.LIVEKIT_API_KEY || "";
+      const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
+
+      const roomName = `dm-call-${convId}`;
+      const httpUrl = LK_URL.replace("wss://", "https://").replace("ws://", "http://");
+
+      // Create the LiveKit room (ignore "already exists" error)
+      try {
+        const svc = new RoomServiceClient(httpUrl, LK_KEY, LK_SECRET);
+        await svc.createRoom({ name: roomName, emptyTimeout: 120, maxParticipants: 2 });
+      } catch (e) {
+        if (!e.message?.includes("already exists")) console.warn("[call_request] createRoom:", e.message);
+      }
+
+      // Generate token for CALLER
+      const callerAt = new AccessToken(LK_KEY, LK_SECRET, { identity: fromEmployeeId, name: fromName, ttl: "1h" });
+      callerAt.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
+      const callerToken = await callerAt.toJwt();
+
+      // Send token directly back to caller's socket
+      socket.emit("call_token_ready", { token: callerToken, url: LK_URL, roomName, convId });
+
+      // Ring the callee
+      console.log(`[Call] ${fromEmployeeId} → ${toEmployeeId} room=${roomName}`);
+      io.to(String(toEmployeeId)).emit("call_incoming", { fromEmployeeId, fromName, convId, roomName });
+
+    } catch (e) {
+      console.error("[call_request] error:", e.message);
+      socket.emit("call_error", { message: "Could not start call: " + e.message });
+    }
+  });
+
+  // STEP 2 — Callee accepts: generate CALLEE token + notify caller
+  socket.on("call_accept", async ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
+    if (!toEmployeeId || !fromEmployeeId || !convId) return;
+    try {
+      const { AccessToken } = require("livekit-server-sdk");
+      const LK_URL = process.env.LIVEKIT_URL || "";
+      const LK_KEY = process.env.LIVEKIT_API_KEY || "";
+      const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
+
+      const roomName = `dm-call-${convId}`;
+
+      // Generate token for CALLEE
+      const calleeAt = new AccessToken(LK_KEY, LK_SECRET, { identity: fromEmployeeId, name: fromName, ttl: "1h" });
+      calleeAt.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
+      const calleeToken = await calleeAt.toJwt();
+
+      // Send token to callee's socket
+      socket.emit("call_token_ready", { token: calleeToken, url: LK_URL, roomName, convId });
+
+      // Notify caller that call was answered
+      io.to(String(toEmployeeId)).emit("call_answered", { fromEmployeeId, convId });
+
+    } catch (e) {
+      console.error("[call_accept] error:", e.message);
+      socket.emit("call_error", { message: "Could not join call: " + e.message });
+    }
+  });
+
+  // Callee rejects
+  socket.on("call_reject", ({ toEmployeeId, fromEmployeeId, convId }) => {
+    if (!toEmployeeId) return;
+    io.to(String(toEmployeeId)).emit("call_rejected", { fromEmployeeId, convId });
+  });
+
+  // Either party ends the call
+  socket.on("call_end", ({ toEmployeeId, fromEmployeeId, convId }) => {
+    if (!toEmployeeId) return;
+    io.to(String(toEmployeeId)).emit("call_ended", { fromEmployeeId, convId });
+  });
+
+  // Re-issue token if page reloaded mid-call (race condition recovery)
+  socket.on("call_rejoin_token", async ({ employeeId, convId }) => {
+    if (!employeeId || !convId) return;
+    try {
+      const { AccessToken } = require("livekit-server-sdk");
+      const LK_URL = process.env.LIVEKIT_URL || "";
+      const LK_KEY = process.env.LIVEKIT_API_KEY || "";
+      const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
+      const roomName = `dm-call-${convId}`;
+      const at = new AccessToken(LK_KEY, LK_SECRET, { identity: employeeId, ttl: "1h" });
+      at.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
+      const token = await at.toJwt();
+      socket.emit("call_token_ready", { token, url: LK_URL, roomName, convId });
+    } catch (e) {
+      socket.emit("call_error", { message: "Could not rejoin: " + e.message });
+    }
+  });
+
   // ── COWORKING SPACE: Online presence tracking ─────────────────────────
   socket.on("workspace-set-online", (memberId) => {
     socket.workspaceMemberId = memberId;
@@ -1253,4 +1358,65 @@ server.listen(PORT, () => {
   console.log(`✅ Production sync service is active`);
   console.log(`Server running on port ${PORT}`);
   transcriptModule.startCron();
+
+  // ── Meeting 15-min reminder cron — runs every 5 minutes ──────────────────
+  const _reminderSent = new Set();
+  setInterval(async () => {
+    try {
+      const { db } = require("./config/firebaseAdmin");
+      const { sendPushToEmployees } = require("./services/fcmPush.service");
+      const { sendNotificationEmail } = require("./services/emailNotifications.service");
+
+      const now = Date.now();
+      const windowStart = new Date(now + 10 * 60 * 1000).toISOString();
+      const windowEnd = new Date(now + 20 * 60 * 1000).toISOString();
+
+      const snap = await db.collection("cowork_scheduled_meets")
+        .where("isCancelled", "==", false)
+        .where("dateTime", ">=", windowStart)
+        .where("dateTime", "<=", windowEnd)
+        .get();
+
+      for (const doc of snap.docs) {
+        const meet = doc.data();
+        const meetId = meet.meetId || doc.id;
+        if (_reminderSent.has(meetId)) continue;
+        _reminderSent.add(meetId);
+
+        const participants = meet.participants || [];
+        if (!participants.length) continue;
+
+        const title = `Meeting in 15 minutes: ${meet.title}`;
+        const body = `"${meet.title}" starts soon. Get ready to join.`;
+
+        await sendPushToEmployees(participants, title, body, { type: "meet_reminder", meetId });
+
+        const empDocs = await Promise.all(
+          participants.map(id => db.collection("cowork_employees").doc(id).get())
+        );
+        for (const empDoc of empDocs) {
+          if (!empDoc.exists) continue;
+          const emp = empDoc.data();
+          if (!emp.email) continue;
+          await sendNotificationEmail({
+            senderId: meet.createdBy || "system",
+            senderName: "CoWork",
+            receiverId: emp.employeeId || empDoc.id,
+            receiverName: emp.name || empDoc.id,
+            receiverEmail: emp.email,
+            type: "meet_reminder",
+            title,
+            body,
+            data: { meetId, meetTitle: meet.title, dateTime: meet.dateTime },
+          });
+        }
+        console.log(`[MeetReminder] Sent for meetId=${meetId} to ${participants.length} participants`);
+      }
+
+      if (_reminderSent.size > 500) _reminderSent.clear();
+
+    } catch (e) {
+      console.error("[MeetReminder cron]", e.message);
+    }
+  }, 5 * 60 * 1000);
 });
