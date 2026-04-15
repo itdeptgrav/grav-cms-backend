@@ -22,13 +22,23 @@ const hhmmMins = (s) => {
     return (h || 0) * 60 + (m || 0);
 };
 
-const minsOf = (d) => (d ? d.getHours() * 60 + d.getMinutes() : null);
+const minsOf = (d) => {
+    if (!d) return null;
+    const dt = new Date(d);
+    const utcMins = dt.getUTCHours() * 60 + dt.getUTCMinutes();
+    return (utcMins + 330) % 1440;
+};
+
 
 const fmtTime = (d) => {
     if (!d) return "--:--";
     const dt = new Date(d);
-    return `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
+    return dt.toLocaleTimeString("en-IN", {
+        hour: "2-digit", minute: "2-digit", hour12: false,
+        timeZone: "Asia/Kolkata",
+    });
 };
+
 
 const fmtHM = (m) => {
     if (!m || m <= 0) return "00:00";

@@ -285,6 +285,112 @@ router.patch("/bulk-approve", EmployeeAuthMiddleware, async (req, res) => {
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
+
+// ── BACKFILL: retry attendance sync for already-approved leaves ────────
+router.post("/backfill-attendance", EmployeeAuthMiddleware, async (req, res) => {
+    try {
+        const { employeeId, year } = req.body;
+        const filter = { status: "hr_approved" };
+        if (employeeId) filter.employeeId = employeeId;
+        if (year) {
+            filter.fromDate = { $gte: `${year}-01-01` };
+            filter.toDate = { $lte: `${year}-12-31` };
+        }
+        const apps = await LeaveApplication.find(filter);
+
+        const results = [];
+        let totalApplied = 0, totalSkipped = 0;
+
+        for (const app of apps) {
+            try {
+                const r = await applyLeaveToAttendance(app);
+                totalApplied += r.applied;
+                totalSkipped += r.skipped;
+                results.push({
+                    id: app._id,
+                    employee: app.employeeName,
+                    leaveType: app.leaveType,
+                    range: `${app.fromDate} → ${app.toDate}`,
+                    applied: r.applied,
+                    skipped: r.skipped,
+                });
+            } catch (e) {
+                results.push({ id: app._id, error: e.message });
+            }
+        }
+
+        res.json({
+            success: true,
+            message: `Processed ${apps.length} approved leave(s). Applied to ${totalApplied} day(s), skipped ${totalSkipped}.`,
+            totalLeaves: apps.length,
+            totalApplied,
+            totalSkipped,
+            results,
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ── DEBUG: trace why a specific leave isn't showing in attendance ─────
+router.get("/debug-attendance/:id", EmployeeAuthMiddleware, async (req, res) => {
+    try {
+        const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+        const app = await LeaveApplication.findById(req.params.id).lean();
+        if (!app) return res.status(404).json({ success: false, message: "Not found" });
+
+        const start = parseLocalDate(app.fromDate);
+        const end = parseLocalDate(app.toDate);
+        const trace = [];
+
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+            const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+            const bid = String(app.biometricId || "").toUpperCase();
+
+            const dayDoc = await DailyAttendance.findOne({ dateStr: ds }).lean();
+            if (!dayDoc) {
+                trace.push({ date: ds, status: "❌ Day not synced yet" });
+                continue;
+            }
+            const entry = (dayDoc.employees || []).find(e => e.biometricId === bid);
+            if (!entry) {
+                trace.push({ date: ds, status: "⚠️ Employee not in day doc — would inject leave row" });
+                continue;
+            }
+            trace.push({
+                date: ds,
+                systemPrediction: entry.systemPrediction,
+                hrFinalStatus: entry.hrFinalStatus,
+                wouldSkip: ["WO", "FH", "NH", "OH", "RH", "PH"].includes(entry.systemPrediction),
+                status: entry.hrFinalStatus
+                    ? `✓ Has hrFinalStatus = ${entry.hrFinalStatus}`
+                    : ["WO", "FH", "NH", "OH", "RH", "PH"].includes(entry.systemPrediction)
+                        ? `⚠️ Skipped (${entry.systemPrediction})`
+                        : "Would set hrFinalStatus"
+            });
+        }
+
+        res.json({
+            success: true,
+            leave: {
+                id: app._id,
+                employee: app.employeeName,
+                biometricId: app.biometricId,
+                leaveType: app.leaveType,
+                fromDate: app.fromDate,
+                toDate: app.toDate,
+                status: app.status,
+                appliedToAttendance: app.appliedToAttendance,
+                appliedAt: app.appliedAt,
+            },
+            mappedTo: { CL: "L-CL", SL: "L-SL", PL: "L-EL" }[app.leaveType] || "UNKNOWN",
+            trace,
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+}); 
+
 router.get("/", EmployeeAuthMiddleware, async (req, res) => {
     try {
         const { status, department, leaveType, month, year, search, page = 1, limit = 50 } = req.query;
