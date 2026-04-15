@@ -241,7 +241,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     }
 
     // Restricted fields
-    ["email", "password", "temporaryPassword", "createdBy", "createdAt"].forEach((f) => delete updateData[f]);
+    ["password", "temporaryPassword", "createdBy", "createdAt"].forEach((f) => delete updateData[f]);
 
     // Sanitize empty-string ObjectId fields to prevent BSONError cast failures
     if (updateData.departmentId === "" || updateData.departmentId === null) {

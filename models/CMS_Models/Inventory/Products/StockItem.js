@@ -1,5 +1,3 @@
-// models/CMS_Models/Inventory/Products/StockItem.js
-
 const mongoose = require("mongoose");
 
 const attributeValueSchema = new mongoose.Schema({
@@ -30,10 +28,10 @@ const variantRawItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  variantId: {
+  variantId: { // New: To store which variant of raw item is used
     type: mongoose.Schema.Types.ObjectId
   },
-  variantCombination: [{
+  variantCombination: [{ // New: Which variant combination of raw item
     type: String,
     trim: true
   }],
@@ -42,15 +40,9 @@ const variantRawItemSchema = new mongoose.Schema({
     required: true,
     min: 0
   },
-  // ── The unit the user chose (may be a converted unit, e.g. "Piece" instead of "Gross") ──
   unit: {
     type: String,
     required: true,
-    trim: true
-  },
-  // ── The base/registered unit of the raw item, stored for deduction logic ──
-  baseUnit: {
-    type: String,
     trim: true
   },
   unitCost: {
@@ -107,7 +99,9 @@ const variantSchema = new mongoose.Schema({
     trim: true
   },
   images: [String],
+  // NEW: Raw items specific to this variant
   rawItems: [variantRawItemSchema],
+  // Status for this specific variant
   status: {
     type: String,
     enum: ["In Stock", "Low Stock", "Out of Stock"],
@@ -120,11 +114,6 @@ const operationSchema = new mongoose.Schema({
     type: String,
     required: true,
     trim: true
-  },
-  operationCode: {
-    type: String,
-    trim: true,
-    default: ""
   },
   machine: {
     type: String,
@@ -164,13 +153,6 @@ const stockItemSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
-
-  // ── Additional / Alternate Names ─────────────────────────────────────────
-  additionalNames: [{
-    type: String,
-    trim: true
-  }],
-
   reference: {
     type: String,
     required: true,
@@ -200,14 +182,6 @@ const stockItemSchema = new mongoose.Schema({
     trim: true
   },
 
-  // ── Gender Category ───────────────────────────────────────────────────────
-  // Indicates intended gender audience for the garment.
-  genderCategory: {
-    type: String,
-    enum: ["Male", "Female", "Unisex", "Kids", ""],
-    default: ""
-  },
-
   // Barcode & HSN
   barcode: {
     type: String,
@@ -224,7 +198,7 @@ const stockItemSchema = new mongoose.Schema({
     trim: true
   },
 
-  // General Pricing
+  // General Pricing (Base prices - can be overridden by variants)
   unit: {
     type: String,
     required: true,
@@ -264,20 +238,20 @@ const stockItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   }],
-
+  
   numberOfPanels: {
     type: Number,
     min: 0,
     default: 0
   },
 
-  // Variants
+  // Variants (REQUIRED - at least one variant)
   variants: [variantSchema],
 
-  // Operations
+  // Operations (common for all variants)
   operations: [operationSchema],
-
-  // Miscellaneous costs
+  
+  // Miscellaneous costs (common for all variants)
   miscellaneousCosts: [{
     name: {
       type: String,
@@ -296,17 +270,17 @@ const stockItemSchema = new mongoose.Schema({
     }
   }],
 
-  // Images
+  // Images (common for all variants)
   images: [String],
 
-  // Overall Status
+  // Overall Status (calculated from variants)
   status: {
     type: String,
     enum: ["In Stock", "Low Stock", "Out of Stock"],
     default: "In Stock"
   },
 
-  // Calculated Fields
+  // Calculated Fields (from all variants)
   totalQuantityOnHand: {
     type: Number,
     min: 0,
@@ -365,5 +339,3 @@ const stockItemSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 module.exports = mongoose.model("StockItem", stockItemSchema);
-
-

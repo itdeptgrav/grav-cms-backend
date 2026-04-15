@@ -1,5 +1,4 @@
 // Middlewear/EmployeeAuthMiddlewear.js
-// Middlewear/EmployeeAuthMiddleware.js - UPDATED VERSION
 
 const jwt = require("jsonwebtoken");
 
@@ -8,7 +7,7 @@ const EmployeeAuthMiddleware = (allowedRoles = []) => {
     try {
       // 🔐 Read token from cookie
       const token = req.cookies.auth_token;
-
+      
       if (!token) {
         return res.status(401).json({
           success: false,

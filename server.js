@@ -20,11 +20,11 @@ const allowedOrigins = [
   "https://grav-cms.vercel.app",
   "https://cms.grav.in",
   "https://customer.grav.in",
-  "https://cowork.grav.in",
   "http://192.168.1.30:3000",
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
   "http://10.99.21.15:3000",
-  "https://8ks0bflk-5000.inc1.devtunnels.ms"
+  "https://8ks0bflk-5000.inc1.devtunnels.ms",
+  "https://grav-cms-dncs.vercel.app"
 ];
 
 app.use(
@@ -55,7 +55,25 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
   transports: ["websocket", "polling"],
-  pingTimeout: 60000,
+});
+
+// WebSocket connection handling
+io.on("connection", (socket) => {
+  console.log("✅ New WebSocket client connected:", socket.id);
+
+  socket.on("join-workorder", (workOrderId) => {
+    socket.join(`workorder-${workOrderId}`);
+    console.log(`Socket ${socket.id} joined room workorder-${workOrderId}`);
+  });
+
+  socket.on("leave-workorder", (workOrderId) => {
+    socket.leave(`workorder-${workOrderId}`);
+    console.log(`Socket ${socket.id} left room workorder-${workOrderId}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("❌ WebSocket client disconnected:", socket.id);
+  });
 });
 
 // Make io accessible to routes
@@ -285,7 +303,6 @@ const transcriptModule = require("./routes/task_routes/transcript.routes");
 app.use("/cowork", transcriptModule.router);
 
 
-
 // ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
   try {
@@ -294,10 +311,8 @@ const connectDB = async () => {
     );
     console.log("✅ MongoDB connected successfully");
 
-
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     productionSyncService.initialize();
-
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -331,7 +346,7 @@ const createDefaultCuttingMaster = async () => {
     const defaultCuttingMaster = new CuttingMaster({
       name: "Cutting Admin",
       email: "cutting@grav.in",
-      password: "Cut@12345",
+      password: "Cut@12345", // will be hashed automatically
       employeeId: "CUT001",
       phone: "9999999999",
       department: "Cutting",
@@ -340,174 +355,108 @@ const createDefaultCuttingMaster = async () => {
     });
 
     await defaultCuttingMaster.save();
+
     console.log("✅ Default Cutting Master created successfully");
   } catch (error) {
     console.error("❌ Cutting Master creation failed:", error.message);
   }
 };
 
+const createDefaultAccountant = async () => {
+  try {
+    const existingAccountant = await AccountantDepartment.findOne({
+      role: "accountant",
+      department: "Accounting",
+    });
 
-//   const flagKey = "backfill_workorder_operation_codes_v3_fixess";
-//   const db = mongoose.connection.db;
-//   const flagsCol = db.collection("_migration_flags");
+    if (existingAccountant) {
+      console.log("✅ Accountant already exists, skipping creation");
+      return;
+    }
 
-//   const alreadyRan = await flagsCol.findOne({ key: flagKey });
-//   if (alreadyRan) {
-//     console.log("✅ WorkOrder operationCode backfill already ran — skipping");
-//     return;
-//   }
+    const defaultAccountant = new AccountantDepartment({
+      name: "Accountant Admin",
+      email: "accountant@grav.in",
+      password: "Account@12345", // will be hashed automatically
+      employeeId: "ACC001",
+      phone: "9999999999",
+      department: "Accounting",
+      role: "accountant",
+      isActive: true,
+    });
 
-//   console.log("🔄 Backfilling operationCode on WorkOrder operations from StockItem...");
+    await defaultAccountant.save();
 
-//   // Fetch all work orders that have operations with missing operationCode
-//   const workOrders = await WorkOrder.find({
-//     "operations.0": { $exists: true }
-//   }).select("workOrderNumber stockItemId operations").lean();
+    console.log("✅ Default Accountant created successfully");
+  } catch (error) {
+    console.error("❌ Accountant creation failed:", error.message);
+  }
+};
 
-//   console.log(`   📦 Found ${workOrders.length} work orders to process`);
-
-//   let totalPatched = 0;
-//   let totalNoMatch = 0;
-//   let totalWOsUpdated = 0;
-
-//   for (const wo of workOrders) {
-//     if (!wo.stockItemId) {
-//       console.warn(`   ⚠️  WO ${wo.workOrderNumber} has no stockItemId — skipping`);
-//       continue;
-//     }
-
-//     // Fetch the corresponding StockItem
-//     const stockItem = await StockItem.findById(wo.stockItemId)
-//       .select("name operations").lean();
-
-//     if (!stockItem || !stockItem.operations?.length) {
-//       console.warn(`   ⚠️  WO ${wo.workOrderNumber} — StockItem not found or has no operations`);
-//       continue;
-//     }
-
-//     // Build a map of operationType (normalized) → operationCode from StockItem
-//     const stockOpMap = new Map();
-//     for (const op of stockItem.operations) {
-//       const key = (op.type || "").trim().toLowerCase().replace(/\s+/g, " ");
-//       if (key && op.operationCode) {
-//         stockOpMap.set(key, op.operationCode);
-//       }
-//     }
-
-//     let woModified = false;
-//     const updatedOps = wo.operations.map(op => {
-//       // Skip if operationCode already filled
-
-
-//       const key = (op.operationType || "").trim().toLowerCase().replace(/\s+/g, " ");
-//       const matchedCode = stockOpMap.get(key);
-
-//       if (matchedCode) {
-//         totalPatched++;
-//         woModified = true;
-//         console.log(`     ✓ WO ${wo.workOrderNumber} — "${op.operationType}" → ${matchedCode}`);
-//         return { ...op, operationCode: matchedCode };
-//       } else {
-//         totalNoMatch++;
-//         console.warn(`     ⚠️  WO ${wo.workOrderNumber} — no match for "${op.operationType}" in StockItem "${stockItem.name}"`);
-//         return op;
-//       }
-//     });
-
-//     if (woModified) {
-//       await WorkOrder.updateOne(
-//         { _id: wo._id },
-//         { $set: { operations: updatedOps } }
-//       );
-//       totalWOsUpdated++;
-//     }
-//   }
-
-//   await flagsCol.insertOne({
-//     key: flagKey,
-//     ranAt: new Date(),
-//     stats: {
-//       workOrdersProcessed: workOrders.length,
-//       workOrdersUpdated: totalWOsUpdated,
-//       operationsPatched: totalPatched,
-//       operationsNoMatch: totalNoMatch,
-//     }
-//   });
-
-//   console.log(`✅ WorkOrder operationCode backfill complete — ${totalWOsUpdated} WOs updated, ${totalPatched} operations patched, ${totalNoMatch} had no match`);
-// };
+// Update the database connection section
+connectDB().then(async () => {
+  await createDefaultAccountant(); // ✅ ADD THIS
+});
+//changes
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
 
-const assignMeasurementsToExistingProducts = async () => {
+const CATEGORY_MEASUREMENTS = {
+  Shirts: [
+    "Length",
+    "Chest",
+    "Stomach",
+    "Button Hem",
+    "Shoulder",
+    "Sleeve Length",
+    "Cuff",
+    "Coller",
+  ],
+  Outerwear: ["Length", "Chest", "Stomach", "Button Hem", "Shoulder"],
+  Bottoms: [
+    "Length",
+    "Waist",
+    "Sheet",
+    "Thigh",
+    "Knee",
+    "Buttom",
+    "Crouch Kista Cut",
+  ],
+};
+
+const overwriteExistingMeasurements = async () => {
   try {
-    console.log("🔄 Starting automatic measurement assignment to existing products (FORCE OVERRIDE)...");
-
-    const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
-
-    const CATEGORY_MEASUREMENTS = {
-      Shirts: [
-        "Length", "Chest", "Stomach", "Bottom hem",
-        "Shoulder", "Sleeve Length", "Cuff", "Coller",
-      ],
-      Bottoms: [
-        "Length", "Waist", "Sheet", "Thigh", "Knee", "Buttom", "Crouch Kista Cut",
-      ],
-      Outerwear: [
-        "Length", "Chest", "Stomach", "Buttom hem",
-        "Shoulder"
-      ],
-    };
-
-    let totalUpdated = 0;
-
-    for (const [category, measurements] of Object.entries(CATEGORY_MEASUREMENTS)) {
-      const result = await StockItem.updateMany(
-        { category },
-        { $set: { measurements, updatedAt: new Date() } },
-      );
-      if (result.modifiedCount > 0 || result.matchedCount > 0) {
-        console.log(
-          `✅ ${category}: Updated ${result.modifiedCount} products (matched: ${result.matchedCount}) with ${measurements.length} measurements`,
-        );
-        totalUpdated += result.modifiedCount;
-      } else {
-        console.log(
-          `ℹ️ ${category}: No products found in this category`,
-        );
-      }
-    }
-
-    console.log(
-      `✅ Measurement force override complete! Total products updated: ${totalUpdated}`,
-    );
-
-    // Create default HR
     const existingHR = await HRDepartment.findOne({
       role: "hr_manager",
       department: "Human Resources",
     });
+    for (const [category, measurements] of Object.entries(
+      CATEGORY_MEASUREMENTS,
+    )) {
+      const result = await StockItem.updateMany(
+        { category },
+        { $set: { measurements } },
+      );
 
-    if (!existingHR) {
-      const defaultHR = new HRDepartment({
-        name: "HR Admin",
-        email: "hr@grav.in",
-        password: "Hr@12345",
-        employeeId: "HR001",
-        phone: "9999999999",
-        department: "Human Resources",
-        role: "hr_manager",
-        isActive: true,
-      });
-
-      await defaultHR.save();
-      console.log("✅ Default HR Department created successfully");
+      console.log(`✅ ${category}: ${result.modifiedCount} documents updated`);
     }
+
+    const defaultHR = new HRDepartment({
+      name: "HR Admin",
+      email: "hr@grav.in",
+      password: "Hr@12345", // will be hashed automatically
+      employeeId: "HR001",
+      phone: "9999999999",
+      department: "Human Resources",
+      role: "hr_manager",
+      isActive: true,
+    });
+
+    await defaultHR.save();
+
+    console.log("✅ Default HR Department created successfully");
   } catch (error) {
-    console.error(
-      "❌ Error assigning measurements to existing products:",
-      error.message,
-    );
+    console.error("❌ Measurement overwrite failed:", error.message);
   }
 };
 
@@ -517,7 +466,9 @@ const assignMeasurementsToExistingProducts = async () => {
 const authRoutes = require("./routes/login");
 const employeeRoutes = require("./routes/HrRoutes/Employee-Section");
 
+// HR Profile Routes
 const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
+
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
@@ -534,6 +485,7 @@ app.use("/api/customer/requests", customerRequestsRoutes);
 const customerProfileRoutes = require("./routes/Customer_Routes/Profile.js");
 app.use("/api/customer/profile", customerProfileRoutes);
 
+// Add this to your server.js in the CMS ROUTES section
 const customerStockItemsRoutes = require("./routes/Customer_Routes/StockItems");
 app.use("/api/customer/stock-items", customerStockItemsRoutes);
 
@@ -544,6 +496,7 @@ const customerQuotationRoutes = require("./routes/Customer_Routes/QuotationRoute
 app.use("/api/customer", customerQuotationRoutes);
 
 const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
+// Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
@@ -552,6 +505,7 @@ app.use("/api/cms", productOperations);
 /* ===================
   CMS ROUTES
 ===================== */
+// Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
 
@@ -564,32 +518,44 @@ app.use("/api/cms/machines", machinesRoutes);
 const warehousesRoutes = require("./routes/CMS_Routes/Inventory/Configurations/warehouses");
 app.use("/api/cms/warehouses", warehousesRoutes);
 
+// Vendor-Buyer Category
 const vendorRoutes = require("./routes/CMS_Routes/Inventory/Vendor-Buyer/vendor");
 app.use("/api/cms/vendors", vendorRoutes);
 
+// Products Category
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
 app.use("/api/cms/raw-items", rawItemsRoutes);
 
-const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems.js");
+const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems");
 app.use("/api/cms/stock-items", stockItemsRoutes);
 
+// Operations Category
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
 
 const deliveryRoutes = require("./routes/CMS_Routes/Inventory/Operations/deliveries");
 app.use("/api/cms/inventory/operations/deliveries", deliveryRoutes);
 
+// Overview Section
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
 const RegisteredDepartments = require("./routes/CMS_Routes/Sales/Configuration/OrganizationDepartment/organizationDepartmentRoutes");
-app.use("/api/cms/configuration/organization-departments", RegisteredDepartments);
+app.use(
+  "/api/cms/configuration/organization-departments",
+  RegisteredDepartments,
+);
 
+// Measurement Routes
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
 app.use("/api/cms/measurements", measurementRoutes);
 
+// Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
-app.use("/api/cms/manufacturing/manufacturing-orders", manufacturingOrderRoutes);
+app.use(
+  "/api/cms/manufacturing/manufacturing-orders",
+  manufacturingOrderRoutes,
+);
 
 const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes");
 app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
@@ -597,11 +563,12 @@ app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 const BarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/barcodeRoutes.js");
 app.use("/api/cms/manufacturing/barcode", BarcodeRoutes);
 
-const ProductionTrackingBarcode = require("./routes/Barcode_Scan_Punchings/trackingRoutes.js");
-app.use("/api/cms/production/barcode_punchings", ProductionTrackingBarcode);
-
+// In your main server.js or app.js
 const workOrderProgressRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderProgressRoutes");
-app.use("/api/cms/manufacturing/work-orders/production-tracking", workOrderProgressRoutes);
+app.use(
+  "/api/cms/manufacturing/work-orders/production-tracking",
+  workOrderProgressRoutes,
+);
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
@@ -609,9 +576,13 @@ app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
 app.use("/api/cms/production/dashboard", productionDashboardRoutes);
 
+
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionMachineLayout);
 
+
+
+// In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
 app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
 
@@ -621,12 +592,7 @@ app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
 const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
 app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
 
-const dispatchRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/dispatchRoutes.js");
-app.use("/api/cms/manufacturing/dispatch", dispatchRoutes);
-
-const markAsDoneRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/markAsDoneRoutes");
-app.use("/api/cms/manufacturing/mark-as-done", markAsDoneRoutes);
-
+// Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
 app.use("/api/cms/sales", salesRoutes);
 
@@ -663,6 +629,15 @@ app.use("/api/hr/payroll", payrollRoutes);
 const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
 app.use("/hr/attendance", attendanceRouter);
 
+const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
+app.use("/api/hr/leaves", hrLeaveRoutes);
+
+app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
+
+// Employee Leave Routes (employee side — apply, balance, calendar, manager actions)
+const employeeLeaveRoutes = require("./routes/Employee_Routes/leaveRoutes");
+app.use("/api/employee/leave-applications", employeeLeaveRoutes);
+
 
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
@@ -671,12 +646,13 @@ const employeeImportRoutes = require("./routes/HrRoutes/employeeImportExport.js"
 app.use("/api/employees/import-export", employeeImportRoutes);
 
 
+// Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
 
+// Accountant Vendor Routes
 const accountantVendorRoutes = require("./routes/Accountant_Routes/vendors");
 app.use("/api/accountant/vendors", accountantVendorRoutes);
-
 const vendorProfileRoutes = require("./routes/Vendor_Routes/profile.js");
 app.use("/api/vendor/profile", vendorProfileRoutes);
 
@@ -686,6 +662,7 @@ app.use("/api/vendor/partner-employees", vendorEmployees);
 const vendorWO = require("./routes/Vendor_Routes/vendorWorkOrderRoutes.js");
 app.use("/api/vendor/work-orders", vendorWO);
 
+// Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
 
@@ -695,36 +672,44 @@ app.use("/api/employee", employeeAuthRoutes);
 const TasksEmployee = require("./routes/Employee_Routes/TasksEmployee");
 app.use("/api/employee/tasks", TasksEmployee);
 
+// Import the cutting master routes
 const cuttingMasterRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/cuttingMasterRoutes");
 app.use("/api/cms/manufacturing/cutting-master", cuttingMasterRoutes);
 
 const patternGradingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/patternGradingRoutes");
 app.use("/api/cms/manufacturing/cutting-master", patternGradingRoutes);
 
+// Import measurement routes
 const CuttingmeasurementRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/measurementRoutes");
 app.use("/api/cms/manufacturing/cutting-master", CuttingmeasurementRoutes);
 
+// Import the bulk cutting routes
 const bulkCuttingRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/bulkCuttingRoutes.js");
+// Merge the routers
 app.use("/api/cms/manufacturing/cutting-master", bulkCuttingRoutes);
 
-const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes");
+// Vendor Routes For Vendor Portal
+const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes"); // NEW FILE
 app.use("/api/vendor", vendorAuthRoutes);
 
-const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js");
+
+const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
 app.use("/api/barcode-devices", barcodeScannerRoutes);
+
+
 
 app.use("/cowork", require("./routes/task_routes/taskForward.js"));
 // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
 app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
-
 // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
 app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
 
 //new tree substack routes
-app.use("/cowork", require("./routes/task_routes/taskTree.routes.js"));
+const taskTreeModule = require("./routes/task_routes/taskTree.routes.js");
+app.use("/cowork", taskTreeModule); // ✅ Fix: use .router
 
-const coworkRoutes = require("./routes//task_routes/cowork");
+const coworkRoutes = require("./routes/task_routes/cowork");
 app.use("/cowork", coworkRoutes);
 
 app.use("/cowork", require("./routes/task_routes/livekit.routes"));
@@ -732,7 +717,11 @@ app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
 
 app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
-app.use("/cowork", require("./routes/task_routes/askAI.routes"));
+
+// Fix: askAI.routes exports an object, use .router
+const askAITest = require("./routes/task_routes/askAI.routes");
+console.log('askAI.routes exports:', Object.keys(askAITest));
+app.use("/cowork", askAITest);
 
 
 const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
