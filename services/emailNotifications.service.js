@@ -4,16 +4,8 @@
  * Sends transactional emails via Brevo API.
  * ENV: BREVO_API_KEY, ENABLE_EMAILS, CUSTOMER_SENDER_EMAIL, COWORK_APP_URL
  *
- * TWO delivery paths:
- *   1. sendNotificationEmail()     — all in-app events with 20-min cooldown per pair
- *   2. sendWelcomeEmail()          — account creation (no cooldown)
- *   3. sendMeetingScheduledEmail() — meeting invites (no cooldown)
- *   4. sendTaskAssignedEmail()     — task assigned (no cooldown)
- *
- * COOLDOWN RULE (emails only, push notifications unaffected):
- *   Same senderId + same receiverId within 20 min → skip email
- *   Different sender OR receiver → send immediately
- *   senderId === receiverId → always send
+ * Every notification event sends an email immediately — no cooldown.
+ * Push notifications also fire immediately (unchanged).
  */
 
 const axios = require("axios");
@@ -22,26 +14,6 @@ const BREVO_URL = "https://api.brevo.com/v3/smtp/email";
 const FROM_EMAIL = process.env.CUSTOMER_SENDER_EMAIL || "noreply@grav.in";
 const FROM_NAME = "Grav CoWork";
 const LOGIN_URL = process.env.COWORK_APP_URL || "https://cowork.grav.in";
-const COOLDOWN_MS = 20 * 60 * 1000; // 20 minutes
-
-// ── In-memory cooldown map ─────────────────────────────────────────────────
-// Key: "senderId::receiverId"   Value: timestamp ms of last email sent
-const _cooldownMap = new Map();
-
-function _coolingDown(senderId, receiverId) {
-    if (!senderId || !receiverId || senderId === receiverId) return false;
-    const last = _cooldownMap.get(`${senderId}::${receiverId}`);
-    return !!last && Date.now() - last < COOLDOWN_MS;
-}
-function _markSent(senderId, receiverId) {
-    if (!senderId || !receiverId || senderId === receiverId) return;
-    _cooldownMap.set(`${senderId}::${receiverId}`, Date.now());
-}
-// Purge stale entries every hour
-setInterval(() => {
-    const cutoff = Date.now() - COOLDOWN_MS;
-    for (const [k, v] of _cooldownMap.entries()) if (v < cutoff) _cooldownMap.delete(k);
-}, 3600000);
 
 // ── Internal Brevo send ────────────────────────────────────────────────────
 async function _send({ to, subject, html, text }) {
@@ -59,6 +31,7 @@ async function _send({ to, subject, html, text }) {
             headers: {
                 "X-Mailer": "Grav-CoWork-Notifications",
                 "X-Priority": "3",
+                "X-CoWork-Notification": "true",
                 "Precedence": "bulk",
                 "List-Unsubscribe": `<mailto:${FROM_EMAIL}?subject=unsubscribe>`,
             },
@@ -81,7 +54,7 @@ function _wrap(title, body) {
     <h2 style="font-size:16px;margin:0 0 16px">${title}</h2>
     ${body}
     <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
-    <p style="font-size:12px;color:#888"><a href="${LOGIN_URL}" style="color:#2563EB">Open CoWork</a> &nbsp;·&nbsp; Emails group every 20 min per conversation to reduce inbox noise.</p>
+    <p style="font-size:12px;color:#888"><a href="${LOGIN_URL}" style="color:#2563EB">Open CoWork</a> &nbsp;·&nbsp; This is an automated notification from Grav CoWork.</p>
   </div>
 </div>`;
 }
@@ -105,11 +78,6 @@ function _quote(text, color) { return `<blockquote style="border-left:3px solid 
 async function sendNotificationEmail({ senderId, senderName, receiverId, receiverName, receiverEmail, type, title, body, data = {} }) {
     if (!receiverEmail) return;
     if (process.env.ENABLE_EMAILS !== "true") return;
-
-    if (_coolingDown(senderId, receiverId)) {
-        console.log(`[Email] Cooldown ${senderId}->${receiverId} (${type}) skipped`);
-        return;
-    }
 
     const app = `${LOGIN_URL}/coworking`;
     let subject = title;
@@ -240,8 +208,6 @@ async function sendNotificationEmail({ senderId, senderName, receiverId, receive
     else {
         html = _wrap(title, `<p>${body}</p>${_btn("Open CoWork", app)}`);
     }
-
-    _markSent(senderId, receiverId);
 
     await _send({
         to: [{ name: receiverName, email: receiverEmail }],
