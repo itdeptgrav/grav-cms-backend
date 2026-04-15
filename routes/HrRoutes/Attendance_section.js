@@ -71,7 +71,33 @@ const dateStrOf = (d) =>
 const toTitleCase = (s) => String(s || "").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
 const numericOf = (s) => { const d = String(s || "").replace(/\D/g, ""); return d ? parseInt(d, 10) : null; };
 
-const minsOf = (d) => (d ? d.getHours() * 60 + d.getMinutes() : null);
+const minsOf = (d) => {
+    if (!d) return null;
+    const dt = new Date(d);
+    // Force IST: UTC + 5:30 = 330 minutes
+    const utcMins = dt.getUTCHours() * 60 + dt.getUTCMinutes();
+    return (utcMins + 330) % 1440;
+};
+// Format a Date as "HH:MM" in IST — used in Excel exports
+const fmtTimeIST = (d) => {
+    if (!d) return "";
+    const dt = new Date(d);
+    return dt.toLocaleTimeString("en-IN", {
+        hour: "2-digit", minute: "2-digit", hour12: false,
+        timeZone: "Asia/Kolkata",
+    });
+};
+
+// Format a Date as "9:56 am" in IST — used in API responses
+const fmtTimeIST12 = (d) => {
+    if (!d) return "—";
+    const dt = new Date(d);
+    return dt.toLocaleTimeString("en-IN", {
+        hour: "numeric", minute: "2-digit", hour12: true,
+        timeZone: "Asia/Kolkata",
+    });
+};
+
 const hhmmMins = (s) => { const [h, m] = String(s || "00:00").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
 
 function normalizeName(s) {
@@ -746,19 +772,31 @@ async function applyLeaveToAttendance(leaveApp) {
     if (!leaveApp || leaveApp.status !== "hr_approved") return { applied: 0, skipped: 0 };
 
     const statusCode = LEAVE_TYPE_TO_STATUS[leaveApp.leaveType];
-    if (!statusCode) return { applied: 0, skipped: 0 };
+    if (!statusCode) {
+        console.warn(`[LEAVE-APPLY] No mapping for leaveType=${leaveApp.leaveType}`);
+        return { applied: 0, skipped: 0 };
+    }
 
     const bid = String(leaveApp.biometricId || "").toUpperCase();
-    if (!bid) return { applied: 0, skipped: 0 };
+    if (!bid) {
+        console.warn(`[LEAVE-APPLY] No biometricId on leave ${leaveApp._id}`);
+        return { applied: 0, skipped: 0 };
+    }
 
-    let applied = 0, skipped = 0;
+    let applied = 0, skipped = 0, missingDays = 0;
     const start = new Date(leaveApp.fromDate + "T00:00:00");
     const end = new Date(leaveApp.toDate + "T00:00:00");
 
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
         const ds = dateStrOf(new Date(d));
         const dayDoc = await DailyAttendance.findOne({ dateStr: ds });
-        if (!dayDoc) { skipped++; continue; }
+
+        if (!dayDoc) {
+            // Day not synced yet — will be picked up later by applyApprovedLeavesForDate
+            // when the day finally syncs. Don't mark as fully applied.
+            missingDays++;
+            continue;
+        }
 
         const idx = (dayDoc.employees || []).findIndex((e) => e.biometricId === bid);
         if (idx === -1) {
@@ -787,6 +825,7 @@ async function applyLeaveToAttendance(leaveApp) {
             const emp = dayDoc.employees[idx];
             // Don't overwrite a holiday/WO status with leave
             if (["WO", "FH", "NH", "OH", "RH", "PH"].includes(emp.systemPrediction)) {
+                console.log(`[LEAVE-APPLY] ${bid} on ${ds}: skipped (rest day: ${emp.systemPrediction})`);
                 skipped++;
                 continue;
             }
@@ -800,12 +839,15 @@ async function applyLeaveToAttendance(leaveApp) {
         await dayDoc.save();
     }
 
-    // Mark the leave application as applied so we don't re-sync
-    leaveApp.appliedToAttendance = true;
-    leaveApp.appliedAt = new Date();
-    if (leaveApp.save) await leaveApp.save();
+    // Only mark fully-applied if no days are pending future sync
+    if (missingDays === 0) {
+        leaveApp.appliedToAttendance = true;
+        leaveApp.appliedAt = new Date();
+        if (leaveApp.save) await leaveApp.save();
+    }
 
-    return { applied, skipped };
+    console.log(`[LEAVE-APPLY] ${bid} ${leaveApp.fromDate}→${leaveApp.toDate} (${leaveApp.leaveType}): applied=${applied}, skipped=${skipped}, missingDays=${missingDays}`);
+    return { applied, skipped, missingDays };
 }
 
 /**
@@ -820,6 +862,7 @@ async function applyApprovedLeavesForDate(dateStr) {
         toDate: { $gte: dateStr },
     }).lean();
 
+    let appliedCount = 0;
     for (const app of apps) {
         const statusCode = LEAVE_TYPE_TO_STATUS[app.leaveType];
         if (!statusCode) continue;
@@ -829,16 +872,48 @@ async function applyApprovedLeavesForDate(dateStr) {
         const dayDoc = await DailyAttendance.findOne({ dateStr });
         if (!dayDoc) continue;
         const idx = (dayDoc.employees || []).findIndex((e) => e.biometricId === bid);
-        if (idx === -1) continue;
+
+        if (idx === -1) {
+            // Employee not in day doc (didn't punch) — inject leave row
+            dayDoc.employees.push({
+                employeeDbId: app.employeeId,
+                biometricId: bid,
+                employeeName: app.employeeName || "",
+                department: app.department || "",
+                designation: app.designation || "",
+                employeeType: "executive",
+                isGhost: false,
+                matchMethod: "leave-injected",
+                rawPunches: [], punchCount: 0,
+                inTime: null, finalOut: null,
+                netWorkMins: 0, otMins: 0, lateMins: 0,
+                hasMissPunch: false, isLate: false, isEarlyDeparture: false, hasOT: false,
+                totalSpanMins: 0, lunchBreakMins: 0, teaBreakMins: 0, totalBreakMins: 0,
+                systemPrediction: "AB",
+                hrFinalStatus: statusCode,
+                hrRemarks: `Leave approved (${app.leaveType})`,
+                hrReviewedAt: new Date(),
+            });
+            appliedCount++;
+            dayDoc.markModified("employees");
+            await dayDoc.save();
+            continue;
+        }
+
         const emp = dayDoc.employees[idx];
         if (["WO", "FH", "NH", "OH", "RH", "PH"].includes(emp.systemPrediction)) continue;
-        if (emp.hrFinalStatus === statusCode) continue;  // already set
+        if (emp.hrFinalStatus === statusCode) continue;
 
         emp.hrFinalStatus = statusCode;
         emp.hrRemarks = emp.hrRemarks || `Leave approved (${app.leaveType})`;
         emp.hrReviewedAt = new Date();
         dayDoc.markModified("employees");
         await dayDoc.save();
+        appliedCount++;
+    }
+
+    if (appliedCount > 0) {
+        console.log(`[LEAVE-DATE-SYNC] ${dateStr}: applied ${appliedCount} leave(s)`);
     }
 }
 
@@ -1140,14 +1215,17 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
 
         const syncedDates = new Set(days.map((d) => d.dateStr));
         const workingDates = workingDaysInRange(from, to);
-        const allCalendarDates = allDaysInRange(from, to);
         const unsyncedWorkingDates = workingDates.filter((d) => !syncedDates.has(d));
 
-        const syncedSundays = new Set();
-        for (const d of days) {
-            const dt = new Date(d.dateStr + "T00:00:00");
-            if (dt.getDay() === 0) syncedSundays.add(d.dateStr);
-        }
+        // Holidays in this range (excluding working_sunday overrides)
+        const activeHolidays = [...holidayMap.values()]
+            .filter(h => h.type !== "working_sunday")
+            .sort((a, b) => a.date.localeCompare(b.date))
+            .map(h => ({
+                date: h.date, name: h.name, type: h.type,
+                description: h.description || "",
+                statusCode: holidayTypeToStatus(h.type),
+            }));
 
         const perEmp = new Map();
         const running = new Map();
@@ -1166,7 +1244,10 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
             totalLateMins: 0, totalOtMins: 0, totalNetWorkMins: 0,
             autoPromotedHDs: 0,
             sundayWorkedCount: 0,
-            totalHolidays: [...holidayMap.values()].filter(h => h.type !== "working_sunday").length,
+            holidayWorkedCount: 0,
+            totalAttendance: 0,
+            holidayCount: activeHolidays.length,
+            holidays: activeHolidays,
         };
 
         for (const emp of filteredActive) {
@@ -1191,13 +1272,17 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
                 effectivePresent: 0,
                 totalLateMins: 0, totalOtMins: 0, totalNetWorkMins: 0, autoHDs: 0,
                 sundayWorked: 0,
+                holidayWorked: 0,
                 totalAttendance: 0,
             });
         }
 
         for (const d of days) {
             if (d.yearMonth !== lastYM) { running.clear(); lastYM = d.yearMonth; }
-            const isSunday = new Date(d.dateStr + "T00:00:00").getDay() === 0;
+            const dt = new Date(d.dateStr + "T00:00:00");
+            const isSunday = dt.getDay() === 0;
+            const hol = holidayMap.get(d.dateStr);
+            const isDeclaredHoliday = !!hol && hol.type !== "working_sunday";
 
             for (const e of (d.employees || [])) {
                 if (department && department !== "all" && e.department !== department) continue;
@@ -1220,7 +1305,7 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
                         },
                         effectivePresent: 0,
                         totalLateMins: 0, totalOtMins: 0, totalNetWorkMins: 0, autoHDs: 0,
-                        sundayWorked: 0,
+                        sundayWorked: 0, holidayWorked: 0,
                         totalAttendance: 0,
                     });
                 }
@@ -1228,21 +1313,26 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
                 b.recordedDays++;
                 if (!isSunday) b.recordedWorkingDays++;
 
-                if (isSunday) {
+                // Sunday worked (punched + Sunday, not holiday)
+                if (isSunday && !isDeclaredHoliday && (e.punchCount || 0) > 0) {
                     b.sundayWorked++;
                     agg.sundayWorkedCount++;
                 }
 
+                // Holiday worked (punched + declared holiday)
+                if (isDeclaredHoliday && (e.punchCount || 0) > 0) {
+                    b.holidayWorked++;
+                    agg.holidayWorkedCount++;
+                }
                 let cum = running.get(key) || 0;
                 let status = e.systemPrediction;
                 let promoted = false;
-                if (e.isLate && (e.lateMins || 0) > 0) {
+                if (settings.lateHalfDayPolicy?.enabled && e.isLate && (e.lateMins || 0) > 0) {  // ← add the policy guard
                     cum += e.lateMins;
                     const thr = thresholds[e.employeeType] ?? thresholds.operator ?? 30;
                     if (cum >= thr) { status = "HD"; promoted = true; cum = 0; }
                 }
                 running.set(key, cum);
-
                 const final = e.hrFinalStatus || status;
                 if (b.days[final] !== undefined) b.days[final]++;
                 if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(final)) b.days.leaves++;
@@ -1254,10 +1344,10 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
                 }
 
                 // TOTAL ATTENDANCE: anything that counts as a "day worked/paid"
-                //   = present types + HD + leaves + all holidays + WO + Sunday worked
-                const paidCodes = ["P", "P*", "P~", "HD", "WO", "FH", "NH", "OH", "RH", "PH", "L-CL", "L-SL", "L-EL", "WFH", "CO"];
-                if (paidCodes.includes(final) || (isSunday && (e.punchCount || 0) > 0)) {
+                const paidCodes = ["P", "P*", "P~", "HD", "MP", "WO", "FH", "NH", "OH", "RH", "PH", "L-CL", "L-SL", "L-EL", "WFH", "CO"];
+                if (paidCodes.includes(final)) {
                     b.totalAttendance++;
+                    agg.totalAttendance++;
                 }
 
                 b.totalLateMins += e.lateMins || 0;
@@ -1289,6 +1379,7 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         agg.activeEmployees = filteredActive.length;
         agg.ghostEmployeeCount = employees.filter((e) => e.isGhost).length;
         agg.presentCount = agg.P + agg["P*"] + agg["P~"];
+        agg.displayLabels = settings.displayLabels || {};
 
         res.json({ success: true, ...agg, employees });
     } catch (err) {
@@ -1300,7 +1391,6 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 //  EMPLOYEE DETAIL (for drawer)
 // ═══════════════════════════════════════════════════════════════════════════
-
 router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { biometricId, from, to } = req.query;
@@ -1325,13 +1415,17 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
             if (d > today) continue;
             const ds = dateStrOf(new Date(d));
             const dow = d.getDay();
+            const hol = holidayMap.get(ds);
             calendar.push({
                 dateStr: ds,
                 dayName: new Date(d).toLocaleDateString("en-IN", { weekday: "short" }),
                 dayNum: d.getDate(),
                 isSunday: dow === 0,
                 restStatus: resolveRestDayStatus(ds, dow, holidayMap),
-                holiday: holidayMap.get(ds) || null,
+                holiday: hol || null,
+                isHoliday: !!hol && hol.type !== "working_sunday",
+                holidayName: (hol && hol.type !== "working_sunday") ? hol.name : null,
+                holidayType: (hol && hol.type !== "working_sunday") ? hol.type : null,
             });
         }
 
@@ -1344,21 +1438,28 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
         const stats = {
             P: 0, "P*": 0, "P~": 0, HD: 0, AB: 0, MP: 0, WO: 0, PH: 0,
             FH: 0, NH: 0, OH: 0, RH: 0,
+            "L-CL": 0, "L-SL": 0, "L-EL": 0, LWP: 0, WFH: 0, CO: 0,
+            leaves: 0,
             unsynced: 0, effectivePresent: 0,
             totalLateMins: 0, totalOtMins: 0, totalNetWorkMins: 0,
-            sundayWorked: 0, totalAttendance: 0,
+            sundayWorked: 0,
+            holidayWorked: 0,
+            totalAttendance: 0,
         };
 
         for (const cal of calendar) {
             const dayDoc = byDate.get(cal.dateStr);
 
             if (!dayDoc) {
-                // Not synced — but if it's a rest day by calendar, show that
                 if (cal.restStatus) {
-                    rows.push({ ...cal, status: cal.restStatus, label: getDisplayLabel(cal.restStatus, settings), synced: false });
+                    rows.push({
+                        ...cal,
+                        status: cal.restStatus,
+                        label: getDisplayLabel(cal.restStatus, settings),
+                        synced: false,
+                    });
                     if (stats[cal.restStatus] !== undefined) stats[cal.restStatus]++;
-                    if (cal.restStatus !== "WO") stats.totalAttendance++;
-                    else stats.totalAttendance++;
+                    stats.totalAttendance++;
                 } else {
                     rows.push({ ...cal, status: "UNSYNCED", label: "Not synced", synced: false });
                     stats.unsynced++;
@@ -1387,7 +1488,7 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
             let cum = running.get(bid) || 0;
             let status = entry.systemPrediction;
             let promoted = false;
-            if (entry.isLate && (entry.lateMins || 0) > 0) {
+            if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {  // ← add the policy guard
                 cum += entry.lateMins;
                 const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
                 if (cum >= thr) { status = "HD"; promoted = true; cum = 0; }
@@ -1397,31 +1498,43 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
 
             if (isEffectivelyPresent({ ...entry, systemPrediction: finalStatus })) stats.effectivePresent++;
             if (stats[finalStatus] !== undefined) stats[finalStatus]++;
+            if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(finalStatus)) stats.leaves++;
 
-            const paidCodes = ["P", "P*", "P~", "HD", "WO", "FH", "NH", "OH", "RH", "PH", "L-CL", "L-SL", "L-EL", "WFH", "CO"];
+            const paidCodes = ["P", "P*", "P~", "HD", "MP", "WO", "FH", "NH", "OH", "RH", "PH", "L-CL", "L-SL", "L-EL", "WFH", "CO"];
             if (paidCodes.includes(finalStatus)) stats.totalAttendance++;
 
             stats.totalLateMins += entry.lateMins || 0;
             stats.totalOtMins += entry.otMins || 0;
             stats.totalNetWorkMins += entry.netWorkMins || 0;
 
-            if (cal.isSunday && (entry.punchCount || 0) > 0) stats.sundayWorked++;
+            const punched = (entry.punchCount || 0) > 0;
+            const isSundayWorked = cal.isSunday && !cal.isHoliday && punched;
+            const punchedOnHoliday = cal.isHoliday && punched;
+            if (isSundayWorked) stats.sundayWorked++;
+            if (punchedOnHoliday) stats.holidayWorked++;
 
             rows.push({
-                ...cal, status: finalStatus,
+                ...cal,
+                status: finalStatus,
                 label: getDisplayLabel(finalStatus, settings),
                 synced: true,
-                isSundayWorked: cal.isSunday && (entry.punchCount || 0) > 0,
+                isSundayWorked,
+                punchedOnHoliday,
                 inTime: entry.inTime, lunchOut: entry.lunchOut, lunchIn: entry.lunchIn,
                 teaOut: entry.teaOut, teaIn: entry.teaIn, finalOut: entry.finalOut,
-                punchCount: entry.punchCount, rawPunches: entry.rawPunches || [],
+                punchCount: entry.punchCount,
+                rawPunches: entry.rawPunches || [],
                 netWorkMins: entry.netWorkMins || 0,
                 totalBreakMins: entry.totalBreakMins || 0,
-                lateMins: entry.lateMins || 0, otMins: entry.otMins || 0,
-                isLate: entry.isLate, isEarlyDeparture: entry.isEarlyDeparture,
-                hasMissPunch: entry.hasMissPunch, hasOT: entry.hasOT,
+                lateMins: entry.lateMins || 0,
+                otMins: entry.otMins || 0,
+                isLate: entry.isLate,
+                isEarlyDeparture: entry.isEarlyDeparture,
+                hasMissPunch: entry.hasMissPunch,
+                hasOT: entry.hasOT,
                 earlyDepartureMins: entry.earlyDepartureMins || 0,
-                shiftStart: entry.shiftStart, shiftEnd: entry.shiftEnd,
+                shiftStart: entry.shiftStart,
+                shiftEnd: entry.shiftEnd,
                 appliedExtraGraceMins: entry.appliedExtraGraceMins || 0,
                 wasPromotedToHalfDay: promoted,
                 cumulativeLateMins: cum,
@@ -1431,7 +1544,15 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
             });
         }
 
-        res.json({ success: true, from, to, biometricId: bid, employee: empMeta, rows, stats });
+        res.json({
+            success: true,
+            from, to,
+            biometricId: bid,
+            employee: empMeta,
+            rows,
+            stats,
+            displayLabels: settings.displayLabels || {},
+        });
     } catch (err) {
         console.error("[EMPLOYEE-DETAIL]", err.message);
         res.status(500).json({ success: false, message: err.message });
@@ -1608,104 +1729,301 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
 
 router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
     try {
-        const { date } = req.query;
-        if (!date) return res.status(400).json({ message: "Date required" });
+        const { date, department } = req.query;
+        if (!date) return res.status(400).json({ success: false, message: "date required" });
 
+        // Reuse the daily endpoint logic by calling it internally would be overkill.
+        // Just fetch the day doc and build rows here.
         const dayDoc = await DailyAttendance.findOne({ dateStr: date }).lean();
-        if (!dayDoc) return res.status(404).json({ message: "No data" });
-
         const settings = await AttendanceSettings.getConfig();
-        const employees = await applyMonthlyLatePromotion(dayDoc, settings);
+        const labels = settings.displayLabels || {};
+        const L = (s) => labels[s] || s;
+
+        const allActive = await Employee.find({
+            $or: [{ status: "active" }, { status: { $exists: false } }, { isActive: true }],
+        }).lean();
+        const filtered = (department && department !== "all")
+            ? allActive.filter((e) => extractDepartment(e) === department)
+            : allActive;
+
+        const byBio = new Map();
+        if (dayDoc) for (const e of (dayDoc.employees || [])) byBio.set(e.biometricId, e);
+
+        // Build rows, sorted by name
+        const rows = [];
+        for (const emp of filtered) {
+            const bid = String(extractBiometricId(emp) || "").toUpperCase();
+            if (!bid) continue;
+            const entry = byBio.get(bid);
+            const status = entry?.hrFinalStatus || entry?.systemPrediction || "AB";
+            rows.push({
+                name: extractName(emp),
+                department: extractDepartment(emp),
+                status,
+                statusLabel: L(status),
+                inTime: entry?.inTime,
+                lunchOut: entry?.lunchOut,
+                lunchIn: entry?.lunchIn,
+                teaOut: entry?.teaOut,
+                teaIn: entry?.teaIn,
+                outTime: entry?.finalOut,
+                netWorkMins: entry?.netWorkMins || 0,
+                otMins: entry?.otMins || 0,
+                isLate: !!entry?.isLate,
+                isEarlyDeparture: !!entry?.isEarlyDeparture,
+                lateMins: entry?.lateMins || 0,
+                earlyMins: entry?.earlyDepartureMins || 0,
+            });
+        }
+        rows.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
 
         const wb = new ExcelJS.Workbook();
-        const ws = wb.addWorksheet("Daily Register", {
-            views: [{ state: "frozen", ySplit: 2, xSplit: 3 }]
+        wb.creator = "Grav Clothing HRMS";
+        const ws = wb.addWorksheet("Daily Attendance", {
+            views: [{ state: "frozen", ySplit: 9, showGridLines: false }],
+            pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
         });
 
-        const COLORS = {
-            HEADER: "FFD9EAD3", BORDER: "FF000000",
-            P: "FF008000", AB: "FFFF0000", WO: "FF800080", LATE: "FFFF8C00",
+        const TOTAL_COLS = 12; // EMPLOYEE, DEPT, STATUS, IN, OUT, L.OUT, L.IN, T.OUT, T.IN, FINAL, WORK, OT
+        const dateLabel = new Date(date + "T00:00:00").toLocaleDateString("en-IN", {
+            weekday: "long", day: "numeric", month: "long", year: "numeric",
+            timeZone: "Asia/Kolkata",
+        });
+
+        // ── Hero banner ────────────────────────────────────────────────
+        ws.mergeCells(1, 1, 1, TOTAL_COLS);
+        const hero = ws.getCell(1, 1);
+        hero.value = {
+            richText: [
+                { text: "GRAV CLOTHING\n", font: { size: 9, bold: true, italic: true, color: { argb: "FFE9D5FF" } } },
+                { text: `Daily Attendance · ${dateLabel}`, font: { size: 16, bold: true, color: { argb: "FFFFFFFF" } } },
+            ]
         };
+        hero.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+        hero.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+        ws.getRow(1).height = 40;
 
-        ws.columns = [
-            { width: 28 }, { width: 20 }, { width: 10 },
-            { width: 9 }, { width: 9 }, { width: 9 }, { width: 9 }, { width: 9 }, { width: 9 },
-            { width: 9 }, { width: 12 }, { width: 10 },
-        ];
+        // ── Stats sub-banner ───────────────────────────────────────────
+        const stats = { P: 0, "P*": 0, "P~": 0, HD: 0, MP: 0, AB: 0, WO: 0, holiday: 0, leaves: 0 };
+        for (const r of rows) {
+            if (stats[r.status] !== undefined) stats[r.status]++;
+            if (["FH", "NH", "OH", "RH", "PH"].includes(r.status)) stats.holiday++;
+            if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(r.status)) stats.leaves++;
+        }
+        ws.mergeCells(2, 1, 2, TOTAL_COLS);
+        const sub = ws.getCell(2, 1);
+        sub.value = `${rows.length} employees  ·  Present ${stats.P + stats["P*"] + stats["P~"]}  ·  Late ${stats["P*"]}  ·  Half Day ${stats.HD}  ·  Miss Punch ${stats.MP}  ·  Absent ${stats.AB}  ·  Off ${stats.WO}  ·  Holiday ${stats.holiday}  ·  Leave ${stats.leaves}`;
+        sub.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
+        sub.font = { size: 9, color: { argb: "FFC4B5FD" } };
+        sub.alignment = { vertical: "middle", horizontal: "center" };
+        ws.getRow(2).height = 22;
 
-        const headers = [
-            "EMPLOYEE", "DEPARTMENT", "STATUS",
-            "IN", "OUT", "L.OUT", "L.IN", "T.OUT", "T.IN",
-            "FINAL", "WORK", "OT"
-        ];
-        const headerRow = ws.getRow(1);
+        // ── LEGEND ROW 1 — status colors ──────────────────────────────
+        ws.mergeCells(3, 1, 3, TOTAL_COLS);
+        const legendHdr = ws.getCell(3, 1);
+        legendHdr.value = "COLOR LEGEND — STATUS CODES";
+        legendHdr.font = { size: 9, bold: true, color: { argb: "FF6B7280" } };
+        legendHdr.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        legendHdr.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF9FAFB" } };
+        ws.getRow(3).height = 20;
+
+        ws.mergeCells(4, 1, 4, TOTAL_COLS);
+        const legendStatus = ws.getCell(4, 1);
+        legendStatus.value = {
+            richText: [
+                { text: "P", font: { size: 10, bold: true, color: { argb: "FF008000" } } },
+                { text: " Present  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "L", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
+                { text: " Late  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "EO", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
+                { text: " Early Out  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "HD", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
+                { text: " Half Day  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "MP", font: { size: 10, bold: true, color: { argb: "FFDB2777" } } },
+                { text: " Miss Punch  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "A", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
+                { text: " Absent  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "WO", font: { size: 10, bold: true, color: { argb: "FF64748B" } } },
+                { text: " Weekly Off  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "FH/NH/OH/RH", font: { size: 10, bold: true, color: { argb: "FF4F46E5" } } },
+                { text: " Holidays  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "CL/SL/EL", font: { size: 10, bold: true, color: { argb: "FF7C3AED" } } },
+                { text: " Leaves", font: { size: 9, color: { argb: "FF6B7280" } } },
+            ]
+        };
+        legendStatus.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+        legendStatus.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
+        ws.getRow(4).height = 22;
+
+        // ── LEGEND ROW 2 — time & work colors ─────────────────────────
+        ws.mergeCells(5, 1, 5, TOTAL_COLS);
+        const legendTimes = ws.getCell(5, 1);
+        legendTimes.value = {
+            richText: [
+                { text: "TIMES → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
+                { text: "09:19", font: { size: 10, bold: true, color: { argb: "FF2563EB" } } },
+                { text: " on-time IN/OUT  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "09:43", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
+                { text: " late IN  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "17:41", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
+                { text: " early OUT  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "WORK → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
+                { text: "8:35", font: { size: 10, bold: true, color: { argb: "FF16A34A" } } },
+                { text: " ≥ 8 hours  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "6:05", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
+                { text: " < 8 hours  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "OT → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
+                { text: "0:30", font: { size: 10, bold: true, color: { argb: "FF4338CA" } } },
+                { text: " any overtime", font: { size: 9, color: { argb: "FF6B7280" } } },
+            ]
+        };
+        legendTimes.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+        legendTimes.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
+        ws.getRow(5).height = 22;
+
+        // ── Border around the legend block ────────────────────────────
+        for (let r = 3; r <= 5; r++) {
+            for (let c = 1; c <= TOTAL_COLS; c++) {
+                ws.getCell(r, c).border = {
+                    top: r === 3 ? { style: "medium", color: { argb: "FF6B7280" } } : { style: "thin", color: { argb: "FFE5E7EB" } },
+                    bottom: r === 5 ? { style: "medium", color: { argb: "FF6B7280" } } : { style: "thin", color: { argb: "FFE5E7EB" } },
+                    left: c === 1 ? { style: "medium", color: { argb: "FF6B7280" } } : undefined,
+                    right: c === TOTAL_COLS ? { style: "medium", color: { argb: "FF6B7280" } } : undefined,
+                };
+            }
+        }
+
+        ws.getRow(6).height = 6; // gap
+
+        // ── Table headers ─────────────────────────────────────────────
+        const headers = ["EMPLOYEE", "DEPARTMENT", "STATUS", "IN", "OUT", "L.OUT", "L.IN", "T.OUT", "T.IN", "FINAL", "WORK", "OT"];
+        const widths = [28, 18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+        widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+        const headerRow = ws.getRow(7);
         headers.forEach((h, i) => {
             const cell = headerRow.getCell(i + 1);
             cell.value = h;
-            cell.font = { bold: true, size: 10 };
-            cell.alignment = { horizontal: "center", vertical: "middle" };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.HEADER } };
+            cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+            cell.alignment = { vertical: "middle", horizontal: i === 0 || i === 1 ? "left" : "center", indent: i <= 1 ? 1 : 0 };
             cell.border = {
-                top: { style: "thin", color: { argb: COLORS.BORDER } },
-                bottom: { style: "medium", color: { argb: COLORS.BORDER } },
-                left: { style: "thin", color: { argb: COLORS.BORDER } },
-                right: { style: "thin", color: { argb: COLORS.BORDER } },
+                top: { style: "medium", color: { argb: "FF0F172A" } },
+                bottom: { style: "medium", color: { argb: "FF0F172A" } },
+                left: { style: "thin", color: { argb: "FF374151" } },
+                right: { style: "thin", color: { argb: "FF374151" } },
             };
         });
+        headerRow.height = 24;
 
-        const fmt = (d) => { if (!d) return ""; const dt = new Date(d); return `${dt.getHours()}:${String(dt.getMinutes()).padStart(2, "0")}`; };
-        const hm = (m) => { if (!m) return ""; return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}`; };
+        // ── Data rows ─────────────────────────────────────────────────
+        const fmt = (d) => fmtTimeIST(d);   // uses Asia/Kolkata
+        const fmtMins = (m) => {
+            if (!m || m <= 0) return "";
+            const h = Math.floor(m / 60), mm = m % 60;
+            return `${h}:${String(mm).padStart(2, "0")}`;
+        };
 
-        let rowIdx = 2;
-        employees.forEach((emp, i) => {
-            const rawStatus = emp.effectiveStatus || "AB";
-            const status = getDisplayLabel(rawStatus, settings);
-            const row = ws.getRow(rowIdx);
-            row.values = [
-                emp.employeeName, emp.department, status,
-                fmt(emp.inTime), fmt(emp.finalOut),
-                fmt(emp.lunchOut), fmt(emp.lunchIn),
-                fmt(emp.teaOut), fmt(emp.teaIn),
-                fmt(emp.finalOut), hm(emp.netWorkMins), emp.otMins ? hm(emp.otMins) : ""
-            ];
-            row.eachCell((cell, col) => {
-                cell.alignment = { horizontal: col === 1 ? "left" : "center" };
+        const STATUS_COLOR = {
+            P: "FF008000", "P*": "FFFF8C00", "P~": "FFFF0000",
+            HD: "FFFF0000", MP: "FFDB2777", AB: "FFDC2626", LWP: "FFDC2626",
+            WO: "FF64748B",
+            FH: "FF4F46E5", NH: "FF4F46E5", OH: "FF4F46E5", RH: "FF4F46E5", PH: "FF4F46E5",
+            "L-CL": "FF7C3AED", "L-SL": "FF7C3AED", "L-EL": "FF7C3AED",
+            WFH: "FF0891B2", CO: "FF0D9488",
+        };
+
+        rows.forEach((r, idx) => {
+            const row = ws.getRow(8 + idx);
+            const rowFill = idx % 2 === 0 ? "FFFFFFFF" : "FFF8FAFC";
+
+            // Name
+            row.getCell(1).value = r.name;
+            row.getCell(1).font = { size: 10, bold: true, color: { argb: "FF1D4ED8" } };
+            row.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            // Department
+            row.getCell(2).value = r.department;
+            row.getCell(2).font = { size: 9, color: { argb: "FF6B7280" } };
+            row.getCell(2).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            // Status (use display label, color-coded)
+            row.getCell(3).value = r.statusLabel;
+            row.getCell(3).font = { size: 10, bold: true, color: { argb: STATUS_COLOR[r.status] || "FF111827" } };
+            row.getCell(3).alignment = { vertical: "middle", horizontal: "center" };
+
+            // IN — orange bold if late
+            row.getCell(4).value = fmt(r.inTime);
+            row.getCell(4).font = { size: 9, bold: r.isLate, color: { argb: r.isLate ? "FFFF8C00" : "FF2563EB" } };
+            row.getCell(4).alignment = { vertical: "middle", horizontal: "center" };
+
+            // OUT (final exit per shift) — same as FINAL but kept here for visual separation
+            row.getCell(5).value = fmt(r.outTime);
+            row.getCell(5).font = { size: 9, bold: r.isEarlyDeparture, color: { argb: r.isEarlyDeparture ? "FFFF8C00" : "FF2563EB" } };
+            row.getCell(5).alignment = { vertical: "middle", horizontal: "center" };
+
+            // Lunch + Tea breaks
+            row.getCell(6).value = fmt(r.lunchOut);
+            row.getCell(7).value = fmt(r.lunchIn);
+            row.getCell(8).value = fmt(r.teaOut);
+            row.getCell(9).value = fmt(r.teaIn);
+            for (const c of [6, 7, 8, 9]) {
+                row.getCell(c).font = { size: 9, color: { argb: "FF6B7280" } };
+                row.getCell(c).alignment = { vertical: "middle", horizontal: "center" };
+            }
+
+            // Final out
+            row.getCell(10).value = fmt(r.outTime);
+            row.getCell(10).font = { size: 9, bold: true, color: { argb: "FF111827" } };
+            row.getCell(10).alignment = { vertical: "middle", horizontal: "center" };
+
+            // Work hours — green ≥8h, red <8h
+            row.getCell(11).value = fmtMins(r.netWorkMins);
+            row.getCell(11).font = {
+                size: 10, bold: true,
+                color: { argb: r.netWorkMins >= 480 ? "FF16A34A" : r.netWorkMins > 0 ? "FFDC2626" : "FF9CA3AF" }
+            };
+            row.getCell(11).alignment = { vertical: "middle", horizontal: "center" };
+
+            // OT — indigo
+            row.getCell(12).value = fmtMins(r.otMins);
+            row.getCell(12).font = {
+                size: 10, bold: r.otMins > 0,
+                color: { argb: r.otMins > 0 ? "FF4338CA" : "FF9CA3AF" }
+            };
+            row.getCell(12).alignment = { vertical: "middle", horizontal: "center" };
+
+            // Borders + zebra fill
+            for (let c = 1; c <= TOTAL_COLS; c++) {
+                const cell = row.getCell(c);
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: rowFill } };
                 cell.border = {
-                    top: { style: "thin", color: { argb: "FF000000" } },
-                    bottom: { style: "thin", color: { argb: "FF000000" } },
-                    left: { style: "thin", color: { argb: "FF000000" } },
-                    right: { style: "thin", color: { argb: "FF000000" } },
+                    top: { style: "thin", color: { argb: "FFE5E7EB" } },
+                    bottom: { style: "thin", color: { argb: "FFE5E7EB" } },
+                    left: { style: "thin", color: { argb: "FFE5E7EB" } },
+                    right: { style: "thin", color: { argb: "FFE5E7EB" } },
                 };
-            });
-            row.getCell(1).font = { bold: true, color: { argb: "FF1D4ED8" } };
-            row.getCell(2).font = { color: { argb: "FF374151" } };
-            const sCell = row.getCell(3);
-            if (rawStatus === "P") sCell.font = { color: { argb: "FF008000" }, bold: true };
-            else if (["WO", "FH", "NH", "OH", "RH"].includes(rawStatus)) sCell.font = { color: { argb: "FF800080" }, bold: true };
-            else if (rawStatus === "P*") sCell.font = { color: { argb: "FFFF8C00" }, bold: true };
-            else sCell.font = { color: { argb: "FFFF0000" }, bold: true };
-
-            const inCell = row.getCell(4); const outCell = row.getCell(5);
-            inCell.font = { color: { argb: "FF2563EB" } }; outCell.font = { color: { argb: "FF2563EB" } };
-            if (emp.lateMins > 0) inCell.font = { color: { argb: "FFFF8C00" }, bold: true };
-            if (emp.earlyDepartureMins > 0) outCell.font = { color: { argb: "FFFF8C00" }, bold: true };
-            [6, 7, 8, 9].forEach(c => { row.getCell(c).font = { color: { argb: "FF6B7280" } }; });
-            const workCell = row.getCell(11);
-            if (emp.netWorkMins >= 480) workCell.font = { color: { argb: "FF16A34A" }, bold: true };
-            else if (emp.netWorkMins > 0) workCell.font = { color: { argb: "FFDC2626" }, bold: true };
-            if (emp.otMins > 0) row.getCell(12).font = { color: { argb: "FF7C3AED" }, bold: true };
-            if ((emp.punchCount || 0) < 2) row.getCell(12).font = { color: { argb: "FFFF0000" }, bold: true };
+            }
             row.height = 20;
-            rowIdx++;
         });
 
+        // Footer
+        const footerRow = ws.getRow(8 + rows.length + 1);
+        ws.mergeCells(footerRow.number, 1, footerRow.number, TOTAL_COLS);
+        footerRow.getCell(1).value = `${rows.length} record${rows.length === 1 ? "" : "s"}  ·  Generated ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`;
+        footerRow.getCell(1).font = { size: 8, italic: true, color: { argb: "FF6B7280" } };
+        footerRow.getCell(1).alignment = { vertical: "middle", horizontal: "right", indent: 1 };
+        footerRow.height = 18;
+
         const buffer = await wb.xlsx.writeBuffer();
+        const filename = `attendance_${date}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-        res.setHeader("Content-Disposition", `attachment; filename=Register_${date}.xlsx`);
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+        res.setHeader("Cache-Control", "no-store");
         res.send(buffer);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: err.message });
+        console.error("[EXPORT-DAILY]", err.message, err.stack);
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
@@ -1747,7 +2065,7 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                 isDeclaredHoliday,
                 isWorkingSunday,
                 holiday: isDeclaredHoliday ? hol : null,
-                holidayStatus: isDeclaredHoliday ? holidayTypeToStatus(hol.type) : null, // FH/NH/OH/RH
+                holidayStatus: isDeclaredHoliday ? holidayTypeToStatus(hol.type) : null,
                 restStatus: resolveRestDayStatus(dateStr, dow, holidayMap),
             });
         }
@@ -1765,8 +2083,6 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         const employees = [];
         const running = new Map();
 
-        // ───── Status codes considered "paid" ─────────────────────────────
-        // MP included: miss-punch means employee was present, device just missed a tap
         const PAID_CODES = [
             "P", "P*", "P~", "HD", "MP",
             "WO", "FH", "NH", "OH", "RH", "PH",
@@ -1794,8 +2110,8 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                     effectivePresent: 0,
                     totalLateMins: 0, totalOtMins: 0, totalNetWorkMins: 0,
                     autoPromotedHDs: 0,
-                    sundayWorked: 0,          // worked on a Sunday (not WO-override)
-                    holidayWorked: 0,         // worked on a declared holiday
+                    sundayWorked: 0,
+                    holidayWorked: 0,
                     totalAttendance: 0,
                 },
             };
@@ -1811,9 +2127,8 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                 const dayDoc = byDate.get(cal.dateStr);
                 const entry = dayDoc ? (dayDoc.employees || []).find((e) => e.biometricId === key) : null;
 
-                // ════ HOLIDAY — applies universally to all employees ════
                 if (cal.isDeclaredHoliday) {
-                    const hs = cal.holidayStatus; // FH / NH / OH / RH
+                    const hs = cal.holidayStatus;
                     const didPunch = !!entry && (entry.punchCount || 0) > 0;
 
                     row.days[cal.dateStr] = {
@@ -1835,11 +2150,9 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                     continue;
                 }
 
-                // ════ SUNDAY (no working-sunday override) ════
                 if (cal.isSunday && !cal.isWorkingSunday) {
                     const didPunch = !!entry && (entry.punchCount || 0) > 0;
                     if (didPunch) {
-                        // Worked on a Sunday — counts as P, Sunday is NOT counted as WO
                         let status = entry.systemPrediction;
                         const finalStatus = entry.hrFinalStatus || status;
                         row.days[cal.dateStr] = {
@@ -1866,7 +2179,6 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                     continue;
                 }
 
-                // ════ NORMAL WORKING DAY (weekday, or working-sunday override) ════
                 if (!dayDoc) {
                     row.days[cal.dateStr] = { status: "—", isSunday: cal.isSunday, unsynced: true };
                     continue;
@@ -1878,10 +2190,11 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                     continue;
                 }
 
+                // FIXED: Changed 'e' to 'entry' in the following block
                 let cum = running.get(key) || 0;
                 let status = entry.systemPrediction;
                 let promoted = false;
-                if (entry.isLate && (entry.lateMins || 0) > 0) {
+                if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
                     cum += entry.lateMins;
                     const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
                     if (cum >= thr) { status = "HD"; promoted = true; cum = 0; }
@@ -2123,7 +2436,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                 let cum = running.get(key) || 0;
                 let status = entry.systemPrediction;
                 let promoted = false;
-                if (entry.isLate && (entry.lateMins || 0) > 0) {
+                if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
                     cum += entry.lateMins;
                     const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
                     if (cum >= thr) { status = "HD"; promoted = true; cum = 0; }
@@ -2649,7 +2962,7 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
             let cum = running.get(bid) || 0;
             let status = entry.systemPrediction;
             let promoted = false;
-            if (entry.isLate && (entry.lateMins || 0) > 0) {
+            if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
                 cum += entry.lateMins;
                 const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
                 if (cum >= thr) { status = "HD"; promoted = true; cum = 0; }
