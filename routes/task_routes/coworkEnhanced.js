@@ -5,7 +5,7 @@
 
 const express = require("express");
 const router = express.Router();
-const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
+const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } = require("../../Middlewear/coworkAuth");
 const svc = require("../../services/coworkEnhanced.service");
 
 // ── Group message with media ──────────────────────────────
@@ -108,7 +108,7 @@ router.patch("/task/:taskId/deadline", verifyCoworkToken, verifyCeoToken, async 
 });
 
 // ── Delete task (CEO only) ────────────────────────────────
-router.delete("/task/:taskId", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.delete("/task/:taskId", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const result = await svc.deleteTask({
             taskId: req.params.taskId,
