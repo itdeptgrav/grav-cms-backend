@@ -62,7 +62,7 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
       .filter(Boolean);
 
     const mpcDocs = await EmployeeMpc.find({ _id: { $in: employeeIds } })
-      .select("_id department designation")
+      .select("_id department designation products")
       .lean();
 
     const mpcById = new Map();
@@ -172,7 +172,7 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
     const employeeIds = matched.map((e) => e.employeeId).filter(Boolean);
 
     const mpcDocs = await EmployeeMpc.find({ _id: { $in: employeeIds } })
-      .select("_id department designation")
+      .select("_id department designation products")
       .lean();
 
     const mpcById = new Map();
@@ -241,8 +241,14 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
             p.productName === wo.stockItemName
         );
 
+        const mpcProduct = (mpc?.products || []).find(
+          (p) => p.productId?.toString() === wo.stockItemId?.toString()
+        );
+        const mpcProductName = mpcProduct?.productName || wo.stockItemName;
+
         products.push({
           productName: wo.stockItemName,
+          mpcProductName, 
           workOrderNumber: wo.workOrderNumber,
           workOrderId: woIdStr,
           quantity: progress.totalUnits,
@@ -300,7 +306,7 @@ router.post("/employee-measurements/:measurementId/update-status", async (req, r
       if (emp.employeeId.toString() === employeeId) {
         emp.products.forEach((product) => {
           if (product.productName === productName) {
-            product.qrGenerated  = true;
+            product.qrGenerated = true;
             product.qrGeneratedAt = now; // ← NEW: stamp the cut date/time
             updated = true;
           }
@@ -333,8 +339,8 @@ router.get("/cutting-history", async (req, res) => {
 
     // ── Build date window (defaults to today in IST) ─────────────────────
     const istOffset = 5.5 * 60 * 60 * 1000;
-    const todayIST  = new Date(Date.now() + istOffset);
-    const todayStr  = todayIST.toISOString().split("T")[0];
+    const todayIST = new Date(Date.now() + istOffset);
+    const todayStr = todayIST.toISOString().split("T")[0];
 
     const fromDate = new Date(from || todayStr);
     fromDate.setHours(0, 0, 0, 0);
@@ -365,10 +371,10 @@ router.get("/cutting-history", async (req, res) => {
     for (const doc of mpcDocs) mpcById.set(doc._id.toString(), doc);
 
     // ── Build grouped result ─────────────────────────────────────────────
-    const groupsMap  = new Map(); // orgName → employee[]
+    const groupsMap = new Map(); // orgName → employee[]
     let totalEmployees = 0;
-    let totalPieces    = 0;
-    const productSet   = new Set();
+    let totalPieces = 0;
+    const productSet = new Set();
 
     for (const measurement of measurements) {
       const orgName = measurement.organizationName || "Unknown";
@@ -377,7 +383,7 @@ router.get("/cutting-history", async (req, res) => {
         // ── Search filter (name or UIN) ───────────────────────────────
         if (searchLower) {
           const nameHit = emp.employeeName?.toLowerCase().includes(searchLower);
-          const uinHit  = emp.employeeUIN?.toLowerCase().includes(searchLower);
+          const uinHit = emp.employeeUIN?.toLowerCase().includes(searchLower);
           if (!nameHit && !uinHit) continue;
         }
 
@@ -391,7 +397,7 @@ router.get("/cutting-history", async (req, res) => {
         if (cutProducts.length === 0) continue;
 
         const empIdStr = emp.employeeId?.toString();
-        const mpc      = mpcById.get(empIdStr) || {};
+        const mpc = mpcById.get(empIdStr) || {};
 
         cutProducts.forEach((p) => {
           productSet.add(p.productName);
@@ -401,15 +407,15 @@ router.get("/cutting-history", async (req, res) => {
 
         if (!groupsMap.has(orgName)) groupsMap.set(orgName, []);
         groupsMap.get(orgName).push({
-          employeeId:  empIdStr,
+          employeeId: empIdStr,
           employeeName: emp.employeeName,
-          employeeUIN:  emp.employeeUIN,
-          gender:        emp.gender,
-          department:    mpc.department   || "",
-          designation:   mpc.designation  || "",
+          employeeUIN: emp.employeeUIN,
+          gender: emp.gender,
+          department: mpc.department || "",
+          designation: mpc.designation || "",
           products: cutProducts.map((p) => ({
-            productName:   p.productName,
-            quantity:      p.quantity,
+            productName: p.productName,
+            quantity: p.quantity,
             qrGeneratedAt: p.qrGeneratedAt,
           })),
         });
@@ -436,7 +442,7 @@ router.get("/cutting-history", async (req, res) => {
       stats: {
         totalEmployees,
         totalPieces,
-        totalProducts:      productSet.size,
+        totalProducts: productSet.size,
         totalOrganizations: groups.length,
       },
       groups,
