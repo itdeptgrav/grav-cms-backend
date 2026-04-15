@@ -57,13 +57,15 @@ function parsePunchDate(str) {
     const [datePart, timePart = "00:00:00"] = String(str).trim().split(/\s+/);
     const [d, m, y] = datePart.split("/");
     const [hh, mm, ss = "00"] = timePart.split(":");
-    const dt = new Date(+y, +m - 1, +d, +hh, +mm, +ss);
+    const utcMs = Date.UTC(+y, +m - 1, +d, +hh, +mm, +ss) - 330 * 60 * 1000;
+    const dt = new Date(utcMs);
     return isNaN(dt.getTime()) ? null : dt;
 }
 
-const dateStrOf = (d) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-
+const dateStrOf = (d) => {
+    const ist = new Date(d.getTime() + 330 * 60 * 1000);
+    return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, "0")}-${String(ist.getUTCDate()).padStart(2, "0")}`;
+};
 // ═══════════════════════════════════════════════════════════════════════════
 //  HELPERS (strings / times)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -74,7 +76,7 @@ const numericOf = (s) => { const d = String(s || "").replace(/\D/g, ""); return 
 const minsOf = (d) => {
     if (!d) return null;
     const dt = new Date(d);
-    // Force IST: UTC + 5:30 = 330 minutes
+    // Date is stored as correct UTC (IST - 330min), so convert back to IST to get clock minutes
     const utcMins = dt.getUTCHours() * 60 + dt.getUTCMinutes();
     return (utcMins + 330) % 1440;
 };
@@ -192,7 +194,8 @@ function resolveRestDayStatus(dateStr, dayOfWeek, holidayMap) {
 function allDaysInRange(from, to) {
     const start = new Date(from + "T00:00:00");
     const end = new Date(to + "T00:00:00");
-    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const _nowIST = new Date(Date.now() + 330 * 60 * 1000);
+    const today = new Date(`${_nowIST.getUTCFullYear()}-${String(_nowIST.getUTCMonth() + 1).padStart(2, "0")}-${String(_nowIST.getUTCDate()).padStart(2, "0")}T00:00:00`);
     const dates = [];
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
         if (d > today) continue;
@@ -204,7 +207,8 @@ function allDaysInRange(from, to) {
 function workingDaysInRange(from, to, weeklyOffDay = 0) {
     const start = new Date(from + "T00:00:00");
     const end = new Date(to + "T00:00:00");
-    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const _nowIST = new Date(Date.now() + 330 * 60 * 1000);
+    const today = new Date(`${_nowIST.getUTCFullYear()}-${String(_nowIST.getUTCMonth() + 1).padStart(2, "0")}-${String(_nowIST.getUTCDate()).padStart(2, "0")}T00:00:00`);
     const dates = [];
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
         if (d > today) continue;
