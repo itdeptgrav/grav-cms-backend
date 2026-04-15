@@ -1,93 +1,116 @@
-/**
- * Attendancesettings.js (v2)
- * Singleton attendance config + Shift collection.
- * Added:
- *  - otGracePeriodMins (grace after shiftEnd before OT counts)
- *  - Holiday categories: "national" | "company" | "optional"
- *  - Full break type config (lunch + tea)
- */
-
+"use strict";
 const mongoose = require("mongoose");
 
-// ── Shift ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  ATTENDANCE SETTINGS — singleton document, HR-configurable
+// ─────────────────────────────────────────────────────────────────────────────
+
 const shiftSchema = new mongoose.Schema(
     {
-        name: { type: String, required: true },
-        code: { type: String, required: true, uppercase: true, trim: true, maxlength: 6 },
-        startTime: { type: String, default: "09:00" },
-        endTime: { type: String, default: "18:30" },
-        breakMins: { type: Number, default: 60 },           // total standard break
-        lunchMins: { type: Number, default: 45 },           // lunch portion
-        teaMins: { type: Number, default: 15 },             // tea portion
-        workingDays: { type: [Number], default: [1, 2, 3, 4, 5, 6] },
-        color: { type: String, default: "#8b5cf6" },
-        isDefault: { type: Boolean, default: false },
-        otGracePeriodMins: { type: Number, default: 30 },   // grace before OT
+        start: { type: String, default: "09:00" },            // "HH:MM"
+        end: { type: String, default: "18:00" },
+        lateGraceMins: { type: Number, default: 10 },
+        halfDayThresholdMins: { type: Number, default: 240 },
+        otGraceMins: { type: Number, default: 15 },
     },
-    { timestamps: true }
+    { _id: false }
 );
 
-// ── Holiday ───────────────────────────────────────────────────────────────────
-const holidaySchema = new mongoose.Schema(
+const attendanceSettingsSchema = new mongoose.Schema(
     {
-        name: { type: String, required: true },
-        date: { type: String, required: true },             // "YYYY-MM-DD"
-        type: {
-            type: String,
-            enum: ["national", "company", "optional", "restricted"],
-            default: "company",
+        _id: { type: String, default: "singleton" },
+
+        // Shift config
+        shifts: {
+            operator: { type: shiftSchema, default: () => ({}) },
+            executive: { type: shiftSchema, default: () => ({ start: "09:30", end: "18:30", lateGraceMins: 15, otGraceMins: 30 }) },
         },
-        description: { type: String },
-        isRecurring: { type: Boolean, default: false },     // repeat every year
-    },
-    { _id: true }
-);
 
-// ── AttendanceSettings (singleton) ───────────────────────────────────────────
-const settingsSchema = new mongoose.Schema(
-    {
-        // Default shift times (when employee has no shift assigned)
-        shiftStart: { type: String, default: "09:00" },
-        shiftEnd: { type: String, default: "18:30" },
+        // Late → half-day policy (cumulative)
+        lateHalfDayPolicy: {
+            enabled: { type: Boolean, default: true },
+            cumulativeLateMinsThreshold: {
+                operator: { type: Number, default: 30 },
+                executive: { type: Number, default: 40 },
+            },
+        },
 
-        // Thresholds
-        lateThresholdMinutes: { type: Number, default: 15 },
-        halfDayThresholdMinutes: { type: Number, default: 270 },  // 4.5 hrs net work = full day
-        earlyDepartureThresholdMinutes: { type: Number, default: 30 },
-        otGracePeriodMins: { type: Number, default: 30 },         // minutes after shiftEnd before OT starts
+        // Department classification (legacy field kept for compat)
+        operatorDepartments: [{ type: String }],
 
-        // Working days (0=Sun, 6=Sat)
-        workingDays: { type: [Number], default: [1, 2, 3, 4, 5, 6] },
+        // Department categories (new canonical field)
+        departmentCategories: {
+            core: [{ type: String }],     // operator-type departments (production, cutting, etc.)
+            general: [{ type: String }],  // executive-type departments (HR, design, etc.)
+        },
 
-        // Break config
-        lunchBreakMins: { type: Number, default: 45 },
-        teaBreakMins: { type: Number, default: 15 },
+        // Designation-based classification
+        operatorDesignations: [{ type: String }],
+        executiveDesignations: [{ type: String }],
 
-        // Overtime
-        overtimeEnabled: { type: Boolean, default: true },
-        overtimeMinimumMinutes: { type: Number, default: 30 },
-        overtimeMaxPerDay: { type: Number, default: 240 },
-        overtimeRateMultiplier: { type: Number, default: 1.5 },
+        // Single punch handling
+        singlePunchHandling: {
+            mode: {
+                type: String,
+                enum: ["midpoint", "assume-in", "assume-out"],
+                default: "midpoint",
+            },
+        },
 
-        // Biometric
-        biometricSyncIntervalMinutes: { type: Number, default: 30 },
-        biometricAutoSync: { type: Boolean, default: false },      // no cron — on-demand only
+        // ═══════════════════════════════════════════════════════════════════
+        //  NEW (Phase 1): Grace Carry-Forward
+        // ═══════════════════════════════════════════════════════════════════
+        //  If an employee worked extra past end-of-shift yesterday, they get
+        //  bonus lateGrace added to today's grace window.
+        //  Formula:
+        //    if yesterday.otMins >= triggerMins → today's effective grace =
+        //        shift.lateGraceMins + bonusGraceMins
+        //  Both numbers configurable from Settings page.
+        graceCarryForward: {
+            enabled: { type: Boolean, default: true },
+            triggerMins: { type: Number, default: 60 },     // extra OT yesterday ≥ this
+            bonusGraceMins: { type: Number, default: 15 },  // extra grace for today
+            applyTo: {
+                type: String,
+                enum: ["operator", "executive", "both"],
+                default: "both",
+            },
+        },
 
-        // Holidays
-        holidays: { type: [holidaySchema], default: [] },
-
-        updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
+        // ═══════════════════════════════════════════════════════════════════
+        //  NEW (Phase 1): Display labels — DB stores P*/P~ forever, UI/Excel
+        //  translate to friendlier codes. Configurable here so anyone can
+        //  localize or change later.
+        // ═══════════════════════════════════════════════════════════════════
+        displayLabels: {
+            P: { type: String, default: "P" },
+            "P*": { type: String, default: "L" },  // was "P*" → now Late
+            "P~": { type: String, default: "EO" },  // was "P~" → now Early Out
+            HD: { type: String, default: "HD" },
+            MP: { type: String, default: "MP" },
+            AB: { type: String, default: "A" },
+            LWP: { type: String, default: "LWP" },
+            WO: { type: String, default: "WO" },
+            PH: { type: String, default: "PH" },  // generic holiday fallback
+            FH: { type: String, default: "FH" },  // festival/company
+            NH: { type: String, default: "NH" },  // national
+            OH: { type: String, default: "OH" },  // optional
+            RH: { type: String, default: "RH" },  // restricted
+            "L-CL": { type: String, default: "CL" },
+            "L-SL": { type: String, default: "SL" },
+            "L-EL": { type: String, default: "EL" },
+            WFH: { type: String, default: "WFH" },
+            CO: { type: String, default: "CO" },
+        },
     },
     { timestamps: true }
 );
 
-settingsSchema.statics.getSingleton = async function () {
-    let s = await this.findOne();
-    if (!s) s = await this.create({});
-    return s;
+// Always fetch or create the singleton
+attendanceSettingsSchema.statics.getConfig = async function () {
+    let cfg = await this.findOne({ _id: "singleton" });
+    if (!cfg) cfg = await this.create({ _id: "singleton" });
+    return cfg;
 };
 
-const AttendanceSettings = mongoose.model("AttendanceSettings", settingsSchema);
-const Shift = mongoose.model("Shift", shiftSchema);
-
-module.exports = { AttendanceSettings, Shift };
+module.exports = mongoose.model("AttendanceSettings", attendanceSettingsSchema);

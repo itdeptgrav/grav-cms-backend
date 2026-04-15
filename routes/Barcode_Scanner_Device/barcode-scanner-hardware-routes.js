@@ -3,18 +3,17 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const mongoose = require('mongoose');
 const BarcodeDevice = require('../../models/Barcode_Scanner_Device/BarcodeDevice');
 const Firmware = require('../../models/Barcode_Scanner_Device/Firmware');
-const Machine = require('../../models/CMS_Models/Inventory/Configurations/Machine');
 
-// ─── Multer (memory storage → written to disk after validation) ───────────────
-const storage = multer.memoryStorage();
+// IMPORTANT: Use multer memory storage first, then process later
+const storage = multer.memoryStorage(); // Store in memory temporarily
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
-  fileFilter: (_req, file, cb) => {
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    // Accept only .bin files
     if (file.originalname.endsWith('.bin') || file.mimetype === 'application/octet-stream') {
       cb(null, true);
     } else {
@@ -23,75 +22,15 @@ const upload = multer({
   }
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Validate 8-char hex device ID (generated from ESP32 MAC). */
-const isValidDeviceId = (id) => /^[0-9a-fA-F]{8}$/.test(id);
-
-/**
- * Look up Machine.name by its _id.
- * Returns the name string on success, or '' if not found / invalid id.
- * Never throws — callers can treat '' as "name unavailable".
- */
-const getMachineNameById = async (machineId) => {
-  if (!machineId || !mongoose.Types.ObjectId.isValid(machineId)) return '';
-  try {
-    const machine = await Machine.findById(machineId).select('name').lean();
-    return machine?.name ?? '';
-  } catch (err) {
-    console.error('getMachineNameById error:', err.message);
-    return '';
-  }
+// Helper to validate deviceId format (8 char hex)
+const isValidDeviceId = (deviceId) => {
+  return /^[0-9a-fA-F]{8}$/.test(deviceId);
 };
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
-/**
- * GET /api/barcode-devices/name?machineId=<mongoId>
- *
- * Called by the ESP32 firmware once after WiFi connects (and only when
- * the machine name is not already cached in device flash).
- *
- * Query param: machineId — the MongoDB _id of the Machine document.
- * Response:    { machineName: "Cutting Machine 1" }
- *
- * On invalid / unknown machineId the response is still 200 with an
- * empty machineName so the device doesn't get stuck retrying forever.
- */
-router.get('/name', async (req, res) => {
-  const { machineId } = req.query;
-
-  if (!machineId) {
-    return res.status(400).json({
-      success: false,
-      message: 'machineId query param is required'
-    });
-  }
-
-  const machineName = await getMachineNameById(machineId);
-
-  if (!machineName) {
-    // Return 200 with empty name rather than 404 so the device can
-    // display "Not Found" gracefully without treating it as a hard error.
-    console.warn(`Machine name not found for machineId: ${machineId}`);
-    return res.json({ success: true, machineName: '' });
-  }
-
-  console.log(`Machine name resolved: ${machineId} → "${machineName}"`);
-  return res.json({ success: true, machineName });
-});
-
-/**
- * POST /api/barcode-devices/check-update
- *
- * Called by the device on every WiFi connect and periodically thereafter.
- * Also serves as the device heartbeat / registration endpoint.
- *
- * Body: { deviceId, machineId, currentVersion, ipAddress, wifiSSID }
- */
+// POST /api/barcode-devices/check-update - Device registration/update check
 router.post('/check-update', async (req, res) => {
   try {
-    const { deviceId, machineId, currentVersion, ipAddress, wifiSSID } = req.body;
+    const { deviceId, currentVersion, ipAddress, wifiSSID } = req.body;
 
     if (!deviceId || !isValidDeviceId(deviceId)) {
       return res.status(400).json({
@@ -100,19 +39,13 @@ router.post('/check-update', async (req, res) => {
       });
     }
 
-    // Resolve machine name for this check-update (used to keep the
-    // BarcodeDevice record in sync — does NOT change what the firmware
-    // caches; that is handled by the /name endpoint above).
-    const machineName = await getMachineNameById(machineId);
-
-    // ── Upsert device record ──────────────────────────────────────────
+    // Find or create device record
     let device = await BarcodeDevice.findOne({ deviceId });
 
     if (!device) {
+      // New device - store in database
       device = new BarcodeDevice({
         deviceId,
-        machineId:   machineId   || '',
-        machineName: machineName || '',
         currentFirmwareVersion: currentVersion || '1.0.0',
         lastIpAddress: ipAddress,
         wifiSSID,
@@ -120,62 +53,60 @@ router.post('/check-update', async (req, res) => {
         firstSeen: new Date()
       });
     } else {
-      device.lastSeen   = new Date();
+      // Update existing device
+      device.lastSeen = new Date();
       device.lastIpAddress = ipAddress;
-      device.wifiSSID   = wifiSSID;
-      device.status     = 'online';
-
-      // Keep machineId / machineName current in case the user
-      // reconfigured the device with a new machine assignment.
-      if (machineId)   device.machineId   = machineId;
-      if (machineName) device.machineName = machineName;
-
-      if (currentVersion) device.currentFirmwareVersion = currentVersion;
+      device.wifiSSID = wifiSSID;
+      device.status = 'online';
+      if (currentVersion) {
+        device.currentFirmwareVersion = currentVersion;
+      }
     }
 
     await device.save();
 
-    // ── Firmware update check ─────────────────────────────────────────
-    const latestFirmware = await Firmware.findOne({ isActive: true })
-      .sort({ releasedAt: -1 });
+    // Check for firmware updates
+    const latestFirmware = await Firmware.findOne({
+      isActive: true
+    }).sort({ releasedAt: -1 });
 
     let updateAvailable = false;
-    let firmwareInfo    = null;
+    let firmwareInfo = null;
 
     if (latestFirmware) {
-      const shouldUpdate =
-        latestFirmware.targetDevices.includes('all') ||
-        latestFirmware.targetDevices.includes(deviceId);
+      // Check if this device should get the update
+      const shouldUpdate = latestFirmware.targetDevices.includes('all') ||
+                          latestFirmware.targetDevices.includes(deviceId);
 
       if (shouldUpdate && latestFirmware.version !== device.currentFirmwareVersion) {
         updateAvailable = true;
-        const baseUrl   = `https://${req.get('host')}`;
-        firmwareInfo    = {
-          version:     latestFirmware.version,
-          url:         `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
-          fileSize:    latestFirmware.fileSize,
+        
+        // Generate the firmware URL
+        const baseUrl = `https://${req.get('host')}`;
+        firmwareInfo = {
+          version: latestFirmware.version,
+          url: `${baseUrl}/api/barcode-devices/firmware/download/${latestFirmware.version}`,
+          fileSize: latestFirmware.fileSize,
           description: latestFirmware.description
         };
+        
         console.log(`Update available for device ${deviceId}: v${latestFirmware.version}`);
       } else {
-        console.log(
-          `No update needed for ${deviceId}. ` +
-          `Current: ${device.currentFirmwareVersion}, Latest: ${latestFirmware.version}`
-        );
+        console.log(`No update needed for device ${deviceId}. Current: ${device.currentFirmwareVersion}, Latest: ${latestFirmware.version}`);
       }
     }
 
-    return res.json({
+    // IMPORTANT FIX: Always include firmware info in response if available
+    res.json({
       success: true,
       updateAvailable,
-      currentVersion:  device.currentFirmwareVersion,
-      machineName,                                       // convenience — device already has this
-      ...(firmwareInfo && { firmware: firmwareInfo })
+      currentVersion: device.currentFirmwareVersion,
+      ...(firmwareInfo && { firmware: firmwareInfo })  // This ensures firmware object is included
     });
 
   } catch (error) {
-    console.error('Error in check-update:', error);
-    return res.status(500).json({
+    console.error('Error in device check-update:', error);
+    res.status(500).json({
       success: false,
       message: 'Server error',
       error: error.message
@@ -183,164 +114,212 @@ router.post('/check-update', async (req, res) => {
   }
 });
 
-/**
- * GET /api/barcode-devices/firmware/download/:version
- * Stream the .bin firmware file to the device.
- */
+// GET /api/barcode-devices/firmware/download/:version - Download firmware file
 router.get('/firmware/download/:version', (req, res) => {
   try {
-    const { version }    = req.params;
-    const firmwarePath   = path.join(__dirname, '../../firmware', `firmware_v${version}.bin`);
-
-    console.log('Firmware download requested:', firmwarePath);
-
-    if (!fs.existsSync(firmwarePath)) {
+    const version = req.params.version;
+    const firmwarePath = path.join(__dirname, '../../firmware', `firmware_v${version}.bin`);
+    
+    console.log('Looking for firmware at:', firmwarePath);
+    
+    // Check if file exists
+    if (fs.existsSync(firmwarePath)) {
+      // Get file stats
+      const stats = fs.statSync(firmwarePath);
+      
+      // Set headers for binary download
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename=firmware_v${version}.bin`);
+      res.setHeader('Content-Length', stats.size);
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      
+      // Stream the file
+      const fileStream = fs.createReadStream(firmwarePath);
+      fileStream.pipe(res);
+      
+      fileStream.on('error', (error) => {
+        console.error('Error streaming firmware:', error);
+        res.status(500).json({ success: false, message: 'Error streaming file' });
+      });
+    } else {
       console.error('Firmware file not found:', firmwarePath);
-      return res.status(404).json({ success: false, message: 'Firmware not found' });
+      res.status(404).json({ success: false, message: 'Firmware not found' });
     }
-
-    const stats = fs.statSync(firmwarePath);
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename=firmware_v${version}.bin`);
-    res.setHeader('Content-Length', stats.size);
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    const fileStream = fs.createReadStream(firmwarePath);
-    fileStream.pipe(res);
-    fileStream.on('error', (err) => {
-      console.error('Error streaming firmware:', err);
-      // Headers already sent — can't send JSON; just destroy the connection.
-      res.destroy();
-    });
-
   } catch (error) {
-    console.error('Error in firmware download:', error);
-    return res.status(500).json({ success: false, message: 'Server error' });
+    console.error('Error downloading firmware:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-/**
- * GET /api/barcode-devices
- * List all registered devices (admin dashboard).
- */
-router.get('/', async (_req, res) => {
+// GET /api/barcode-devices - Get all devices
+router.get('/', async (req, res) => {
   try {
     const devices = await BarcodeDevice.find({})
       .sort({ lastSeen: -1 })
-      .select('deviceId machineId machineName currentFirmwareVersion lastSeen status wifiSSID firstSeen');
+      .select('deviceId machineId currentFirmwareVersion lastSeen status wifiSSID firstSeen');
 
-    return res.json({ success: true, devices });
+    res.json({
+      success: true,
+      devices
+    });
   } catch (error) {
     console.error('Error fetching devices:', error);
-    return res.status(500).json({ success: false, message: 'Server error' });
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
   }
 });
 
-/**
- * GET /api/barcode-devices/:deviceId
- * Get a single device record.
- */
+// GET /api/barcode-devices/:deviceId - Get specific device
 router.get('/:deviceId', async (req, res) => {
   try {
     const { deviceId } = req.params;
 
     if (!isValidDeviceId(deviceId)) {
-      return res.status(400).json({ success: false, message: 'Invalid device ID format' });
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid device ID format'
+      });
     }
 
     const device = await BarcodeDevice.findOne({ deviceId });
+
     if (!device) {
-      return res.status(404).json({ success: false, message: 'Device not found' });
+      return res.status(404).json({
+        success: false,
+        message: 'Device not found'
+      });
     }
 
-    return res.json({ success: true, device });
+    res.json({
+      success: true,
+      device
+    });
   } catch (error) {
     console.error('Error fetching device:', error);
-    return res.status(500).json({ success: false, message: 'Server error' });
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
   }
 });
 
-/**
- * POST /api/barcode-devices/firmware
- * Upload a new firmware .bin file.
- */
+// POST /api/barcode-devices/firmware - Upload new firmware (FIXED VERSION)
 router.post('/firmware', upload.single('firmware'), async (req, res) => {
   try {
     const { version, description, targetDevices } = req.body;
     const file = req.file;
 
-    console.log('Firmware upload — version:', version, '| file:', file?.originalname ?? 'none');
+    console.log('Received upload request:');
+    console.log('Version from body:', version);
+    console.log('File received:', file ? file.originalname : 'No file');
 
     if (!version) {
-      return res.status(400).json({ success: false, message: 'Version is required' });
+      return res.status(400).json({
+        success: false,
+        message: 'Version is required'
+      });
     }
+
     if (!file) {
-      return res.status(400).json({ success: false, message: 'Firmware file is required' });
+      return res.status(400).json({
+        success: false,
+        message: 'Firmware file is required'
+      });
     }
 
-    // Persist .bin to disk
+    // Get file size
+    const fileSize = file.size;
+
+    // Create firmware directory if it doesn't exist
     const firmwareDir = path.join(__dirname, '../../firmware');
-    if (!fs.existsSync(firmwareDir)) fs.mkdirSync(firmwareDir, { recursive: true });
+    if (!fs.existsSync(firmwareDir)) {
+      fs.mkdirSync(firmwareDir, { recursive: true });
+    }
 
-    const filename  = `firmware_v${version}.bin`;
-    const filePath  = path.join(firmwareDir, filename);
+    // Save file with correct version name
+    const filename = `firmware_v${version}.bin`;
+    const filePath = path.join(firmwareDir, filename);
+    
+    console.log('Saving firmware to:', filePath);
+    
+    // Write file from memory buffer
     fs.writeFileSync(filePath, file.buffer);
-    console.log('Firmware saved to:', filePath);
+    console.log('File saved successfully');
 
-    const baseUrl    = `https://${req.get('host')}`;
+    // Generate the firmware URL - FORCE HTTP
+    const baseUrl = `https://${req.get('host')}`;
     const firmwareUrl = `${baseUrl}/api/barcode-devices/firmware/download/${version}`;
 
-    // Deactivate any existing record with the same version
-    await Firmware.updateMany({ version }, { isActive: false });
+    // Deactivate previous versions with same version number
+    await Firmware.updateMany(
+      { version },
+      { isActive: false }
+    );
 
+    // Parse targetDevices if it's a string
     let targetDevicesArray = ['all'];
     if (targetDevices) {
       try {
         targetDevicesArray = JSON.parse(targetDevices);
-      } catch {
+      } catch (e) {
         targetDevicesArray = [targetDevices];
       }
     }
 
+    // Create new firmware record
     const firmware = new Firmware({
       version,
       cloudinaryUrl: firmwareUrl,
-      fileSize:      file.size,
+      fileSize,
       description,
-      isActive:      true,
+      isActive: true,
       targetDevices: targetDevicesArray,
-      releasedAt:    new Date()
+      releasedAt: new Date()
     });
 
     await firmware.save();
 
-    return res.json({
+    res.json({
       success: true,
       message: 'Firmware uploaded successfully',
-      firmware: { version, url: firmwareUrl, fileSize: file.size, description }
+      firmware: {
+        version,
+        url: firmwareUrl,
+        fileSize,
+        description
+      }
     });
 
   } catch (error) {
-    console.error('Error uploading firmware:', error);
-    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
+    console.error('Error saving firmware:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: error.message
+    });
   }
 });
 
-/**
- * GET /api/barcode-devices/firmware/list
- * Return full firmware history for the admin dashboard.
- */
-router.get('/firmware/list', async (_req, res) => {
+// GET /api/barcode-devices/firmware/list - Get firmware history
+router.get('/firmware/list', async (req, res) => {
   try {
     const firmwareList = await Firmware.find({})
       .sort({ releasedAt: -1 })
       .select('version cloudinaryUrl fileSize description releasedAt isActive targetDevices');
 
-    return res.json({ success: true, firmwareList });
+    res.json({
+      success: true,
+      firmwareList
+    });
   } catch (error) {
     console.error('Error fetching firmware list:', error);
-    return res.status(500).json({ success: false, message: 'Server error' });
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
   }
 });
 
