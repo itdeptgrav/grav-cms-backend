@@ -10,7 +10,7 @@ const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } 
 
 const svc = require("../../services/cowork.service");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
-const { sendWelcomeEmail, sendMeetingScheduledEmail } = require("../../services/emailNotifications.service");
+const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
 
 // ── Seed CEO ──────────────────────────────────────────────
 router.post("/setup/seed-ceo", async (req, res) => {
@@ -317,6 +317,52 @@ router.get("/group/:groupId/members", verifyCoworkToken, verifyEmployeeToken, as
   }
 });
 
+// ── Notify-only endpoints (frontend already wrote to Firestore, just need push+email) ──
+router.post("/direct-message/notify", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { toEmployeeId, text, messageType } = req.body;
+    if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
+    // Only send push notification + email — do NOT write to Firestore again
+    const { sendPushToEmployees } = require("../../services/fcmPush.service");
+    await sendPushToEmployees([toEmployeeId], req.coworkUser.name, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const empDoc = await db.collection("cowork_employees").doc(toEmployeeId).get();
+      if (empDoc.exists && empDoc.data().email) {
+        const emp = empDoc.data();
+        await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: toEmployeeId, receiverName: emp.name, receiverEmail: emp.email, type: "direct_message", title: req.coworkUser.name, body: (text || "📎 Attachment").slice(0, 80), data: {} });
+      }
+    } catch (e) { console.error("[dm notify email]", e.message); }
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { text, messageType } = req.body;
+    const groupDoc = await db.collection("cowork_groups").doc(groupId).get();
+    if (!groupDoc.exists) return res.status(404).json({ error: "Group not found" });
+    const group = groupDoc.data();
+    const recipients = (group.memberIds || []).filter(id => id !== req.coworkUser.employeeId);
+    if (!recipients.length) return res.json({ success: true });
+    // Only send push notification + email — do NOT write to Firestore again
+    const { sendPushToEmployees } = require("../../services/fcmPush.service");
+    await sendPushToEmployees(recipients, `${req.coworkUser.name} in ${group.name}`, (text || "📎 Attachment").slice(0, 80), { type: "group_message", groupId });
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const empDocs = await Promise.all(recipients.map(id => db.collection("cowork_employees").doc(id).get()));
+      for (const empDoc of empDocs) {
+        if (!empDoc.exists) continue;
+        const emp = empDoc.data();
+        if (!emp.email) continue;
+        await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: emp.employeeId || empDoc.id, receiverName: emp.name, receiverEmail: emp.email, type: "group_message", title: `${req.coworkUser.name} in ${group.name}`, body: (text || "📎 Attachment").slice(0, 80), data: { groupId, groupName: group.name } });
+      }
+    } catch (e) { console.error("[group notify email]", e.message); }
+    res.json({ success: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 router.post("/group/:groupId/message", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const msg = await svc.sendGroupMessage({ groupId: req.params.groupId, senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, text: req.body.text, attachments: req.body.attachments || [] });
@@ -370,16 +416,8 @@ router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoOrTL, async (re
       return res.status(400).json({ error: "Title and dateTime are required." });
     const meet = await svc.scheduleCoworkMeet({ title, description, createdBy: req.coworkUser.employeeId, participants, dateTime, googleMeetLink });
     res.status(201).json({ meet });
+    // Email is handled inside svc.scheduleCoworkMeet() via _notifyMany → sendNotificationEmail
 
-    // Send meeting invitation email to all participants (non-blocking)
-    Promise.all(participants.map(id =>
-      db.collection("cowork_employees").doc(id).get()
-        .then(s => s.exists ? { name: s.data().name, email: s.data().email } : null)
-        .catch(() => null)
-    )).then(contacts => sendMeetingScheduledEmail(
-      { meetId: meet.meetId, title, description, dateTime, createdByName: req.coworkUser.name, googleMeetLink },
-      contacts.filter(Boolean)
-    )).catch(err => console.error("[cowork/schedule-meet] Email error:", err.message));
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
