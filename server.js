@@ -639,13 +639,17 @@ app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
 const employeeLeaveRoutes = require("./routes/Employee_Routes/leaveRoutes");
 app.use("/api/employee/leave-applications", employeeLeaveRoutes);
 
-
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
 
 const employeeImportRoutes = require("./routes/HrRoutes/employeeImportExport.js");
 app.use("/api/employees/import-export", employeeImportRoutes);
 
+const payRollRouter = require("./routes/HrRoutes/Payroll_section");
+app.use("/api/hr/payroll", payRollRouter);
+
+const payslipRouter = require("./routes/HrRoutes/Payslip_section");
+app.use("/api/hr/payslip", payslipRouter);
 
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
