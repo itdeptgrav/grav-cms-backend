@@ -27,12 +27,42 @@ const payrollItemSchema = new mongoose.Schema(
         year: { type: Number, required: true },
         payPeriod: { type: String }, // e.g. "March 2025"
 
+        // ── Rate snapshot (employee's configured monthly salary at time of run) ─
+        // Persisted so the Salary Register tab can show "Rate of wages payable"
+        // directly without having to re-query the Employee model.
+        rateBasic: { type: Number, default: 0 },
+        rateHra: { type: Number, default: 0 },
+        rateGross: { type: Number, default: 0 },
+
         // ── Working Days ───────────────────────────────────────────────
-        workingDays: { type: Number, default: 26 },
+        workingDays: { type: Number, default: 26 },        // divisor (26 / 30 / 31 / weekdays)
+        daysInMonth: { type: Number, default: 30 },        // calendar days (28-31)
         presentDays: { type: Number, default: 26 },
         absentDays: { type: Number, default: 0 },
-        lopDays: { type: Number, default: 0 }, // Loss of Pay days
+        halfDays: { type: Number, default: 0 },
+        missPunchDays: { type: Number, default: 0 },
+        lopDays: { type: Number, default: 0 },             // Loss of Pay days
         paidLeaveDays: { type: Number, default: 0 },
+        weekOffDays: { type: Number, default: 0 },
+        holidayDays: { type: Number, default: 0 },
+        holidayWorkedDays: { type: Number, default: 0 },
+        sundayWorkedDays: { type: Number, default: 0 },
+        lwpDays: { type: Number, default: 0 },
+        clUsedDays: { type: Number, default: 0 },
+        slUsedDays: { type: Number, default: 0 },
+        plUsedDays: { type: Number, default: 0 },
+
+        // ── Payable Days ───────────────────────────────────────────────
+        payableDays: { type: Number, default: 0 },         // divisor − LOP (display)
+        effectivePayableDays: { type: Number, default: 0 },// actually paid days (with bonus)
+        perDayRate: { type: Number, default: 0 },          // gross ÷ divisor
+        divisorBasis: { type: String },                     // fixed26 / calendar / working_days
+
+        // ── Engine Adjustments (audit trail) ───────────────────────────
+        sundayOffsetApplied: { type: Number, default: 0 },  // AB days rescued by Sunday work
+        autoAdjustedCL: { type: Number, default: 0 },       // AB days auto-converted to CL
+        sundayExtraPayDays: { type: Number, default: 0 },   // bonus Sunday pay days
+        unsyncedDays: { type: Number, default: 0 },         // days with no attendance record
 
         // ── Earnings ───────────────────────────────────────────────────
         earnings: {
@@ -52,7 +82,7 @@ const payrollItemSchema = new mongoose.Schema(
         deductions: {
             providentFund: { type: Number, default: 0 }, // 12% of basic
             employerPF: { type: Number, default: 0 }, // 12% employer contribution
-            esic: { type: Number, default: 0 }, // 0.75% of gross (if gross <= 21000)
+            esic: { type: Number, default: 0 }, // 0.75% of basic (if gross <= 21000)
             employerESIC: { type: Number, default: 0 }, // 3.25% employer
             professionalTax: { type: Number, default: 0 }, // state-specific
             incomeTax: { type: Number, default: 0 }, // TDS
@@ -67,6 +97,17 @@ const payrollItemSchema = new mongoose.Schema(
         // ── Net Pay ────────────────────────────────────────────────────
         netPay: { type: Number, default: 0 },
         roundedNetPay: { type: Number, default: 0 },
+
+        // ── Day Breakdown (per-day audit trail) ────────────────────────
+        // Array of { dateStr, dayOfWeek, category, paid, lopWeight, note, ... }
+        // Kept as Mixed so engine can evolve fields without migrations.
+        dayBreakdown: { type: [mongoose.Schema.Types.Mixed], default: undefined },
+
+        // ── Manual Override ────────────────────────────────────────────
+        isManuallyOverridden: { type: Boolean, default: false },
+        overriddenPayableDays: { type: Number },
+        lastEditedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
+        lastEditedAt: { type: Date },
 
         // ── Bank Details (snapshot at time of payment) ─────────────────
         bankDetails: {
