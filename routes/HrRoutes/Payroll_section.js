@@ -4,13 +4,20 @@ const router = express.Router();
 const mongoose = require("mongoose");
 
 const { Payroll, PayrollItem } = require("../../models/HR_Models/Payroll");
-const PayrollSettings = require("../../models/HR_Models/Payrollsettings");
+const PayrollSettings = require("../../models/HR_Models/PayrollSettings");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const { CompanyHoliday, LeaveBalance, LeaveConfig } =
     require("../../models/HR_Models/LeaveManagement");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
+const {
+    decryptSalaryFields,
+    decryptEmployeeDoc,
+    encryptPayrollItem,
+    decryptPayrollItem,
+    encryptNumber,
+} = require("../../utils/salaryEncryption");
 
 const MONTH_NAMES = [
     "", "January", "February", "March", "April", "May", "June",
@@ -506,13 +513,16 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
             .select("-password -temporaryPassword -__v")
             .lean();
 
+        // Decrypt salary fields so computeEmployeePayroll works with plain numbers
+        const decryptedEmployees = employees.map(decryptEmployeeDoc);
+
         const leaveBalances = await LeaveBalance.find({
             employeeId: { $in: employees.map((e) => e._id) },
             year,
         }).lean();
         const balanceByEmpId = new Map(leaveBalances.map((b) => [String(b.employeeId), b]));
 
-        const items = employees.map((emp) => {
+        const items = decryptedEmployees.map((emp) => {
             const bid = (emp.biometricId || "").toUpperCase();
             const ctx = {
                 month, year, settings, salaryCfg, holidayMap, leaveConfig,
@@ -556,7 +566,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
                     sundayWorkExtraPay: settings.sundayWorkExtraPay,
                 },
                 summary,
-                items,
+                items: items.map(decryptPayrollItem),
                 existingRun: existingRun
                     ? { id: existingRun._id, status: existingRun.status, processedAt: existingRun.processedAt }
                     : null,
@@ -598,6 +608,9 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             .select("-password -temporaryPassword -__v")
             .lean();
 
+        // Decrypt salary so computeEmployeePayroll gets plain numbers
+        const decryptedEmployees = employees.map(decryptEmployeeDoc);
+
         const leaveBalances = await LeaveBalance.find({
             employeeId: { $in: employees.map((e) => e._id) }, year,
         });
@@ -621,7 +634,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
         let totalGross = 0, totalDed = 0, totalNet = 0, totalPF = 0, totalESIC = 0, totalBonus = 0;
         const clBalanceUpdates = []; // { balanceDoc, daysToDeduct }
 
-        for (const emp of employees) {
+        for (const emp of decryptedEmployees) {
             const bid = (emp.biometricId || "").toUpperCase();
             const balance = balanceByEmpId.get(String(emp._id)) || null;
             const ctx = {
@@ -630,6 +643,16 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                 leaveBalance: balance,
             };
             const computed = computeEmployeePayroll(emp, ctx);
+
+            // Encrypt monetary fields before persisting to MongoDB
+            const encEarnings = encryptPayrollItem({ earnings: computed.earnings }).earnings;
+            const encDeductions = encryptPayrollItem({ deductions: computed.deductions }).deductions;
+            const encRateGross = computed.rateGross ? encryptNumber(computed.rateGross) : 0;
+            const encRateBasic = computed.rateBasic ? encryptNumber(computed.rateBasic) : 0;
+            const encRateHra = computed.rateHra ? encryptNumber(computed.rateHra) : 0;
+            const encPerDayRate = computed.perDayRate ? encryptNumber(computed.perDayRate) : 0;
+            const encNetPay = computed.netPay ? encryptNumber(computed.netPay) : 0;
+            const encRoundedNetPay = computed.roundedNetPay ? encryptNumber(computed.roundedNetPay) : 0;
 
             // Upsert PayrollItem  (unique on employeeId + month + year)
             // Persist ALL computed fields so the saved payroll list, drawer, payslip,
@@ -648,12 +671,12 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     month, year,
                     payPeriod: computed.payPeriod,
 
-                    // Rate snapshot
-                    rateBasic: computed.rateBasic,
-                    rateHra: computed.rateHra,
-                    rateGross: computed.rateGross,
+                    // Rate snapshot — encrypted
+                    rateBasic: encRateBasic,
+                    rateHra: encRateHra,
+                    rateGross: encRateGross,
 
-                    // Attendance counts
+                    // Attendance counts (not sensitive — not encrypted)
                     workingDays: computed.workingDays,
                     daysInMonth: computed.daysInMonth,
                     presentDays: computed.presentDays,
@@ -671,29 +694,29 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     slUsedDays: computed.slUsedDays,
                     plUsedDays: computed.plUsedDays,
 
-                    // Payable days + per-day rate
+                    // Payable days + per-day rate — per-day rate encrypted
                     payableDays: computed.payableDays,
                     effectivePayableDays: computed.effectivePayableDays,
-                    perDayRate: computed.perDayRate,
+                    perDayRate: encPerDayRate,
                     divisorBasis: computed.divisorBasis,
                     sundayExtraPayDays: computed.sundayExtraPayDays,
 
-                    // Engine adjustments
+                    // Engine adjustments (counts, not sensitive)
                     autoAdjustedCL: computed.autoAdjustedCL,
                     sundayOffsetApplied: computed.sundayOffsetApplied,
                     unsyncedDays: computed.unsyncedDays,
 
-                    // Leave balance snapshot
+                    // Leave balance snapshot (not sensitive)
                     leaveBalanceSnapshot: computed.leaveBalanceSnapshot,
 
-                    // Earnings & Deductions
-                    earnings: computed.earnings,
-                    deductions: computed.deductions,
-                    netPay: computed.netPay,
-                    roundedNetPay: computed.roundedNetPay,
+                    // Earnings & Deductions — encrypted
+                    earnings: encEarnings,
+                    deductions: encDeductions,
+                    netPay: encNetPay,
+                    roundedNetPay: encRoundedNetPay,
                     bankDetails: computed.bankDetails,
 
-                    // Day breakdown (per-day audit trail)
+                    // Day breakdown (per-day audit trail — not sensitive)
                     dayBreakdown: computed.dayBreakdown,
 
                     status: "processed",
@@ -825,7 +848,10 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
 
         const run = await Payroll.findOne({ month, year }).lean();
 
-        res.json({ success: true, data: { items, run, count: items.length } });
+        // Decrypt earnings/deductions in every item before sending to the frontend
+        const decryptedItems = items.map(decryptPayrollItem);
+
+        res.json({ success: true, data: { items: decryptedItems, run, count: decryptedItems.length } });
     } catch (err) {
         console.error("[PAYROLL-ITEMS]", err);
         res.status(500).json({ success: false, message: err.message });
@@ -839,7 +865,7 @@ router.get("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
             .populate("employeeId", "firstName lastName profilePhoto email phone dateOfJoining")
             .lean();
         if (!item) return res.status(404).json({ success: false, message: "Payroll item not found" });
-        res.json({ success: true, data: item });
+        res.json({ success: true, data: decryptPayrollItem(item) });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -863,7 +889,7 @@ router.put("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
         const allowed = ["earnings", "deductions", "remarks"];
         allowed.forEach((k) => { if (req.body[k] !== undefined) item[k] = req.body[k]; });
         await item.save(); // pre-save recalculates gross & net
-        res.json({ success: true, data: item });
+        res.json({ success: true, data: decryptPayrollItem(item.toObject()) });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -890,6 +916,7 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
 
         const employee = await Employee.findById(item.employeeId).lean();
         if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
+        const empSalary = decryptSalaryFields(employee.salary || {});
         const salaryCfg = await SalaryConfig.getSingleton();
 
         const {
@@ -912,9 +939,9 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         // historical items stable if the employee's configured salary later changes.
         // Fall back to current employee salary for items that predate the snapshot.
         const divisor = item.workingDays || 26;
-        const fullGross = Number(item.rateGross || employee.salary?.gross || 0);
-        const fullBasic = Number(item.rateBasic || employee.salary?.basic || 0);
-        const fullHra = Number(item.rateHra || employee.salary?.hra || 0);
+        const fullGross = Number(item.rateGross || empSalary.gross || 0);
+        const fullBasic = Number(item.rateBasic || empSalary.basic || 0);
+        const fullHra = Number(item.rateHra || empSalary.hra || 0);
 
         if (fullGross <= 0) {
             return res.status(400).json({ success: false, message: "Employee has no gross salary set" });
@@ -1023,7 +1050,7 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         res.json({
             success: true,
             message: "Override applied and net pay recomputed",
-            data: item,
+            data: decryptPayrollItem(item.toObject()),
         });
     } catch (err) {
         console.error("[PAYROLL-OVERRIDE]", err);
@@ -1208,7 +1235,8 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         const employees = await Employee.find({
             _id: { $in: items.map((i) => i.employeeId) },
         }).select("firstName middleName lastName biometricId designation jobTitle department salary bankDetails").lean();
-        const empById = new Map(employees.map((e) => [String(e._id), e]));
+        // Decrypt salary so fallback reads (emp.salary?.gross etc.) work correctly
+        const empById = new Map(employees.map((e) => [String(e._id), decryptEmployeeDoc(e)]));
 
         const wb = new ExcelJS.Workbook();
         wb.creator = "Grav Clothing HRMS";
@@ -1294,12 +1322,14 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         items.forEach((it, idx) => {
             const row = ws.getRow(4 + idx);
             const emp = empById.get(String(it.employeeId)) || {};
+            // Decrypt the payroll item's rate snapshot and earnings/deductions
+            const decIt = decryptPayrollItem(it);
             // Prefer rate snapshot from payroll item; fall back to employee salary
-            const rateBasic = it.rateBasic || emp.salary?.basic || 0;
-            const rateHra = it.rateHra || emp.salary?.hra || 0;
-            const rateGross = it.rateGross || emp.salary?.gross || 0;
-            const e = it.earnings || {};
-            const d = it.deductions || {};
+            const rateBasic = decIt.attendance?.rateBasic || emp.salary?.basic || 0;
+            const rateHra = decIt.attendance?.rateHra || emp.salary?.hra || 0;
+            const rateGross = decIt.attendance?.rateGross || emp.salary?.gross || 0;
+            const e = decIt.earnings || {};
+            const d = decIt.deductions || {};
 
             row.getCell(1).value = idx + 1;                                           // Sl
             row.getCell(2).value = it.employeeName || "";                             // Name
