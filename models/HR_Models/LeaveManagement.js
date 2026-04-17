@@ -1,6 +1,6 @@
 "use strict";
 /**
- * LeaveManagement.js — v3 (GRAV Clothing)
+ * LeaveManagement.js — v4 (GRAV Clothing)
  * ═══════════════════════════════════════════════════════════════════════════════
  * Models:
  *  1. LeaveConfig             — HR-configurable dynamic parameters (single document)
@@ -9,6 +9,12 @@
  *  4. CompanyHoliday          — holidays defined by HR, shown on both calendars
  *  5. RegularizationRequest   — miss-punch / attendance correction requests
  *                                (Employee → Manager → HR → applied to attendance)
+ *
+ * v4 changes:
+ *  - RegularizationRequest: added proposedPunchType, proposedPunchTime, proposedPunchAction
+ *    to support punch-specific regularization from the employee web/mobile app
+ *  - RegularizationRequest: added proposedPunches[] array for multi-punch corrections
+ *  - RegularizationRequest: added originalSnapshot.rawPunches field
  */
 
 const mongoose = require("mongoose");
@@ -117,14 +123,7 @@ const leaveApplicationSchema = new mongoose.Schema(
 
         status: {
             type: String,
-            enum: [
-                "pending",
-                "manager_approved",
-                "manager_rejected",
-                "hr_approved",
-                "hr_rejected",
-                "cancelled",
-            ],
+            enum: ["pending", "manager_approved", "manager_rejected", "hr_approved", "hr_rejected", "cancelled"],
             default: "pending",
             index: true,
         },
@@ -195,20 +194,49 @@ const CompanyHoliday = mongoose.model("CompanyHoliday", companyHolidaySchema);
 // ─────────────────────────────────────────────────────────────────────────────
 //  5. REGULARIZATION REQUEST  (miss-punch & attendance corrections)
 // ─────────────────────────────────────────────────────────────────────────────
-//  Employee on mobile app → files a request saying "on date X, my actual in-time
-//  was 9:12am but device didn't record it". Flow:
+//  Employee on mobile/web app → files a request saying "on date X my actual
+//  in-time was 9:12am but device didn't record it" OR "my lunch-out was at
+//  1:30pm but I forgot to scan lunch-in".
+//
+//  Flow:
 //    1. Employee submits → status = pending
 //    2. Manager(s) review → status = manager_approved | manager_rejected
 //    3. HR finalises → status = hr_approved | hr_rejected
-//    4. On hr_approved, we write the corrected times into DailyAttendance and
-//       recompute metrics (late / HD / OT / status) for that day.
+//    4. On hr_approved, the corrected punches / times are written into
+//       DailyAttendance and metrics recomputed for that day.
 //
 //  Request types:
-//    miss_punch      — full rewrite of in/out for the day
-//    late_arrival    — employee admits to being late, optionally with reason
-//    early_departure — employee admits early out (reason)
-//    wrong_status    — dispute the system-predicted status (AB when really WO etc.)
+//    miss_punch        — one or more punches entirely missing
+//    punch_correction  — a specific punch has the wrong time (e.g. wrong scan)
+//    late_arrival      — employee admits to being late, optionally with reason
+//    early_departure   — employee admits early out (reason)
+//    wrong_status      — dispute the system-predicted status (AB when really WO)
+//    other             — catch-all
+//
+//  Punch actions (proposedPunchAction):
+//    add    — punch was never recorded; add it with proposedPunchTime
+//    remove — punch recorded erroneously; delete it
+//    modify — punch exists but at wrong time; replace with proposedPunchTime
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Sub-schema for individual punch corrections in proposedPunches[]
+const proposedPunchSchema = new mongoose.Schema(
+    {
+        punchType: {
+            type: String,
+            enum: ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out"],
+            required: true,
+        },
+        action: {
+            type: String,
+            enum: ["add", "remove", "modify"],
+            required: true,
+        },
+        punchTime: { type: String, default: null },  // "HH:MM" 24-hr — required for add/modify
+        reason: { type: String, default: "" },
+    },
+    { _id: false }
+);
 
 const regularizationRequestSchema = new mongoose.Schema(
     {
@@ -222,14 +250,15 @@ const regularizationRequestSchema = new mongoose.Schema(
         // Request basics
         requestType: {
             type: String,
-            enum: ["miss_punch", "late_arrival", "early_departure", "wrong_status", "other"],
+            enum: ["miss_punch", "punch_correction", "late_arrival", "early_departure", "wrong_status", "other"],
             default: "miss_punch",
             required: true,
         },
-        dateStr: { type: String, required: true, index: true },  // "YYYY-MM-DD" — day this request is for
+        dateStr: { type: String, required: true, index: true },  // "YYYY-MM-DD" — day this is for
         reason: { type: String, required: true },
 
-        // Proposed corrections (filled by employee on mobile)
+        // ── Simple (whole-day) corrections ─────────────────────────────────
+        // Use these for common miss_punch / late / early_departure requests
         proposedInTime: { type: String, default: null },   // "HH:MM" (24-hr)
         proposedOutTime: { type: String, default: null },
         proposedStatus: {
@@ -239,13 +268,33 @@ const regularizationRequestSchema = new mongoose.Schema(
         },
         proposedRemarks: { type: String, default: null },
 
+        // ── Punch-specific corrections (NEW) ───────────────────────────────
+        // Use these for punch_correction requests where individual punches
+        // need to be added, removed, or changed.
+        //
+        // Quick single-punch shorthand:
+        proposedPunchType: {
+            type: String,
+            enum: ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out", null],
+            default: null,
+        },
+        proposedPunchTime: { type: String, default: null }, // "HH:MM" 24-hr
+        proposedPunchAction: {
+            type: String,
+            enum: ["add", "remove", "modify", null],
+            default: null,
+        },
+
+        // Multi-punch correction list (for complex scenarios):
+        proposedPunches: { type: [proposedPunchSchema], default: [] },
+
         // Supporting document (optional — e.g. client-visit proof)
         documentUrl: { type: String, default: null },
         documentFileId: { type: String, default: null },
         documentFileName: { type: String, default: null },
         documentUploadedAt: { type: Date, default: null },
 
-        // Snapshot of the original day record at time of filing (so HR can compare)
+        // Snapshot of the original day record at time of filing
         originalSnapshot: {
             inTime: { type: Date, default: null },
             finalOut: { type: Date, default: null },
@@ -255,19 +304,14 @@ const regularizationRequestSchema = new mongoose.Schema(
             lateMins: { type: Number, default: 0 },
             otMins: { type: Number, default: 0 },
             punchCount: { type: Number, default: 0 },
+            // Raw punches snapshot so HR can see exactly what was on the device
+            rawPunches: { type: Array, default: [] },
         },
 
-        // ── Approval workflow (mirrors leaves) ──────────────────────
+        // ── Approval workflow ────────────────────────────────────────────────
         status: {
             type: String,
-            enum: [
-                "pending",
-                "manager_approved",
-                "manager_rejected",
-                "hr_approved",
-                "hr_rejected",
-                "cancelled",
-            ],
+            enum: ["pending", "manager_approved", "manager_rejected", "hr_approved", "hr_rejected", "cancelled"],
             default: "pending",
             index: true,
         },
@@ -316,4 +360,10 @@ regularizationRequestSchema.index({ dateStr: 1 });
 const RegularizationRequest = mongoose.model("RegularizationRequest", regularizationRequestSchema);
 
 
-module.exports = { LeaveConfig, LeaveBalance, LeaveApplication, CompanyHoliday, RegularizationRequest };
+module.exports = {
+    LeaveConfig,
+    LeaveBalance,
+    LeaveApplication,
+    CompanyHoliday,
+    RegularizationRequest,
+};
