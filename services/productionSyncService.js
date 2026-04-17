@@ -1,17 +1,29 @@
+// services/productionSyncService.js
+//
+// Key rules enforced here:
+//   1. completedQuantity on WO is APPEND-ONLY — never decreases even if scan
+//      data is deleted. New value is accepted only if >= existing value.
+//   2. completedUnitNumbers on each operationCompletion is a union — new unit
+//      numbers are merged with existing ones, never replaced.
+//   3. Employee sync reads WO.productionCompletion.operationCompletion[].completedUnitNumbers
+//      — it does NOT re-query ProductionTracking. This avoids double DB load
+//      and keeps employee progress independent of scan data deletions.
+//   4. Employee completedUnits is also append-only (same no-downgrade rule).
+
 const cron = require("node-cron");
 const WorkOrder = require("../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const ProductionTracking = require("../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
-const EmployeeProductionProgress = require("../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+const EmployeeProductionProgress = require("../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 
 class ProductionSyncService {
   constructor() {
-    this.syncJob = null;
-    this.cleanupJob = null;
+    this.syncJob        = null;
+    this.cleanupJob     = null;
     this.employeeSyncJob = null;
-    this.isRunning = false;
+    this.isRunning       = false;
     this.isEmpSyncRunning = false;
-    this.isInitialized = false;
-    this.syncCount = 0;
+    this.isInitialized   = false;
+    this.syncCount       = 0;
   }
 
   initialize() {
@@ -111,7 +123,7 @@ class ProductionSyncService {
 
   async processWorkOrder(workOrderData) {
     const workOrderShortId = workOrderData._id.toString().slice(-8);
-    const totalQuantity = workOrderData.quantity || 0;
+    const totalQuantity    = workOrderData.quantity || 0;
 
     const trackingDocs = await ProductionTracking.find({
       "machines.operators.barcodeScans.barcodeId": { $regex: `^WO-${workOrderShortId}-` },
@@ -148,8 +160,8 @@ class ProductionSyncService {
 
   extractAndValidateScansForWorkOrder(trackingDocs, workOrderShortId, workOrderData, totalQuantity) {
     const scansByOperation = {};
-    const invalidScans = [];
-    let totalInvalidScans = 0;
+    const invalidScans     = [];
+    let totalInvalidScans  = 0;
 
     const extractUnitNumber = (barcodeId) => {
       const parts = barcodeId.split("-");
@@ -163,14 +175,14 @@ class ProductionSyncService {
     for (const trackingDoc of trackingDocs) {
       for (const machine of trackingDoc.machines) {
         const machineInfo = {
-          id: machine.machineId?._id?.toString(),
-          name: machine.machineId?.name || "Unknown",
+          id:           machine.machineId?._id?.toString(),
+          name:         machine.machineId?.name || "Unknown",
           serialNumber: machine.machineId?.serialNumber,
-          type: machine.machineId?.type,
+          type:         machine.machineId?.type,
         };
 
         for (const operator of machine.operators || []) {
-          const operatorId = operator.operatorIdentityId;
+          const operatorId   = operator.operatorIdentityId;
           const operatorName = operator.operatorName || `Operator ${operatorId}`;
           const relevantScans = (operator.barcodeScans || []).filter(
             (scan) => scan.barcodeId.startsWith(`WO-${workOrderShortId}-`)
@@ -182,14 +194,14 @@ class ProductionSyncService {
             if (unitNumber === null || unitNumber <= 0 || unitNumber > totalQuantity) {
               totalInvalidScans++;
               invalidScans.push({
-                barcodeId: scan.barcodeId,
-                timestamp: scan.timeStamp,
+                barcodeId:   scan.barcodeId,
+                timestamp:   scan.timeStamp,
                 unitNumber,
                 operatorId,
                 operatorName,
-                machineId: machineInfo.id,
+                machineId:   machineInfo.id,
                 machineName: machineInfo.name,
-                reason: unitNumber === null ? "invalid_format" : "exceeds_quantity",
+                reason:      unitNumber === null ? "invalid_format" : "exceeds_quantity",
                 details:
                   unitNumber === null
                     ? "Invalid barcode format"
@@ -214,9 +226,9 @@ class ProductionSyncService {
                   const workOrderOp = workOrderData.operations?.[opNum - 1];
                   if (!workOrderOp) continue;
                   scansByOperation[opNum] = {
-                    operationNumber: opNum,
-                    operationType: workOrderOp.operationType,
-                    operationCode: workOrderOp.operationCode || "",
+                    operationNumber:    opNum,
+                    operationType:      workOrderOp.operationType,
+                    operationCode:      workOrderOp.operationCode || "",
                     plannedTimeSeconds: workOrderOp.plannedTimeSeconds || 0,
                     machines: {},
                   };
@@ -257,13 +269,13 @@ class ProductionSyncService {
   }
 
   calculateCompletionMetrics(scansByOperation, workOrderData, totalInvalidScans = 0) {
-    const totalQuantity = workOrderData.quantity;
+    const totalQuantity    = workOrderData.quantity;
     const operationCompletion = [], operatorDetails = [], efficiencyMetrics = [], timeMetrics = [];
-    const unitsByOperation = {};
-    const numberedOpNums = Object.keys(scansByOperation).map(Number).filter((n) => n > 0);
+    const unitsByOperation    = {};
+    const numberedOpNums      = Object.keys(scansByOperation).map(Number).filter((n) => n > 0);
 
     for (const opNum of numberedOpNums) {
-      const opData = scansByOperation[opNum];
+      const opData       = scansByOperation[opNum];
       const completedUnits = new Set();
 
       for (const [machineId, machineData] of Object.entries(opData.machines)) {
@@ -306,17 +318,17 @@ class ProductionSyncService {
       }
 
       unitsByOperation[opNum] = completedUnits;
-      const completedCount = completedUnits.size;
+      const completedCount    = completedUnits.size;
 
       operationCompletion.push({
-        operationNumber: opNum,
-        operationType: opData.operationType,
-        operationCode: opData.operationCode || "",
-        completedQuantity: completedCount,
+        operationNumber:      opNum,
+        operationType:        opData.operationType,
+        operationCode:        opData.operationCode || "",
+        completedQuantity:    completedCount,
         completedUnitNumbers: [...completedUnits], // ← written here, read by employee sync
         totalQuantity,
         completionPercentage: Math.min(Math.round((completedCount / totalQuantity) * 100), 100),
-        status: completedCount >= totalQuantity ? "completed" : "in_progress",
+        status:               completedCount >= totalQuantity ? "completed" : "in_progress",
       });
     }
 
@@ -327,10 +339,10 @@ class ProductionSyncService {
 
     let newStatus = workOrderData.status;
     if (overallCompleted >= totalQuantity) newStatus = "completed";
-    else if (overallCompleted > 0) newStatus = "in_progress";
+    else if (overallCompleted > 0)         newStatus = "in_progress";
 
     return {
-      overallCompletedQuantity: overallCompleted,
+      overallCompletedQuantity:    overallCompleted,
       overallCompletionPercentage: Math.min(overallPct, 100),
       operationCompletion,
       operatorDetails,
@@ -366,25 +378,25 @@ class ProductionSyncService {
       if (d < 1800) intervals.push(d);
     }
     if (!intervals.length) return null;
-    const avgTimePerUnit = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    const targetTime = plannedTime || estimatedTime || 0;
-    const efficiency = targetTime > 0 && avgTimePerUnit > 0
+    const avgTimePerUnit  = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+    const targetTime      = plannedTime || estimatedTime || 0;
+    const efficiency      = targetTime > 0 && avgTimePerUnit > 0
       ? Math.min((targetTime / avgTimePerUnit) * 100, 200) : 0;
-    const productiveTime = intervals.reduce((a, b) => a + b, 0);
+    const productiveTime  = intervals.reduce((a, b) => a + b, 0);
     const totalSessionTime =
       ((session.signOutTime ? new Date(session.signOutTime) : new Date()) -
         new Date(session.signInTime)) / 1000;
     return {
-      unitsCompleted: scans.length,
-      avgTimePerUnit: Math.round(avgTimePerUnit),
+      unitsCompleted:       scans.length,
+      avgTimePerUnit:       Math.round(avgTimePerUnit),
       estimatedTimePerUnit: estimatedTime || 0,
-      plannedTimePerUnit: plannedTime || 0,
+      plannedTimePerUnit:   plannedTime || 0,
       efficiencyPercentage: Math.round(efficiency * 100) / 100,
-      utilizationRate: Math.round(
+      utilizationRate:      Math.round(
         ((totalSessionTime > 0 ? productiveTime / totalSessionTime : 0) * 100 * 100) / 100
       ),
       totalProductiveTime: Math.round(productiveTime),
-      totalSessionTime: Math.round(totalSessionTime),
+      totalSessionTime:    Math.round(totalSessionTime),
     };
   }
 
@@ -410,7 +422,7 @@ class ProductionSyncService {
       avgCompletionTimeSeconds: Math.round(times.reduce((a, b) => a + b, 0) / times.length),
       minCompletionTimeSeconds: Math.round(Math.min(...times)),
       maxCompletionTimeSeconds: Math.round(Math.max(...times)),
-      totalUnitsAnalyzed: times.length,
+      totalUnitsAnalyzed:       times.length,
     };
   }
 
@@ -428,9 +440,9 @@ class ProductionSyncService {
 
       // ── overall — only go up, never down ─────────────────────────────
       const existingOverall = workOrder.productionCompletion.overallCompletedQuantity || 0;
-      const newOverall = completionData.overallCompletedQuantity || 0;
+      const newOverall      = completionData.overallCompletedQuantity || 0;
       const acceptedOverall = Math.max(existingOverall, newOverall);
-      const acceptedPct = workOrder.quantity > 0
+      const acceptedPct     = workOrder.quantity > 0
         ? Math.min(Math.round((acceptedOverall / workOrder.quantity) * 100), 100)
         : 0;
 
@@ -446,18 +458,18 @@ class ProductionSyncService {
         if (!existing) return incoming;
 
         // Union of unit numbers — never shrink
-        const existingSet = new Set(existing.completedUnitNumbers || []);
-        const incomingSet = new Set(incoming.completedUnitNumbers || []);
-        const mergedUnits = [...new Set([...existingSet, ...incomingSet])];
-        const mergedCount = Math.max(existing.completedQuantity || 0, incoming.completedQuantity || 0);
-        const mergedPct = workOrder.quantity > 0
+        const existingSet  = new Set(existing.completedUnitNumbers || []);
+        const incomingSet  = new Set(incoming.completedUnitNumbers || []);
+        const mergedUnits  = [...new Set([...existingSet, ...incomingSet])];
+        const mergedCount  = Math.max(existing.completedQuantity || 0, incoming.completedQuantity || 0);
+        const mergedPct    = workOrder.quantity > 0
           ? Math.min(Math.round((mergedCount / workOrder.quantity) * 100), 100)
           : 0;
 
         return {
           ...incoming,
           completedUnitNumbers: mergedUnits,
-          completedQuantity: mergedCount,
+          completedQuantity:    mergedCount,
           completionPercentage: mergedPct,
           // status: keep "completed" once set
           status: existing.status === "completed" ? "completed" : incoming.status,
@@ -466,8 +478,8 @@ class ProductionSyncService {
 
       // ── invalid scans — merge + deduplicate, cap at 100 ──────────────
       const existingInvalid = workOrder.productionCompletion.invalidScans || [];
-      const merged = [...existingInvalid, ...invalidScans.slice(-100)];
-      const unique = Array.from(
+      const merged          = [...existingInvalid, ...invalidScans.slice(-100)];
+      const unique          = Array.from(
         new Map(
           merged.map((i) => [`${i.barcodeId}-${new Date(i.timestamp).getTime()}`, i])
         ).values()
@@ -475,15 +487,15 @@ class ProductionSyncService {
 
       // ── write ─────────────────────────────────────────────────────────
       workOrder.productionCompletion = {
-        overallCompletedQuantity: acceptedOverall,
+        overallCompletedQuantity:    acceptedOverall,
         overallCompletionPercentage: acceptedPct,
-        operationCompletion: mergedOpCompletion,
-        operatorDetails: completionData.operatorDetails || [],
-        efficiencyMetrics: completionData.efficiencyMetrics || [],
-        timeMetrics: completionData.timeMetrics || [],
-        invalidScansCount: (workOrder.productionCompletion.invalidScansCount || 0) + invalidScansCount,
-        invalidScans: unique,
-        lastSyncedAt: completionData.lastSyncedAt || new Date(),
+        operationCompletion:         mergedOpCompletion,
+        operatorDetails:             completionData.operatorDetails || [],
+        efficiencyMetrics:           completionData.efficiencyMetrics || [],
+        timeMetrics:                 completionData.timeMetrics || [],
+        invalidScansCount:           (workOrder.productionCompletion.invalidScansCount || 0) + invalidScansCount,
+        invalidScans:                unique,
+        lastSyncedAt:                completionData.lastSyncedAt || new Date(),
       };
 
       // Update per-operation status on the operations array
@@ -534,8 +546,8 @@ class ProductionSyncService {
       if (!workOrder.productionCompletion) workOrder.productionCompletion = {};
 
       const existing = workOrder.productionCompletion.invalidScans || [];
-      const merged = [...existing, ...invalidScans.slice(-100)];
-      const unique = Array.from(
+      const merged   = [...existing, ...invalidScans.slice(-100)];
+      const unique   = Array.from(
         new Map(
           merged.map((i) => [`${i.barcodeId}-${new Date(i.timestamp).getTime()}`, i])
         ).values()
@@ -543,8 +555,8 @@ class ProductionSyncService {
 
       workOrder.productionCompletion.invalidScansCount =
         (workOrder.productionCompletion.invalidScansCount || 0) + invalidScansCount;
-      workOrder.productionCompletion.invalidScans = unique;
-      workOrder.productionCompletion.lastSyncedAt = new Date();
+      workOrder.productionCompletion.invalidScans  = unique;
+      workOrder.productionCompletion.lastSyncedAt  = new Date();
       await workOrder.save();
     } catch (error) {
       const displayName = workOrderNumber || workOrderId?.toString?.()?.slice(-8) || "unknown";
@@ -566,8 +578,8 @@ class ProductionSyncService {
       }
 
       const completedShortIds = completedWorkOrders.map((wo) => wo._id.toString().slice(-8));
-      const barcodePatterns = completedShortIds.map((id) => `WO-${id}-`);
-      const oldTrackingDocs = await ProductionTracking.find({ date: { $lt: fifteenDaysAgo } }).lean();
+      const barcodePatterns   = completedShortIds.map((id) => `WO-${id}-`);
+      const oldTrackingDocs   = await ProductionTracking.find({ date: { $lt: fifteenDaysAgo } }).lean();
 
       if (oldTrackingDocs.length === 0) {
         console.log("✅ No tracking docs older than 15 days found\n");
@@ -619,8 +631,8 @@ class ProductionSyncService {
   }
 
   stop() {
-    if (this.syncJob) { this.syncJob.stop(); this.syncJob = null; }
-    if (this.cleanupJob) { this.cleanupJob.stop(); this.cleanupJob = null; }
+    if (this.syncJob)         { this.syncJob.stop();         this.syncJob = null; }
+    if (this.cleanupJob)      { this.cleanupJob.stop();      this.cleanupJob = null; }
     if (this.employeeSyncJob) { this.employeeSyncJob.stop(); this.employeeSyncJob = null; }
     this.isRunning = false; this.isEmpSyncRunning = false; this.syncCount = 0;
     console.log("✅ Production Sync Service stopped");
@@ -675,7 +687,7 @@ class ProductionSyncService {
             .lean();
           if (!wo) continue;
 
-          const totalOps = wo.operations?.length || 0;
+          const totalOps     = wo.operations?.length || 0;
           const opCompletion = wo.productionCompletion?.operationCompletion || [];
 
           // ── Build truly-completed unit set (intersection across all ops) ──
@@ -705,7 +717,7 @@ class ProductionSyncService {
           // ── Update each employee doc — no-downgrade rule ──────────────
           for (const empDoc of empDocs) {
             const unitStart = empDoc.unitStart || 1;
-            const unitEnd = empDoc.unitEnd || unitStart;
+            const unitEnd   = empDoc.unitEnd   || unitStart;
 
             // New completed unit numbers from the intersection set
             const newlyCompleted = [];
@@ -715,8 +727,8 @@ class ProductionSyncService {
 
             // Union with existing (no-downgrade)
             const existingSet = new Set(empDoc.completedUnitNumbers || []);
-            const mergedSet = new Set([...existingSet, ...newlyCompleted]);
-            const mergedArr = [...mergedSet].sort((a, b) => a - b);
+            const mergedSet   = new Set([...existingSet, ...newlyCompleted]);
+            const mergedArr   = [...mergedSet].sort((a, b) => a - b);
             const mergedCount = mergedArr.length;
 
             const completionPercentage = empDoc.totalUnits > 0
@@ -729,10 +741,10 @@ class ProductionSyncService {
                 { _id: empDoc._id },
                 {
                   $set: {
-                    completedUnits: mergedCount,
+                    completedUnits:       mergedCount,
                     completedUnitNumbers: mergedArr,
                     completionPercentage,
-                    lastSyncedAt: new Date(),
+                    lastSyncedAt:         new Date(),
                   },
                 }
               );
@@ -753,8 +765,8 @@ class ProductionSyncService {
     }
   }
 
-  async manualSync() { await this.syncProductionToWorkOrders(); }
-  async manualCleanup() { await this.cleanupOldTrackingData(); }
+  async manualSync()         { await this.syncProductionToWorkOrders(); }
+  async manualCleanup()      { await this.cleanupOldTrackingData(); }
   async manualEmployeeSync() { await this.syncEmployeeProgress(); }
 }
 

@@ -4,7 +4,7 @@ const router = express.Router();
 const mongoose = require("mongoose");
 
 const { Payroll, PayrollItem } = require("../../models/HR_Models/Payroll");
-const PayrollSettings = require("../../models/HR_Models/PayrollSettings");
+const PayrollSettings = require("../../models/HR_Models/Payrollsettings");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
