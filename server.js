@@ -5,7 +5,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
- 
+
 const http = require("http");
 const { Server } = require("socket.io");
 const activeMeetingRecordings = new Map();
