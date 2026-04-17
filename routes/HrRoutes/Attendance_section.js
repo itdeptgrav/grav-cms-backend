@@ -9,6 +9,7 @@ const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
 const Employee = require("../../models/Employee");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const { CompanyHoliday, RegularizationRequest, LeaveApplication } = require("../../models/HR_Models/LeaveManagement");
+const emailService = require("../../services/emailService");
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CONFIG & AUTH
@@ -274,7 +275,7 @@ function assignPunchTypes(punches, employeeType, shift, settings) {
     const sorted = [...punches].sort((a, b) => a.time - b.time);
 
     if (sorted.length === 0) {
-        return { punches: [], expected, hasMissPunch: true };
+        return { punches: [], expected, hasMissPunch: true, missingPunchType: null };
     }
 
     const assigned = sorted.map((p) => ({ ...p, punchType: "unknown" }));
@@ -291,22 +292,73 @@ function assignPunchTypes(punches, employeeType, shift, settings) {
         }
         assigned[0].punchType = kind;
         assigned[0].seq = 1;
-        return { punches: assigned, expected, hasMissPunch: true };
+        return { punches: assigned, expected, hasMissPunch: true, missingPunchType: kind === "in" ? "out" : "in" };
     }
 
     assigned[0].punchType = "in";
     assigned[assigned.length - 1].punchType = "out";
 
+    let missingPunchType = null;
+
     if (employeeType === "operator") {
         const middle = assigned.slice(1, -1);
-        if (middle.length >= 1) middle[0].punchType = "lunch_out";
-        if (middle.length >= 2) middle[1].punchType = "lunch_in";
-        if (middle.length >= 3) middle[2].punchType = "tea_out";
-        if (middle.length >= 4) middle[3].punchType = "tea_in";
+
+        if (middle.length >= 4) {
+            // All 4 middle punches present — full 6-punch day
+            middle[0].punchType = "lunch_out";
+            middle[1].punchType = "lunch_in";
+            middle[2].punchType = "tea_out";
+            middle[3].punchType = "tea_in";
+
+        } else if (middle.length === 3) {
+            // 5 punches total — one middle punch missing
+            // Use break-duration heuristics to detect WHICH middle punch is absent
+            //
+            // Logic:
+            //  Tea breaks are short (≤ 45 min). Lunch breaks are longer.
+            //  If the LAST two middle punches form a short pair → they are tea_out + tea_in,
+            //    meaning lunch_in is the missing punch.
+            //  If the FIRST two middle punches form a short pair → they are lunch_out + lunch_in,
+            //    meaning tea_in is missing.
+            //  Fall-through: assume tea_in is missing (most common real-world scenario).
+            const TEA_MAX_MINS = 45;
+            const g01 = Math.round((middle[1].time - middle[0].time) / 60000); // gap between m[0] and m[1]
+            const g12 = Math.round((middle[2].time - middle[1].time) / 60000); // gap between m[1] and m[2]
+
+            if (g12 <= TEA_MAX_MINS && g01 > TEA_MAX_MINS) {
+                // Last pair is the tea break → lunch_in is the missing punch
+                middle[0].punchType = "lunch_out";
+                // lunch_in = absent — NOT assigned, stays as "unknown"
+                middle[1].punchType = "tea_out";
+                middle[2].punchType = "tea_in";
+                missingPunchType = "lunch_in";
+            } else if (g01 <= TEA_MAX_MINS + 30 && g12 > TEA_MAX_MINS) {
+                // First pair looks like a lunch break, last punch is tea_out → tea_in missing
+                middle[0].punchType = "lunch_out";
+                middle[1].punchType = "lunch_in";
+                middle[2].punchType = "tea_out";
+                missingPunchType = "tea_in";
+            } else {
+                // Cannot determine confidently — default: tea_in is missing
+                middle[0].punchType = "lunch_out";
+                middle[1].punchType = "lunch_in";
+                middle[2].punchType = "tea_out";
+                missingPunchType = "tea_in";
+            }
+
+        } else if (middle.length === 2) {
+            middle[0].punchType = "lunch_out";
+            middle[1].punchType = "lunch_in";
+            missingPunchType = "tea_out";
+
+        } else if (middle.length === 1) {
+            middle[0].punchType = "lunch_out";
+            missingPunchType = "lunch_in";
+        }
     }
 
     assigned.forEach((p, i) => (p.seq = i + 1));
-    return { punches: assigned, expected, hasMissPunch: assigned.length < expected };
+    return { punches: assigned, expected, hasMissPunch: assigned.length < expected, missingPunchType };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -382,26 +434,63 @@ function matchEmployee({ Name, Empcode }, empMap) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  FORMAT HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Format late/early minutes as human-readable string: "1h 30m", "45m", "2h"
+ * Returns "" for zero / null values.
+ */
+function fmtLateMins(mins) {
+    if (!mins || mins <= 0) return "";
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    if (h === 0) return `${m}m`;
+    if (m === 0) return `${h}h`;
+    return `${h}h ${m}m`;
+}
+
+/**
+ * Payroll attendance value for a status code:
+ *   1   — present / paid full day
+ *   0.5 — half day (HD)
+ *   0   — absent / unpaid (AB, LWP)
+ */
+function getAttendanceValue(status) {
+    if (!status) return 0;
+    if (status === "HD") return 0.5;
+    const zero = ["AB", "LWP"];
+    if (zero.includes(status)) return 0;
+    return 1; // P, P*, P~, MP, WO, FH, NH, OH, RH, PH, L-*, WFH, CO
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  PUNCH → DAY COMPUTATION
 // ═══════════════════════════════════════════════════════════════════════════
-//  extraGraceMins (NEW): bonus grace added to today's late window because the
+//  isToday (NEW): when true, an employee who has checked in but not checked out
+//  gets systemPrediction = "P" (present, shift in progress) instead of "MP"
+//  (miss punch). At end-of-day re-sync the overnight job re-evaluates.
+//
+//  extraGraceMins: bonus grace added to today's late window because the
 //  employee worked extra yesterday. Computed upstream in syncDay().
 // ═══════════════════════════════════════════════════════════════════════════
 
-function computeDay(punches, employeeType, shift, settings, extraGraceMins = 0) {
+function computeDay(punches, employeeType, shift, settings, extraGraceMins = 0, isToday = false) {
     if (!punches.length) {
         return {
             rawPunches: [], punchCount: 0, systemPrediction: "AB",
-            hasMissPunch: false, isLate: false, lateMins: 0,
+            hasMissPunch: false, missingPunchType: null,
+            isLate: false, lateMins: 0, lateDisplay: "",
             netWorkMins: 0, otMins: 0, totalBreakMins: 0,
             lunchBreakMins: 0, teaBreakMins: 0, totalSpanMins: 0,
             isEarlyDeparture: false, earlyDepartureMins: 0, hasOT: false,
             inTime: null, lunchOut: null, lunchIn: null, teaOut: null, teaIn: null, finalOut: null,
             appliedExtraGraceMins: extraGraceMins || 0,
+            attendanceValue: 0,
         };
     }
 
-    const { punches: assigned, hasMissPunch } = assignPunchTypes(punches, employeeType, shift, settings);
+    const { punches: assigned, hasMissPunch, missingPunchType } = assignPunchTypes(punches, employeeType, shift, settings);
     const find = (t) => assigned.find((p) => p.punchType === t)?.time || null;
     const inTime = find("in"), lunchOut = find("lunch_out"), lunchIn = find("lunch_in");
     const teaOut = find("tea_out"), teaIn = find("tea_in"), finalOut = find("out");
@@ -417,10 +506,11 @@ function computeDay(punches, employeeType, shift, settings, extraGraceMins = 0) 
     const inMins = minsOf(inTime);
     const outMins = minsOf(finalOut);
 
-    // Effective late grace = shift's grace + any carry-forward bonus
     const effectiveGrace = (shift.lateGraceMins || 0) + (extraGraceMins || 0);
     const lateMins = (inMins != null) ? Math.max(0, inMins - (shiftStart + effectiveGrace)) : 0;
     const isLate = lateMins > 0;
+    const lateDisplay = fmtLateMins(lateMins);
+
     const earlyDepartureMins = (outMins != null) ? Math.max(0, shiftEnd - outMins) : 0;
     const isEarlyDeparture = earlyDepartureMins > 0;
 
@@ -433,11 +523,27 @@ function computeDay(punches, employeeType, shift, settings, extraGraceMins = 0) 
     const hasInAndOut = !!inTime && !!finalOut;
 
     let systemPrediction;
-    if (!hasInAndOut) systemPrediction = "MP";
-    else if (netWorkMins < (shift.halfDayThresholdMins || 240)) systemPrediction = "HD";
-    else if (isLate) systemPrediction = "P*";
-    else if (isEarlyDeparture) systemPrediction = "P~";
-    else systemPrediction = "P";
+    if (!hasInAndOut) {
+        // Key fix: if today and employee has already checked IN → show as P (shift in progress)
+        // Only mark as MP for PAST days where the checkout was never recorded
+        if (isToday && !!inTime && !finalOut) {
+            systemPrediction = "P";
+        } else {
+            systemPrediction = "MP";
+        }
+    } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
+        systemPrediction = "HD";
+    } else if (isLate) {
+        // Show as P* (Present but Late) — NOT a standalone "Late" status
+        // lateDisplay gives formatted duration e.g. "1h 30m"
+        systemPrediction = "P*";
+    } else if (isEarlyDeparture) {
+        systemPrediction = "P~";
+    } else {
+        systemPrediction = "P";
+    }
+
+    const attendanceValue = getAttendanceValue(systemPrediction);
 
     return {
         rawPunches: assigned.map((p) => ({
@@ -449,9 +555,10 @@ function computeDay(punches, employeeType, shift, settings, extraGraceMins = 0) 
         inTime, lunchOut, lunchIn, teaOut, teaIn, finalOut,
         totalSpanMins, lunchBreakMins, teaBreakMins, totalBreakMins,
         netWorkMins, otMins,
-        isLate, lateMins, isEarlyDeparture, earlyDepartureMins,
-        hasOT: otMins > 0, hasMissPunch,
-        systemPrediction,
+        isLate, lateMins, lateDisplay,
+        isEarlyDeparture, earlyDepartureMins,
+        hasOT: otMins > 0, hasMissPunch, missingPunchType,
+        systemPrediction, attendanceValue,
         appliedExtraGraceMins: extraGraceMins || 0,
     };
 }
@@ -493,10 +600,276 @@ function graceAppliesTo(employeeType, settings) {
 //  SYNC
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  SMART SYNC HELPERS — preserve HR / manual data on every re-sync
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Problem this solves:
+//    When HR manually adds a punch (e.g. lunch_in) and the system re-syncs,
+//    the raw $set replaces the whole employees array with device-only data,
+//    wiping the manual punch. These helpers prevent that.
+//
+//  Strategy:
+//    canSkipDeviceFetch  — for past days where all punches are complete (or
+//                          HR-overridden), skip the eTimeOffice API call entirely.
+//                          Leaves/holidays are still re-applied (idempotent & fast).
+//
+//    mergeEmployeeEntry  — for one employee, merge the freshly-fetched device
+//                          punches with whatever manual/HR data already exists.
+//                          Manual punches win over device punches for the same slot.
+//                          HR status fields are always preserved.
+//
+//    smartSaveDay        — orchestrates the per-employee merge and writes the
+//                          merged document, preserving injected rows (leave /
+//                          holiday) that are absent from the device feed.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Returns true when we can safely skip the eTimeOffice API call for dateStr.
+ * Conditions:
+ *   • Not today  (today always gets fresh data — new punches arriving)
+ *   • Already synced at least once
+ *   • Every employee either has a full punch set OR an HR override
+ *     (meaning there is nothing left for the device to fill in)
+ */
+function canSkipDeviceFetch(dateStr, todayStr, existingDoc) {
+    if (!existingDoc || dateStr === todayStr) return false;
+    if ((existingDoc.syncCount || 0) === 0) return false;
+    return existingDoc.employees.every(e => !e.hasMissPunch || !!e.hrFinalStatus);
+}
+
+/**
+ * Merge a freshly-computed employee entry (device data) with the existing
+ * DB record, preserving any manual punches and HR overrides.
+ *
+ * Rules enforced:
+ *  1. Punches with source "manual" or "miss_punch" are NEVER replaced.
+ *  2. Device punches fill only slots NOT already covered by manual punches.
+ *  3. hrFinalStatus / hrRemarks / hrReviewedAt are always kept from existing.
+ *  4. All metrics (netWorkMins, lateMins, etc.) are recomputed from merged punches.
+ *  5. systemPrediction is derived from merged data (not from either source alone).
+ */
+function mergeEmployeeEntry(fresh, existing, shift, isToday) {
+    // Split existing punches by source
+    const existingManual = (existing.rawPunches || []).filter(
+        p => p.source === "manual" || p.source === "miss_punch"
+    );
+    const manualTypes = new Set(existingManual.map(p => p.punchType));
+
+    // Device punches: only keep slots NOT manually covered
+    const freshDevice = (fresh.rawPunches || []).filter(
+        p => !manualTypes.has(p.punchType)
+    );
+
+    // Merged set, sorted by time, re-sequenced
+    const mergedRaw = [...existingManual, ...freshDevice]
+        .filter(p => p.time)
+        .sort((a, b) => new Date(a.time) - new Date(b.time))
+        .map((p, i) => ({ ...p, seq: i + 1 }));
+
+    // Re-derive named time fields from merged punches
+    const findTime = (pt) => (mergedRaw.find(r => r.punchType === pt) || {}).time || null;
+    const inTime = findTime("in");
+    const lunchOut = findTime("lunch_out");
+    const lunchIn = findTime("lunch_in");
+    const teaOut = findTime("tea_out");
+    const teaIn = findTime("tea_in");
+    const finalOut = findTime("out");
+
+    // Recompute metrics
+    const ms = (t) => t ? new Date(t).getTime() : null;
+    const inMs = ms(inTime), outMs = ms(finalOut);
+    const loMs = ms(lunchOut), liMs = ms(lunchIn);
+    const toMs = ms(teaOut), tiMs = ms(teaIn);
+
+    const totalSpanMins = (inMs && outMs && outMs > inMs) ? Math.round((outMs - inMs) / 60000) : 0;
+    const lunchBreakMins = (loMs && liMs && liMs > loMs) ? Math.round((liMs - loMs) / 60000) : 0;
+    const teaBreakMins = (toMs && tiMs && tiMs > toMs) ? Math.round((tiMs - toMs) / 60000) : 0;
+    const totalBreakMins = lunchBreakMins + teaBreakMins;
+    const netWorkMins = Math.max(0, totalSpanMins - totalBreakMins);
+
+    const shiftStart = hhmmMins(shift.start);
+    const shiftEnd = hhmmMins(shift.end);
+    const inClockMins = inTime ? minsOf(new Date(inTime)) : null;
+    const outClockMins = finalOut ? minsOf(new Date(finalOut)) : null;
+
+    const effectiveGrace = (shift.lateGraceMins || 0) + (fresh.appliedExtraGraceMins || 0);
+    const lateMins = inClockMins != null ? Math.max(0, inClockMins - (shiftStart + effectiveGrace)) : 0;
+    const earlyDepartureMins = outClockMins != null ? Math.max(0, shiftEnd - outClockMins) : 0;
+
+    let otMins = 0;
+    if (fresh.employeeType === "operator" && outClockMins != null) {
+        const over = outClockMins - shiftEnd - (shift.otGraceMins || 0);
+        if (over > 0) otMins = over;
+    }
+
+    const hasMissPunch = !(inTime && finalOut);
+
+    // Detect which specific punch is missing (for UI alert)
+    let missingPunchType = null;
+    if (hasMissPunch) {
+        const presentTypes = new Set(mergedRaw.map(p => p.punchType));
+        const scope = fresh.employeeType === "operator"
+            ? ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out"]
+            : ["in", "out"];
+        const missing = scope.filter(t => !presentTypes.has(t));
+        if (missing.length === 1) {
+            missingPunchType = missing[0];
+        } else if (missing.length > 0) {
+            if (!presentTypes.has("lunch_in") && presentTypes.has("tea_out")) missingPunchType = "lunch_in";
+            else if (!presentTypes.has("tea_in") && presentTypes.has("tea_out")) missingPunchType = "tea_in";
+            else missingPunchType = missing[0];
+        }
+    }
+
+    // System prediction from merged data
+    let systemPrediction;
+    if (!inTime) {
+        systemPrediction = "AB";
+    } else if (!finalOut) {
+        systemPrediction = isToday ? "P" : "MP";
+    } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
+        systemPrediction = "HD";
+    } else if (lateMins > 0) {
+        systemPrediction = "P*";
+    } else if (earlyDepartureMins > 0) {
+        systemPrediction = "P~";
+    } else {
+        systemPrediction = "P";
+    }
+
+    return {
+        // Identity — always from fresh (reflects current employee record)
+        employeeDbId: fresh.employeeDbId, biometricId: fresh.biometricId,
+        numericId: fresh.numericId, identityId: fresh.identityId,
+        employeeName: fresh.employeeName, department: fresh.department,
+        designation: fresh.designation, employeeType: fresh.employeeType,
+        isGhost: fresh.isGhost, matchMethod: fresh.matchMethod,
+        providerName: fresh.providerName,
+        shiftStart: fresh.shiftStart, shiftEnd: fresh.shiftEnd,
+        appliedExtraGraceMins: fresh.appliedExtraGraceMins || 0,
+
+        // Merged punches
+        rawPunches: mergedRaw, punchCount: mergedRaw.length,
+        inTime, lunchOut, lunchIn, teaOut, teaIn, finalOut,
+
+        // Recomputed metrics
+        totalSpanMins, lunchBreakMins, teaBreakMins, totalBreakMins,
+        netWorkMins, otMins,
+        lateMins, lateDisplay: fmtLateMins(lateMins), isLate: lateMins > 0,
+        earlyDepartureMins, isEarlyDeparture: earlyDepartureMins > 0,
+        hasOT: otMins > 0, hasMissPunch, missingPunchType,
+        systemPrediction,
+        attendanceValue: getAttendanceValue(existing.hrFinalStatus || systemPrediction),
+
+        // ── Preserved HR fields — NEVER overwritten by sync ─────────────────
+        hrFinalStatus: existing.hrFinalStatus || null,
+        hrRemarks: existing.hrRemarks || null,
+        hrReviewedAt: existing.hrReviewedAt || null,
+    };
+}
+
+/**
+ * Save a synced day using a smart merge strategy.
+ *
+ * For each employee in freshEmployees:
+ *   - If no manual punches and no HR override → use fresh data directly (fast path)
+ *   - Otherwise → mergeEmployeeEntry() to combine device + manual/HR data
+ *
+ * Employees present in the existing doc but absent from freshEmployees (e.g.
+ * leave-injected or holiday-injected rows) are kept unchanged — they would
+ * disappear with a plain $set replace.
+ */
+async function smartSaveDay(dateStr, freshEmployees, dayMeta, existingDoc, settings, isToday) {
+    if (!existingDoc || existingDoc.employees.length === 0) {
+        // First sync for this date — no merging needed
+        await DailyAttendance.updateOne(
+            { dateStr },
+            { $set: { ...dayMeta, employees: freshEmployees, summary: buildSummary(freshEmployees) } },
+            { upsert: true }
+        );
+        return;
+    }
+
+    const existingMap = new Map(
+        existingDoc.employees.map(e => [e.biometricId, e])
+    );
+
+    const mergedEmployees = freshEmployees.map(fresh => {
+        const old = existingMap.get(fresh.biometricId);
+        if (!old) return fresh; // Employee new to this day
+
+        const hasManualPunches = (old.rawPunches || []).some(
+            p => p.source === "manual" || p.source === "miss_punch"
+        );
+        const hasHROverride = !!(old.hrFinalStatus || old.hrRemarks);
+
+        // Fast path: no manual data to preserve → take device data as-is
+        if (!hasManualPunches && !hasHROverride) return fresh;
+
+        // Slow path: merge carefully
+        const empType = fresh.employeeType || "operator";
+        const shift = settings.shifts[empType] || settings.shifts.executive;
+        return mergeEmployeeEntry(fresh, old, shift, isToday);
+    });
+
+    // Preserve injected rows absent from the device feed (leave, holiday, manual)
+    const freshBids = new Set(freshEmployees.map(e => e.biometricId));
+    for (const old of existingDoc.employees) {
+        if (!freshBids.has(old.biometricId)) {
+            mergedEmployees.push(old.toObject ? old.toObject() : { ...old });
+        }
+    }
+
+    // Re-sort
+    mergedEmployees.sort((a, b) => {
+        if (a.isGhost !== b.isGhost) return a.isGhost ? 1 : -1;
+        return (a.employeeName || "").localeCompare(b.employeeName || "");
+    });
+
+    await DailyAttendance.updateOne(
+        { dateStr },
+        {
+            $set: {
+                ...dayMeta,
+                employees: mergedEmployees,
+                summary: buildSummary(mergedEmployees),
+                syncedAt: new Date(),
+                syncSource: "etimeoffice",
+                syncCount: (existingDoc.syncCount || 0) + 1,
+            }
+        },
+        { upsert: true }
+    );
+}
+
 async function syncDay(dateStr, empCode = "ALL") {
     console.log(`[SYNC] Day ${dateStr}`);
 
+    // ── Is this today's date? (IST) ──
+    const _nowIST = new Date(Date.now() + 330 * 60 * 1000);
+    const todayStr = `${_nowIST.getUTCFullYear()}-${String(_nowIST.getUTCMonth() + 1).padStart(2, "0")}-${String(_nowIST.getUTCDate()).padStart(2, "0")}`;
+    const isToday = dateStr === todayStr;
+
     const settings = await AttendanceSettings.getConfig();
+
+    // ── Load full existing doc upfront — used for skip-check AND merge ──────
+    const existingDoc = await DailyAttendance.findOne({ dateStr }).lean();
+
+    // ── Smart skip: past completed day — save the API round-trip ────────────
+    if (canSkipDeviceFetch(dateStr, todayStr, existingDoc)) {
+        console.log(`[SYNC] ${dateStr}: skipping device fetch (all employees have complete/HR-overridden punches)`);
+        try { await applyApprovedLeavesForDate(dateStr); }
+        catch (e) { console.warn(`[SYNC] leave-sync for ${dateStr} failed:`, e.message); }
+        return {
+            dateStr, fetched: 0, matched: 0, employees: existingDoc.employees.length,
+            ghostCount: existingDoc.employees.filter(e => e.isGhost).length,
+            skipped: true,
+            methodTally: {}, nameMismatches: [], unmatchedList: [],
+            holiday: existingDoc.holiday || null,
+        };
+    }
+
     const rawPunches = await fetchPunches(dateStr, dateStr, empCode);
     const empMap = await buildEmployeeMap();
     const holidayMap = await loadHolidayMap(dateStr, dateStr);
@@ -586,7 +959,7 @@ async function syncDay(dateStr, empCode = "ALL") {
             ? (yesterdayOt.get(g.biometricId) || 0)
             : 0;
 
-        const computed = computeDay(g.punches, employeeType, shift, settings, extraGrace);
+        const computed = computeDay(g.punches, employeeType, shift, settings, extraGrace, isToday);
 
         // Holiday override: if today is a holiday (FH/NH/OH/RH) and employee DID punch,
         // keep their P status (they get paid + present). If they didn't punch, they fall
@@ -604,6 +977,9 @@ async function syncDay(dateStr, empCode = "ALL") {
             matchMethod: g.method,
             providerName: g.providerName,
             ...computed,
+            lateDisplay: computed.lateDisplay || "",
+            attendanceValue: computed.attendanceValue ?? getAttendanceValue(computed.systemPrediction),
+            missingPunchType: computed.missingPunchType || null,
             shiftStart: shift.start,
             shiftEnd: shift.end,
         });
@@ -659,33 +1035,23 @@ async function syncDay(dateStr, empCode = "ALL") {
         biometricId: bid, empcode: info.empcode, name: info.name,
     }));
 
-    const summary = buildSummary(employees);
     const date = new Date(dateStr + "T00:00:00");
-    const existing = await DailyAttendance.findOne({ dateStr }).select("syncCount").lean();
-
-    // Holiday metadata on the day document itself
     const dayHoliday = holidayMap.get(dateStr) || null;
 
-    await DailyAttendance.updateOne(
-        { dateStr },
-        {
-            $set: {
-                dateStr, date,
-                yearMonth: dateStr.slice(0, 7),
-                dayOfWeek: date.getDay(),
-                holiday: dayHoliday ? {
-                    name: dayHoliday.name,
-                    type: dayHoliday.type,
-                    statusCode: holidayTypeToStatus(dayHoliday.type),
-                } : null,
-                employees, summary, unmatchedPunches,
-                syncedAt: new Date(),
-                syncSource: "etimeoffice",
-                syncCount: (existing?.syncCount || 0) + 1,
-            }
-        },
-        { upsert: true }
-    );
+    // Smart merge-save: preserves manual punches and HR overrides
+    const dayMeta = {
+        dateStr, date,
+        yearMonth: dateStr.slice(0, 7),
+        dayOfWeek: date.getDay(),
+        holiday: dayHoliday ? {
+            name: dayHoliday.name,
+            type: dayHoliday.type,
+            statusCode: holidayTypeToStatus(dayHoliday.type),
+        } : null,
+        unmatchedPunches,
+        syncSource: "etimeoffice",
+    };
+    await smartSaveDay(dateStr, employees, dayMeta, existingDoc, settings, isToday);
 
     console.log(`[SYNC] ${dateStr}: ${employees.length} rows (real:${employees.filter(e => !e.isGhost).length} ghost:${employees.filter(e => e.isGhost).length}) methods=${JSON.stringify(methodTally)} holiday=${dayHoliday?.type || "none"}`);
 
@@ -724,25 +1090,44 @@ function buildSummary(employees) {
     return s;
 }
 
-async function syncDateRange(fromDate, toDate, empCode = "ALL") {
+async function syncDateRange(fromDate, toDate, empCode = "ALL", force = false) {
     const start = new Date(fromDate + "T00:00:00");
     const end = new Date(toDate + "T00:00:00");
     const today = new Date(); today.setHours(0, 0, 0, 0);
+
+    // When force=true, temporarily bypass canSkipDeviceFetch by deleting
+    // the syncCount from existing docs isn't practical, so instead we
+    // monkey-patch: just call syncDay normally — the skip logic inside
+    // checks for today so today is always fresh; for past days, force
+    // is communicated via a short-circuit override below.
     const results = [];
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
         if (d > today) continue;
         const ds = dateStrOf(d);
-        try { results.push(await syncDay(ds, empCode)); }
-        catch (e) { console.error(`[SYNC] ${ds} failed:`, e.message, e.stack); results.push({ dateStr: ds, error: e.message }); }
+        try {
+            if (force) {
+                // Force full re-fetch: temporarily clear in-memory skip
+                // by passing a sentinel so canSkipDeviceFetch returns false.
+                // We achieve this by passing empCode normally — the flag is
+                // respected at the syncDay level via the force parameter.
+                results.push(await syncDayForce(ds, empCode));
+            } else {
+                results.push(await syncDay(ds, empCode));
+            }
+        } catch (e) {
+            console.error(`[SYNC] ${ds} failed:`, e.message, e.stack);
+            results.push({ dateStr: ds, error: e.message });
+        }
     }
     const agg = results.reduce((a, r) => ({
         fetched: a.fetched + (r.fetched || 0),
         matched: a.matched + (r.matched || 0),
         saved: a.saved + (r.employees || 0),
+        skipped: a.skipped + (r.skipped ? 1 : 0),
         ghostCount: a.ghostCount + (r.ghostCount || 0),
         employees: Math.max(a.employees, r.employees || 0),
         unmatchedList: [...a.unmatchedList, ...(r.unmatchedList || [])],
-    }), { fetched: 0, matched: 0, saved: 0, ghostCount: 0, employees: 0, unmatchedList: [] });
+    }), { fetched: 0, matched: 0, saved: 0, skipped: 0, ghostCount: 0, employees: 0, unmatchedList: [] });
 
     const seen = new Set();
     agg.unmatchedList = agg.unmatchedList.filter((u) => {
@@ -751,6 +1136,150 @@ async function syncDateRange(fromDate, toDate, empCode = "ALL") {
     });
     agg.unmatched = agg.unmatchedList.length;
     return agg;
+}
+
+/**
+ * Force a full re-fetch ignoring the skip optimisation.
+ * Used when HR explicitly triggers a re-sync to pick up late-arriving punches.
+ */
+async function syncDayForce(dateStr, empCode = "ALL") {
+    // Same as syncDay but we bypass canSkipDeviceFetch by temporarily
+    // pretending there is no existing doc for the skip check.
+    const _nowIST = new Date(Date.now() + 330 * 60 * 1000);
+    const todayStr = `${_nowIST.getUTCFullYear()}-${String(_nowIST.getUTCMonth() + 1).padStart(2, "0")}-${String(_nowIST.getUTCDate()).padStart(2, "0")}`;
+    const isToday = dateStr === todayStr;
+
+    const settings = await AttendanceSettings.getConfig();
+    const existingDoc = await DailyAttendance.findOne({ dateStr }).lean();
+    const rawPunches = await fetchPunches(dateStr, dateStr, empCode);
+    const empMap = await buildEmployeeMap();
+    const holidayMap = await loadHolidayMap(dateStr, dateStr);
+    const yesterdayOt = await buildYesterdayOtMap(dateStr, settings);
+    const dayOfWeek = new Date(dateStr + "T00:00:00").getDay();
+    const restDayStatus = resolveRestDayStatus(dateStr, dayOfWeek, holidayMap);
+
+    // Reuse the exact same grouping/computation logic from syncDay
+    // by delegating back — but since we already have settings/empMap/etc
+    // we inline the grouping here to avoid double-fetching.
+
+    const grouped = new Map();
+    const ghostInfo = new Map();
+    const methodTally = { "biometric-exact": 0, "biometric-numeric": 0, "biometric-raw": 0, "name-exact": 0, "name-first-last": 0, "name-sorted": 0, ghost: 0 };
+    const nameMismatches = [];
+
+    for (const p of rawPunches) {
+        const time = parsePunchDate(p.PunchDate);
+        if (!time || dateStrOf(time) !== dateStr) continue;
+        const match = matchEmployee(p, empMap);
+        const keys = providerKeys(p.Empcode);
+        let groupKey, employee, isGhost, method;
+        if (match) {
+            employee = match.employee; method = match.method;
+            groupKey = "E:" + employee._id.toString(); isGhost = false;
+            if (method.startsWith("biometric")) {
+                const k1 = normalizeName(extractName(employee));
+                const k2 = normalizeName(p.Name);
+                if (k1 && k2 && k1 !== k2 && !k1.includes(k2) && !k2.includes(k1))
+                    nameMismatches.push({ biometricId: keys.padded, providerName: p.Name, dbName: extractName(employee) });
+            }
+        } else {
+            employee = null; method = "ghost";
+            groupKey = "G:" + keys.padded; isGhost = true;
+            if (!ghostInfo.has(keys.padded)) ghostInfo.set(keys.padded, { name: p.Name, empcode: p.Empcode });
+        }
+        methodTally[method]++;
+        if (!grouped.has(groupKey)) {
+            grouped.set(groupKey, {
+                employee, isGhost, biometricId: keys.padded,
+                providerName: p.Name, providerEmpcode: p.Empcode, method, punches: []
+            });
+        }
+        grouped.get(groupKey).punches.push({ time, mcid: p.mcid || null, mFlag: p.M_Flag || null });
+    }
+
+    const employees = []; const seenBids = new Set();
+    for (const [, g] of grouped) {
+        let employeeType, department, designation, employeeName, employeeDbId, identityId, numericId;
+        if (g.isGhost) {
+            employeeType = "operator"; department = "PRODUCTION"; designation = "OPERATOR";
+            employeeName = toTitleCase(g.providerName || g.biometricId);
+            employeeDbId = null; identityId = ""; numericId = numericOf(g.providerEmpcode);
+        } else {
+            employeeType = resolveEmployeeType(g.employee, settings);
+            department = extractDepartment(g.employee);
+            designation = extractDesignation(g.employee);
+            employeeName = extractName(g.employee, g.providerName);
+            employeeDbId = g.employee._id;
+            identityId = extractIdentity(g.employee);
+            numericId = numericOf(g.biometricId);
+        }
+        const shift = settings.shifts[employeeType] || settings.shifts.executive;
+        const extraGrace = graceAppliesTo(employeeType, settings) ? (yesterdayOt.get(g.biometricId) || 0) : 0;
+        const computed = computeDay(g.punches, employeeType, shift, settings, extraGrace, isToday);
+        employees.push({
+            employeeDbId, biometricId: g.biometricId, numericId, identityId,
+            employeeName, department, designation, employeeType,
+            isGhost: g.isGhost, matchMethod: g.method, providerName: g.providerName,
+            ...computed,
+            lateDisplay: computed.lateDisplay || "",
+            attendanceValue: computed.attendanceValue ?? getAttendanceValue(computed.systemPrediction),
+            missingPunchType: computed.missingPunchType || null,
+            shiftStart: shift.start, shiftEnd: shift.end,
+        });
+        seenBids.add(g.biometricId);
+    }
+
+    if (restDayStatus) {
+        for (const emp of empMap.employees) {
+            const bid = extractBiometricId(emp);
+            if (!bid) continue;
+            const key = String(bid).toUpperCase();
+            if (seenBids.has(key)) continue;
+            const empType = resolveEmployeeType(emp, settings);
+            const shift = settings.shifts[empType] || settings.shifts.executive;
+            employees.push({
+                employeeDbId: emp._id, biometricId: key, numericId: numericOf(key),
+                identityId: extractIdentity(emp), employeeName: extractName(emp),
+                department: extractDepartment(emp), designation: extractDesignation(emp),
+                employeeType: empType, isGhost: false, matchMethod: "holiday-injected", providerName: null,
+                rawPunches: [], punchCount: 0,
+                inTime: null, lunchOut: null, lunchIn: null, teaOut: null, teaIn: null, finalOut: null,
+                totalSpanMins: 0, lunchBreakMins: 0, teaBreakMins: 0, totalBreakMins: 0,
+                netWorkMins: 0, otMins: 0, isLate: false, lateMins: 0, lateDisplay: "",
+                isEarlyDeparture: false, earlyDepartureMins: 0, hasOT: false, hasMissPunch: false,
+                missingPunchType: null, attendanceValue: 0,
+                systemPrediction: restDayStatus, appliedExtraGraceMins: 0,
+                shiftStart: shift.start, shiftEnd: shift.end,
+            });
+            seenBids.add(key);
+        }
+    }
+
+    employees.sort((a, b) => {
+        if (a.isGhost !== b.isGhost) return a.isGhost ? 1 : -1;
+        return (a.employeeName || "").localeCompare(b.employeeName || "");
+    });
+
+    const unmatchedPunches = [...ghostInfo.entries()].map(([bid, info]) => ({ biometricId: bid, empcode: info.empcode, name: info.name }));
+    const date = new Date(dateStr + "T00:00:00");
+    const dayHoliday = holidayMap.get(dateStr) || null;
+
+    const dayMeta = {
+        dateStr, date, yearMonth: dateStr.slice(0, 7), dayOfWeek: date.getDay(),
+        holiday: dayHoliday ? { name: dayHoliday.name, type: dayHoliday.type, statusCode: holidayTypeToStatus(dayHoliday.type) } : null,
+        unmatchedPunches, syncSource: "etimeoffice",
+    };
+    await smartSaveDay(dateStr, employees, dayMeta, existingDoc, settings, isToday);
+
+    console.log(`[SYNC-FORCE] ${dateStr}: ${employees.length} rows`);
+    try { await applyApprovedLeavesForDate(dateStr); } catch (e) { /* noop */ }
+
+    return {
+        dateStr, fetched: rawPunches.length, matched: rawPunches.length,
+        employees: employees.length, ghostCount: employees.filter(e => e.isGhost).length,
+        methodTally, nameMismatches, unmatchedList: unmatchedPunches,
+        holiday: dayHoliday ? { date: dayHoliday.date, name: dayHoliday.name, type: dayHoliday.type } : null,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1066,12 +1595,12 @@ router.get("/preview-match", EmployeeAuthMiddlewear, async (req, res) => {
 
 router.post("/sync", EmployeeAuthMiddlewear, async (req, res) => {
     try {
-        const { fromDate, toDate, empCode = "ALL" } = req.body;
+        const { fromDate, toDate, empCode = "ALL", force = false } = req.body;
         if (!fromDate || !toDate) return res.status(400).json({ success: false, message: "fromDate and toDate required" });
-        const agg = await syncDateRange(fromDate, toDate, empCode);
+        const agg = await syncDateRange(fromDate, toDate, empCode, force);
         res.json({
             success: true,
-            message: `Synced ${agg.saved} employees (${agg.ghostCount} ghost)`,
+            message: `Synced ${agg.saved} employees (${agg.ghostCount} ghost, ${agg.skipped || 0} days skipped as complete)`,
             ...agg,
         });
     } catch (err) {
@@ -1158,8 +1687,101 @@ router.get("/settings", EmployeeAuthMiddlewear, async (req, res) => {
     catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
+// ── Helper: diff old vs new settings and return human-readable changes array ──
+function buildSettingsChanges(oldCfg, body) {
+    const changes = [];
+
+    const diff = (label, oldVal, newVal) => {
+        const o = String(oldVal ?? "—"), n = String(newVal ?? "—");
+        if (o !== n) changes.push({ label, before: o, after: n });
+    };
+
+    // Operator shift
+    const os = body.shifts?.operator;
+    if (os) {
+        const oo = oldCfg.shifts?.operator || {};
+        diff("Operator shift start", oo.start, os.start);
+        diff("Operator shift end", oo.end, os.end);
+        diff("Operator late grace (mins)", oo.lateGraceMins, os.lateGraceMins);
+        diff("Operator half-day threshold (mins)", oo.halfDayThresholdMins, os.halfDayThresholdMins);
+        diff("Operator OT grace (mins)", oo.otGraceMins, os.otGraceMins);
+    }
+
+    // Executive shift
+    const es = body.shifts?.executive;
+    if (es) {
+        const oe = oldCfg.shifts?.executive || {};
+        diff("Executive shift start", oe.start, es.start);
+        diff("Executive shift end", oe.end, es.end);
+        diff("Executive late grace (mins)", oe.lateGraceMins, es.lateGraceMins);
+        diff("Executive half-day threshold (mins)", oe.halfDayThresholdMins, es.halfDayThresholdMins);
+        diff("Executive OT grace (mins)", oe.otGraceMins, es.otGraceMins);
+    }
+
+    // Late half-day policy
+    const lhp = body.lateHalfDayPolicy;
+    if (lhp) {
+        const ol = oldCfg.lateHalfDayPolicy || {};
+        if (lhp.enabled !== undefined && lhp.enabled !== ol.enabled)
+            changes.push({ label: "Auto late→HD policy", before: ol.enabled ? "Enabled" : "Disabled", after: lhp.enabled ? "Enabled" : "Disabled" });
+        const thr = lhp.cumulativeLateMinsThreshold || {};
+        const oThr = ol.cumulativeLateMinsThreshold || {};
+        if (thr.operator !== undefined) diff("Operator cumulative late threshold (mins)", oThr.operator, thr.operator);
+        if (thr.executive !== undefined) diff("Executive cumulative late threshold (mins)", oThr.executive, thr.executive);
+    }
+
+    // Single punch handling
+    if (body.singlePunchHandling?.mode && body.singlePunchHandling.mode !== (oldCfg.singlePunchHandling?.mode))
+        diff("Single punch mode", oldCfg.singlePunchHandling?.mode, body.singlePunchHandling.mode);
+
+    // Grace carry-forward
+    const gcf = body.graceCarryForward;
+    if (gcf) {
+        const og = oldCfg.graceCarryForward || {};
+        if (gcf.enabled !== undefined && gcf.enabled !== og.enabled)
+            changes.push({ label: "Grace carry-forward", before: og.enabled ? "Enabled" : "Disabled", after: gcf.enabled ? "Enabled" : "Disabled" });
+        if (gcf.triggerMins !== undefined) diff("Grace carry-forward trigger OT (mins)", og.triggerMins, gcf.triggerMins);
+        if (gcf.bonusGraceMins !== undefined) diff("Bonus grace minutes", og.bonusGraceMins, gcf.bonusGraceMins);
+        if (gcf.applyTo !== undefined && gcf.applyTo !== og.applyTo) diff("Grace apply to", og.applyTo, gcf.applyTo);
+    }
+
+    // Department / designation changes — summarise counts only (not each item)
+    if (body.departmentCategories) {
+        const oldCore = (oldCfg.departmentCategories?.core || oldCfg.operatorDepartments || []).length;
+        const newCore = (body.departmentCategories.core || []).length;
+        if (newCore !== oldCore) diff("Operator departments count", oldCore, newCore);
+        const oldGen = (oldCfg.departmentCategories?.general || []).length;
+        const newGen = (body.departmentCategories.general || []).length;
+        if (newGen !== oldGen) diff("Executive departments count", oldGen, newGen);
+    }
+    if (body.operatorDesignations) {
+        const olen = (oldCfg.operatorDesignations || []).length;
+        const nlen = body.operatorDesignations.length;
+        if (nlen !== olen) diff("Operator designations count", olen, nlen);
+    }
+    if (body.executiveDesignations) {
+        const olen = (oldCfg.executiveDesignations || []).length;
+        const nlen = body.executiveDesignations.length;
+        if (nlen !== olen) diff("Executive designations count", olen, nlen);
+    }
+
+    // Display labels — only list ones that actually changed
+    if (body.displayLabels) {
+        const ol = oldCfg.displayLabels || {};
+        for (const [code, newLabel] of Object.entries(body.displayLabels)) {
+            if (String(newLabel) !== String(ol[code] ?? ""))
+                changes.push({ label: `Display label: ${code}`, before: ol[code] || code, after: newLabel || code });
+        }
+    }
+
+    return changes;
+}
+
 router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
     try {
+        // ── Snapshot current config before overwriting (for email diff) ──
+        const oldCfg = await AttendanceSettings.getConfig();
+
         const {
             shifts, lateHalfDayPolicy, operatorDepartments,
             departmentCategories, executiveDesignations, operatorDesignations,
@@ -1180,7 +1802,17 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
         if (displayLabels) update.displayLabels = displayLabels;
 
         await AttendanceSettings.updateOne({ _id: "singleton" }, { $set: update }, { upsert: true });
-        res.json({ success: true, data: await AttendanceSettings.getConfig() });
+        const newCfg = await AttendanceSettings.getConfig();
+
+        // ── Send CEO email if anything meaningful changed ──────────────────
+        const changes = buildSettingsChanges(oldCfg, req.body);
+        if (changes.length > 0) {
+            const changedBy = req.user?.name || req.user?.email || "HR";
+            emailService.sendAttendanceSettingsChangeToCEO(changedBy, changes)
+                .catch(e => console.warn("[SETTINGS-EMAIL]", e.message));
+        }
+
+        res.json({ success: true, data: newCfg });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
@@ -1569,7 +2201,7 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
 
 router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
     try {
-        const { from, to, onlyMissing = false } = req.body;
+        const { from, to, onlyMissing = false, force = false } = req.body;
         if (!from || !to) return res.status(400).json({ success: false, message: "from and to required" });
 
         const todayStr = dateStrOf(new Date());
@@ -1585,25 +2217,30 @@ router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
             datesToSync = allDaysInRange(from, actualTo);
         }
 
-        console.log(`[SYNC-PERIOD] ${from}..${actualTo} → ${datesToSync.length} days (onlyMissing=${onlyMissing})`);
+        console.log(`[SYNC-PERIOD] ${from}..${actualTo} → ${datesToSync.length} days (onlyMissing=${onlyMissing} force=${force})`);
 
         const results = [];
         for (const dateStr of datesToSync) {
-            try { results.push(await syncDay(dateStr)); }
-            catch (e) { console.error(`[SYNC-PERIOD] ${dateStr} failed:`, e.message, e.stack); results.push({ dateStr, error: e.message }); }
+            try {
+                results.push(force ? await syncDayForce(dateStr) : await syncDay(dateStr));
+            } catch (e) {
+                console.error(`[SYNC-PERIOD] ${dateStr} failed:`, e.message, e.stack);
+                results.push({ dateStr, error: e.message });
+            }
         }
 
         const aggregate = results.reduce((a, r) => ({
             daysSynced: a.daysSynced + (r.error ? 0 : 1),
             daysFailed: a.daysFailed + (r.error ? 1 : 0),
+            daysSkipped: a.daysSkipped + (r.skipped ? 1 : 0),
             totalFetched: a.totalFetched + (r.fetched || 0),
             totalEmployees: Math.max(a.totalEmployees, r.employees || 0),
             totalGhosts: a.totalGhosts + (r.ghostCount || 0),
-        }), { daysSynced: 0, daysFailed: 0, totalFetched: 0, totalEmployees: 0, totalGhosts: 0 });
+        }), { daysSynced: 0, daysFailed: 0, daysSkipped: 0, totalFetched: 0, totalEmployees: 0, totalGhosts: 0 });
 
         res.json({
             success: true,
-            message: `Synced ${aggregate.daysSynced}/${datesToSync.length} days`,
+            message: `Synced ${aggregate.daysSynced}/${datesToSync.length} days (${aggregate.daysSkipped} skipped as complete)`,
             range: { from, to: actualTo },
             ...aggregate,
             details: results,
@@ -1620,7 +2257,11 @@ router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
 
 router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     try {
-        const { dateStr, biometricId, hrFinalStatus, hrRemarks, inTime, finalOut } = req.body;
+        const {
+            dateStr, biometricId, hrFinalStatus, hrRemarks,
+            inTime, finalOut,
+            lunchOut, lunchIn, teaOut, teaIn,
+        } = req.body;
         if (!dateStr || !biometricId) return res.status(400).json({ success: false, message: "dateStr and biometricId required" });
 
         const validStatuses = [
@@ -1640,34 +2281,79 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
 
         const emp = dayDoc.employees[empIdx];
 
+        // Snapshot before for CEO email
+        const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
+
         if (hrFinalStatus !== undefined) emp.hrFinalStatus = hrFinalStatus || null;
         if (hrRemarks !== undefined) emp.hrRemarks = hrRemarks || null;
         emp.hrReviewedAt = new Date();
 
-        const needsTimeUpdate = inTime !== undefined || finalOut !== undefined;
-        if (needsTimeUpdate) {
-            const parseTimeOnDate = (timeStr) => {
-                if (!timeStr) return null;
-                const [h, m] = String(timeStr).split(":").map(Number);
-                const d = new Date(dateStr + "T00:00:00");
-                d.setHours(h || 0, m || 0, 0, 0);
-                return d;
+        // ── Punch time update helper ─────────────────────────────────────────
+        const parseTimeOnDate = (timeStr) => {
+            if (!timeStr) return null;
+            const [h, m] = String(timeStr).split(":").map(Number);
+            // Convert local IST time → store as UTC (IST = UTC+5:30)
+            const d = new Date(dateStr + "T00:00:00+05:30");
+            d.setHours(h || 0, m || 0, 0, 0);
+            return d;
+        };
+
+        const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
+        const punchChanges = [];
+        let anyTimeUpdated = false;
+
+        for (const [field, value] of Object.entries(punchFields)) {
+            if (value === undefined) continue;
+            anyTimeUpdated = true;
+            const oldVal = emp[field] ? fmtTimeIST12(emp[field]) : "—";
+            const newDate = value ? parseTimeOnDate(value) : null;
+            emp[field] = newDate;
+            punchChanges.push({
+                punchType: field,
+                action: !emp[field] && value ? "add" : (emp[field] && !value ? "remove" : "modify"),
+                oldTime: oldVal,
+                newTime: newDate ? fmtTimeIST12(newDate) : "removed",
+            });
+
+            // Sync rawPunches array too
+            const punchTypeMap = {
+                inTime: "in", finalOut: "out",
+                lunchOut: "lunch_out", lunchIn: "lunch_in",
+                teaOut: "tea_out", teaIn: "tea_in",
             };
+            const pt = punchTypeMap[field];
+            if (pt) {
+                const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === pt);
+                if (newDate) {
+                    const manualPunch = {
+                        time: newDate,
+                        punchType: pt,
+                        source: "manual",
+                        addedBy: req.user?.name || req.user?.id || "HR",
+                        addedAt: new Date(),
+                    };
+                    if (existingIdx >= 0) {
+                        emp.rawPunches[existingIdx] = { ...emp.rawPunches[existingIdx], ...manualPunch };
+                    } else {
+                        emp.rawPunches = [...(emp.rawPunches || []), manualPunch];
+                    }
+                } else if (existingIdx >= 0) {
+                    emp.rawPunches.splice(existingIdx, 1);
+                }
+                emp.punchCount = (emp.rawPunches || []).length;
+            }
+        }
 
-            const newIn = inTime !== undefined ? (inTime ? parseTimeOnDate(inTime) : null) : emp.inTime;
-            const newOut = finalOut !== undefined ? (finalOut ? parseTimeOnDate(finalOut) : null) : emp.finalOut;
-
-            emp.inTime = newIn;
-            emp.finalOut = newOut;
-
+        if (anyTimeUpdated) {
+            // Recompute all derived metrics from the updated punch times
             const settings = await AttendanceSettings.getConfig();
             const shift = settings.shifts[emp.employeeType] || settings.shifts.executive;
             const shiftStart = hhmmMins(shift.start);
             const shiftEnd = hhmmMins(shift.end);
-            const inMins = minsOf(newIn);
-            const outMins = minsOf(newOut);
+            const inMins = minsOf(emp.inTime);
+            const outMins = minsOf(emp.finalOut);
 
-            const totalSpanMins = (newIn && newOut) ? Math.round((newOut - newIn) / 60000) : 0;
+            const totalSpanMins = (emp.inTime && emp.finalOut) ? Math.round((emp.finalOut - emp.inTime) / 60000) : 0;
             const lunchBreakMins = (emp.lunchOut && emp.lunchIn) ? Math.max(0, Math.round((emp.lunchIn - emp.lunchOut) / 60000)) : 0;
             const teaBreakMins = (emp.teaOut && emp.teaIn) ? Math.max(0, Math.round((emp.teaIn - emp.teaOut) / 60000)) : 0;
             const totalBreakMins = lunchBreakMins + teaBreakMins;
@@ -1684,15 +2370,39 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
             }
 
             emp.totalSpanMins = totalSpanMins;
+            emp.lunchBreakMins = lunchBreakMins;
+            emp.teaBreakMins = teaBreakMins;
             emp.totalBreakMins = totalBreakMins;
             emp.netWorkMins = netWorkMins;
             emp.lateMins = lateMins;
+            emp.lateDisplay = fmtLateMins(lateMins);
             emp.isLate = lateMins > 0;
             emp.earlyDepartureMins = earlyDepartureMins;
             emp.isEarlyDeparture = earlyDepartureMins > 0;
             emp.otMins = otMins;
             emp.hasOT = otMins > 0;
-            emp.hasMissPunch = !(newIn && newOut);
+            emp.hasMissPunch = !(emp.inTime && emp.finalOut);
+
+            // Recompute system prediction if hrFinalStatus not explicitly set
+            if (!emp.hrFinalStatus) {
+                if (!emp.inTime) {
+                    emp.systemPrediction = "AB";
+                } else if (!emp.finalOut) {
+                    emp.systemPrediction = "MP";
+                } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
+                    emp.systemPrediction = "HD";
+                } else if (lateMins > 0) {
+                    emp.systemPrediction = "P*";
+                } else if (earlyDepartureMins > 0) {
+                    emp.systemPrediction = "P~";
+                } else {
+                    emp.systemPrediction = "P";
+                }
+            }
+
+            // Update attendanceValue based on effective status
+            const effectiveStatus = emp.hrFinalStatus || emp.systemPrediction;
+            emp.attendanceValue = getAttendanceValue(effectiveStatus);
         }
 
         dayDoc.markModified("employees");
@@ -1701,6 +2411,172 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
         res.json({ success: true, message: "Override saved", data: dayDoc.employees[empIdx] });
     } catch (err) {
         console.error("[OVERRIDE]", err.message, err.stack);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PUNCH CORRECTION — add / remove / modify a single named punch
+// ═══════════════════════════════════════════════════════════════════════════
+//  This gives HR a surgical tool: pick exactly which punch (lunch_in, tea_out,
+//  etc.) is wrong and fix it without touching anything else.
+//
+//  Body: { dateStr, biometricId, punchType, action, punchTime, hrRemarks }
+//    punchType: "in" | "lunch_out" | "lunch_in" | "tea_out" | "tea_in" | "out"
+//    action:    "add" | "remove" | "modify"
+//    punchTime: "HH:MM"  (required for add / modify)
+// ═══════════════════════════════════════════════════════════════════════════
+
+router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const {
+            dateStr, biometricId, punchType, action, punchTime,
+            hrRemarks,
+        } = req.body;
+
+        if (!dateStr || !biometricId || !punchType || !action) {
+            return res.status(400).json({ success: false, message: "dateStr, biometricId, punchType and action are required" });
+        }
+
+        const VALID_PUNCH_TYPES = ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out"];
+        const VALID_ACTIONS = ["add", "remove", "modify"];
+
+        if (!VALID_PUNCH_TYPES.includes(punchType)) {
+            return res.status(400).json({ success: false, message: `punchType must be one of: ${VALID_PUNCH_TYPES.join(", ")}` });
+        }
+        if (!VALID_ACTIONS.includes(action)) {
+            return res.status(400).json({ success: false, message: `action must be one of: ${VALID_ACTIONS.join(", ")}` });
+        }
+        if ((action === "add" || action === "modify") && !punchTime) {
+            return res.status(400).json({ success: false, message: "punchTime (HH:MM) is required for add/modify" });
+        }
+
+        const bid = biometricId.toUpperCase();
+        const dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
+        if (!dayDoc) return res.status(404).json({ success: false, message: `No record for ${biometricId} on ${dateStr}` });
+
+        const empIdx = dayDoc.employees.findIndex((e) => e.biometricId === bid);
+        if (empIdx === -1) return res.status(404).json({ success: false, message: `Employee ${biometricId} not in day doc` });
+
+        const emp = dayDoc.employees[empIdx];
+        const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
+
+        // ── Parse time → Date ──────────────────────────────────────────────
+        const parseTimeOnDate = (timeStr) => {
+            if (!timeStr) return null;
+            const [h, m] = String(timeStr).split(":").map(Number);
+            const d = new Date(dateStr + "T00:00:00+05:30");
+            d.setHours(h || 0, m || 0, 0, 0);
+            return d;
+        };
+
+        // ── Map punchType → employee field name ────────────────────────────
+        const punchFieldMap = {
+            in: "inTime", lunch_out: "lunchOut", lunch_in: "lunchIn",
+            tea_out: "teaOut", tea_in: "teaIn", out: "finalOut",
+        };
+        const fieldName = punchFieldMap[punchType];
+        const oldTime = emp[fieldName] ? fmtTimeIST12(emp[fieldName]) : null;
+
+        if (action === "remove") {
+            emp[fieldName] = null;
+            // Remove from rawPunches
+            emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== punchType);
+        } else {
+            // add or modify
+            const newDate = parseTimeOnDate(punchTime);
+            emp[fieldName] = newDate;
+
+            // Upsert in rawPunches
+            const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === punchType);
+            const punchEntry = {
+                time: newDate,
+                punchType,
+                source: "manual",
+                addedBy: req.user?.name || req.user?.id || "HR",
+                addedAt: new Date(),
+            };
+            if (existingIdx >= 0) {
+                emp.rawPunches[existingIdx] = { ...emp.rawPunches[existingIdx], ...punchEntry };
+            } else {
+                emp.rawPunches = [...(emp.rawPunches || []), punchEntry];
+            }
+        }
+
+        emp.punchCount = (emp.rawPunches || []).length;
+
+        // Re-sort rawPunches by time and reassign seq
+        emp.rawPunches = (emp.rawPunches || [])
+            .filter(p => p.time)
+            .sort((a, b) => new Date(a.time) - new Date(b.time))
+            .map((p, i) => ({ ...p, seq: i + 1 }));
+
+        // ── Recompute all metrics ──────────────────────────────────────────
+        const settings = await AttendanceSettings.getConfig();
+        const shift = settings.shifts[emp.employeeType] || settings.shifts.executive;
+        const shiftStart = hhmmMins(shift.start);
+        const shiftEnd = hhmmMins(shift.end);
+        const inMins = minsOf(emp.inTime);
+        const outMins = minsOf(emp.finalOut);
+
+        const totalSpanMins = (emp.inTime && emp.finalOut) ? Math.round((emp.finalOut - emp.inTime) / 60000) : 0;
+        const lunchBreakMins = (emp.lunchOut && emp.lunchIn) ? Math.max(0, Math.round((emp.lunchIn - emp.lunchOut) / 60000)) : 0;
+        const teaBreakMins = (emp.teaOut && emp.teaIn) ? Math.max(0, Math.round((emp.teaIn - emp.teaOut) / 60000)) : 0;
+        const totalBreakMins = lunchBreakMins + teaBreakMins;
+        const netWorkMins = Math.max(0, totalSpanMins - totalBreakMins);
+
+        const effectiveGrace = (shift.lateGraceMins || 0) + (emp.appliedExtraGraceMins || 0);
+        const lateMins = (inMins != null) ? Math.max(0, inMins - (shiftStart + effectiveGrace)) : 0;
+        const earlyDepartureMins = (outMins != null) ? Math.max(0, shiftEnd - outMins) : 0;
+
+        let otMins = 0;
+        if (emp.employeeType === "operator" && outMins != null) {
+            const over = outMins - shiftEnd - (shift.otGraceMins || 0);
+            if (over > 0) otMins = over;
+        }
+
+        emp.totalSpanMins = totalSpanMins;
+        emp.lunchBreakMins = lunchBreakMins;
+        emp.teaBreakMins = teaBreakMins;
+        emp.totalBreakMins = totalBreakMins;
+        emp.netWorkMins = netWorkMins;
+        emp.lateMins = lateMins;
+        emp.lateDisplay = fmtLateMins(lateMins);
+        emp.isLate = lateMins > 0;
+        emp.earlyDepartureMins = earlyDepartureMins;
+        emp.isEarlyDeparture = earlyDepartureMins > 0;
+        emp.otMins = otMins;
+        emp.hasOT = otMins > 0;
+        emp.hasMissPunch = !(emp.inTime && emp.finalOut);
+
+        if (!emp.inTime) {
+            emp.systemPrediction = "AB";
+        } else if (!emp.finalOut) {
+            emp.systemPrediction = "MP";
+        } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
+            emp.systemPrediction = "HD";
+        } else if (lateMins > 0) {
+            emp.systemPrediction = "P*";
+        } else if (earlyDepartureMins > 0) {
+            emp.systemPrediction = "P~";
+        } else {
+            emp.systemPrediction = "P";
+        }
+
+        emp.attendanceValue = getAttendanceValue(emp.hrFinalStatus || emp.systemPrediction);
+        if (hrRemarks) { emp.hrRemarks = hrRemarks; }
+        emp.hrReviewedAt = new Date();
+
+        dayDoc.markModified("employees");
+        await dayDoc.save();
+
+        res.json({
+            success: true,
+            message: `Punch ${action} applied for ${punchType}`,
+            data: dayDoc.employees[empIdx],
+        });
+    } catch (err) {
+        console.error("[PUNCH-CORRECTION]", err.message, err.stack);
         res.status(500).json({ success: false, message: err.message });
     }
 });
@@ -3189,10 +4065,9 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
             return res.status(400).json({ success: false, message: "employeeId, dateStr and reason are required" });
         }
 
-        // Snapshot current state for audit
         let originalSnapshot = {
             inTime: null, finalOut: null, systemPrediction: null, hrFinalStatus: null,
-            netWorkMins: 0, lateMins: 0, otMins: 0, punchCount: 0,
+            netWorkMins: 0, lateMins: 0, otMins: 0, punchCount: 0, rawPunches: [],
         };
         const dayDoc = await DailyAttendance.findOne({ dateStr }).lean();
         if (dayDoc && biometricId) {
@@ -3207,6 +4082,7 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
                     lateMins: entry.lateMins || 0,
                     otMins: entry.otMins || 0,
                     punchCount: entry.punchCount || 0,
+                    rawPunches: entry.rawPunches || [],
                 };
             }
         }
@@ -3221,6 +4097,11 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
             proposedOutTime: proposedOutTime || null,
             proposedStatus: proposedStatus || null,
             proposedRemarks: proposedRemarks || null,
+            // Punch-specific fields
+            proposedPunchType: req.body.proposedPunchType || null,
+            proposedPunchTime: req.body.proposedPunchTime || null,
+            proposedPunchAction: req.body.proposedPunchAction || null,
+            proposedPunches: Array.isArray(req.body.proposedPunches) ? req.body.proposedPunches : [],
             documentUrl: documentUrl || null,
             documentFileId: documentFileId || null,
             documentFileName: documentFileName || null,
@@ -3279,6 +4160,8 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
         r.hrApprovedAt = new Date();
         r.hrRemarks = (req.body?.remarks) || "";
 
+        const punchChanges = [];
+
         // Apply to attendance
         const bid = r.biometricId;
         if (bid) {
@@ -3287,21 +4170,86 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                 const idx = (dayDoc.employees || []).findIndex(e => e.biometricId === bid);
                 if (idx !== -1) {
                     const emp = dayDoc.employees[idx];
+                    const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
 
-                    // Apply proposed times
+                    // ── Parse helper ────────────────────────────────────────
                     const parseTimeOnDate = (timeStr) => {
                         if (!timeStr) return null;
                         const [h, m] = String(timeStr).split(":").map(Number);
-                        const d = new Date(r.dateStr + "T00:00:00");
+                        const d = new Date(r.dateStr + "T00:00:00+05:30");
                         d.setHours(h || 0, m || 0, 0, 0);
                         return d;
                     };
 
-                    if (r.proposedInTime) emp.inTime = parseTimeOnDate(r.proposedInTime);
-                    if (r.proposedOutTime) emp.finalOut = parseTimeOnDate(r.proposedOutTime);
+                    const punchFieldMap = {
+                        in: "inTime", lunch_out: "lunchOut", lunch_in: "lunchIn",
+                        tea_out: "teaOut", tea_in: "teaIn", out: "finalOut",
+                    };
 
-                    // Recompute derived values if we updated times
-                    if (r.proposedInTime || r.proposedOutTime) {
+                    // ── 1. Apply whole-day proposed times (legacy / simple) ─
+                    if (r.proposedInTime) {
+                        const oldT = emp.inTime ? fmtTimeIST12(emp.inTime) : "—";
+                        emp.inTime = parseTimeOnDate(r.proposedInTime);
+                        punchChanges.push({ punchType: "in", action: "modify", oldTime: oldT, newTime: fmtTimeIST12(emp.inTime) });
+                    }
+                    if (r.proposedOutTime) {
+                        const oldT = emp.finalOut ? fmtTimeIST12(emp.finalOut) : "—";
+                        emp.finalOut = parseTimeOnDate(r.proposedOutTime);
+                        punchChanges.push({ punchType: "out", action: "modify", oldTime: oldT, newTime: fmtTimeIST12(emp.finalOut) });
+                    }
+
+                    // ── 2. Apply single punch-specific correction ───────────
+                    if (r.proposedPunchType && r.proposedPunchAction) {
+                        const fieldName = punchFieldMap[r.proposedPunchType];
+                        if (fieldName) {
+                            const oldT = emp[fieldName] ? fmtTimeIST12(emp[fieldName]) : "—";
+                            if (r.proposedPunchAction === "remove") {
+                                emp[fieldName] = null;
+                                emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== r.proposedPunchType);
+                                punchChanges.push({ punchType: r.proposedPunchType, action: "remove", oldTime: oldT, newTime: "removed" });
+                            } else if (r.proposedPunchTime) {
+                                const newDate = parseTimeOnDate(r.proposedPunchTime);
+                                emp[fieldName] = newDate;
+                                // Upsert rawPunch
+                                const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === r.proposedPunchType);
+                                const entry = { time: newDate, punchType: r.proposedPunchType, source: "miss_punch", addedBy: req.user?.id, addedAt: new Date() };
+                                if (existingIdx >= 0) emp.rawPunches[existingIdx] = { ...emp.rawPunches[existingIdx], ...entry };
+                                else emp.rawPunches = [...(emp.rawPunches || []), entry];
+                                punchChanges.push({ punchType: r.proposedPunchType, action: r.proposedPunchAction, oldTime: oldT, newTime: fmtTimeIST12(newDate) });
+                            }
+                        }
+                    }
+
+                    // ── 3. Apply multi-punch correction list ────────────────
+                    for (const pc of (r.proposedPunches || [])) {
+                        const fieldName = punchFieldMap[pc.punchType];
+                        if (!fieldName) continue;
+                        const oldT = emp[fieldName] ? fmtTimeIST12(emp[fieldName]) : "—";
+
+                        if (pc.action === "remove") {
+                            emp[fieldName] = null;
+                            emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== pc.punchType);
+                            punchChanges.push({ punchType: pc.punchType, action: "remove", oldTime: oldT, newTime: "removed" });
+                        } else if (pc.punchTime) {
+                            const newDate = parseTimeOnDate(pc.punchTime);
+                            emp[fieldName] = newDate;
+                            const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === pc.punchType);
+                            const entry = { time: newDate, punchType: pc.punchType, source: "miss_punch", addedBy: req.user?.id, addedAt: new Date() };
+                            if (existingIdx >= 0) emp.rawPunches[existingIdx] = { ...emp.rawPunches[existingIdx], ...entry };
+                            else emp.rawPunches = [...(emp.rawPunches || []), entry];
+                            punchChanges.push({ punchType: pc.punchType, action: pc.action, oldTime: oldT, newTime: fmtTimeIST12(newDate) });
+                        }
+                    }
+
+                    // ── 4. Re-sort rawPunches ───────────────────────────────
+                    emp.rawPunches = (emp.rawPunches || [])
+                        .filter(p => p.time)
+                        .sort((a, b) => new Date(a.time) - new Date(b.time))
+                        .map((p, i) => ({ ...p, seq: i + 1 }));
+                    emp.punchCount = emp.rawPunches.length;
+
+                    // ── 5. Recompute metrics ────────────────────────────────
+                    if (r.proposedInTime || r.proposedOutTime || r.proposedPunchType || (r.proposedPunches || []).length > 0) {
                         const settings = await AttendanceSettings.getConfig();
                         const shift = settings.shifts[emp.employeeType] || settings.shifts.executive;
                         const shiftStart = hhmmMins(shift.start);
@@ -3326,20 +4274,39 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                         }
 
                         emp.totalSpanMins = totalSpanMins;
+                        emp.lunchBreakMins = lunchBreakMins;
+                        emp.teaBreakMins = teaBreakMins;
                         emp.totalBreakMins = totalBreakMins;
                         emp.netWorkMins = netWorkMins;
                         emp.lateMins = lateMins;
+                        emp.lateDisplay = fmtLateMins(lateMins);
                         emp.isLate = lateMins > 0;
                         emp.earlyDepartureMins = earlyDepartureMins;
                         emp.isEarlyDeparture = earlyDepartureMins > 0;
                         emp.otMins = otMins;
                         emp.hasOT = otMins > 0;
                         emp.hasMissPunch = !(emp.inTime && emp.finalOut);
+
+                        if (!emp.inTime) {
+                            emp.systemPrediction = "AB";
+                        } else if (!emp.finalOut) {
+                            emp.systemPrediction = "MP";
+                        } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
+                            emp.systemPrediction = "HD";
+                        } else if (lateMins > 0) {
+                            emp.systemPrediction = "P*";
+                        } else if (earlyDepartureMins > 0) {
+                            emp.systemPrediction = "P~";
+                        } else {
+                            emp.systemPrediction = "P";
+                        }
                     }
 
+                    // ── 6. Apply proposed status if any ────────────────────
                     if (r.proposedStatus) emp.hrFinalStatus = r.proposedStatus;
-                    emp.hrRemarks = r.proposedRemarks || `Regularized (${r.requestType})`;
+                    emp.hrRemarks = r.hrRemarks || `Regularized (${r.requestType})`;
                     emp.hrReviewedAt = new Date();
+                    emp.attendanceValue = getAttendanceValue(emp.hrFinalStatus || emp.systemPrediction);
 
                     dayDoc.markModified("employees");
                     await dayDoc.save();

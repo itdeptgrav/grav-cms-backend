@@ -498,7 +498,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid month" });
         }
 
-        const { settings, salaryCfg, holidayMap, attendanceByEmp } = await loadMonthContext(month, year);
+        const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } = await loadMonthContext(month, year);
 
         const employees = await Employee.find({
             $or: [{ status: "active" }, { isActive: true }],
@@ -515,7 +515,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
         const items = employees.map((emp) => {
             const bid = (emp.biometricId || "").toUpperCase();
             const ctx = {
-                month, year, settings, salaryCfg, holidayMap,
+                month, year, settings, salaryCfg, holidayMap, leaveConfig,
                 attendanceByDate: attendanceByEmp.get(bid) || new Map(),
                 leaveBalance: balanceByEmpId.get(String(emp._id)) || null,
             };
@@ -590,7 +590,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             });
         }
 
-        const { settings, salaryCfg, holidayMap, attendanceByEmp } = await loadMonthContext(month, year);
+        const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } = await loadMonthContext(month, year);
 
         const employees = await Employee.find({
             $or: [{ status: "active" }, { isActive: true }],
@@ -625,13 +625,15 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             const bid = (emp.biometricId || "").toUpperCase();
             const balance = balanceByEmpId.get(String(emp._id)) || null;
             const ctx = {
-                month, year, settings, salaryCfg, holidayMap,
+                month, year, settings, salaryCfg, holidayMap, leaveConfig,
                 attendanceByDate: attendanceByEmp.get(bid) || new Map(),
                 leaveBalance: balance,
             };
             const computed = computeEmployeePayroll(emp, ctx);
 
             // Upsert PayrollItem  (unique on employeeId + month + year)
+            // Persist ALL computed fields so the saved payroll list, drawer, payslip,
+            // and Excel export all read directly from the DB without recomputing.
             await PayrollItem.findOneAndUpdate(
                 { employeeId: emp._id, month, year },
                 {
@@ -645,23 +647,63 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     payrollId: payrollRun._id,
                     month, year,
                     payPeriod: computed.payPeriod,
+
+                    // Rate snapshot
+                    rateBasic: computed.rateBasic,
+                    rateHra: computed.rateHra,
+                    rateGross: computed.rateGross,
+
+                    // Attendance counts
                     workingDays: computed.workingDays,
+                    daysInMonth: computed.daysInMonth,
                     presentDays: computed.presentDays,
                     absentDays: computed.absentDays,
+                    halfDays: computed.halfDays,
+                    missPunchDays: computed.missPunchDays,
                     lopDays: computed.lopDays,
                     paidLeaveDays: computed.paidLeaveDays,
+                    weekOffDays: computed.weekOffDays,
+                    holidayDays: computed.holidayDays,
+                    holidayWorkedDays: computed.holidayWorkedDays,
+                    sundayWorkedDays: computed.sundayWorkedDays,
+                    lwpDays: computed.lwpDays,
+                    clUsedDays: computed.clUsedDays,
+                    slUsedDays: computed.slUsedDays,
+                    plUsedDays: computed.plUsedDays,
+
+                    // Payable days + per-day rate
+                    payableDays: computed.payableDays,
+                    effectivePayableDays: computed.effectivePayableDays,
+                    perDayRate: computed.perDayRate,
+                    divisorBasis: computed.divisorBasis,
+                    sundayExtraPayDays: computed.sundayExtraPayDays,
+
+                    // Engine adjustments
+                    autoAdjustedCL: computed.autoAdjustedCL,
+                    sundayOffsetApplied: computed.sundayOffsetApplied,
+                    unsyncedDays: computed.unsyncedDays,
+
+                    // Leave balance snapshot
+                    leaveBalanceSnapshot: computed.leaveBalanceSnapshot,
+
+                    // Earnings & Deductions
                     earnings: computed.earnings,
                     deductions: computed.deductions,
                     netPay: computed.netPay,
                     roundedNetPay: computed.roundedNetPay,
                     bankDetails: computed.bankDetails,
+
+                    // Day breakdown (per-day audit trail)
+                    dayBreakdown: computed.dayBreakdown,
+
                     status: "processed",
                     processedBy: user.id,
                     processedAt: new Date(),
-                    // Store audit-extras in remarks-ish area (keeping existing schema)
                     remarks: computed.autoAdjustedCL > 0
                         ? `Auto-adjusted ${computed.autoAdjustedCL} day(s) from AB to CL`
-                        : null,
+                        : (computed.sundayOffsetApplied > 0
+                            ? `${computed.sundayOffsetApplied} AB offset by Sunday worked`
+                            : null),
                 },
                 { upsert: true, new: true, setDefaultsOnInsert: true }
             );
@@ -1058,7 +1100,7 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
             if (changes.length > 0) {
                 // Lazy require so a missing service file doesn't crash route loading
                 let EmailService;
-                try { EmailService = require("../../services/emailService"); }
+                try { EmailService = require("../../service/emailService"); }
                 catch (e) {
                     console.warn("[PAYROLL-SETTINGS] emailService not found, skipping CEO notification");
                 }
@@ -1175,35 +1217,45 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
             pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
         });
 
-        // Title
-        ws.mergeCells(1, 1, 1, 20);
+        // Title row — merged across all 22 columns
+        ws.mergeCells(1, 1, 1, 22);
         const title = ws.getCell(1, 1);
         title.value = `GRAV CLOTHING — SALARY REGISTER for ${MONTH_NAMES[month]} ${year}`;
         title.font = { size: 14, bold: true, color: { argb: "FFFFFFFF" } };
         title.alignment = { vertical: "middle", horizontal: "center" };
         title.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
-        ws.getRow(1).height = 28;
+        ws.getRow(1).height = 30;
 
-        // Header row 1 (grouped: Rate of wages payable / Wages actually paid / others)
+        // Header row 1 (grouped columns)
+        // Col layout: 1=Sl, 2=Name, 3=Designation, 4-6=Rate(Basic/HRA/Total),
+        //   7=DaysInMonth, 8=Attendance, 9-10=WagesPaid(Basic/HRA), 11=OT,
+        //   12=Gross, 13=EE PF, 14=ESI(EE), 15=ER PF, 16=ESI(ER),
+        //   17=Advance, 18=Other, 19=TotalDed, 20=Net, 21=DatePayment, 22=Bank
         const h1 = [
-            "Sl. No", "Name of the Employee", "Designation",
-            "Rate of wages payable", null, null,  // span Basic / HRA / Total
-            "Total No. of Days of the Month",
-            "Total attendance units of work done",
-            "Wages actually paid", null,           // span Basic / HRA
-            "Overtime worked", "Gross Wages Payable",
-            "Employee's contribution to P.F", "E.S.I", "Salary Advance", "Other Deduct.",
-            "Total Dedc.", "Net Wages Paid",
-            "Date of Payment",
-            "Payment made by Bank Transfer / Signature or thumb impression of the Emp.",
+            "Sl.\nNo", "Name of the Employee", "Designation",
+            "Rate of wages payable", null, null,
+            "Total No. of\nDays of Month",
+            "Total attendance\nunits of work done",
+            "Wages actually paid", null,
+            "Overtime\nworked",
+            "Gross Wages\nPayable",
+            "Employee's\nPF",
+            "ESI\n(Employee)",
+            "Employer\nPF",
+            "ESI\n(Employer)",
+            "Salary\nAdvance",
+            "Other\nDeduct.",
+            "Total\nDedc.",
+            "Net Wages\nPaid",
+            "Date of\nPayment",
+            "Bank Transfer /\nSignature",
         ];
-        // Header row 2 (sub-labels for the grouped columns)
         const h2 = [
             "", "", "",
             "Basic", "HRA", "Total Salary",
             "", "",
             "Basic", "HRA",
-            "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", "", "", "",
         ];
 
         const r2 = ws.getRow(2);
@@ -1211,14 +1263,16 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         h1.forEach((v, i) => { if (v !== null) r2.getCell(i + 1).value = v; });
         h2.forEach((v, i) => { r3.getCell(i + 1).value = v; });
 
-        // Merge grouped header cells vertically (cols 1,2,3,7,8,11..20) and horizontally (4-6, 9-10)
-        [1, 2, 3, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20].forEach((c) => ws.mergeCells(2, c, 3, c));
-        ws.mergeCells(2, 4, 2, 6);   // Rate of wages payable
-        ws.mergeCells(2, 9, 2, 10);  // Wages actually paid
+        // Merge grouped header cells
+        // Vertical merges (cols that span both header rows)
+        [1, 2, 3, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22].forEach((c) => ws.mergeCells(2, c, 3, c));
+        // Horizontal merges
+        ws.mergeCells(2, 4, 2, 6);   // Rate of wages payable (3 cols)
+        ws.mergeCells(2, 9, 2, 10);  // Wages actually paid (2 cols)
 
         [r2, r3].forEach((r) => {
             r.eachCell((cell) => {
-                cell.font = { size: 10, bold: true, color: { argb: "FFFFFFFF" } };
+                cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
                 cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
                 cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
                 cell.border = {
@@ -1229,51 +1283,55 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
                 };
             });
         });
-        r2.height = 24; r3.height = 20;
+        r2.height = 36; r3.height = 22;
 
-        // Column widths — roughly matches the Excel user uploaded
-        const widths = [6, 28, 18, 8, 8, 10, 8, 10, 8, 8, 8, 12, 10, 8, 10, 10, 10, 12, 12, 20];
+        // Column widths — relaxed so nothing overlaps
+        //         Sl  Name  Desig  Basic HRA  Total DIM  Att   WBasic WHra  OT   Gross  EEPF  EESI  ERPF  ERESI Adv   Oth   TDed  Net   Date  Bank
+        const widths = [5, 26, 16, 10, 10, 12, 8, 10, 10, 10, 9, 13, 10, 10, 10, 10, 10, 10, 11, 13, 12, 18];
         widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
-        // Data rows
+        // Data rows — 22 columns
         items.forEach((it, idx) => {
             const row = ws.getRow(4 + idx);
             const emp = empById.get(String(it.employeeId)) || {};
-            const fullBasic = emp.salary?.basic || 0;
-            const fullHra = emp.salary?.hra || 0;
-            const fullGross = emp.salary?.gross || 0;
+            // Prefer rate snapshot from payroll item; fall back to employee salary
+            const rateBasic = it.rateBasic || emp.salary?.basic || 0;
+            const rateHra = it.rateHra || emp.salary?.hra || 0;
+            const rateGross = it.rateGross || emp.salary?.gross || 0;
             const e = it.earnings || {};
             const d = it.deductions || {};
 
-            row.getCell(1).value = idx + 1;
-            row.getCell(2).value = it.employeeName || "";
-            row.getCell(3).value = it.designation || emp.designation || emp.jobTitle || "";
-            row.getCell(4).value = fullBasic;
-            row.getCell(5).value = fullHra;
-            row.getCell(6).value = fullGross;
-            row.getCell(7).value = new Date(year, month, 0).getDate();       // days in month
-            row.getCell(8).value = Math.round((it.presentDays || 0) + (it.paidLeaveDays || 0)); // attendance units
-            row.getCell(9).value = e.basicSalary || 0;
-            row.getCell(10).value = e.houseRentAllowance || 0;
-            row.getCell(11).value = e.overtime || 0;
-            row.getCell(12).value = e.grossEarnings || 0;
-            row.getCell(13).value = d.providentFund || 0;
-            row.getCell(14).value = d.esic || 0;
-            row.getCell(15).value = d.advanceDeduction || 0;
-            row.getCell(16).value = d.otherDeductions || 0;
-            row.getCell(17).value = d.totalDeductions || 0;
-            row.getCell(18).value = it.roundedNetPay ?? it.netPay ?? 0;
-            row.getCell(19).value = it.paymentDate ? new Date(it.paymentDate).toLocaleDateString("en-IN") : "";
-            row.getCell(20).value = emp.bankDetails?.accountNumber ? `A/C: ${emp.bankDetails.accountNumber}` : "";
+            row.getCell(1).value = idx + 1;                                           // Sl
+            row.getCell(2).value = it.employeeName || "";                             // Name
+            row.getCell(3).value = it.designation || emp.designation || emp.jobTitle || "";  // Designation
+            row.getCell(4).value = rateBasic;                                         // Rate Basic
+            row.getCell(5).value = rateHra;                                           // Rate HRA
+            row.getCell(6).value = rateGross;                                         // Rate Total
+            row.getCell(7).value = new Date(year, month, 0).getDate();               // Days in month
+            row.getCell(8).value = it.payableDays || Math.round((it.presentDays || 0) + (it.paidLeaveDays || 0)); // Attendance
+            row.getCell(9).value = e.basicSalary || 0;                               // Wages Basic
+            row.getCell(10).value = e.houseRentAllowance || 0;                       // Wages HRA
+            row.getCell(11).value = e.overtime || 0;                                  // OT
+            row.getCell(12).value = e.grossEarnings || 0;                            // Gross
+            row.getCell(13).value = d.providentFund || 0;                            // Employee PF
+            row.getCell(14).value = d.esic || 0;                                      // ESI (EE)
+            row.getCell(15).value = d.employerPF || d.providentFund || 0;            // Employer PF
+            row.getCell(16).value = d.employerESIC || 0;                              // ESI (ER)
+            row.getCell(17).value = d.advanceDeduction || 0;                          // Advance
+            row.getCell(18).value = d.otherDeductions || 0;                           // Other
+            row.getCell(19).value = d.totalDeductions || 0;                           // Total Ded
+            row.getCell(20).value = it.roundedNetPay ?? it.netPay ?? 0;              // Net
+            row.getCell(21).value = it.paymentDate ? new Date(it.paymentDate).toLocaleDateString("en-IN") : "";
+            row.getCell(22).value = emp.bankDetails?.accountNumber ? `A/C: ${emp.bankDetails.accountNumber}` : "";
 
             row.eachCell((cell, col) => {
-                cell.font = { size: 10 };
+                cell.font = { size: 9 };
                 cell.alignment = {
                     vertical: "middle",
                     horizontal: col <= 3 ? "left" : "right",
                     indent: col <= 3 ? 1 : 0,
                 };
-                if (col >= 4 && col !== 19 && col !== 20) cell.numFmt = "#,##0";
+                if (col >= 4 && col !== 21 && col !== 22) cell.numFmt = "#,##0";
                 cell.border = {
                     top: { style: "thin", color: { argb: "FFD1D5DB" } },
                     bottom: { style: "thin", color: { argb: "FFD1D5DB" } },
@@ -1288,7 +1346,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         const tr = ws.getRow(4 + items.length);
         tr.getCell(1).value = "";
         tr.getCell(2).value = "TOTAL";
-        const sum = (key) => items.reduce((a, i) => a + (i[key] || 0), 0);
         const sumE = (k) => items.reduce((a, i) => a + (i.earnings?.[k] || 0), 0);
         const sumD = (k) => items.reduce((a, i) => a + (i.deductions?.[k] || 0), 0);
         tr.getCell(9).value = sumE("basicSalary");
@@ -1297,13 +1354,15 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         tr.getCell(12).value = sumE("grossEarnings");
         tr.getCell(13).value = sumD("providentFund");
         tr.getCell(14).value = sumD("esic");
-        tr.getCell(15).value = sumD("advanceDeduction");
-        tr.getCell(16).value = sumD("otherDeductions");
-        tr.getCell(17).value = sumD("totalDeductions");
-        tr.getCell(18).value = items.reduce((a, i) => a + (i.roundedNetPay ?? i.netPay ?? 0), 0);
+        tr.getCell(15).value = sumD("employerPF") || sumD("providentFund");
+        tr.getCell(16).value = sumD("employerESIC");
+        tr.getCell(17).value = sumD("advanceDeduction");
+        tr.getCell(18).value = sumD("otherDeductions");
+        tr.getCell(19).value = sumD("totalDeductions");
+        tr.getCell(20).value = items.reduce((a, i) => a + (i.roundedNetPay ?? i.netPay ?? 0), 0);
 
         tr.eachCell((cell, col) => {
-            cell.font = { size: 10, bold: true };
+            cell.font = { size: 9, bold: true };
             cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFEF3C7" } };
             cell.alignment = { vertical: "middle", horizontal: col <= 3 ? "left" : "right", indent: col <= 3 ? 1 : 0 };
             if (col >= 4) cell.numFmt = "#,##0";
