@@ -2,26 +2,27 @@
 
 const mongoose = require("mongoose");
 
+const conversionSchema = new mongoose.Schema({
+  toUnit: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Unit",
+    required: true
+  },
+  quantity: {
+    type: Number,
+    required: true,
+    min: 0.001
+  }
+});
+
 const unitSchema = new mongoose.Schema({
   name: {
     type: String,
     required: true,
-    trim: true
+    trim: true,
+    unique: true
   },
-  gstUqc: {
-    type: String,
-    uppercase: true,
-    trim: true
-  },
-  quantity: {
-    type: Number,
-    min: 0
-  },
-  baseUnit: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "Unit",
-    default: null
-  },
+  conversions: [conversionSchema],
   status: {
     type: String,
     enum: ["Active", "Inactive"],
@@ -29,13 +30,12 @@ const unitSchema = new mongoose.Schema({
   },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: "ProjectManager",
+    ref: "ProjectManager"
   },
   updatedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "ProjectManager"
   }
 }, { timestamps: true });
-
 
 module.exports = mongoose.model("Unit", unitSchema);

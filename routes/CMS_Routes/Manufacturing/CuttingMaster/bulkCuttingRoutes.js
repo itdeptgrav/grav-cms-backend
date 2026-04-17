@@ -32,7 +32,7 @@ router.get("/work-orders/:woId/bulk-cutting", async (req, res) => {
       const stockItem = await StockItem.findById(workOrder.stockItemId)
         .select('numberOfPanels')
         .lean();
-
+      
       panelCount = stockItem?.numberOfPanels || 1;
     }
 
@@ -72,7 +72,7 @@ router.post("/work-orders/:woId/update-cutting", async (req, res) => {
     const { quantityCut, action = "add" } = req.body;
 
     const workOrder = await WorkOrder.findById(woId);
-
+    
     if (!workOrder) {
       return res.status(404).json({
         success: false,
@@ -166,7 +166,7 @@ router.post("/work-orders/:woId/generate-bulk-barcodes", async (req, res) => {
     const panelCount = workOrder.stockItemId?.numberOfPanels || 1;
     const completed = workOrder.cuttingProgress?.completed || 0;
     const startFromUnit = completed + 1;
-
+    
     console.log(`Panel count: ${panelCount}, Start unit: ${startFromUnit}`);
 
     // Validate quantity
@@ -187,7 +187,7 @@ router.post("/work-orders/:woId/generate-bulk-barcodes", async (req, res) => {
     // Generate barcodes - FIXED LOGIC
     const barcodes = [];
     let woNumber = workOrder.workOrderNumber || "";
-
+    
     // Ensure WO number has prefix
     if (!woNumber.startsWith('WO-')) {
       woNumber = `WO-${woNumber}`;
@@ -196,10 +196,10 @@ router.post("/work-orders/:woId/generate-bulk-barcodes", async (req, res) => {
     // Generate for each unit and each panel
     for (let i = 0; i < quantityToGenerate; i++) {
       const unitNumber = startFromUnit + i;
-
+      
       for (let panel = 1; panel <= panelCount; panel++) {
         const barcodeId = `${woNumber}-${unitNumber.toString().padStart(3, '0')}`;
-
+        
         barcodes.push({
           id: barcodeId,
           baseId: barcodeId,
