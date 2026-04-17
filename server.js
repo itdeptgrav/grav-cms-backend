@@ -5,7 +5,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
-
+ 
 const http = require("http");
 const { Server } = require("socket.io");
 const activeMeetingRecordings = new Map();
@@ -19,6 +19,7 @@ const allowedOrigins = [
   "http://localhost:3001",
   "https://grav-cms.vercel.app",
   "https://cms.grav.in",
+  "https://cowork.grav.in",
   "https://customer.grav.in",
   "http://192.168.1.30:3000",
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
@@ -638,13 +639,17 @@ app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
 const employeeLeaveRoutes = require("./routes/Employee_Routes/leaveRoutes");
 app.use("/api/employee/leave-applications", employeeLeaveRoutes);
 
-
 const passwordMgmt = require("./routes/HrRoutes/Passwordmanagement.js");
 app.use("/api/hr/password-management", passwordMgmt);
 
 const employeeImportRoutes = require("./routes/HrRoutes/employeeImportExport.js");
 app.use("/api/employees/import-export", employeeImportRoutes);
 
+const payRollRouter = require("./routes/HrRoutes/Payroll_section");
+app.use("/api/hr/payroll", payRollRouter);
+
+const payslipRouter = require("./routes/HrRoutes/Payslip_section");
+app.use("/api/hr/payslip", payslipRouter);
 
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");

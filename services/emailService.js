@@ -2,10 +2,15 @@
 
 const axios = require('axios');
 
+// ─── Notification recipients (hard-coded as strings, not env vars) ────────────
+// Change these if the CEO's email address changes.
+const CEO_NOTIFICATION_EMAIL = "ray@grav.in";     // ← change to real CEO address
+const CEO_NOTIFICATION_NAME = "Grav CEO";
+
 class EmailService {
     constructor() {
         this.apiKey = process.env.BREVO_API_KEY;
-        this.senderEmail = "biswalpramod3.1415@gmail.com";
+        this.senderEmail = process.env.CUSTOMER_SENDER_EMAIL || "noreply@grav.in";
         this.senderName = "Grav HR";
         this.baseUrl = "https://api.brevo.com/v3";
     }
@@ -286,6 +291,164 @@ If you need assistance, please contact the HR department.
     async sendPasswordResetEmail(employeeData, resetToken) {
         // You can add other email templates here as needed
         // For future implementation
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  PAYROLL SETTINGS CHANGE NOTIFICATION → CEO
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Notify the CEO when HR changes payroll settings.
+     * @param {Object} opts
+     * @param {string} opts.changedBy — name/email of the HR user who made the change
+     * @param {Array<{ label: string, before: any, after: any }>} opts.changes
+     * @returns {Promise<{ success: boolean, messageId?: string, skipped?: boolean, error?: string }>}
+     */
+    async sendPayrollSettingsChangeEmail({ changedBy, changes }) {
+        try {
+            if (!changes || changes.length === 0) {
+                return { success: true, skipped: true, reason: "no-changes" };
+            }
+
+            const htmlContent = this.generatePayrollSettingsChangeTemplate(changedBy, changes);
+            const textContent = this.generatePayrollSettingsChangeText(changedBy, changes);
+
+            const emailPayload = {
+                sender: { name: this.senderName, email: this.senderEmail },
+                to: [{ email: CEO_NOTIFICATION_EMAIL, name: CEO_NOTIFICATION_NAME }],
+                subject: `Payroll Settings Updated — ${changes.length} change${changes.length === 1 ? "" : "s"}`,
+                htmlContent,
+                textContent,
+                headers: { 'X-Mailin-custom': 'payroll_settings_change' }
+            };
+
+            const response = await axios.post(
+                `${this.baseUrl}/smtp/email`,
+                emailPayload,
+                {
+                    headers: {
+                        'api-key': this.apiKey,
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    }
+                }
+            );
+
+            console.log(`[EMAIL] Payroll settings change sent to ${CEO_NOTIFICATION_EMAIL}:`, response.data);
+            return { success: true, messageId: response.data.messageId };
+
+        } catch (error) {
+            // Don't throw — just log. A failed CEO email must never break HR's save.
+            console.error('[EMAIL] Failed to send payroll settings change email:',
+                error.response?.data || error.message);
+            return { success: false, error: error.response?.data?.message || error.message };
+        }
+    }
+
+    /**
+     * HTML template for the CEO notification.
+     */
+    generatePayrollSettingsChangeTemplate(changedBy, changes) {
+        const rows = changes.map((c) => `
+            <tr>
+                <td style="padding:10px 12px;border-bottom:1px solid #edf2f7;font-weight:600;color:#2d3748;">
+                    ${c.label}
+                </td>
+                <td style="padding:10px 12px;border-bottom:1px solid #edf2f7;color:#c53030;text-decoration:line-through;">
+                    ${c.before}
+                </td>
+                <td style="padding:10px 12px;border-bottom:1px solid #edf2f7;color:#22543d;font-weight:600;">
+                    ${c.after}
+                </td>
+            </tr>
+        `).join('');
+
+        const when = new Date().toLocaleString('en-IN', {
+            dateStyle: 'full', timeStyle: 'short', timeZone: 'Asia/Kolkata'
+        });
+
+        return `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payroll Settings Updated</title>
+</head>
+<body style="font-family:Arial,sans-serif;line-height:1.6;color:#333;max-width:680px;margin:0 auto;padding:20px;background-color:#f4f4f4;">
+    <div style="background-color:#ffffff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);overflow:hidden;">
+        <div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:25px 20px;text-align:center;">
+            <h1 style="margin:0;font-size:22px;">Payroll Settings Updated</h1>
+            <p style="margin:4px 0 0;font-size:13px;opacity:.9;">HR has modified the payroll configuration</p>
+        </div>
+
+        <div style="padding:28px 30px;">
+            <p style="font-size:14px;color:#4a5568;margin:0 0 20px;">
+                This is an automated notification that the payroll settings for
+                <strong>Grav Clothing</strong> have been updated.
+            </p>
+
+            <div style="background-color:#f7fafc;border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:16px 0;font-size:13px;">
+                <div style="margin-bottom:6px;"><strong>Updated by:</strong> ${changedBy || 'HR'}</div>
+                <div><strong>When:</strong> ${when} IST</div>
+            </div>
+
+            <h3 style="margin:24px 0 10px;font-size:15px;color:#2d3748;border-bottom:2px solid #667eea;padding-bottom:6px;">
+                Changes (${changes.length})
+            </h3>
+
+            <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:10px;">
+                <thead>
+                    <tr style="background-color:#edf2f7;">
+                        <th style="padding:10px 12px;text-align:left;color:#4a5568;font-weight:600;border-bottom:2px solid #cbd5e0;">Setting</th>
+                        <th style="padding:10px 12px;text-align:left;color:#4a5568;font-weight:600;border-bottom:2px solid #cbd5e0;">Before</th>
+                        <th style="padding:10px 12px;text-align:left;color:#4a5568;font-weight:600;border-bottom:2px solid #cbd5e0;">After</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+
+            <div style="background-color:#fffaf0;border:1px solid #fbd38d;border-radius:4px;padding:12px;margin:24px 0;font-size:13px;color:#744210;">
+                <strong>Note:</strong> These changes apply to the next payroll run.
+                Payroll items already marked as "paid" are not affected.
+            </div>
+
+            <div style="margin-top:30px;padding-top:20px;border-top:1px solid #e2e8f0;font-size:12px;color:#718096;text-align:center;">
+                <p style="margin:4px 0;">This is an automated email. Please do not reply.</p>
+                <p style="margin:4px 0;">© ${new Date().getFullYear()} Grav Clothing. All rights reserved.</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>`;
+    }
+
+    /**
+     * Plain-text version for email clients that don't render HTML.
+     */
+    generatePayrollSettingsChangeText(changedBy, changes) {
+        const when = new Date().toLocaleString('en-IN', {
+            dateStyle: 'full', timeStyle: 'short', timeZone: 'Asia/Kolkata'
+        });
+        const lines = changes.map((c) => `  • ${c.label}: ${c.before} → ${c.after}`).join('\n');
+        return `
+PAYROLL SETTINGS UPDATED
+
+The payroll settings for Grav Clothing have been updated.
+
+Updated by: ${changedBy || 'HR'}
+When:       ${when} IST
+
+Changes (${changes.length}):
+${lines}
+
+Note: These changes apply to the next payroll run. Payroll items
+already marked as "paid" are not affected.
+
+---
+This is an automated email. Please do not reply.
+© ${new Date().getFullYear()} Grav Clothing. All rights reserved.
+`;
     }
 }
 
