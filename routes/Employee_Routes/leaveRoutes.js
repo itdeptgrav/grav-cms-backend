@@ -449,6 +449,47 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
             status: "pending",
         });
 
+        // ── Notify HR via email (non-fatal) ──
+        try {
+            const emailService = require("../../services/emailService");
+            if (emailService.sendLeaveAppliedToHR) {
+                emailService.sendLeaveAppliedToHR({
+                    employeeName: app.employeeName,
+                    department: app.department,
+                    designation: app.designation,
+                    leaveType: app.leaveType,
+                    fromDate: app.fromDate,
+                    toDate: app.toDate,
+                    totalDays: app.totalDays,
+                    reason: app.reason,
+                    isHalfDay: app.isHalfDay,
+                    requiresDocument: app.requiresDocument,
+                    applicationId: app._id.toString(),
+                }).catch(e => console.warn("[LEAVE-APPLY-EMAIL]", e.message));
+            }
+        } catch (_) { }
+
+        // ── Real-time notification to primary manager (socket.io) ──
+        try {
+            const io = req.app.get("io");
+            if (io && managersNotified.length > 0) {
+                const primaryMgr = managersNotified.find(m => m.type === "primary");
+                if (primaryMgr?.managerId) {
+                    io.to(String(primaryMgr.managerId)).emit("leave_notification", {
+                        type: "leave_applied",
+                        leaveId: app._id.toString(),
+                        employeeName: app.employeeName,
+                        leaveType: app.leaveType,
+                        fromDate: app.fromDate,
+                        toDate: app.toDate,
+                        totalDays: app.totalDays,
+                        message: `${app.employeeName} has applied for ${app.leaveType} leave (${app.fromDate} – ${app.toDate})`,
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            }
+        } catch (_) { }
+
         const responseMsg = requiresDocument
             ? `Leave application submitted. Note: You need to submit supporting documents for ${totalDays} days of Sick Leave.`
             : "Leave application submitted successfully";
@@ -602,11 +643,19 @@ router.post("/:id/upload-document", AllEmployeeAppMiddleware, (req, res, next) =
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /api/employee/leave-applications/manager/pending
+// Shows apps where:
+//   - I am a primary manager AND status = pending  (needs my first approval)
+//   - I am a secondary manager AND status = manager_approved (primary already approved, now needs me)
 router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
     try {
+        const myId = req.user.id;
         const apps = await LeaveApplication.find({
-            "managersNotified.managerId": req.user.id,
-            status: "pending",
+            $or: [
+                // Primary: I need to act first
+                { "managersNotified": { $elemMatch: { managerId: myId, type: "primary" } }, status: "pending" },
+                // Secondary / HR: primary already approved, waiting for me
+                { "managersNotified": { $elemMatch: { managerId: myId, type: "secondary" } }, status: "manager_approved" },
+            ],
         }).sort({ createdAt: -1 }).lean();
 
         res.json({ success: true, data: apps });
@@ -616,33 +665,130 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
 });
 
 // PATCH /api/employee/leave-applications/manager/:id/approve
+// Workflow:
+//   Primary approves → status becomes manager_approved (waits for secondary if exists)
+//   Secondary approves → status becomes hr_approved + balance consumed + attendance synced
 router.patch("/manager/:id/approve", AllEmployeeAppMiddleware, async (req, res) => {
     try {
         const { remarks } = req.body;
+        const myId = req.user.id;
+
         const app = await LeaveApplication.findOne({
             _id: req.params.id,
-            "managersNotified.managerId": req.user.id,
+            "managersNotified.managerId": myId,
         });
         if (!app) return res.status(404).json({ success: false, message: "Not found or not your application" });
 
-        // Record this manager's decision
-        const existing = app.managerDecisions.find(d => String(d.managerId) === req.user.id);
-        if (!existing) {
-            const mgr = app.managersNotified.find(m => String(m.managerId) === req.user.id);
+        const mgr = app.managersNotified.find(m => String(m.managerId) === String(myId));
+        const mgrType = mgr?.type || "primary";
+
+        // Guard: primary can only approve when status=pending
+        if (mgrType === "primary" && app.status !== "pending")
+            return res.status(400).json({ success: false, message: `Cannot approve — current status is ${app.status}` });
+
+        // Guard: secondary can only approve when primary has already approved
+        if (mgrType === "secondary" && app.status !== "manager_approved")
+            return res.status(400).json({ success: false, message: "Primary manager must approve first" });
+
+        // Record decision
+        if (!app.managerDecisions.find(d => String(d.managerId) === String(myId))) {
             app.managerDecisions.push({
-                managerId: req.user.id,
+                managerId: myId,
                 managerName: mgr?.managerName || "",
-                type: mgr?.type || "primary",
+                type: mgrType,
                 decision: "approved",
                 remarks: remarks || "",
                 decidedAt: new Date(),
             });
         }
 
-        app.status = "manager_approved";
+        const hasSecondary = app.managersNotified.some(m => m.type === "secondary");
+
+        if (mgrType === "primary" && hasSecondary) {
+            // Primary approved — now route to secondary manager
+            app.status = "manager_approved";
+            await app.save();
+
+            // Notify secondary manager via socket
+            try {
+                const io = req.app.get("io");
+                if (io) {
+                    const secMgr = app.managersNotified.find(m => m.type === "secondary");
+                    if (secMgr?.managerId) {
+                        io.to(String(secMgr.managerId)).emit("leave_notification", {
+                            type: "leave_pending_approval",
+                            leaveId: app._id.toString(),
+                            employeeName: app.employeeName,
+                            leaveType: app.leaveType,
+                            fromDate: app.fromDate,
+                            toDate: app.toDate,
+                            totalDays: app.totalDays,
+                            message: `${app.employeeName}'s ${app.leaveType} leave needs your approval`,
+                            timestamp: new Date().toISOString(),
+                        });
+                    }
+                }
+            } catch (_) { }
+
+            return res.json({ success: true, data: app, message: "Leave approved by primary manager. Awaiting secondary manager approval." });
+        }
+
+        // Either primary-only approval, or secondary approval → final HR approve
+        const { LeaveConfig: LC, LeaveBalance: LB } = require("../../models/HR_Models/LeaveManagement");
+        const { applyLeaveToAttendance } = require("../HrRoutes/Attendance_section");
+
+        app.status = "hr_approved";
+        app.hrApprovedAt = new Date();
+        app.hrRemarks = remarks || `Approved by ${mgrType} manager`;
         await app.save();
 
-        res.json({ success: true, data: app, message: "Leave approved by manager" });
+        // Consume balance
+        const year = new Date(app.fromDate).getFullYear();
+        const config = await LC.getConfig();
+        await LB.findOneAndUpdate(
+            { employeeId: app.employeeId, year },
+            {
+                $setOnInsert: {
+                    employeeId: app.employeeId,
+                    biometricId: app.biometricId || "",
+                    year,
+                    entitlement: { CL: config.clPerYear, SL: config.slPerYear, PL: 0 },
+                    consumed: { CL: 0, SL: 0, PL: 0 },
+                },
+                $inc: { [`consumed.${app.leaveType}`]: app.totalDays },
+            },
+            { upsert: true }
+        );
+
+        // Sync to attendance
+        let attendanceResult = { applied: 0, skipped: 0 };
+        try {
+            if (applyLeaveToAttendance) attendanceResult = await applyLeaveToAttendance(app);
+        } catch (e) { console.warn("[MGR-APPROVE] attendance sync:", e.message); }
+
+        // Notify the employee that their leave is approved
+        try {
+            const io = req.app.get("io");
+            if (io) {
+                io.to(String(app.employeeId)).emit("leave_notification", {
+                    type: "leave_approved",
+                    leaveId: app._id.toString(),
+                    leaveType: app.leaveType,
+                    fromDate: app.fromDate,
+                    toDate: app.toDate,
+                    totalDays: app.totalDays,
+                    message: `Your ${app.leaveType} leave (${app.fromDate} – ${app.toDate}) has been approved`,
+                    timestamp: new Date().toISOString(),
+                });
+            }
+        } catch (_) { }
+
+        res.json({
+            success: true,
+            data: app,
+            message: `Leave fully approved. Attendance updated on ${attendanceResult.applied} day(s).`,
+            attendanceSync: attendanceResult,
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -673,6 +819,23 @@ router.patch("/manager/:id/reject", AllEmployeeAppMiddleware, async (req, res) =
         app.rejectedAt = new Date();
         app.rejectionReason = remarks || "";
         await app.save();
+
+        // Notify employee of rejection
+        try {
+            const io = req.app.get("io");
+            if (io) {
+                io.to(String(app.employeeId)).emit("leave_notification", {
+                    type: "leave_rejected",
+                    leaveId: app._id.toString(),
+                    leaveType: app.leaveType,
+                    fromDate: app.fromDate,
+                    toDate: app.toDate,
+                    rejectionReason: remarks || "",
+                    message: `Your ${app.leaveType} leave (${app.fromDate} – ${app.toDate}) was not approved`,
+                    timestamp: new Date().toISOString(),
+                });
+            }
+        } catch (_) { }
 
         res.json({ success: true, data: app, message: "Leave rejected by manager" });
     } catch (err) {

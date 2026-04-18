@@ -13,7 +13,7 @@ class EmailService {
         // Use an hr@ address — noreply@ addresses have higher spam rates.
         this.senderEmail = process.env.HR_SENDER_EMAIL
             || process.env.CUSTOMER_SENDER_EMAIL
-            || "hr@grav.in";
+            || "soumyaranjanpraharaj04@gmail.com";
         this.senderName = "Grav HR System";
         this.baseUrl = "https://api.brevo.com/v3";
     }
@@ -694,6 +694,132 @@ Grav Clothing Limited · Bhubaneswar, Odisha, India
 This is an automated notification. Please do not reply directly to this email.
 © ${new Date().getFullYear()} Grav Clothing. All rights reserved.
 `;
+    }
+    // =========================================================================
+    //  LEAVE APPLIED — notify HR when employee submits a leave application
+    // =========================================================================
+
+    /**
+     * @param {Object} data
+     * @param {string} data.employeeName
+     * @param {string} data.department
+     * @param {string} data.designation
+     * @param {string} data.leaveType       CL | SL | PL
+     * @param {string} data.fromDate
+     * @param {string} data.toDate
+     * @param {number} data.totalDays
+     * @param {string} data.reason
+     * @param {boolean} data.isHalfDay
+     * @param {boolean} data.requiresDocument
+     * @param {string} data.applicationId
+     */
+    async sendLeaveAppliedToHR(data) {
+        const typeLabels = { CL: "Casual Leave", SL: "Sick Leave", PL: "Privilege Leave" };
+        const when = new Date().toLocaleString("en-IN", { dateStyle: "full", timeStyle: "short", timeZone: "Asia/Kolkata" });
+        const subject = `New Leave Request: ${data.employeeName} — ${typeLabels[data.leaveType] || data.leaveType} (${data.fromDate} to ${data.toDate})`;
+
+        const htmlContent = `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="font-family:Arial,sans-serif;line-height:1.6;color:#333;max-width:640px;margin:0 auto;padding:20px;background:#f4f4f4;">
+    <div style="background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1);overflow:hidden;">
+        <div style="background:linear-gradient(135deg,#5b21b6 0%,#4f46e5 100%);color:#fff;padding:24px 28px;">
+            <h1 style="margin:0;font-size:20px;">New Leave Application</h1>
+            <p style="margin:4px 0 0;font-size:13px;opacity:.9;">Submitted by ${data.employeeName}</p>
+        </div>
+        <div style="padding:28px 30px;">
+            <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;">
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;width:40%;">Employee</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;font-weight:600;">${data.employeeName}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Department</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;">${data.department || "—"}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Designation</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;">${data.designation || "—"}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Leave Type</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;font-weight:600;color:#5b21b6;">${typeLabels[data.leaveType] || data.leaveType}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">From</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;">${data.fromDate}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">To</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;">${data.toDate}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Total Days</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;font-weight:600;">${data.isHalfDay ? "0.5 (Half Day)" : data.totalDays}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Reason</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;">${data.reason}</td></tr>
+                ${data.requiresDocument ? `<tr><td colspan="2" style="padding:8px 12px;background:#fef3c7;color:#92400e;font-weight:600;border-radius:4px;">⚠ Document required for this Sick Leave application</td></tr>` : ""}
+            </table>
+            <p style="font-size:12px;color:#718096;">Submitted: ${when} IST</p>
+            <div style="margin-top:24px;padding-top:20px;border-top:1px solid #e2e8f0;font-size:12px;color:#718096;text-align:center;">
+                <p>Grav Clothing Limited · Bhubaneswar, Odisha, India</p>
+                <p>This is an automated notification. Please do not reply directly to this email.</p>
+                <p>© ${new Date().getFullYear()} Grav Clothing. All rights reserved.</p>
+            </div>
+        </div>
+    </div>
+</body></html>`;
+
+        const textContent = `NEW LEAVE APPLICATION\n\nEmployee: ${data.employeeName}\nDepartment: ${data.department || "—"}\nLeave Type: ${typeLabels[data.leaveType] || data.leaveType}\nFrom: ${data.fromDate}  To: ${data.toDate}\nDays: ${data.isHalfDay ? "0.5 (Half Day)" : data.totalDays}\nReason: ${data.reason}\n${data.requiresDocument ? "\n⚠ Document required for this Sick Leave." : ""}\nSubmitted: ${when} IST\n\n---\nGrav Clothing Limited · Bhubaneswar, Odisha, India\nThis is an automated notification. Please do not reply.\n© ${new Date().getFullYear()} Grav Clothing.`;
+
+        try {
+            return await this._send({
+                sender: { name: this.senderName, email: this.senderEmail },
+                to: [{ email: CEO_NOTIFICATION_EMAIL, name: CEO_NOTIFICATION_NAME }],
+                subject,
+                htmlContent,
+                textContent,
+            });
+        } catch (error) {
+            console.error("sendLeaveAppliedToHR error:", error.response?.data || error.message);
+        }
+    }
+
+    // =========================================================================
+    //  LEAVE REJECTED — notify employee when HR/manager rejects their leave
+    // =========================================================================
+
+    /**
+     * @param {Object} data
+     * @param {string} data.employeeEmail
+     * @param {string} data.employeeName
+     * @param {string} data.leaveType
+     * @param {string} data.fromDate
+     * @param {string} data.toDate
+     * @param {number} data.totalDays
+     * @param {string} data.reason         rejection reason
+     */
+    async sendLeaveRejectedToEmployee(data) {
+        if (!data.employeeEmail) return;
+        const typeLabels = { CL: "Casual Leave", SL: "Sick Leave", PL: "Privilege Leave" };
+        const subject = `Leave Request Update: Your ${typeLabels[data.leaveType] || data.leaveType} was not approved`;
+
+        const htmlContent = `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif;line-height:1.6;color:#333;max-width:600px;margin:0 auto;padding:20px;background:#f4f4f4;">
+    <div style="background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1);overflow:hidden;">
+        <div style="background:linear-gradient(135deg,#dc2626 0%,#b91c1c 100%);color:#fff;padding:24px 28px;">
+            <h1 style="margin:0;font-size:20px;">Leave Not Approved</h1>
+            <p style="margin:4px 0 0;font-size:13px;opacity:.9;">Your leave request has been reviewed</p>
+        </div>
+        <div style="padding:28px 30px;">
+            <p>Dear ${data.employeeName},</p>
+            <p>We regret to inform you that your leave application has not been approved.</p>
+            <table style="width:100%;border-collapse:collapse;font-size:13px;margin:16px 0;">
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Leave Type</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;font-weight:600;">${typeLabels[data.leaveType] || data.leaveType}</td></tr>
+                <tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Period</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;">${data.fromDate} to ${data.toDate} (${data.totalDays} day${data.totalDays !== 1 ? "s" : ""})</td></tr>
+                ${data.reason ? `<tr><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;color:#718096;">Reason</td><td style="padding:8px 12px;border-bottom:1px solid #edf2f7;">${data.reason}</td></tr>` : ""}
+            </table>
+            <p style="font-size:13px;color:#4a5568;">If you have any questions, please contact HR directly.</p>
+            <div style="margin-top:24px;padding-top:20px;border-top:1px solid #e2e8f0;font-size:12px;color:#718096;text-align:center;">
+                <p>Grav Clothing Limited · Bhubaneswar, Odisha, India</p>
+                <p>This is an automated notification. Please do not reply directly to this email.</p>
+                <p>© ${new Date().getFullYear()} Grav Clothing. All rights reserved.</p>
+            </div>
+        </div>
+    </div>
+</body></html>`;
+
+        try {
+            return await this._send({
+                sender: { name: this.senderName, email: this.senderEmail },
+                to: [{ email: data.employeeEmail, name: data.employeeName }],
+                subject,
+                htmlContent,
+            });
+        } catch (error) {
+            console.error("sendLeaveRejectedToEmployee error:", error.response?.data || error.message);
+        }
     }
 }
 
