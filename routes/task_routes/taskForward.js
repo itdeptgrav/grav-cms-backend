@@ -421,13 +421,14 @@ router.get("/task/:taskId/full", verifyCoworkToken, verifyEmployeeToken, async (
 // ── PROPOSE DEADLINE (employee sets deadline before confirming) ───────────────
 router.post("/task/:taskId/propose-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { proposedDate } = req.body;
+    const { proposedDate, workedSecs } = req.body;
     if (!proposedDate) return res.status(400).json({ error: "proposedDate required" });
     const result = await svc.proposeDeadline({
       taskId: req.params.taskId,
       employeeId: req.coworkUser.employeeId,
       employeeName: req.coworkUser.name,
       proposedDate,
+      workedSecs: Number(workedSecs) || 0,
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -444,6 +445,38 @@ router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeT
       approverName: req.coworkUser.name,
       approved,
       rejectionReason: rejectionReason || "",
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── TL/CEO COUNTER-PROPOSE DEADLINE ───────────────────────────────────────────
+router.post("/task/:taskId/tl-counter-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { counterDate, message } = req.body;
+    if (!counterDate) return res.status(400).json({ error: "counterDate required" });
+    const result = await svc.tlCounterProposeDeadline({
+      taskId: req.params.taskId,
+      proposerId: req.coworkUser.employeeId,
+      proposerName: req.coworkUser.name,
+      counterDate,
+      message: message || "",
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── EMPLOYEE RESPOND TO TL COUNTER-PROPOSAL ────────────────────────────────────
+router.post("/task/:taskId/respond-tl-counter", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { accepted, rejectMessage } = req.body;
+    if (typeof accepted !== "boolean") return res.status(400).json({ error: "accepted (boolean) required" });
+    const result = await svc.employeeRespondToTlCounter({
+      taskId: req.params.taskId,
+      employeeId: req.coworkUser.employeeId,
+      employeeName: req.coworkUser.name,
+      accepted,
+      rejectMessage: rejectMessage || "",
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
