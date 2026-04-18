@@ -102,7 +102,7 @@ async function _buildPath(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
-async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = "medium", parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null }) {
+async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false }) {
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
   const path = await _buildPath(parentTaskId);
@@ -130,6 +130,7 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     progressPercent: 0,
     status: "open",
     groupId: groupId || null,
+    isFolder: isFolder || false,
     // Hierarchy
     parentTaskId: parentTaskId || null,
     isRoot: !parentTaskId,
@@ -196,6 +197,14 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
   const task = doc.data();
   if (!task.assigneeIds.includes(employeeId)) throw new Error("Not assigned to this task.");
   if (task.confirmedBy?.includes(employeeId)) throw new Error("Already confirmed.");
+
+  // If no dueDate exists yet (new flow), require deadline approval first
+  if (!task.dueDate && task.status !== "deadline_approved") {
+    if (task.status === "pending_deadline_approval") {
+      throw new Error("Your deadline proposal is pending approval. Please wait.");
+    }
+    throw new Error("Please propose a deadline and get it approved before confirming.");
+  }
 
   await ref.update({
     confirmedBy: admin.firestore.FieldValue.arrayUnion(employeeId),
@@ -449,6 +458,8 @@ async function getTaskWithDetails(taskId) {
   const doc = await db.collection("cowork_tasks").doc(taskId).get();
   if (!doc.exists) return null;
   const task = { id: doc.id, ...doc.data() };
+  // Default isFolder — older tasks saved before this field existed will be false
+  if (task.isFolder === undefined) task.isFolder = false;
 
   // Timestamps
   if (task.createdAt?.toDate) task.createdAt = task.createdAt.toDate().toISOString();
@@ -481,6 +492,9 @@ async function getTaskWithDetails(taskId) {
 
   // Chat messages (THIS TASK'S OWN chat — isolated)
   task.chatMessages = await getTaskChat(taskId, 100);
+
+  // Draft chat messages (pre-confirmation discussion)
+  task.draftChatMessages = await getDraftChat(taskId, 100);
 
   return task;
 }
@@ -969,6 +983,200 @@ async function updateParentTaskProgress({ parentTaskId, updatedBy, updatedByName
   return { success: true };
 }
 
+// ═════════════════════════════════════════════════════════
+//  DEADLINE PROPOSAL — employee proposes, creator approves
+// ═════════════════════════════════════════════════════════
+async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate, workedSecs = 0 }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+  if (!task.assigneeIds?.includes(employeeId)) throw new Error("Not assigned to this task.");
+  if (!["open", "deadline_rejected", "in_progress", "confirmed", "deadline_approved"].includes(task.status))
+    throw new Error("Cannot propose a deadline change in current status.");
+  if (!proposedDate) throw new Error("Proposed date is required.");
+
+  // How many seconds THIS proposal adds (from now to new deadline)
+  const extensionSecs = Math.max(0, Math.floor((new Date(proposedDate).getTime() - Date.now()) / 1000));
+
+  // ACCUMULATE correctly:
+  // First proposal: deadlineWindowSecs = time from now to deadline
+  // Extension: base = max(existingWindowSecs, workedSecs) + new extension
+  //   - workedSecs passed from frontend so we know actual work done
+  //   - this handles old tasks where existingWindowSecs = 0
+  const isExtension = ["in_progress", "confirmed"].includes(task.status);
+  const existingWindowSecs = task.deadlineWindowSecs || 0;
+  const workedSecsFromFrontend = workedSecs || 0;
+  const deadlineWindowSecs = isExtension
+    ? Math.max(existingWindowSecs, workedSecsFromFrontend) + extensionSecs
+    : extensionSecs;
+
+  await ref.update({
+    proposedDeadline: proposedDate,
+    proposedDeadlineBy: employeeId,
+    proposedDeadlineByName: employeeName,
+    proposedDeadlineAt: admin.firestore.FieldValue.serverTimestamp(),
+    deadlineWindowSecs,  // how many seconds employee is asking for (e.g. 3h = 10800)
+    prevStatusBeforeDeadlineProposal: task.status,
+    status: "pending_deadline_approval",
+    deadlineProposalRejected: false,
+    deadlineRejectionReason: null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // If task was in_progress, notify the employee their timer should stop
+  // (frontend blocks the timer when status = pending_deadline_approval)
+  if (task.status === "in_progress") {
+    socket.emitToMany(task.assigneeIds || [], "timer_blocked", {
+      taskId,
+      taskTitle: task.title,
+      reason: "Deadline extension pending approval — timer paused until approved",
+    });
+  }
+
+  // Post system message in draft chat
+  await sendDraftChat({
+    taskId,
+    senderId: employeeId,
+    senderName: employeeName,
+    text: `📅 ${employeeName} proposed deadline: ${new Date(proposedDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}`,
+    messageType: "system",
+  });
+
+  // Notify the task creator
+  const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
+  await _notifyMany({
+    recipientIds: [...new Set(notifyIds)],
+    type: "deadline_proposed",
+    title: `Deadline proposed for: ${task.title}`,
+    body: `${employeeName} proposed a deadline for "${task.title}"`,
+    data: { taskId, taskTitle: task.title, proposedDate },
+    senderId: employeeId,
+    senderName: employeeName,
+  });
+  socket.emitToMany([...new Set(notifyIds)], "deadline_proposed", { taskId, employeeId, proposedDate });
+  return { success: true };
+}
+
+async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+
+  // Only the creator can approve/reject
+  if (task.assignedBy !== approverId) throw new Error("Only the task creator can approve or reject the deadline.");
+  if (task.status !== "pending_deadline_approval") throw new Error("No pending deadline proposal.");
+
+  // Determine what status to restore after approval
+  // Only restore to in_progress or confirmed — everything else (open, etc.) → deadline_approved
+  const prev = task.prevStatusBeforeDeadlineProposal;
+  const prevStatus = ["in_progress", "confirmed"].includes(prev) ? prev : "deadline_approved";
+
+  if (approved) {
+    const newDueDate = task.proposedDeadline;
+    await ref.update({
+      status: prevStatus,
+      dueDate: newDueDate,
+      deadlineApprovedBy: approverId,
+      deadlineApprovedByName: approverName,
+      deadlineApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deadlineProposalRejected: false,
+      deadlineRejectionReason: null,
+      deadlineStatus: deadlineStatus(newDueDate),
+      deadlineColor: deadlineColor(newDueDate),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await sendDraftChat({
+      taskId,
+      senderId: approverId,
+      senderName: approverName,
+      text: `✅ ${approverName} approved the deadline: ${new Date(newDueDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}. You can now confirm the task.`,
+      messageType: "system",
+    });
+
+    // Notify assignees
+    await _notifyMany({
+      recipientIds: task.assigneeIds || [],
+      type: "deadline_approved",
+      title: `Deadline approved for: ${task.title}`,
+      body: `Your proposed deadline was approved. Please confirm the task.`,
+      data: { taskId, taskTitle: task.title },
+      senderId: approverId,
+      senderName: approverName,
+    });
+    socket.emitToMany(task.assigneeIds || [], "deadline_approved", { taskId, dueDate: newDueDate });
+  } else {
+    if (!rejectionReason?.trim()) throw new Error("Rejection reason is required.");
+    await ref.update({
+      status: "open",
+      deadlineProposalRejected: true,
+      deadlineRejectionReason: rejectionReason.trim(),
+      proposedDeadline: null,
+      proposedDeadlineBy: null,
+      proposedDeadlineAt: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await sendDraftChat({
+      taskId,
+      senderId: approverId,
+      senderName: approverName,
+      text: `❌ ${approverName} rejected the deadline. Reason: "${rejectionReason.trim()}". Please propose a new deadline.`,
+      messageType: "system",
+    });
+
+    await _notifyMany({
+      recipientIds: task.assigneeIds || [],
+      type: "deadline_rejected",
+      title: `Deadline rejected for: ${task.title}`,
+      body: `Reason: ${rejectionReason.trim()}`,
+      data: { taskId, taskTitle: task.title },
+      senderId: approverId,
+      senderName: approverName,
+    });
+    socket.emitToMany(task.assigneeIds || [], "deadline_rejected", { taskId, reason: rejectionReason.trim() });
+  }
+  return { success: true };
+}
+
+// ═════════════════════════════════════════════════════════
+//  DRAFT CHAT — pre-confirmation discussion per task
+// ═════════════════════════════════════════════════════════
+async function sendDraftChat({ taskId, senderId, senderName, text, attachments = [], messageType = "text" }) {
+  const { v4: _uuidv4 } = require("uuid");
+  const messageId = _uuidv4();
+  const isoTime = new Date().toISOString();
+  const msg = {
+    messageId, taskId, senderId, senderName,
+    text: text || "", attachments, messageType,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  await db.collection("cowork_tasks").doc(taskId).collection("draft_chat").doc(messageId).set(msg);
+  await db.collection("cowork_tasks").doc(taskId).update({
+    draftChatMessageCount: admin.firestore.FieldValue.increment(1),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  // Get all participants for socket
+  const taskDoc = await db.collection("cowork_tasks").doc(taskId).get();
+  if (taskDoc.exists) {
+    const t = taskDoc.data();
+    const all = [...new Set([...(t.assigneeIds || []), t.assignedBy].filter(Boolean))];
+    socket.emitToMany(all, "task_draft_chat_message", { taskId, message: { ...msg, createdAt: isoTime } });
+  }
+  return { ...msg, createdAt: isoTime };
+}
+
+async function getDraftChat(taskId, limit = 100) {
+  const snap = await db.collection("cowork_tasks").doc(taskId).collection("draft_chat")
+    .orderBy("createdAt", "asc").limitToLast(Number(limit)).get();
+  return snap.docs.map(d => {
+    const data = d.data();
+    return { ...data, createdAt: data.createdAt?.toDate?.()?.toISOString() || data.createdAt };
+  });
+}
+
 module.exports = {
   createTask,
   createParentTask: createTask, // backward compat alias
@@ -989,4 +1197,8 @@ module.exports = {
   updateParentTaskProgress,
   deadlineStatus,
   deadlineColor,
+  proposeDeadline,
+  approveDeadline,
+  sendDraftChat,
+  getDraftChat,
 };
