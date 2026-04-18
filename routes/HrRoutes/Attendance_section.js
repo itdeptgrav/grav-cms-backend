@@ -3770,13 +3770,47 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
 
         const holidayMap = await loadHolidayMap(from, to);
 
+        // ── Load ALL leave applications for this employee in this range ──────
+        // Includes all statuses: pending, approved, rejected, cancelled
+        // Used for both: (a) future date display and (b) the leave applications panel
+        const leaveAppsQuery = {
+            fromDate: { $lte: to },
+            toDate: { $gte: from },
+        };
+        if (empDoc) {
+            leaveAppsQuery.$or = [
+                { biometricId: bid },
+                { employeeId: empDoc._id },
+            ];
+        } else {
+            leaveAppsQuery.biometricId = bid;
+        }
+        const allLeaveApps = await LeaveApplication.find(leaveAppsQuery)
+            .sort({ applicationDate: -1 })
+            .lean();
+
+        // Build approved-leave date map for future-date row status
+        const LEAVE_TYPE_TO_STATUS = { CL: "L-CL", SL: "L-SL", PL: "L-EL" };
+        const approvedLeaveByDate = new Map();
+        for (const lv of allLeaveApps) {
+            if (lv.status !== "hr_approved") continue;
+            const s = new Date(lv.fromDate + "T00:00:00");
+            const e = new Date(lv.toDate + "T00:00:00");
+            for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+                const ds = dateStrOf(new Date(d));
+                if (!approvedLeaveByDate.has(ds)) {
+                    approvedLeaveByDate.set(ds, LEAVE_TYPE_TO_STATUS[lv.leaveType] || "L-CL");
+                }
+            }
+        }
+
         const start = new Date(from + "T00:00:00");
         const end = new Date(to + "T00:00:00");
         const today = new Date(); today.setHours(0, 0, 0, 0);
 
+        // ── Build FULL calendar — all dates including future ─────────────────
         const calendar = [];
         for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-            if (d > today) continue;
             const ds = dateStrOf(new Date(d));
             const dow = d.getDay();
             calendar.push({
@@ -3786,6 +3820,7 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
                 dayNum: d.getDate(),
                 monthName: new Date(d).toLocaleDateString("en-IN", { month: "short" }),
                 isSunday: dow === 0,
+                isFuture: d > today,
                 restStatus: resolveRestDayStatus(ds, dow, holidayMap),
                 holiday: holidayMap.get(ds) || null,
             });
@@ -3806,10 +3841,38 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
         };
 
         for (const cal of calendar) {
+
+            // ── Future dates ─────────────────────────────────────────────────
+            if (cal.isFuture) {
+                const leaveCode = approvedLeaveByDate.get(cal.dateStr);
+                if (leaveCode) {
+                    // Approved leave on a future date
+                    rows.push({ ...cal, status: leaveCode, label: getDisplayLabel(leaveCode, settings), synced: false });
+                    if (stats[leaveCode] !== undefined) stats[leaveCode]++;
+                    stats.leaves++;
+                    stats.totalAttendance++;
+                } else if (cal.restStatus) {
+                    // Future holiday or Sunday
+                    rows.push({ ...cal, status: cal.restStatus, label: getDisplayLabel(cal.restStatus, settings), synced: false });
+                } else {
+                    // Plain future working day — no data yet
+                    rows.push({ ...cal, status: "FUTURE", label: "—", synced: false });
+                }
+                continue;
+            }
+
+            // ── Past / today ─────────────────────────────────────────────────
             const dayDoc = byDate.get(cal.dateStr);
 
             if (!dayDoc) {
-                if (cal.restStatus) {
+                // Check approved leave first (might have been approved after sync)
+                const leaveCode = approvedLeaveByDate.get(cal.dateStr);
+                if (leaveCode) {
+                    rows.push({ ...cal, status: leaveCode, label: getDisplayLabel(leaveCode, settings), synced: false });
+                    if (stats[leaveCode] !== undefined) stats[leaveCode]++;
+                    stats.leaves++;
+                    stats.totalAttendance++;
+                } else if (cal.restStatus) {
                     rows.push({ ...cal, status: cal.restStatus, label: getDisplayLabel(cal.restStatus, settings), synced: false });
                     if (stats[cal.restStatus] !== undefined) stats[cal.restStatus]++;
                     stats.totalAttendance++;
@@ -3820,7 +3883,9 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
                 continue;
             }
 
-            const entry = (dayDoc.employees || []).find((e) => e.biometricId === bid);
+            const entry = (dayDoc.employees || []).find((e) => e.biometricId === bid)
+                || (empDoc ? (dayDoc.employees || []).find((e) => e.employeeDbId?.toString() === empDoc._id.toString()) : null);
+
             if (!entry) {
                 const s = cal.restStatus || "AB";
                 rows.push({ ...cal, status: s, label: getDisplayLabel(s, settings), synced: true });
@@ -3907,7 +3972,29 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
             };
         }
 
-        res.json({ success: true, from, to, biometricId: bid, employee: empMeta, rows, stats });
+        // ── Serialize leave applications for the frontend panel ──────────────
+        const leaveApplications = allLeaveApps.map(lv => ({
+            _id: lv._id,
+            leaveType: lv.leaveType,
+            status: lv.status,
+            fromDate: lv.fromDate,
+            toDate: lv.toDate,
+            totalDays: lv.totalDays,
+            reason: lv.reason,
+            applicationDate: lv.applicationDate,
+            isHalfDay: lv.isHalfDay || false,
+            halfDaySlot: lv.halfDaySlot || null,
+            rejectionReason: lv.rejectionReason || null,
+            hrRemarks: lv.hrRemarks || null,
+            managerDecisions: lv.managerDecisions || [],
+        }));
+
+        res.json({
+            success: true, from, to, biometricId: bid,
+            employee: empMeta, rows, stats,
+            leaveApplications,
+            displayLabels: settings.displayLabels || {},
+        });
     } catch (err) {
         console.error("[TIMECARD]", err.message, err.stack);
         res.status(500).json({ success: false, message: err.message });
@@ -4408,6 +4495,372 @@ router.delete("/holidays/:id", EmployeeAuthMiddlewear, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ATTENDANCE PUNCH NOTIFICATIONS + SETTINGS
+//  Dependencies: npm install node-cron
+// ═══════════════════════════════════════════════════════════════════════════
+
+const cron = require("node-cron");
+
+// ── Inline notification settings model ──────────────────────────────────────
+const mongoose = require("mongoose");
+const HRNotifSettingsSchema = new mongoose.Schema({
+    singleton: { type: String, default: "global", unique: true },
+    checkin_missing: { type: Boolean, default: true },
+    lunch_missing: { type: Boolean, default: true },
+    checkout_missing: { type: Boolean, default: true },
+    yesterday_digest: { type: Boolean, default: true },
+}, { _id: false });
+const HRNotifSettings = mongoose.models.HRNotificationSettings
+    || mongoose.model("HRNotificationSettings", HRNotifSettingsSchema);
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function istDateStr(offsetDays = 0) {
+    const d = new Date(Date.now() + 5.5 * 60 * 60 * 1000 + offsetDays * 86400000);
+    return d.toISOString().slice(0, 10);
+}
+
+async function getNotifSettings() {
+    try {
+        return (await HRNotifSettings.findOne({ singleton: "global" }).lean()) ||
+            { checkin_missing: true, lunch_missing: true, checkout_missing: true, yesterday_digest: true };
+    } catch (_) {
+        return { checkin_missing: true, lunch_missing: true, checkout_missing: true, yesterday_digest: true };
+    }
+}
+
+async function getLeaveEmployeeIds(dateStr) {
+    const apps = await LeaveApplication.find({
+        startDate: { $lte: new Date(dateStr + "T23:59:59Z") },
+        endDate: { $gte: new Date(dateStr + "T00:00:00Z") },
+        status: { $in: ["hr_approved", "manager_approved", "pending"] },
+    }).select("employeeId").lean();
+    return new Set(apps.map(a => String(a.employeeId)));
+}
+
+// ── Push + email fallback ─────────────────────────────────────────────────────
+async function notifyHR(title, body, issues, dateStr) {
+    let pushOk = false;
+    try {
+        const { messaging } = require("../../config/firebaseAdmin");
+        const HRDept = require("../../models/HR_Models/HRDepartment");
+        const hrList = await HRDept.find({ isActive: { $ne: false } }).select("fcmTokens").lean();
+        const tokens = hrList.flatMap(h => h.fcmTokens || []).filter(Boolean);
+        if (tokens.length) {
+            let sent = 0;
+            for (const token of tokens) {
+                try {
+                    await messaging.send({
+                        token,
+                        notification: { title, body },
+                        webpush: { notification: { title, body, icon: "/logo.png" }, fcmOptions: { link: "/hr/dashboard/attendance" } },
+                    });
+                    sent++;
+                } catch (_) { }
+            }
+            pushOk = sent > 0;
+        }
+    } catch (_) { }
+
+    // Email fallback — only fires if push reached nobody
+    if (!pushOk && issues?.length && emailService?._send) {
+        try {
+            const HRDept = require("../../models/HR_Models/HRDepartment");
+            const hrList = await HRDept.find({ isActive: { $ne: false } }).select("email name").lean();
+            const toList = hrList.filter(h => h.email).map(h => ({ email: h.email, name: h.name }));
+            if (!toList.length) return;
+            const rows = issues.map(i => `<tr><td style="padding:9px 12px;font-size:13px;font-weight:600">${i.name}</td><td style="padding:9px 12px;font-size:13px;color:#555">${i.empId}</td><td style="padding:9px 12px;font-size:13px;color:#555">${i.dept}</td><td style="padding:9px 12px"><span style="background:${i.bg};color:${i.color};padding:3px 8px;border-radius:99px;font-size:11px;font-weight:700">${i.issue}</span></td></tr>`).join("");
+            const html = `<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto"><div style="background:#1a1a2e;padding:20px 28px;border-radius:10px 10px 0 0"><h2 style="color:#fff;margin:0;font-size:17px">${title}</h2><p style="color:#aaa;margin:4px 0 0;font-size:12px">Date: ${dateStr} · Push notification could not be delivered</p></div><div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:20px 28px"><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f7fafc"><th style="padding:9px 12px;text-align:left;font-size:12px">Name</th><th style="padding:9px 12px;text-align:left;font-size:12px">ID</th><th style="padding:9px 12px;text-align:left;font-size:12px">Dept</th><th style="padding:9px 12px;text-align:left;font-size:12px">Issue</th></tr></thead><tbody>${rows}</tbody></table><p style="font-size:12px;color:#888;margin-top:16px">Grav HR System · Automated alert</p></div></div>`;
+            for (const hr of toList) {
+                await emailService._send({ to: [hr], subject: `${title} [${dateStr}]`, htmlContent: html, textContent: body + "\n\n" + issues.map(i => `${i.name} (${i.empId}) — ${i.issue}`).join("\n") }).catch(() => { });
+            }
+        } catch (_) { }
+    }
+}
+
+// ── Cron runners ─────────────────────────────────────────────────────────────
+
+async function runCheckinAlert() {
+    try {
+        const s = await getNotifSettings();
+        if (!s.checkin_missing) return;
+        const today = istDateStr();
+        const onLeave = await getLeaveEmployeeIds(today);
+        const doc = await DailyAttendance.findOne({ dateStr: today }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department _id").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const missing = [];
+        for (const emp of doc.employees) {
+            if (emp.inTime) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            const ed = empMap[emp.biometricId];
+            if (ed && onLeave.has(String(ed._id))) continue;
+            missing.push({ name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId, empId: emp.biometricId || "—", dept: ed?.department || "—", issue: "No Check-In", bg: "#fee2e2", color: "#b91c1c" });
+        }
+        if (!missing.length) return;
+
+        const names = missing.slice(0, 3).map(m => m.name).join(", ") + (missing.length > 3 ? ` +${missing.length - 3} more` : "");
+        await notifyHR(`⚠️ ${missing.length} employee(s) haven't checked in`, `${names} — no punch & no approved leave as of 10:15 AM.`, missing, today);
+        console.log(`[PunchNotif] 10:15 check-in: ${missing.length} missing`);
+    } catch (e) { console.error("[PunchNotif] checkin:", e.message); }
+}
+
+async function runLunchAlert(type) {
+    try {
+        const s = await getNotifSettings();
+        if (!s.lunch_missing) return;
+        const today = istDateStr();
+        const doc = await DailyAttendance.findOne({ dateStr: today }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const missing = [];
+        for (const emp of doc.employees) {
+            if (!emp.inTime) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["AB", "WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            // Only operator-type employees have lunch punches tracked
+            if (emp.employeeType !== "operator") continue;
+            if (type === "lunch_in" && !emp.lunchIn) { /* missing */ }
+            else if (type === "lunch_out" && emp.lunchIn && !emp.lunchOut) { /* missing */ }
+            else continue;
+            const ed = empMap[emp.biometricId];
+            missing.push({ name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId, empId: emp.biometricId || "—", dept: ed?.department || "—", issue: type === "lunch_in" ? "No Lunch-In" : "No Lunch-Out", bg: "#fef3c7", color: "#92400e" });
+        }
+        if (!missing.length) return;
+        const label = type === "lunch_in" ? "lunch-in" : "lunch-out";
+        await notifyHR(`🍽️ ${missing.length} employee(s) missing ${label} punch`, `${missing.length} operator(s) haven't recorded ${label}.`, missing, today);
+        console.log(`[PunchNotif] ${label}: ${missing.length} missing`);
+    } catch (e) { console.error("[PunchNotif] lunch:", e.message); }
+}
+
+async function runCheckoutAlert() {
+    try {
+        const s = await getNotifSettings();
+        if (!s.checkout_missing) return;
+        const today = istDateStr();
+        const doc = await DailyAttendance.findOne({ dateStr: today }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const missing = [];
+        for (const emp of doc.employees) {
+            if (!emp.inTime || emp.finalOut) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["AB", "WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            const ed = empMap[emp.biometricId];
+            missing.push({ name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId, empId: emp.biometricId || "—", dept: ed?.department || "—", issue: "No Check-Out", bg: "#ffedd5", color: "#9a3412" });
+        }
+        if (!missing.length) return;
+        await notifyHR(`🚪 ${missing.length} employee(s) missing check-out`, `${missing.length} employee(s) punched in but haven't checked out.`, missing, today);
+        console.log(`[PunchNotif] 18:00 checkout: ${missing.length} missing`);
+    } catch (e) { console.error("[PunchNotif] checkout:", e.message); }
+}
+
+async function runYesterdayDigest() {
+    try {
+        const s = await getNotifSettings();
+        if (!s.yesterday_digest) return;
+        const yesterday = istDateStr(-1);
+        const onLeave = await getLeaveEmployeeIds(yesterday);
+        const doc = await DailyAttendance.findOne({ dateStr: yesterday }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department _id").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const issues = [];
+        for (const emp of doc.employees) {
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            const ed = empMap[emp.biometricId];
+            if (ed && onLeave.has(String(ed._id))) continue;
+            const name = ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId;
+            const dept = ed?.department || "—";
+            const empId = emp.biometricId || "—";
+            if (!emp.inTime && !emp.hrFinalStatus) issues.push({ name, empId, dept, issue: "Absent / No Record", bg: "#fee2e2", color: "#b91c1c" });
+            else if (emp.inTime && !emp.finalOut && !emp.isMissPunchSettled) issues.push({ name, empId, dept, issue: "Missing Check-Out", bg: "#ffedd5", color: "#9a3412" });
+            else if (emp.inTime && !emp.lunchIn && emp.employeeType === "operator" && !emp.isMissPunchSettled) issues.push({ name, empId, dept, issue: "No Lunch-In", bg: "#fef3c7", color: "#92400e" });
+        }
+        if (!issues.length) return;
+
+        // Push summary
+        await notifyHR(`📋 Yesterday's unresolved punch issues [${yesterday}]`, `${issues.length} unresolved attendance issue(s) from yesterday need fixing.`, issues, yesterday);
+
+        // Digest email ALWAYS sent regardless of push status
+        if (emailService?._send) {
+            try {
+                const HRDept = require("../../models/HR_Models/HRDepartment");
+                const hrList = await HRDept.find({ isActive: { $ne: false } }).select("email name").lean();
+                const toList = hrList.filter(h => h.email).map(h => ({ email: h.email, name: h.name }));
+                const rows = issues.map(i => `<tr><td style="padding:8px 12px;font-size:13px">${i.name}</td><td style="padding:8px 12px;font-size:13px;color:#555">${i.empId}</td><td style="padding:8px 12px;font-size:13px;color:#555">${i.dept}</td><td style="padding:8px 12px"><span style="background:${i.bg};color:${i.color};padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700">${i.issue}</span></td></tr>`).join("");
+                const html = `<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto"><div style="background:#1a1a2e;padding:20px 28px;border-radius:10px 10px 0 0"><h2 style="color:#fff;margin:0;font-size:17px">📋 Yesterday's Attendance Digest</h2><p style="color:#aaa;margin:4px 0 0;font-size:12px">${yesterday} · ${issues.length} unresolved issue(s)</p></div><div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:20px 28px"><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f7fafc"><th style="padding:9px 12px;text-align:left;font-size:12px">Name</th><th style="padding:9px 12px;text-align:left;font-size:12px">ID</th><th style="padding:9px 12px;text-align:left;font-size:12px">Dept</th><th style="padding:9px 12px;text-align:left;font-size:12px">Issue</th></tr></thead><tbody>${rows}</tbody></table><p style="font-size:11px;color:#888;margin-top:16px">Grav HR System · Please log in and resolve before payroll.</p></div></div>`;
+                for (const hr of toList) {
+                    await emailService._send({ to: [hr], subject: `📋 Attendance Digest [${yesterday}] — ${issues.length} issues`, htmlContent: html, textContent: `Yesterday digest for ${yesterday}:\n\n` + issues.map(i => `${i.name} (${i.empId}) — ${i.issue}`).join("\n") }).catch(() => { });
+                }
+            } catch (_) { }
+        }
+        console.log(`[PunchNotif] Yesterday digest: ${issues.length} issues`);
+    } catch (e) { console.error("[PunchNotif] digest:", e.message); }
+}
+
+// ── Start crons — call once from server.js ────────────────────────────────────
+function startPunchNotificationCrons() {
+    const tz = { timezone: "Asia/Kolkata", scheduled: true };
+    cron.schedule("15 10 * * 1-6", runCheckinAlert, tz); // 10:15 Mon–Sat
+    cron.schedule("30 13 * * 1-6", () => runLunchAlert("lunch_in"), tz); // 13:30
+    cron.schedule("30 14 * * 1-6", () => runLunchAlert("lunch_out"), tz); // 14:30
+    cron.schedule("0 18  * * 1-6", runCheckoutAlert, tz); // 18:00
+    cron.schedule("0 9   * * *", runYesterdayDigest, tz); // 09:00 daily
+    console.log("[PunchNotif] ✅ 5 punch notification crons scheduled (IST)");
+}
+
+// ── Notification settings API routes ──────────────────────────────────────────
+
+// GET /api/hr/attendance/notification-settings
+router.get("/notification-settings", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        let s = await HRNotifSettings.findOne({ singleton: "global" }).lean();
+        if (!s) s = await HRNotifSettings.create({ singleton: "global" });
+        res.json({ success: true, data: s });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /api/hr/attendance/notification-settings
+router.put("/notification-settings", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const allowed = ["checkin_missing", "lunch_missing", "checkout_missing", "yesterday_digest"];
+        const update = {};
+        allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+        const s = await HRNotifSettings.findOneAndUpdate({ singleton: "global" }, { $set: update }, { new: true, upsert: true });
+        res.json({ success: true, data: s });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/hr/attendance/notification-subscribe  — save FCM token for this HR user
+router.post("/notification-subscribe", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { fcmToken } = req.body;
+        if (!fcmToken) return res.status(400).json({ success: false, message: "fcmToken required" });
+        try {
+            const HRDept = require("../../models/HR_Models/HRDepartment");
+            const hr = await HRDept.findById(req.user.id);
+            if (hr) {
+                if (!hr.fcmTokens) hr.fcmTokens = [];
+                if (!hr.fcmTokens.includes(fcmToken)) {
+                    hr.fcmTokens = [...hr.fcmTokens.slice(-4), fcmToken]; // keep last 5
+                    await hr.save();
+                }
+            }
+        } catch (_) { }
+        res.json({ success: true, message: "Token saved" });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/hr/attendance/notification-test
+router.post("/notification-test", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { messaging } = require("../../config/firebaseAdmin");
+        const HRDept = require("../../models/HR_Models/HRDepartment");
+        const hr = await HRDept.findById(req.user.id).select("fcmTokens").lean();
+        const tokens = hr?.fcmTokens || [];
+        if (!tokens.length) return res.json({ success: false, message: "No push tokens registered. Enable notifications first." });
+        let sent = 0;
+        for (const token of tokens) {
+            try { await messaging.send({ token, notification: { title: "✅ HRMS Alerts Active", body: "Punch notifications are working!" }, webpush: { notification: { title: "✅ HRMS Alerts Active", body: "Punch notifications are working!", icon: "/logo.png" } } }); sent++; } catch (_) { }
+        }
+        res.json({ success: true, message: `Test sent to ${sent} device(s)` });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/hr/attendance/missed-punches?date=YYYY-MM-DD — live badge for HR UI
+router.get("/missed-punches", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const dateStr = req.query.date || istDateStr();
+        const onLeave = await getLeaveEmployeeIds(dateStr);
+        const doc = await DailyAttendance.findOne({ dateStr }).lean();
+        if (!doc?.employees?.length) return res.json({ success: true, data: [], count: 0 });
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department designation _id").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const issues = [];
+        for (const emp of doc.employees) {
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            const ed = empMap[emp.biometricId];
+            if (["WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            if (ed && onLeave.has(String(ed._id))) continue;
+            const base = {
+                biometricId: emp.biometricId,
+                name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId,
+                department: ed?.department || "—",
+                inTime: emp.inTime, finalOut: emp.finalOut, lunchIn: emp.lunchIn,
+            };
+            if (!emp.inTime && !emp.hrFinalStatus) issues.push({ ...base, issueType: "no_checkin", severity: "high" });
+            else if (emp.inTime && !emp.finalOut) issues.push({ ...base, issueType: "no_checkout", severity: "medium" });
+            else if (emp.inTime && !emp.lunchIn && emp.employeeType === "operator") issues.push({ ...base, issueType: "no_lunch_in", severity: "low" });
+            else if (emp.lunchIn && !emp.lunchOut) issues.push({ ...base, issueType: "no_lunch_out", severity: "low" });
+        }
+        res.json({ success: true, data: issues, count: issues.length, date: dateStr });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/hr/attendance/calendar?biometricId=xxx&yearMonth=YYYY-MM
+router.get("/calendar", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { biometricId, employeeId, yearMonth } = req.query;
+        if (!yearMonth || !/^\d{4}-\d{2}$/.test(yearMonth))
+            return res.status(400).json({ success: false, message: "yearMonth required (YYYY-MM)" });
+
+        let bid = biometricId;
+        if (!bid && employeeId) {
+            const emp = await Employee.findById(employeeId).select("biometricId").lean();
+            bid = emp?.biometricId;
+        }
+        if (!bid) return res.status(400).json({ success: false, message: "biometricId or employeeId required" });
+
+        bid = String(bid).toUpperCase();
+        const [y, m] = yearMonth.split("-").map(Number);
+        const from = `${yearMonth}-01`;
+        const last = new Date(y, m, 0).getDate();
+        const to = `${yearMonth}-${String(last).padStart(2, "0")}`;
+
+        const docs = await DailyAttendance.find({ dateStr: { $gte: from, $lte: to } }).lean();
+        const summary = { present: 0, absent: 0, onLeave: 0, halfDay: 0, weeklyOff: 0, late: 0 };
+        const data = [];
+
+        for (const doc of docs) {
+            const emp = (doc.employees || []).find(e => e.biometricId === bid);
+            if (!emp) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["P", "P*", "P~", "MP"].includes(st)) summary.present++;
+            else if (st === "AB") summary.absent++;
+            else if (st?.startsWith("L-") || st === "LWP" || st === "CO") summary.onLeave++;
+            else if (st === "HD") summary.halfDay++;
+            else if (["WO", "FH", "NH", "OH", "RH"].includes(st)) summary.weeklyOff++;
+            if (emp.isLate) summary.late++;
+            data.push({ date: doc.dateStr, ...emp });
+        }
+
+        res.json({ success: true, data, summary });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  EXPORT HELPERS FOR OTHER ROUTE FILES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -4416,3 +4869,4 @@ router.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports = router;
 module.exports.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports.applyApprovedLeavesForDate = applyApprovedLeavesForDate;
+module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
