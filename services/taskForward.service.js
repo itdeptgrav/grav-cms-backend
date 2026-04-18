@@ -1075,9 +1075,19 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
 
   if (approved) {
     const newDueDate = task.proposedDeadline;
+
+    // Recalculate deadlineWindowSecs AT APPROVAL TIME (not proposal time).
+    // "Asked for" = how long from NOW (approval moment) until deadline.
+    // e.g. TL approves at 10:44 AM, deadline 11:14 AM → 30 min (correct)
+    // vs old: proposed at 5:12 AM, deadline 11:14 AM → 6h 02m (wrong)
+    const approvedWindowSecs = Math.max(0, Math.floor(
+      (new Date(newDueDate).getTime() - Date.now()) / 1000
+    ));
+
     await ref.update({
       status: prevStatus,
       dueDate: newDueDate,
+      deadlineWindowSecs: approvedWindowSecs,  // ← fixed: recalculated at approval time
       deadlineApprovedBy: approverId,
       deadlineApprovedByName: approverName,
       deadlineApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1141,9 +1151,122 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
   return { success: true };
 }
 
-// ═════════════════════════════════════════════════════════
-//  DRAFT CHAT — pre-confirmation discussion per task
-// ═════════════════════════════════════════════════════════
+// ── TL/CEO counter-proposes a deadline to employee ────────────────────────────
+// Called when TL doesn't accept employee's date but wants to suggest their own
+async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, counterDate, message }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+
+  if (task.assignedBy !== proposerId) throw new Error("Only the task creator can counter-propose a deadline.");
+  if (task.status !== "pending_deadline_approval") throw new Error("No pending deadline proposal to counter.");
+  if (!counterDate) throw new Error("Counter-propose date is required.");
+
+  await ref.update({
+    status: "pending_employee_deadline_confirmation",
+    tlCounterDeadline: counterDate,
+    tlCounterDeadlineMessage: message?.trim() || "",
+    tlCounterDeadlineBy: proposerId,
+    tlCounterDeadlineByName: proposerName,
+    tlCounterDeadlineAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await sendDraftChat({
+    taskId, senderId: proposerId, senderName: proposerName,
+    text: `📅 ${proposerName} suggested a new deadline: ${new Date(counterDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}${message ? ` — "${message.trim()}"` : ""}`,
+    messageType: "system",
+  });
+
+  await _notifyMany({
+    recipientIds: task.assigneeIds || [],
+    type: "deadline_counter_proposed",
+    title: `New deadline suggested for: ${task.title}`,
+    body: `${proposerName} suggested ${new Date(counterDate).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}`,
+    data: { taskId, taskTitle: task.title, counterDate },
+    senderId: proposerId, senderName: proposerName,
+  });
+  socket.emitToMany(task.assigneeIds || [], "deadline_counter_proposed", { taskId, counterDate, message: message?.trim() || "" });
+  return { success: true };
+}
+
+// ── Employee responds to TL's counter-proposal ────────────────────────────────
+async function employeeRespondToTlCounter({ taskId, employeeId, employeeName, accepted, rejectMessage }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+
+  if (!task.assigneeIds?.includes(employeeId)) throw new Error("Not assigned to this task.");
+  if (task.status !== "pending_employee_deadline_confirmation") throw new Error("No TL counter-proposal pending.");
+
+  if (accepted) {
+    const newDueDate = task.tlCounterDeadline;
+    const approvedWindowSecs = Math.max(0, Math.floor(
+      (new Date(newDueDate).getTime() - Date.now()) / 1000
+    ));
+
+    await ref.update({
+      status: "deadline_approved",
+      dueDate: newDueDate,
+      deadlineWindowSecs: approvedWindowSecs,
+      deadlineApprovedBy: task.tlCounterDeadlineBy,
+      deadlineApprovedByName: task.tlCounterDeadlineByName,
+      deadlineApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      tlCounterDeadline: null,
+      tlCounterDeadlineMessage: null,
+      deadlineStatus: deadlineStatus(newDueDate),
+      deadlineColor: deadlineColor(newDueDate),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await sendDraftChat({
+      taskId, senderId: employeeId, senderName: employeeName,
+      text: `✅ ${employeeName} accepted the deadline: ${new Date(newDueDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}`,
+      messageType: "system",
+    });
+
+    socket.emitToMany([task.assignedBy], "deadline_accepted", { taskId, dueDate: newDueDate });
+    await _notifyMany({
+      recipientIds: [task.assignedBy],
+      type: "deadline_accepted",
+      title: `Deadline accepted: ${task.title}`,
+      body: `${employeeName} accepted your suggested deadline.`,
+      data: { taskId, taskTitle: task.title },
+      senderId: employeeId, senderName: employeeName,
+    });
+  } else {
+    // Employee rejects TL counter → go back to open so employee can re-propose
+    await ref.update({
+      status: "open",
+      tlCounterDeadline: null,
+      tlCounterDeadlineMessage: null,
+      deadlineProposalRejected: false,
+      proposedDeadline: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await sendDraftChat({
+      taskId, senderId: employeeId, senderName: employeeName,
+      text: `❌ ${employeeName} rejected the suggested deadline${rejectMessage ? `: "${rejectMessage.trim()}"` : ""}. Please propose a new deadline.`,
+      messageType: "system",
+    });
+
+    socket.emitToMany([task.assignedBy], "deadline_counter_rejected", { taskId, reason: rejectMessage?.trim() || "" });
+    await _notifyMany({
+      recipientIds: [task.assignedBy],
+      type: "deadline_counter_rejected",
+      title: `Deadline rejected: ${task.title}`,
+      body: `${employeeName} rejected your suggested deadline${rejectMessage ? `: ${rejectMessage.trim()}` : ""}.`,
+      data: { taskId, taskTitle: task.title },
+      senderId: employeeId, senderName: employeeName,
+    });
+  }
+  return { success: true };
+}
+
+
 async function sendDraftChat({ taskId, senderId, senderName, text, attachments = [], messageType = "text" }) {
   const { v4: _uuidv4 } = require("uuid");
   const messageId = _uuidv4();
@@ -1199,6 +1322,8 @@ module.exports = {
   deadlineColor,
   proposeDeadline,
   approveDeadline,
+  tlCounterProposeDeadline,
+  employeeRespondToTlCounter,
   sendDraftChat,
   getDraftChat,
 };
