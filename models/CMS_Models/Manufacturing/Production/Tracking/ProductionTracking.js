@@ -67,7 +67,4 @@ const productionTrackingSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-productionTrackingSchema.index({ date: 1 });
-productionTrackingSchema.index({ "machines.machineId": 1 });
-
 module.exports = mongoose.model("ProductionTracking", productionTrackingSchema);
