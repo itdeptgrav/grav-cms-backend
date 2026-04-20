@@ -1,9 +1,9 @@
 "use strict";
 const express = require("express");
 const axios = require("axios");
+const cron = require("node-cron");
 const router = express.Router();
 const ExcelJS = require("exceljs");
-
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
 const Employee = require("../../models/Employee");
@@ -1294,6 +1294,39 @@ async function syncDayForce(dateStr, empCode = "ALL") {
 //  a holiday on a leave date doesn't consume leave balance — the leave route
 //  layer can re-examine this but for display this is correct.
 // ═══════════════════════════════════════════════════════════════════════════
+
+async function syncTodayOnly() {
+    const today = dateStrOf(new Date());
+    console.log(`[HOURLY-SYNC] Starting sync for ${today}`);
+    try {
+        const result = await syncDay(today, "ALL");
+        console.log(`[HOURLY-SYNC] Completed: ${result.employees} employees synced`);
+        return result;
+    } catch (err) {
+        console.error(`[HOURLY-SYNC] Failed for ${today}:`, err.message);
+        return null;
+    }
+}
+
+function startHourlyAttendanceSync() {
+    // Run every hour at minute 5 (e.g., 9:05, 10:05, 11:05...)
+    // This gives the device a few minutes to record punches after the hour
+    cron.schedule("5 * * * *", async () => {
+        console.log(`[HOURLY-SYNC-CRON] Triggered at ${new Date().toISOString()}`);
+        await syncTodayOnly();
+    }, {
+        timezone: "Asia/Kolkata",
+        scheduled: true,
+    });
+
+    console.log("[HOURLY-SYNC] ✅ Hourly attendance sync cron scheduled (runs at :05 past every hour IST)");
+
+    // Also run once immediately on server start to ensure today's data is fresh
+    setTimeout(() => {
+        syncTodayOnly().catch(e => console.error("[HOURLY-SYNC] Initial sync failed:", e.message));
+    }, 5000);
+}
+
 
 const LEAVE_TYPE_TO_STATUS = {
     CL: "L-CL",
@@ -4501,8 +4534,6 @@ router.delete("/holidays/:id", EmployeeAuthMiddlewear, async (req, res) => {
 //  Dependencies: npm install node-cron
 // ═══════════════════════════════════════════════════════════════════════════
 
-const cron = require("node-cron");
-
 // ── Inline notification settings model ──────────────────────────────────────
 const mongoose = require("mongoose");
 const HRNotifSettingsSchema = new mongoose.Schema({
@@ -4870,3 +4901,4 @@ module.exports = router;
 module.exports.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports.applyApprovedLeavesForDate = applyApprovedLeavesForDate;
 module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
+module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
