@@ -691,6 +691,74 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+router.get("/team-structure", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    // Fetch all active employees with only the fields we need
+    const employees = await Employee.find({ isActive: true })
+      .select("firstName lastName department designation biometricId profilePhoto primaryManager secondaryManager")
+      .lean();
+
+    // Build a map: leaderId → { leaderDoc, primaryReports, secondaryReports }
+    const leaderMap = {};
+
+    for (const emp of employees) {
+      const pid = emp.primaryManager?.managerId ? String(emp.primaryManager.managerId) : null;
+      const sid = emp.secondaryManager?.managerId ? String(emp.secondaryManager.managerId) : null;
+
+      if (pid) {
+        if (!leaderMap[pid]) leaderMap[pid] = { primary: [], secondary: [] };
+        leaderMap[pid].primary.push({
+          _id: emp._id, firstName: emp.firstName, lastName: emp.lastName,
+          department: emp.department, designation: emp.designation,
+          biometricId: emp.biometricId, profilePhoto: emp.profilePhoto,
+        });
+      }
+      if (sid) {
+        if (!leaderMap[sid]) leaderMap[sid] = { primary: [], secondary: [] };
+        leaderMap[sid].secondary.push({
+          _id: emp._id, firstName: emp.firstName, lastName: emp.lastName,
+          department: emp.department, designation: emp.designation,
+          biometricId: emp.biometricId, profilePhoto: emp.profilePhoto,
+        });
+      }
+    }
+
+    // Enrich with leader data
+    const leaderIds = Object.keys(leaderMap);
+    if (!leaderIds.length) return res.json({ success: true, data: [] });
+
+    const leaders = await Employee.find({ _id: { $in: leaderIds }, isActive: true })
+      .select("firstName lastName department designation biometricId profilePhoto")
+      .lean();
+
+    const result = leaders.map(l => ({
+      _id: l._id,
+      firstName: l.firstName,
+      lastName: l.lastName,
+      department: l.department,
+      designation: l.designation,
+      biometricId: l.biometricId,
+      profilePhoto: l.profilePhoto,
+      primaryReports: leaderMap[String(l._id)]?.primary || [],
+      secondaryReports: leaderMap[String(l._id)]?.secondary || [],
+      totalReports: (leaderMap[String(l._id)]?.primary.length || 0) +
+        (leaderMap[String(l._id)]?.secondary.length || 0),
+    }));
+
+    // Sort by department, then by name
+    result.sort((a, b) => {
+      const dept = (a.department || "").localeCompare(b.department || "");
+      if (dept !== 0) return dept;
+      return `${a.firstName} ${a.lastName}`.localeCompare(`${b.firstName} ${b.lastName}`);
+    });
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    console.error("[TEAM-STRUCTURE]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 const capitalize = (str) =>
   str ? str.charAt(0).toUpperCase() + str.slice(1) : str;

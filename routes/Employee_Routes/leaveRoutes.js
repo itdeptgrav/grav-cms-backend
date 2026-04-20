@@ -283,6 +283,163 @@ router.get("/calendar", AllEmployeeAppMiddleware, async (req, res) => {
     }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANAGER ENDPOINTS  ←  ALL here BEFORE /:id (prevents /:id swallowing them)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/employee/leave-applications/manager/my-team
+// Returns employees where the logged-in user is their primary OR secondary manager.
+// Empty result means this person is not a manager → hide Team Leave tab in the app.
+router.get("/manager/my-team", AllEmployeeAppMiddleware, async (req, res) => {
+    try {
+        const myId = req.user.id;
+        const team = await Employee.find({
+            isActive: true,
+            $or: [
+                { "primaryManager.managerId": myId },
+                { "secondaryManager.managerId": myId },
+            ],
+        })
+            .select("firstName lastName biometricId department designation primaryManager secondaryManager")
+            .lean();
+        res.json({ success: true, data: team });
+    } catch (err) {
+        console.error("[my-team]", err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// GET /api/employee/leave-applications/manager/pending
+// Shows apps where I am primary/secondary manager and need to act.
+router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
+    try {
+        const myId = req.user.id;
+        const apps = await LeaveApplication.find({
+            $or: [
+                // Primary: I need to act first
+                { "managersNotified": { $elemMatch: { managerId: myId, type: "primary" } }, status: "pending" },
+                // Secondary / HR: primary already approved, waiting for me
+                { "managersNotified": { $elemMatch: { managerId: myId, type: "secondary" } }, status: "manager_approved" },
+            ],
+        }).sort({ createdAt: -1 }).lean();
+
+        res.json({ success: true, data: apps });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// POST /api/employee/leave-applications/manager/add-on-behalf
+// Manager submits leave for an offline team member.
+// Backend validates the target employee is actually under this manager.
+router.post("/manager/add-on-behalf", AllEmployeeAppMiddleware, async (req, res) => {
+    try {
+        const { employeeId, leaveType, fromDate, toDate, reason, isHalfDay, halfDaySlot, managerRemarks } = req.body;
+        if (!employeeId || !leaveType || !fromDate || !toDate || !reason)
+            return res.status(400).json({ success: false, message: "employeeId, leaveType, fromDate, toDate, reason are required" });
+        if (!["CL", "SL", "PL"].includes(leaveType))
+            return res.status(400).json({ success: false, message: "Invalid leave type" });
+
+        const myId = req.user.id;
+        const targetEmp = await Employee.findById(employeeId)
+            .select("firstName lastName biometricId designation department dateOfJoining primaryManager secondaryManager email")
+            .lean();
+        if (!targetEmp) return res.status(404).json({ success: false, message: "Employee not found" });
+
+        // Strict manager check — must be primary OR secondary manager
+        const isPrimary = String(targetEmp.primaryManager?.managerId) === String(myId);
+        const isSecondary = String(targetEmp.secondaryManager?.managerId) === String(myId);
+        if (!isPrimary && !isSecondary)
+            return res.status(403).json({ success: false, message: "You are not a manager of this employee." });
+
+        const config = await LeaveConfig.getConfig();
+        const year = new Date(fromDate).getFullYear();
+        const workingDays = workingDaysSinceJoining(targetEmp.dateOfJoining);
+
+        if (workingDays < config.initialWaitingDays)
+            return res.status(400).json({ success: false, message: `Employee hasn't completed waiting period (${workingDays}/${config.initialWaitingDays} days).`, code: "WAITING_PERIOD" });
+        if (leaveType === "PL" && workingDays < config.daysRequiredForPL)
+            return res.status(400).json({ success: false, message: `Employee not eligible for PL (${workingDays}/${config.daysRequiredForPL} days).`, code: "PL_NOT_ELIGIBLE" });
+
+        const totalDays = isHalfDay ? 0.5 : countLeaveDays(fromDate, toDate);
+        if (totalDays <= 0) return res.status(400).json({ success: false, message: "No valid leave days in selected range" });
+
+        const activeConflict = await LeaveApplication.findOne({
+            employeeId, status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
+            fromDate: { $lte: toDate }, toDate: { $gte: fromDate },
+        });
+        if (activeConflict)
+            return res.status(400).json({ success: false, message: `Employee already has a leave from ${activeConflict.fromDate} to ${activeConflict.toDate}.`, code: "OVERLAP" });
+
+        const bal = await ensureBalance(employeeId, year, targetEmp.biometricId, config);
+        if (leaveType === "PL" && !bal.plEligible) { bal.plEligible = true; bal.plGrantedDate = new Date(); bal.entitlement.PL = config.plPerYear; await bal.save(); }
+        const liveEnt = { CL: config.clPerYear, SL: config.slPerYear, PL: bal.plEligible ? config.plPerYear : 0 };
+        const available = Math.max(0, liveEnt[leaveType] - bal.consumed[leaveType]);
+        if (totalDays > available)
+            return res.status(400).json({ success: false, message: `Insufficient ${leaveType} balance. Available: ${available}, Requested: ${totalDays}.`, code: "INSUFFICIENT_BALANCE" });
+
+        const requiresDocument = leaveType === "SL" && totalDays > config.slDocumentThreshold;
+        const managersNotified = [];
+        if (targetEmp.primaryManager?.managerId)
+            managersNotified.push({ managerId: targetEmp.primaryManager.managerId, managerName: targetEmp.primaryManager.managerName || "", type: "primary" });
+        if (targetEmp.secondaryManager?.managerId)
+            managersNotified.push({ managerId: targetEmp.secondaryManager.managerId, managerName: targetEmp.secondaryManager.managerName || "", type: "secondary" });
+
+        const myEmp = await Employee.findById(myId).select("firstName lastName").lean();
+        const myName = myEmp ? `${myEmp.firstName || ""} ${myEmp.lastName || ""}`.trim() : "Manager";
+
+        const managerDecisions = [{
+            managerId: myId, managerName: myName,
+            type: isPrimary ? "primary" : "secondary",
+            decision: "approved", remarks: managerRemarks || "Added on behalf by manager", decidedAt: new Date(),
+        }];
+        const hasSecondaryManager = !!targetEmp.secondaryManager?.managerId;
+        const status = (isPrimary && hasSecondaryManager) ? "manager_approved" : "hr_approved";
+
+        const app = await LeaveApplication.create({
+            employeeId, biometricId: targetEmp.biometricId,
+            employeeName: `${targetEmp.firstName} ${targetEmp.lastName}`.trim(),
+            designation: targetEmp.designation, department: targetEmp.department,
+            leaveType, applicationDate: new Date().toISOString().split("T")[0],
+            fromDate, toDate, totalDays, reason,
+            isHalfDay: isHalfDay ? true : false,
+            halfDaySlot: isHalfDay ? (halfDaySlot || "first_half") : null,
+            requiresDocument, managersNotified, managerDecisions, status,
+            hrRemarks: status === "hr_approved" ? `Approved on behalf by manager: ${myName}` : undefined,
+            hrApprovedAt: status === "hr_approved" ? new Date() : undefined,
+        });
+
+        if (status === "hr_approved") {
+            try {
+                await LeaveBalance.findOneAndUpdate({ employeeId, year },
+                    { $setOnInsert: { employeeId, biometricId: targetEmp.biometricId || "", year, entitlement: { CL: config.clPerYear, SL: config.slPerYear, PL: 0 }, consumed: { CL: 0, SL: 0, PL: 0 } }, $inc: { [`consumed.${leaveType}`]: totalDays } },
+                    { upsert: true });
+            } catch (e) { console.warn("[MGR-ONBEHALF] balance:", e.message); }
+            try {
+                const { applyLeaveToAttendance } = require("../HrRoutes/Attendance_section");
+                if (applyLeaveToAttendance) await applyLeaveToAttendance(app);
+            } catch (e) { console.warn("[MGR-ONBEHALF] attendance:", e.message); }
+            if (targetEmp.email) {
+                try {
+                    const emailService = require("../../services/emailService");
+                    if (emailService.sendLeaveApprovedToEmployee) emailService.sendLeaveApprovedToEmployee({ employeeEmail: targetEmp.email, employeeName: app.employeeName, leaveType, fromDate, toDate, totalDays, isHalfDay: app.isHalfDay, approvedBy: myName }).catch(() => { });
+                } catch (_) { }
+            }
+        }
+
+        res.status(201).json({
+            success: true, data: app,
+            message: status === "hr_approved"
+                ? `Leave added and approved for ${targetEmp.firstName}.`
+                : "Leave added and routed to secondary manager.",
+        });
+    } catch (err) {
+        console.error("[MGR-ONBEHALF]", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // GET /api/employee/leave-applications/:id
 router.get("/:id", AllEmployeeAppMiddleware, async (req, res) => {
     try {
@@ -639,30 +796,8 @@ router.post("/:id/upload-document", AllEmployeeAppMiddleware, (req, res, next) =
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MANAGER ENDPOINTS (employee who is someone's manager)
+//  MANAGER APPROVAL/REJECT ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/employee/leave-applications/manager/pending
-// Shows apps where:
-//   - I am a primary manager AND status = pending  (needs my first approval)
-//   - I am a secondary manager AND status = manager_approved (primary already approved, now needs me)
-router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
-    try {
-        const myId = req.user.id;
-        const apps = await LeaveApplication.find({
-            $or: [
-                // Primary: I need to act first
-                { "managersNotified": { $elemMatch: { managerId: myId, type: "primary" } }, status: "pending" },
-                // Secondary / HR: primary already approved, waiting for me
-                { "managersNotified": { $elemMatch: { managerId: myId, type: "secondary" } }, status: "manager_approved" },
-            ],
-        }).sort({ createdAt: -1 }).lean();
-
-        res.json({ success: true, data: apps });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
 
 // PATCH /api/employee/leave-applications/manager/:id/approve
 // Workflow:
