@@ -581,10 +581,19 @@ router.post(
             const rawText = await callGemini(apiKey, uploadedGeminiFiles, prompt);
 
             // ── Self-Cleaning: remove all files from Gemini File API ──────────
-            console.log(`\n[Pipeline] 🧹 Cleaning up ${uploadedGeminiFiles.length} file(s) from Gemini...`);
-            await Promise.all(
-                uploadedGeminiFiles.map(f => deleteGeminiFile(f.geminiName, apiKey))
-            );
+            // ── Save Gemini URIs so Ask AI can reuse them (no re-upload) ──────
+            await db.collection("meeting_gemini_files").doc(meetId).set({
+                meetId,
+                files: uploadedGeminiFiles.map((f, i) => ({
+                    fileUri: f.fileUri,
+                    geminiName: f.geminiName,
+                    mimeType: f.mimeType,
+                    employeeName: participantNames[i] || "",
+                })),
+                savedAt: Date.now(),
+                expiresAt: Date.now() + (47 * 60 * 60 * 1000),
+            });
+            console.log(`[Pipeline] 💾 Gemini URIs saved for Ask AI reuse (47h TTL)`);
 
             // ── Parse response ────────────────────────────────────────────────
             const parsed = parseResponse(rawText);
