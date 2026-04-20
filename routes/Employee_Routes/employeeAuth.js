@@ -5,6 +5,11 @@ const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
 const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
+const {
+  decryptSalaryFields,
+} = require("../../utils/salaryEncryption");
+
+
 
 // Get employee profile
 router.get("/profile", AllEmployeeAppMiddleware, async (req, res) => {
@@ -228,6 +233,47 @@ router.get("/dashboard", AllEmployeeAppMiddleware, async (req, res) => {
       success: false,
       message: "Error fetching dashboard data",
     });
+  }
+});
+
+
+// ─── GET employee salary breakdown (decrypted) ────────────────────────────────
+// Mounted at: GET /api/employee/salary
+// Salary is stored AES-256 encrypted in MongoDB. This endpoint decrypts and
+// returns plain numbers so the frontend can display ₹ amounts.
+router.get("/salary", AllEmployeeAppMiddleware, async (req, res) => {
+  try {
+    const employee = await Employee.findById(req.user.id)
+      .select("salary firstName lastName biometricId")
+      .lean();
+
+    if (!employee) {
+      return res.status(404).json({ success: false, message: "Employee not found" });
+    }
+
+    // Decrypt AES-encrypted salary fields into plain numbers
+    const sal = decryptSalaryFields(employee.salary || {});
+
+    res.status(200).json({
+      success: true,
+      data: {
+        gross: sal.gross || 0,
+        basic: sal.basic || 0,
+        hra: sal.hra || 0,
+        netSalary: sal.netSalary || 0,
+        epf: sal.epf || 0,
+        eeesic: sal.eeesic || 0,
+        totalDeduction: sal.totalDeduction || 0,
+        employerCost: sal.employerCost || 0,
+        foodAllowance: sal.foodAllowance || 0,
+        edli: sal.edli || 0,
+        adminCharges: sal.adminCharges || 0,
+        erEsic: sal.erEsic || 0,
+      },
+    });
+  } catch (error) {
+    console.error("Get salary error:", error);
+    res.status(500).json({ success: false, message: "Error fetching salary" });
   }
 });
 

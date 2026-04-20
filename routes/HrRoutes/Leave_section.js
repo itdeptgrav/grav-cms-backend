@@ -6,7 +6,10 @@ const mongoose = require("mongoose");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const Employee = require("../../models/Employee");
 const { LeaveConfig, LeaveBalance, LeaveApplication, CompanyHoliday } = require("../../models/HR_Models/LeaveManagement");
+const multer = require("multer");
+const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 const emailService = require("../../services/emailService");
+
 
 // Import attendance sync helpers
 const Attendance_section = require("./Attendance_section");
@@ -75,6 +78,18 @@ async function finaliseApproval(app, approverId, remarks = "") {
     }
     return attendanceResult;
 }
+
+
+const hrUploadMiddleware = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+        const allowed = ["application/pdf", "image/jpeg", "image/jpg", "image/png", "image/webp"];
+        if (allowed.includes(file.mimetype)) cb(null, true);
+        else cb(new Error("Only PDF, JPG, PNG or WEBP files are allowed."));
+    },
+}).single("document");
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  NAMED ROUTES
@@ -1143,5 +1158,94 @@ router.post("/add-on-behalf", EmployeeAuthMiddleware, async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
+
+router.post("/:id/upload-document", EmployeeAuthMiddleware, (req, res, next) => {
+    hrUploadMiddleware(req, res, (err) => {
+        if (err) return res.status(400).json({ success: false, message: err.message });
+        next();
+    });
+}, async (req, res) => {
+    try {
+        if (!req.file)
+            return res.status(400).json({ success: false, message: "No file uploaded." });
+
+        const app = await LeaveApplication.findById(req.params.id);
+        if (!app)
+            return res.status(404).json({ success: false, message: "Leave application not found." });
+
+        const ext = req.file.originalname.includes(".")
+            ? req.file.originalname.slice(req.file.originalname.lastIndexOf("."))
+            : ".pdf";
+        const safeName = (app.employeeName || "employee").replace(/[^a-zA-Z0-9]/g, "_");
+        const fileName = `SL_${safeName}_${app.fromDate}_${Date.now()}${ext}`;
+
+        const driveResult = await uploadToGoogleDrive(req.file.buffer, {
+            fileName,
+            mimeType: req.file.mimetype,
+        });
+
+        await LeaveApplication.updateOne(
+            { _id: req.params.id },
+            {
+                $set: {
+                    documentSubmitted: true,
+                    documentUrl: driveResult.viewUrl || driveResult.url,
+                    documentFileId: driveResult.fileId,
+                    documentFileName: fileName,
+                    documentUploadedAt: new Date(),
+                },
+            }
+        );
+
+        return res.json({
+            success: true,
+            message: "Document uploaded to Google Drive.",
+            data: {
+                documentUrl: driveResult.viewUrl || driveResult.url,
+                documentFileName: fileName,
+            },
+        });
+    } catch (err) {
+        console.error("[HR-DOC-UPLOAD]", err.message);
+        return res.status(500).json({ success: false, message: err.message || "Upload failed." });
+    }
+});
+
+
+async function _notifyEmployeeApproved(app) {
+    try {
+        const emp = await Employee.findById(app.employeeId).select("email").lean();
+        if (emp?.email) {
+            emailService.sendLeaveApprovedToEmployee({
+                employeeEmail: emp.email,
+                employeeName: app.employeeName,
+                leaveType: app.leaveType,
+                fromDate: app.fromDate,
+                toDate: app.toDate,
+                totalDays: app.totalDays,
+                isHalfDay: app.isHalfDay,
+                approvedBy: "HR",
+            }).catch(e => console.warn("[HR-APPROVE-EMAIL]", e.message));
+        }
+    } catch (e) { console.warn("[HR-APPROVE-EMAIL]", e.message); }
+}
+
+// Helper — fires-and-forgets email to employee on HR rejection
+async function _notifyEmployeeRejected(app, rejectionReason) {
+    try {
+        const emp = await Employee.findById(app.employeeId).select("email").lean();
+        if (emp?.email) {
+            emailService.sendLeaveRejectedToEmployee({
+                employeeEmail: emp.email,
+                employeeName: app.employeeName,
+                leaveType: app.leaveType,
+                fromDate: app.fromDate,
+                toDate: app.toDate,
+                totalDays: app.totalDays,
+                reason: rejectionReason || app.rejectionReason || "Not approved",
+            }).catch(e => console.warn("[HR-REJECT-EMAIL]", e.message));
+        }
+    } catch (e) { console.warn("[HR-REJECT-EMAIL]", e.message); }
+}
 
 module.exports = router;

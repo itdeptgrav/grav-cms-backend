@@ -651,6 +651,10 @@ app.use("/api/hr/payroll", payRollRouter);
 const payslipRouter = require("./routes/HrRoutes/Payslip_section");
 app.use("/api/hr/payslip", payslipRouter);
 
+
+const empAttendance = require("./routes/Employee_Routes/employeeAttendance");
+app.use("/api/employee/attendance", empAttendance);
+
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
