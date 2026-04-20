@@ -10,6 +10,7 @@ const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/Wo
 const Measurement = require("../../../models/Customer_Models/Measurement");
 const EmployeeProductionProgress = require("../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const mongoose = require("mongoose");
+const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -133,7 +134,8 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
       const discountedBase = priceBeforeGST - discountAmount;
       const discountedGST = discountedBase * (gstPercentage / 100);
       const discountedTotal = discountedBase + discountedGST;
-      return { ...item, gstPercentage,
+      return {
+        ...item, gstPercentage,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
         priceIncludingGST: discountPercentage > 0 ? parseFloat(discountedTotal.toFixed(2)) : priceIncludingGST,
@@ -148,7 +150,8 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
     const adjustment = parseFloat(quotationData.adjustment) || 0;
     const grandTotal = subtotalBeforeGST + totalGST + shippingCharges + adjustment;
 
-    Object.assign(quotation, { ...quotationData, items: itemsWithCalculations,
+    Object.assign(quotation, {
+      ...quotationData, items: itemsWithCalculations,
       subtotalBeforeGST: parseFloat(subtotalBeforeGST.toFixed(2)), totalDiscount: parseFloat(totalDiscount.toFixed(2)),
       totalGST: parseFloat(totalGST.toFixed(2)), shippingCharges: parseFloat(shippingCharges.toFixed(2)),
       adjustment: parseFloat(adjustment.toFixed(2)), grandTotal: parseFloat(grandTotal.toFixed(2)), updatedAt: new Date()
@@ -535,76 +538,76 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 
 
 router.get('/:measurementId/po-persons-export', async (req, res) => {
-    try {
-        const { measurementId } = req.params;
- 
-        if (!mongoose.Types.ObjectId.isValid(measurementId)) {
-            return res.status(400).json({ success: false, message: 'Valid measurement ID required' });
-        }
- 
-        const measurement = await Measurement.findById(measurementId)
-            .populate({ path: 'employeeMeasurements.products.productId', select: '_id name' })
-            .lean();
- 
-        if (!measurement) {
-            return res.status(404).json({ success: false, message: 'Measurement not found' });
-        }
- 
-        // Fetch MPC employees to get their display product names
-        const empIds = measurement.employeeMeasurements.map(e => e.employeeId).filter(Boolean);
- 
-        const mpcEmployees = await EmployeeMpc.find({ _id: { $in: empIds } })
-            .select('_id products department designation')
-            .lean();
- 
-        // Build map: employeeId → productId → mpcProductName
-        const mpcNameMap = new Map();
-        const mpcDetailsMap = new Map();
-        mpcEmployees.forEach(emp => {
-            const eid = emp._id.toString();
-            mpcDetailsMap.set(eid, { department: emp.department || '', designation: emp.designation || '' });
-            const prodMap = new Map();
-            (emp.products || []).forEach(p => {
-                const pid = p.productId?.toString();
-                if (pid && p.productName?.trim()) prodMap.set(pid, p.productName.trim());
-            });
-            mpcNameMap.set(eid, prodMap);
-        });
- 
-        // Build CSV
-        const headers = ['#', 'Employee Name', 'UIN', 'Gender', 'Department', 'Designation', 'Products'];
-        const rows = measurement.employeeMeasurements.map((emp, idx) => {
-            const eid = emp.employeeId?.toString();
-            const mpcDets = mpcDetailsMap.get(eid) || {};
-            const prodMap = mpcNameMap.get(eid) || new Map();
- 
-            const productsStr = (emp.products || []).map(p => {
-                const pid = (p.productId?._id || p.productId)?.toString();
-                const displayName = (pid && prodMap.get(pid)) || p.productName || p.productId?.name || 'Unknown';
-                return `${displayName} x${p.quantity || 1}`;
-            }).join(' | ');
- 
-            return [
-                idx + 1,
-                `"${emp.employeeName || ''}"`,
-                emp.employeeUIN || '',
-                emp.gender || '',
-                `"${mpcDets.department || ''}"`,
-                `"${mpcDets.designation || ''}"`,
-                `"${productsStr}"`,
-            ].join(',');
-        });
- 
-        const csv = ['\uFEFF', headers.join(','), ...rows].join('\n');
-        const safeName = (measurement.name || 'measurement').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
- 
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="${safeName}_persons.csv"`);
-        res.send(csv);
-    } catch (error) {
-        console.error('po-persons-export error:', error);
-        res.status(500).json({ success: false, message: 'Export failed' });
+  try {
+    const { measurementId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(measurementId)) {
+      return res.status(400).json({ success: false, message: 'Valid measurement ID required' });
     }
+
+    const measurement = await Measurement.findById(measurementId)
+      .populate({ path: 'employeeMeasurements.products.productId', select: '_id name' })
+      .lean();
+
+    if (!measurement) {
+      return res.status(404).json({ success: false, message: 'Measurement not found' });
+    }
+
+    // Fetch MPC employees to get their display product names
+    const empIds = measurement.employeeMeasurements.map(e => e.employeeId).filter(Boolean);
+
+    const mpcEmployees = await EmployeeMpc.find({ _id: { $in: empIds } })
+      .select('_id products department designation')
+      .lean();
+
+    // Build map: employeeId → productId → mpcProductName
+    const mpcNameMap = new Map();
+    const mpcDetailsMap = new Map();
+    mpcEmployees.forEach(emp => {
+      const eid = emp._id.toString();
+      mpcDetailsMap.set(eid, { department: emp.department || '', designation: emp.designation || '' });
+      const prodMap = new Map();
+      (emp.products || []).forEach(p => {
+        const pid = p.productId?.toString();
+        if (pid && p.productName?.trim()) prodMap.set(pid, p.productName.trim());
+      });
+      mpcNameMap.set(eid, prodMap);
+    });
+
+    // Build CSV
+    const headers = ['#', 'Employee Name', 'UIN', 'Gender', 'Department', 'Designation', 'Products'];
+    const rows = measurement.employeeMeasurements.map((emp, idx) => {
+      const eid = emp.employeeId?.toString();
+      const mpcDets = mpcDetailsMap.get(eid) || {};
+      const prodMap = mpcNameMap.get(eid) || new Map();
+
+      const productsStr = (emp.products || []).map(p => {
+        const pid = (p.productId?._id || p.productId)?.toString();
+        const displayName = (pid && prodMap.get(pid)) || p.productName || p.productId?.name || 'Unknown';
+        return `${displayName} x${p.quantity || 1}`;
+      }).join(' | ');
+
+      return [
+        idx + 1,
+        `"${emp.employeeName || ''}"`,
+        emp.employeeUIN || '',
+        emp.gender || '',
+        `"${mpcDets.department || ''}"`,
+        `"${mpcDets.designation || ''}"`,
+        `"${productsStr}"`,
+      ].join(',');
+    });
+
+    const csv = ['\uFEFF', headers.join(','), ...rows].join('\n');
+    const safeName = (measurement.name || 'measurement').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}_persons.csv"`);
+    res.send(csv);
+  } catch (error) {
+    console.error('po-persons-export error:', error);
+    res.status(500).json({ success: false, message: 'Export failed' });
+  }
 });
 
 
@@ -672,10 +675,10 @@ router.get("/requests/:requestId/quotations/:quotationId/download", async (req, 
 router.delete("/requests/:requestId", async (req, res) => {
   try {
     const { requestId } = req.params;
- 
+
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
- 
+
     // ── If this request originated from a measurement, clear its PO fields ──
     if (request.measurementId) {
       await Measurement.findByIdAndUpdate(request.measurementId, {
@@ -689,7 +692,7 @@ router.delete("/requests/:requestId", async (req, res) => {
       });
       console.log(`[delete-request] Reset PO fields on measurement ${request.measurementId}`);
     }
- 
+
     // ── Delete associated work orders if any ────────────────────────────────
     if (WorkOrder) {
       const woResult = await WorkOrder.deleteMany({ customerRequestId: request._id });
@@ -697,10 +700,10 @@ router.delete("/requests/:requestId", async (req, res) => {
         console.log(`[delete-request] Deleted ${woResult.deletedCount} work order(s) for request ${requestId}`);
       }
     }
- 
+
     // ── Delete the CustomerRequest itself ────────────────────────────────────
     await CustomerRequest.findByIdAndDelete(requestId);
- 
+
     res.json({
       success: true,
       message: "PO/Quotation removed successfully",
@@ -709,6 +712,250 @@ router.delete("/requests/:requestId", async (req, res) => {
   } catch (error) {
     console.error("Error deleting request:", error);
     res.status(500).json({ success: false, message: "Server error while removing PO/Quotation" });
+  }
+});
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET /requests/:requestId/po-breakdown
+// Realtime PO breakdown for PDF generation.
+// For measurement_conversion POs, expands items into rows keyed by
+// (stockItemId, variantId, MPC alias name, gender), summing quantities across
+// employees. For non-measurement POs, returns the quotation items as-is.
+// Rows are sorted by: productName (alpha) → gender (Male, Female, Unisex, Kids).
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get("/requests/:requestId/po-breakdown", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+
+    const request = await CustomerRequest.findById(requestId)
+      .populate("items.stockItemId", "name genderCategory hsnCode reference")
+      .lean();
+
+    if (!request) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+    if (!request.quotations || request.quotations.length === 0) {
+      return res.status(400).json({ success: false, message: "No quotation found for this request" });
+    }
+
+    const quotation = request.quotations[0];
+
+    // ── Non-measurement POs: no breakdown needed, return as-is ────────────
+    const isMeasurementPO =
+      request.requestType === "measurement_conversion" && !!request.measurementId;
+
+    if (!isMeasurementPO) {
+      return res.json({ success: true, quotation, request });
+    }
+
+    // ── Load measurement ──────────────────────────────────────────────────
+    const measurement = await Measurement.findById(request.measurementId)
+      .select("employeeMeasurements")
+      .lean();
+
+    if (!measurement) {
+      console.warn(`[po-breakdown] Measurement ${request.measurementId} not found, falling back to stored quotation`);
+      return res.json({ success: true, quotation, request });
+    }
+
+    // ── Load EmployeeMpc records for alias lookup ─────────────────────────
+    const empIds = (measurement.employeeMeasurements || [])
+      .map((e) => e.employeeId)
+      .filter(Boolean);
+
+    const mpcEmployees = await EmployeeMpc.find({ _id: { $in: empIds } })
+      .select("_id products")
+      .lean();
+
+    // Map<empIdStr, Map<"pid::vid"|"pid::_noVar_"|pid, aliasProductName>>
+    const mpcAliasMap = new Map();
+    for (const emp of mpcEmployees) {
+      const eid = emp._id.toString();
+      const lookup = new Map();
+      for (const p of emp.products || []) {
+        const pidStr = p.productId?.toString();
+        if (!pidStr) continue;
+        const vidStr = p.variantId?.toString() || null;
+        const alias = (p.productName || "").trim();
+        if (!alias) continue;
+
+        if (vidStr) lookup.set(`${pidStr}::${vidStr}`, alias);
+        else lookup.set(`${pidStr}::_noVar_`, alias);
+        // fallback bucket (first one wins)
+        if (!lookup.has(pidStr)) lookup.set(pidStr, alias);
+      }
+      mpcAliasMap.set(eid, lookup);
+    }
+
+    // ── Helper: attribute-equal match for quotation item lookup ──────────
+    const attrsEqual = (a = [], b = []) => {
+      if (a.length !== b.length) return false;
+      return a.every((x) =>
+        b.some((y) => y.name === x.name && y.value === x.value)
+      );
+    };
+
+    // ── Bucket: key = "pid::vid::alias::gender" ───────────────────────────
+    const bucketMap = new Map();
+
+    for (const empM of measurement.employeeMeasurements || []) {
+      const eid = empM.employeeId?.toString();
+
+      const aliasLookup = mpcAliasMap.get(eid) || new Map();
+
+      for (const prod of empM.products || []) {
+        const pidStr = prod.productId?.toString();
+        if (!pidStr) continue;
+        const vidStr = prod.variantId?.toString() || null;
+        const qty = Number(prod.quantity) || 0;
+        if (qty <= 0) continue;
+
+        const reqItemForGender = request.items.find(i => {
+          const iPid = (i.stockItemId?._id || i.stockItemId)?.toString();
+          return iPid === pidStr;
+        });
+        const gender = reqItemForGender?.stockItemId?.genderCategory || "Unisex";
+
+        // Resolve alias — prefer variant-specific, then product-only, then measurement's own stored name
+        let aliasName =
+          (vidStr && aliasLookup.get(`${pidStr}::${vidStr}`)) ||
+          aliasLookup.get(`${pidStr}::_noVar_`) ||
+          aliasLookup.get(pidStr) ||
+          (prod.productName || "").trim() ||
+          "Unknown";
+
+        const bucketKey = `${pidStr}::${vidStr || "noVar"}::${aliasName}::${gender}`;
+
+        if (!bucketMap.has(bucketKey)) {
+          // Find the corresponding request item + variant to pull attributes/reference
+          const reqItem = request.items.find((i) => {
+            const iPid = (i.stockItemId?._id || i.stockItemId)?.toString();
+            return iPid === pidStr;
+          });
+
+          let reqVariant = null;
+          if (reqItem) {
+            // try match by attribute set if measurement variant attrs exist somewhere,
+            // otherwise fall back to the first variant under this stockItem
+            // (we don't have attrs on measurement.products[] so we'll rely on index position of variant in stockItem — use first for now)
+            reqVariant = reqItem.variants?.[0] || null;
+          }
+
+          // Match quotation item by stockItemId + attribute equality
+          let quotItem = null;
+          if (reqItem && reqVariant) {
+            quotItem = quotation.items.find((qi) => {
+              const qiPid = (qi.stockItemId?._id || qi.stockItemId)?.toString();
+              if (qiPid !== pidStr) return false;
+              return attrsEqual(qi.attributes || [], reqVariant.attributes || []);
+            });
+          }
+          // Fallback — first quotation item with matching stockItemId
+          if (!quotItem) {
+            quotItem = quotation.items.find((qi) => {
+              const qiPid = (qi.stockItemId?._id || qi.stockItemId)?.toString();
+              return qiPid === pidStr;
+            });
+          }
+
+          const unitPrice = Number(quotItem?.unitPrice) || 0;
+          const gstPercentage =
+            quotItem?.gstPercentage != null
+              ? Number(quotItem.gstPercentage)
+              : getGSTPercentage(unitPrice);
+
+          bucketMap.set(bucketKey, {
+            stockItemId: pidStr,
+            variantId: vidStr,
+            itemName: gender ? `${aliasName} (${gender})` : aliasName,
+            itemCode:
+              quotItem?.itemCode ||
+              reqItem?.stockItemReference ||
+              reqItem?.stockItemId?.reference ||
+              "",
+            hsnCode:
+              quotItem?.hsnCode ||
+              reqItem?.stockItemId?.hsnCode ||
+              "",
+            gender,
+            attributes: reqVariant?.attributes || quotItem?.attributes || [],
+            unitPrice,
+            gstPercentage,
+            quantity: 0,
+            priceBeforeGST: 0,
+            gstAmount: 0,
+            priceIncludingGST: 0,
+          });
+        }
+
+        bucketMap.get(bucketKey).quantity += qty;
+      }
+    }
+
+    // ── Finalise rows: compute totals, sort ───────────────────────────────
+    const rows = Array.from(bucketMap.values()).map((r) => {
+      const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(
+        r.quantity,
+        r.unitPrice,
+        r.gstPercentage
+      );
+      return { ...r, priceBeforeGST, gstAmount, priceIncludingGST };
+    });
+
+    const genderOrder = { Male: 1, Female: 2, Unisex: 3, Kids: 4 };
+    rows.sort((a, b) => {
+      const nameCmp = (a.itemName || "").localeCompare(b.itemName || "");
+      if (nameCmp !== 0) return nameCmp;
+      const ga = genderOrder[a.gender] || 99;
+      const gb = genderOrder[b.gender] || 99;
+      if (ga !== gb) return ga - gb;
+      // tie-break by attribute signature so rows stay stable
+      const aSig = (a.attributes || []).map((x) => `${x.name}=${x.value}`).join("|");
+      const bSig = (b.attributes || []).map((x) => `${x.name}=${x.value}`).join("|");
+      return aSig.localeCompare(bSig);
+    });
+
+    // ── Rebuild quotation totals from broken-down rows ────────────────────
+    const subtotalBeforeGST = rows.reduce((s, r) => s + r.priceBeforeGST, 0);
+    const totalGST = rows.reduce((s, r) => s + r.gstAmount, 0);
+    const customCharges = quotation.customAdditionalCharges || [];
+    const customTotal = customCharges.reduce((s, c) => s + (Number(c.amount) || 0), 0);
+    const shipping = Number(quotation.shippingCharges) || 0;
+    const grandTotal = subtotalBeforeGST + totalGST + shipping + customTotal;
+
+    const brokenDownQuotation = {
+      ...quotation,
+      items: rows,
+      subtotalBeforeGST: parseFloat(subtotalBeforeGST.toFixed(2)),
+      totalGST: parseFloat(totalGST.toFixed(2)),
+      grandTotal: parseFloat(grandTotal.toFixed(2)),
+      paymentSchedule: (quotation.paymentSchedule || []).map((p) => ({
+        ...p,
+        amount: parseFloat(
+          ((grandTotal * (Number(p.percentage) || 0)) / 100).toFixed(2)
+        ),
+      })),
+    };
+
+    res.json({
+      success: true,
+      quotation: brokenDownQuotation,
+      request,
+      meta: {
+        breakdownApplied: true,
+        rowCount: rows.length,
+        source: "measurement_mpc_aliases",
+      },
+    });
+  } catch (error) {
+    console.error("Error generating PO breakdown:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while generating PO breakdown",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
   }
 });
 

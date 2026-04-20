@@ -69,9 +69,13 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, dueDate, priority, parentTaskId, groupId, createdByTl } = req.body;
+    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder } = req.body;
+    const dueDate = null; // Deadline is always set by employee after assignment
+    console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
-    if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
+    // isFolder can be boolean true OR string "true" from some clients
+    const folderFlag = isFolder === true || isFolder === "true";
+    if (!folderFlag && !assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
     const requesterRole = req.coworkUser.role;
     if (!["ceo", "tl", "employee"].includes(requesterRole)) {
@@ -80,7 +84,7 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
 
     // Check if any assignee is a TL → needs TL approval (only when employee creates)
     let initialStatus = "open";
-    if (requesterRole === "employee") {
+    if (requesterRole === "employee" && assigneeIds?.length) {
       for (const aid of assigneeIds) {
         const emp = await getEmployeeInfo(aid);
         if (emp?.role === "tl") { initialStatus = "pending_tl_approval"; break; }
@@ -92,13 +96,14 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       assignedBy: req.coworkUser.employeeId,
       assignedByName: req.coworkUser.name,
       assignedByRole: requesterRole,
-      assigneeIds,
-      dueDate: dueDate || null,
-      priority: priority || "medium",
+      assigneeIds: assigneeIds || [],
+      dueDate: null,
+      priority: (typeof priority === "number" ? priority : Number(priority)) || 5,
       parentTaskId: parentTaskId || null,
       groupId: groupId || null,
       createdByTl: createdByTl || false,
       status: initialStatus,
+      isFolder: folderFlag,
       // Mark whether this is a CEO-created root task (for visibility filtering)
       createdByCeo: requesterRole === "ceo" && !parentTaskId,
       createdByTl: requesterRole === "tl",
@@ -211,7 +216,7 @@ router.post("/task/:taskId/forward", verifyCoworkToken, verifyEmployeeToken, asy
 // ── 6. CREATE SUBTASK ─────────────────────────────────────────────────────────
 router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, dueDate, priority } = req.body;
+    const { title, description, notes, assigneeIds, priority } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
@@ -231,8 +236,8 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       assignedByName: name,
       assignedByRole: requesterRole,
       assigneeIds,
-      dueDate: dueDate || null,
-      priority: priority || "medium",
+      dueDate: null,
+      priority: (typeof priority === "number" ? priority : Number(priority)) || 5,
       parentTaskId: req.params.taskId,
       // TL subtasks should NOT show in CEO tree
       createdByTl: requesterRole === "tl",
@@ -411,6 +416,95 @@ router.get("/task/:taskId/full", verifyCoworkToken, verifyEmployeeToken, async (
     if (!task) return res.status(404).json({ error: "Task not found" });
     res.json({ task });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PROPOSE DEADLINE (employee sets deadline before confirming) ───────────────
+router.post("/task/:taskId/propose-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { proposedDate, workedSecs } = req.body;
+    if (!proposedDate) return res.status(400).json({ error: "proposedDate required" });
+    const result = await svc.proposeDeadline({
+      taskId: req.params.taskId,
+      employeeId: req.coworkUser.employeeId,
+      employeeName: req.coworkUser.name,
+      proposedDate,
+      workedSecs: Number(workedSecs) || 0,
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── APPROVE / REJECT DEADLINE (task creator only) ─────────────────────────────
+router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { approved, rejectionReason } = req.body;
+    if (typeof approved !== "boolean") return res.status(400).json({ error: "approved (boolean) required" });
+    const result = await svc.approveDeadline({
+      taskId: req.params.taskId,
+      approverId: req.coworkUser.employeeId,
+      approverName: req.coworkUser.name,
+      approved,
+      rejectionReason: rejectionReason || "",
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── TL/CEO COUNTER-PROPOSE DEADLINE ───────────────────────────────────────────
+router.post("/task/:taskId/tl-counter-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { counterDate, message } = req.body;
+    if (!counterDate) return res.status(400).json({ error: "counterDate required" });
+    const result = await svc.tlCounterProposeDeadline({
+      taskId: req.params.taskId,
+      proposerId: req.coworkUser.employeeId,
+      proposerName: req.coworkUser.name,
+      counterDate,
+      message: message || "",
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── EMPLOYEE RESPOND TO TL COUNTER-PROPOSAL ────────────────────────────────────
+router.post("/task/:taskId/respond-tl-counter", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { accepted, rejectMessage } = req.body;
+    if (typeof accepted !== "boolean") return res.status(400).json({ error: "accepted (boolean) required" });
+    const result = await svc.employeeRespondToTlCounter({
+      taskId: req.params.taskId,
+      employeeId: req.coworkUser.employeeId,
+      employeeName: req.coworkUser.name,
+      accepted,
+      rejectMessage: rejectMessage || "",
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── DRAFT CHAT (GET) ──────────────────────────────────────────────────────────
+router.get("/task/:taskId/draft-chat", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const messages = await svc.getDraftChat(req.params.taskId, req.query.limit || 100);
+    res.json({ messages });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DRAFT CHAT (POST) ─────────────────────────────────────────────────────────
+router.post("/task/:taskId/draft-chat", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { text, attachments, messageType } = req.body;
+    if (!text?.trim() && !attachments?.length) return res.status(400).json({ error: "text or attachments required" });
+    const msg = await svc.sendDraftChat({
+      taskId: req.params.taskId,
+      senderId: req.coworkUser.employeeId,
+      senderName: req.coworkUser.name,
+      text: text || "",
+      attachments: attachments || [],
+      messageType: messageType || "text",
+    });
+    res.status(201).json({ success: true, message: msg });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 module.exports = router;
