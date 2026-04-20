@@ -607,7 +607,6 @@ app.use("/api/cms/sales", quotationRoutes);
 const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
 
-
 // HR Department Routes
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
@@ -1318,6 +1317,15 @@ app.post("/api/cms/production/cleanup/manual", async (req, res) => {
     res.status(500).json({ success: false, message: "Error during manual cleanup", error: error.message });
   }
 });
+
+
+if (attendanceRouter.startHourlyAttendanceSync) {
+  attendanceRouter.startHourlyAttendanceSync();
+  console.log("✅ Hourly attendance sync cron initialized");
+} else {
+  console.warn("⚠️ Hourly attendance sync not available");
+}
+
 
 // Graceful shutdown
 let isShuttingDown = false;
