@@ -29,6 +29,27 @@ function deadlineColor(dueDate) {
   return s === "overdue" ? "#d93025" : s === "near" ? "#f9ab00" : s === "safe" ? "#1e8e3e" : "#80868b";
 }
 
+// ─── Duration formatter for draft-chat system messages ────────────────────────
+// Formats "duration from now" as a human string like "2h", "45m", "1h 30m", "3 days".
+// Used in deadline proposal/counter chat messages to AVOID a stale wall-clock timestamp
+// (which misleads under the live-deadline model where the clock only starts when the
+// employee presses Play).
+function _fmtDurationChat(targetDate) {
+  if (!targetDate) return "?";
+  const ms = new Date(targetDate).getTime() - Date.now();
+  if (ms <= 0) return "0m";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) {
+    const h = Math.floor(s / 3600);
+    const m = Math.round((s % 3600) / 60);
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+  const days = Math.round(s / 86400);
+  return days === 1 ? "1 day" : `${days} days`;
+}
+
 // ─── Notify helper ────────────────────────────────────────
 async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
@@ -1035,11 +1056,15 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
   }
 
   // Post system message in draft chat
+  // Show DURATION ("2h to complete") instead of a wall-clock timestamp.
+  // The live-deadline model starts the clock only when the employee presses Play,
+  // so a wall-clock time written here (e.g. "10:11 am") becomes misleading as real
+  // time passes and the timer hasn't started yet.
   await sendDraftChat({
     taskId,
     senderId: employeeId,
     senderName: employeeName,
-    text: `📅 ${employeeName} proposed deadline: ${new Date(proposedDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}`,
+    text: `📅 ${employeeName} proposed deadline: ${_fmtDurationChat(proposedDate)} to complete`,
     messageType: "system",
   });
 
@@ -1102,7 +1127,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
       taskId,
       senderId: approverId,
       senderName: approverName,
-      text: `✅ ${approverName} approved the deadline: ${new Date(newDueDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}. You can now confirm the task.`,
+      text: `✅ ${approverName} approved the deadline: ${_fmtDurationChat(newDueDate)} to complete. You can now confirm the task.`,
       messageType: "system",
     });
 
@@ -1175,7 +1200,7 @@ async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, coun
 
   await sendDraftChat({
     taskId, senderId: proposerId, senderName: proposerName,
-    text: `📅 ${proposerName} suggested a new deadline: ${new Date(counterDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}${message ? ` — "${message.trim()}"` : ""}`,
+    text: `📅 ${proposerName} suggested a new deadline: ${_fmtDurationChat(counterDate)} to complete${message ? ` — "${message.trim()}"` : ""}`,
     messageType: "system",
   });
 
@@ -1183,7 +1208,7 @@ async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, coun
     recipientIds: task.assigneeIds || [],
     type: "deadline_counter_proposed",
     title: `New deadline suggested for: ${task.title}`,
-    body: `${proposerName} suggested ${new Date(counterDate).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}`,
+    body: `${proposerName} suggested ${_fmtDurationChat(counterDate)} to complete`,
     data: { taskId, taskTitle: task.title, counterDate },
     senderId: proposerId, senderName: proposerName,
   });
@@ -1223,7 +1248,7 @@ async function employeeRespondToTlCounter({ taskId, employeeId, employeeName, ac
 
     await sendDraftChat({
       taskId, senderId: employeeId, senderName: employeeName,
-      text: `✅ ${employeeName} accepted the deadline: ${new Date(newDueDate).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}`,
+      text: `✅ ${employeeName} accepted the deadline: ${_fmtDurationChat(newDueDate)} to complete`,
       messageType: "system",
     });
 
