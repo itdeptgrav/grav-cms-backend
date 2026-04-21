@@ -1297,6 +1297,9 @@ app.get("/", (req, res) => {
   });
 });
 
+const payslipRoutes = require('./routes/Employee_routes/payslip');
+app.use('/api/employee/payslip', payslipRoutes);
+
 /* =====================
     PRODUCTION SYNC MANAGEMENT ROUTES
   ===================== */
