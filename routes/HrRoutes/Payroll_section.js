@@ -14,9 +14,6 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 const {
     decryptSalaryFields,
     decryptEmployeeDoc,
-    encryptPayrollItem,
-    decryptPayrollItem,
-    encryptNumber,
 } = require("../../utils/salaryEncryption");
 
 const MONTH_NAMES = [
@@ -566,7 +563,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
                     sundayWorkExtraPay: settings.sundayWorkExtraPay,
                 },
                 summary,
-                items: items.map(decryptPayrollItem),
+                items,
                 existingRun: existingRun
                     ? { id: existingRun._id, status: existingRun.status, processedAt: existingRun.processedAt }
                     : null,
@@ -644,15 +641,9 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             };
             const computed = computeEmployeePayroll(emp, ctx);
 
-            // Encrypt monetary fields before persisting to MongoDB
-            const encEarnings = encryptPayrollItem({ earnings: computed.earnings }).earnings;
-            const encDeductions = encryptPayrollItem({ deductions: computed.deductions }).deductions;
-            const encRateGross = computed.rateGross ? encryptNumber(computed.rateGross) : 0;
-            const encRateBasic = computed.rateBasic ? encryptNumber(computed.rateBasic) : 0;
-            const encRateHra = computed.rateHra ? encryptNumber(computed.rateHra) : 0;
-            const encPerDayRate = computed.perDayRate ? encryptNumber(computed.perDayRate) : 0;
-            const encNetPay = computed.netPay ? encryptNumber(computed.netPay) : 0;
-            const encRoundedNetPay = computed.roundedNetPay ? encryptNumber(computed.roundedNetPay) : 0;
+            // Store all PayrollItem fields as plain numbers (schema expects Number type).
+            // The employee's source salary in the Employee model is already encrypted.
+            // PayrollItem is HR-access-only and the pre-save hook needs plain numbers for calculations.
 
             // Upsert PayrollItem  (unique on employeeId + month + year)
             // Persist ALL computed fields so the saved payroll list, drawer, payslip,
@@ -671,10 +662,10 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     month, year,
                     payPeriod: computed.payPeriod,
 
-                    // Rate snapshot — encrypted
-                    rateBasic: encRateBasic,
-                    rateHra: encRateHra,
-                    rateGross: encRateGross,
+                    // Rate snapshot — plain numbers
+                    rateBasic: computed.rateBasic,
+                    rateHra: computed.rateHra,
+                    rateGross: computed.rateGross,
 
                     // Attendance counts (not sensitive — not encrypted)
                     workingDays: computed.workingDays,
@@ -694,10 +685,10 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     slUsedDays: computed.slUsedDays,
                     plUsedDays: computed.plUsedDays,
 
-                    // Payable days + per-day rate — per-day rate encrypted
+                    // Payable days + per-day rate
                     payableDays: computed.payableDays,
                     effectivePayableDays: computed.effectivePayableDays,
-                    perDayRate: encPerDayRate,
+                    perDayRate: computed.perDayRate,
                     divisorBasis: computed.divisorBasis,
                     sundayExtraPayDays: computed.sundayExtraPayDays,
 
@@ -709,11 +700,11 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     // Leave balance snapshot (not sensitive)
                     leaveBalanceSnapshot: computed.leaveBalanceSnapshot,
 
-                    // Earnings & Deductions — encrypted
-                    earnings: encEarnings,
-                    deductions: encDeductions,
-                    netPay: encNetPay,
-                    roundedNetPay: encRoundedNetPay,
+                    // Earnings & Deductions — plain numbers (pre-save hook calculates totals)
+                    earnings: computed.earnings,
+                    deductions: computed.deductions,
+                    netPay: computed.netPay,
+                    roundedNetPay: computed.roundedNetPay,
                     bankDetails: computed.bankDetails,
 
                     // Day breakdown (per-day audit trail — not sensitive)
@@ -848,10 +839,7 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
 
         const run = await Payroll.findOne({ month, year }).lean();
 
-        // Decrypt earnings/deductions in every item before sending to the frontend
-        const decryptedItems = items.map(decryptPayrollItem);
-
-        res.json({ success: true, data: { items: decryptedItems, run, count: decryptedItems.length } });
+        res.json({ success: true, data: { items, run, count: items.length } });
     } catch (err) {
         console.error("[PAYROLL-ITEMS]", err);
         res.status(500).json({ success: false, message: err.message });
@@ -865,7 +853,7 @@ router.get("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
             .populate("employeeId", "firstName lastName profilePhoto email phone dateOfJoining")
             .lean();
         if (!item) return res.status(404).json({ success: false, message: "Payroll item not found" });
-        res.json({ success: true, data: decryptPayrollItem(item) });
+        res.json({ success: true, data: item });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -889,7 +877,7 @@ router.put("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
         const allowed = ["earnings", "deductions", "remarks"];
         allowed.forEach((k) => { if (req.body[k] !== undefined) item[k] = req.body[k]; });
         await item.save(); // pre-save recalculates gross & net
-        res.json({ success: true, data: decryptPayrollItem(item.toObject()) });
+        res.json({ success: true, data: item.toObject() });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -1050,7 +1038,7 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         res.json({
             success: true,
             message: "Override applied and net pay recomputed",
-            data: decryptPayrollItem(item.toObject()),
+            data: item.toObject(),
         });
     } catch (err) {
         console.error("[PAYROLL-OVERRIDE]", err);
@@ -1235,6 +1223,7 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         const employees = await Employee.find({
             _id: { $in: items.map((i) => i.employeeId) },
         }).select("firstName middleName lastName biometricId designation jobTitle department salary bankDetails").lean();
+
         // Decrypt salary so fallback reads (emp.salary?.gross etc.) work correctly
         const empById = new Map(employees.map((e) => [String(e._id), decryptEmployeeDoc(e)]));
 
@@ -1322,14 +1311,13 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         items.forEach((it, idx) => {
             const row = ws.getRow(4 + idx);
             const emp = empById.get(String(it.employeeId)) || {};
-            // Decrypt the payroll item's rate snapshot and earnings/deductions
-            const decIt = decryptPayrollItem(it);
+
             // Prefer rate snapshot from payroll item; fall back to employee salary
-            const rateBasic = decIt.attendance?.rateBasic || emp.salary?.basic || 0;
-            const rateHra = decIt.attendance?.rateHra || emp.salary?.hra || 0;
-            const rateGross = decIt.attendance?.rateGross || emp.salary?.gross || 0;
-            const e = decIt.earnings || {};
-            const d = decIt.deductions || {};
+            const rateBasic = it.rateBasic || emp.salary?.basic || 0;
+            const rateHra = it.rateHra || emp.salary?.hra || 0;
+            const rateGross = it.rateGross || emp.salary?.gross || 0;
+            const e = it.earnings || {};
+            const d = it.deductions || {};
 
             row.getCell(1).value = idx + 1;                                           // Sl
             row.getCell(2).value = it.employeeName || "";                             // Name

@@ -18,13 +18,9 @@
  *   Generate a key once:
  *     node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
  *
- * WHAT IS ENCRYPTED (all numeric salary fields):
- *   gross, basic, hra, specialAllowance, epf, edli, adminCharges,
- *   eeesic, erEsic, foodAllowance, employerCost, totalDeduction, netSalary,
- *   allowances, deductions
- *
- * WHAT IS NOT ENCRYPTED:
- *   edliOverride, adminOverride (booleans — not sensitive, needed for logic)
+ * WHAT IS ENCRYPTED:
+ *   Employee model salary fields only (gross, basic, hra, etc.)
+ *   PayrollItem is NOT encrypted (derived data, schema compatibility, performance)
  *
  * HOW IT WORKS IN MONGO:
  *   { "salary.gross": "enc:a1b2c3...:iv...:tag..." }
@@ -41,26 +37,13 @@ const IV_BYTES = 12;   // 96-bit IV — recommended for GCM
 const TAG_BYTES = 16;   // 128-bit auth tag — GCM default
 const PREFIX = "enc:";
 
-// Salary fields that should be encrypted (all numeric monetary values)
+// Salary fields that should be encrypted (Employee model only)
 const SALARY_NUM_FIELDS = [
     "gross", "basic", "hra", "specialAllowance",
     "epf", "edli", "adminCharges",
     "eeesic", "erEsic", "foodAllowance",
     "employerCost", "totalDeduction", "netSalary",
     "allowances", "deductions",
-    // Payroll model rate fields
-    "rateGross", "rateBasic", "rateHra",
-    "perDayRate",
-    // Payroll earnings sub-fields
-    "basicSalary", "houseRentAllowance", "travelAllowance",
-    "medicalAllowance", "specialAllowance", "overtime", "bonus",
-    "incentives", "otherEarnings", "grossEarnings",
-    // Payroll deductions sub-fields
-    "providentFund", "esic", "incomeTax", "loanDeduction",
-    "advanceDeduction", "lopDeduction", "otherDeductions", "totalDeductions",
-    "employerPF", "employerESIC",
-    // Payroll totals
-    "grossPay", "netPay", "roundedNetPay",
 ];
 
 // ─── Key management ──────────────────────────────────────────────────────────
@@ -192,7 +175,7 @@ function decryptSalaryFields(salaryObj) {
  * Safe to call even if the employee has no salary sub-doc.
  *
  * @param  {Object} employeeDoc
- * @returns {Object}  new object with salary and bankDetails decrypted
+ * @returns {Object}  new object with salary decrypted
  */
 function decryptEmployeeDoc(employeeDoc) {
     if (!employeeDoc) return employeeDoc;
@@ -212,55 +195,6 @@ function decryptEmployeeDoc(employeeDoc) {
 function decryptEmployeeDocs(docs) {
     if (!Array.isArray(docs)) return docs;
     return docs.map(decryptEmployeeDoc);
-}
-
-/**
- * Decrypt a PayrollItem document (salary numbers live inside earnings /
- * deductions / attendance sub-docs).
- */
-function decryptPayrollItem(item) {
-    if (!item) return item;
-    const doc = typeof item.toObject === "function"
-        ? item.toObject({ virtuals: true })
-        : { ...item };
-
-    const att = doc.attendance || {};
-    if (att.rateGross !== undefined) att.rateGross = decryptNumber(att.rateGross);
-    if (att.rateBasic !== undefined) att.rateBasic = decryptNumber(att.rateBasic);
-    if (att.rateHra !== undefined) att.rateHra = decryptNumber(att.rateHra);
-    if (att.perDayRate !== undefined) att.perDayRate = decryptNumber(att.perDayRate);
-    doc.attendance = att;
-
-    if (doc.earnings) doc.earnings = decryptSalaryFields(doc.earnings);
-    if (doc.deductions) doc.deductions = decryptSalaryFields(doc.deductions);
-
-    if (doc.grossPay !== undefined) doc.grossPay = decryptNumber(doc.grossPay);
-    if (doc.netPay !== undefined) doc.netPay = decryptNumber(doc.netPay);
-    if (doc.roundedNetPay !== undefined) doc.roundedNetPay = decryptNumber(doc.roundedNetPay);
-
-    return doc;
-}
-
-/**
- * Encrypt a PayrollItem's monetary fields before saving.
- */
-function encryptPayrollItem(item) {
-    if (!item) return item;
-
-    const att = item.attendance || {};
-    if (att.rateGross !== undefined && att.rateGross !== 0) att.rateGross = encryptNumber(att.rateGross);
-    if (att.rateBasic !== undefined && att.rateBasic !== 0) att.rateBasic = encryptNumber(att.rateBasic);
-    if (att.rateHra !== undefined && att.rateHra !== 0) att.rateHra = encryptNumber(att.rateHra);
-    if (att.perDayRate !== undefined && att.perDayRate !== 0) att.perDayRate = encryptNumber(att.perDayRate);
-
-    if (item.earnings) item.earnings = encryptSalaryFields(item.earnings);
-    if (item.deductions) item.deductions = encryptSalaryFields(item.deductions);
-
-    if (item.grossPay && item.grossPay !== 0) item.grossPay = encryptNumber(item.grossPay);
-    if (item.netPay && item.netPay !== 0) item.netPay = encryptNumber(item.netPay);
-    if (item.roundedNetPay && item.roundedNetPay !== 0) item.roundedNetPay = encryptNumber(item.roundedNetPay);
-
-    return item;
 }
 
 // ─── Migration helper ────────────────────────────────────────────────────────
@@ -316,8 +250,6 @@ module.exports = {
     decryptSalaryFields,
     decryptEmployeeDoc,
     decryptEmployeeDocs,
-    encryptPayrollItem,
-    decryptPayrollItem,
     isEncrypted,
     migrateSalaryData,
     SALARY_NUM_FIELDS,
