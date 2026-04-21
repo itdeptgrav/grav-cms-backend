@@ -18,7 +18,7 @@ async function getHRRecipients() {
 class EmailService {
     constructor() {
         this.apiKey = process.env.BREVO_API_KEY;
-        this.senderEmail = process.env.HR_SENDER_EMAIL || process.env.CUSTOMER_SENDER_EMAIL || "soumyaranjanpraharaj04@gmail.com";
+        this.senderEmail = process.env.HR_SENDER_EMAIL || process.env.CUSTOMER_SENDER_EMAIL || "itdeptgrav@gmail.com";
         this.senderName = "Grav HR System";
         this.baseUrl = "https://api.brevo.com/v3";
     }
