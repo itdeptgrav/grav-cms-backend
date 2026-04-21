@@ -25,7 +25,8 @@ const allowedOrigins = [
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
   "http://10.99.21.15:3000",
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
-  "https://grav-cms-dncs.vercel.app"
+  "https://grav-cms-dncs.vercel.app",
+  "https://crm.grav.in"
 ];
 
 app.use(
@@ -1297,7 +1298,7 @@ app.get("/", (req, res) => {
   });
 });
 
-const payslipRoutes = require('./routes/Employee_routes/payslip');
+const payslipRoutes = require('./routes/Employee_Routes/Payslip');
 app.use('/api/employee/payslip', payslipRoutes);
 
 /* =====================
