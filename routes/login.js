@@ -88,19 +88,15 @@ router.post("/login", async (req, res) => {
       { expiresIn: "7d" },
     );
 
-    // After — detects HTTPS from the request itself
-    const isSecure =
-      req.secure ||
-      req.headers["x-forwarded-proto"] === "https" ||
-      process.env.NODE_ENV === "production";
+    const isProduction = process.env.NODE_ENV === "production";
 
+    // 🔐 SET COOKIE
     res.cookie("auth_token", token, {
       httpOnly: true,
-      secure: isSecure,
-      sameSite: isSecure ? "none" : "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // ✅ 7 days
     });
-
 
     // ✅ Determine redirect path based on role
     let redirectPath = "/";
