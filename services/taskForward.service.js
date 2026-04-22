@@ -1056,6 +1056,10 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
     proposedDeadlineByName: employeeName,
     proposedDeadlineAt: admin.firestore.FieldValue.serverTimestamp(),
     deadlineWindowSecs,           // asked-for TOTAL after this request
+    // ── Snapshot the CURRENT approved window so the rejection path can
+    // roll it back. Without this, a rejected extension leaves deadlineWindowSecs
+    // permanently inflated (e.g. rejected +1h 60m shows "2h 5m asked" forever).
+    deadlineWindowSecsBeforeProposal: existingWindowSecs,
     prevStatusBeforeDeadlineProposal: task.status,
     status: "pending_deadline_approval",
     deadlineProposalRejected: false,
@@ -1225,15 +1229,30 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     socket.emitToMany(task.assigneeIds || [], "deadline_approved", { taskId, dueDate: newDueDate });
   } else {
     if (!rejectionReason?.trim()) throw new Error("Rejection reason is required.");
+    // ── Roll deadlineWindowSecs back to what it was before this proposal ──
+    // proposeDeadline wrote the new proposed total into deadlineWindowSecs so
+    // TL/CEO could see "X asked". On rejection that value must be reverted —
+    // otherwise a rejected +1h extension permanently shows "2h 5m asked" and
+    // the DeadlineBreakdown math breaks (original + approved extensions ≠ total).
+    const rolledBackWindowSecs = Number(task.deadlineWindowSecsBeforeProposal) > 0
+      ? Number(task.deadlineWindowSecsBeforeProposal)
+      : (Number(task.originalWindowSecs) || 0) +
+      ((task.extensions || []).reduce((s, e) => s + (Number(e.addedSecs) || 0), 0));
     await ref.update({
       status: "open",
+      deadlineWindowSecs: rolledBackWindowSecs,
+      deadlineWindowSecsBeforeProposal: null,   // clear the snapshot
       deadlineProposalRejected: true,
       deadlineRejectionReason: rejectionReason.trim(),
       proposedDeadline: null,
       proposedDeadlineBy: null,
       proposedDeadlineAt: null,
+      // Clear pending extension markers too — they're stale now
+      pendingExtensionSecs: null,
+      pendingExtensionPrevWindowSecs: null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
 
     await sendDraftChat({
       taskId,
@@ -1364,6 +1383,7 @@ async function employeeRespondToTlCounter({ taskId, employeeId, employeeName, ac
       deadlineStatus: deadlineStatus(newDueDate),
       deadlineColor: deadlineColor(newDueDate),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deadlineWindowSecsBeforeProposal: null,
     };
 
     // First-time: record original window. Extension: append audit entry.
