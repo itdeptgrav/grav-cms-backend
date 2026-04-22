@@ -17,6 +17,9 @@ const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/
 const Employee = require("../../../../models/Employee");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 
+const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+const Measurement = require("../../../../models/Customer_Models/Measurement");
+
 router.use(EmployeeAuthMiddleware);
 
 // ============================================================================
@@ -993,6 +996,187 @@ router.get("/operator-details", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching operator details:", error);
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+});
+
+
+router.get("/find-piece", async (req, res) => {
+  try {
+    const { barcode } = req.query;
+    if (!barcode) {
+      return res.status(400).json({ success: false, message: "barcode query param is required" });
+    }
+
+    const parsed = parseBarcode(barcode.trim());
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid barcode format. Expected WO-<shortId>-<unitNumber>",
+      });
+    }
+
+    const { workOrderShortId, unitNumber } = parsed;
+
+    const workOrder = await findWorkOrderByShortId(workOrderShortId);
+    if (!workOrder) {
+      return res.status(404).json({
+        success: false,
+        message: `Work order with short id "${workOrderShortId}" not found`,
+      });
+    }
+
+    if (!unitNumber || unitNumber <= 0 || unitNumber > workOrder.quantity) {
+      return res.status(400).json({
+        success: false,
+        message: `Unit ${unitNumber} is out of range for this WO (1 – ${workOrder.quantity})`,
+      });
+    }
+
+    // ── MO / CustomerRequest ──────────────────────────────────────────────
+    const customerRequest = workOrder.customerRequestId
+      ? await CustomerRequest.findById(workOrder.customerRequestId).lean()
+      : null;
+
+    const isMeasurementConversion = customerRequest?.requestType === "measurement_conversion";
+
+    // ── Piece owner (measurement-to-PO only) ──────────────────────────────
+    let pieceOwner = null;
+    let siblingPieces = [];
+    let measurementDoc = null;
+
+    if (isMeasurementConversion) {
+      const empProgress = await EmployeeProductionProgress.findOne({
+        workOrderId: workOrder._id,
+        unitStart: { $lte: unitNumber },
+        unitEnd:   { $gte: unitNumber },
+      }).lean();
+
+      if (empProgress) {
+        pieceOwner = {
+          employeeId:     empProgress.employeeId,
+          employeeName:   empProgress.employeeName,
+          employeeUIN:    empProgress.employeeUIN,
+          gender:         empProgress.gender,
+          unitStart:      empProgress.unitStart,
+          unitEnd:        empProgress.unitEnd,
+          totalUnits:     empProgress.totalUnits,
+          completedUnits: empProgress.completedUnits,
+          isDispatched:   empProgress.isDispatched,
+        };
+
+        const completedSet = new Set(empProgress.completedUnitNumbers || []);
+        for (let u = empProgress.unitStart; u <= empProgress.unitEnd; u++) {
+          if (u === unitNumber) continue;
+          siblingPieces.push({
+            unitNumber: u,
+            barcodeId: `WO-${workOrderShortId}-${String(u).padStart(3, "0")}`,
+            completed: completedSet.has(u),
+          });
+        }
+      }
+
+      if (customerRequest?.measurementId) {
+        measurementDoc = await Measurement.findById(customerRequest.measurementId)
+          .select("name organizationName")
+          .lean();
+      }
+    }
+
+    // ── Operation log across ALL tracking docs for this exact barcode ────
+    const trackingDocs = await ProductionTracking.find({
+      "machines.operators.barcodeScans.barcodeId": barcode.trim(),
+    })
+      .populate("machines.machineId", "name serialNumber type")
+      .lean();
+
+    const getEmployeeName = makeEmployeeNameCache();
+    const operationLog = [];
+
+    for (const doc of trackingDocs) {
+      for (const machine of doc.machines) {
+        for (const operator of machine.operators || []) {
+          const operatorName = await getEmployeeName(operator.operatorIdentityId);
+          for (const scan of operator.barcodeScans || []) {
+            if (scan.barcodeId !== barcode.trim()) continue;
+
+            const codes = Array.isArray(scan.activeOps)
+              ? scan.activeOps
+              : (scan.activeOps || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+            const resolvedOps = codes.map((code) => {
+              const op = (workOrder.operations || []).find(
+                (o) => (o.operationCode || "").trim().toLowerCase() === code.trim().toLowerCase()
+              );
+              return op
+                ? { code, name: op.operationType, plannedTimeSeconds: op.plannedTimeSeconds || 0 }
+                : { code, name: "", plannedTimeSeconds: 0 };
+            });
+
+            operationLog.push({
+              timestamp:     scan.timeStamp,
+              trackingDate:  doc.date,
+              machineId:     machine.machineId?._id,
+              machineName:   machine.machineId?.name || "Unknown",
+              machineSerial: machine.machineId?.serialNumber || "",
+              machineType:   machine.machineId?.type || "",
+              operatorId:    operator.operatorIdentityId,
+              operatorName,
+              signInTime:    operator.signInTime,
+              signOutTime:   operator.signOutTime,
+              operations:    resolvedOps,
+            });
+          }
+        }
+      }
+    }
+
+    operationLog.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    return res.json({
+      success: true,
+      barcode: barcode.trim(),
+      unitNumber,
+      workOrder: {
+        _id:                 workOrder._id,
+        workOrderNumber:     workOrder.workOrderNumber,
+        workOrderShortId,
+        stockItemName:       workOrder.stockItemName,
+        stockItemReference:  workOrder.stockItemReference,
+        quantity:            workOrder.quantity,
+        status:              workOrder.status,
+        variantAttributes:   workOrder.variantAttributes || [],
+        operations: (workOrder.operations || []).map((op, idx) => ({
+          operationNumber:    idx + 1,
+          operationType:      op.operationType,
+          operationCode:      op.operationCode || "",
+          plannedTimeSeconds: op.plannedTimeSeconds || 0,
+          status:             op.status,
+        })),
+      },
+      manufacturingOrder: customerRequest
+        ? {
+            _id:              customerRequest._id,
+            requestId:        customerRequest.requestId,
+            moNumber:         `MO-${customerRequest.requestId}`,
+            requestType:      customerRequest.requestType,
+            customerName:     customerRequest.customerInfo?.name,
+            customerPhone:    customerRequest.customerInfo?.phone,
+            customerEmail:    customerRequest.customerInfo?.email,
+            deliveryDeadline: customerRequest.customerInfo?.deliveryDeadline,
+            status:           customerRequest.status,
+            measurementName:  customerRequest.measurementName || null,
+          }
+        : null,
+      isMeasurementConversion,
+      pieceOwner,
+      siblingPieces,
+      measurement: measurementDoc,
+      operationLog,
+      totalScans: operationLog.length,
+    });
+  } catch (error) {
+    console.error("Error finding piece:", error);
     res.status(500).json({ success: false, message: "Server error", error: error.message });
   }
 });
