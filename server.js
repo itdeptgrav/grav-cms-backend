@@ -329,6 +329,8 @@ const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
 const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
 
+const PackagingDispatchDepartment = require("./models/PackagingDispatchDepartment");
+
 const Measurement = require("./models/Customer_Models/Measurement");
 const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
 
@@ -395,9 +397,41 @@ const createDefaultAccountant = async () => {
   }
 };
 
+const createDefaultPackagingDispatch = async () => {
+  try {
+    const existingPackagingDispatch = await PackagingDispatchDepartment.findOne({
+      role: "packaging_dispatch",
+      department: "Packaging & Dispatch",
+    });
+
+    if (existingPackagingDispatch) {
+      console.log("✅ Packaging & Dispatch user already exists, skipping creation");
+      return;
+    }
+
+    const defaultPackagingDispatch = new PackagingDispatchDepartment({
+      name: "Dispatch Admin",
+      email: "dispatch@grav.in",
+      password: "Dispatch@12345", // will be hashed automatically
+      employeeId: "PKG001",
+      phone: "9999999999",
+      department: "Packaging & Dispatch",
+      role: "packaging_dispatch",
+      isActive: true,
+    });
+
+    await defaultPackagingDispatch.save();
+
+    console.log("✅ Default Packaging & Dispatch user created successfully");
+  } catch (error) {
+    console.error("❌ Packaging & Dispatch creation failed:", error.message);
+  }
+};
+
 // Update the database connection section
 connectDB().then(async () => {
   await createDefaultAccountant(); // ✅ ADD THIS
+  await createDefaultPackagingDispatch();
 });
 //changes
 
@@ -563,6 +597,9 @@ app.use(
   manufacturingOrderRoutes,
 );
 
+const packagingDispatchViewRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingDispatchViewRoutes");
+app.use("/api/cms/manufacturing/packaging-dispatch-view", packagingDispatchViewRoutes);
+
 const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes");
 app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 
@@ -586,6 +623,9 @@ app.use("/api/cms/production/dashboard", productionDashboardRoutes);
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionMachineLayout);
 
+
+const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
+app.use("/api/cms/manufacturing/packaging", packagingRoutes);
 
 
 // In your main server.js or app.js
