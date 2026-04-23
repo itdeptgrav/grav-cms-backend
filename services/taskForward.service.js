@@ -34,11 +34,9 @@ function deadlineColor(dueDate) {
 // Used in deadline proposal/counter chat messages to AVOID a stale wall-clock timestamp
 // (which misleads under the live-deadline model where the clock only starts when the
 // employee presses Play).
-function _fmtDurationChat(targetDate) {
-  if (!targetDate) return "?";
-  const ms = new Date(targetDate).getTime() - Date.now();
-  if (ms <= 0) return "0m";
-  const s = Math.round(ms / 1000);
+// Format a raw second count as a short human string: "45m", "2h", "1h 30m", "3 days".
+function _fmtSecs(s) {
+  s = Math.max(0, Math.round(Number(s) || 0));
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.round(s / 60)}m`;
   if (s < 86400) {
@@ -48,6 +46,13 @@ function _fmtDurationChat(targetDate) {
   }
   const days = Math.round(s / 86400);
   return days === 1 ? "1 day" : `${days} days`;
+}
+
+function _fmtDurationChat(targetDate) {
+  if (!targetDate) return "?";
+  const ms = new Date(targetDate).getTime() - Date.now();
+  if (ms <= 0) return "0m";
+  return _fmtSecs(Math.round(ms / 1000));
 }
 
 // ─── Notify helper ────────────────────────────────────────
@@ -1017,33 +1022,65 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
     throw new Error("Cannot propose a deadline change in current status.");
   if (!proposedDate) throw new Error("Proposed date is required.");
 
-  // How many seconds THIS proposal adds (from now to new deadline)
+  // ──────────────────────────────────────────────────────────────────────────
+  // Extension vs first-time proposal:
+  //
+  //   • FIRST proposal (from "open" / "deadline_rejected" — no approved deadline
+  //     exists yet): the typed duration IS the whole window.
+  //        deadlineWindowSecs = extensionSecs
+  //
+  //   • EXTENSION (task already running or confirmed — already has an approved
+  //     window): the typed duration is ADDITIONAL work time on top of what the
+  //     employee already has. Keeps a clean audit trail of every bump so
+  //     everyone (employee + CEO/TL) sees the same breakdown:
+  //          30m (original) + 20m (ext 1) + 10m (ext 2) = 60m total
+  //
+  //     Math is ADDITIVE — no `max(existing, worked)` black magic, no wall-
+  //     clock subtraction at approval time that silently overwrites everything.
+  // ──────────────────────────────────────────────────────────────────────────
+  const isExtension = ["in_progress", "confirmed"].includes(task.status);
+
+  // How many seconds the employee is asking for (extension magnitude for
+  // extensions; total window for first-time proposals). Derived from "now"
+  // because the frontend computes proposedDate as `now + typedDuration`.
   const extensionSecs = Math.max(0, Math.floor((new Date(proposedDate).getTime() - Date.now()) / 1000));
 
-  // ACCUMULATE correctly:
-  // First proposal: deadlineWindowSecs = time from now to deadline
-  // Extension: base = max(existingWindowSecs, workedSecs) + new extension
-  //   - workedSecs passed from frontend so we know actual work done
-  //   - this handles old tasks where existingWindowSecs = 0
-  const isExtension = ["in_progress", "confirmed"].includes(task.status);
   const existingWindowSecs = task.deadlineWindowSecs || 0;
-  const workedSecsFromFrontend = workedSecs || 0;
   const deadlineWindowSecs = isExtension
-    ? Math.max(existingWindowSecs, workedSecsFromFrontend) + extensionSecs
+    ? existingWindowSecs + extensionSecs
     : extensionSecs;
 
-  await ref.update({
+  const updates = {
     proposedDeadline: proposedDate,
     proposedDeadlineBy: employeeId,
     proposedDeadlineByName: employeeName,
     proposedDeadlineAt: admin.firestore.FieldValue.serverTimestamp(),
-    deadlineWindowSecs,  // how many seconds employee is asking for (e.g. 3h = 10800)
+    deadlineWindowSecs,           // asked-for TOTAL after this request
+    // ── Snapshot the CURRENT approved window so the rejection path can
+    // roll it back. Without this, a rejected extension leaves deadlineWindowSecs
+    // permanently inflated (e.g. rejected +1h 60m shows "2h 5m asked" forever).
+    deadlineWindowSecsBeforeProposal: existingWindowSecs,
     prevStatusBeforeDeadlineProposal: task.status,
     status: "pending_deadline_approval",
     deadlineProposalRejected: false,
     deadlineRejectionReason: null,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
+  };
+
+  // Extension-specific bookkeeping — let approval path know this is an extension
+  // and what to record in the audit trail once approved.
+  if (isExtension) {
+    const prevWindowSecs = Number(task.deadlineWindowSecs) || 0;
+    const newWindowSecs = prevWindowSecs + extensionSecs;
+    updates.pendingExtensionSecs = extensionSecs;          // just the delta
+    updates.pendingExtensionPrevWindowSecs = existingWindowSecs; // window before this bump
+  } else {
+    // First proposal: clear any stale extension markers from rejected past rounds.
+    updates.pendingExtensionSecs = null;
+    updates.pendingExtensionPrevWindowSecs = null;
+  }
+
+  await ref.update(updates);
 
   // If task was in_progress, notify the employee their timer should stop
   // (frontend blocks the timer when status = pending_deadline_approval)
@@ -1055,16 +1092,17 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
     });
   }
 
-  // Post system message in draft chat
-  // Show DURATION ("2h to complete") instead of a wall-clock timestamp.
-  // The live-deadline model starts the clock only when the employee presses Play,
-  // so a wall-clock time written here (e.g. "10:11 am") becomes misleading as real
-  // time passes and the timer hasn't started yet.
+  // Post system message in draft chat.
+  // For EXTENSIONS we show "+Xm extension — new total Ym" so CEO/TL and employee
+  // see the same audit breakdown. First-time proposals still say "Xm to complete".
+  const chatText = isExtension
+    ? `📅 ${employeeName} requested +${_fmtSecs(extensionSecs)} extension — new total ${_fmtSecs(deadlineWindowSecs)} (was ${_fmtSecs(existingWindowSecs)})`
+    : `📅 ${employeeName} proposed deadline: ${_fmtSecs(extensionSecs)} to complete`;
   await sendDraftChat({
     taskId,
     senderId: employeeId,
     senderName: employeeName,
-    text: `📅 ${employeeName} proposed deadline: ${_fmtDurationChat(proposedDate)} to complete`,
+    text: chatText,
     messageType: "system",
   });
 
@@ -1101,18 +1139,24 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
   if (approved) {
     const newDueDate = task.proposedDeadline;
 
-    // Recalculate deadlineWindowSecs AT APPROVAL TIME (not proposal time).
-    // "Asked for" = how long from NOW (approval moment) until deadline.
-    // e.g. TL approves at 10:44 AM, deadline 11:14 AM → 30 min (correct)
-    // vs old: proposed at 5:12 AM, deadline 11:14 AM → 6h 02m (wrong)
-    const approvedWindowSecs = Math.max(0, Math.floor(
-      (new Date(newDueDate).getTime() - Date.now()) / 1000
-    ));
+    // ── Trust the window that was stored at proposal time ──────────────────
+    // Do NOT recompute from wall-clock (newDueDate − now) — that throws away
+    // the accumulated extension math and creates the "time mismatch" where
+    // the employee sees one number and the CEO/TL sees another.
+    //
+    // proposeDeadline already stored the correct TOTAL window on the task
+    // (first-time: typed duration; extension: existing + delta). We just
+    // carry it forward.
+    //
+    // For extensions, also append an audit entry to `extensions[]` so the
+    // UI can render the breakdown "30 + 20 + 10 = 60".
+    const wasExtension = typeof task.pendingExtensionSecs === "number" && task.pendingExtensionSecs > 0;
+    const approvedWindowSecs = Number(task.deadlineWindowSecs) || 0;
 
-    await ref.update({
+    const update = {
       status: prevStatus,
       dueDate: newDueDate,
-      deadlineWindowSecs: approvedWindowSecs,  // ← fixed: recalculated at approval time
+      deadlineWindowSecs: approvedWindowSecs,
       deadlineApprovedBy: approverId,
       deadlineApprovedByName: approverName,
       deadlineApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1120,14 +1164,55 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
       deadlineRejectionReason: null,
       deadlineStatus: deadlineStatus(newDueDate),
       deadlineColor: deadlineColor(newDueDate),
+      // Clear pending extension markers now that the proposal is resolved.
+      pendingExtensionSecs: null,
+      pendingExtensionPrevWindowSecs: null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    };
 
+    // First-time approval: record the original window so the UI can render
+    // the breakdown as "30 + 20 + 10" even after many extensions.
+    if (!wasExtension && !task.originalWindowSecs) {
+      update.originalWindowSecs = approvedWindowSecs;
+    }
+
+    // Extension approval: append to audit trail.
+    if (wasExtension) {
+      update.extensions = admin.firestore.FieldValue.arrayUnion({
+        addedSecs: Number(task.pendingExtensionSecs) || 0,
+        prevWindowSecs: Number(task.pendingExtensionPrevWindowSecs) || 0,
+        newWindowSecs: approvedWindowSecs,
+        approvedBy: approverId,
+        approvedByName: approverName,
+        approvedAt: new Date().toISOString(),  // arrayUnion can't accept serverTimestamp
+      });
+
+      // ── Wait for employee to press Start Timer ────────────────────────
+      // The new deadline is NOT computed from approval time. It's
+      // (startTime + extensionSecs), set by the frontend on the employee's
+      // first Start click. Until then:
+      //   - awaitingExtensionStart=true tells the UI to show a green
+      //     "Press Start Timer" card instead of the stale overdue pill.
+      //   - lastExtensionSecs tells the frontend how much budget to grant.
+      //   - dueDate is intentionally left stale (points to old deadline);
+      //     frontend overwrites it on Start.
+      update.awaitingExtensionStart = true;
+      update.lastExtensionSecs = Number(task.pendingExtensionSecs) || 0;
+    }
+
+    await ref.update(update);
+
+    // Approval chat message — show the right phrasing for extensions.
+    // For extensions we add a nudge about the new Start-Timer flow so the
+    // employee knows the +N min starts when they press Start, not now.
+    const approveChatText = wasExtension
+      ? `✅ ${approverName} approved +${_fmtSecs(task.pendingExtensionSecs)} extension. Press ▶ Start when ready — your +${_fmtSecs(task.pendingExtensionSecs)} begins then.`
+      : `✅ ${approverName} approved the deadline: ${_fmtSecs(approvedWindowSecs)} to complete. You can now confirm the task.`;
     await sendDraftChat({
       taskId,
       senderId: approverId,
       senderName: approverName,
-      text: `✅ ${approverName} approved the deadline: ${_fmtDurationChat(newDueDate)} to complete. You can now confirm the task.`,
+      text: approveChatText,
       messageType: "system",
     });
 
@@ -1144,15 +1229,30 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     socket.emitToMany(task.assigneeIds || [], "deadline_approved", { taskId, dueDate: newDueDate });
   } else {
     if (!rejectionReason?.trim()) throw new Error("Rejection reason is required.");
+    // ── Roll deadlineWindowSecs back to what it was before this proposal ──
+    // proposeDeadline wrote the new proposed total into deadlineWindowSecs so
+    // TL/CEO could see "X asked". On rejection that value must be reverted —
+    // otherwise a rejected +1h extension permanently shows "2h 5m asked" and
+    // the DeadlineBreakdown math breaks (original + approved extensions ≠ total).
+    const rolledBackWindowSecs = Number(task.deadlineWindowSecsBeforeProposal) > 0
+      ? Number(task.deadlineWindowSecsBeforeProposal)
+      : (Number(task.originalWindowSecs) || 0) +
+      ((task.extensions || []).reduce((s, e) => s + (Number(e.addedSecs) || 0), 0));
     await ref.update({
       status: "open",
+      deadlineWindowSecs: rolledBackWindowSecs,
+      deadlineWindowSecsBeforeProposal: null,   // clear the snapshot
       deadlineProposalRejected: true,
       deadlineRejectionReason: rejectionReason.trim(),
       proposedDeadline: null,
       proposedDeadlineBy: null,
       proposedDeadlineAt: null,
+      // Clear pending extension markers too — they're stale now
+      pendingExtensionSecs: null,
+      pendingExtensionPrevWindowSecs: null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
 
     await sendDraftChat({
       taskId,
@@ -1178,7 +1278,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
 
 // ── TL/CEO counter-proposes a deadline to employee ────────────────────────────
 // Called when TL doesn't accept employee's date but wants to suggest their own
-async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, counterDate, message }) {
+async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, counterDate, counterWindowSecs, message }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1188,6 +1288,22 @@ async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, coun
   if (task.status !== "pending_deadline_approval") throw new Error("No pending deadline proposal to counter.");
   if (!counterDate) throw new Error("Counter-propose date is required.");
 
+  // If frontend passed the typed duration, use it — otherwise derive from date.
+  // This mirrors proposeDeadline: for extensions we want the raw typed duration
+  // preserved so we can add it to the existing window at accept time.
+  const typedSecs = Number(counterWindowSecs) > 0
+    ? Number(counterWindowSecs)
+    : Math.max(0, Math.floor((new Date(counterDate).getTime() - Date.now()) / 1000));
+
+  // Extension context: was the original proposal being countered an extension?
+  // (i.e. employee was running/confirmed when they made the proposal the TL is
+  // now countering). If so, the counter's typed duration ADDS to the existing
+  // window — same accumulator rules as proposeDeadline.
+  const wasExtensionContext = ["in_progress", "confirmed"].includes(task.prevStatusBeforeDeadlineProposal);
+  const existingWindowForCounter = wasExtensionContext
+    ? (Number(task.pendingExtensionPrevWindowSecs) || 0)  // window BEFORE the employee's proposal
+    : 0;
+
   await ref.update({
     status: "pending_employee_deadline_confirmation",
     tlCounterDeadline: counterDate,
@@ -1195,12 +1311,22 @@ async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, coun
     tlCounterDeadlineBy: proposerId,
     tlCounterDeadlineByName: proposerName,
     tlCounterDeadlineAt: admin.firestore.FieldValue.serverTimestamp(),
+    // Store the TL's typed duration + extension context so the accept path
+    // can reconstruct the right total without re-deriving from wall-clock.
+    tlCounterTypedSecs: typedSecs,
+    tlCounterIsExtension: wasExtensionContext,
+    tlCounterPrevWindowSecs: existingWindowForCounter,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
+  // Counter chat + notification wording: show the typed duration with "+X min
+  // extension" shape when applicable so everyone sees the same audit info.
+  const counterMsg = wasExtensionContext
+    ? `📅 ${proposerName} suggested +${_fmtSecs(typedSecs)} extension instead — new total ${_fmtSecs(existingWindowForCounter + typedSecs)}${message ? ` — "${message.trim()}"` : ""}`
+    : `📅 ${proposerName} suggested a new deadline: ${_fmtSecs(typedSecs)} to complete${message ? ` — "${message.trim()}"` : ""}`;
   await sendDraftChat({
     taskId, senderId: proposerId, senderName: proposerName,
-    text: `📅 ${proposerName} suggested a new deadline: ${_fmtDurationChat(counterDate)} to complete${message ? ` — "${message.trim()}"` : ""}`,
+    text: counterMsg,
     messageType: "system",
   });
 
@@ -1208,7 +1334,9 @@ async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, coun
     recipientIds: task.assigneeIds || [],
     type: "deadline_counter_proposed",
     title: `New deadline suggested for: ${task.title}`,
-    body: `${proposerName} suggested ${_fmtDurationChat(counterDate)} to complete`,
+    body: wasExtensionContext
+      ? `${proposerName} suggested +${_fmtSecs(typedSecs)} extension`
+      : `${proposerName} suggested ${_fmtSecs(typedSecs)} to complete`,
     data: { taskId, taskTitle: task.title, counterDate },
     senderId: proposerId, senderName: proposerName,
   });
@@ -1228,11 +1356,16 @@ async function employeeRespondToTlCounter({ taskId, employeeId, employeeName, ac
 
   if (accepted) {
     const newDueDate = task.tlCounterDeadline;
-    const approvedWindowSecs = Math.max(0, Math.floor(
-      (new Date(newDueDate).getTime() - Date.now()) / 1000
-    ));
 
-    await ref.update({
+    // Build the approved window from STORED values — not wall-clock.
+    // If this was an extension context: new total = prev window + TL's typed secs.
+    // If it was a first-time proposal: new total = TL's typed secs.
+    const typedSecs = Number(task.tlCounterTypedSecs) || 0;
+    const isExt = !!task.tlCounterIsExtension;
+    const prevWin = Number(task.tlCounterPrevWindowSecs) || 0;
+    const approvedWindowSecs = isExt ? (prevWin + typedSecs) : typedSecs;
+
+    const update = {
       status: "deadline_approved",
       dueDate: newDueDate,
       deadlineWindowSecs: approvedWindowSecs,
@@ -1241,14 +1374,49 @@ async function employeeRespondToTlCounter({ taskId, employeeId, employeeName, ac
       deadlineApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
       tlCounterDeadline: null,
       tlCounterDeadlineMessage: null,
+      tlCounterTypedSecs: null,
+      tlCounterIsExtension: null,
+      tlCounterPrevWindowSecs: null,
+      // Clear pending employee-side extension markers too (they're moot now).
+      pendingExtensionSecs: null,
+      pendingExtensionPrevWindowSecs: null,
       deadlineStatus: deadlineStatus(newDueDate),
       deadlineColor: deadlineColor(newDueDate),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+      deadlineWindowSecsBeforeProposal: null,
+    };
 
+    // First-time: record original window. Extension: append audit entry.
+    if (!isExt && !task.originalWindowSecs) {
+      update.originalWindowSecs = approvedWindowSecs;
+    }
+    if (isExt) {
+      update.extensions = admin.firestore.FieldValue.arrayUnion({
+        addedSecs: typedSecs,
+        prevWindowSecs: prevWin,
+        newWindowSecs: approvedWindowSecs,
+        approvedBy: task.tlCounterDeadlineBy,
+        approvedByName: task.tlCounterDeadlineByName,
+        approvedAt: new Date().toISOString(),
+        viaCounter: true,
+      });
+
+      // ── Same Start-Timer wait as direct approval path ─────────────────
+      // See approveDeadline above for the full rationale. The dueDate is
+      // left stale; the frontend computes (startTime + extensionSecs) when
+      // the employee presses Start.
+      update.awaitingExtensionStart = true;
+      update.lastExtensionSecs = typedSecs;
+    }
+
+    await ref.update(update);
+
+    const acceptChat = isExt
+      ? `✅ ${employeeName} accepted +${_fmtSecs(typedSecs)} extension. Press ▶ Start when ready — your +${_fmtSecs(typedSecs)} begins then.`
+      : `✅ ${employeeName} accepted the deadline: ${_fmtSecs(approvedWindowSecs)} to complete`;
     await sendDraftChat({
       taskId, senderId: employeeId, senderName: employeeName,
-      text: `✅ ${employeeName} accepted the deadline: ${_fmtDurationChat(newDueDate)} to complete`,
+      text: acceptChat,
       messageType: "system",
     });
 
