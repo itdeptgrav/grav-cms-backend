@@ -2,22 +2,22 @@ const express = require("express");
 const router = express.Router();
 const Employee = require("../../models/Employee");
 
-// ─── HELPER: Calculate Tenure ─────────────────────────────────────────────────
+// ─── HELPER: Calculate Tenure (proper format) ────────────────────────────────
 function calculateEmployeeTenure(dateOfJoining) {
   const today = new Date();
   const joining = new Date(dateOfJoining);
+
   let years = today.getFullYear() - joining.getFullYear();
   let months = today.getMonth() - joining.getMonth();
+  const days = today.getDate() - joining.getDate();
 
-  if (months < 0) {
-    years--;
-    months += 12;
-  }
+  if (days < 0) months--;
+  if (months < 0) { years--; months += 12; }
 
-  if (years === 0 && months === 0) return 'Less than a month';
-  if (years === 0) return `${months} month${months > 1 ? 's' : ''}`;
-  if (months === 0) return `${years} year${years > 1 ? 's' : ''}`;
-  return `${years} year${years > 1 ? 's' : ''}, ${months} month${months > 1 ? 's' : ''}`;
+  if (years === 0 && months === 0) return "Less than a month";
+  if (years === 0) return `${months} ${months === 1 ? "month" : "months"}`;
+  if (months === 0) return `${years} ${years === 1 ? "year" : "years"}`;
+  return `${years} ${years === 1 ? "year" : "years"}, ${months} ${months === 1 ? "month" : "months"}`;
 }
 
 // ─── GET /api/employee/public/:identityId ────────────────────────────────────
@@ -25,38 +25,39 @@ router.get("/public/:identityId", async (req, res) => {
   try {
     const { identityId } = req.params;
 
-    console.log(`[PUBLIC-PROFILE-API] Searching for employee with identityId: ${identityId.toUpperCase()}`);
-
-    // Find active employee by identityId (case-insensitive)
     const employee = await Employee.findOne({
       identityId: identityId.toUpperCase(),
       isActive: true
     })
-      .select('firstName middleName lastName profilePhoto department designation jobTitle dateOfJoining workLocation identityId biometricId')
+      .select('firstName middleName lastName profilePhoto department designation jobTitle dateOfJoining workLocation identityId biometricId phone alternatePhone extension address')
       .lean();
 
-    console.log(`[PUBLIC-PROFILE-API] Employee found:`, !!employee);
-
     if (!employee) {
-      // ALSO CHECK WITHOUT isActive filter to see if employee exists but is inactive
-      const inactiveEmployee = await Employee.findOne({
-        identityId: identityId.toUpperCase()
-      }).select('identityId isActive').lean();
-
-      console.log(`[PUBLIC-PROFILE-API] Inactive employee check:`, inactiveEmployee);
-
       return res.status(404).json({
         success: false,
         message: "Employee not found or inactive"
       });
     }
 
-    // Calculate tenure
     const tenure = employee.dateOfJoining
       ? calculateEmployeeTenure(employee.dateOfJoining)
       : null;
 
-    // Build response with public-safe data only
+    // Format current address (strips private ownershipType field)
+    let address = null;
+    if (employee.address?.current) {
+      const a = employee.address.current;
+      if (a.street || a.city || a.state || a.pincode) {
+        address = {
+          street: a.street || null,
+          city: a.city || null,
+          state: a.state || null,
+          pincode: a.pincode || null,
+          country: a.country || null,
+        };
+      }
+    }
+
     const publicProfile = {
       firstName: employee.firstName,
       middleName: employee.middleName || null,
@@ -70,6 +71,10 @@ router.get("/public/:identityId", async (req, res) => {
       workLocation: employee.workLocation || null,
       dateOfJoining: employee.dateOfJoining || null,
       tenure: tenure,
+      phone: employee.phone || null,
+      alternatePhone: employee.alternatePhone || null,
+      extension: employee.extension || null,
+      address: address,
     };
 
     res.status(200).json({
@@ -85,6 +90,5 @@ router.get("/public/:identityId", async (req, res) => {
     });
   }
 });
-
 
 module.exports = router;
