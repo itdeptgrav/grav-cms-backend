@@ -453,13 +453,14 @@ router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeT
 // ── TL/CEO COUNTER-PROPOSE DEADLINE ───────────────────────────────────────────
 router.post("/task/:taskId/tl-counter-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { counterDate, message } = req.body;
+    const { counterDate, counterWindowSecs, message } = req.body;
     if (!counterDate) return res.status(400).json({ error: "counterDate required" });
     const result = await svc.tlCounterProposeDeadline({
       taskId: req.params.taskId,
       proposerId: req.coworkUser.employeeId,
       proposerName: req.coworkUser.name,
       counterDate,
+      counterWindowSecs,  // typed duration in seconds (for extension-aware accounting)
       message: message || "",
     });
     res.json(result);

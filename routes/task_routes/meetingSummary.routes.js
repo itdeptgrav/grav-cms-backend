@@ -319,12 +319,13 @@ function buildPrompt(participantNames) {
 Each audio file contains ONLY ONE person's voice.
 The participants in this meeting are: ${names}.
 
+
 IMPORTANT: Analyze ALL audio files together. Reconstruct the full conversation in the ORDER it happened — based on what each person said in response to others.
 
 Respond in this EXACT format (do not change the section headers):
 
 ## MEETING SUMMARY
-[Write 3-5 sentences summarizing what was discussed and decided overall]
+[Write 5-7 sentences summarizing what was discussed and decided overall]
 
 ## CONVERSATION
 [Show the FULL conversation in sequence — exactly who said what and when. Use this format for EVERY line:
@@ -353,6 +354,58 @@ If none, write: No specific deadlines mentioned]
 [Format:
 - {action item}
 List the next steps decided in the meeting]
+
+
+
+
+VOICES ACTUALLY HEARD IN AUDIO FILES (these are the ONLY participants):
+${audioFileParticipants.map((name, i) => `  File ${i + 1}: ${name}`).join('\n')}
+
+IMPORTANT DISTINCTION:
+- "PARTICIPANTS" = ONLY the people whose VOICES are in the audio files above
+- "MENTIONED PEOPLE" = People discussed in conversation but NOT present
+
+EXAMPLE OF CORRECT OUTPUT:
+If audio has voices of Rakesh and Jiten, and they discuss Pramod:
+
+## PARTICIPANTS
+- Rakesh Biswal
+- Jiten Swain
+(NOT Pramod - his voice is not in audio)
+
+## CONVERSATION
+Rakesh: "I talked to Pramod yesterday about the CAD files."
+Jiten: "What did Pramod say?"
+Rakesh: "He'll send them by Friday."
+
+## MEETING SUMMARY
+Rakesh and Jiten discussed Pramod's pending CAD files. Rakesh confirmed 
+Pramod will deliver them by Friday.
+
+Respond in this EXACT format:
+
+## PARTICIPANTS
+[List ONLY people whose VOICES are in the audio files above]
+
+## MEETING SUMMARY
+[3-5 sentences about what was discussed, including mentions of absent people]
+
+## CONVERSATION
+[Format: {Name}: "{what they said}"]
+
+## TASKS ASSIGNED
+[Format: - {Person}: {task} [Deadline: {date}]]
+
+## DEADLINES MENTIONED
+[Format: - {Task} by {date}]
+
+## ACTION ITEMS
+[Format: - {action item}]
+
+RULES:
+- If someone's voice is NOT in audio files, they CANNOT be in PARTICIPANTS
+- If someone is mentioned in conversation, include that in SUMMARY and CONVERSATION
+- Translate Hindi/Odia to English
 
 Rules:
 - If audio is in Hindi, Odia, or mixed language → translate everything to English
