@@ -719,6 +719,9 @@ app.use("/api/vendor/work-orders", vendorWO);
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
 
+const publicProfileAPI = require("./routes/Employee_Routes/publicProfileAPI");
+app.use("/employee", publicProfileAPI);
+
 const employeeAuthRoutes = require("./routes/Employee_Routes/employeeAuth");
 app.use("/api/employee", employeeAuthRoutes);
 
