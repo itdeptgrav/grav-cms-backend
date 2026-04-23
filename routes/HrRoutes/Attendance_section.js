@@ -67,10 +67,21 @@ const dateStrOf = (d) => {
     const ist = new Date(d.getTime() + 330 * 60 * 1000);
     return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, "0")}-${String(ist.getUTCDate()).padStart(2, "0")}`;
 };
+
+// ── IST-aware time parser for manual punch edits ──────────────────────────
+const parseTimeOnDateIST = (timeStr, dateStr) => {
+    if (!timeStr) return null;
+    const [h, m] = String(timeStr).split(":").map(Number);
+    const [y, mo, d] = dateStr.split("-").map(Number);
+    // User enters IST time (e.g., "17:30 IST")
+    // Create UTC timestamp then subtract IST offset (5.5 hours)
+    const utcMs = Date.UTC(y, mo - 1, d, h, m, 0) - (5.5 * 60 * 60 * 1000);
+    return new Date(utcMs);
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  HELPERS (strings / times)
 // ═══════════════════════════════════════════════════════════════════════════
-
 const toTitleCase = (s) => String(s || "").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
 const numericOf = (s) => { const d = String(s || "").replace(/\D/g, ""); return d ? parseInt(d, 10) : null; };
 
@@ -2322,15 +2333,6 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
         emp.hrReviewedAt = new Date();
 
         // ── Punch time update helper ─────────────────────────────────────────
-        const parseTimeOnDate = (timeStr) => {
-            if (!timeStr) return null;
-            const [h, m] = String(timeStr).split(":").map(Number);
-            // Convert local IST time → store as UTC (IST = UTC+5:30)
-            const d = new Date(dateStr + "T00:00:00+05:30");
-            d.setHours(h || 0, m || 0, 0, 0);
-            return d;
-        };
-
         const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
         const punchChanges = [];
         let anyTimeUpdated = false;
@@ -2339,7 +2341,7 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
             if (value === undefined) continue;
             anyTimeUpdated = true;
             const oldVal = emp[field] ? fmtTimeIST12(emp[field]) : "—";
-            const newDate = value ? parseTimeOnDate(value) : null;
+            const newDate = value ? parseTimeOnDateIST(value, dateStr) : null;
             emp[field] = newDate;
             punchChanges.push({
                 punchType: field,
@@ -2494,15 +2496,6 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
         const emp = dayDoc.employees[empIdx];
         const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
 
-        // ── Parse time → Date ──────────────────────────────────────────────
-        const parseTimeOnDate = (timeStr) => {
-            if (!timeStr) return null;
-            const [h, m] = String(timeStr).split(":").map(Number);
-            const d = new Date(dateStr + "T00:00:00+05:30");
-            d.setHours(h || 0, m || 0, 0, 0);
-            return d;
-        };
-
         // ── Map punchType → employee field name ────────────────────────────
         const punchFieldMap = {
             in: "inTime", lunch_out: "lunchOut", lunch_in: "lunchIn",
@@ -2517,7 +2510,7 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
             emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== punchType);
         } else {
             // add or modify
-            const newDate = parseTimeOnDate(punchTime);
+            const newDate = parseTimeOnDateIST(punchTime, dateStr);
             emp[fieldName] = newDate;
 
             // Upsert in rawPunches
@@ -2582,18 +2575,21 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
         emp.hasOT = otMins > 0;
         emp.hasMissPunch = !(emp.inTime && emp.finalOut);
 
-        if (!emp.inTime) {
-            emp.systemPrediction = "AB";
-        } else if (!emp.finalOut) {
-            emp.systemPrediction = "MP";
-        } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
-            emp.systemPrediction = "HD";
-        } else if (lateMins > 0) {
-            emp.systemPrediction = "P*";
-        } else if (earlyDepartureMins > 0) {
-            emp.systemPrediction = "P~";
-        } else {
-            emp.systemPrediction = "P";
+        // Recompute system prediction if hrFinalStatus not explicitly set
+        if (!emp.hrFinalStatus) {
+            if (!emp.inTime) {
+                emp.systemPrediction = "AB";
+            } else if (!emp.finalOut) {
+                emp.systemPrediction = "MP";
+            } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
+                emp.systemPrediction = "HD";
+            } else if (lateMins > 0) {
+                emp.systemPrediction = "P*";
+            } else if (earlyDepartureMins > 0) {
+                emp.systemPrediction = "P~";
+            } else {
+                emp.systemPrediction = "P";
+            }
         }
 
         emp.attendanceValue = getAttendanceValue(emp.hrFinalStatus || emp.systemPrediction);
@@ -2636,8 +2632,16 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  EXCEL EXPORTS — unchanged for now, will be updated in Phase 2 to use
-//  displayLabels and show FH/NH/OH/RH properly.
+//  GET /export-daily  — Unified Manpower Intelligence Report
+//
+//  Design philosophy:
+//    • One sheet, no disconnected sections.
+//    • Employees grouped under inline department header rows that show
+//      dept-level KPIs (headcount, attendance%, OT pool, late pool).
+//    • Each employee row is a self-contained scorecard: identity on the
+//      left, punch timeline in the middle, performance metrics on the right.
+//    • Heat-mapped cells for instant visual parsing (no legend needed).
+//    • Bottom summary strip closes the report.
 // ═══════════════════════════════════════════════════════════════════════════
 
 router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
@@ -2645,8 +2649,6 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
         const { date, department } = req.query;
         if (!date) return res.status(400).json({ success: false, message: "date required" });
 
-        // Reuse the daily endpoint logic by calling it internally would be overkill.
-        // Just fetch the day doc and build rows here.
         const dayDoc = await DailyAttendance.findOne({ dateStr: date }).lean();
         const settings = await AttendanceSettings.getConfig();
         const labels = settings.displayLabels || {};
@@ -2655,23 +2657,27 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
         const allActive = await Employee.find({
             $or: [{ status: "active" }, { status: { $exists: false } }, { isActive: true }],
         }).lean();
-        const filtered = (department && department !== "all")
+        const filteredActive = (department && department !== "all")
             ? allActive.filter((e) => extractDepartment(e) === department)
             : allActive;
 
         const byBio = new Map();
         if (dayDoc) for (const e of (dayDoc.employees || [])) byBio.set(e.biometricId, e);
 
-        // Build rows, sorted by name
+        // ── Build employee rows ────────────────────────────────────────────
         const rows = [];
-        for (const emp of filtered) {
+        for (const emp of filteredActive) {
             const bid = String(extractBiometricId(emp) || "").toUpperCase();
             if (!bid) continue;
             const entry = byBio.get(bid);
             const status = entry?.hrFinalStatus || entry?.systemPrediction || "AB";
+            const empType = resolveEmployeeType(emp, settings);
             rows.push({
                 name: extractName(emp),
-                department: extractDepartment(emp),
+                empId: bid,
+                department: extractDepartment(emp) || "—",
+                designation: extractDesignation(emp) || "—",
+                empType,
                 status,
                 statusLabel: L(status),
                 inTime: entry?.inTime,
@@ -2682,254 +2688,472 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
                 outTime: entry?.finalOut,
                 netWorkMins: entry?.netWorkMins || 0,
                 otMins: entry?.otMins || 0,
+                lateMins: entry?.lateMins || 0,
+                lateDisplay: entry?.lateDisplay || "",
                 isLate: !!entry?.isLate,
                 isEarlyDeparture: !!entry?.isEarlyDeparture,
-                lateMins: entry?.lateMins || 0,
-                earlyMins: entry?.earlyDepartureMins || 0,
             });
         }
-        rows.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+        rows.sort((a, b) => {
+            const d = (a.department || "").localeCompare(b.department || "");
+            if (d !== 0) return d;
+            const g = (a.designation || "").localeCompare(b.designation || "");
+            if (g !== 0) return g;
+            return (a.name || "").localeCompare(b.name || "");
+        });
 
+        // ── Aggregate manpower stats by dept and designation ───────────────
+        const PRESENT_CODES = ["P", "P*", "P~"];
+        const LEAVE_CODES = ["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"];
+        const OFF_CODES = ["WO", "FH", "NH", "OH", "RH", "PH"];
+
+        const counterTemplate = () => ({
+            total: 0, present: 0, late: 0, halfDay: 0, missPunch: 0,
+            absent: 0, leave: 0, off: 0,
+        });
+        const incCounters = (c, status) => {
+            c.total++;
+            if (PRESENT_CODES.includes(status)) c.present++;
+            if (status === "P*") c.late++;
+            if (status === "HD") c.halfDay++;
+            if (status === "MP") c.missPunch++;
+            if (status === "AB") c.absent++;
+            if (LEAVE_CODES.includes(status)) c.leave++;
+            if (OFF_CODES.includes(status)) c.off++;
+        };
+
+        const deptMap = new Map();
+        for (const r of rows) {
+            const dep = r.department, des = r.designation;
+            if (!deptMap.has(dep)) deptMap.set(dep, { ...counterTemplate(), designations: new Map() });
+            const d = deptMap.get(dep);
+            incCounters(d, r.status);
+            if (!d.designations.has(des)) d.designations.set(des, counterTemplate());
+            incCounters(d.designations.get(des), r.status);
+        }
+
+        const grand = counterTemplate();
+        for (const [, d] of deptMap) {
+            grand.total += d.total; grand.present += d.present; grand.late += d.late;
+            grand.halfDay += d.halfDay; grand.missPunch += d.missPunch;
+            grand.absent += d.absent; grand.leave += d.leave; grand.off += d.off;
+        }
+
+        // Attendance %: of those expected to work today (excl. leave & off), how many showed
+        const attndPct = (c) => {
+            const expected = c.total - c.off - c.leave;
+            const showed = expected - c.absent;
+            return expected > 0 ? Math.round((showed / expected) * 100) : 100;
+        };
+
+        // ── Build workbook ──────────────────────────────────────────────────
         const wb = new ExcelJS.Workbook();
         wb.creator = "Grav Clothing HRMS";
-        const ws = wb.addWorksheet("Daily Attendance", {
-            views: [{ state: "frozen", ySplit: 9, showGridLines: false }],
-            pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
+        const ws = wb.addWorksheet("Daily Manpower", {
+            views: [{ state: "frozen", ySplit: 5, showGridLines: false }],
+            pageSetup: {
+                paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1,
+                margins: { left: 0.3, right: 0.3, top: 0.4, bottom: 0.4, header: 0.2, footer: 0.2 },
+            },
         });
 
-        const TOTAL_COLS = 12; // EMPLOYEE, DEPT, STATUS, IN, OUT, L.OUT, L.IN, T.OUT, T.IN, FINAL, WORK, OT
-        const dateLabel = new Date(date + "T00:00:00").toLocaleDateString("en-IN", {
-            weekday: "long", day: "numeric", month: "long", year: "numeric",
-            timeZone: "Asia/Kolkata",
-        });
-
-        // ── Hero banner ────────────────────────────────────────────────
-        ws.mergeCells(1, 1, 1, TOTAL_COLS);
-        const hero = ws.getCell(1, 1);
-        hero.value = {
-            richText: [
-                { text: "GRAV CLOTHING\n", font: { size: 9, bold: true, italic: true, color: { argb: "FFE9D5FF" } } },
-                { text: `Daily Attendance · ${dateLabel}`, font: { size: 16, bold: true, color: { argb: "FFFFFFFF" } } },
-            ]
-        };
-        hero.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
-        hero.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        ws.getRow(1).height = 40;
-
-        // ── Stats sub-banner ───────────────────────────────────────────
-        const stats = { P: 0, "P*": 0, "P~": 0, HD: 0, MP: 0, AB: 0, WO: 0, holiday: 0, leaves: 0 };
-        for (const r of rows) {
-            if (stats[r.status] !== undefined) stats[r.status]++;
-            if (["FH", "NH", "OH", "RH", "PH"].includes(r.status)) stats.holiday++;
-            if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(r.status)) stats.leaves++;
-        }
-        ws.mergeCells(2, 1, 2, TOTAL_COLS);
-        const sub = ws.getCell(2, 1);
-        sub.value = `${rows.length} employees  ·  Present ${stats.P + stats["P*"] + stats["P~"]}  ·  Late ${stats["P*"]}  ·  Half Day ${stats.HD}  ·  Miss Punch ${stats.MP}  ·  Absent ${stats.AB}  ·  Off ${stats.WO}  ·  Holiday ${stats.holiday}  ·  Leave ${stats.leaves}`;
-        sub.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
-        sub.font = { size: 9, color: { argb: "FFC4B5FD" } };
-        sub.alignment = { vertical: "middle", horizontal: "center" };
-        ws.getRow(2).height = 22;
-
-        // ── LEGEND ROW 1 — status colors ──────────────────────────────
-        ws.mergeCells(3, 1, 3, TOTAL_COLS);
-        const legendHdr = ws.getCell(3, 1);
-        legendHdr.value = "COLOR LEGEND — STATUS CODES";
-        legendHdr.font = { size: 9, bold: true, color: { argb: "FF6B7280" } };
-        legendHdr.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
-        legendHdr.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF9FAFB" } };
-        ws.getRow(3).height = 20;
-
-        ws.mergeCells(4, 1, 4, TOTAL_COLS);
-        const legendStatus = ws.getCell(4, 1);
-        legendStatus.value = {
-            richText: [
-                { text: "P", font: { size: 10, bold: true, color: { argb: "FF008000" } } },
-                { text: " Present  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "L", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
-                { text: " Late  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "EO", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
-                { text: " Early Out  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "HD", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
-                { text: " Half Day  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "MP", font: { size: 10, bold: true, color: { argb: "FFDB2777" } } },
-                { text: " Miss Punch  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "A", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
-                { text: " Absent  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "WO", font: { size: 10, bold: true, color: { argb: "FF64748B" } } },
-                { text: " Weekly Off  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "FH/NH/OH/RH", font: { size: 10, bold: true, color: { argb: "FF4F46E5" } } },
-                { text: " Holidays  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "CL/SL/EL", font: { size: 10, bold: true, color: { argb: "FF7C3AED" } } },
-                { text: " Leaves", font: { size: 9, color: { argb: "FF6B7280" } } },
-            ]
-        };
-        legendStatus.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        legendStatus.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
-        ws.getRow(4).height = 22;
-
-        // ── LEGEND ROW 2 — time & work colors ─────────────────────────
-        ws.mergeCells(5, 1, 5, TOTAL_COLS);
-        const legendTimes = ws.getCell(5, 1);
-        legendTimes.value = {
-            richText: [
-                { text: "TIMES → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
-                { text: "09:19", font: { size: 10, bold: true, color: { argb: "FF2563EB" } } },
-                { text: " on-time IN/OUT  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "09:43", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
-                { text: " late IN  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "17:41", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
-                { text: " early OUT  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "WORK → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
-                { text: "8:35", font: { size: 10, bold: true, color: { argb: "FF16A34A" } } },
-                { text: " ≥ 8 hours  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "6:05", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
-                { text: " < 8 hours  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "OT → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
-                { text: "0:30", font: { size: 10, bold: true, color: { argb: "FF4338CA" } } },
-                { text: " any overtime", font: { size: 9, color: { argb: "FF6B7280" } } },
-            ]
-        };
-        legendTimes.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        legendTimes.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
-        ws.getRow(5).height = 22;
-
-        // ── Border around the legend block ────────────────────────────
-        for (let r = 3; r <= 5; r++) {
-            for (let c = 1; c <= TOTAL_COLS; c++) {
-                ws.getCell(r, c).border = {
-                    top: r === 3 ? { style: "medium", color: { argb: "FF6B7280" } } : { style: "thin", color: { argb: "FFE5E7EB" } },
-                    bottom: r === 5 ? { style: "medium", color: { argb: "FF6B7280" } } : { style: "thin", color: { argb: "FFE5E7EB" } },
-                    left: c === 1 ? { style: "medium", color: { argb: "FF6B7280" } } : undefined,
-                    right: c === TOTAL_COLS ? { style: "medium", color: { argb: "FF6B7280" } } : undefined,
-                };
-            }
-        }
-
-        ws.getRow(6).height = 6; // gap
-
-        // ── Table headers ─────────────────────────────────────────────
-        const headers = ["EMPLOYEE", "DEPARTMENT", "STATUS", "IN", "OUT", "L.OUT", "L.IN", "T.OUT", "T.IN", "FINAL", "WORK", "OT"];
-        const widths = [28, 18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+        const COLS = 16;
+        const widths = [5, 26, 10, 16, 19, 7, 14, 9, 9, 9, 9, 9, 9, 9, 9, 10];
         widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
-        const headerRow = ws.getRow(7);
-        headers.forEach((h, i) => {
-            const cell = headerRow.getCell(i + 1);
-            cell.value = h;
-            cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
-            cell.alignment = { vertical: "middle", horizontal: i === 0 || i === 1 ? "left" : "center", indent: i <= 1 ? 1 : 0 };
-            cell.border = {
-                top: { style: "medium", color: { argb: "FF0F172A" } },
-                bottom: { style: "medium", color: { argb: "FF0F172A" } },
-                left: { style: "thin", color: { argb: "FF374151" } },
-                right: { style: "thin", color: { argb: "FF374151" } },
-            };
+        const dateLabel = new Date(date + "T00:00:00").toLocaleDateString("en-IN", {
+            weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "Asia/Kolkata",
         });
-        headerRow.height = 24;
 
-        // ── Data rows ─────────────────────────────────────────────────
-        const fmt = (d) => fmtTimeIST(d);   // uses Asia/Kolkata
+        const fmt = (d) => fmtTimeIST(d);
         const fmtMins = (m) => {
             if (!m || m <= 0) return "";
             const h = Math.floor(m / 60), mm = m % 60;
-            return `${h}:${String(mm).padStart(2, "0")}`;
+            return h ? `${h}:${String(mm).padStart(2, "0")}` : `0:${String(mm).padStart(2, "0")}`;
         };
 
         const STATUS_COLOR = {
             P: "FF008000", "P*": "FFFF8C00", "P~": "FFFF0000",
-            HD: "FFFF0000", MP: "FFDB2777", AB: "FFDC2626", LWP: "FFDC2626",
+            HD: "FFCA8A04", MP: "FFDB2777", AB: "FFDC2626", LWP: "FFDC2626",
             WO: "FF64748B",
             FH: "FF4F46E5", NH: "FF4F46E5", OH: "FF4F46E5", RH: "FF4F46E5", PH: "FF4F46E5",
             "L-CL": "FF7C3AED", "L-SL": "FF7C3AED", "L-EL": "FF7C3AED",
             WFH: "FF0891B2", CO: "FF0D9488",
         };
 
-        rows.forEach((r, idx) => {
-            const row = ws.getRow(8 + idx);
-            const rowFill = idx % 2 === 0 ? "FFFFFFFF" : "FFF8FAFC";
+        let row = 1;
 
-            // Name
-            row.getCell(1).value = r.name;
-            row.getCell(1).font = { size: 10, bold: true, color: { argb: "FF1D4ED8" } };
-            row.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        // ── Hero banner ────────────────────────────────────────────────────
+        ws.mergeCells(row, 1, row, COLS);
+        const hero = ws.getCell(row, 1);
+        hero.value = {
+            richText: [
+                { text: "GRAV CLOTHING\n", font: { size: 11, bold: true, italic: true, color: { argb: "FFE9D5FF" } } },
+                { text: `Daily Manpower Report  ·  ${dateLabel}`, font: { size: 22, bold: true, color: { argb: "FFFFFFFF" } } },
+            ],
+        };
+        hero.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+        hero.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+        ws.getRow(row).height = 56;
+        row++;
 
-            // Department
-            row.getCell(2).value = r.department;
-            row.getCell(2).font = { size: 9, color: { argb: "FF6B7280" } };
-            row.getCell(2).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        // ── Exec summary bar ───────────────────────────────────────────────
+        ws.mergeCells(row, 1, row, COLS);
+        const sub = ws.getCell(row, 1);
+        const overallPct = attndPct(grand);
+        sub.value = `${grand.total} TOTAL  ·  ${grand.present} PRESENT (${overallPct}%)  ·  ${grand.late} LATE  ·  ${grand.halfDay} HALF-DAY  ·  ${grand.missPunch} MISS PUNCH  ·  ${grand.absent} ABSENT  ·  ${grand.leave} ON LEAVE  ·  ${grand.off} OFF/HOLIDAY${department && department !== "all" ? `  ·  Filtered: ${department}` : ""}`;
+        sub.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
+        sub.font = { size: 11, color: { argb: "FFC4B5FD" }, bold: true };
+        sub.alignment = { vertical: "middle", horizontal: "center" };
+        ws.getRow(row).height = 30;
+        row++;
 
-            // Status (use display label, color-coded)
-            row.getCell(3).value = r.statusLabel;
-            row.getCell(3).font = { size: 10, bold: true, color: { argb: STATUS_COLOR[r.status] || "FF111827" } };
-            row.getCell(3).alignment = { vertical: "middle", horizontal: "center" };
+        // ── Color legend ───────────────────────────────────────────────────
+        ws.mergeCells(row, 1, row, COLS);
+        const lg = ws.getCell(row, 1);
+        lg.value = {
+            richText: [
+                { text: "P", font: { size: 10, bold: true, color: { argb: "FF008000" } } },
+                { text: " Present  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "P*", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
+                { text: " Late  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "P~", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
+                { text: " Early Out  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "HD", font: { size: 10, bold: true, color: { argb: "FFCA8A04" } } },
+                { text: " Half Day  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "MP", font: { size: 10, bold: true, color: { argb: "FFDB2777" } } },
+                { text: " Miss Punch  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "AB", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
+                { text: " Absent  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "WO", font: { size: 10, bold: true, color: { argb: "FF64748B" } } },
+                { text: " Weekly Off  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "FH/NH/OH/RH", font: { size: 10, bold: true, color: { argb: "FF4F46E5" } } },
+                { text: " Holiday  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "CL/SL/EL/WFH/CO", font: { size: 10, bold: true, color: { argb: "FF7C3AED" } } },
+                { text: " Leave", font: { size: 9, color: { argb: "FF6B7280" } } },
+            ],
+        };
+        lg.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+        lg.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF9FAFB" } };
+        ws.getRow(row).height = 22;
+        for (let c = 1; c <= COLS; c++) {
+            ws.getCell(row, c).border = {
+                top: { style: "thin", color: { argb: "FFE5E7EB" } },
+                bottom: { style: "medium", color: { argb: "FF6B7280" } },
+            };
+        }
+        row++;
 
-            // IN — orange bold if late
-            row.getCell(4).value = fmt(r.inTime);
-            row.getCell(4).font = { size: 9, bold: r.isLate, color: { argb: r.isLate ? "FFFF8C00" : "FF2563EB" } };
-            row.getCell(4).alignment = { vertical: "middle", horizontal: "center" };
+        // ════════════════════════════════════════════════════════════════════
+        // SECTION 1 — DETAILED EMPLOYEE ROSTER
+        // ════════════════════════════════════════════════════════════════════
+        ws.mergeCells(row, 1, row, COLS);
+        const rh = ws.getCell(row, 1);
+        rh.value = `EMPLOYEE ROSTER  ·  ${rows.length} employee${rows.length === 1 ? "" : "s"}`;
+        rh.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+        rh.font = { size: 11, bold: true, color: { argb: "FFFFFFFF" } };
+        rh.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        ws.getRow(row).height = 24;
+        row++;
 
-            // OUT (final exit per shift) — same as FINAL but kept here for visual separation
-            row.getCell(5).value = fmt(r.outTime);
-            row.getCell(5).font = { size: 9, bold: r.isEarlyDeparture, color: { argb: r.isEarlyDeparture ? "FFFF8C00" : "FF2563EB" } };
-            row.getCell(5).alignment = { vertical: "middle", horizontal: "center" };
+        const colHeaders = ["#", "EMPLOYEE", "EMP ID", "DEPARTMENT", "DESIGNATION", "TYPE", "STATUS", "IN", "L.OUT", "L.IN", "T.OUT", "T.IN", "OUT", "WORK", "OT", "LATE"];
+        const headerRow = ws.getRow(row);
+        colHeaders.forEach((h, i) => {
+            const cell = headerRow.getCell(i + 1);
+            cell.value = h;
+            cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF374151" } };
+            cell.alignment = {
+                vertical: "middle",
+                horizontal: (i === 1 || i === 3 || i === 4) ? "left" : "center",
+                indent: (i === 1 || i === 3 || i === 4) ? 1 : 0,
+            };
+            cell.border = {
+                top: { style: "medium", color: { argb: "FF0F172A" } },
+                bottom: { style: "medium", color: { argb: "FF0F172A" } },
+                left: { style: "thin", color: { argb: "FF4B5563" } },
+                right: { style: "thin", color: { argb: "FF4B5563" } },
+            };
+        });
+        headerRow.height = 28;
+        row++;
 
-            // Lunch + Tea breaks
-            row.getCell(6).value = fmt(r.lunchOut);
-            row.getCell(7).value = fmt(r.lunchIn);
-            row.getCell(8).value = fmt(r.teaOut);
-            row.getCell(9).value = fmt(r.teaIn);
-            for (const c of [6, 7, 8, 9]) {
-                row.getCell(c).font = { size: 9, color: { argb: "FF6B7280" } };
-                row.getCell(c).alignment = { vertical: "middle", horizontal: "center" };
+        // Data rows — with department dividers
+        let lastDept = null;
+        let counter = 0;
+        for (const r of rows) {
+            if (r.department !== lastDept) {
+                if (lastDept !== null) {
+                    // small divider stripe between departments
+                    ws.getRow(row).height = 4;
+                    for (let c = 1; c <= COLS; c++) {
+                        ws.getCell(row, c).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEDE9FE" } };
+                    }
+                    row++;
+                }
+                lastDept = r.department;
+            }
+            counter++;
+            const dr = ws.getRow(row);
+            const fillColor = counter % 2 === 0 ? "FFF8FAFC" : "FFFFFFFF";
+
+            dr.getCell(1).value = counter;
+            dr.getCell(1).font = { size: 9, color: { argb: "FF9CA3AF" } };
+            dr.getCell(1).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(2).value = r.name;
+            dr.getCell(2).font = { size: 10, bold: true, color: { argb: "FF1D4ED8" } };
+            dr.getCell(2).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            dr.getCell(3).value = r.empId;
+            dr.getCell(3).font = { name: "Consolas", size: 9, color: { argb: "FF6B7280" } };
+            dr.getCell(3).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(4).value = r.department;
+            dr.getCell(4).font = { size: 9, color: { argb: "FF374151" } };
+            dr.getCell(4).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            dr.getCell(5).value = r.designation;
+            dr.getCell(5).font = { size: 9, color: { argb: "FF374151" } };
+            dr.getCell(5).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            dr.getCell(6).value = r.empType === "executive" ? "EXE" : "OPR";
+            dr.getCell(6).font = { size: 8, bold: true, color: { argb: r.empType === "executive" ? "FF4F46E5" : "FF2563EB" } };
+            dr.getCell(6).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(7).value = r.statusLabel;
+            dr.getCell(7).font = { size: 10, bold: true, color: { argb: STATUS_COLOR[r.status] || "FF111827" } };
+            dr.getCell(7).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(8).value = fmt(r.inTime);
+            dr.getCell(8).font = { name: "Consolas", size: 9, bold: r.isLate, color: { argb: r.isLate ? "FFFF8C00" : "FF2563EB" } };
+            dr.getCell(8).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(9).value = fmt(r.lunchOut);
+            dr.getCell(10).value = fmt(r.lunchIn);
+            dr.getCell(11).value = fmt(r.teaOut);
+            dr.getCell(12).value = fmt(r.teaIn);
+            for (const c of [9, 10, 11, 12]) {
+                dr.getCell(c).font = { name: "Consolas", size: 8, color: { argb: "FF6B7280" } };
+                dr.getCell(c).alignment = { vertical: "middle", horizontal: "center" };
             }
 
-            // Final out
-            row.getCell(10).value = fmt(r.outTime);
-            row.getCell(10).font = { size: 9, bold: true, color: { argb: "FF111827" } };
-            row.getCell(10).alignment = { vertical: "middle", horizontal: "center" };
+            dr.getCell(13).value = fmt(r.outTime);
+            dr.getCell(13).font = { name: "Consolas", size: 9, bold: true, color: { argb: r.isEarlyDeparture ? "FFFF8C00" : "FF111827" } };
+            dr.getCell(13).alignment = { vertical: "middle", horizontal: "center" };
 
-            // Work hours — green ≥8h, red <8h
-            row.getCell(11).value = fmtMins(r.netWorkMins);
-            row.getCell(11).font = {
-                size: 10, bold: true,
-                color: { argb: r.netWorkMins >= 480 ? "FF16A34A" : r.netWorkMins > 0 ? "FFDC2626" : "FF9CA3AF" }
+            dr.getCell(14).value = fmtMins(r.netWorkMins);
+            dr.getCell(14).font = {
+                name: "Consolas", size: 10, bold: true,
+                color: { argb: r.netWorkMins >= 480 ? "FF16A34A" : r.netWorkMins > 0 ? "FFDC2626" : "FF9CA3AF" },
             };
-            row.getCell(11).alignment = { vertical: "middle", horizontal: "center" };
+            dr.getCell(14).alignment = { vertical: "middle", horizontal: "center" };
 
-            // OT — indigo
-            row.getCell(12).value = fmtMins(r.otMins);
-            row.getCell(12).font = {
-                size: 10, bold: r.otMins > 0,
-                color: { argb: r.otMins > 0 ? "FF4338CA" : "FF9CA3AF" }
-            };
-            row.getCell(12).alignment = { vertical: "middle", horizontal: "center" };
+            dr.getCell(15).value = fmtMins(r.otMins);
+            dr.getCell(15).font = { name: "Consolas", size: 9, bold: r.otMins > 0, color: { argb: r.otMins > 0 ? "FF4338CA" : "FF9CA3AF" } };
+            dr.getCell(15).alignment = { vertical: "middle", horizontal: "center" };
 
-            // Borders + zebra fill
-            for (let c = 1; c <= TOTAL_COLS; c++) {
-                const cell = row.getCell(c);
-                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: rowFill } };
+            dr.getCell(16).value = r.lateDisplay || (r.lateMins > 0 ? fmtMins(r.lateMins) : "");
+            dr.getCell(16).font = { size: 9, bold: r.lateMins > 0, color: { argb: r.lateMins > 0 ? "FFFF8C00" : "FF9CA3AF" } };
+            dr.getCell(16).alignment = { vertical: "middle", horizontal: "center" };
+
+            for (let c = 1; c <= COLS; c++) {
+                const cell = dr.getCell(c);
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: fillColor } };
                 cell.border = {
                     top: { style: "thin", color: { argb: "FFE5E7EB" } },
                     bottom: { style: "thin", color: { argb: "FFE5E7EB" } },
-                    left: { style: "thin", color: { argb: "FFE5E7EB" } },
-                    right: { style: "thin", color: { argb: "FFE5E7EB" } },
+                    left: { style: "thin", color: { argb: "FFF3F4F6" } },
+                    right: { style: "thin", color: { argb: "FFF3F4F6" } },
                 };
             }
-            row.height = 20;
+            dr.height = 22;
+            row++;
+        }
+
+        // Gap before breakdown section
+        ws.getRow(row).height = 16;
+        row++;
+
+        // ════════════════════════════════════════════════════════════════════
+        // SECTION 2 — MANPOWER BREAKDOWN BY DEPT & DESIGNATION
+        // ════════════════════════════════════════════════════════════════════
+        ws.mergeCells(row, 1, row, COLS);
+        const mh = ws.getCell(row, 1);
+        mh.value = "MANPOWER BREAKDOWN  ·  By Department & Designation";
+        mh.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+        mh.font = { size: 11, bold: true, color: { argb: "FFFFFFFF" } };
+        mh.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        ws.getRow(row).height = 24;
+        row++;
+
+        // Breakdown header — uses cols 1-10 only (cols 11-16 stay merged & blank)
+        const bkHeaders = ["DEPARTMENT / DESIGNATION", "TOTAL", "PRESENT", "LATE", "HD", "MP", "ABSENT", "LEAVE", "OFF/HOL", "ATTND %"];
+        const bkRow = ws.getRow(row);
+        bkHeaders.forEach((h, i) => {
+            const cell = bkRow.getCell(i + 1);
+            cell.value = h;
+            cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF374151" } };
+            cell.alignment = { vertical: "middle", horizontal: i === 0 ? "left" : "center", indent: i === 0 ? 1 : 0 };
+            cell.border = {
+                top: { style: "medium", color: { argb: "FF0F172A" } },
+                bottom: { style: "medium", color: { argb: "FF0F172A" } },
+                left: { style: "thin", color: { argb: "FF4B5563" } },
+                right: { style: "thin", color: { argb: "FF4B5563" } },
+            };
         });
+        ws.mergeCells(row, 11, row, COLS);
+        const bkPad = ws.getCell(row, 11);
+        bkPad.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF374151" } };
+        bkPad.border = { top: { style: "medium", color: { argb: "FF0F172A" } }, bottom: { style: "medium", color: { argb: "FF0F172A" } } };
+        bkRow.height = 26;
+        row++;
+
+        // Sort departments by total (largest first)
+        const sortedDepts = [...deptMap.entries()].sort((a, b) => b[1].total - a[1].total);
+
+        for (const [depName, depCounts] of sortedDepts) {
+            // Department band
+            ws.mergeCells(row, 1, row, 10);
+            const dh = ws.getCell(row, 1);
+            const depPct = attndPct(depCounts);
+            dh.value = `▼ ${depName}  ·  ${depCounts.total} employee${depCounts.total === 1 ? "" : "s"}  ·  ${depCounts.present} present  ·  ${depPct}% attendance`;
+            dh.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+            dh.font = { size: 10, bold: true, color: { argb: "FFFFFFFF" } };
+            dh.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+            ws.mergeCells(row, 11, row, COLS);
+            ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+            ws.getRow(row).height = 22;
+            row++;
+
+            // Designation rows
+            const sortedDesigs = [...depCounts.designations.entries()].sort((a, b) => b[1].total - a[1].total);
+            for (const [desigName, c] of sortedDesigs) {
+                const dr = ws.getRow(row);
+                const pct = attndPct(c);
+
+                dr.getCell(1).value = `    ${desigName}`;
+                dr.getCell(1).font = { size: 9, color: { argb: "FF374151" } };
+                dr.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 2 };
+
+                const cells = [
+                    { v: c.total, color: "FF111827", bold: true },
+                    { v: c.present || "—", color: c.present ? "FF16A34A" : "FF9CA3AF", bold: true },
+                    { v: c.late || "—", color: c.late ? "FFFF8C00" : "FF9CA3AF" },
+                    { v: c.halfDay || "—", color: c.halfDay ? "FFCA8A04" : "FF9CA3AF" },
+                    { v: c.missPunch || "—", color: c.missPunch ? "FFDB2777" : "FF9CA3AF" },
+                    { v: c.absent || "—", color: c.absent ? "FFDC2626" : "FF9CA3AF", bold: !!c.absent },
+                    { v: c.leave || "—", color: c.leave ? "FF7C3AED" : "FF9CA3AF" },
+                    { v: c.off || "—", color: c.off ? "FF4F46E5" : "FF9CA3AF" },
+                    { v: `${pct}%`, color: pct >= 90 ? "FF16A34A" : pct >= 75 ? "FFCA8A04" : "FFDC2626", bold: true },
+                ];
+                cells.forEach((vc, i) => {
+                    const cell = dr.getCell(i + 2);
+                    cell.value = vc.v;
+                    cell.font = { size: 9, bold: vc.bold, color: { argb: vc.color } };
+                    cell.alignment = { vertical: "middle", horizontal: "center" };
+                });
+
+                for (let c2 = 1; c2 <= 10; c2++) {
+                    dr.getCell(c2).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
+                    dr.getCell(c2).border = {
+                        top: { style: "thin", color: { argb: "FFF3F4F6" } },
+                        bottom: { style: "thin", color: { argb: "FFE5E7EB" } },
+                        left: { style: "thin", color: { argb: "FFF3F4F6" } },
+                        right: { style: "thin", color: { argb: "FFF3F4F6" } },
+                    };
+                }
+                ws.mergeCells(row, 11, row, COLS);
+                ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
+                dr.height = 20;
+                row++;
+            }
+
+            // Department subtotal
+            const stRow = ws.getRow(row);
+            const stPct = attndPct(depCounts);
+            stRow.getCell(1).value = `  ▶ ${depName} TOTAL`;
+            stRow.getCell(1).font = { size: 10, bold: true, color: { argb: "FF581C87" } };
+            stRow.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            const stCells = [
+                { v: depCounts.total, color: "FF581C87" },
+                { v: depCounts.present, color: "FF16A34A" },
+                { v: depCounts.late, color: "FFFF8C00" },
+                { v: depCounts.halfDay, color: "FFCA8A04" },
+                { v: depCounts.missPunch, color: "FFDB2777" },
+                { v: depCounts.absent, color: "FFDC2626" },
+                { v: depCounts.leave, color: "FF7C3AED" },
+                { v: depCounts.off, color: "FF4F46E5" },
+                { v: `${stPct}%`, color: "FFFFFFFF", fill: stPct >= 90 ? "FF16A34A" : stPct >= 75 ? "FFCA8A04" : "FFDC2626" },
+            ];
+            stCells.forEach((vc, i) => {
+                const cell = stRow.getCell(i + 2);
+                cell.value = vc.v;
+                cell.font = { size: 10, bold: true, color: { argb: vc.color } };
+                cell.alignment = { vertical: "middle", horizontal: "center" };
+                if (vc.fill) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: vc.fill } };
+            });
+
+            for (let c2 = 1; c2 <= 10; c2++) {
+                if (!stRow.getCell(c2).fill) {
+                    stRow.getCell(c2).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEDE9FE" } };
+                }
+                stRow.getCell(c2).border = {
+                    top: { style: "medium", color: { argb: "FF7C3AED" } },
+                    bottom: { style: "medium", color: { argb: "FF7C3AED" } },
+                };
+            }
+            ws.mergeCells(row, 11, row, COLS);
+            ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEDE9FE" } };
+            stRow.height = 22;
+            row++;
+
+            // Tiny gap
+            ws.getRow(row).height = 4;
+            row++;
+        }
+
+        // Grand total row
+        const gtRow = ws.getRow(row);
+        const gtPct = attndPct(grand);
+        gtRow.getCell(1).value = "GRAND TOTAL";
+        gtRow.getCell(1).font = { size: 12, bold: true, color: { argb: "FFFFFFFF" } };
+        gtRow.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+        const gtVals = [grand.total, grand.present, grand.late, grand.halfDay, grand.missPunch, grand.absent, grand.leave, grand.off, `${gtPct}%`];
+        gtVals.forEach((v, i) => {
+            const cell = gtRow.getCell(i + 2);
+            cell.value = v;
+            cell.font = { size: 12, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.alignment = { vertical: "middle", horizontal: "center" };
+        });
+        for (let c2 = 1; c2 <= 10; c2++) {
+            gtRow.getCell(c2).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
+            gtRow.getCell(c2).border = {
+                top: { style: "double", color: { argb: "FF0F172A" } },
+                bottom: { style: "double", color: { argb: "FF0F172A" } },
+            };
+        }
+        ws.mergeCells(row, 11, row, COLS);
+        ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
+        gtRow.height = 30;
+        row++;
 
         // Footer
-        const footerRow = ws.getRow(8 + rows.length + 1);
-        ws.mergeCells(footerRow.number, 1, footerRow.number, TOTAL_COLS);
-        footerRow.getCell(1).value = `${rows.length} record${rows.length === 1 ? "" : "s"}  ·  Generated ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`;
-        footerRow.getCell(1).font = { size: 8, italic: true, color: { argb: "FF6B7280" } };
-        footerRow.getCell(1).alignment = { vertical: "middle", horizontal: "right", indent: 1 };
-        footerRow.height = 18;
+        ws.getRow(row).height = 8;
+        row++;
+        ws.mergeCells(row, 1, row, COLS);
+        const ft = ws.getCell(row, 1);
+        ft.value = `Generated ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}  ·  Grav Clothing HRMS  ·  Daily Manpower Report`;
+        ft.font = { size: 8, italic: true, color: { argb: "FF6B7280" } };
+        ft.alignment = { vertical: "middle", horizontal: "right", indent: 1 };
+        ws.getRow(row).height = 18;
 
+        // ── Send file ───────────────────────────────────────────────────────
         const buffer = await wb.xlsx.writeBuffer();
-        const filename = `attendance_${date}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
+        const filename = `manpower_${date}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
         res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
         res.setHeader("Cache-Control", "no-store");
@@ -4292,29 +4516,22 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                     const emp = dayDoc.employees[idx];
                     const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
 
-                    // ── Parse helper ────────────────────────────────────────
-                    const parseTimeOnDate = (timeStr) => {
-                        if (!timeStr) return null;
-                        const [h, m] = String(timeStr).split(":").map(Number);
-                        const d = new Date(r.dateStr + "T00:00:00+05:30");
-                        d.setHours(h || 0, m || 0, 0, 0);
-                        return d;
-                    };
-
+                    // ── Use IST-aware parser (no local function needed) ────
                     const punchFieldMap = {
                         in: "inTime", lunch_out: "lunchOut", lunch_in: "lunchIn",
                         tea_out: "teaOut", tea_in: "teaIn", out: "finalOut",
                     };
 
                     // ── 1. Apply whole-day proposed times (legacy / simple) ─
+                    // ── 1. Apply whole-day proposed times (legacy / simple) ─
                     if (r.proposedInTime) {
                         const oldT = emp.inTime ? fmtTimeIST12(emp.inTime) : "—";
-                        emp.inTime = parseTimeOnDate(r.proposedInTime);
+                        emp.inTime = parseTimeOnDateIST(r.proposedInTime, r.dateStr);
                         punchChanges.push({ punchType: "in", action: "modify", oldTime: oldT, newTime: fmtTimeIST12(emp.inTime) });
                     }
                     if (r.proposedOutTime) {
                         const oldT = emp.finalOut ? fmtTimeIST12(emp.finalOut) : "—";
-                        emp.finalOut = parseTimeOnDate(r.proposedOutTime);
+                        emp.finalOut = parseTimeOnDateIST(r.proposedOutTime, r.dateStr);
                         punchChanges.push({ punchType: "out", action: "modify", oldTime: oldT, newTime: fmtTimeIST12(emp.finalOut) });
                     }
 
@@ -4328,7 +4545,7 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                                 emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== r.proposedPunchType);
                                 punchChanges.push({ punchType: r.proposedPunchType, action: "remove", oldTime: oldT, newTime: "removed" });
                             } else if (r.proposedPunchTime) {
-                                const newDate = parseTimeOnDate(r.proposedPunchTime);
+                                const newDate = parseTimeOnDateIST(r.proposedPunchTime, r.dateStr);
                                 emp[fieldName] = newDate;
                                 // Upsert rawPunch
                                 const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === r.proposedPunchType);
@@ -4351,7 +4568,7 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                             emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== pc.punchType);
                             punchChanges.push({ punchType: pc.punchType, action: "remove", oldTime: oldT, newTime: "removed" });
                         } else if (pc.punchTime) {
-                            const newDate = parseTimeOnDate(pc.punchTime);
+                            const newDate = parseTimeOnDateIST(pc.punchTime, r.dateStr);
                             emp[fieldName] = newDate;
                             const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === pc.punchType);
                             const entry = { time: newDate, punchType: pc.punchType, source: "miss_punch", addedBy: req.user?.id, addedAt: new Date() };

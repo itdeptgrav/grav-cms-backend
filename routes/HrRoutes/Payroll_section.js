@@ -32,39 +32,70 @@ const HOLIDAY_TYPE_TO_CODE = {
     national: "NH", company: "FH", optional: "OH", restricted: "RH",
 };
 
+// ─── DOJ HELPERS ─────────────────────────────────────────────────────────────
+
+function parseDOJ(val) {
+    if (!val) return null;
+    const d = val instanceof Date ? val : new Date(val);
+    if (isNaN(d.getTime())) return null;
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function firstActiveDayOfMonth(dateOfJoining, month, year, daysInMonth) {
+    const doj = parseDOJ(dateOfJoining);
+    if (!doj) return 1;
+
+    const dojYear = doj.getFullYear();
+    const dojMonth = doj.getMonth() + 1;
+    const dojDay = doj.getDate();
+
+    if (dojYear < year || (dojYear === year && dojMonth < month)) return 1;
+    if (dojYear > year || (dojYear === year && dojMonth > month)) return daysInMonth + 1;
+    return dojDay;
+}
+
+function calendarDaysSinceDOJ(dateOfJoining, month, year) {
+    const doj = parseDOJ(dateOfJoining);
+    if (!doj) return Infinity;
+    const endOfMonth = new Date(year, month, 0);
+    if (doj > endOfMonth) return 0;
+    const msPerDay = 86400000;
+    return Math.floor((endOfMonth - doj) / msPerDay) + 1;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
-//  ENGINE — computes payroll for a single employee for a given month
+//  ENGINE
 // ═════════════════════════════════════════════════════════════════════════════
 
-/**
- * @param {Object} employee  — Employee document
- * @param {Object} ctx       — shared context { month, year, settings, salaryCfg, holidayMap, attendanceByDate, leaveBalance }
- * @returns {Object}         — full computed payroll payload for this employee
- */
 function computeEmployeePayroll(employee, ctx) {
     const { month, year, settings, salaryCfg, holidayMap, attendanceByDate, leaveBalance, leaveConfig } = ctx;
     const daysInMonth = new Date(year, month, 0).getDate();
 
-    // Leave entitlements come from LeaveConfig (HR-tunable). Fall back to
-    // schema defaults only when no config exists yet. Support both PL
-    // (Privilege Leave — used in the live routes + settings UI) and EL
-    // (Earned Leave — legacy schema key).
+    // ── DOJ ──────────────────────────────────────────────────────────────────
+    const firstActiveDay = firstActiveDayOfMonth(employee.dateOfJoining, month, year, daysInMonth);
+    const preJoiningDays = Math.max(0, firstActiveDay - 1);
+    const activeDaysInMonth = daysInMonth - preJoiningDays;
+
+    // ── 24-day CL eligibility ─────────────────────────────────────────────────
+    const daysSinceDOJ = calendarDaysSinceDOJ(employee.dateOfJoining, month, year);
+    const clEligible = daysSinceDOJ >= 24;
+
     const CL_ENT_DEFAULT = leaveConfig?.clPerYear ?? 12;
     const SL_ENT_DEFAULT = leaveConfig?.slPerYear ?? 12;
     const PL_ENT_DEFAULT = leaveConfig?.plPerYear ?? 15;
 
     const stats = {
         daysInMonth,
-        presentDays: 0,       // P + P* + P~ + MP (if treated present)
+        presentDays: 0,
         halfDays: 0,
         missPunchDays: 0,
         absentDays: 0,
         lwpDays: 0,
         weekOffDays: 0,
-        workingSundayDays: 0, // Sundays where employee actually worked (punched)
-        holidayDays: 0,       // FH/NH/OH/RH/PH (not worked)
-        holidayWorkedDays: 0, // punched on a declared holiday
-        paidLeaveDays: 0,     // L-CL + L-SL + L-EL + WFH + CO
+        workingSundayDays: 0,
+        holidayDays: 0,
+        holidayWorkedDays: 0,
+        paidLeaveDays: 0,
         clUsedDays: 0, slUsedDays: 0, plUsedDays: 0,
         autoAdjustedCL: 0,
         sundayOffsetApplied: 0,
@@ -79,6 +110,22 @@ function computeEmployeePayroll(employee, ctx) {
         const dateStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
         const dt = new Date(dateStr + "T00:00:00");
         const dow = dt.getDay();
+
+        // Pre-joining days: completely excluded — not payable, not LOP
+        if (d < firstActiveDay) {
+            dayBreakdown.push({
+                dateStr, dayOfWeek: dow,
+                category: "PRE-JOINING",
+                paid: false, lopWeight: 0,
+                note: "Before date of joining — excluded",
+                isDeclaredHoliday: false, isSundayOff: false, isWorkingSunday: false,
+                rawStatus: null, netWorkMins: 0, otMins: 0, lateMins: 0,
+                inTime: null, finalOut: null,
+                preJoining: true,
+            });
+            continue;
+        }
+
         const hol = holidayMap.get(dateStr);
         const isWorkingSunday = hol && hol.type === "working_sunday";
         const isDeclaredHoliday = hol && hol.type !== "working_sunday";
@@ -87,7 +134,7 @@ function computeEmployeePayroll(employee, ctx) {
 
         let category = null;
         let paid = false;
-        let lopWeight = 0; // 0 = full pay, 0.5 = half day, 1 = unpaid
+        let lopWeight = 0;
         let note = "";
 
         if (entry) {
@@ -125,14 +172,12 @@ function computeEmployeePayroll(employee, ctx) {
                     category = "AB"; lopWeight = 1; break;
             }
         } else {
-            // No attendance entry for this date — infer from calendar
             if (isDeclaredHoliday) {
                 category = HOLIDAY_TYPE_TO_CODE[hol.type] || "PH";
                 paid = true;
             } else if (isSundayOff) {
                 category = "WO"; paid = true;
             } else if (dt > new Date()) {
-                // future date — skip
                 category = "—"; note = "future";
             } else {
                 category = "AB"; lopWeight = 1; note = "no attendance data";
@@ -140,7 +185,6 @@ function computeEmployeePayroll(employee, ctx) {
             }
         }
 
-        // Count stats
         if (["P", "P*", "P~", "MP"].includes(category)) stats.presentDays++;
         else if (category === "HD") stats.halfDays++;
         else if (category === "AB") stats.absentDays++;
@@ -169,26 +213,18 @@ function computeEmployeePayroll(employee, ctx) {
         });
     }
 
-    // ── Sunday Offsets Absence (compensatory off) ──────────────────────────
-    // If enabled: each Sunday-worked day cancels out one AB day. Runs BEFORE
-    // CL auto-adjust so any remainder can still be rescued by the 1-CL rule.
-    // Example: AB=2, Sunday-worked=1 → AB=1, then 1-CL rule absorbs it → AB=0.
-    if (
-        settings.sundayOffsetsAbsence &&
-        stats.workingSundayDays > 0 &&
-        stats.absentDays > 0
-    ) {
+    // ── Sunday Offsets ────────────────────────────────────────────────────────
+    if (settings.sundayOffsetsAbsence && stats.workingSundayDays > 0 && stats.absentDays > 0) {
         const offsetCount = Math.min(stats.workingSundayDays, stats.absentDays);
         stats.sundayOffsetApplied = offsetCount;
         stats.absentDays -= offsetCount;
         payableDays += offsetCount;
         lopDays -= offsetCount;
 
-        // Mark offset AB rows in the day breakdown for audit
         let remaining = offsetCount;
         for (const day of dayBreakdown) {
             if (remaining <= 0) break;
-            if (day.category === "AB") {
+            if (day.category === "AB" && !day.preJoining) {
                 day.category = "AB-OFFSET";
                 day.paid = true;
                 day.lopWeight = 0;
@@ -199,37 +235,23 @@ function computeEmployeePayroll(employee, ctx) {
         }
     }
 
-    // ── CL Auto-Adjustment ──────────────────────────────────────────────────
-    // Convert up to `maxCLPerMonth` AB days to L-CL (paid), limited by the
-    // employee's remaining annual CL balance. Any AB days beyond this cap stay
-    // as LOP. This matches the Indian HR convention where every employee has a
-    // monthly CL allowance (typically 2 per month) drawn from their annual
-    // entitlement (typically 12 per year).
-    //
-    // If no LeaveBalance record exists yet for this employee+year, fall back
-    // to the schema default (12 CL) so new employees still get the benefit.
-    if (settings.clAutoAdjust?.enabled && stats.absentDays > 0) {
+    // ── CL Auto-Adjustment — gated on 24-day probation ───────────────────────
+    if (clEligible && settings.clAutoAdjust?.enabled && stats.absentDays > 0) {
         const consumeFromBalance = settings.clAutoAdjust.consumeFromBalance !== false;
         const maxCLPerMonth = settings.clAutoAdjust.maxABForAdjustment ?? 2;
 
         let clAvailable;
         if (!consumeFromBalance) {
-            clAvailable = Infinity; // no balance check
+            clAvailable = Infinity;
         } else {
             const clEntitlement = leaveBalance
                 ? (leaveBalance.entitlement?.CL ?? 0)
-                : CL_ENT_DEFAULT;  // ← from LeaveConfig, not hardcoded
+                : CL_ENT_DEFAULT;
             const clConsumed = leaveBalance?.consumed?.CL ?? 0;
             clAvailable = Math.max(0, clEntitlement - clConsumed);
         }
 
-        // Convert as many AB days as possible, bounded by the monthly cap AND
-        // the remaining annual balance. Remaining AB stays as LOP.
-        const daysToAdjust = Math.min(
-            stats.absentDays,
-            maxCLPerMonth,
-            clAvailable
-        );
+        const daysToAdjust = Math.min(stats.absentDays, maxCLPerMonth, clAvailable);
 
         if (daysToAdjust > 0) {
             stats.autoAdjustedCL = daysToAdjust;
@@ -239,11 +261,10 @@ function computeEmployeePayroll(employee, ctx) {
             payableDays += daysToAdjust;
             lopDays -= daysToAdjust;
 
-            // Mark adjusted AB rows in breakdown
             let remaining = daysToAdjust;
             for (const day of dayBreakdown) {
                 if (remaining <= 0) break;
-                if (day.category === "AB") {
+                if (day.category === "AB" && !day.preJoining) {
                     day.category = "L-CL";
                     day.paid = true;
                     day.lopWeight = 0;
@@ -255,78 +276,77 @@ function computeEmployeePayroll(employee, ctx) {
         }
     }
 
-    // ── Determine divisor for per-day rate ──────────────────────────────────
-    const sundaysOff = dayBreakdown.filter(
-        (d) => d.dayOfWeek === 0 && !d.isWorkingSunday && !d.isDeclaredHoliday
-    ).length;
-    const declaredHolidayCount = dayBreakdown.filter((d) => d.isDeclaredHoliday).length;
+    // ── Divisor ───────────────────────────────────────────────────────────────
+    // Divisor = calendar days in the month. Same for ALL employees.
+    // 31 for March, 30 for April, etc.  No special cases.
+    const divisor = daysInMonth;
 
-    let divisor;
-    switch (settings.payableDaysBasis) {
-        case "calendar":
-            divisor = daysInMonth;
-            break;
-        case "working_days":
-            divisor = Math.max(1, daysInMonth - sundaysOff - declaredHolidayCount);
-            break;
-        case "fixed26":
-        default:
-            divisor = 26;
-            break;
-    }
-
-    // ── Earnings calculation ────────────────────────────────────────────────
-    // Indian payroll convention: monthly gross already covers Sundays & holidays.
-    // Employee earns full gross unless they have LOP days (AB / LWP / half-of-HD).
-    //     effectivePayableDays = divisor − lopDays   (+ Sunday bonus if enabled)
+    // ── Earnings ──────────────────────────────────────────────────────────────
     const fullGross = Number(employee.salary?.gross || 0);
     const fullBasic = Number(employee.salary?.basic || 0);
     const fullHra = Number(employee.salary?.hra || 0);
-    const perDayRate = fullGross / divisor;
+
+    const perDayRate = fullGross / Math.max(1, divisor);
 
     let sundayExtraPayDays = 0;
     if (settings.sundayWorkExtraPay && stats.workingSundayDays > 0) {
         sundayExtraPayDays = stats.workingSundayDays;
     }
-    const effectivePayableDays = Math.max(0, divisor - lopDays + sundayExtraPayDays);
 
-    // Keep the descriptive "payableDays" for the UI (display only, not used in math)
-    payableDays = Math.max(0, divisor - lopDays);
+    // payableDays comes directly from the day loop.
+    // Pre-joining days are skipped entirely (not payable, not LOP).
+    // Only actual absences after joining count as LOP.
+    // payableDays + lopDays + preJoiningDays = daysInMonth
+    const effectivePayableDays = payableDays + sundayExtraPayDays;
 
+    // Calculate pro-rated gross, basic, and HRA based on payable days
     const grossEarned = roundMoney(perDayRate * effectivePayableDays, settings.roundingMode);
 
-    // Proportional basic & hra (per the employee's configured split)
     const basicRatio = fullGross > 0 ? fullBasic / fullGross : 0.5;
     const hraRatio = fullGross > 0 ? fullHra / fullGross : 0.5;
-    const basicEarned = roundMoney(grossEarned * basicRatio, settings.roundingMode);
-    const hraEarned = roundMoney(grossEarned * hraRatio, settings.roundingMode);
-    const specialEarned = Math.max(0, grossEarned - basicEarned - hraEarned);
 
-    // ── Deductions (statutory, computed on EARNED basic) ───────────────────
+    // Calculate earned basic and HRA from grossEarned to avoid rounding mismatch
+    const basicEarned = roundMoney(grossEarned * basicRatio, settings.roundingMode);
+    const hraEarned = grossEarned - basicEarned;  // Force exact match: HRA = Gross - Basic (no separate rounding)
+    const specialEarned = 0;  // specialEarned is always 0 when basic + HRA = gross
+
+    // ── Deductions ────────────────────────────────────────────────────────────
     const epfCap = salaryCfg?.epfCapAmount ?? 1800;
     const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
     const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
     const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
+    // CRITICAL FIX: PF and ESIC should be calculated on EARNED (pro-rated) BASIC, not full month
     const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
-    // ESI applicability matches the convention used in EmployeeForm.js →
-    // "const esiApplicable = basic <= esiWageLimit".  The configured BASIC
-    // (not the earned gross) determines whether the employee is in the ESI
-    // bracket; the premium itself is then calculated on the earned basic so
-    // partial-month pay scales the deduction correctly.
-    const esiApplicable = fullBasic > 0 && fullBasic <= esiLimit;
-    const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
-    // Professional Tax is opt-in — only applied when HR explicitly enables it
-    // via settings.ptEnabled (the default PT slabs are sample templates, not
-    // something we should be silently deducting).
-    const pt = (settings.ptEnabled && settings.ptForBasic) ? settings.ptForBasic(fullBasic) : 0;
-
-    // LOP deduction is informational only — the gross is already reduced proportionally
-    const lopDeduction = Math.round(perDayRate * lopDays);
+    const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
+    const esic = esiApplicable ? Math.round(basicEarned * eeEsicPct) : 0;
+    const pt = (settings.ptEnabled && settings.ptForBasic) ? settings.ptForBasic(basicEarned) : 0;
 
     const totalDeductions = epf + esic + pt;
     const netPay = grossEarned - totalDeductions;
     const roundedNetPay = settings.roundNetPay ? Math.round(netPay) : netPay;
+
+    // ── Leave balance snapshot ────────────────────────────────────────────────
+    const leaveBalanceSnapshot = (() => {
+        const clEnt = clEligible ? (leaveBalance?.entitlement?.CL ?? CL_ENT_DEFAULT) : 0;
+        const slEnt = leaveBalance?.entitlement?.SL ?? SL_ENT_DEFAULT;
+        const plEnt = (leaveBalance?.entitlement?.PL ?? leaveBalance?.entitlement?.EL ?? PL_ENT_DEFAULT);
+        const clCon = leaveBalance?.consumed?.CL ?? 0;
+        const slCon = leaveBalance?.consumed?.SL ?? 0;
+        const plCon = leaveBalance?.consumed?.PL ?? leaveBalance?.consumed?.EL ?? 0;
+        return {
+            hasRecord: !!leaveBalance,
+            clEligible,
+            daysSinceDOJ: daysSinceDOJ === Infinity ? null : daysSinceDOJ,
+            entitlement: { CL: clEnt, SL: slEnt, PL: plEnt },
+            consumed: { CL: clCon, SL: slCon, PL: plCon },
+            available: {
+                CL: Math.max(0, clEnt - clCon),
+                SL: Math.max(0, slEnt - slCon),
+                PL: Math.max(0, plEnt - plCon),
+            },
+        };
+    })();
 
     return {
         employeeId: employee._id,
@@ -336,43 +356,23 @@ function computeEmployeePayroll(employee, ctx) {
         designation: employee.designation || employee.jobTitle || "",
         jobTitle: employee.jobTitle || "",
         employmentType: employee.employmentType || "",
+        dateOfJoining: employee.dateOfJoining || null,
 
         month, year,
         payPeriod: `${MONTH_NAMES[month]} ${year}`,
 
-        // ── Rate snapshot — the employee's configured monthly salary at time of run.
-        // Persisted so the Salary Register / payslip can show "Rate of wages payable"
-        // correctly without having to re-query the Employee model later.
         rateBasic: fullBasic,
         rateHra: fullHra,
         rateGross: fullGross,
 
-        // ── Leave balance snapshot at compute time — lets the payroll drawer show
-        // remaining CL/SL/PL balance to HR. Pulls defaults from LeaveConfig
-        // when no per-employee LeaveBalance record exists. Reads both PL (current
-        // live code) and EL (legacy schema) so neither convention breaks.
-        leaveBalanceSnapshot: (() => {
-            const clEnt = leaveBalance?.entitlement?.CL ?? CL_ENT_DEFAULT;
-            const slEnt = leaveBalance?.entitlement?.SL ?? SL_ENT_DEFAULT;
-            const plEnt = (leaveBalance?.entitlement?.PL
-                ?? leaveBalance?.entitlement?.EL
-                ?? PL_ENT_DEFAULT);
-            const clCon = leaveBalance?.consumed?.CL ?? 0;
-            const slCon = leaveBalance?.consumed?.SL ?? 0;
-            const plCon = leaveBalance?.consumed?.PL ?? leaveBalance?.consumed?.EL ?? 0;
-            return {
-                hasRecord: !!leaveBalance,
-                entitlement: { CL: clEnt, SL: slEnt, PL: plEnt },
-                consumed: { CL: clCon, SL: slCon, PL: plCon },
-                available: {
-                    CL: Math.max(0, clEnt - clCon),
-                    SL: Math.max(0, slEnt - slCon),
-                    PL: Math.max(0, plEnt - plCon),
-                },
-            };
-        })(),
+        preJoiningDays,
+        firstActiveDayInMonth: firstActiveDay,
+        activeDaysInMonth,
+        clEligible,
+        daysSinceDOJ: daysSinceDOJ === Infinity ? null : daysSinceDOJ,
 
-        // ── Attendance counts (for display/audit) ─────────────────
+        leaveBalanceSnapshot,
+
         workingDays: divisor,
         daysInMonth,
         presentDays: stats.presentDays,
@@ -399,7 +399,6 @@ function computeEmployeePayroll(employee, ctx) {
         perDayRate: +perDayRate.toFixed(2),
         divisorBasis: settings.payableDaysBasis,
 
-        // ── Earnings & Deductions (persisted structure matches PayrollItem schema) ──
         earnings: {
             basicSalary: basicEarned,
             houseRentAllowance: hraEarned,
@@ -414,15 +413,14 @@ function computeEmployeePayroll(employee, ctx) {
         },
         deductions: {
             providentFund: epf,
-            employerPF: epf, // same rate; employer contribution recorded but not deducted from employee
+            employerPF: epf,
             esic: esic,
-            employerESIC: esiApplicable ? Math.ceil(basicEarned * (((salaryCfg?.erEsicPct) ?? 3.25) / 100)) : 0,
+            employerESIC: esiApplicable ? Math.round(basicEarned * (((salaryCfg?.erEsicPct) ?? 3.25) / 100)) : 0,
             professionalTax: pt,
             incomeTax: 0,
             loanDeduction: 0,
             advanceDeduction: 0,
             lateDeduction: 0,
-            lopDeduction,
             otherDeductions: 0,
             totalDeductions,
         },
@@ -435,7 +433,6 @@ function computeEmployeePayroll(employee, ctx) {
             ifscCode: employee.bankDetails?.ifscCode || "",
         },
 
-        // ── Audit-only day breakdown (not persisted) ──────────────
         dayBreakdown,
     };
 }
@@ -453,8 +450,6 @@ function roundMoney(n, mode = "round") {
 
 async function loadMonthContext(month, year) {
     const yearMonth = `${year}-${String(month).padStart(2, "0")}`;
-    // Fetch LeaveConfig if the model is available. It may not be in every
-    // deployment — fall back to nulls so the engine uses built-in defaults.
     const leaveConfigP = (LeaveConfig && typeof LeaveConfig.getConfig === "function")
         ? LeaveConfig.getConfig().catch(() => null)
         : Promise.resolve(null);
@@ -490,9 +485,7 @@ async function loadMonthContext(month, year) {
 //  ROUTES
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── GET /preview  ────────────────────────────────────────────────────────────
-// Compute payroll in-memory for the whole company for (month, year), WITHOUT
-// saving. Returns the list HR reviews before hitting "Process".
+// ── GET /preview ──────────────────────────────────────────────────────────────
 router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const month = parseInt(req.query.month) || new Date().getMonth() + 1;
@@ -510,7 +503,6 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
             .select("-password -temporaryPassword -__v")
             .lean();
 
-        // Decrypt salary fields so computeEmployeePayroll works with plain numbers
         const decryptedEmployees = employees.map(decryptEmployeeDoc);
 
         const leaveBalances = await LeaveBalance.find({
@@ -529,7 +521,6 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
             return computeEmployeePayroll(emp, ctx);
         });
 
-        // Aggregate summary for the UI banner
         const summary = items.reduce(
             (acc, i) => ({
                 totalEmployees: acc.totalEmployees + 1,
@@ -575,9 +566,7 @@ router.get("/preview", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── POST /run  ──────────────────────────────────────────────────────────────
-// Persists the preview as PayrollItem docs + the parent Payroll run doc.
-// Idempotent: if a run already exists in draft, it's updated in place.
+// ── POST /run ─────────────────────────────────────────────────────────────────
 router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { user } = req;
@@ -588,7 +577,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
         const month = parseInt(req.body.month) || new Date().getMonth() + 1;
         const year = parseInt(req.body.year) || new Date().getFullYear();
 
-        // Block re-run if already paid / approved
         const existing = await Payroll.findOne({ month, year });
         if (existing && ["paid", "approved"].includes(existing.status)) {
             return res.status(400).json({
@@ -605,7 +593,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             .select("-password -temporaryPassword -__v")
             .lean();
 
-        // Decrypt salary so computeEmployeePayroll gets plain numbers
         const decryptedEmployees = employees.map(decryptEmployeeDoc);
 
         const leaveBalances = await LeaveBalance.find({
@@ -613,7 +600,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
         });
         const balanceByEmpId = new Map(leaveBalances.map((b) => [String(b.employeeId), b]));
 
-        // Create-or-update parent run
         let payrollRun = existing;
         if (!payrollRun) {
             payrollRun = await Payroll.create({
@@ -627,9 +613,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             await payrollRun.save();
         }
 
-        // Compute + upsert items
         let totalGross = 0, totalDed = 0, totalNet = 0, totalPF = 0, totalESIC = 0, totalBonus = 0;
-        const clBalanceUpdates = []; // { balanceDoc, daysToDeduct }
+        const clBalanceUpdates = [];
 
         for (const emp of decryptedEmployees) {
             const bid = (emp.biometricId || "").toUpperCase();
@@ -641,13 +626,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             };
             const computed = computeEmployeePayroll(emp, ctx);
 
-            // Store all PayrollItem fields as plain numbers (schema expects Number type).
-            // The employee's source salary in the Employee model is already encrypted.
-            // PayrollItem is HR-access-only and the pre-save hook needs plain numbers for calculations.
-
-            // Upsert PayrollItem  (unique on employeeId + month + year)
-            // Persist ALL computed fields so the saved payroll list, drawer, payslip,
-            // and Excel export all read directly from the DB without recomputing.
             await PayrollItem.findOneAndUpdate(
                 { employeeId: emp._id, month, year },
                 {
@@ -658,16 +636,21 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     designation: computed.designation,
                     jobTitle: computed.jobTitle,
                     employmentType: computed.employmentType,
+                    dateOfJoining: computed.dateOfJoining,
                     payrollId: payrollRun._id,
                     month, year,
                     payPeriod: computed.payPeriod,
 
-                    // Rate snapshot — plain numbers
                     rateBasic: computed.rateBasic,
                     rateHra: computed.rateHra,
                     rateGross: computed.rateGross,
 
-                    // Attendance counts (not sensitive — not encrypted)
+                    preJoiningDays: computed.preJoiningDays,
+                    firstActiveDayInMonth: computed.firstActiveDayInMonth,
+                    activeDaysInMonth: computed.activeDaysInMonth,
+                    clEligible: computed.clEligible,
+                    daysSinceDOJ: computed.daysSinceDOJ,
+
                     workingDays: computed.workingDays,
                     daysInMonth: computed.daysInMonth,
                     presentDays: computed.presentDays,
@@ -685,44 +668,41 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     slUsedDays: computed.slUsedDays,
                     plUsedDays: computed.plUsedDays,
 
-                    // Payable days + per-day rate
                     payableDays: computed.payableDays,
                     effectivePayableDays: computed.effectivePayableDays,
                     perDayRate: computed.perDayRate,
                     divisorBasis: computed.divisorBasis,
                     sundayExtraPayDays: computed.sundayExtraPayDays,
 
-                    // Engine adjustments (counts, not sensitive)
                     autoAdjustedCL: computed.autoAdjustedCL,
                     sundayOffsetApplied: computed.sundayOffsetApplied,
                     unsyncedDays: computed.unsyncedDays,
 
-                    // Leave balance snapshot (not sensitive)
                     leaveBalanceSnapshot: computed.leaveBalanceSnapshot,
 
-                    // Earnings & Deductions — plain numbers (pre-save hook calculates totals)
                     earnings: computed.earnings,
                     deductions: computed.deductions,
                     netPay: computed.netPay,
                     roundedNetPay: computed.roundedNetPay,
                     bankDetails: computed.bankDetails,
-
-                    // Day breakdown (per-day audit trail — not sensitive)
                     dayBreakdown: computed.dayBreakdown,
 
                     status: "processed",
                     processedBy: user.id,
                     processedAt: new Date(),
+                    isManuallyOverridden: false,
+                    overriddenPayableDays: null,
                     remarks: computed.autoAdjustedCL > 0
                         ? `Auto-adjusted ${computed.autoAdjustedCL} day(s) from AB to CL`
                         : (computed.sundayOffsetApplied > 0
                             ? `${computed.sundayOffsetApplied} AB offset by Sunday worked`
-                            : null),
+                            : computed.preJoiningDays > 0
+                                ? `Mid-month joiner — ${computed.preJoiningDays} pre-joining day(s) excluded`
+                                : null),
                 },
                 { upsert: true, new: true, setDefaultsOnInsert: true }
             );
 
-            // Queue CL-balance consumption
             if (
                 settings.clAutoAdjust?.enabled &&
                 settings.clAutoAdjust?.consumeFromBalance &&
@@ -740,7 +720,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             totalBonus += computed.earnings.bonus || 0;
         }
 
-        // Apply CL balance consumption
         for (const u of clBalanceUpdates) {
             await LeaveBalance.updateOne(
                 { _id: u.balanceId },
@@ -748,7 +727,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
             );
         }
 
-        // Update parent run summary
         payrollRun.totalEmployees = employees.length;
         payrollRun.totalGross = totalGross;
         payrollRun.totalDeductions = totalDed;
@@ -779,8 +757,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── GET /items  ─────────────────────────────────────────────────────────────
-// List processed payroll items for a month (what feeds the payroll list page)
+// ── GET /items ────────────────────────────────────────────────────────────────
 router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const month = parseInt(req.query.month) || new Date().getMonth() + 1;
@@ -801,9 +778,6 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
             .sort({ employeeName: 1 })
             .lean();
 
-        // Attach current leave balance to each item so the drawer can show
-        // "CL remaining" without a second round-trip per employee.
-        // Pull defaults from LeaveConfig (HR-tunable: clPerYear/slPerYear/plPerYear).
         const empIds = items.map((i) => i.employeeId);
         const [balances, leaveCfg] = await Promise.all([
             LeaveBalance.find({ employeeId: { $in: empIds }, year }).lean(),
@@ -818,15 +792,17 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
 
         items.forEach((it) => {
             const b = byEmp.get(String(it.employeeId));
-            const clEnt = b?.entitlement?.CL ?? clDef;
+            const clEligible = it.clEligible !== false;
+            const clEnt = clEligible ? (b?.entitlement?.CL ?? clDef) : 0;
             const slEnt = b?.entitlement?.SL ?? slDef;
-            // Support both PL (live routes) and EL (legacy schema)
             const plEnt = b?.entitlement?.PL ?? b?.entitlement?.EL ?? plDef;
             const clCon = b?.consumed?.CL ?? 0;
             const slCon = b?.consumed?.SL ?? 0;
             const plCon = b?.consumed?.PL ?? b?.consumed?.EL ?? 0;
             it.leaveBalanceSnapshot = {
                 hasRecord: !!b,
+                clEligible,
+                daysSinceDOJ: it.daysSinceDOJ ?? null,
                 entitlement: { CL: clEnt, SL: slEnt, PL: plEnt },
                 consumed: { CL: clCon, SL: slCon, PL: plCon },
                 available: {
@@ -846,7 +822,7 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── GET /item/:id  ──────────────────────────────────────────────────────────
+// ── GET /item/:id ─────────────────────────────────────────────────────────────
 router.get("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const item = await PayrollItem.findById(req.params.id)
@@ -859,8 +835,7 @@ router.get("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── PUT /item/:id  ──────────────────────────────────────────────────────────
-// HR can tweak individual earnings / deductions before approving
+// ── PUT /item/:id ─────────────────────────────────────────────────────────────
 router.put("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { user } = req;
@@ -876,17 +851,14 @@ router.put("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
         const allowed = ["earnings", "deductions", "remarks"];
         allowed.forEach((k) => { if (req.body[k] !== undefined) item[k] = req.body[k]; });
-        await item.save(); // pre-save recalculates gross & net
+        await item.save();
         res.json({ success: true, data: item.toObject() });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// ── PATCH /item/:id/override  ───────────────────────────────────────────────
-// HR-friendly override: accept new payableDays + supplementary amounts,
-// re-derive basic/HRA/gross/EPF/ESIC/PT, update net pay. This is what HR
-// uses when the auto-computed payroll is wrong for a specific employee.
+// ── PATCH /item/:id/override ──────────────────────────────────────────────────
 router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { user } = req;
@@ -909,8 +881,8 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
 
         const {
             payableDays,
-            lopDays,                    // NEW — if provided, payableDays = workingDays - lopDays
-            clUsedDays,                 // NEW — informational leave counts
+            lopDays,
+            clUsedDays,
             slUsedDays,
             plUsedDays,
             overtime,
@@ -923,10 +895,15 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
             remarks,
         } = req.body;
 
-        // Prefer the rate snapshot captured when payroll was run — this keeps
-        // historical items stable if the employee's configured salary later changes.
-        // Fall back to current employee salary for items that predate the snapshot.
-        const divisor = item.workingDays || 26;
+        // divisor = daysInMonth (same as compute engine)
+        const divisor = item.workingDays || new Date(item.year, item.month, 0).getDate() || 31;
+        // activeCap = max payable days for this employee
+        // For mid-month joiners: activeDaysInMonth (can't be paid for days before joining)
+        // For regular employees: divisor (= daysInMonth)
+        const activeCap = (item.preJoiningDays > 0 && item.activeDaysInMonth != null)
+            ? item.activeDaysInMonth
+            : divisor;
+
         const fullGross = Number(item.rateGross || empSalary.gross || 0);
         const fullBasic = Number(item.rateBasic || empSalary.basic || 0);
         const fullHra = Number(item.rateHra || empSalary.hra || 0);
@@ -935,32 +912,29 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
             return res.status(400).json({ success: false, message: "Employee has no gross salary set" });
         }
 
-        // Resolve payable days. HR can provide either payableDays OR lopDays
-        // (or neither, in which case we keep the existing value).
-        //   lopDays wins if both provided — it's the more explicit input.
         let newPayableDays;
         let newLopDays;
-        if (lopDays !== undefined) {
-            newLopDays = Math.max(0, Math.min(Number(lopDays), divisor));
-            newPayableDays = Math.max(0, divisor - newLopDays);
-        } else if (payableDays !== undefined) {
-            newPayableDays = Math.max(0, Math.min(Number(payableDays), divisor));
-            newLopDays = Math.max(0, divisor - newPayableDays);
+        // Both fields are independent — accept whatever the user sends
+        if (payableDays !== undefined) {
+            newPayableDays = Math.max(0, Math.min(Number(payableDays), activeCap));
         } else {
             newPayableDays = item.payableDays ?? ((item.presentDays || 0) + (item.paidLeaveDays || 0));
+        }
+        if (lopDays !== undefined) {
+            newLopDays = Math.max(0, Math.min(Number(lopDays), activeCap));
+        } else {
             newLopDays = item.lopDays ?? 0;
         }
 
-        const perDay = fullGross / divisor;
-        const basicRatio = fullBasic / fullGross;
-        const hraRatio = fullHra / fullGross;
+        const perDay = fullGross / Math.max(1, divisor);
+        const basicRatio = fullBasic / Math.max(1, fullGross);
+        const hraRatio = fullHra / Math.max(1, fullGross);
 
         const grossEarnedBase = Math.round(perDay * newPayableDays);
         const basicEarned = Math.round(grossEarnedBase * basicRatio);
-        const hraEarned = Math.round(grossEarnedBase * hraRatio);
-        const specialEarned = Math.max(0, grossEarnedBase - basicEarned - hraEarned);
+        const hraEarned = grossEarnedBase - basicEarned;  // Force exact match
+        const specialEarned = 0;
 
-        // Supplementary earnings (default to existing values if not provided)
         const ot = overtime !== undefined ? Number(overtime) : (item.earnings?.overtime || 0);
         const bn = bonus !== undefined ? Number(bonus) : (item.earnings?.bonus || 0);
         const inc = incentives !== undefined ? Number(incentives) : (item.earnings?.incentives || 0);
@@ -968,20 +942,18 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
 
         const grossTotal = grossEarnedBase + ot + bn + inc + oth;
 
-        // Deductions: re-derive EPF/ESIC/PT on the new earned basic + honour supplied values
         const epfCap = salaryCfg?.epfCapAmount ?? 1800;
         const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
         const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
         const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
         const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
+        // CRITICAL FIX: Calculate on EARNED (pro-rated) BASIC
         const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
-        // ESI applicability based on configured BASIC (matches EmployeeForm.js)
-        const esiApplicable = fullBasic > 0 && fullBasic <= esiLimit;
-        const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
-        const erEsic = esiApplicable ? Math.ceil(basicEarned * erEsicPct) : 0;
-        // PT only applied when HR explicitly enables it
-        const pt = (settings.ptEnabled && settings.ptForBasic) ? settings.ptForBasic(fullBasic) : 0;
+        const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
+        const esic = esiApplicable ? Math.round(basicEarned * eeEsicPct) : 0;
+        const erEsic = esiApplicable ? Math.round(basicEarned * erEsicPct) : 0;
+        const pt = (settings.ptEnabled && settings.ptForBasic) ? settings.ptForBasic(basicEarned) : 0;
 
         const loan = loanDeduction !== undefined ? Number(loanDeduction) : (item.deductions?.loanDeduction || 0);
         const advance = advanceDeduction !== undefined ? Number(advanceDeduction) : (item.deductions?.advanceDeduction || 0);
@@ -990,7 +962,6 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         const totalDeductions = epf + esic + pt + loan + advance + otherD;
         const netPay = grossTotal - totalDeductions;
 
-        // Update the item
         item.earnings = {
             ...(item.earnings || {}),
             basicSalary: basicEarned,
@@ -1015,14 +986,12 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         item.roundedNetPay = settings.roundNetPay ? Math.round(netPay) : netPay;
         if (remarks !== undefined) item.remarks = remarks;
 
-        // Persist the new day counts (affects payable-days math + leave tracking).
         item.payableDays = newPayableDays;
         item.lopDays = newLopDays;
         if (clUsedDays !== undefined) item.clUsedDays = Math.max(0, Number(clUsedDays));
         if (slUsedDays !== undefined) item.slUsedDays = Math.max(0, Number(slUsedDays));
         if (plUsedDays !== undefined) item.plUsedDays = Math.max(0, Number(plUsedDays));
 
-        // Any of these changing = manual override
         const dayEdit = payableDays !== undefined || lopDays !== undefined
             || clUsedDays !== undefined || slUsedDays !== undefined || plUsedDays !== undefined;
         if (dayEdit) {
@@ -1046,7 +1015,7 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── PATCH /mark-paid  ───────────────────────────────────────────────────────
+// ── PATCH /mark-paid ──────────────────────────────────────────────────────────
 router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { user } = req;
@@ -1068,7 +1037,7 @@ router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── GET /runs  ──────────────────────────────────────────────────────────────
+// ── GET /runs ─────────────────────────────────────────────────────────────────
 router.get("/runs", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const runs = await Payroll.find().sort({ year: -1, month: -1 }).limit(24).lean();
@@ -1078,7 +1047,7 @@ router.get("/runs", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── GET /settings  ──────────────────────────────────────────────────────────
+// ── GET /settings ─────────────────────────────────────────────────────────────
 router.get("/settings", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const cfg = await PayrollSettings.getConfig();
@@ -1088,8 +1057,7 @@ router.get("/settings", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── PUT /settings  ──────────────────────────────────────────────────────────
-// Also notifies the CEO by email whenever settings actually change.
+// ── PUT /settings ─────────────────────────────────────────────────────────────
 router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { user } = req;
@@ -1101,7 +1069,6 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
         const update = { updatedBy: user.id, updatedAt: new Date() };
         allowed.forEach((k) => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
 
-        // Load the existing config so we can diff old vs new for the CEO email
         const before = await PayrollSettings.findById("singleton").lean();
 
         const cfg = await PayrollSettings.findByIdAndUpdate(
@@ -1109,18 +1076,14 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
             { new: true, upsert: true, runValidators: true }
         );
 
-        // Best-effort CEO notification. Never block the HR save if email fails.
         try {
             const changes = diffPayrollSettings(before, cfg, req.body);
             if (changes.length > 0) {
-                // Lazy require so a missing service file doesn't crash route loading
                 let EmailService;
-                try { EmailService = require("../../service/emailService"); }
-                catch (e) {
+                try { EmailService = require("../../service/emailService"); } catch (e) {
                     console.warn("[PAYROLL-SETTINGS] emailService not found, skipping CEO notification");
                 }
                 if (EmailService?.sendPayrollSettingsChangeEmail) {
-                    // Resolve the HR user's name — fall back to their id / "HR"
                     const changedBy = req.user?.name || req.user?.email || req.user?.id || "HR";
                     EmailService
                         .sendPayrollSettingsChangeEmail({ changedBy, changes })
@@ -1137,14 +1100,11 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ─── Helper: produce a human-readable diff of payroll settings ──────────────
-//   Returns [{ label, before, after }, ...] for fields that actually changed.
 function diffPayrollSettings(oldCfg, newCfg, requestBody) {
     if (!oldCfg) oldCfg = {};
     const changes = [];
     const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
-    // Scalar fields — only report if the client actually touched them
     const scalars = [
         { key: "payableDaysBasis", label: "Payable Days Basis" },
         { key: "mpTreatment", label: "Miss-Punch Treatment" },
@@ -1163,7 +1123,6 @@ function diffPayrollSettings(oldCfg, newCfg, requestBody) {
         }
     }
 
-    // CL Auto-Adjust nested object — break into 3 labelled rows when any field changed
     if (requestBody.clAutoAdjust !== undefined) {
         const o = oldCfg.clAutoAdjust || {};
         const n = newCfg.clAutoAdjust || {};
@@ -1178,7 +1137,6 @@ function diffPayrollSettings(oldCfg, newCfg, requestBody) {
         }
     }
 
-    // PT Slabs — just say "updated" if changed (too noisy to show full table)
     if (requestBody.ptSlabs !== undefined && !same(oldCfg.ptSlabs, newCfg.ptSlabs)) {
         const summarise = (slabs) => (slabs || [])
             .map((s) => `${s.minBasic}–${s.maxBasic}: ₹${s.amount}`)
@@ -1200,10 +1158,7 @@ function formatVal(v) {
     return String(v);
 }
 
-// ── GET /export  ────────────────────────────────────────────────────────────
-// Excel export matching your salary-register template: Sl, Name, Designation,
-// Rate of wages payable (Basic/HRA/Total), Days in month, Attendance, Wages
-// paid (Basic/HRA), OT, Gross, PF, ESI, Advance, Other, Total Ded, Net.
+// ── GET /export ───────────────────────────────────────────────────────────────
 router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const ExcelJS = require("exceljs");
@@ -1222,9 +1177,8 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
 
         const employees = await Employee.find({
             _id: { $in: items.map((i) => i.employeeId) },
-        }).select("firstName middleName lastName biometricId designation jobTitle department salary bankDetails").lean();
+        }).select("firstName middleName lastName biometricId designation jobTitle department salary bankDetails dateOfJoining").lean();
 
-        // Decrypt salary so fallback reads (emp.salary?.gross etc.) work correctly
         const empById = new Map(employees.map((e) => [String(e._id), decryptEmployeeDoc(e)]));
 
         const wb = new ExcelJS.Workbook();
@@ -1234,7 +1188,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
             pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
         });
 
-        // Title row — merged across all 22 columns
         ws.mergeCells(1, 1, 1, 22);
         const title = ws.getCell(1, 1);
         title.value = `GRAV CLOTHING — SALARY REGISTER for ${MONTH_NAMES[month]} ${year}`;
@@ -1243,11 +1196,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         title.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
         ws.getRow(1).height = 30;
 
-        // Header row 1 (grouped columns)
-        // Col layout: 1=Sl, 2=Name, 3=Designation, 4-6=Rate(Basic/HRA/Total),
-        //   7=DaysInMonth, 8=Attendance, 9-10=WagesPaid(Basic/HRA), 11=OT,
-        //   12=Gross, 13=EE PF, 14=ESI(EE), 15=ER PF, 16=ESI(ER),
-        //   17=Advance, 18=Other, 19=TotalDed, 20=Net, 21=DatePayment, 22=Bank
         const h1 = [
             "Sl.\nNo", "Name of the Employee", "Designation",
             "Rate of wages payable", null, null,
@@ -1280,12 +1228,9 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         h1.forEach((v, i) => { if (v !== null) r2.getCell(i + 1).value = v; });
         h2.forEach((v, i) => { r3.getCell(i + 1).value = v; });
 
-        // Merge grouped header cells
-        // Vertical merges (cols that span both header rows)
         [1, 2, 3, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22].forEach((c) => ws.mergeCells(2, c, 3, c));
-        // Horizontal merges
-        ws.mergeCells(2, 4, 2, 6);   // Rate of wages payable (3 cols)
-        ws.mergeCells(2, 9, 2, 10);  // Wages actually paid (2 cols)
+        ws.mergeCells(2, 4, 2, 6);
+        ws.mergeCells(2, 9, 2, 10);
 
         [r2, r3].forEach((r) => {
             r.eachCell((cell) => {
@@ -1302,45 +1247,49 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         });
         r2.height = 36; r3.height = 22;
 
-        // Column widths — relaxed so nothing overlaps
-        //         Sl  Name  Desig  Basic HRA  Total DIM  Att   WBasic WHra  OT   Gross  EEPF  EESI  ERPF  ERESI Adv   Oth   TDed  Net   Date  Bank
         const widths = [5, 26, 16, 10, 10, 12, 8, 10, 10, 10, 9, 13, 10, 10, 10, 10, 10, 10, 11, 13, 12, 18];
         widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
-        // Data rows — 22 columns
         items.forEach((it, idx) => {
             const row = ws.getRow(4 + idx);
             const emp = empById.get(String(it.employeeId)) || {};
 
-            // Prefer rate snapshot from payroll item; fall back to employee salary
             const rateBasic = it.rateBasic || emp.salary?.basic || 0;
             const rateHra = it.rateHra || emp.salary?.hra || 0;
             const rateGross = it.rateGross || emp.salary?.gross || 0;
             const e = it.earnings || {};
             const d = it.deductions || {};
 
-            row.getCell(1).value = idx + 1;                                           // Sl
-            row.getCell(2).value = it.employeeName || "";                             // Name
-            row.getCell(3).value = it.designation || emp.designation || emp.jobTitle || "";  // Designation
-            row.getCell(4).value = rateBasic;                                         // Rate Basic
-            row.getCell(5).value = rateHra;                                           // Rate HRA
-            row.getCell(6).value = rateGross;                                         // Rate Total
-            row.getCell(7).value = new Date(year, month, 0).getDate();               // Days in month
-            row.getCell(8).value = it.payableDays || Math.round((it.presentDays || 0) + (it.paidLeaveDays || 0)); // Attendance
-            row.getCell(9).value = e.basicSalary || 0;                               // Wages Basic
-            row.getCell(10).value = e.houseRentAllowance || 0;                       // Wages HRA
-            row.getCell(11).value = e.overtime || 0;                                  // OT
-            row.getCell(12).value = e.grossEarnings || 0;                            // Gross
-            row.getCell(13).value = d.providentFund || 0;                            // Employee PF
-            row.getCell(14).value = d.esic || 0;                                      // ESI (EE)
-            row.getCell(15).value = d.employerPF || d.providentFund || 0;            // Employer PF
-            row.getCell(16).value = d.employerESIC || 0;                              // ESI (ER)
-            row.getCell(17).value = d.advanceDeduction || 0;                          // Advance
-            row.getCell(18).value = d.otherDeductions || 0;                           // Other
-            row.getCell(19).value = d.totalDeductions || 0;                           // Total Ded
-            row.getCell(20).value = it.roundedNetPay ?? it.netPay ?? 0;              // Net
+            const daysForRegister = new Date(year, month, 0).getDate();
+            row.getCell(1).value = idx + 1;
+            row.getCell(2).value = it.employeeName || "";
+            row.getCell(3).value = it.designation || emp.designation || emp.jobTitle || "";
+            row.getCell(4).value = rateBasic;
+            row.getCell(5).value = rateHra;
+            row.getCell(6).value = rateGross;
+            row.getCell(7).value = daysForRegister;
+            row.getCell(8).value = it.payableDays || Math.round((it.presentDays || 0) + (it.paidLeaveDays || 0));
+            row.getCell(9).value = e.basicSalary || 0;
+            row.getCell(10).value = e.houseRentAllowance || 0;
+            row.getCell(11).value = e.overtime || 0;
+            row.getCell(12).value = e.grossEarnings || 0;
+            row.getCell(13).value = d.providentFund || 0;
+            row.getCell(14).value = d.esic || 0;
+            row.getCell(15).value = d.employerPF || d.providentFund || 0;
+            row.getCell(16).value = d.employerESIC || 0;
+            row.getCell(17).value = d.advanceDeduction || 0;
+            row.getCell(18).value = d.otherDeductions || 0;
+            row.getCell(19).value = d.totalDeductions || 0;
+            row.getCell(20).value = it.roundedNetPay ?? it.netPay ?? 0;
             row.getCell(21).value = it.paymentDate ? new Date(it.paymentDate).toLocaleDateString("en-IN") : "";
             row.getCell(22).value = emp.bankDetails?.accountNumber ? `A/C: ${emp.bankDetails.accountNumber}` : "";
+
+            if (it.preJoiningDays > 0) {
+                const doj = it.dateOfJoining
+                    ? new Date(it.dateOfJoining).toLocaleDateString("en-IN")
+                    : "";
+                row.getCell(2).value = `${it.employeeName || ""}\n(Joined: ${doj})`;
+            }
 
             row.eachCell((cell, col) => {
                 cell.font = { size: 9 };
@@ -1348,6 +1297,7 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
                     vertical: "middle",
                     horizontal: col <= 3 ? "left" : "right",
                     indent: col <= 3 ? 1 : 0,
+                    wrapText: col === 2,
                 };
                 if (col >= 4 && col !== 21 && col !== 22) cell.numFmt = "#,##0";
                 cell.border = {
@@ -1357,10 +1307,9 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
                     right: { style: "thin", color: { argb: "FFD1D5DB" } },
                 };
             });
-            row.height = 22;
+            row.height = it.preJoiningDays > 0 ? 30 : 22;
         });
 
-        // Totals footer
         const tr = ws.getRow(4 + items.length);
         tr.getCell(1).value = "";
         tr.getCell(2).value = "TOTAL";
