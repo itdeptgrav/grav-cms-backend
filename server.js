@@ -314,7 +314,7 @@ const connectDB = async () => {
     console.log("✅ MongoDB connected successfully");
 
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
-    productionSyncService.initialize();
+    // productionSyncService.initialize();
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -333,6 +333,7 @@ const PackagingDispatchDepartment = require("./models/PackagingDispatchDepartmen
 
 const Measurement = require("./models/Customer_Models/Measurement");
 const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
+const ProductionSupervisorDepartment = require("./models/ProductionSupervisorDepartment");
 
 
 const createDefaultCuttingMaster = async () => {
@@ -365,6 +366,33 @@ const createDefaultCuttingMaster = async () => {
     console.error("❌ Cutting Master creation failed:", error.message);
   }
 };
+
+async function createDefaultProductionSupervisor() {
+  try {
+    const existing = await ProductionSupervisorDepartment.findOne({ email: "p1supervisor@grav.in" });
+    if (existing) {
+      console.log("✓ Default Production Supervisor already exists");
+      return;
+    }
+
+    const hashed = await bcrypt.hash("P1supervisor@12345", 10);
+
+    await ProductionSupervisorDepartment.create({
+      name: "Production Supervisor",
+      email: "p1supervisor@grav.in",
+      password: hashed,                    // ✅ use the hashed value
+      employeeId: "PSUP001",
+      phone: "",
+      role: "production_supervisor",
+      department: "Production Supervisor",
+      isActive: true,
+    });
+
+    console.log("✅ Default Production Supervisor created: p1supervisor@grav.in");
+  } catch (err) {
+    console.error("❌ Failed to create default Production Supervisor:", err);
+  }
+}
 
 const createDefaultAccountant = async () => {
   try {
@@ -432,6 +460,7 @@ const createDefaultPackagingDispatch = async () => {
 connectDB().then(async () => {
   await createDefaultAccountant(); // ✅ ADD THIS
   await createDefaultPackagingDispatch();
+  await createDefaultProductionSupervisor();
 });
 //changes
 
@@ -541,6 +570,10 @@ app.use("/api/customer/employees", employeeMpcRoutes);
 
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
+
+
+const productionCompletionRoutes = require("./routes/CMS_Routes/Manufacturing/Production/productionCompletionRoutes.js");
+app.use("/api/cms/manufacturing/production-completion", productionCompletionRoutes);
 
 /* ===================
   CMS ROUTES
