@@ -47,14 +47,14 @@ const rawMaterialAllocationSchema = new mongoose.Schema(
       ref: "RawItem",
       required: true,
     },
-    name:  { type: String, trim: true, required: true },
-    sku:   { type: String, trim: true, required: true },
+    name: { type: String, trim: true, required: true },
+    sku: { type: String, trim: true, required: true },
     rawItemVariantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     rawItemVariantCombination: [{ type: String, trim: true }],
-    quantityRequired:  { type: Number, required: true, min: 0 },
+    quantityRequired: { type: Number, required: true, min: 0 },
     quantityAllocated: { type: Number, default: 0, min: 0 },
-    quantityIssued:    { type: Number, default: 0, min: 0 },
-    unit:     { type: String, trim: true, required: true },
+    quantityIssued: { type: Number, default: 0, min: 0 },
+    unit: { type: String, trim: true, required: true },
     unitCost: { type: Number, required: true, min: 0 },
     totalCost: { type: Number, required: true, min: 0 },
     allocationStatus: {
@@ -69,26 +69,26 @@ const rawMaterialAllocationSchema = new mongoose.Schema(
 
 // ── timelineSchema ────────────────────────────────────────────────────────────
 const timelineSchema = new mongoose.Schema({
-  plannedStartDate:      { type: Date, default: null },
-  plannedEndDate:        { type: Date, default: null },
-  actualStartDate:       { type: Date, default: null },
-  actualEndDate:         { type: Date, default: null },
-  scheduledStartDate:    { type: Date, default: null },
-  scheduledEndDate:      { type: Date, default: null },
+  plannedStartDate: { type: Date, default: null },
+  plannedEndDate: { type: Date, default: null },
+  actualStartDate: { type: Date, default: null },
+  actualEndDate: { type: Date, default: null },
+  scheduledStartDate: { type: Date, default: null },
+  scheduledEndDate: { type: Date, default: null },
   totalEstimatedSeconds: { type: Number, default: 0, min: 0 },
-  totalPlannedSeconds:   { type: Number, default: 0, min: 0 },
-  efficiencyPercentage:  { type: Number, default: 100, min: 0, max: 100 },
+  totalPlannedSeconds: { type: Number, default: 0, min: 0 },
+  efficiencyPercentage: { type: Number, default: 100, min: 0, max: 100 },
 });
 
 // ── Production Completion Tracking (written by cron from scan data) ───────────
 const operationCompletionSchema = new mongoose.Schema(
   {
-    operationNumber:      { type: Number, required: true },
-    operationType:        { type: String, trim: true },
-    operationCode:        { type: String, trim: true, default: "" },
-    completedQuantity:    { type: Number, default: 0, min: 0 },
+    operationNumber: { type: Number, required: true },
+    operationType: { type: String, trim: true },
+    operationCode: { type: String, trim: true, default: "" },
+    completedQuantity: { type: Number, default: 0, min: 0 },
     completedUnitNumbers: [{ type: Number }],
-    totalQuantity:        { type: Number, required: true },
+    totalQuantity: { type: Number, required: true },
     completionPercentage: { type: Number, default: 0, min: 0, max: 100 },
     status: {
       type: String,
@@ -101,15 +101,15 @@ const operationCompletionSchema = new mongoose.Schema(
 
 const operatorDetailSchema = new mongoose.Schema(
   {
-    operatorId:      { type: String, required: true },
-    operatorName:    { type: String, required: true },
+    operatorId: { type: String, required: true },
+    operatorName: { type: String, required: true },
     operationNumber: { type: Number, required: true },
-    operationType:   { type: String },
-    operationCode:   { type: String, default: "" },
-    machineId:   { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
+    operationType: { type: String },
+    operationCode: { type: String, default: "" },
+    machineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
     machineName: { type: String },
-    totalScans:  { type: Number, default: 0 },
-    signInTime:  { type: Date },
+    totalScans: { type: Number, default: 0 },
+    signInTime: { type: Date },
     signOutTime: { type: Date },
   },
   { _id: false },
@@ -117,49 +117,49 @@ const operatorDetailSchema = new mongoose.Schema(
 
 const efficiencyMetricSchema = new mongoose.Schema(
   {
-    operationNumber:      { type: Number, required: true },
-    operationType:        { type: String },
-    operationCode:        { type: String, default: "" },
-    machineId:            { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
-    machineName:          { type: String },
-    operatorId:           { type: String },
-    operatorName:         { type: String },
-    unitsCompleted:       { type: Number, default: 0 },
-    avgTimePerUnit:       { type: Number, default: 0 },
+    operationNumber: { type: Number, required: true },
+    operationType: { type: String },
+    operationCode: { type: String, default: "" },
+    machineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
+    machineName: { type: String },
+    operatorId: { type: String },
+    operatorName: { type: String },
+    unitsCompleted: { type: Number, default: 0 },
+    avgTimePerUnit: { type: Number, default: 0 },
     estimatedTimePerUnit: { type: Number, default: 0 },
-    plannedTimePerUnit:   { type: Number, default: 0 },
+    plannedTimePerUnit: { type: Number, default: 0 },
     efficiencyPercentage: { type: Number, default: 0 },
-    utilizationRate:      { type: Number, default: 0 },
-    totalProductiveTime:  { type: Number, default: 0 },
-    totalSessionTime:     { type: Number, default: 0 },
+    utilizationRate: { type: Number, default: 0 },
+    totalProductiveTime: { type: Number, default: 0 },
+    totalSessionTime: { type: Number, default: 0 },
   },
   { _id: false },
 );
 
 const timeMetricSchema = new mongoose.Schema(
   {
-    operationNumber:          { type: Number, required: true },
-    operationType:            { type: String },
-    operationCode:            { type: String, default: "" },
-    machineId:                { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
-    machineName:              { type: String },
+    operationNumber: { type: Number, required: true },
+    operationType: { type: String },
+    operationCode: { type: String, default: "" },
+    machineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
+    machineName: { type: String },
     avgCompletionTimeSeconds: { type: Number, default: 0 },
     minCompletionTimeSeconds: { type: Number, default: 0 },
     maxCompletionTimeSeconds: { type: Number, default: 0 },
-    totalUnitsAnalyzed:       { type: Number, default: 0 },
+    totalUnitsAnalyzed: { type: Number, default: 0 },
   },
   { _id: false },
 );
 
 const invalidScanSchema = new mongoose.Schema(
   {
-    barcodeId:    { type: String, required: true },
-    timestamp:    { type: Date, required: true },
-    unitNumber:   { type: Number, default: null },
-    operatorId:   { type: String },
+    barcodeId: { type: String, required: true },
+    timestamp: { type: Date, required: true },
+    unitNumber: { type: Number, default: null },
+    operatorId: { type: String },
     operatorName: { type: String },
-    machineId:    { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
-    machineName:  { type: String },
+    machineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine" },
+    machineName: { type: String },
     reason: {
       type: String,
       enum: ["invalid_format", "exceeds_quantity", "duplicate", "other"],
@@ -172,15 +172,15 @@ const invalidScanSchema = new mongoose.Schema(
 
 const productionCompletionSchema = new mongoose.Schema(
   {
-    overallCompletedQuantity:    { type: Number, default: 0, min: 0 },
+    overallCompletedQuantity: { type: Number, default: 0, min: 0 },
     overallCompletionPercentage: { type: Number, default: 0, min: 0, max: 100 },
     operationCompletion: [operationCompletionSchema],
-    operatorDetails:     [operatorDetailSchema],
-    efficiencyMetrics:   [efficiencyMetricSchema],
-    timeMetrics:         [timeMetricSchema],
-    invalidScansCount:   { type: Number, default: 0 },
-    invalidScans:        [invalidScanSchema],
-    lastSyncedAt:        { type: Date, default: null },
+    operatorDetails: [operatorDetailSchema],
+    efficiencyMetrics: [efficiencyMetricSchema],
+    timeMetrics: [timeMetricSchema],
+    invalidScansCount: { type: Number, default: 0 },
+    invalidScans: [invalidScanSchema],
+    lastSyncedAt: { type: Date, default: null },
   },
   { _id: false },
 );
@@ -188,15 +188,15 @@ const productionCompletionSchema = new mongoose.Schema(
 const dispatchRecordSchema = new mongoose.Schema(
   {
     dispatchedQuantity: { type: Number, required: true, min: 1 },
-    dispatchedAt:       { type: Date, default: Date.now },
-    dispatchedBy:       { type: String },
-    notes:              { type: String, trim: true },
+    dispatchedAt: { type: Date, default: Date.now },
+    dispatchedBy: { type: String },
+    notes: { type: String, trim: true },
     dispatchType: {
       type: String,
       enum: ["person_wise", "bulk"],
       default: "bulk",
     },
-    employeeIds:   [{ type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" }],
+    employeeIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" }],
     employeeNames: [{ type: String }],
   },
   { _id: true },
@@ -205,21 +205,21 @@ const dispatchRecordSchema = new mongoose.Schema(
 // ── WorkOrder ─────────────────────────────────────────────────────────────────
 const workOrderSchema = new mongoose.Schema(
   {
-    workOrderNumber:    { type: String, unique: true, trim: true },
-    customerRequestId:  { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
-    stockItemId:        { type: mongoose.Schema.Types.ObjectId, ref: "StockItem" },
-    stockItemName:      { type: String, trim: true },
+    workOrderNumber: { type: String, unique: true, trim: true },
+    customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
+    stockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem" },
+    stockItemName: { type: String, trim: true },
     stockItemReference: { type: String, trim: true },
-    variantId:          { type: String },
+    variantId: { type: String },
     variantAttributes: [
       {
-        name:  { type: String, trim: true },
+        name: { type: String, trim: true },
         value: { type: String, trim: true },
       },
     ],
-    quantity:         { type: Number, min: 1 },
+    quantity: { type: Number, min: 1 },
     originalQuantity: { type: Number, min: 1 },
-    customerId:   { type: mongoose.Schema.Types.ObjectId, ref: "Customer" },
+    customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer" },
     customerName: { type: String, trim: true },
     priority: {
       type: String,
@@ -239,13 +239,13 @@ const workOrderSchema = new mongoose.Schema(
     // Operations — name + code + timing only. No machine assignment at planning.
     operations: [operationAssignmentSchema],
 
-    rawMaterials:        [rawMaterialAllocationSchema],
-    timeline:            timelineSchema,
+    rawMaterials: [rawMaterialAllocationSchema],
+    timeline: timelineSchema,
     productionCompletion: productionCompletionSchema,
 
     specialInstructions: [{ type: String, trim: true }],
     estimatedCost: { type: Number, min: 0, default: 0 },
-    actualCost:    { type: Number, min: 0, default: 0 },
+    actualCost: { type: Number, min: 0, default: 0 },
 
     productionNotes: [
       {
@@ -263,10 +263,10 @@ const workOrderSchema = new mongoose.Schema(
     ],
 
     qualityCheck: {
-      passed:    { type: Boolean, default: false },
+      passed: { type: Boolean, default: false },
       checkedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager" },
       checkedAt: { type: Date },
-      notes:     { type: String, trim: true },
+      notes: { type: String, trim: true },
     },
 
     cuttingStatus: {
@@ -283,21 +283,37 @@ const workOrderSchema = new mongoose.Schema(
       },
     },
 
-    dispatchedQuantity: { type: Number, default: 0, min: 0 },
-    dispatchRecords:    [dispatchRecordSchema],
 
-    createdBy:    { type: mongoose.Schema.Types.ObjectId, ref: "SalesDepartment" },
-    plannedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
-    plannedAt:    { type: Date, default: null },
+    // ── Packaging tracking (for bulk orders mainly, also used by measurement) ──
+    packagedQuantity: { type: Number, default: 0, min: 0 },
+    packagingRecords: [
+      {
+        packagedQuantity: { type: Number, required: true, min: 1 },
+        packagedAt: { type: Date, default: Date.now },
+        packagedBy: { type: String, default: "" },
+        packagingType: { type: String, enum: ["person_wise", "bulk"], default: "bulk" },
+        employeeIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" }],
+        employeeNames: [{ type: String }],
+        notes: { type: String, trim: true, default: "" },
+        unitNumbers: [{ type: Number }], // ← ADD
+      },
+    ],
+
+    dispatchedQuantity: { type: Number, default: 0, min: 0 },
+    dispatchRecords: [dispatchRecordSchema],
+
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "SalesDepartment" },
+    plannedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    plannedAt: { type: Date, default: null },
     planningNotes: { type: String, trim: true, default: "" },
 
-    isSplitOrder:      { type: Boolean, default: false },
+    isSplitOrder: { type: Boolean, default: false },
     parentWorkOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder", default: null },
-    splitReason:       { type: String, trim: true, default: "" },
+    splitReason: { type: String, trim: true, default: "" },
 
-    forwardedToVendor:        { type: mongoose.Schema.Types.ObjectId, ref: "VendorDetails", default: null },
-    forwardedAt:              { type: Date, default: null },
-    forwardedBy:              { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    forwardedToVendor: { type: mongoose.Schema.Types.ObjectId, ref: "VendorDetails", default: null },
+    forwardedAt: { type: Date, default: null },
+    forwardedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
     vendorWorkOrderReference: { type: String, trim: true, default: null },
   },
   { timestamps: true },

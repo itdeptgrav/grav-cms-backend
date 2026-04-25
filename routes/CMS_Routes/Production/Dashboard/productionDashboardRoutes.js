@@ -1,11 +1,5 @@
 // routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes.js
-//
-// Operation tracking concept:
-//   Every barcodeScan carries an `activeOps` array of operation CODE strings
-//   (e.g. ["SJ-01", "BA-03"]) sent by the device.
-//   We match those codes against the WO's operations[].operationCode (case-insensitive).
-//   A single scan can credit multiple operations simultaneously.
-//   Machine assignment is NOT used — machines are identified purely from scan data.
+
 
 const express = require("express");
 const router = express.Router();
@@ -19,8 +13,6 @@ const StockItem = require("../../../../models/CMS_Models/Inventory/Products/Stoc
 
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const Measurement = require("../../../../models/Customer_Models/Measurement");
-
-router.use(EmployeeAuthMiddleware);
 
 // ============================================================================
 // HELPERS

@@ -5,8 +5,6 @@ const router = express.Router();
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const CanvasLayout = require("../../../../models/CMS_Models/Manufacturing/Production/CanvasLayout");
 
-router.use(EmployeeAuthMiddleware);
-
 /**
  * GET /api/cms/production/canvas-layout
  * Fetch saved canvas layout
