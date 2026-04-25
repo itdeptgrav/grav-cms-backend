@@ -391,18 +391,12 @@ router.get("/manufacturing-orders/:id/bulk", async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
-// DISPATCH SECTION
-// ═════════════════════════════════════════════════════════════════════════════
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /manufacturing-orders/:id/dispatch-history
-// Returns consolidated dispatch history for MO — both employee + bulk
-// ─────────────────────────────────────────────────────────────────────────────
+// ── GET /manufacturing-orders/:id/dispatch-history ───────────────────────────
+// Query: page, limit, search, startDate (ISO), endDate (ISO)
 router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
   try {
     const { id } = req.params;
-    const { page = 1, limit = 25, search = "" } = req.query;
+    const { page = 1, limit = 25, search = "", startDate = "", endDate = "" } = req.query;
 
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ success: false, message: "Invalid MO id" });
@@ -416,11 +410,11 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
 
     const events = [];
 
-    // ── BULK events ─────────────────────────────────────────────────────
+    // Bulk events
     for (const wo of wos) {
       const meta = wo.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
       for (const rec of wo.dispatchRecords || []) {
-        if (rec.dispatchType === "person_wise") continue; // person-wise handled below via EmployeeProductionProgress
+        if (rec.dispatchType === "person_wise") continue;
         events.push({
           _id: rec._id,
           type: "bulk",
@@ -434,7 +428,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
             workOrderNumber: wo.workOrderNumber,
             productName: wo.stockItemName || meta?.name || "—",
             productRef: wo.stockItemReference || meta?.reference || "",
-            gender: meta?.gender || "",
+            gender: meta?.genderCategory || meta?.gender || "",
             category: meta?.category || "",
             variantAttributes: wo.variantAttributes || [],
             quantity: rec.dispatchedQuantity,
@@ -444,7 +438,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
       }
     }
 
-    // ── PERSON-WISE events — group by (employee + dispatch timestamp bucket) ─
+    // Person-wise events (grouped by employee + minute bucket)
     const empDocs = await EmployeeProductionProgress.find({
       manufacturingOrderId: id,
       "dispatchHistory.0": { $exists: true },
@@ -452,9 +446,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
       .select("employeeId employeeName employeeUIN workOrderId totalUnits packagedUnits dispatchHistory")
       .lean();
 
-    // Group: key = employeeId + timestamp (truncated to minute for safety)
     const personEventMap = new Map();
-
     for (const ep of empDocs) {
       const wo = woMap.get(ep.workOrderId.toString());
       const meta = wo?.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
@@ -462,16 +454,15 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
         workOrderNumber: wo?.workOrderNumber || "—",
         productName: wo?.stockItemName || meta?.name || "—",
         productRef: wo?.stockItemReference || meta?.reference || "",
-        gender: meta?.gender || "",
+        gender: meta?.genderCategory || meta?.gender || "",
         category: meta?.category || "",
         variantAttributes: wo?.variantAttributes || [],
         quantity: ep.packagedUnits || ep.totalUnits || 0,
       };
 
       for (const h of ep.dispatchHistory || []) {
-        // Bucket by minute so a single "Dispatch Queue" action groups its products
         const ts = new Date(h.dispatchedAt);
-        const bucket = Math.floor(ts.getTime() / 60000); // minute precision
+        const bucket = Math.floor(ts.getTime() / 60000);
         const key = `${ep.employeeId}_${bucket}_${h.dispatchedBy || ""}`;
 
         if (!personEventMap.has(key)) {
@@ -489,24 +480,36 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
             productCount: 0,
           });
         }
-
         const ev = personEventMap.get(key);
         ev.products.push(product);
         ev.totalUnits += product.quantity;
         ev.productCount++;
       }
     }
-
     for (const ev of personEventMap.values()) {
       ev.products.sort((a, b) => a.productName.localeCompare(b.productName));
       events.push(ev);
     }
 
-    // ── Apply search ────────────────────────────────────────────────────
+    // ── Apply date filter ──────────────────────────────────────────────────
     let filtered = events;
+    if (startDate || endDate) {
+      const start = startDate ? new Date(startDate) : null;
+      const end = endDate ? new Date(endDate) : null;
+      if (end) end.setHours(23, 59, 59, 999); // include full end day
+
+      filtered = filtered.filter((ev) => {
+        const t = new Date(ev.dispatchedAt);
+        if (start && t < start) return false;
+        if (end && t > end) return false;
+        return true;
+      });
+    }
+
+    // Apply search
     if (search) {
       const term = search.trim().toLowerCase();
-      filtered = events.filter((ev) => {
+      filtered = filtered.filter((ev) => {
         if (ev.employeeName?.toLowerCase().includes(term)) return true;
         if (ev.employeeUIN?.toLowerCase().includes(term)) return true;
         if (ev.dispatchedBy?.toLowerCase().includes(term)) return true;
@@ -518,7 +521,6 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
       });
     }
 
-    // Sort newest first
     filtered.sort((a, b) => new Date(b.dispatchedAt) - new Date(a.dispatchedAt));
 
     const totals = filtered.reduce(
@@ -539,6 +541,7 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
     return res.json({
       success: true,
       events: paged,
+      allEvents: filtered, // for CSV export — frontend can use this when needed
       totals,
       pagination: {
         page: pageNum,
@@ -549,6 +552,250 @@ router.get("/manufacturing-orders/:id/dispatch-history", async (req, res) => {
     });
   } catch (err) {
     console.error("PD dispatch history error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+
+// ── POST /manufacturing-orders/:id/lookup-by-barcodes ────────────────────────
+// Body: { barcodes: ["WO-xxxx-001","WO-xxxx-002",...] }
+// Resolves these barcodes → finds the employee in this MO who owns those units
+// Returns the employee + dispatchable products (same shape as employees/:eid/products)
+router.post("/manufacturing-orders/:id/lookup-by-barcodes", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { barcodes } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid MO id" });
+    }
+    if (!Array.isArray(barcodes) || !barcodes.length) {
+      return res.status(400).json({ success: false, message: "barcodes array is required" });
+    }
+
+    // Parse each barcode → { woShortId, unit }
+    const parsed = [];
+    const invalid = [];
+    for (const bc of barcodes) {
+      if (typeof bc !== "string") { invalid.push(bc); continue; }
+      const parts = bc.trim().split("-");
+      if (parts.length >= 3 && parts[0] === "WO") {
+        const unit = parseInt(parts[2], 10);
+        if (!isNaN(unit) && unit > 0) {
+          parsed.push({ barcode: bc.trim(), woShortId: parts[1], unit });
+          continue;
+        }
+      }
+      invalid.push(bc);
+    }
+
+    if (!parsed.length) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid barcodes",
+        invalidBarcodes: invalid,
+      });
+    }
+
+    // Get all WOs of this MO and resolve short IDs
+    const allWOs = await WorkOrder.find({ customerRequestId: id })
+      .select("_id workOrderNumber stockItemId stockItemName stockItemReference variantAttributes")
+      .lean();
+    const woByShortId = new Map();
+    for (const wo of allWOs) {
+      woByShortId.set(wo._id.toString().slice(-8), wo);
+    }
+
+    // Match barcodes to WOs and collect (workOrderId, unitNumber) pairs
+    const woUnits = new Map(); // workOrderId.toString() -> Set<unitNumber>
+    const unmatchedBarcodes = [];
+    for (const p of parsed) {
+      const wo = woByShortId.get(p.woShortId);
+      if (!wo) {
+        unmatchedBarcodes.push(p.barcode);
+        continue;
+      }
+      const key = wo._id.toString();
+      if (!woUnits.has(key)) woUnits.set(key, new Set());
+      woUnits.get(key).add(p.unit);
+    }
+
+    if (woUnits.size === 0) {
+      return res.json({
+        success: false,
+        message: "No barcodes matched any WO in this MO",
+        invalidBarcodes: [...invalid, ...unmatchedBarcodes],
+      });
+    }
+
+    // Find EmployeeProductionProgress docs whose unit ranges contain these units
+    const candidateDocs = await EmployeeProductionProgress.find({
+      manufacturingOrderId: new mongoose.Types.ObjectId(id),
+      workOrderId: { $in: [...woUnits.keys()].map((id) => new mongoose.Types.ObjectId(id)) },
+    }).lean();
+
+    // Score each employee — count how many scanned units fall in their range
+    const empScore = new Map(); // employeeId -> { count, docs:[...] }
+    for (const doc of candidateDocs) {
+      const units = woUnits.get(doc.workOrderId.toString());
+      if (!units) continue;
+      let hits = 0;
+      for (const u of units) {
+        if (u >= doc.unitStart && u <= doc.unitEnd) hits++;
+      }
+      if (hits === 0) continue;
+      const empKey = doc.employeeId?.toString();
+      if (!empKey) continue;
+      if (!empScore.has(empKey)) {
+        empScore.set(empKey, { count: 0, docs: [], employeeName: doc.employeeName, employeeUIN: doc.employeeUIN, employeeId: doc.employeeId });
+      }
+      const rec = empScore.get(empKey);
+      rec.count += hits;
+      rec.docs.push(doc);
+    }
+
+    if (empScore.size === 0) {
+      return res.json({
+        success: false,
+        message: "Barcodes don't match any employee's assigned unit range",
+        invalidBarcodes: [...invalid, ...unmatchedBarcodes],
+      });
+    }
+
+    // Pick the employee with the highest hit count
+    const best = [...empScore.values()].sort((a, b) => b.count - a.count)[0];
+
+    // Build product list (only dispatchable ones — same logic as /employees/:eid/products)
+    const allEmpDocs = await EmployeeProductionProgress.find({
+      manufacturingOrderId: id,
+      employeeId: best.employeeId,
+    }).lean();
+
+    const woIds = [...new Set(allEmpDocs.map((d) => d.workOrderId.toString()))];
+    const wos = await WorkOrder.find({ _id: { $in: woIds } })
+      .select("workOrderNumber stockItemId stockItemName stockItemReference variantAttributes")
+      .lean();
+    const woMap = new Map(wos.map((w) => [w._id.toString(), w]));
+    const metaMap = await resolveStockItemMeta(wos.map((w) => w.stockItemId));
+
+    const products = allEmpDocs.map((doc) => {
+      const wo = woMap.get(doc.workOrderId.toString());
+      const meta = wo?.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
+      return {
+        progressDocId: doc._id,
+        workOrderId: doc.workOrderId,
+        workOrderNumber: wo?.workOrderNumber || "—",
+        productName: wo?.stockItemName || meta?.name || "—",
+        productRef: wo?.stockItemReference || meta?.reference || "",
+        productGender: meta?.genderCategory || meta?.gender || "",
+        productCategory: meta?.category || "",
+        variantAttributes: wo?.variantAttributes || [],
+        totalUnits: doc.totalUnits,
+        packagedUnits: doc.packagedUnits || 0,
+        isFullyPackaged: doc.isFullyPackaged || false,
+        isDispatched: doc.isDispatched || false,
+        canDispatch: (doc.packagedUnits || 0) > 0 && !doc.isDispatched,
+      };
+    });
+
+    products.sort((a, b) => a.productName.localeCompare(b.productName));
+
+    return res.json({
+      success: true,
+      employee: {
+        employeeId: best.employeeId,
+        employeeName: best.employeeName,
+        employeeUIN: best.employeeUIN,
+      },
+      products,
+      barcodesScanned: parsed.length,
+      barcodesMatched: best.count,
+      invalidBarcodes: [...invalid, ...unmatchedBarcodes],
+    });
+  } catch (err) {
+    console.error("PD lookup-by-barcodes error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+
+// ── GET /manufacturing-orders/:id/remaining-employees ────────────────────────
+// Returns employees whose packaged units haven't been fully dispatched yet.
+router.get("/manufacturing-orders/:id/remaining-employees", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid MO id" });
+    }
+
+    const docs = await EmployeeProductionProgress.find({
+      manufacturingOrderId: new mongoose.Types.ObjectId(id),
+      isDispatched: false,
+      packagedUnits: { $gt: 0 },
+    }).lean();
+
+    if (!docs.length) {
+      return res.json({ success: true, employees: [], totals: { employees: 0, products: 0, units: 0 } });
+    }
+
+    const woIds = [...new Set(docs.map((d) => d.workOrderId.toString()))];
+    const wos = await WorkOrder.find({ _id: { $in: woIds } })
+      .select("workOrderNumber stockItemId stockItemName stockItemReference variantAttributes")
+      .lean();
+    const woMap = new Map(wos.map((w) => [w._id.toString(), w]));
+    const metaMap = await resolveStockItemMeta(wos.map((w) => w.stockItemId));
+
+    // Group by employee
+    const empMap = new Map();
+    for (const doc of docs) {
+      const key = doc.employeeId?.toString();
+      if (!key) continue;
+      const wo = woMap.get(doc.workOrderId.toString());
+      const meta = wo?.stockItemId ? metaMap.get(wo.stockItemId.toString()) : null;
+
+      if (!empMap.has(key)) {
+        empMap.set(key, {
+          employeeId: doc.employeeId,
+          employeeName: doc.employeeName,
+          employeeUIN: doc.employeeUIN,
+          gender: doc.gender || "",
+          products: [],
+          totalProducts: 0,
+          totalUnits: 0,
+        });
+      }
+      const rec = empMap.get(key);
+      rec.products.push({
+        progressDocId: doc._id,
+        workOrderId: doc.workOrderId,
+        workOrderNumber: wo?.workOrderNumber || "—",
+        productName: wo?.stockItemName || meta?.name || "—",
+        productRef: wo?.stockItemReference || meta?.reference || "",
+        productGender: meta?.genderCategory || meta?.gender || "",
+        productCategory: meta?.category || "",
+        variantAttributes: wo?.variantAttributes || [],
+        packagedUnits: doc.packagedUnits || 0,
+        totalUnits: doc.totalUnits || 0,
+      });
+      rec.totalProducts++;
+      rec.totalUnits += doc.packagedUnits || 0;
+    }
+
+    const employees = [...empMap.values()].sort((a, b) =>
+      a.employeeName.localeCompare(b.employeeName)
+    );
+
+    return res.json({
+      success: true,
+      employees,
+      totals: {
+        employees: employees.length,
+        products: employees.reduce((s, e) => s + e.totalProducts, 0),
+        units: employees.reduce((s, e) => s + e.totalUnits, 0),
+      },
+    });
+  } catch (err) {
+    console.error("PD remaining employees error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
