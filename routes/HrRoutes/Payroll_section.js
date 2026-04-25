@@ -319,7 +319,7 @@ function computeEmployeePayroll(employee, ctx) {
     // CRITICAL FIX: PF and ESIC should be calculated on EARNED (pro-rated) BASIC, not full month
     const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
     const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
-    const esic = esiApplicable ? Math.round(basicEarned * eeEsicPct) : 0;
+    const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
     const pt = (settings.ptEnabled && settings.ptForBasic) ? settings.ptForBasic(basicEarned) : 0;
 
     const totalDeductions = epf + esic + pt;
@@ -415,7 +415,7 @@ function computeEmployeePayroll(employee, ctx) {
             providentFund: epf,
             employerPF: epf,
             esic: esic,
-            employerESIC: esiApplicable ? Math.round(basicEarned * (((salaryCfg?.erEsicPct) ?? 3.25) / 100)) : 0,
+            employerESIC: esiApplicable ? Math.ceil(basicEarned * (((salaryCfg?.erEsicPct) ?? 3.25) / 100)) : 0,
             professionalTax: pt,
             incomeTax: 0,
             loanDeduction: 0,
@@ -951,8 +951,8 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         // CRITICAL FIX: Calculate on EARNED (pro-rated) BASIC
         const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
         const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
-        const esic = esiApplicable ? Math.round(basicEarned * eeEsicPct) : 0;
-        const erEsic = esiApplicable ? Math.round(basicEarned * erEsicPct) : 0;
+        const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
+        const erEsic = esiApplicable ? Math.ceil(basicEarned * erEsicPct) : 0;
         const pt = (settings.ptEnabled && settings.ptForBasic) ? settings.ptForBasic(basicEarned) : 0;
 
         const loan = loanDeduction !== undefined ? Number(loanDeduction) : (item.deductions?.loanDeduction || 0);
@@ -1349,6 +1349,39 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         res.send(buffer);
     } catch (err) {
         console.error("[PAYROLL-EXPORT]", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+
+// ── DELETE /run ───────────────────────────────────────────────────────────────
+router.delete("/run", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { user } = req;
+        if (user.role !== "hr_manager") {
+            return res.status(403).json({ success: false, message: "Only HR managers can delete a payroll run" });
+        }
+
+        const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+        const year = parseInt(req.query.year) || new Date().getFullYear();
+
+        const run = await Payroll.findOne({ month, year });
+        if (!run) {
+            return res.status(404).json({ success: false, message: "No payroll run found for this period" });
+        }
+        if (["paid", "approved"].includes(run.status)) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot delete a payroll run that is already ${run.status}`,
+            });
+        }
+
+        await PayrollItem.deleteMany({ month, year });
+        await Payroll.deleteOne({ _id: run._id });
+
+        res.json({ success: true, message: `Payroll run for ${MONTH_NAMES[month]} ${year} deleted` });
+    } catch (err) {
+        console.error("[PAYROLL-DELETE-RUN]", err);
         res.status(500).json({ success: false, message: err.message });
     }
 });

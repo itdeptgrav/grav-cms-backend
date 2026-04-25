@@ -29,7 +29,7 @@ router.get("/public/:identityId", async (req, res) => {
       identityId: identityId.toUpperCase(),
       isActive: true
     })
-      .select('firstName middleName lastName profilePhoto department designation jobTitle dateOfJoining workLocation identityId biometricId phone alternatePhone extension address')
+      .select('firstName middleName lastName profilePhoto department designation jobTitle dateOfJoining workLocation identityId biometricId phone alternatePhone extension address bloodGroup dateOfBirth employmentType')
       .lean();
 
     if (!employee) {
@@ -75,6 +75,9 @@ router.get("/public/:identityId", async (req, res) => {
       alternatePhone: employee.alternatePhone || null,
       extension: employee.extension || null,
       address: address,
+      bloodGroup: employee.bloodGroup || null,
+      dateOfBirth: employee.dateOfBirth || null,
+      employmentType: employee.employmentType || null,
     };
 
     res.status(200).json({
