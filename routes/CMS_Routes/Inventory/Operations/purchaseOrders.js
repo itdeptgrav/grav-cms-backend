@@ -384,26 +384,40 @@ router.post("/", async (req, res) => {
     }
 
     // Build items with details (simplified version)
-    const itemsWithDetails = items.map((item) => {
+    // Build items with details (async — looks up baseUnit + vendor nickname)
+    const itemsWithDetails = await Promise.all(items.map(async (item) => {
+      const ri = await RawItem.findById(item.rawItem)
+        .select("unit customUnit name sku vendorNicknames")
+        .lean();
+
+      const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
+      const poUnit = item.unit || registeredUnit;
+
+      // Snapshot vendor's nickname for this raw item
+      const nicknameEntry = ri?.vendorNicknames?.find(
+        vn => vn.vendor?.toString() === vendor.toString()
+      );
+      const vendorNickname = nicknameEntry?.nickname || "";
+
       return {
         rawItem: item.rawItem,
-        itemName: item.itemName || "Unknown Item",
-        sku: item.sku || "",
-        unit: item.unit || "unit",
+        itemName: item.itemName || ri?.name || "Unknown Item",
+        sku: item.sku || ri?.sku || "",
+        unit: poUnit,
+        baseUnit: registeredUnit,
+        vendorNickname,                      // ← NEW
         quantity: Number(item.quantity),
         unitPrice: Number(item.unitPrice),
         totalPrice: Number(item.quantity) * Number(item.unitPrice),
         receivedQuantity: 0,
         pendingQuantity: Number(item.quantity),
         status: "PENDING",
-        variant: "Undefined",
-
         variantId: item.variantId || null,
         variantCombination: item.variantCombination || [],
-        variantName: item.variantCombination?.join(" • ") || "Variant",
+        variantName: item.variantCombination?.join(" • ") || "",
         variantSku: item.variantSku || "",
       };
-    });
+    }));
 
     console.log("Processed items:", JSON.stringify(itemsWithDetails, null, 2));
 
@@ -605,19 +619,26 @@ router.put("/:id", async (req, res) => {
         }
       }
 
-      // Get item details (with variant support)
-      // Build items with details + capture baseUnit (registered unit) at PO time
       const itemsWithDetails = await Promise.all(items.map(async (item) => {
-        const ri = await RawItem.findById(item.rawItem).select("unit customUnit name sku").lean();
+        const ri = await RawItem.findById(item.rawItem)
+          .select("unit customUnit name sku vendorNicknames")
+          .lean();
+
         const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
         const poUnit = item.unit || registeredUnit;
+
+        const nicknameEntry = ri?.vendorNicknames?.find(
+          vn => vn.vendor?.toString() === purchaseOrder.vendor.toString()
+        );
+        const vendorNickname = nicknameEntry?.nickname || "";
 
         return {
           rawItem: item.rawItem,
           itemName: item.itemName || ri?.name || "Unknown Item",
           sku: item.sku || ri?.sku || "",
-          unit: poUnit,                  // unit chosen on PO line
-          baseUnit: registeredUnit,      // raw-item registered unit (for conversion at delivery)
+          unit: poUnit,
+          baseUnit: registeredUnit,
+          vendorNickname,                      // ← NEW
           quantity: Number(item.quantity),
           unitPrice: Number(item.unitPrice),
           totalPrice: Number(item.quantity) * Number(item.unitPrice),
@@ -936,7 +957,7 @@ router.post("/:id/receive", async (req, res) => {
       .populate("items.rawItem", "name sku unit customUnit variants quantity status minStock maxStock");
 
     if (!purchaseOrder) return res.status(404).json({ success: false, message: "PO not found" });
-    if (purchaseOrder.status === "DRAFT")     return res.status(400).json({ success: false, message: "Cannot receive against a draft PO" });
+    if (purchaseOrder.status === "DRAFT") return res.status(400).json({ success: false, message: "Cannot receive against a draft PO" });
     if (purchaseOrder.status === "CANCELLED") return res.status(400).json({ success: false, message: "Cannot receive against a cancelled PO" });
 
     // ── Validate ───────────────────────────────────────────────────────────
@@ -1003,10 +1024,10 @@ router.post("/:id/receive", async (req, res) => {
 
       // Update PO item (kept in PO unit)
       poItem.receivedQuantity += qtyInPoUnit;
-      poItem.pendingQuantity   = Math.max(0, poItem.quantity - poItem.receivedQuantity);
+      poItem.pendingQuantity = Math.max(0, poItem.quantity - poItem.receivedQuantity);
       poItem.status =
         poItem.receivedQuantity >= poItem.quantity ? "COMPLETED" :
-        poItem.receivedQuantity > 0                 ? "PARTIALLY_RECEIVED" : "PENDING";
+          poItem.receivedQuantity > 0 ? "PARTIALLY_RECEIVED" : "PENDING";
 
       const previousBaseQty = rawItem.quantity;
 
@@ -1026,7 +1047,7 @@ router.post("/:id/receive", async (req, res) => {
           for (let i = 0; i < rawItem.variants.length; i++) {
             const v = rawItem.variants[i];
             if (v.combination?.length === variantCombination.length &&
-                v.combination.every((val, idx) => val === variantCombination[idx])) {
+              v.combination.every((val, idx) => val === variantCombination[idx])) {
               variant = v; variantIdx = i; break;
             }
           }
@@ -1036,7 +1057,7 @@ router.post("/:id/receive", async (req, res) => {
           variant.quantity = (variant.quantity || 0) + qtyInRegisteredUnit;
           variant.status =
             variant.quantity === 0 ? "Out of Stock" :
-            variant.quantity <= (variant.minStock || rawItem.minStock || 0) ? "Low Stock" : "In Stock";
+              variant.quantity <= (variant.minStock || rawItem.minStock || 0) ? "Low Stock" : "In Stock";
           if (!variant.sku) variant.sku = poItem.variantSku || `${rawItem.sku}-var`;
           rawItem.variants[variantIdx] = variant;
         } else {
@@ -1059,7 +1080,7 @@ router.post("/:id/receive", async (req, res) => {
       // Raw-item overall status
       rawItem.status =
         rawItem.quantity === 0 ? "Out of Stock" :
-        rawItem.quantity <= (rawItem.minStock || 0) ? "Low Stock" : "In Stock";
+          rawItem.quantity <= (rawItem.minStock || 0) ? "Low Stock" : "In Stock";
 
       // Transaction record (records both PO-unit + registered-unit values)
       const conversionNote = fromUnit !== registeredUnit
@@ -1111,7 +1132,7 @@ router.post("/:id/receive", async (req, res) => {
 
     purchaseOrder.status =
       purchaseOrder.totalPending === 0 ? "COMPLETED" :
-      purchaseOrder.totalReceived > 0  ? "PARTIALLY_RECEIVED" : purchaseOrder.status;
+        purchaseOrder.totalReceived > 0 ? "PARTIALLY_RECEIVED" : purchaseOrder.status;
 
     await purchaseOrder.save();
 
