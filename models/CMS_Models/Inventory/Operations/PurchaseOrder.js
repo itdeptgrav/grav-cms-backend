@@ -21,7 +21,8 @@ const purchaseOrderItemSchema = new mongoose.Schema({
     variantId:           { type: mongoose.Schema.Types.ObjectId },
     variantCombination:  [{ type: String, trim: true }],
     variantName:         { type: String, trim: true, default: "" },
-    variantSku:          { type: String, trim: true, default: "" }
+    variantSku:          { type: String, trim: true, default: "" },
+    vendorNickname: { type: String, trim: true, default: "" }
 }, { _id: true });
 
 const deliverySchema = new mongoose.Schema({
