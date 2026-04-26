@@ -7,6 +7,8 @@ const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawIte
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const VendorEmailService = require("../../../../services/VendorEmailService");
+const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
+
 
 // Apply auth middleware to all routes
 router.use(EmployeeAuthMiddleware);
@@ -21,6 +23,37 @@ const generatePONumber = () => {
     .padStart(4, "0");
   return `${prefix}${year}${month}${randomNum}`;
 };
+
+// ──────────────────────────────────────────────────────────────────────────
+// Helper: convert quantity between units using Unit.conversions
+// ──────────────────────────────────────────────────────────────────────────
+async function convertQuantity(quantity, fromUnit, toUnit) {
+  if (!fromUnit || !toUnit || fromUnit === toUnit) return quantity;
+  if (!quantity || isNaN(quantity)) return quantity;
+  try {
+    const fromDoc = await Unit.findOne({ name: fromUnit })
+      .populate("conversions.toUnit", "name").lean();
+    if (fromDoc) {
+      const direct = (fromDoc.conversions || []).find(
+        c => (c.toUnit?.name || c.toUnit) === toUnit
+      );
+      if (direct?.quantity) return quantity * direct.quantity;
+    }
+    const toDoc = await Unit.findOne({ name: toUnit })
+      .populate("conversions.toUnit", "name").lean();
+    if (toDoc) {
+      const reverse = (toDoc.conversions || []).find(
+        c => (c.toUnit?.name || c.toUnit) === fromUnit
+      );
+      if (reverse?.quantity) return quantity / reverse.quantity;
+    }
+    console.warn(`[PO convertQuantity] No path "${fromUnit}"→"${toUnit}".`);
+    return quantity;
+  } catch (err) {
+    console.error("[PO convertQuantity]", err.message);
+    return quantity;
+  }
+}
 
 // ✅ GET all purchase orders
 router.get("/", async (req, res) => {
@@ -126,6 +159,71 @@ router.get("/", async (req, res) => {
       success: false,
       message: "Server error while fetching purchase orders",
     });
+  }
+});
+
+
+// ✅ GET available units for a raw item (registered + convertible)
+router.get("/data/raw-items/:id/units", async (req, res) => {
+  try {
+    const rawItem = await RawItem.findById(req.params.id)
+      .select("unit customUnit name").lean();
+    if (!rawItem) {
+      return res.status(404).json({ success: false, message: "Raw item not found" });
+    }
+
+    const baseUnit = rawItem.customUnit || rawItem.unit;
+    const available = [{
+      name: baseUnit,
+      isBase: true,
+      factor: 1,
+      label: `${baseUnit} (registered)`
+    }];
+
+    // Direct: baseUnit -> X  (1 base = factor X)
+    const baseDoc = await Unit.findOne({ name: baseUnit })
+      .populate("conversions.toUnit", "name").lean();
+
+    if (baseDoc?.conversions?.length) {
+      for (const c of baseDoc.conversions) {
+        const toName = c.toUnit?.name || c.toUnit;
+        if (toName && !available.find(u => u.name === toName)) {
+          available.push({
+            name: toName,
+            isBase: false,
+            factor: c.quantity,
+            label: `${toName} (1 ${baseUnit} = ${c.quantity} ${toName})`
+          });
+        }
+      }
+    }
+
+    // Reverse: X -> baseUnit  (1 X = q baseUnit, so factor = 1/q for our display)
+    if (baseDoc?._id) {
+      const reverseUnits = await Unit.find({
+        "conversions.toUnit": baseDoc._id
+      }).lean();
+
+      for (const u of reverseUnits) {
+        if (available.find(au => au.name === u.name)) continue;
+        const conv = (u.conversions || []).find(
+          c => c.toUnit?.toString() === baseDoc._id.toString()
+        );
+        if (conv?.quantity) {
+          available.push({
+            name: u.name,
+            isBase: false,
+            factor: 1 / conv.quantity,
+            label: `${u.name} (1 ${u.name} = ${conv.quantity} ${baseUnit})`
+          });
+        }
+      }
+    }
+
+    res.json({ success: true, baseUnit, availableUnits: available });
+  } catch (err) {
+    console.error("Error fetching unit conversions:", err);
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -508,46 +606,30 @@ router.put("/:id", async (req, res) => {
       }
 
       // Get item details (with variant support)
-      const itemsWithDetails = await Promise.all(
-        items.map(async (item) => {
-          const rawItem = await RawItem.findById(item.rawItem).select(
-            "name sku unit customUnit variants",
-          );
+      // Build items with details + capture baseUnit (registered unit) at PO time
+      const itemsWithDetails = await Promise.all(items.map(async (item) => {
+        const ri = await RawItem.findById(item.rawItem).select("unit customUnit name sku").lean();
+        const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
+        const poUnit = item.unit || registeredUnit;
 
-          let variantInfo = {};
-          let variantSku = item.sku || rawItem?.sku || "";
-
-          // If variantId is provided, get variant details
-          if (item.variantId) {
-            const variant = rawItem?.variants?.find(
-              (v) => v._id.toString() === item.variantId,
-            );
-            if (variant) {
-              variantInfo = {
-                variantId: item.variantId,
-                variantCombination: variant.combination || [],
-                variantName: variant.combination?.join(" • ") || "Variant",
-                variantSku: variant.sku || variantSku,
-              };
-              variantSku = variant.sku || variantSku;
-            }
-          }
-
-          return {
-            rawItem: item.rawItem,
-            itemName: rawItem?.name || item.itemName,
-            sku: variantSku,
-            unit: rawItem?.customUnit || rawItem?.unit || item.unit,
-            quantity: parseFloat(item.quantity),
-            unitPrice: parseFloat(item.unitPrice),
-            totalPrice: parseFloat(item.quantity) * parseFloat(item.unitPrice),
-            receivedQuantity: 0,
-            pendingQuantity: parseFloat(item.quantity),
-            status: "PENDING",
-            ...variantInfo,
-          };
-        }),
-      );
+        return {
+          rawItem: item.rawItem,
+          itemName: item.itemName || ri?.name || "Unknown Item",
+          sku: item.sku || ri?.sku || "",
+          unit: poUnit,                  // unit chosen on PO line
+          baseUnit: registeredUnit,      // raw-item registered unit (for conversion at delivery)
+          quantity: Number(item.quantity),
+          unitPrice: Number(item.unitPrice),
+          totalPrice: Number(item.quantity) * Number(item.unitPrice),
+          receivedQuantity: 0,
+          pendingQuantity: Number(item.quantity),
+          status: "PENDING",
+          variantId: item.variantId || null,
+          variantCombination: item.variantCombination || [],
+          variantName: (item.variantCombination || []).join(" • ") || "",
+          variantSku: item.variantSku || "",
+        };
+      }));
 
       purchaseOrder.items = itemsWithDetails;
     }
@@ -574,145 +656,6 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-// ✅ RECEIVE delivery against purchase order - SIMPLIFIED FIX
-router.post("/:id/receive", async (req, res) => {
-  try {
-    const { deliveryDate, items, invoiceNumber, notes } = req.body;
-
-    console.log("=== RECEIVING DELIVERY ===");
-    console.log("Items:", JSON.stringify(items, null, 2));
-
-    // Get PO with variant info
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id).populate(
-      "items.rawItem",
-      "name sku unit variants quantity",
-    );
-
-    if (!purchaseOrder) {
-      return res.status(404).json({ success: false, message: "PO not found" });
-    }
-
-    let totalReceivedQty = 0;
-
-    // Process each item
-    for (const receivedItem of items) {
-      const qty = receivedItem.quantity || 0;
-      if (qty <= 0) continue;
-
-      // Find PO item
-      const poItem = purchaseOrder.items.id(receivedItem.itemId);
-      if (!poItem) continue;
-
-      // Update PO item
-      poItem.receivedQuantity += qty;
-      poItem.pendingQuantity = poItem.quantity - poItem.receivedQuantity;
-
-      // Get variant info (from receivedItem or poItem)
-      const variantId = receivedItem.variantId || poItem.variantId;
-      const variantCombination =
-        receivedItem.variantCombination || poItem.variantCombination;
-
-      // Update RawItem
-      const rawItem = await RawItem.findById(poItem.rawItem);
-      if (!rawItem) continue;
-
-      console.log(
-        `Processing: ${rawItem.name}, Qty: ${qty}, Variant: ${variantId ? "Yes" : "No"}`,
-      );
-
-      if (variantId) {
-        // Find variant by ID
-        let variant = rawItem.variants.id(variantId);
-
-        if (variant) {
-          // Update existing variant
-          variant.quantity += qty;
-          console.log(
-            `Updated variant ${variant.combination?.join(", ")} to ${variant.quantity}`,
-          );
-        } else {
-          // Create new variant
-          rawItem.variants.push({
-            _id: variantId,
-            combination: variantCombination || [],
-            quantity: qty,
-            minStock: rawItem.minStock || 0,
-            maxStock: rawItem.maxStock || 0,
-            sku: poItem.variantSku || `${rawItem.sku}-var`,
-            status: "In Stock",
-          });
-          console.log(`Created new variant`);
-        }
-      } else {
-        // No variant - update base quantity
-        rawItem.quantity += qty;
-        console.log(`Updated base quantity to ${rawItem.quantity}`);
-      }
-
-      // Recalculate total quantity
-      const totalVariantQty = rawItem.variants.reduce(
-        (sum, v) => sum + (v.quantity || 0),
-        0,
-      );
-      rawItem.quantity = totalVariantQty;
-
-      // Add transaction
-      rawItem.stockTransactions.unshift({
-        type: variantId ? "VARIANT_ADD" : "ADD",
-        quantity: qty,
-        variantId: variantId,
-        variantCombination: variantCombination,
-        previousQuantity: rawItem.quantity - qty,
-        newQuantity: rawItem.quantity,
-        reason: "Purchase Order Delivery",
-        supplier: purchaseOrder.vendorName,
-        supplierId: purchaseOrder.vendor,
-        unitPrice: poItem.unitPrice,
-        purchaseOrder: purchaseOrder.poNumber,
-        purchaseOrderId: purchaseOrder._id,
-        invoiceNumber: invoiceNumber,
-        notes: `Received from PO: ${purchaseOrder.poNumber}`,
-        performedBy: req.user.id,
-      });
-
-      await rawItem.save();
-      totalReceivedQty += qty;
-    }
-
-    // Update PO totals
-    purchaseOrder.totalReceived += totalReceivedQty;
-    purchaseOrder.totalPending = purchaseOrder.items.reduce(
-      (sum, item) => sum + item.pendingQuantity,
-      0,
-    );
-
-    if (purchaseOrder.totalPending === 0) {
-      purchaseOrder.status = "COMPLETED";
-    } else if (purchaseOrder.totalReceived > 0) {
-      purchaseOrder.status = "PARTIALLY_RECEIVED";
-    }
-
-    // Add delivery record
-    purchaseOrder.deliveries.unshift({
-      deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
-      quantityReceived: totalReceivedQty,
-      invoiceNumber: invoiceNumber || "",
-      notes: notes || "",
-      receivedBy: req.user.id,
-    });
-
-    await purchaseOrder.save();
-
-    res.json({
-      success: true,
-      message: `Delivery received: ${totalReceivedQty} units added`,
-      totalReceived: totalReceivedQty,
-    });
-  } catch (error) {
-    console.error("Delivery error:", error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
 
 // ✅ RECORD PAYMENT for purchase order
 router.post("/:id/payment", async (req, res) => {
@@ -891,13 +834,13 @@ router.get("/raw-item/:itemId", async (req, res) => {
         status: po.status,
         itemDetails: item
           ? {
-              quantity: item.quantity,
-              receivedQuantity: item.receivedQuantity,
-              pendingQuantity: item.pendingQuantity,
-              unitPrice: item.unitPrice,
-              totalPrice: item.totalPrice,
-              status: item.status,
-            }
+            quantity: item.quantity,
+            receivedQuantity: item.receivedQuantity,
+            pendingQuantity: item.pendingQuantity,
+            unitPrice: item.unitPrice,
+            totalPrice: item.totalPrice,
+            status: item.status,
+          }
           : null,
       };
     });
@@ -980,304 +923,212 @@ router.patch("/:id/status", async (req, res) => {
 });
 
 // ✅ RECEIVE delivery against purchase order (COMPLETELY FIXED VERSION)
+// ✅ RECEIVE delivery — handles unit conversion + variant-correct stock updates
 router.post("/:id/receive", async (req, res) => {
   try {
     const { deliveryDate, items, invoiceNumber, notes } = req.body;
 
-    console.log("=== DELIVERY REQUEST ===");
-    console.log("Items received:", JSON.stringify(items, null, 2));
-
-    // Validation
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "At least one item is required",
-      });
+    if (!items?.length) {
+      return res.status(400).json({ success: false, message: "At least one item is required" });
     }
 
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id).populate(
-      "items.rawItem",
-      "name sku unit variants quantity status minStock maxStock",
-    );
+    const purchaseOrder = await PurchaseOrder.findById(req.params.id)
+      .populate("items.rawItem", "name sku unit customUnit variants quantity status minStock maxStock");
 
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "PO not found" });
+    if (purchaseOrder.status === "DRAFT")     return res.status(400).json({ success: false, message: "Cannot receive against a draft PO" });
+    if (purchaseOrder.status === "CANCELLED") return res.status(400).json({ success: false, message: "Cannot receive against a cancelled PO" });
 
-    // Check if PO is issued
-    if (purchaseOrder.status === "DRAFT") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot receive against a draft purchase order",
-      });
-    }
-
-    if (purchaseOrder.status === "CANCELLED") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot receive against a cancelled purchase order",
-      });
-    }
-
-    // Track updates
+    // ── Validate ───────────────────────────────────────────────────────────
     const updates = [];
-    let totalReceivedQty = 0;
-
-    // STEP 1: Validate all items first
-    for (const receivedItem of items) {
-      const poItem = purchaseOrder.items.find(
-        (item) => item._id.toString() === receivedItem.itemId,
-      );
-
+    for (const ri of items) {
+      const poItem = purchaseOrder.items.find(it => it._id.toString() === ri.itemId);
       if (!poItem) {
+        return res.status(400).json({ success: false, message: `Item not found in PO: ${ri.itemId}` });
+      }
+      const qty = parseFloat(ri.quantity) || 0;
+      if (qty <= 0) continue;
+
+      const pending = poItem.quantity - poItem.receivedQuantity;
+      if (qty > pending + 0.0001) {
         return res.status(400).json({
           success: false,
-          message: `Item not found in purchase order: ${receivedItem.itemId}`,
+          message: `Cannot receive ${qty} of ${poItem.itemName}. Only ${pending} pending.`,
         });
       }
 
-      const receivedQty = parseFloat(receivedItem.quantity) || 0;
-
-      if (receivedQty <= 0) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid quantity for item: ${poItem.itemName}`,
-        });
-      }
-
-      const availablePending = poItem.quantity - poItem.receivedQuantity;
-
-      if (receivedQty > availablePending) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot receive ${receivedQty} units of ${poItem.itemName}. Only ${availablePending} units pending.`,
-        });
-      }
-
-      // Store update info
       updates.push({
         poItem,
-        rawItemId: poItem.rawItem,
-        variantId: receivedItem.variantId || poItem.variantId,
-        variantCombination:
-          receivedItem.variantCombination || poItem.variantCombination,
-        quantity: receivedQty,
+        rawItemId: poItem.rawItem?._id || poItem.rawItem,
+        variantId: ri.variantId || poItem.variantId,
+        variantCombination: ri.variantCombination?.length
+          ? ri.variantCombination
+          : (poItem.variantCombination || []),
+        qtyInPoUnit: qty,
+        poUnit: poItem.unit,
         unitPrice: poItem.unitPrice,
       });
-
-      totalReceivedQty += receivedQty;
     }
 
-    // STEP 2: Process each update
-    const processedItems = [];
+    if (!updates.length) {
+      return res.status(400).json({ success: false, message: "No valid quantities to receive" });
+    }
 
-    for (const update of updates) {
-      const {
-        poItem,
-        rawItemId,
-        variantId,
-        variantCombination,
-        quantity,
-        unitPrice,
-      } = update;
+    // ── Process each line ──────────────────────────────────────────────────
+    let totalReceivedInPoUnits = 0;
+    const processed = [];
 
-      // Update PO item
-      poItem.receivedQuantity += quantity;
-      poItem.pendingQuantity = poItem.quantity - poItem.receivedQuantity;
+    for (const u of updates) {
+      const { poItem, rawItemId, variantId, variantCombination, qtyInPoUnit, poUnit, unitPrice } = u;
 
-      if (poItem.receivedQuantity >= poItem.quantity) {
-        poItem.status = "COMPLETED";
-      } else if (poItem.receivedQuantity > 0) {
-        poItem.status = "PARTIALLY_RECEIVED";
-      }
-
-      processedItems.push({
-        itemId: poItem._id,
-        itemName: poItem.itemName,
-        variantId: variantId,
-        variantCombination: variantCombination,
-        quantity: quantity,
-        pendingBefore: poItem.quantity - (poItem.receivedQuantity - quantity),
-        pendingAfter: poItem.pendingQuantity,
-      });
-
-      // Update RawItem
       const rawItem = await RawItem.findById(rawItemId);
       if (!rawItem) {
-        console.log(`RawItem not found: ${rawItemId}`);
+        console.warn(`RawItem not found: ${rawItemId}`);
         continue;
       }
 
-      console.log(`\nUpdating RawItem: ${rawItem.name}`);
-      console.log(`Variant ID: ${variantId}`);
-      console.log(`Quantity to add: ${quantity}`);
+      const registeredUnit = rawItem.customUnit || rawItem.unit;
+      const fromUnit = poUnit || registeredUnit;
 
+      // CONVERT to registered unit before touching stock
+      let qtyInRegisteredUnit = qtyInPoUnit;
+      if (fromUnit !== registeredUnit) {
+        qtyInRegisteredUnit = await convertQuantity(qtyInPoUnit, fromUnit, registeredUnit);
+      }
+
+      console.log(
+        `[Receive] ${rawItem.name} | ${qtyInPoUnit} ${fromUnit}` +
+        (fromUnit !== registeredUnit ? ` → ${qtyInRegisteredUnit} ${registeredUnit}` : "")
+      );
+
+      // Update PO item (kept in PO unit)
+      poItem.receivedQuantity += qtyInPoUnit;
+      poItem.pendingQuantity   = Math.max(0, poItem.quantity - poItem.receivedQuantity);
+      poItem.status =
+        poItem.receivedQuantity >= poItem.quantity ? "COMPLETED" :
+        poItem.receivedQuantity > 0                 ? "PARTIALLY_RECEIVED" : "PENDING";
+
+      const previousBaseQty = rawItem.quantity;
+
+      // Update variant stock (in registered unit)
       if (variantId) {
-        // Find or create variant
         let variant = null;
-        let variantIndex = -1;
+        let variantIdx = -1;
 
-        // Search for variant
         for (let i = 0; i < rawItem.variants.length; i++) {
           const v = rawItem.variants[i];
-          if (v._id && v._id.toString() === variantId.toString()) {
-            variant = v;
-            variantIndex = i;
-            break;
+          if (v._id?.toString() === variantId.toString()) {
+            variant = v; variantIdx = i; break;
+          }
+        }
+
+        if (!variant && variantCombination?.length) {
+          for (let i = 0; i < rawItem.variants.length; i++) {
+            const v = rawItem.variants[i];
+            if (v.combination?.length === variantCombination.length &&
+                v.combination.every((val, idx) => val === variantCombination[idx])) {
+              variant = v; variantIdx = i; break;
+            }
           }
         }
 
         if (variant) {
-          console.log(
-            `Found existing variant: ${variant.combination?.join(", ")}`,
-          );
-          console.log(`Previous variant quantity: ${variant.quantity}`);
-
-          // Update existing variant
-          variant.quantity += quantity;
-
-          // Update SKU if empty
-          if (!variant.sku) {
-            variant.sku = poItem.variantSku || `${rawItem.sku}-var`;
-          }
-
-          // Update status
-          if (variant.quantity === 0) {
-            variant.status = "Out of Stock";
-          } else if (
-            variant.quantity <= (variant.minStock || rawItem.minStock || 0)
-          ) {
-            variant.status = "Low Stock";
-          } else {
-            variant.status = "In Stock";
-          }
-
-          console.log(`Updated variant quantity: ${variant.quantity}`);
-
-          // Update the variant in the array
-          rawItem.variants[variantIndex] = variant;
+          variant.quantity = (variant.quantity || 0) + qtyInRegisteredUnit;
+          variant.status =
+            variant.quantity === 0 ? "Out of Stock" :
+            variant.quantity <= (variant.minStock || rawItem.minStock || 0) ? "Low Stock" : "In Stock";
+          if (!variant.sku) variant.sku = poItem.variantSku || `${rawItem.sku}-var`;
+          rawItem.variants[variantIdx] = variant;
         } else {
-          console.log(
-            `Creating new variant with combination: ${variantCombination?.join(", ")}`,
-          );
-
-          // Create new variant
-          const newVariant = {
+          rawItem.variants.push({
             combination: variantCombination || [],
-            quantity: quantity,
+            quantity: qtyInRegisteredUnit,
             minStock: rawItem.minStock || 0,
             maxStock: rawItem.maxStock || 0,
             sku: poItem.variantSku || `${rawItem.sku}-var-${Date.now()}`,
             status: "In Stock",
-          };
-
-          rawItem.variants.push(newVariant);
-          console.log(`Created new variant with quantity: ${quantity}`);
+          });
         }
+
+        // Recompute total from variants
+        rawItem.quantity = rawItem.variants.reduce((s, v) => s + (v.quantity || 0), 0);
       } else {
-        // No variant - update base quantity
-        console.log(
-          `No variant, updating base quantity: ${rawItem.quantity} -> ${rawItem.quantity + quantity}`,
-        );
-        rawItem.quantity += quantity;
+        rawItem.quantity = (rawItem.quantity || 0) + qtyInRegisteredUnit;
       }
 
-      // Calculate total from all variants
-      const totalFromVariants = rawItem.variants.reduce(
-        (sum, v) => sum + (v.quantity || 0),
-        0,
-      );
-      console.log(`Total from variants: ${totalFromVariants}`);
+      // Raw-item overall status
+      rawItem.status =
+        rawItem.quantity === 0 ? "Out of Stock" :
+        rawItem.quantity <= (rawItem.minStock || 0) ? "Low Stock" : "In Stock";
 
-      // If we have variants, use their total; otherwise keep the base quantity
-      if (rawItem.variants.length > 0) {
-        rawItem.quantity = totalFromVariants;
-      }
+      // Transaction record (records both PO-unit + registered-unit values)
+      const conversionNote = fromUnit !== registeredUnit
+        ? ` (received ${qtyInPoUnit} ${fromUnit} = ${qtyInRegisteredUnit.toFixed(4)} ${registeredUnit})`
+        : "";
 
-      console.log(`Final rawItem quantity: ${rawItem.quantity}`);
-
-      // Update raw item status
-      if (rawItem.quantity === 0) {
-        rawItem.status = "Out of Stock";
-      } else if (rawItem.quantity <= (rawItem.minStock || 0)) {
-        rawItem.status = "Low Stock";
-      } else {
-        rawItem.status = "In Stock";
-      }
-
-      // Add stock transaction
-      const transaction = {
+      rawItem.stockTransactions.unshift({
         type: variantId ? "VARIANT_ADD" : "ADD",
-        quantity: quantity,
-        variantId: variantId,
-        variantCombination: variantCombination,
-        previousQuantity: rawItem.quantity - quantity,
+        quantity: qtyInRegisteredUnit,
+        variantId,
+        variantCombination,
+        previousQuantity: previousBaseQty,
         newQuantity: rawItem.quantity,
         reason: "Purchase Order Delivery",
         supplier: purchaseOrder.vendorName,
         supplierId: purchaseOrder.vendor,
-        unitPrice: unitPrice,
+        unitPrice,
         purchaseOrder: purchaseOrder.poNumber,
         purchaseOrderId: purchaseOrder._id,
-        invoiceNumber: invoiceNumber,
-        notes: `Received from PO: ${purchaseOrder.poNumber}`,
+        invoiceNumber,
+        notes: `Received from PO: ${purchaseOrder.poNumber}${conversionNote}`,
         performedBy: req.user.id,
-      };
+      });
 
-      rawItem.stockTransactions.unshift(transaction);
       await rawItem.save();
-      console.log(`Saved RawItem: ${rawItem.name}`);
+
+      processed.push({
+        itemName: poItem.itemName,
+        variant: variantCombination?.join(" • ") || null,
+        qtyInPoUnit, poUnit: fromUnit,
+        qtyInRegisteredUnit, registeredUnit,
+        converted: fromUnit !== registeredUnit,
+      });
+
+      totalReceivedInPoUnits += qtyInPoUnit;
     }
 
-    // STEP 3: Update purchase order
-    const delivery = {
+    // ── PO totals + delivery record ────────────────────────────────────────
+    purchaseOrder.deliveries.unshift({
       deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
-      quantityReceived: totalReceivedQty,
+      quantityReceived: totalReceivedInPoUnits,
       invoiceNumber: invoiceNumber || "",
       notes: notes || "",
       receivedBy: req.user.id,
-    };
+    });
 
-    purchaseOrder.deliveries.unshift(delivery);
-    purchaseOrder.totalReceived += totalReceivedQty;
-    purchaseOrder.totalPending = purchaseOrder.items.reduce(
-      (sum, item) => sum + item.pendingQuantity,
-      0,
-    );
+    purchaseOrder.totalReceived += totalReceivedInPoUnits;
+    purchaseOrder.totalPending = purchaseOrder.items.reduce((s, it) => s + (it.pendingQuantity || 0), 0);
 
-    // Update overall PO status
-    if (purchaseOrder.totalPending === 0) {
-      purchaseOrder.status = "COMPLETED";
-    } else if (purchaseOrder.totalReceived > 0) {
-      purchaseOrder.status = "PARTIALLY_RECEIVED";
-    }
+    purchaseOrder.status =
+      purchaseOrder.totalPending === 0 ? "COMPLETED" :
+      purchaseOrder.totalReceived > 0  ? "PARTIALLY_RECEIVED" : purchaseOrder.status;
 
     await purchaseOrder.save();
 
-    // Populate and return
     const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
       .populate("vendor", "companyName contactPerson")
-      .populate("items.rawItem", "name sku unit")
+      .populate("items.rawItem", "name sku unit customUnit")
       .populate("deliveries.receivedBy", "name email");
-
-    console.log("=== DELIVERY COMPLETED SUCCESSFULLY ===");
 
     res.json({
       success: true,
-      message: `Delivery received successfully. ${totalReceivedQty} units added to inventory.`,
+      message: `Delivery received. ${totalReceivedInPoUnits} unit(s) recorded.`,
       purchaseOrder: populatedPO,
-      delivery,
-      processedItems,
+      processed,
     });
-  } catch (error) {
-    console.error("Error receiving delivery:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while receiving delivery",
-    });
+  } catch (err) {
+    console.error("Error receiving delivery:", err);
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
