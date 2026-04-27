@@ -3,80 +3,26 @@
 const mongoose = require("mongoose");
 
 const purchaseOrderItemSchema = new mongoose.Schema({
-    rawItem: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "RawItem",
-        required: [true, "Raw item is required"]
-    },
-    itemName: {
-        type: String,
-        trim: true,
-        required: [true, "Item name is required"]
-    },
-    sku: {
-        type: String,
-        trim: true,
-        default: ""
-    },
-    unit: {
-        type: String,
-        trim: true,
-        default: "unit"
-    },
-    quantity: {
-        type: Number,
-        min: [0, "Quantity cannot be negative"],
-        required: [true, "Quantity is required"]
-    },
-    unitPrice: {
-        type: Number,
-        min: [0, "Unit price cannot be negative"],
-        required: [true, "Unit price is required"]
-    },
-    totalPrice: {
-        type: Number,
-        min: [0, "Total price cannot be negative"],
-        default: 0
-    },
-    receivedQuantity: {
-        type: Number,
-        min: [0, "Received quantity cannot be negative"],
-        default: 0
-    },
-    pendingQuantity: {
-        type: Number,
-        min: [0, "Pending quantity cannot be negative"],
-        default: 0
-    },
+    rawItem:    { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+    itemName:   { type: String, trim: true, required: true },
+    sku:        { type: String, trim: true, default: "" },
+    unit:       { type: String, trim: true, default: "unit" },     // PO line unit
+    baseUnit:   { type: String, trim: true, default: "" },         // ← NEW: raw-item registered unit at PO time
+    quantity:   { type: Number, min: 0, required: true },
+    unitPrice:  { type: Number, min: 0, required: true },
+    totalPrice: { type: Number, min: 0, default: 0 },
+    receivedQuantity: { type: Number, min: 0, default: 0 },        // (only one — remove the duplicate)
+    pendingQuantity:  { type: Number, min: 0, default: 0 },
     status: {
         type: String,
         enum: ["PENDING", "PARTIALLY_RECEIVED", "COMPLETED", "CANCELLED"],
         default: "PENDING"
     },
-
-    variantId: {
-        type: mongoose.Schema.Types.ObjectId
-    },
-   
-    receivedQuantity: {
-        type: Number,
-        min: [0, "Received quantity cannot be negative"],
-        default: 0
-    },
-    variantCombination: [{
-        type: String,
-        trim: true
-    }],
-    variantName: {
-        type: String,
-        trim: true,
-        default: ""
-    },
-    variantSku: {
-        type: String,
-        trim: true,
-        default: ""
-    }
+    variantId:           { type: mongoose.Schema.Types.ObjectId },
+    variantCombination:  [{ type: String, trim: true }],
+    variantName:         { type: String, trim: true, default: "" },
+    variantSku:          { type: String, trim: true, default: "" },
+    vendorNickname: { type: String, trim: true, default: "" }
 }, { _id: true });
 
 const deliverySchema = new mongoose.Schema({

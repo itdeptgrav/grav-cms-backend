@@ -119,36 +119,39 @@ const employeeSchema = new mongoose.Schema({
   workCustomFields: { type: [customFieldSchema], default: [] },
 
   // ─── SALARY INFORMATION ──────────────────────────────────────────────────────
+  //  All monetary fields are stored as AES-256-GCM encrypted strings.
+  //  Schema type is Mixed so Mongoose accepts either the legacy Number
+  //  (old records before encryption was added) or the new encrypted String.
+  //  Use salaryEncryption.decryptEmployeeDoc() to get plain numbers back.
   salary: {
     // ── HR Input ──────────────────────────────────────────────────────────────
-    gross: { type: Number, min: 0, default: 0 }, // Monthly gross salary
+    gross: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── Earnings (auto) ───────────────────────────────────────────────────────
-    basic: { type: Number, default: 0 }, // basicPct % of gross
-    hra: { type: Number, default: 0 }, // hraPct % of gross
-    specialAllowance: { type: Number, default: 0 }, // gross − basic − hra
+    basic: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    hra: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    specialAllowance: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── PF (auto) ─────────────────────────────────────────────────────────────
-    epf: { type: Number, default: 0 }, // EPF: 12% of Basic, capped ₹1,800/mo
-    // EDLI & Admin — HR-editable; override flags prevent auto-recalculation
-    edli: { type: Number, default: 0 },
-    edliOverride: { type: Boolean, default: false },
-    adminCharges: { type: Number, default: 0 },
-    adminOverride: { type: Boolean, default: false },
+    epf: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    edli: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    edliOverride: { type: Boolean, default: false },  // kept as boolean
+    adminCharges: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    adminOverride: { type: Boolean, default: false },  // kept as boolean
 
-    // ── ESI on Basic (if basic ≤ esiWageLimit) ───────────────────────────────
-    eeesic: { type: Number, default: 0 }, // eeEsicPct% of basic
-    erEsic: { type: Number, default: 0 }, // erEsicPct% of basic
-    foodAllowance: { type: Number, default: 1600 }, // Fixed food allowance (from config)
+    // ── ESI on Basic ─────────────────────────────────────────────────────────
+    eeesic: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    erEsic: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    foodAllowance: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── Totals (auto) ─────────────────────────────────────────────────────────
-    employerCost: { type: Number, default: 0 }, // gross + EPF + ESIC(ER) + foodAllowance = CTC
-    totalDeduction: { type: Number, default: 0 }, // epf + eeesic
-    netSalary: { type: Number, default: 0 }, // gross − totalDeduction
+    employerCost: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    totalDeduction: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    netSalary: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── Legacy ────────────────────────────────────────────────────────────────
-    allowances: { type: Number, default: 0 },
-    deductions: { type: Number, default: 0 },
+    allowances: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    deductions: { type: mongoose.Schema.Types.Mixed, default: 0 },
   },
 
   // Bank Details
@@ -246,13 +249,17 @@ employeeSchema.pre("save", async function (next) {
   if (!this.salary) { this.updatedAt = Date.now(); return next(); }
   try {
     const SalaryConfig = require("./Salaryconfig");
+    const { decryptSalaryFields, encryptSalaryFields } = require("../utils/salaryEncryption");
+
     const cfg = await SalaryConfig.getSingleton();
-    const s = this.salary;
+
+    // ── 1. Decrypt first so all arithmetic works on plain numbers ────────────
+    const s = decryptSalaryFields(this.salary);
 
     const basicPct = (cfg.basicPct ?? 50) / 100;
     const hraPct = (cfg.hraPct ?? 50) / 100;
     const eepfPct = (cfg.eepfPct ?? 12) / 100;
-    const epfCapAmount = cfg.epfCapAmount ?? 1800;   // rupee cap = 12% of PF wage ceiling 15000
+    const epfCapAmount = cfg.epfCapAmount ?? 1800;
     const edliPct = (cfg.edliPct ?? 0.5) / 100;
     const edliCapAmount = cfg.edliCapAmount ?? 15000;
     const adminPct = (cfg.adminChargesPct ?? 0.5) / 100;
@@ -264,37 +271,37 @@ employeeSchema.pre("save", async function (next) {
     const basic = Math.round(gross * basicPct);
     const hra = Math.round(gross * hraPct);
 
-    // EPF: ROUND(MIN(basic * eepfPct, epfCapAmount)) -- rupee cap of 1800/mo
     const epf = Math.round(Math.min(basic * eepfPct, epfCapAmount));
-
-    // EDLI & Admin -- respect HR override, else auto-calculate
     const edli = s.edliOverride ? (s.edli || 0) : Math.round(Math.min(basic * edliPct, edliCapAmount));
     const adminCharges = s.adminOverride ? (s.adminCharges || 0) : Math.round(basic * adminPct);
 
-    // ESI -- calculated on Basic, applies when Basic <= esiWageLimit
     const esiApplicable = basic <= esiWageLimit;
     const eeesic = esiApplicable ? Math.ceil(basic * eeEsicPct) : 0;
     const erEsic = esiApplicable ? Math.ceil(basic * erEsicPct) : 0;
 
-    // CTC = Gross + EPF + ESIC(ER) + Food Allowance
     const foodAllowance = cfg.foodAllowance ?? 1600;
     const employerCost = gross + epf + erEsic + foodAllowance;
-
-    // Employee deductions -- only statutory (EPF + ESIC)
     const totalDeduction = epf + eeesic;
     const netSalary = Math.max(gross - totalDeduction, 0);
 
-    s.basic = basic; s.hra = hra;
-    s.epf = epf;
-    s.edli = edli; s.adminCharges = adminCharges;
-    s.eeesic = eeesic; s.erEsic = erEsic;
-    s.foodAllowance = foodAllowance;
-    s.employerCost = employerCost;
-    s.totalDeduction = totalDeduction;
-    s.netSalary = netSalary;
-    s.allowances = hra;
-    s.deductions = totalDeduction;
+    // ── 2. Build the plain calculated object ─────────────────────────────────
+    const calculated = {
+      gross, basic, hra,
+      epf, edli, adminCharges,
+      edliOverride: this.salary.edliOverride || false,
+      adminOverride: this.salary.adminOverride || false,
+      eeesic, erEsic, foodAllowance,
+      employerCost, totalDeduction, netSalary,
+      allowances: hra, deductions: totalDeduction,
+    };
 
+    // ── 3. Encrypt all monetary fields before persisting ─────────────────────
+    const encrypted = encryptSalaryFields(calculated);
+    // Preserve boolean override flags (not encrypted)
+    encrypted.edliOverride = calculated.edliOverride;
+    encrypted.adminOverride = calculated.adminOverride;
+
+    this.salary = encrypted;
     this.updatedAt = Date.now();
     next();
   } catch (err) { next(err); }

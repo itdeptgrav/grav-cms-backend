@@ -124,6 +124,25 @@ const stockTransactionSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
+// ── NEW: Vendor-specific nickname for this raw item ──
+const vendorNicknameSchema = new mongoose.Schema({
+  vendor: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Vendor",
+    required: true
+  },
+  nickname: {
+    type: String,
+    trim: true,
+    required: true
+  },
+  notes: {
+    type: String,
+    trim: true,
+    default: ""
+  }
+}, { timestamps: true, _id: true });
+
 const rawItemSchema = new mongoose.Schema({
   // Basic Information
   name: {
@@ -145,7 +164,7 @@ const rawItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  
+
   // Measurement
   unit: {
     type: String,
@@ -156,11 +175,14 @@ const rawItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  
+
   // Attributes & Variants
   attributes: [attributeSchema],
   variants: [variantSchema],
-  
+
+  // ── NEW: Per-vendor nicknames for the same raw item ──
+  vendorNicknames: [vendorNicknameSchema],
+
   // Stock Information (total quantity - sum of all variants)
   quantity: {
     type: Number,
@@ -178,20 +200,20 @@ const rawItemSchema = new mongoose.Schema({
     required: true,
     min: 0
   },
-  
+
   // Bulk Discounts
   discounts: [discountSchema],
-  
+
   // Stock Transactions History
   stockTransactions: [stockTransactionSchema],
-  
+
   // Status
   status: {
     type: String,
     enum: ["In Stock", "Low Stock", "Out of Stock"],
     default: "In Stock"
   },
-  
+
   // Additional Info
   description: {
     type: String,
@@ -201,7 +223,7 @@ const rawItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  
+
   // Vendor associations
   primaryVendor: {
     type: mongoose.Schema.Types.ObjectId,
@@ -211,7 +233,7 @@ const rawItemSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: "Vendor"
   }],
-  
+
   // Audit Fields
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,

@@ -6,7 +6,7 @@ const dispatchRecordSchema = new mongoose.Schema(
   {
     dispatchedAt: { type: Date, default: Date.now },
     dispatchedBy: { type: String }, // employee name / id who created dispatch
-    notes:        { type: String, trim: true },
+    notes: { type: String, trim: true },
   },
   { _id: true }
 );
@@ -29,27 +29,41 @@ const employeeProductionProgressSchema = new mongoose.Schema(
     },
 
     // ── Employee (denormalised for fast reads) ────────────────────────────
-    employeeId:   { type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" },
+    employeeId: { type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" },
     employeeName: { type: String },
-    employeeUIN:  { type: String },
-    gender:       { type: String },
+    employeeUIN: { type: String },
+    gender: { type: String },
 
     // ── Unit assignment ───────────────────────────────────────────────────
-    unitStart:  { type: Number },
-    unitEnd:    { type: Number },
+    unitStart: { type: Number },
+    unitEnd: { type: Number },
     totalUnits: { type: Number },
 
     // ── Progress (updated by cron) ────────────────────────────────────────
-    completedUnits:       { type: Number, default: 0 },
+    completedUnits: { type: Number, default: 0 },
     completedUnitNumbers: [{ type: Number }],
     completionPercentage: { type: Number, default: 0, min: 0, max: 100 },
 
     lastSyncedAt: { type: Date, default: null },
 
+
+    packagedUnits: { type: Number, default: 0 },
+    isFullyPackaged: { type: Boolean, default: false },
+    lastPackagedAt: { type: Date, default: null },
+    packagingHistory: [
+      {
+        packagedQuantity: { type: Number, required: true, min: 1 },
+        packagedAt: { type: Date, default: Date.now },
+        packagedBy: { type: String, default: "" },
+        notes: { type: String, trim: true, default: "" },
+        unitNumbers: [{ type: Number }], // ← ADD
+      },
+    ],
+
     // ── Dispatch tracking ─────────────────────────────────────────────────
     // dispatched = true means all units for this employee have been dispatched
-    isDispatched:    { type: Boolean, default: false },
-    dispatchNotes:   { type: String, trim: true, default: null },
+    isDispatched: { type: Boolean, default: false },
+    dispatchNotes: { type: String, trim: true, default: null },
     dispatchHistory: [dispatchRecordSchema], // full audit trail — latest entry holds current dispatchedAt / dispatchedBy
   },
   { timestamps: true }

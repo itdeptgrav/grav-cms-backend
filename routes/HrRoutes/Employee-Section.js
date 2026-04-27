@@ -5,11 +5,22 @@ const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const emailService = require("../../services/emailService");
+const {
+  encryptSalaryFields,
+  decryptSalaryFields,
+  decryptEmployeeDoc,
+  decryptEmployeeDocs,
+} = require("../../utils/salaryEncryption");
 
 require("dotenv").config();
 
 // ─── SALARY CALCULATION HELPER ───────────────────────────────────────────────
+// Always operates on plain numbers. Caller must decrypt before passing in,
+// and encrypt the result before saving to MongoDB.
 function recalculateSalary(salary = {}, cfg = {}) {
+  // Decrypt in case caller passed an encrypted object (belt-and-suspenders)
+  const s = decryptSalaryFields(salary);
+
   const basicPct = (cfg.basicPct ?? 50) / 100;
   const hraPct = (cfg.hraPct ?? 50) / 100;
   const eepfPct = (cfg.eepfPct ?? 12) / 100;
@@ -22,7 +33,7 @@ function recalculateSalary(salary = {}, cfg = {}) {
   const erEsicPct = (cfg.erEsicPct ?? 3.25) / 100;
   const foodAllowance = cfg.foodAllowance ?? 1600;
 
-  const gross = salary.gross || 0;
+  const gross = s.gross || 0;
   const basic = Math.round(gross * basicPct);
   const hra = Math.round(gross * hraPct);
 
@@ -30,11 +41,11 @@ function recalculateSalary(salary = {}, cfg = {}) {
   const epf = Math.round(Math.min(basic * eepfPct, epfCapAmount));
 
   // EDLI & Admin — respect HR override
-  const edli = salary.edliOverride
-    ? (salary.edli || 0)
+  const edli = s.edliOverride
+    ? (s.edli || 0)
     : Math.round(Math.min(basic * edliPct, edliCapAmount));
-  const adminCharges = salary.adminOverride
-    ? (salary.adminCharges || 0)
+  const adminCharges = s.adminOverride
+    ? (s.adminCharges || 0)
     : Math.round(basic * adminPct);
 
   // ESI — calculated on Basic, applies when Basic <= esiWageLimit
@@ -49,11 +60,12 @@ function recalculateSalary(salary = {}, cfg = {}) {
   const totalDeduction = epf + eeesic;
   const netSalary = Math.max(gross - totalDeduction, 0);
 
+  // Returns plain numbers — caller encrypts before saving
   return {
     gross, basic, hra,
     epf, edli, adminCharges,
-    edliOverride: salary.edliOverride || false,
-    adminOverride: salary.adminOverride || false,
+    edliOverride: s.edliOverride || false,
+    adminOverride: s.adminOverride || false,
     eeesic, erEsic, foodAllowance, employerCost,
     totalDeduction, netSalary,
     allowances: hra, deductions: totalDeduction,
@@ -196,6 +208,9 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     delete resp.temporaryPassword;
     delete resp.__v;
 
+    // Decrypt salary in the response so the client gets plain numbers back
+    if (resp.salary) resp.salary = decryptSalaryFields(resp.salary);
+
     res.status(201).json({ success: true, message: "Employee created successfully", data: resp });
   } catch (error) {
     console.error("Create employee error:", error);
@@ -254,10 +269,15 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       delete updateData.secondaryManager;
     }
 
-    // Recalculate all salary fields from gross using current config rates
+    // Recalculate all salary fields from gross using current config rates,
+    // then encrypt the result before it goes into MongoDB
     if (updateData.salary) {
       const cfg = await SalaryConfig.getSingleton();
-      updateData.salary = recalculateSalary(updateData.salary, cfg.toObject());
+      const calculated = recalculateSalary(updateData.salary, cfg.toObject());
+      updateData.salary = encryptSalaryFields(calculated);
+      // Boolean override flags are not encrypted
+      updateData.salary.edliOverride = calculated.edliOverride;
+      updateData.salary.adminOverride = calculated.adminOverride;
     }
 
     const updated = await Employee.findByIdAndUpdate(id, updateData, {
@@ -266,7 +286,9 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     if (!updated) return res.status(404).json({ success: false, message: "Employee not found" });
 
-    res.status(200).json({ success: true, message: "Employee updated successfully", data: updated });
+    // Decrypt salary before sending to client
+    const decryptedDoc = decryptEmployeeDoc(updated);
+    res.status(200).json({ success: true, message: "Employee updated successfully", data: decryptedDoc });
   } catch (error) {
     console.error("Update employee error:", error);
     if (error.code === 11000) return res.status(400).json({ success: false, message: "Duplicate value error" });
@@ -347,7 +369,12 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
     const { page = 1, limit = 10, department, status, search } = req.query;
 
     let filter = {};
-    if (department && department !== "all") filter.department = department;
+
+    // FIX: Case-insensitive department match — employee records may store "PRODUCTION"
+    // while the departments API returns "Production". Regex handles any casing.
+    if (department && department !== "all")
+      filter.department = { $regex: new RegExp(`^${department.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") };
+
     if (status && status !== "all") filter.status = status;
     if (search) {
       filter.$or = [
@@ -372,7 +399,10 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
         .select("-password -temporaryPassword -__v")
         .lean(),
       Employee.countDocuments(filter),
+      // FIX: deptStats must respect the active/inactive tab — add $match on status only
+      // (intentionally excludes department + search so the strip always shows all depts)
       Employee.aggregate([
+        ...(status && status !== "all" ? [{ $match: { status } }] : []),
         { $group: { _id: "$department", count: { $sum: 1 } } },
         { $sort: { count: -1 } },
       ]),
@@ -380,10 +410,14 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
 
     const totalPages = Math.ceil(total / parseInt(limit));
 
+    // Decrypt salary fields in each employee doc before sending to client.
+    // List views only show minimal salary info (gross/net) so this is fast.
+    const decryptedEmployees = decryptEmployeeDocs(employees);
+
     res.status(200).json({
       success: true,
       data: {
-        employees,
+        employees: decryptedEmployees,
         pagination: {
           currentPage: parseInt(page),
           totalPages,
@@ -407,7 +441,9 @@ router.get("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       .select("-password -temporaryPassword -__v")
       .lean();
     if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
-    res.status(200).json({ success: true, data: employee });
+    // Decrypt salary fields before sending to client
+    const decrypted = decryptEmployeeDoc(employee);
+    res.status(200).json({ success: true, data: decrypted });
   } catch (error) {
     console.error("Get employee error:", error);
     if (error.name === "CastError") return res.status(400).json({ success: false, message: "Invalid employee ID" });
@@ -429,6 +465,9 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
       .lean();
 
     if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
+
+    // Decrypt salary before building the response object
+    const sal = decryptSalaryFields(employee.salary || {});
 
     const [teamMembers, managerHierarchy, recentActivities] = await Promise.all([
       Employee.find({
@@ -526,10 +565,9 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
           : null,
       },
       salaryInfo: {
-        gross: employee.salary?.gross ? `₹${employee.salary.gross.toLocaleString("en-IN")}` : "Not Provided",
-        // Legacy fields
-        basic: employee.salary?.basic ? `₹${employee.salary.basic.toLocaleString("en-IN")}` : null,
-        netSalary: employee.salary?.netSalary ? `₹${employee.salary.netSalary.toLocaleString("en-IN")}` : null,
+        gross: sal.gross ? `₹${sal.gross.toLocaleString("en-IN")}` : "Not Provided",
+        basic: sal.basic ? `₹${sal.basic.toLocaleString("en-IN")}` : null,
+        netSalary: sal.netSalary ? `₹${sal.netSalary.toLocaleString("en-IN")}` : null,
         customFields: employee.salaryCustomFields || [],
       },
       bankDetails: {
@@ -639,6 +677,7 @@ router.get("/department/employees", EmployeeAuthMiddlewear, async (req, res) => 
 });
 
 // ─── SOFT DELETE ──────────────────────────────────────────────────────────────
+// ─── SOFT DELETE ──────────────────────────────────────────────────────────────
 router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
@@ -646,18 +685,96 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       return res.status(403).json({ success: false, message: "Only HR managers can delete employees" });
     }
 
-    const employee = await Employee.findById(req.params.id);
-    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
+    // BEFORE (broken): loads full doc then calls .save() → triggers full validation
+    // → fails on stale enum values like gender:"Male" stored before schema tightening
+    //
+    // const employee = await Employee.findById(req.params.id);
+    // employee.isActive = false;
+    // employee.status = "inactive";
+    // await employee.save();
 
-    employee.isActive = false;
-    employee.status = "inactive";
-    await employee.save();
+    // AFTER: direct update, runValidators:false — only touches these two fields
+    const employee = await Employee.findByIdAndUpdate(
+      req.params.id,
+      { $set: { isActive: false, status: "inactive" } },
+      { new: true, runValidators: false }
+    );
+
+    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
 
     res.status(200).json({ success: true, message: "Employee deactivated successfully" });
   } catch (error) {
     console.error("Delete employee error:", error);
     if (error.name === "CastError") return res.status(400).json({ success: false, message: "Invalid employee ID" });
     res.status(500).json({ success: false, message: "Error deleting employee" });
+  }
+});
+
+router.get("/team-structure", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    // Fetch all active employees with only the fields we need
+    const employees = await Employee.find({ isActive: true })
+      .select("firstName lastName department designation biometricId profilePhoto primaryManager secondaryManager")
+      .lean();
+
+    // Build a map: leaderId → { leaderDoc, primaryReports, secondaryReports }
+    const leaderMap = {};
+
+    for (const emp of employees) {
+      const pid = emp.primaryManager?.managerId ? String(emp.primaryManager.managerId) : null;
+      const sid = emp.secondaryManager?.managerId ? String(emp.secondaryManager.managerId) : null;
+
+      if (pid) {
+        if (!leaderMap[pid]) leaderMap[pid] = { primary: [], secondary: [] };
+        leaderMap[pid].primary.push({
+          _id: emp._id, firstName: emp.firstName, lastName: emp.lastName,
+          department: emp.department, designation: emp.designation,
+          biometricId: emp.biometricId, profilePhoto: emp.profilePhoto,
+        });
+      }
+      if (sid) {
+        if (!leaderMap[sid]) leaderMap[sid] = { primary: [], secondary: [] };
+        leaderMap[sid].secondary.push({
+          _id: emp._id, firstName: emp.firstName, lastName: emp.lastName,
+          department: emp.department, designation: emp.designation,
+          biometricId: emp.biometricId, profilePhoto: emp.profilePhoto,
+        });
+      }
+    }
+
+    // Enrich with leader data
+    const leaderIds = Object.keys(leaderMap);
+    if (!leaderIds.length) return res.json({ success: true, data: [] });
+
+    const leaders = await Employee.find({ _id: { $in: leaderIds }, isActive: true })
+      .select("firstName lastName department designation biometricId profilePhoto")
+      .lean();
+
+    const result = leaders.map(l => ({
+      _id: l._id,
+      firstName: l.firstName,
+      lastName: l.lastName,
+      department: l.department,
+      designation: l.designation,
+      biometricId: l.biometricId,
+      profilePhoto: l.profilePhoto,
+      primaryReports: leaderMap[String(l._id)]?.primary || [],
+      secondaryReports: leaderMap[String(l._id)]?.secondary || [],
+      totalReports: (leaderMap[String(l._id)]?.primary.length || 0) +
+        (leaderMap[String(l._id)]?.secondary.length || 0),
+    }));
+
+    // Sort by department, then by name
+    result.sort((a, b) => {
+      const dept = (a.department || "").localeCompare(b.department || "");
+      if (dept !== 0) return dept;
+      return `${a.firstName} ${a.lastName}`.localeCompare(`${b.firstName} ${b.lastName}`);
+    });
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    console.error("[TEAM-STRUCTURE]", err.message);
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 

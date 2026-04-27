@@ -1,9 +1,9 @@
 "use strict";
 const express = require("express");
 const axios = require("axios");
+const cron = require("node-cron");
 const router = express.Router();
 const ExcelJS = require("exceljs");
-
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
 const Employee = require("../../models/Employee");
@@ -67,10 +67,21 @@ const dateStrOf = (d) => {
     const ist = new Date(d.getTime() + 330 * 60 * 1000);
     return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, "0")}-${String(ist.getUTCDate()).padStart(2, "0")}`;
 };
+
+// ── IST-aware time parser for manual punch edits ──────────────────────────
+const parseTimeOnDateIST = (timeStr, dateStr) => {
+    if (!timeStr) return null;
+    const [h, m] = String(timeStr).split(":").map(Number);
+    const [y, mo, d] = dateStr.split("-").map(Number);
+    // User enters IST time (e.g., "17:30 IST")
+    // Create UTC timestamp then subtract IST offset (5.5 hours)
+    const utcMs = Date.UTC(y, mo - 1, d, h, m, 0) - (5.5 * 60 * 60 * 1000);
+    return new Date(utcMs);
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  HELPERS (strings / times)
 // ═══════════════════════════════════════════════════════════════════════════
-
 const toTitleCase = (s) => String(s || "").toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
 const numericOf = (s) => { const d = String(s || "").replace(/\D/g, ""); return d ? parseInt(d, 10) : null; };
 
@@ -1295,6 +1306,39 @@ async function syncDayForce(dateStr, empCode = "ALL") {
 //  layer can re-examine this but for display this is correct.
 // ═══════════════════════════════════════════════════════════════════════════
 
+async function syncTodayOnly() {
+    const today = dateStrOf(new Date());
+    console.log(`[HOURLY-SYNC] Starting sync for ${today}`);
+    try {
+        const result = await syncDay(today, "ALL");
+        console.log(`[HOURLY-SYNC] Completed: ${result.employees} employees synced`);
+        return result;
+    } catch (err) {
+        console.error(`[HOURLY-SYNC] Failed for ${today}:`, err.message);
+        return null;
+    }
+}
+
+function startHourlyAttendanceSync() {
+    // Run every hour at minute 5 (e.g., 9:05, 10:05, 11:05...)
+    // This gives the device a few minutes to record punches after the hour
+    cron.schedule("5 * * * *", async () => {
+        console.log(`[HOURLY-SYNC-CRON] Triggered at ${new Date().toISOString()}`);
+        await syncTodayOnly();
+    }, {
+        timezone: "Asia/Kolkata",
+        scheduled: true,
+    });
+
+    console.log("[HOURLY-SYNC] ✅ Hourly attendance sync cron scheduled (runs at :05 past every hour IST)");
+
+    // Also run once immediately on server start to ensure today's data is fresh
+    setTimeout(() => {
+        syncTodayOnly().catch(e => console.error("[HOURLY-SYNC] Initial sync failed:", e.message));
+    }, 5000);
+}
+
+
 const LEAVE_TYPE_TO_STATUS = {
     CL: "L-CL",
     SL: "L-SL",
@@ -2273,11 +2317,55 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
         }
 
         const bid = biometricId.toUpperCase();
-        const dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
-        if (!dayDoc) return res.status(404).json({ success: false, message: `No record for ${biometricId} on ${dateStr}` });
+
+        // ── Upsert: find or create the DailyAttendance doc and employee entry ──
+        let dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
+
+        if (!dayDoc) {
+            const existingDay = await DailyAttendance.findOne({ dateStr });
+            const empRecord = await Employee.findOne({
+                $or: [{ biometricId: bid }, { "basicInfo.biometricId": bid }, { "workInfo.biometricId": bid }],
+            }).lean();
+            const settings2 = await AttendanceSettings.getConfig();
+            const empType2 = resolveEmployeeType(empRecord, settings2);
+            const shift2 = settings2.shifts?.[empType2] || settings2.shifts?.executive || { start: "09:30", end: "18:30" };
+            const newEntry = {
+                biometricId: bid,
+                employeeDbId: empRecord?._id || null,
+                identityId: extractIdentity(empRecord) || "",
+                employeeName: extractName(empRecord, bid),
+                department: extractDepartment(empRecord),
+                designation: extractDesignation(empRecord),
+                employeeType: empType2,
+                shiftStart: shift2.start || "09:30",
+                shiftEnd: shift2.end || "18:30",
+                systemPrediction: "AB",
+                hrFinalStatus: null,
+                rawPunches: [],
+                punchCount: 0,
+                netWorkMins: 0, totalBreakMins: 0, totalSpanMins: 0,
+                otMins: 0, lateMins: 0, lateDisplay: "",
+                isLate: false, isEarlyDeparture: false, hasOT: false, hasMissPunch: false,
+                attendanceValue: 0,
+            };
+            if (existingDay) {
+                existingDay.employees.push(newEntry);
+                await existingDay.save();
+                dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
+            } else {
+                const [y2, m2, d2] = dateStr.split("-").map(Number);
+                await DailyAttendance.create({
+                    dateStr,
+                    date: new Date(Date.UTC(y2, m2 - 1, d2)),
+                    yearMonth: dateStr.slice(0, 7),
+                    employees: [newEntry],
+                });
+                dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
+            }
+        }
 
         const empIdx = dayDoc.employees.findIndex((e) => e.biometricId === bid);
-        if (empIdx === -1) return res.status(404).json({ success: false, message: `Employee ${biometricId} not in day doc` });
+        if (empIdx === -1) return res.status(500).json({ success: false, message: "Failed to locate employee entry after upsert" });
 
         const emp = dayDoc.employees[empIdx];
 
@@ -2289,15 +2377,6 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
         emp.hrReviewedAt = new Date();
 
         // ── Punch time update helper ─────────────────────────────────────────
-        const parseTimeOnDate = (timeStr) => {
-            if (!timeStr) return null;
-            const [h, m] = String(timeStr).split(":").map(Number);
-            // Convert local IST time → store as UTC (IST = UTC+5:30)
-            const d = new Date(dateStr + "T00:00:00+05:30");
-            d.setHours(h || 0, m || 0, 0, 0);
-            return d;
-        };
-
         const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
         const punchChanges = [];
         let anyTimeUpdated = false;
@@ -2306,7 +2385,7 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
             if (value === undefined) continue;
             anyTimeUpdated = true;
             const oldVal = emp[field] ? fmtTimeIST12(emp[field]) : "—";
-            const newDate = value ? parseTimeOnDate(value) : null;
+            const newDate = value ? parseTimeOnDateIST(value, dateStr) : null;
             emp[field] = newDate;
             punchChanges.push({
                 punchType: field,
@@ -2461,15 +2540,6 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
         const emp = dayDoc.employees[empIdx];
         const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
 
-        // ── Parse time → Date ──────────────────────────────────────────────
-        const parseTimeOnDate = (timeStr) => {
-            if (!timeStr) return null;
-            const [h, m] = String(timeStr).split(":").map(Number);
-            const d = new Date(dateStr + "T00:00:00+05:30");
-            d.setHours(h || 0, m || 0, 0, 0);
-            return d;
-        };
-
         // ── Map punchType → employee field name ────────────────────────────
         const punchFieldMap = {
             in: "inTime", lunch_out: "lunchOut", lunch_in: "lunchIn",
@@ -2484,7 +2554,7 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
             emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== punchType);
         } else {
             // add or modify
-            const newDate = parseTimeOnDate(punchTime);
+            const newDate = parseTimeOnDateIST(punchTime, dateStr);
             emp[fieldName] = newDate;
 
             // Upsert in rawPunches
@@ -2549,18 +2619,21 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
         emp.hasOT = otMins > 0;
         emp.hasMissPunch = !(emp.inTime && emp.finalOut);
 
-        if (!emp.inTime) {
-            emp.systemPrediction = "AB";
-        } else if (!emp.finalOut) {
-            emp.systemPrediction = "MP";
-        } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
-            emp.systemPrediction = "HD";
-        } else if (lateMins > 0) {
-            emp.systemPrediction = "P*";
-        } else if (earlyDepartureMins > 0) {
-            emp.systemPrediction = "P~";
-        } else {
-            emp.systemPrediction = "P";
+        // Recompute system prediction if hrFinalStatus not explicitly set
+        if (!emp.hrFinalStatus) {
+            if (!emp.inTime) {
+                emp.systemPrediction = "AB";
+            } else if (!emp.finalOut) {
+                emp.systemPrediction = "MP";
+            } else if (netWorkMins < (shift.halfDayThresholdMins || 240)) {
+                emp.systemPrediction = "HD";
+            } else if (lateMins > 0) {
+                emp.systemPrediction = "P*";
+            } else if (earlyDepartureMins > 0) {
+                emp.systemPrediction = "P~";
+            } else {
+                emp.systemPrediction = "P";
+            }
         }
 
         emp.attendanceValue = getAttendanceValue(emp.hrFinalStatus || emp.systemPrediction);
@@ -2603,8 +2676,16 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  EXCEL EXPORTS — unchanged for now, will be updated in Phase 2 to use
-//  displayLabels and show FH/NH/OH/RH properly.
+//  GET /export-daily  — Unified Manpower Intelligence Report
+//
+//  Design philosophy:
+//    • One sheet, no disconnected sections.
+//    • Employees grouped under inline department header rows that show
+//      dept-level KPIs (headcount, attendance%, OT pool, late pool).
+//    • Each employee row is a self-contained scorecard: identity on the
+//      left, punch timeline in the middle, performance metrics on the right.
+//    • Heat-mapped cells for instant visual parsing (no legend needed).
+//    • Bottom summary strip closes the report.
 // ═══════════════════════════════════════════════════════════════════════════
 
 router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
@@ -2612,8 +2693,6 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
         const { date, department } = req.query;
         if (!date) return res.status(400).json({ success: false, message: "date required" });
 
-        // Reuse the daily endpoint logic by calling it internally would be overkill.
-        // Just fetch the day doc and build rows here.
         const dayDoc = await DailyAttendance.findOne({ dateStr: date }).lean();
         const settings = await AttendanceSettings.getConfig();
         const labels = settings.displayLabels || {};
@@ -2622,23 +2701,27 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
         const allActive = await Employee.find({
             $or: [{ status: "active" }, { status: { $exists: false } }, { isActive: true }],
         }).lean();
-        const filtered = (department && department !== "all")
+        const filteredActive = (department && department !== "all")
             ? allActive.filter((e) => extractDepartment(e) === department)
             : allActive;
 
         const byBio = new Map();
         if (dayDoc) for (const e of (dayDoc.employees || [])) byBio.set(e.biometricId, e);
 
-        // Build rows, sorted by name
+        // ── Build employee rows ────────────────────────────────────────────
         const rows = [];
-        for (const emp of filtered) {
+        for (const emp of filteredActive) {
             const bid = String(extractBiometricId(emp) || "").toUpperCase();
             if (!bid) continue;
             const entry = byBio.get(bid);
             const status = entry?.hrFinalStatus || entry?.systemPrediction || "AB";
+            const empType = resolveEmployeeType(emp, settings);
             rows.push({
                 name: extractName(emp),
-                department: extractDepartment(emp),
+                empId: bid,
+                department: extractDepartment(emp) || "—",
+                designation: extractDesignation(emp) || "—",
+                empType,
                 status,
                 statusLabel: L(status),
                 inTime: entry?.inTime,
@@ -2649,254 +2732,472 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
                 outTime: entry?.finalOut,
                 netWorkMins: entry?.netWorkMins || 0,
                 otMins: entry?.otMins || 0,
+                lateMins: entry?.lateMins || 0,
+                lateDisplay: entry?.lateDisplay || "",
                 isLate: !!entry?.isLate,
                 isEarlyDeparture: !!entry?.isEarlyDeparture,
-                lateMins: entry?.lateMins || 0,
-                earlyMins: entry?.earlyDepartureMins || 0,
             });
         }
-        rows.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+        rows.sort((a, b) => {
+            const d = (a.department || "").localeCompare(b.department || "");
+            if (d !== 0) return d;
+            const g = (a.designation || "").localeCompare(b.designation || "");
+            if (g !== 0) return g;
+            return (a.name || "").localeCompare(b.name || "");
+        });
 
+        // ── Aggregate manpower stats by dept and designation ───────────────
+        const PRESENT_CODES = ["P", "P*", "P~"];
+        const LEAVE_CODES = ["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"];
+        const OFF_CODES = ["WO", "FH", "NH", "OH", "RH", "PH"];
+
+        const counterTemplate = () => ({
+            total: 0, present: 0, late: 0, halfDay: 0, missPunch: 0,
+            absent: 0, leave: 0, off: 0,
+        });
+        const incCounters = (c, status) => {
+            c.total++;
+            if (PRESENT_CODES.includes(status)) c.present++;
+            if (status === "P*") c.late++;
+            if (status === "HD") c.halfDay++;
+            if (status === "MP") c.missPunch++;
+            if (status === "AB") c.absent++;
+            if (LEAVE_CODES.includes(status)) c.leave++;
+            if (OFF_CODES.includes(status)) c.off++;
+        };
+
+        const deptMap = new Map();
+        for (const r of rows) {
+            const dep = r.department, des = r.designation;
+            if (!deptMap.has(dep)) deptMap.set(dep, { ...counterTemplate(), designations: new Map() });
+            const d = deptMap.get(dep);
+            incCounters(d, r.status);
+            if (!d.designations.has(des)) d.designations.set(des, counterTemplate());
+            incCounters(d.designations.get(des), r.status);
+        }
+
+        const grand = counterTemplate();
+        for (const [, d] of deptMap) {
+            grand.total += d.total; grand.present += d.present; grand.late += d.late;
+            grand.halfDay += d.halfDay; grand.missPunch += d.missPunch;
+            grand.absent += d.absent; grand.leave += d.leave; grand.off += d.off;
+        }
+
+        // Attendance %: of those expected to work today (excl. leave & off), how many showed
+        const attndPct = (c) => {
+            const expected = c.total - c.off - c.leave;
+            const showed = expected - c.absent;
+            return expected > 0 ? Math.round((showed / expected) * 100) : 100;
+        };
+
+        // ── Build workbook ──────────────────────────────────────────────────
         const wb = new ExcelJS.Workbook();
         wb.creator = "Grav Clothing HRMS";
-        const ws = wb.addWorksheet("Daily Attendance", {
-            views: [{ state: "frozen", ySplit: 9, showGridLines: false }],
-            pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
+        const ws = wb.addWorksheet("Daily Manpower", {
+            views: [{ state: "frozen", ySplit: 5, showGridLines: false }],
+            pageSetup: {
+                paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1,
+                margins: { left: 0.3, right: 0.3, top: 0.4, bottom: 0.4, header: 0.2, footer: 0.2 },
+            },
         });
 
-        const TOTAL_COLS = 12; // EMPLOYEE, DEPT, STATUS, IN, OUT, L.OUT, L.IN, T.OUT, T.IN, FINAL, WORK, OT
-        const dateLabel = new Date(date + "T00:00:00").toLocaleDateString("en-IN", {
-            weekday: "long", day: "numeric", month: "long", year: "numeric",
-            timeZone: "Asia/Kolkata",
-        });
-
-        // ── Hero banner ────────────────────────────────────────────────
-        ws.mergeCells(1, 1, 1, TOTAL_COLS);
-        const hero = ws.getCell(1, 1);
-        hero.value = {
-            richText: [
-                { text: "GRAV CLOTHING\n", font: { size: 9, bold: true, italic: true, color: { argb: "FFE9D5FF" } } },
-                { text: `Daily Attendance · ${dateLabel}`, font: { size: 16, bold: true, color: { argb: "FFFFFFFF" } } },
-            ]
-        };
-        hero.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
-        hero.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        ws.getRow(1).height = 40;
-
-        // ── Stats sub-banner ───────────────────────────────────────────
-        const stats = { P: 0, "P*": 0, "P~": 0, HD: 0, MP: 0, AB: 0, WO: 0, holiday: 0, leaves: 0 };
-        for (const r of rows) {
-            if (stats[r.status] !== undefined) stats[r.status]++;
-            if (["FH", "NH", "OH", "RH", "PH"].includes(r.status)) stats.holiday++;
-            if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(r.status)) stats.leaves++;
-        }
-        ws.mergeCells(2, 1, 2, TOTAL_COLS);
-        const sub = ws.getCell(2, 1);
-        sub.value = `${rows.length} employees  ·  Present ${stats.P + stats["P*"] + stats["P~"]}  ·  Late ${stats["P*"]}  ·  Half Day ${stats.HD}  ·  Miss Punch ${stats.MP}  ·  Absent ${stats.AB}  ·  Off ${stats.WO}  ·  Holiday ${stats.holiday}  ·  Leave ${stats.leaves}`;
-        sub.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
-        sub.font = { size: 9, color: { argb: "FFC4B5FD" } };
-        sub.alignment = { vertical: "middle", horizontal: "center" };
-        ws.getRow(2).height = 22;
-
-        // ── LEGEND ROW 1 — status colors ──────────────────────────────
-        ws.mergeCells(3, 1, 3, TOTAL_COLS);
-        const legendHdr = ws.getCell(3, 1);
-        legendHdr.value = "COLOR LEGEND — STATUS CODES";
-        legendHdr.font = { size: 9, bold: true, color: { argb: "FF6B7280" } };
-        legendHdr.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
-        legendHdr.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF9FAFB" } };
-        ws.getRow(3).height = 20;
-
-        ws.mergeCells(4, 1, 4, TOTAL_COLS);
-        const legendStatus = ws.getCell(4, 1);
-        legendStatus.value = {
-            richText: [
-                { text: "P", font: { size: 10, bold: true, color: { argb: "FF008000" } } },
-                { text: " Present  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "L", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
-                { text: " Late  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "EO", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
-                { text: " Early Out  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "HD", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
-                { text: " Half Day  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "MP", font: { size: 10, bold: true, color: { argb: "FFDB2777" } } },
-                { text: " Miss Punch  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "A", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
-                { text: " Absent  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "WO", font: { size: 10, bold: true, color: { argb: "FF64748B" } } },
-                { text: " Weekly Off  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "FH/NH/OH/RH", font: { size: 10, bold: true, color: { argb: "FF4F46E5" } } },
-                { text: " Holidays  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "CL/SL/EL", font: { size: 10, bold: true, color: { argb: "FF7C3AED" } } },
-                { text: " Leaves", font: { size: 9, color: { argb: "FF6B7280" } } },
-            ]
-        };
-        legendStatus.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        legendStatus.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
-        ws.getRow(4).height = 22;
-
-        // ── LEGEND ROW 2 — time & work colors ─────────────────────────
-        ws.mergeCells(5, 1, 5, TOTAL_COLS);
-        const legendTimes = ws.getCell(5, 1);
-        legendTimes.value = {
-            richText: [
-                { text: "TIMES → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
-                { text: "09:19", font: { size: 10, bold: true, color: { argb: "FF2563EB" } } },
-                { text: " on-time IN/OUT  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "09:43", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
-                { text: " late IN  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "17:41", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
-                { text: " early OUT  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "WORK → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
-                { text: "8:35", font: { size: 10, bold: true, color: { argb: "FF16A34A" } } },
-                { text: " ≥ 8 hours  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "6:05", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
-                { text: " < 8 hours  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
-                { text: "OT → ", font: { size: 9, bold: true, color: { argb: "FF6B7280" } } },
-                { text: "0:30", font: { size: 10, bold: true, color: { argb: "FF4338CA" } } },
-                { text: " any overtime", font: { size: 9, color: { argb: "FF6B7280" } } },
-            ]
-        };
-        legendTimes.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        legendTimes.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
-        ws.getRow(5).height = 22;
-
-        // ── Border around the legend block ────────────────────────────
-        for (let r = 3; r <= 5; r++) {
-            for (let c = 1; c <= TOTAL_COLS; c++) {
-                ws.getCell(r, c).border = {
-                    top: r === 3 ? { style: "medium", color: { argb: "FF6B7280" } } : { style: "thin", color: { argb: "FFE5E7EB" } },
-                    bottom: r === 5 ? { style: "medium", color: { argb: "FF6B7280" } } : { style: "thin", color: { argb: "FFE5E7EB" } },
-                    left: c === 1 ? { style: "medium", color: { argb: "FF6B7280" } } : undefined,
-                    right: c === TOTAL_COLS ? { style: "medium", color: { argb: "FF6B7280" } } : undefined,
-                };
-            }
-        }
-
-        ws.getRow(6).height = 6; // gap
-
-        // ── Table headers ─────────────────────────────────────────────
-        const headers = ["EMPLOYEE", "DEPARTMENT", "STATUS", "IN", "OUT", "L.OUT", "L.IN", "T.OUT", "T.IN", "FINAL", "WORK", "OT"];
-        const widths = [28, 18, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+        const COLS = 16;
+        const widths = [5, 26, 10, 16, 19, 7, 14, 9, 9, 9, 9, 9, 9, 9, 9, 10];
         widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
-        const headerRow = ws.getRow(7);
-        headers.forEach((h, i) => {
-            const cell = headerRow.getCell(i + 1);
-            cell.value = h;
-            cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
-            cell.alignment = { vertical: "middle", horizontal: i === 0 || i === 1 ? "left" : "center", indent: i <= 1 ? 1 : 0 };
-            cell.border = {
-                top: { style: "medium", color: { argb: "FF0F172A" } },
-                bottom: { style: "medium", color: { argb: "FF0F172A" } },
-                left: { style: "thin", color: { argb: "FF374151" } },
-                right: { style: "thin", color: { argb: "FF374151" } },
-            };
+        const dateLabel = new Date(date + "T00:00:00").toLocaleDateString("en-IN", {
+            weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "Asia/Kolkata",
         });
-        headerRow.height = 24;
 
-        // ── Data rows ─────────────────────────────────────────────────
-        const fmt = (d) => fmtTimeIST(d);   // uses Asia/Kolkata
+        const fmt = (d) => fmtTimeIST(d);
         const fmtMins = (m) => {
             if (!m || m <= 0) return "";
             const h = Math.floor(m / 60), mm = m % 60;
-            return `${h}:${String(mm).padStart(2, "0")}`;
+            return h ? `${h}:${String(mm).padStart(2, "0")}` : `0:${String(mm).padStart(2, "0")}`;
         };
 
         const STATUS_COLOR = {
             P: "FF008000", "P*": "FFFF8C00", "P~": "FFFF0000",
-            HD: "FFFF0000", MP: "FFDB2777", AB: "FFDC2626", LWP: "FFDC2626",
+            HD: "FFCA8A04", MP: "FFDB2777", AB: "FFDC2626", LWP: "FFDC2626",
             WO: "FF64748B",
             FH: "FF4F46E5", NH: "FF4F46E5", OH: "FF4F46E5", RH: "FF4F46E5", PH: "FF4F46E5",
             "L-CL": "FF7C3AED", "L-SL": "FF7C3AED", "L-EL": "FF7C3AED",
             WFH: "FF0891B2", CO: "FF0D9488",
         };
 
-        rows.forEach((r, idx) => {
-            const row = ws.getRow(8 + idx);
-            const rowFill = idx % 2 === 0 ? "FFFFFFFF" : "FFF8FAFC";
+        let row = 1;
 
-            // Name
-            row.getCell(1).value = r.name;
-            row.getCell(1).font = { size: 10, bold: true, color: { argb: "FF1D4ED8" } };
-            row.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        // ── Hero banner ────────────────────────────────────────────────────
+        ws.mergeCells(row, 1, row, COLS);
+        const hero = ws.getCell(row, 1);
+        hero.value = {
+            richText: [
+                { text: "GRAV CLOTHING\n", font: { size: 11, bold: true, italic: true, color: { argb: "FFE9D5FF" } } },
+                { text: `Daily Manpower Report  ·  ${dateLabel}`, font: { size: 22, bold: true, color: { argb: "FFFFFFFF" } } },
+            ],
+        };
+        hero.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+        hero.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+        ws.getRow(row).height = 56;
+        row++;
 
-            // Department
-            row.getCell(2).value = r.department;
-            row.getCell(2).font = { size: 9, color: { argb: "FF6B7280" } };
-            row.getCell(2).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        // ── Exec summary bar ───────────────────────────────────────────────
+        ws.mergeCells(row, 1, row, COLS);
+        const sub = ws.getCell(row, 1);
+        const overallPct = attndPct(grand);
+        sub.value = `${grand.total} TOTAL  ·  ${grand.present} PRESENT (${overallPct}%)  ·  ${grand.late} LATE  ·  ${grand.halfDay} HALF-DAY  ·  ${grand.missPunch} MISS PUNCH  ·  ${grand.absent} ABSENT  ·  ${grand.leave} ON LEAVE  ·  ${grand.off} OFF/HOLIDAY${department && department !== "all" ? `  ·  Filtered: ${department}` : ""}`;
+        sub.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
+        sub.font = { size: 11, color: { argb: "FFC4B5FD" }, bold: true };
+        sub.alignment = { vertical: "middle", horizontal: "center" };
+        ws.getRow(row).height = 30;
+        row++;
 
-            // Status (use display label, color-coded)
-            row.getCell(3).value = r.statusLabel;
-            row.getCell(3).font = { size: 10, bold: true, color: { argb: STATUS_COLOR[r.status] || "FF111827" } };
-            row.getCell(3).alignment = { vertical: "middle", horizontal: "center" };
+        // ── Color legend ───────────────────────────────────────────────────
+        ws.mergeCells(row, 1, row, COLS);
+        const lg = ws.getCell(row, 1);
+        lg.value = {
+            richText: [
+                { text: "P", font: { size: 10, bold: true, color: { argb: "FF008000" } } },
+                { text: " Present  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "P*", font: { size: 10, bold: true, color: { argb: "FFFF8C00" } } },
+                { text: " Late  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "P~", font: { size: 10, bold: true, color: { argb: "FFFF0000" } } },
+                { text: " Early Out  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "HD", font: { size: 10, bold: true, color: { argb: "FFCA8A04" } } },
+                { text: " Half Day  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "MP", font: { size: 10, bold: true, color: { argb: "FFDB2777" } } },
+                { text: " Miss Punch  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "AB", font: { size: 10, bold: true, color: { argb: "FFDC2626" } } },
+                { text: " Absent  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "WO", font: { size: 10, bold: true, color: { argb: "FF64748B" } } },
+                { text: " Weekly Off  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "FH/NH/OH/RH", font: { size: 10, bold: true, color: { argb: "FF4F46E5" } } },
+                { text: " Holiday  ·  ", font: { size: 9, color: { argb: "FF6B7280" } } },
+                { text: "CL/SL/EL/WFH/CO", font: { size: 10, bold: true, color: { argb: "FF7C3AED" } } },
+                { text: " Leave", font: { size: 9, color: { argb: "FF6B7280" } } },
+            ],
+        };
+        lg.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+        lg.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF9FAFB" } };
+        ws.getRow(row).height = 22;
+        for (let c = 1; c <= COLS; c++) {
+            ws.getCell(row, c).border = {
+                top: { style: "thin", color: { argb: "FFE5E7EB" } },
+                bottom: { style: "medium", color: { argb: "FF6B7280" } },
+            };
+        }
+        row++;
 
-            // IN — orange bold if late
-            row.getCell(4).value = fmt(r.inTime);
-            row.getCell(4).font = { size: 9, bold: r.isLate, color: { argb: r.isLate ? "FFFF8C00" : "FF2563EB" } };
-            row.getCell(4).alignment = { vertical: "middle", horizontal: "center" };
+        // ════════════════════════════════════════════════════════════════════
+        // SECTION 1 — DETAILED EMPLOYEE ROSTER
+        // ════════════════════════════════════════════════════════════════════
+        ws.mergeCells(row, 1, row, COLS);
+        const rh = ws.getCell(row, 1);
+        rh.value = `EMPLOYEE ROSTER  ·  ${rows.length} employee${rows.length === 1 ? "" : "s"}`;
+        rh.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+        rh.font = { size: 11, bold: true, color: { argb: "FFFFFFFF" } };
+        rh.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        ws.getRow(row).height = 24;
+        row++;
 
-            // OUT (final exit per shift) — same as FINAL but kept here for visual separation
-            row.getCell(5).value = fmt(r.outTime);
-            row.getCell(5).font = { size: 9, bold: r.isEarlyDeparture, color: { argb: r.isEarlyDeparture ? "FFFF8C00" : "FF2563EB" } };
-            row.getCell(5).alignment = { vertical: "middle", horizontal: "center" };
+        const colHeaders = ["#", "EMPLOYEE", "EMP ID", "DEPARTMENT", "DESIGNATION", "TYPE", "STATUS", "IN", "L.OUT", "L.IN", "T.OUT", "T.IN", "OUT", "WORK", "OT", "LATE"];
+        const headerRow = ws.getRow(row);
+        colHeaders.forEach((h, i) => {
+            const cell = headerRow.getCell(i + 1);
+            cell.value = h;
+            cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF374151" } };
+            cell.alignment = {
+                vertical: "middle",
+                horizontal: (i === 1 || i === 3 || i === 4) ? "left" : "center",
+                indent: (i === 1 || i === 3 || i === 4) ? 1 : 0,
+            };
+            cell.border = {
+                top: { style: "medium", color: { argb: "FF0F172A" } },
+                bottom: { style: "medium", color: { argb: "FF0F172A" } },
+                left: { style: "thin", color: { argb: "FF4B5563" } },
+                right: { style: "thin", color: { argb: "FF4B5563" } },
+            };
+        });
+        headerRow.height = 28;
+        row++;
 
-            // Lunch + Tea breaks
-            row.getCell(6).value = fmt(r.lunchOut);
-            row.getCell(7).value = fmt(r.lunchIn);
-            row.getCell(8).value = fmt(r.teaOut);
-            row.getCell(9).value = fmt(r.teaIn);
-            for (const c of [6, 7, 8, 9]) {
-                row.getCell(c).font = { size: 9, color: { argb: "FF6B7280" } };
-                row.getCell(c).alignment = { vertical: "middle", horizontal: "center" };
+        // Data rows — with department dividers
+        let lastDept = null;
+        let counter = 0;
+        for (const r of rows) {
+            if (r.department !== lastDept) {
+                if (lastDept !== null) {
+                    // small divider stripe between departments
+                    ws.getRow(row).height = 4;
+                    for (let c = 1; c <= COLS; c++) {
+                        ws.getCell(row, c).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEDE9FE" } };
+                    }
+                    row++;
+                }
+                lastDept = r.department;
+            }
+            counter++;
+            const dr = ws.getRow(row);
+            const fillColor = counter % 2 === 0 ? "FFF8FAFC" : "FFFFFFFF";
+
+            dr.getCell(1).value = counter;
+            dr.getCell(1).font = { size: 9, color: { argb: "FF9CA3AF" } };
+            dr.getCell(1).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(2).value = r.name;
+            dr.getCell(2).font = { size: 10, bold: true, color: { argb: "FF1D4ED8" } };
+            dr.getCell(2).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            dr.getCell(3).value = r.empId;
+            dr.getCell(3).font = { name: "Consolas", size: 9, color: { argb: "FF6B7280" } };
+            dr.getCell(3).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(4).value = r.department;
+            dr.getCell(4).font = { size: 9, color: { argb: "FF374151" } };
+            dr.getCell(4).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            dr.getCell(5).value = r.designation;
+            dr.getCell(5).font = { size: 9, color: { argb: "FF374151" } };
+            dr.getCell(5).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            dr.getCell(6).value = r.empType === "executive" ? "EXE" : "OPR";
+            dr.getCell(6).font = { size: 8, bold: true, color: { argb: r.empType === "executive" ? "FF4F46E5" : "FF2563EB" } };
+            dr.getCell(6).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(7).value = r.statusLabel;
+            dr.getCell(7).font = { size: 10, bold: true, color: { argb: STATUS_COLOR[r.status] || "FF111827" } };
+            dr.getCell(7).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(8).value = fmt(r.inTime);
+            dr.getCell(8).font = { name: "Consolas", size: 9, bold: r.isLate, color: { argb: r.isLate ? "FFFF8C00" : "FF2563EB" } };
+            dr.getCell(8).alignment = { vertical: "middle", horizontal: "center" };
+
+            dr.getCell(9).value = fmt(r.lunchOut);
+            dr.getCell(10).value = fmt(r.lunchIn);
+            dr.getCell(11).value = fmt(r.teaOut);
+            dr.getCell(12).value = fmt(r.teaIn);
+            for (const c of [9, 10, 11, 12]) {
+                dr.getCell(c).font = { name: "Consolas", size: 8, color: { argb: "FF6B7280" } };
+                dr.getCell(c).alignment = { vertical: "middle", horizontal: "center" };
             }
 
-            // Final out
-            row.getCell(10).value = fmt(r.outTime);
-            row.getCell(10).font = { size: 9, bold: true, color: { argb: "FF111827" } };
-            row.getCell(10).alignment = { vertical: "middle", horizontal: "center" };
+            dr.getCell(13).value = fmt(r.outTime);
+            dr.getCell(13).font = { name: "Consolas", size: 9, bold: true, color: { argb: r.isEarlyDeparture ? "FFFF8C00" : "FF111827" } };
+            dr.getCell(13).alignment = { vertical: "middle", horizontal: "center" };
 
-            // Work hours — green ≥8h, red <8h
-            row.getCell(11).value = fmtMins(r.netWorkMins);
-            row.getCell(11).font = {
-                size: 10, bold: true,
-                color: { argb: r.netWorkMins >= 480 ? "FF16A34A" : r.netWorkMins > 0 ? "FFDC2626" : "FF9CA3AF" }
+            dr.getCell(14).value = fmtMins(r.netWorkMins);
+            dr.getCell(14).font = {
+                name: "Consolas", size: 10, bold: true,
+                color: { argb: r.netWorkMins >= 480 ? "FF16A34A" : r.netWorkMins > 0 ? "FFDC2626" : "FF9CA3AF" },
             };
-            row.getCell(11).alignment = { vertical: "middle", horizontal: "center" };
+            dr.getCell(14).alignment = { vertical: "middle", horizontal: "center" };
 
-            // OT — indigo
-            row.getCell(12).value = fmtMins(r.otMins);
-            row.getCell(12).font = {
-                size: 10, bold: r.otMins > 0,
-                color: { argb: r.otMins > 0 ? "FF4338CA" : "FF9CA3AF" }
-            };
-            row.getCell(12).alignment = { vertical: "middle", horizontal: "center" };
+            dr.getCell(15).value = fmtMins(r.otMins);
+            dr.getCell(15).font = { name: "Consolas", size: 9, bold: r.otMins > 0, color: { argb: r.otMins > 0 ? "FF4338CA" : "FF9CA3AF" } };
+            dr.getCell(15).alignment = { vertical: "middle", horizontal: "center" };
 
-            // Borders + zebra fill
-            for (let c = 1; c <= TOTAL_COLS; c++) {
-                const cell = row.getCell(c);
-                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: rowFill } };
+            dr.getCell(16).value = r.lateDisplay || (r.lateMins > 0 ? fmtMins(r.lateMins) : "");
+            dr.getCell(16).font = { size: 9, bold: r.lateMins > 0, color: { argb: r.lateMins > 0 ? "FFFF8C00" : "FF9CA3AF" } };
+            dr.getCell(16).alignment = { vertical: "middle", horizontal: "center" };
+
+            for (let c = 1; c <= COLS; c++) {
+                const cell = dr.getCell(c);
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: fillColor } };
                 cell.border = {
                     top: { style: "thin", color: { argb: "FFE5E7EB" } },
                     bottom: { style: "thin", color: { argb: "FFE5E7EB" } },
-                    left: { style: "thin", color: { argb: "FFE5E7EB" } },
-                    right: { style: "thin", color: { argb: "FFE5E7EB" } },
+                    left: { style: "thin", color: { argb: "FFF3F4F6" } },
+                    right: { style: "thin", color: { argb: "FFF3F4F6" } },
                 };
             }
-            row.height = 20;
+            dr.height = 22;
+            row++;
+        }
+
+        // Gap before breakdown section
+        ws.getRow(row).height = 16;
+        row++;
+
+        // ════════════════════════════════════════════════════════════════════
+        // SECTION 2 — MANPOWER BREAKDOWN BY DEPT & DESIGNATION
+        // ════════════════════════════════════════════════════════════════════
+        ws.mergeCells(row, 1, row, COLS);
+        const mh = ws.getCell(row, 1);
+        mh.value = "MANPOWER BREAKDOWN  ·  By Department & Designation";
+        mh.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
+        mh.font = { size: 11, bold: true, color: { argb: "FFFFFFFF" } };
+        mh.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+        ws.getRow(row).height = 24;
+        row++;
+
+        // Breakdown header — uses cols 1-10 only (cols 11-16 stay merged & blank)
+        const bkHeaders = ["DEPARTMENT / DESIGNATION", "TOTAL", "PRESENT", "LATE", "HD", "MP", "ABSENT", "LEAVE", "OFF/HOL", "ATTND %"];
+        const bkRow = ws.getRow(row);
+        bkHeaders.forEach((h, i) => {
+            const cell = bkRow.getCell(i + 1);
+            cell.value = h;
+            cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF374151" } };
+            cell.alignment = { vertical: "middle", horizontal: i === 0 ? "left" : "center", indent: i === 0 ? 1 : 0 };
+            cell.border = {
+                top: { style: "medium", color: { argb: "FF0F172A" } },
+                bottom: { style: "medium", color: { argb: "FF0F172A" } },
+                left: { style: "thin", color: { argb: "FF4B5563" } },
+                right: { style: "thin", color: { argb: "FF4B5563" } },
+            };
         });
+        ws.mergeCells(row, 11, row, COLS);
+        const bkPad = ws.getCell(row, 11);
+        bkPad.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF374151" } };
+        bkPad.border = { top: { style: "medium", color: { argb: "FF0F172A" } }, bottom: { style: "medium", color: { argb: "FF0F172A" } } };
+        bkRow.height = 26;
+        row++;
+
+        // Sort departments by total (largest first)
+        const sortedDepts = [...deptMap.entries()].sort((a, b) => b[1].total - a[1].total);
+
+        for (const [depName, depCounts] of sortedDepts) {
+            // Department band
+            ws.mergeCells(row, 1, row, 10);
+            const dh = ws.getCell(row, 1);
+            const depPct = attndPct(depCounts);
+            dh.value = `▼ ${depName}  ·  ${depCounts.total} employee${depCounts.total === 1 ? "" : "s"}  ·  ${depCounts.present} present  ·  ${depPct}% attendance`;
+            dh.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+            dh.font = { size: 10, bold: true, color: { argb: "FFFFFFFF" } };
+            dh.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+            ws.mergeCells(row, 11, row, COLS);
+            ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+            ws.getRow(row).height = 22;
+            row++;
+
+            // Designation rows
+            const sortedDesigs = [...depCounts.designations.entries()].sort((a, b) => b[1].total - a[1].total);
+            for (const [desigName, c] of sortedDesigs) {
+                const dr = ws.getRow(row);
+                const pct = attndPct(c);
+
+                dr.getCell(1).value = `    ${desigName}`;
+                dr.getCell(1).font = { size: 9, color: { argb: "FF374151" } };
+                dr.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 2 };
+
+                const cells = [
+                    { v: c.total, color: "FF111827", bold: true },
+                    { v: c.present || "—", color: c.present ? "FF16A34A" : "FF9CA3AF", bold: true },
+                    { v: c.late || "—", color: c.late ? "FFFF8C00" : "FF9CA3AF" },
+                    { v: c.halfDay || "—", color: c.halfDay ? "FFCA8A04" : "FF9CA3AF" },
+                    { v: c.missPunch || "—", color: c.missPunch ? "FFDB2777" : "FF9CA3AF" },
+                    { v: c.absent || "—", color: c.absent ? "FFDC2626" : "FF9CA3AF", bold: !!c.absent },
+                    { v: c.leave || "—", color: c.leave ? "FF7C3AED" : "FF9CA3AF" },
+                    { v: c.off || "—", color: c.off ? "FF4F46E5" : "FF9CA3AF" },
+                    { v: `${pct}%`, color: pct >= 90 ? "FF16A34A" : pct >= 75 ? "FFCA8A04" : "FFDC2626", bold: true },
+                ];
+                cells.forEach((vc, i) => {
+                    const cell = dr.getCell(i + 2);
+                    cell.value = vc.v;
+                    cell.font = { size: 9, bold: vc.bold, color: { argb: vc.color } };
+                    cell.alignment = { vertical: "middle", horizontal: "center" };
+                });
+
+                for (let c2 = 1; c2 <= 10; c2++) {
+                    dr.getCell(c2).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
+                    dr.getCell(c2).border = {
+                        top: { style: "thin", color: { argb: "FFF3F4F6" } },
+                        bottom: { style: "thin", color: { argb: "FFE5E7EB" } },
+                        left: { style: "thin", color: { argb: "FFF3F4F6" } },
+                        right: { style: "thin", color: { argb: "FFF3F4F6" } },
+                    };
+                }
+                ws.mergeCells(row, 11, row, COLS);
+                ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFFFF" } };
+                dr.height = 20;
+                row++;
+            }
+
+            // Department subtotal
+            const stRow = ws.getRow(row);
+            const stPct = attndPct(depCounts);
+            stRow.getCell(1).value = `  ▶ ${depName} TOTAL`;
+            stRow.getCell(1).font = { size: 10, bold: true, color: { argb: "FF581C87" } };
+            stRow.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+            const stCells = [
+                { v: depCounts.total, color: "FF581C87" },
+                { v: depCounts.present, color: "FF16A34A" },
+                { v: depCounts.late, color: "FFFF8C00" },
+                { v: depCounts.halfDay, color: "FFCA8A04" },
+                { v: depCounts.missPunch, color: "FFDB2777" },
+                { v: depCounts.absent, color: "FFDC2626" },
+                { v: depCounts.leave, color: "FF7C3AED" },
+                { v: depCounts.off, color: "FF4F46E5" },
+                { v: `${stPct}%`, color: "FFFFFFFF", fill: stPct >= 90 ? "FF16A34A" : stPct >= 75 ? "FFCA8A04" : "FFDC2626" },
+            ];
+            stCells.forEach((vc, i) => {
+                const cell = stRow.getCell(i + 2);
+                cell.value = vc.v;
+                cell.font = { size: 10, bold: true, color: { argb: vc.color } };
+                cell.alignment = { vertical: "middle", horizontal: "center" };
+                if (vc.fill) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: vc.fill } };
+            });
+
+            for (let c2 = 1; c2 <= 10; c2++) {
+                if (!stRow.getCell(c2).fill) {
+                    stRow.getCell(c2).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEDE9FE" } };
+                }
+                stRow.getCell(c2).border = {
+                    top: { style: "medium", color: { argb: "FF7C3AED" } },
+                    bottom: { style: "medium", color: { argb: "FF7C3AED" } },
+                };
+            }
+            ws.mergeCells(row, 11, row, COLS);
+            ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEDE9FE" } };
+            stRow.height = 22;
+            row++;
+
+            // Tiny gap
+            ws.getRow(row).height = 4;
+            row++;
+        }
+
+        // Grand total row
+        const gtRow = ws.getRow(row);
+        const gtPct = attndPct(grand);
+        gtRow.getCell(1).value = "GRAND TOTAL";
+        gtRow.getCell(1).font = { size: 12, bold: true, color: { argb: "FFFFFFFF" } };
+        gtRow.getCell(1).alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+        const gtVals = [grand.total, grand.present, grand.late, grand.halfDay, grand.missPunch, grand.absent, grand.leave, grand.off, `${gtPct}%`];
+        gtVals.forEach((v, i) => {
+            const cell = gtRow.getCell(i + 2);
+            cell.value = v;
+            cell.font = { size: 12, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.alignment = { vertical: "middle", horizontal: "center" };
+        });
+        for (let c2 = 1; c2 <= 10; c2++) {
+            gtRow.getCell(c2).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
+            gtRow.getCell(c2).border = {
+                top: { style: "double", color: { argb: "FF0F172A" } },
+                bottom: { style: "double", color: { argb: "FF0F172A" } },
+            };
+        }
+        ws.mergeCells(row, 11, row, COLS);
+        ws.getCell(row, 11).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0F172A" } };
+        gtRow.height = 30;
+        row++;
 
         // Footer
-        const footerRow = ws.getRow(8 + rows.length + 1);
-        ws.mergeCells(footerRow.number, 1, footerRow.number, TOTAL_COLS);
-        footerRow.getCell(1).value = `${rows.length} record${rows.length === 1 ? "" : "s"}  ·  Generated ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`;
-        footerRow.getCell(1).font = { size: 8, italic: true, color: { argb: "FF6B7280" } };
-        footerRow.getCell(1).alignment = { vertical: "middle", horizontal: "right", indent: 1 };
-        footerRow.height = 18;
+        ws.getRow(row).height = 8;
+        row++;
+        ws.mergeCells(row, 1, row, COLS);
+        const ft = ws.getCell(row, 1);
+        ft.value = `Generated ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}  ·  Grav Clothing HRMS  ·  Daily Manpower Report`;
+        ft.font = { size: 8, italic: true, color: { argb: "FF6B7280" } };
+        ft.alignment = { vertical: "middle", horizontal: "right", indent: 1 };
+        ws.getRow(row).height = 18;
 
+        // ── Send file ───────────────────────────────────────────────────────
         const buffer = await wb.xlsx.writeBuffer();
-        const filename = `attendance_${date}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
+        const filename = `manpower_${date}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
         res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
         res.setHeader("Cache-Control", "no-store");
@@ -3170,7 +3471,8 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// Muster Excel export — unchanged; Phase 2 will update for FH/NH/etc
+// ═══════════════════════════════════════════════════════════════════════════
+//  MUSTER ROLL EXPORT — matches Grav Clothing attendance sheet template exactly
 // ═══════════════════════════════════════════════════════════════════════════
 router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     try {
@@ -3181,15 +3483,16 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         const lastDay = new Date(yr, mo, 0).getDate();
         const from = `${yearMonth}-01`;
         const to = `${yearMonth}-${String(lastDay).padStart(2, "0")}`;
+        const monthLabel = new Date(from + "T00:00:00").toLocaleDateString("en-IN", { month: "long", year: "numeric" }).toUpperCase();
 
         const settings = await AttendanceSettings.getConfig();
         const thresholds = settings.lateHalfDayPolicy?.cumulativeLateMinsThreshold || { operator: 30, executive: 40 };
-        const labels = settings.displayLabels || {};
-        const L = (s) => labels[s] || s;
 
         const holidayMap = await loadHolidayMap(from, to);
 
         const today = new Date(); today.setHours(0, 0, 0, 0);
+
+        // Build allDays array
         const allDays = [];
         for (let d = 1; d <= lastDay; d++) {
             const dateStr = `${yearMonth}-${String(d).padStart(2, "0")}`;
@@ -3200,17 +3503,32 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
             const isWorkingSunday = !!hol && hol.type === "working_sunday";
             allDays.push({
                 day: d, dateStr,
-                dayName: dt.toLocaleDateString("en-IN", { weekday: "short" }),
-                dayLetter: dt.toLocaleDateString("en-IN", { weekday: "short" }).charAt(0),
+                dayAbbr: dt.toLocaleDateString("en-IN", { weekday: "short" }).substring(0, 3).toUpperCase(),
                 isSunday: dow === 0,
                 isFuture: dt > today,
                 isDeclaredHoliday,
                 isWorkingSunday,
                 holiday: isDeclaredHoliday ? hol : null,
                 holidayStatus: isDeclaredHoliday ? holidayTypeToStatus(hol.type) : null,
+                holidayName: isDeclaredHoliday ? hol.name : null,
             });
         }
 
+        // Map internal status codes to sheet abbreviations
+        function toSheetCode(status) {
+            const map = {
+                "P": "P", "P*": "P", "P~": "P", "MP": "P", "WFH": "P",
+                "AB": "A", "LWP": "A",
+                "HD": "HD",
+                "WO": "WO", "OH": "WO", "RH": "WO",
+                "CO": "CO",
+                "L-CL": "CL", "L-SL": "SL", "L-EL": "PL",
+                "FH": "FH", "NH": "NH", "PH": "FH",
+            };
+            return map[status] || "";
+        }
+
+        // Load employees
         const allActive = await Employee.find({
             $or: [{ status: "active" }, { status: { $exists: false } }, { isActive: true }],
         }).lean();
@@ -3221,131 +3539,120 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         const dayDocs = await DailyAttendance.find({ yearMonth }).sort({ dateStr: 1 }).lean();
         const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
 
-        const PAID_CODES = [
-            "P", "P*", "P~", "HD", "MP",
-            "WO", "FH", "NH", "OH", "RH", "PH",
-            "L-CL", "L-SL", "L-EL", "WFH", "CO",
-        ];
-
         const employees = [];
         const running = new Map();
 
-        for (const emp of filteredActive) {
-            const bid = extractBiometricId(emp);
-            if (!bid) continue;
-            const key = String(bid).toUpperCase();
-            const empType = resolveEmployeeType(emp, settings);
-
+        // Helper: build day codes for one employee key given their basic info
+        function buildEmpRow(key, empName, empDept, empDesig, empType) {
             const row = {
                 biometricId: key,
-                empCode: extractIdentity(emp) || key.replace(/^GR/, ""),
-                employeeName: extractName(emp),
-                department: extractDepartment(emp),
-                designation: extractDesignation(emp),
+                employeeName: empName,
+                department: empDept,
+                designation: empDesig,
                 employeeType: empType,
-                days: {},
-                totals: {
-                    P: 0, "P*": 0, "P~": 0, HD: 0, AB: 0, MP: 0, WO: 0, PH: 0,
-                    FH: 0, NH: 0, OH: 0, RH: 0, leaves: 0,
-                    totalLateMins: 0, totalOtMins: 0, totalNetWorkMins: 0,
-                    totalAttendance: 0,
-                    sundayWorked: 0, holidayWorked: 0,
-                },
+                dayCodes: {},        // dateStr -> sheet code
+                hrOverrides: new Set(), // dateStrings where hrFinalStatus was applied
+                totals: { P: 0, A: 0, HD: 0, WO: 0, CO: 0, CL: 0, SL: 0, PL: 0, NHFH: 0, Total: 0 },
             };
             running.set(key, 0);
 
             for (const cal of allDays) {
-                if (cal.isFuture) { row.days[cal.dateStr] = { status: "—", isFuture: true }; continue; }
+                if (cal.isFuture) { row.dayCodes[cal.dateStr] = ""; continue; }
 
                 const dayDoc = byDate.get(cal.dateStr);
                 const entry = dayDoc ? (dayDoc.employees || []).find((e) => e.biometricId === key) : null;
 
-                // HOLIDAY → applies to everyone
+                let sheetCode = "";
+
                 if (cal.isDeclaredHoliday) {
                     const hs = cal.holidayStatus;
                     const didPunch = !!entry && (entry.punchCount || 0) > 0;
-                    row.days[cal.dateStr] = {
-                        status: hs,
-                        punchedOnHoliday: didPunch,
-                        otMins: entry?.otMins || 0,
-                        netWorkMins: entry?.netWorkMins || 0,
-                        hrOverride: !!entry?.hrFinalStatus,
-                    };
-                    row.totals[hs] = (row.totals[hs] || 0) + 1;
-                    row.totals.totalAttendance++;
-                    if (didPunch) {
-                        row.totals.holidayWorked++;
-                        row.totals.totalOtMins += entry.otMins || 0;
-                        row.totals.totalNetWorkMins += entry.netWorkMins || 0;
-                    }
-                    continue;
-                }
-
-                // SUNDAY
-                if (cal.isSunday && !cal.isWorkingSunday) {
+                    sheetCode = didPunch ? "P" : toSheetCode(hs);
+                    if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch) row.totals.NHFH++;
+                    else if (didPunch) row.totals.P++;
+                    // HR override on a holiday (e.g., someone HR-marked absent on a holiday)
+                    if (didPunch && (entry?.hrFinalStatus || (entry?.rawPunches || []).some(p => p.source === 'manual'))) row.hrOverrides.add(cal.dateStr);
+                } else if (cal.isSunday && !cal.isWorkingSunday) {
                     const didPunch = !!entry && (entry.punchCount || 0) > 0;
                     if (didPunch) {
-                        let status = entry.systemPrediction;
-                        const finalStatus = entry.hrFinalStatus || status;
-                        row.days[cal.dateStr] = {
-                            status: finalStatus,
-                            netWorkMins: entry.netWorkMins || 0,
-                            lateMins: entry.lateMins || 0,
-                            otMins: entry.otMins || 0,
-                            hrOverride: !!entry.hrFinalStatus,
-                            isSundayWorked: true,
-                        };
-                        if (row.totals[finalStatus] !== undefined) row.totals[finalStatus]++;
-                        row.totals.sundayWorked++;
-                        row.totals.totalAttendance++;
-                        row.totals.totalLateMins += entry.lateMins || 0;
-                        row.totals.totalOtMins += entry.otMins || 0;
-                        row.totals.totalNetWorkMins += entry.netWorkMins || 0;
+                        const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
+                        sheetCode = toSheetCode(finalStatus) || "P";
+                        row.totals.P++;
+                        if (entry.hrFinalStatus || (entry.rawPunches || []).some(p => p.source === 'manual' || p.source === 'miss_punch')) row.hrOverrides.add(cal.dateStr);
                     } else {
-                        row.days[cal.dateStr] = { status: "WO" };
+                        sheetCode = "WO";
                         row.totals.WO++;
-                        row.totals.totalAttendance++;
                     }
-                    continue;
+                } else if (!dayDoc || !entry) {
+                    sheetCode = dayDoc ? "A" : "";
+                    if (dayDoc) row.totals.A++;
+                } else {
+                    // Normal working day
+                    let cum = running.get(key) || 0;
+                    let status = entry.systemPrediction;
+                    if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
+                        cum += entry.lateMins;
+                        const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
+                        if (cum >= thr) { status = "HD"; cum = 0; }
+                    }
+                    running.set(key, cum);
+                    const finalStatus = entry.hrFinalStatus || status;
+                    sheetCode = toSheetCode(finalStatus);
+
+                    // Track HR override
+                    // HR override: explicit status change OR manually edited punch times
+                    const hasManualPunch = (entry.rawPunches || []).some(p => p.source === 'manual' || p.source === 'miss_punch');
+                    if (entry.hrFinalStatus || hasManualPunch) row.hrOverrides.add(cal.dateStr);
+
+                    if (["P", "P*", "P~", "MP", "WFH"].includes(finalStatus)) row.totals.P++;
+                    else if (finalStatus === "AB" || finalStatus === "LWP") row.totals.A++;
+                    else if (finalStatus === "HD") row.totals.HD++;
+                    else if (finalStatus === "WO") row.totals.WO++;
+                    else if (finalStatus === "CO") row.totals.CO++;
+                    else if (finalStatus === "L-CL") row.totals.CL++;
+                    else if (finalStatus === "L-SL") row.totals.SL++;
+                    else if (finalStatus === "L-EL") row.totals.PL++;
+                    else if (["FH", "NH", "OH", "RH", "PH"].includes(finalStatus)) row.totals.NHFH++;
                 }
-
-                // Normal working day
-                if (!dayDoc) { row.days[cal.dateStr] = { status: "—" }; continue; }
-                if (!entry) { row.days[cal.dateStr] = { status: "AB" }; row.totals.AB++; continue; }
-
-                let cum = running.get(key) || 0;
-                let status = entry.systemPrediction;
-                let promoted = false;
-                if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
-                    cum += entry.lateMins;
-                    const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
-                    if (cum >= thr) { status = "HD"; promoted = true; cum = 0; }
-                }
-                running.set(key, cum);
-                const finalStatus = entry.hrFinalStatus || status;
-
-                row.days[cal.dateStr] = {
-                    status: finalStatus,
-                    netWorkMins: entry.netWorkMins || 0,
-                    lateMins: entry.lateMins || 0,
-                    otMins: entry.otMins || 0,
-                    hrOverride: !!entry.hrFinalStatus,
-                    wasPromoted: promoted,
-                };
-                if (row.totals[finalStatus] !== undefined) row.totals[finalStatus]++;
-                if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(finalStatus)) row.totals.leaves++;
-                if (PAID_CODES.includes(finalStatus)) row.totals.totalAttendance++;
-
-                row.totals.totalLateMins += entry.lateMins || 0;
-                row.totals.totalOtMins += entry.otMins || 0;
-                row.totals.totalNetWorkMins += entry.netWorkMins || 0;
+                row.dayCodes[cal.dateStr] = sheetCode;
             }
 
-            const worked = row.totals.P + row.totals["P*"] + row.totals["P~"] + row.totals.MP;
-            const workable = allDays.filter(d => !d.isSunday && !d.isFuture && !d.isDeclaredHoliday).length;
-            row.attendanceRate = workable > 0 ? Math.round((worked / workable) * 100) : 0;
-            employees.push(row);
+            row.totals.Total = row.totals.P + row.totals.A + row.totals.HD + row.totals.WO
+                + row.totals.CO + row.totals.CL + row.totals.SL + row.totals.PL + row.totals.NHFH;
+            return row;
         }
+
+        // ── Process employees from Employee collection ──
+        const processedBids = new Set();
+        for (const emp of filteredActive) {
+            const bid = extractBiometricId(emp);
+            if (!bid) continue;
+            const key = String(bid).toUpperCase();
+            if (processedBids.has(key)) continue;
+            processedBids.add(key);
+            const empType = resolveEmployeeType(emp, settings);
+            employees.push(buildEmpRow(key, extractName(emp), extractDepartment(emp), extractDesignation(emp), empType));
+        }
+
+        // ── Also include any employees found in attendance records but missing above ──
+        // (ghost employees: in biometric device but Employee doc missing/no-biometric-ID)
+        for (const dayDoc of dayDocs) {
+            for (const entry of (dayDoc.employees || [])) {
+                const key = String(entry.biometricId || "").toUpperCase();
+                if (!key || processedBids.has(key)) continue;
+                if (department && department !== "all" && entry.department !== department) continue;
+                processedBids.add(key);
+                employees.push(buildEmpRow(
+                    key,
+                    entry.employeeName || key,
+                    entry.department || "—",
+                    entry.designation || "—",
+                    entry.employeeType || "operator"
+                ));
+            }
+        }
+
+        // Sort by department then name (matching uploaded sheet style)
         employees.sort((a, b) => {
             if (a.department !== b.department) return (a.department || "").localeCompare(b.department || "");
             return (a.employeeName || "").localeCompare(b.employeeName || "");
@@ -3356,378 +3663,220 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         wb.creator = "Grav Clothing HRMS";
         wb.created = new Date();
         const ws = wb.addWorksheet("Attendance", {
-            views: [{ state: "frozen", xSplit: 3, ySplit: 7, showGridLines: false }],
+            views: [{ state: "frozen", xSplit: 4, ySplit: 4, showGridLines: true }],
             pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
         });
 
-        const monthLabel = new Date(from + "T00:00:00").toLocaleDateString("en-IN", { month: "long", year: "numeric" });
-        // cols: #, Name, Dept, 1..lastDay, Total-Att, P, A, HD, MP, WO, LV, HW, Rate
-        const dayStart = 4;
-        const totalAttCol = dayStart + lastDay;
-        const afterCols = ["P", "A", "HD", "MP", "WO", "LV", "HW", "RATE"];
-        const totalCols = 3 + lastDay + 1 + afterCols.length;
+        // Column widths
+        ws.getColumn(1).width = 6;   // Sr
+        ws.getColumn(2).width = 24;  // Name
+        ws.getColumn(3).width = 14;  // Dept
+        ws.getColumn(4).width = 20;  // Designation
+        for (let d = 1; d <= lastDay; d++) ws.getColumn(4 + d).width = 4;
+        const sumStart = 4 + lastDay + 1;
+        const sumCols = ["P", "A", "HD", "WO", "CO", "CL", "SL", "PL", "NH/FH", "Total Days"];
+        sumCols.forEach((_, i) => { ws.getColumn(sumStart + i).width = 7; });
 
-        const STATUS = {
-            P: { font: "FF16A34A", fill: "FFDCFCE7" },
-            "P*": { font: "FF854D0E", fill: "FFFEF9C3" },
-            "P~": { font: "FF9A3412", fill: "FFFFEDD5" },
-            HD: { font: "FF92400E", fill: "FFFEF3C7" },
-            MP: { font: "FF9D174D", fill: "FFFCE7F3" },
-            AB: { font: "FF991B1B", fill: "FFFEE2E2" },
-            LWP: { font: "FF991B1B", fill: "FFFEE2E2" },
-            WO: { font: "FF475569", fill: "FFF1F5F9" },
-            PH: { font: "FF1E40AF", fill: "FFDBEAFE" },
-            FH: { font: "FF3730A3", fill: "FFE0E7FF" },
-            NH: { font: "FF831843", fill: "FFFCE7F3" },
-            OH: { font: "FF134E4A", fill: "FFCCFBF1" },
-            RH: { font: "FF78350F", fill: "FFFEF3C7" },
-            "L-CL": { font: "FF5B21B6", fill: "FFEDE9FE" },
-            "L-SL": { font: "FF5B21B6", fill: "FFEDE9FE" },
-            "L-EL": { font: "FF5B21B6", fill: "FFEDE9FE" },
-            WFH: { font: "FF155E75", fill: "FFCFFAFE" },
-            CO: { font: "FF0F766E", fill: "FFCCFBF1" },
-            "—": { font: "FFCBD5E1", fill: null },
-        };
+        const totalCols = 4 + lastDay + sumCols.length;
 
-        const THEME = {
-            heroStart: "FF0F172A", heroMid: "FF581C87",
-            accent: "FF7C3AED", accentText: "FFE9D5FF",
-            bg: "FFFFFFFF", bgAlt: "FFF8FAFC",
-            border: "FFE2E8F0",
-            textPrimary: "FF0F172A", textSecondary: "FF64748B", textMuted: "FF94A3B8",
-            sundayBg: "FFFEE2E2", sundayText: "FF991B1B",
-            holidayBg: "FFE0E7FF", holidayText: "FF3730A3",
-            totalAttBg: "FFDCFCE7", totalAttText: "FF166534",
-        };
+        // ── Row 1: Title ──
+        ws.mergeCells(1, 1, 1, totalCols);
+        const titleCell = ws.getCell("A1");
+        titleCell.value = `MONTHLY ATTENDANCE SHEET \u2014 ${monthLabel}`;
+        titleCell.font = { name: "Arial", size: 14, bold: true };
+        titleCell.alignment = { horizontal: "center", vertical: "middle" };
+        titleCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
+        titleCell.border = { top: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" }, bottom: { style: "thin" } };
+        ws.getRow(1).height = 22;
 
-        ws.mergeCells(1, 1, 2, totalCols);
-        const hero = ws.getCell(1, 1);
-        hero.value = {
-            richText: [
-                { text: "GRAV CLOTHING\n", font: { name: "Calibri", size: 10, bold: true, color: { argb: THEME.accentText }, italic: true } },
-                { text: `Muster Roll · ${monthLabel}`, font: { name: "Calibri", size: 22, bold: true, color: { argb: "FFFFFFFF" } } },
-            ]
-        };
-        hero.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroMid } };
-        hero.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        hero.border = {
-            top: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "medium", color: { argb: THEME.heroStart } },
-            right: { style: "medium", color: { argb: THEME.heroStart } },
-        };
-        ws.getRow(1).height = 20;
-        ws.getRow(2).height = 30;
+        // ── Row 2: Legend + holiday note ──
+        // Legend spans cols 1 to 12ish
+        const legendText = "P = Present\t\tA= Absent\t\tHD = Half Day\t\tWO = Week Off\t\tCL = Casual Leave\t\tSL = Sick Leave\t\tPL = Privilege Leave\t\t[ Purple border = HR Override ]";
+        ws.mergeCells(2, 1, 2, Math.min(totalCols - 3, 30));
+        const legendCell = ws.getCell(2, 1);
+        legendCell.value = legendText;
+        legendCell.font = { name: "Arial", size: 8 };
+        legendCell.alignment = { vertical: "middle" };
+        ws.getRow(2).height = 14;
 
-        // Stats bar
-        const grand = {
-            P: employees.reduce((a, e) => a + e.totals.P + e.totals["P*"] + e.totals["P~"], 0),
-            A: employees.reduce((a, e) => a + e.totals.AB, 0),
-            HD: employees.reduce((a, e) => a + e.totals.HD, 0),
-            MP: employees.reduce((a, e) => a + e.totals.MP, 0),
-            WO: employees.reduce((a, e) => a + e.totals.WO, 0),
-            L: employees.reduce((a, e) => a + e.totals.leaves, 0),
-            H: employees.reduce((a, e) => a + e.totals.FH + e.totals.NH + e.totals.OH + e.totals.RH, 0),
-            HW: employees.reduce((a, e) => a + e.totals.holidayWorked, 0),
-            SW: employees.reduce((a, e) => a + e.totals.sundayWorked, 0),
-            OT: employees.reduce((a, e) => a + e.totals.totalOtMins, 0),
-            TA: employees.reduce((a, e) => a + e.totals.totalAttendance, 0),
-        };
-        const hm = (m) => { if (!m || m <= 0) return "—"; const h = Math.floor(m / 60), mm = m % 60; return `${h}h ${String(mm).padStart(2, "0")}m`; };
-
-        const workingDaysInMonth = allDays.filter(d => !d.isSunday && !d.isFuture && !d.isDeclaredHoliday).length;
-        const holidayCount = allDays.filter(d => d.isDeclaredHoliday).length;
-        const sundayCount = allDays.filter(d => d.isSunday && !d.isWorkingSunday).length;
-
-        ws.mergeCells(3, 1, 3, totalCols);
-        const statsBar = ws.getCell(3, 1);
-        statsBar.value = `${employees.length} employees  ·  ${workingDaysInMonth} working days  ·  ${sundayCount} Sundays  ·  ${holidayCount} holidays  ·  Total Attendance ${grand.TA}  ·  Present ${grand.P}  ·  Absent ${grand.A}  ·  MP ${grand.MP}  ·  WO ${grand.WO}  ·  Leaves ${grand.L}  ·  Holiday Worked ${grand.HW}  ·  Sunday Worked ${grand.SW}  ·  OT ${hm(grand.OT)}`;
-        statsBar.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroStart } };
-        statsBar.font = { name: "Calibri", size: 9, color: { argb: THEME.accentText } };
-        statsBar.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        statsBar.border = {
-            bottom: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "medium", color: { argb: THEME.heroStart } },
-            right: { style: "medium", color: { argb: THEME.heroStart } },
-        };
-        ws.getRow(3).height = 28;
-        ws.getRow(4).height = 8;
-
-        // Legend
-        ws.mergeCells(5, 1, 5, totalCols);
-        const legend = ws.getCell(5, 1);
-        legend.value = `LEGEND:   ${L("P")} Present  ·  ${L("P*")} Late  ·  ${L("P~")} Early Out  ·  ${L("HD")} Half Day  ·  ${L("MP")} Miss Punch  ·  ${L("AB")} Absent  ·  ${L("WO")} Weekly Off  ·  ${L("FH")} Festival  ·  ${L("NH")} National  ·  ${L("OH")} Optional  ·  ${L("RH")} Restricted  ·  ${L("L-CL")} Casual  ·  ${L("L-SL")} Sick  ·  ${L("L-EL")} Earned  ·  ${L("WFH")} WFH  ·  ${L("CO")} Comp Off  ·  ★ = worked on holiday/Sunday`;
-        legend.font = { name: "Calibri", size: 9, color: { argb: THEME.textSecondary }, italic: true };
-        legend.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        legend.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.bgAlt } };
-        ws.getRow(5).height = 22;
-        ws.getRow(6).height = 4;
-
-        // Day header
-        const headerRow = ws.getRow(7);
-        headerRow.getCell(1).value = "#";
-        headerRow.getCell(2).value = "EMPLOYEE";
-        headerRow.getCell(3).value = "DEPARTMENT";
-        for (let i = 0; i < lastDay; i++) {
-            const cal = allDays[i];
-            const cell = headerRow.getCell(dayStart + i);
-            cell.value = {
-                richText: [
-                    { text: `${cal.dayLetter}\n`, font: { name: "Calibri", size: 7, color: { argb: cal.isSunday ? THEME.sundayText : cal.isDeclaredHoliday ? THEME.holidayText : THEME.textMuted } } },
-                    { text: `${cal.day}`, font: { name: "Calibri", size: 10, bold: true, color: { argb: cal.isSunday ? THEME.sundayText : cal.isDeclaredHoliday ? THEME.holidayText : "FFFFFFFF" } } },
-                ]
-            };
+        // Holiday notes on right side of row 2 (if any holidays)
+        const holidays = [...holidayMap.values()].filter(h => h.type !== "working_sunday").sort((a, b) => a.date.localeCompare(b.date));
+        if (holidays.length > 0) {
+            const h = holidays[0];
+            const [y2, m2, d2] = h.date.split("-").map(Number);
+            const ordinals = ["", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "11th", "12th", "13th", "14th", "15th", "16th", "17th", "18th", "19th", "20th", "21st", "22nd", "23rd", "24th", "25th", "26th", "27th", "28th", "29th", "30th", "31st"];
+            const mn = new Date(h.date + "T00:00:00").toLocaleDateString("en-IN", { month: "long" });
+            const noteCol = Math.max(Math.min(totalCols - sumCols.length + 1, totalCols - 2), 1);
+            ws.mergeCells(2, noteCol, 2, totalCols);
+            const noteCell = ws.getCell(2, noteCol);
+            noteCell.value = `${ordinals[d2]} ${mn} ${y2}\t\t${h.name}`;
+            noteCell.font = { name: "Arial", size: 8, italic: true };
+            noteCell.alignment = { horizontal: "right", vertical: "middle" };
         }
-        headerRow.getCell(totalAttCol).value = "TOTAL\nATT";
-        afterCols.forEach((h, i) => { headerRow.getCell(totalAttCol + 1 + i).value = h; });
 
-        headerRow.eachCell((c, colNum) => {
-            const isDay = colNum >= dayStart && colNum < dayStart + lastDay;
-            const isSunday = isDay && allDays[colNum - dayStart]?.isSunday;
-            const isHoliday = isDay && allDays[colNum - dayStart]?.isDeclaredHoliday;
-            const isTotalAtt = colNum === totalAttCol;
+        // ── Row 3: Column headers ──
+        ws.getRow(3).height = 16;
+        const hdr = ws.getRow(3);
+        hdr.getCell(1).value = "Sr.  No.";
+        hdr.getCell(2).value = "Employee Name";
+        hdr.getCell(3).value = "Department";
+        hdr.getCell(4).value = "Designation";
+        for (let d = 1; d <= lastDay; d++) {
+            hdr.getCell(4 + d).value = d;
+        }
+        sumCols.forEach((h, i) => { hdr.getCell(sumStart + i).value = h; });
 
-            let fill = THEME.heroMid;
-            if (isSunday) fill = THEME.sundayBg;
-            else if (isHoliday) fill = THEME.holidayBg;
-            else if (isTotalAtt) fill = "FF065F46";
-            c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: fill } };
-            if (!isDay) c.font = { bold: true, size: 9, color: { argb: "FFFFFFFF" } };
-            c.alignment = { horizontal: colNum === 2 ? "left" : "center", vertical: "middle", wrapText: true, indent: colNum === 2 ? 1 : 0 };
-            c.border = {
-                top: { style: "thin", color: { argb: THEME.heroStart } },
-                bottom: { style: "medium", color: { argb: THEME.heroStart } },
-                left: { style: "thin", color: { argb: "FF4C1D95" } },
-                right: { style: "thin", color: { argb: "FF4C1D95" } },
-            };
+        hdr.eachCell((cell, col) => {
+            const isDay = col >= 5 && col < sumStart;
+            const isSumCol = col >= sumStart;
+            const isTitleCol = col <= 4;
+            cell.font = { name: "Arial", size: 9, bold: true };
+            cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+            if (isTitleCol) {
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } };
+            } else if (isSumCol) {
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF4B942" } };
+            } else {
+                const dayIdx = col - 5;
+                const cal = allDays[dayIdx];
+                if (cal?.isSunday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
+                else if (cal?.isDeclaredHoliday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFB4C6E7" } };
+                else cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } };
+            }
+            cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
         });
-        headerRow.height = 34;
 
-        ws.getColumn(1).width = 5;
-        ws.getColumn(2).width = 28;
-        ws.getColumn(3).width = 16;
-        for (let i = 0; i < lastDay; i++) ws.getColumn(dayStart + i).width = 4;
-        ws.getColumn(totalAttCol).width = 8;
-        for (let i = 0; i < afterCols.length - 1; i++) ws.getColumn(totalAttCol + 1 + i).width = 5.5;
-        ws.getColumn(totalAttCol + afterCols.length).width = 7; // rate
+        // ── Row 4: Day-of-week abbreviations ──
+        ws.getRow(4).height = 14;
+        const dowRow = ws.getRow(4);
+        for (let d = 1; d <= lastDay; d++) {
+            const cal = allDays[d - 1];
+            const cell = dowRow.getCell(4 + d);
+            cell.value = cal.dayAbbr;
+            cell.font = { name: "Arial", size: 7, bold: false };
+            cell.alignment = { horizontal: "center", vertical: "middle" };
+            if (cal.isSunday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
+            else if (cal.isDeclaredHoliday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFB4C6E7" } };
+            cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+        }
 
-        // Data rows
-        let rowIdx = 8;
+        // Status cell styles
+        const STATUS_STYLE = {
+            "P": { font: "FF000000", fill: null },  // no background — present is default
+            "A": { font: "FF9C0006", fill: "FFFFC7CE" },  // red (unchanged)
+            "HD": { font: "FF7D4701", fill: "FFFFEB9C" },
+            "WO": { font: "FF375623", fill: "FFC6EFCE" },  // green — weekly off stands out
+            "CO": { font: "FF0D4A8C", fill: "FFBDD7EE" },
+            "CL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+            "SL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+            "PL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+            "FH": { font: "FF1F4E79", fill: "FFDCE6F1" },
+            "NH": { font: "FF7B1E46", fill: "FFFCE4EC" },
+            "": { font: "FFAAAAAA", fill: null },
+        };
+
+        // Column totals for TOTALS row
+        const colTotals = new Array(totalCols + 1).fill(0);
+
+        // ── Employee rows (starting from row 5) ──
         employees.forEach((emp, i) => {
-            const r = ws.getRow(rowIdx);
+            const rowNum = 5 + i;
+            const r = ws.getRow(rowNum);
+            r.height = 15;
+
             r.getCell(1).value = i + 1;
-            r.getCell(2).value = {
-                richText: [
-                    { text: `${emp.employeeName}\n`, font: { name: "Calibri", size: 10, bold: true, color: { argb: THEME.textPrimary } } },
-                    { text: `${emp.designation} · ${emp.employeeType === "executive" ? "EXE" : "OPR"}`, font: { name: "Calibri", size: 8, color: { argb: THEME.textMuted } } },
-                ]
-            };
+            r.getCell(2).value = emp.employeeName;
             r.getCell(3).value = emp.department;
+            r.getCell(4).value = emp.designation;
 
-            for (let di = 0; di < lastDay; di++) {
-                const cal = allDays[di];
-                const d = emp.days[cal.dateStr] || { status: "—" };
-                const cfg = STATUS[d.status] || STATUS["—"];
-                const cell = r.getCell(dayStart + di);
-
-                // Show label + star if worked on holiday or Sunday
-                const star = (d.punchedOnHoliday || d.isSundayWorked) ? "★" : "";
-                cell.value = star ? `${L(d.status)}${star}` : L(d.status);
-
-                if (cfg.fill) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cfg.fill } };
-                cell.font = { name: "Calibri", size: 8, bold: !!cfg.fill, color: { argb: cfg.font } };
-                cell.alignment = { horizontal: "center", vertical: "middle" };
-
-                if (d.hrOverride) {
-                    cell.border = {
-                        top: { style: "medium", color: { argb: THEME.accent } },
-                        bottom: { style: "medium", color: { argb: THEME.accent } },
-                        left: { style: "medium", color: { argb: THEME.accent } },
-                        right: { style: "medium", color: { argb: THEME.accent } },
-                    };
-                } else {
-                    cell.border = {
-                        top: { style: "thin", color: { argb: THEME.border } },
-                        bottom: { style: "thin", color: { argb: THEME.border } },
-                        left: { style: "thin", color: { argb: THEME.border } },
-                        right: { style: "thin", color: { argb: THEME.border } },
-                    };
-                }
-                if ((d.otMins || 0) > 0) {
-                    cell.border = { ...cell.border, bottom: { style: "thick", color: { argb: "FF4338CA" } } };
-                }
-            }
-
-            // Total Attendance
-            const taCell = r.getCell(totalAttCol);
-            taCell.value = emp.totals.totalAttendance || 0;
-            taCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.totalAttBg } };
-            taCell.font = { name: "Calibri", size: 11, bold: true, color: { argb: THEME.totalAttText } };
-            taCell.alignment = { horizontal: "center", vertical: "middle" };
-            taCell.border = {
-                top: { style: "thin", color: { argb: THEME.border } },
-                bottom: { style: "thin", color: { argb: THEME.border } },
-                left: { style: "medium", color: { argb: "FF065F46" } },
-                right: { style: "medium", color: { argb: "FF065F46" } },
-            };
-
-            // Individual totals: P, A, HD, MP, WO, LV, HW
-            const presentCount = emp.totals.P + emp.totals["P*"] + emp.totals["P~"];
-            const totalsData = [
-                { v: presentCount || "—", fill: presentCount ? "FFDCFCE7" : THEME.bgAlt, font: presentCount ? "FF166534" : THEME.textMuted },
-                { v: emp.totals.AB || "—", fill: emp.totals.AB ? "FFFECACA" : THEME.bgAlt, font: emp.totals.AB ? "FF991B1B" : THEME.textMuted },
-                { v: emp.totals.HD || "—", fill: emp.totals.HD ? "FFFEF3C7" : THEME.bgAlt, font: emp.totals.HD ? "FF854D0E" : THEME.textMuted },
-                { v: emp.totals.MP || "—", fill: emp.totals.MP ? "FFFCE7F3" : THEME.bgAlt, font: emp.totals.MP ? "FF9D174D" : THEME.textMuted },
-                { v: emp.totals.WO || "—", fill: emp.totals.WO ? "FFF1F5F9" : THEME.bgAlt, font: emp.totals.WO ? "FF475569" : THEME.textMuted },
-                { v: emp.totals.leaves || "—", fill: emp.totals.leaves ? "FFEDE9FE" : THEME.bgAlt, font: emp.totals.leaves ? "FF6B21A8" : THEME.textMuted },
-                { v: emp.totals.holidayWorked || "—", fill: emp.totals.holidayWorked ? "FFFEF3C7" : THEME.bgAlt, font: emp.totals.holidayWorked ? "FF854D0E" : THEME.textMuted },
-            ];
-            totalsData.forEach((t, ti) => {
-                const cell = r.getCell(totalAttCol + 1 + ti);
-                cell.value = t.v;
-                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: t.fill } };
-                cell.font = { name: "Calibri", size: 9, bold: true, color: { argb: t.font } };
-                cell.alignment = { horizontal: "center", vertical: "middle" };
-                cell.border = {
-                    top: { style: "thin", color: { argb: THEME.border } },
-                    bottom: { style: "thin", color: { argb: THEME.border } },
-                    left: { style: "thin", color: { argb: THEME.border } },
-                    right: { style: "thin", color: { argb: THEME.border } },
-                };
+            // Style first 4 cols
+            [1, 2, 3, 4].forEach(col => {
+                const cell = r.getCell(col);
+                const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: altBg } };
+                cell.font = { name: "Arial", size: 9 };
+                cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+                if (col === 1) cell.alignment = { horizontal: "center", vertical: "middle" };
+                else cell.alignment = { horizontal: "left", vertical: "middle" };
             });
 
-            const rate = emp.attendanceRate;
-            const rateFill = rate >= 95 ? "FF16A34A" : rate >= 85 ? "FFCA8A04" : rate >= 70 ? "FFEA580C" : "FFDC2626";
-            const rateCell = r.getCell(totalAttCol + afterCols.length);
-            rateCell.value = `${rate}%`;
-            rateCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: rateFill } };
-            rateCell.font = { name: "Calibri", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
-            rateCell.alignment = { horizontal: "center", vertical: "middle" };
-            rateCell.border = {
-                top: { style: "thin", color: { argb: THEME.border } },
-                bottom: { style: "thin", color: { argb: THEME.border } },
-                left: { style: "thin", color: { argb: THEME.border } },
-                right: { style: "thin", color: { argb: THEME.border } },
-            };
-
-            [1, 2, 3].forEach((c) => {
-                const cell = r.getCell(c);
-                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: i % 2 === 0 ? THEME.bg : THEME.bgAlt } };
-                if (c === 1) {
-                    cell.font = { name: "Calibri", size: 9, color: { argb: THEME.textMuted } };
-                    cell.alignment = { horizontal: "center", vertical: "middle" };
-                } else if (c === 3) {
-                    cell.font = { name: "Calibri", size: 9, color: { argb: THEME.textSecondary } };
-                    cell.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-                } else {
-                    cell.alignment = { vertical: "middle", horizontal: "left", indent: 1, wrapText: true };
+            // Day cells
+            allDays.forEach((cal, di) => {
+                const cell = r.getCell(5 + di);
+                const code = emp.dayCodes[cal.dateStr] || "";
+                const isHrOverride = emp.hrOverrides.has(cal.dateStr);
+                cell.value = code;
+                const st = STATUS_STYLE[code] || STATUS_STYLE[""];
+                cell.font = { name: "Arial", size: 8, bold: !!code, color: { argb: st.font } };
+                cell.alignment = { horizontal: "center", vertical: "middle" };
+                if (st.fill) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: st.fill } };
+                else {
+                    const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+                    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cal.isSunday ? "FFFFF0F0" : altBg } };
                 }
-                cell.border = {
-                    top: { style: "thin", color: { argb: THEME.border } },
-                    bottom: { style: "thin", color: { argb: THEME.border } },
-                    left: { style: "thin", color: { argb: THEME.border } },
-                    right: { style: "thin", color: { argb: THEME.border } },
-                };
+                // HR override: thick purple border + note
+                if (isHrOverride) {
+                    cell.border = {
+                        top: { style: "medium", color: { argb: "FF7C3AED" } },
+                        left: { style: "medium", color: { argb: "FF7C3AED" } },
+                        right: { style: "medium", color: { argb: "FF7C3AED" } },
+                        bottom: { style: "medium", color: { argb: "FF7C3AED" } },
+                    };
+                    cell.note = { texts: [{ font: { bold: true, size: 9, color: { argb: "FF7C3AED" } }, text: "HR Override" }] };
+                } else {
+                    cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+                }
             });
-            r.height = 28;
-            rowIdx++;
+
+            // Summary columns
+            const vals = [emp.totals.P, emp.totals.A, emp.totals.HD, emp.totals.WO, emp.totals.CO, emp.totals.CL, emp.totals.SL, emp.totals.PL, emp.totals.NHFH, emp.totals.Total];
+            vals.forEach((v, si) => {
+                const cell = r.getCell(sumStart + si);
+                cell.value = v;
+                cell.font = { name: "Arial", size: 9, bold: si === sumCols.length - 1 };
+                cell.alignment = { horizontal: "center", vertical: "middle" };
+                const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: si === sumCols.length - 1 ? "FFF4B942" : altBg } };
+                cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+                colTotals[sumStart + si] = (colTotals[sumStart + si] || 0) + v;
+            });
         });
 
-        // Footer
-        const footerRow = ws.getRow(rowIdx);
-        ws.mergeCells(rowIdx, 1, rowIdx, 3);
-        footerRow.getCell(1).value = "COMPANY TOTAL";
-        footerRow.getCell(1).font = { name: "Calibri", size: 11, bold: true, color: { argb: "FFFFFFFF" } };
-        footerRow.getCell(1).alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-        footerRow.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroMid } };
+        // ── TOTALS row ──
+        const totRow = ws.getRow(5 + employees.length);
+        totRow.height = 16;
+        ws.mergeCells(5 + employees.length, 1, 5 + employees.length, 4);
+        const totLabel = totRow.getCell(1);
+        totLabel.value = "TOTALS";
+        totLabel.font = { name: "Arial", size: 10, bold: true };
+        totLabel.alignment = { horizontal: "center", vertical: "middle" };
+        totLabel.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } };
+        totLabel.border = { top: { style: "medium" }, left: { style: "medium" }, right: { style: "thin" }, bottom: { style: "medium" } };
 
-        for (let di = 0; di < lastDay; di++) {
-            const cal = allDays[di];
-            let presentToday = 0;
-            for (const e of employees) {
-                const d = e.days[cal.dateStr];
-                if (d && ["P", "P*", "P~"].includes(d.status)) presentToday++;
+        // Day totals (count of P in each day)
+        allDays.forEach((cal, di) => {
+            const cell = totRow.getCell(5 + di);
+            if (!cal.isFuture) {
+                const cnt = employees.filter(e => e.dayCodes[cal.dateStr] === "P").length;
+                cell.value = cnt || 0;
+            } else {
+                cell.value = 0;
             }
-            const cell = footerRow.getCell(dayStart + di);
-            cell.value = cal.isFuture ? "" : presentToday;
-            cell.font = { name: "Calibri", size: 8, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.font = { name: "Arial", size: 9, bold: true };
             cell.alignment = { horizontal: "center", vertical: "middle" };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cal.isSunday ? "FF7F1D1D" : cal.isDeclaredHoliday ? "FF3730A3" : THEME.heroStart } };
-            cell.border = {
-                top: { style: "medium", color: { argb: THEME.heroStart } },
-                bottom: { style: "medium", color: { argb: THEME.heroStart } },
-                left: { style: "thin", color: { argb: "FF334155" } },
-                right: { style: "thin", color: { argb: "FF334155" } },
-            };
-        }
-
-        const taFooter = footerRow.getCell(totalAttCol);
-        taFooter.value = grand.TA;
-        taFooter.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FFFFFFFF" } };
-        taFooter.alignment = { horizontal: "center", vertical: "middle" };
-        taFooter.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF065F46" } };
-        taFooter.border = {
-            top: { style: "medium", color: { argb: THEME.heroStart } },
-            bottom: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "medium", color: { argb: "FF065F46" } },
-            right: { style: "medium", color: { argb: "FF065F46" } },
-        };
-
-        [grand.P, grand.A, grand.HD, grand.MP, grand.WO, grand.L, grand.HW].forEach((v, ti) => {
-            const cell = footerRow.getCell(totalAttCol + 1 + ti);
-            cell.value = v;
-            cell.font = { name: "Calibri", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
-            cell.alignment = { horizontal: "center", vertical: "middle" };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroMid } };
-            cell.border = {
-                top: { style: "medium", color: { argb: THEME.heroStart } },
-                bottom: { style: "medium", color: { argb: THEME.heroStart } },
-                left: { style: "thin", color: { argb: "FF4C1D95" } },
-                right: { style: "thin", color: { argb: "FF4C1D95" } },
-            };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cal.isSunday ? "FFFFC7CE" : cal.isDeclaredHoliday ? "FFB4C6E7" : "FF8EA9C1" } };
+            cell.border = { top: { style: "medium" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "medium" } };
         });
 
-        const avgRate = employees.length ? Math.round(employees.reduce((a, e) => a + e.attendanceRate, 0) / employees.length) : 0;
-        const rateFooter = footerRow.getCell(totalAttCol + afterCols.length);
-        rateFooter.value = `${avgRate}%`;
-        rateFooter.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FFFFFFFF" } };
-        rateFooter.alignment = { horizontal: "center", vertical: "middle" };
-        rateFooter.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.accent } };
-        rateFooter.border = {
-            top: { style: "medium", color: { argb: THEME.heroStart } },
-            bottom: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "thin", color: { argb: "FF4C1D95" } },
-            right: { style: "medium", color: { argb: THEME.heroStart } },
-        };
-        footerRow.height = 28;
-
-        // Holiday listing
-        const activeHolidays = [...holidayMap.values()].filter(h => h.type !== "working_sunday").sort((a, b) => a.date.localeCompare(b.date));
-        if (activeHolidays.length > 0) {
-            const holStartRow = rowIdx + 2;
-            ws.mergeCells(holStartRow, 1, holStartRow, totalCols);
-            const holHeader = ws.getCell(holStartRow, 1);
-            holHeader.value = `HOLIDAYS THIS MONTH  ·  ${activeHolidays.length} total`;
-            holHeader.font = { name: "Calibri", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
-            holHeader.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-            holHeader.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.holidayText } };
-            ws.getRow(holStartRow).height = 22;
-
-            activeHolidays.forEach((h, idx) => {
-                const r = ws.getRow(holStartRow + 1 + idx);
-                ws.mergeCells(holStartRow + 1 + idx, 1, holStartRow + 1 + idx, Math.min(3, totalCols));
-                ws.mergeCells(holStartRow + 1 + idx, 4, holStartRow + 1 + idx, totalCols);
-                const typeMap = { national: "NH · National", company: "FH · Festival", optional: "OH · Optional", restricted: "RH · Restricted" };
-                r.getCell(1).value = h.date;
-                r.getCell(1).font = { name: "Consolas", size: 10, bold: true, color: { argb: THEME.holidayText } };
-                r.getCell(1).alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-                r.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.holidayBg } };
-                r.getCell(4).value = `${typeMap[h.type] || "PH"}  ·  ${h.name}${h.description ? `  —  ${h.description}` : ""}`;
-                r.getCell(4).font = { name: "Calibri", size: 10, color: { argb: THEME.textPrimary } };
-                r.getCell(4).alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-                r.getCell(4).fill = { type: "pattern", pattern: "solid", fgColor: { argb: idx % 2 === 0 ? THEME.bg : THEME.bgAlt } };
-                r.height = 20;
-            });
-        }
+        // Summary col totals
+        sumCols.forEach((_, si) => {
+            const cell = totRow.getCell(sumStart + si);
+            cell.value = colTotals[sumStart + si] || 0;
+            cell.font = { name: "Arial", size: 10, bold: true };
+            cell.alignment = { horizontal: "center", vertical: "middle" };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF4B942" } };
+            cell.border = { top: { style: "medium" }, left: { style: "thin" }, right: si === sumCols.length - 1 ? { style: "medium" } : { style: "thin" }, bottom: { style: "medium" } };
+        });
 
         const buffer = await wb.xlsx.writeBuffer();
         const filename = `attendance_${yearMonth}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
@@ -3770,13 +3919,47 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
 
         const holidayMap = await loadHolidayMap(from, to);
 
+        // ── Load ALL leave applications for this employee in this range ──────
+        // Includes all statuses: pending, approved, rejected, cancelled
+        // Used for both: (a) future date display and (b) the leave applications panel
+        const leaveAppsQuery = {
+            fromDate: { $lte: to },
+            toDate: { $gte: from },
+        };
+        if (empDoc) {
+            leaveAppsQuery.$or = [
+                { biometricId: bid },
+                { employeeId: empDoc._id },
+            ];
+        } else {
+            leaveAppsQuery.biometricId = bid;
+        }
+        const allLeaveApps = await LeaveApplication.find(leaveAppsQuery)
+            .sort({ applicationDate: -1 })
+            .lean();
+
+        // Build approved-leave date map for future-date row status
+        const LEAVE_TYPE_TO_STATUS = { CL: "L-CL", SL: "L-SL", PL: "L-EL" };
+        const approvedLeaveByDate = new Map();
+        for (const lv of allLeaveApps) {
+            if (lv.status !== "hr_approved") continue;
+            const s = new Date(lv.fromDate + "T00:00:00");
+            const e = new Date(lv.toDate + "T00:00:00");
+            for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+                const ds = dateStrOf(new Date(d));
+                if (!approvedLeaveByDate.has(ds)) {
+                    approvedLeaveByDate.set(ds, LEAVE_TYPE_TO_STATUS[lv.leaveType] || "L-CL");
+                }
+            }
+        }
+
         const start = new Date(from + "T00:00:00");
         const end = new Date(to + "T00:00:00");
         const today = new Date(); today.setHours(0, 0, 0, 0);
 
+        // ── Build FULL calendar — all dates including future ─────────────────
         const calendar = [];
         for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-            if (d > today) continue;
             const ds = dateStrOf(new Date(d));
             const dow = d.getDay();
             calendar.push({
@@ -3786,6 +3969,7 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
                 dayNum: d.getDate(),
                 monthName: new Date(d).toLocaleDateString("en-IN", { month: "short" }),
                 isSunday: dow === 0,
+                isFuture: d > today,
                 restStatus: resolveRestDayStatus(ds, dow, holidayMap),
                 holiday: holidayMap.get(ds) || null,
             });
@@ -3806,10 +3990,38 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
         };
 
         for (const cal of calendar) {
+
+            // ── Future dates ─────────────────────────────────────────────────
+            if (cal.isFuture) {
+                const leaveCode = approvedLeaveByDate.get(cal.dateStr);
+                if (leaveCode) {
+                    // Approved leave on a future date
+                    rows.push({ ...cal, status: leaveCode, label: getDisplayLabel(leaveCode, settings), synced: false });
+                    if (stats[leaveCode] !== undefined) stats[leaveCode]++;
+                    stats.leaves++;
+                    stats.totalAttendance++;
+                } else if (cal.restStatus) {
+                    // Future holiday or Sunday
+                    rows.push({ ...cal, status: cal.restStatus, label: getDisplayLabel(cal.restStatus, settings), synced: false });
+                } else {
+                    // Plain future working day — no data yet
+                    rows.push({ ...cal, status: "FUTURE", label: "—", synced: false });
+                }
+                continue;
+            }
+
+            // ── Past / today ─────────────────────────────────────────────────
             const dayDoc = byDate.get(cal.dateStr);
 
             if (!dayDoc) {
-                if (cal.restStatus) {
+                // Check approved leave first (might have been approved after sync)
+                const leaveCode = approvedLeaveByDate.get(cal.dateStr);
+                if (leaveCode) {
+                    rows.push({ ...cal, status: leaveCode, label: getDisplayLabel(leaveCode, settings), synced: false });
+                    if (stats[leaveCode] !== undefined) stats[leaveCode]++;
+                    stats.leaves++;
+                    stats.totalAttendance++;
+                } else if (cal.restStatus) {
                     rows.push({ ...cal, status: cal.restStatus, label: getDisplayLabel(cal.restStatus, settings), synced: false });
                     if (stats[cal.restStatus] !== undefined) stats[cal.restStatus]++;
                     stats.totalAttendance++;
@@ -3820,7 +4032,9 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
                 continue;
             }
 
-            const entry = (dayDoc.employees || []).find((e) => e.biometricId === bid);
+            const entry = (dayDoc.employees || []).find((e) => e.biometricId === bid)
+                || (empDoc ? (dayDoc.employees || []).find((e) => e.employeeDbId?.toString() === empDoc._id.toString()) : null);
+
             if (!entry) {
                 const s = cal.restStatus || "AB";
                 rows.push({ ...cal, status: s, label: getDisplayLabel(s, settings), synced: true });
@@ -3907,7 +4121,29 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
             };
         }
 
-        res.json({ success: true, from, to, biometricId: bid, employee: empMeta, rows, stats });
+        // ── Serialize leave applications for the frontend panel ──────────────
+        const leaveApplications = allLeaveApps.map(lv => ({
+            _id: lv._id,
+            leaveType: lv.leaveType,
+            status: lv.status,
+            fromDate: lv.fromDate,
+            toDate: lv.toDate,
+            totalDays: lv.totalDays,
+            reason: lv.reason,
+            applicationDate: lv.applicationDate,
+            isHalfDay: lv.isHalfDay || false,
+            halfDaySlot: lv.halfDaySlot || null,
+            rejectionReason: lv.rejectionReason || null,
+            hrRemarks: lv.hrRemarks || null,
+            managerDecisions: lv.managerDecisions || [],
+        }));
+
+        res.json({
+            success: true, from, to, biometricId: bid,
+            employee: empMeta, rows, stats,
+            leaveApplications,
+            displayLabels: settings.displayLabels || {},
+        });
     } catch (err) {
         console.error("[TIMECARD]", err.message, err.stack);
         res.status(500).json({ success: false, message: err.message });
@@ -4172,29 +4408,22 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                     const emp = dayDoc.employees[idx];
                     const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
 
-                    // ── Parse helper ────────────────────────────────────────
-                    const parseTimeOnDate = (timeStr) => {
-                        if (!timeStr) return null;
-                        const [h, m] = String(timeStr).split(":").map(Number);
-                        const d = new Date(r.dateStr + "T00:00:00+05:30");
-                        d.setHours(h || 0, m || 0, 0, 0);
-                        return d;
-                    };
-
+                    // ── Use IST-aware parser (no local function needed) ────
                     const punchFieldMap = {
                         in: "inTime", lunch_out: "lunchOut", lunch_in: "lunchIn",
                         tea_out: "teaOut", tea_in: "teaIn", out: "finalOut",
                     };
 
                     // ── 1. Apply whole-day proposed times (legacy / simple) ─
+                    // ── 1. Apply whole-day proposed times (legacy / simple) ─
                     if (r.proposedInTime) {
                         const oldT = emp.inTime ? fmtTimeIST12(emp.inTime) : "—";
-                        emp.inTime = parseTimeOnDate(r.proposedInTime);
+                        emp.inTime = parseTimeOnDateIST(r.proposedInTime, r.dateStr);
                         punchChanges.push({ punchType: "in", action: "modify", oldTime: oldT, newTime: fmtTimeIST12(emp.inTime) });
                     }
                     if (r.proposedOutTime) {
                         const oldT = emp.finalOut ? fmtTimeIST12(emp.finalOut) : "—";
-                        emp.finalOut = parseTimeOnDate(r.proposedOutTime);
+                        emp.finalOut = parseTimeOnDateIST(r.proposedOutTime, r.dateStr);
                         punchChanges.push({ punchType: "out", action: "modify", oldTime: oldT, newTime: fmtTimeIST12(emp.finalOut) });
                     }
 
@@ -4208,7 +4437,7 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                                 emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== r.proposedPunchType);
                                 punchChanges.push({ punchType: r.proposedPunchType, action: "remove", oldTime: oldT, newTime: "removed" });
                             } else if (r.proposedPunchTime) {
-                                const newDate = parseTimeOnDate(r.proposedPunchTime);
+                                const newDate = parseTimeOnDateIST(r.proposedPunchTime, r.dateStr);
                                 emp[fieldName] = newDate;
                                 // Upsert rawPunch
                                 const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === r.proposedPunchType);
@@ -4231,7 +4460,7 @@ router.patch("/regularizations/:id/hr-approve", EmployeeAuthMiddlewear, async (r
                             emp.rawPunches = (emp.rawPunches || []).filter(p => p.punchType !== pc.punchType);
                             punchChanges.push({ punchType: pc.punchType, action: "remove", oldTime: oldT, newTime: "removed" });
                         } else if (pc.punchTime) {
-                            const newDate = parseTimeOnDate(pc.punchTime);
+                            const newDate = parseTimeOnDateIST(pc.punchTime, r.dateStr);
                             emp[fieldName] = newDate;
                             const existingIdx = (emp.rawPunches || []).findIndex(p => p.punchType === pc.punchType);
                             const entry = { time: newDate, punchType: pc.punchType, source: "miss_punch", addedBy: req.user?.id, addedAt: new Date() };
@@ -4408,6 +4637,370 @@ router.delete("/holidays/:id", EmployeeAuthMiddlewear, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ATTENDANCE PUNCH NOTIFICATIONS + SETTINGS
+//  Dependencies: npm install node-cron
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Inline notification settings model ──────────────────────────────────────
+const mongoose = require("mongoose");
+const HRNotifSettingsSchema = new mongoose.Schema({
+    singleton: { type: String, default: "global", unique: true },
+    checkin_missing: { type: Boolean, default: true },
+    lunch_missing: { type: Boolean, default: true },
+    checkout_missing: { type: Boolean, default: true },
+    yesterday_digest: { type: Boolean, default: true },
+}, { _id: false });
+const HRNotifSettings = mongoose.models.HRNotificationSettings
+    || mongoose.model("HRNotificationSettings", HRNotifSettingsSchema);
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function istDateStr(offsetDays = 0) {
+    const d = new Date(Date.now() + 5.5 * 60 * 60 * 1000 + offsetDays * 86400000);
+    return d.toISOString().slice(0, 10);
+}
+
+async function getNotifSettings() {
+    try {
+        return (await HRNotifSettings.findOne({ singleton: "global" }).lean()) ||
+            { checkin_missing: true, lunch_missing: true, checkout_missing: true, yesterday_digest: true };
+    } catch (_) {
+        return { checkin_missing: true, lunch_missing: true, checkout_missing: true, yesterday_digest: true };
+    }
+}
+
+async function getLeaveEmployeeIds(dateStr) {
+    const apps = await LeaveApplication.find({
+        startDate: { $lte: new Date(dateStr + "T23:59:59Z") },
+        endDate: { $gte: new Date(dateStr + "T00:00:00Z") },
+        status: { $in: ["hr_approved", "manager_approved", "pending"] },
+    }).select("employeeId").lean();
+    return new Set(apps.map(a => String(a.employeeId)));
+}
+
+// ── Push + email fallback ─────────────────────────────────────────────────────
+async function notifyHR(title, body, issues, dateStr) {
+    let pushOk = false;
+    try {
+        const { messaging } = require("../../config/firebaseAdmin");
+        const HRDept = require("../../models/HR_Models/HRDepartment");
+        const hrList = await HRDept.find({ isActive: { $ne: false } }).select("fcmTokens").lean();
+        const tokens = hrList.flatMap(h => h.fcmTokens || []).filter(Boolean);
+        if (tokens.length) {
+            let sent = 0;
+            for (const token of tokens) {
+                try {
+                    await messaging.send({
+                        token,
+                        notification: { title, body },
+                        webpush: { notification: { title, body, icon: "/logo.png" }, fcmOptions: { link: "/hr/dashboard/attendance" } },
+                    });
+                    sent++;
+                } catch (_) { }
+            }
+            pushOk = sent > 0;
+        }
+    } catch (_) { }
+
+    // Email fallback — only fires if push reached nobody
+    if (!pushOk && issues?.length && emailService?._send) {
+        try {
+            const HRDept = require("../../models/HR_Models/HRDepartment");
+            const hrList = await HRDept.find({ isActive: { $ne: false } }).select("email name").lean();
+            const toList = hrList.filter(h => h.email).map(h => ({ email: h.email, name: h.name }));
+            if (!toList.length) return;
+            const rows = issues.map(i => `<tr><td style="padding:9px 12px;font-size:13px;font-weight:600">${i.name}</td><td style="padding:9px 12px;font-size:13px;color:#555">${i.empId}</td><td style="padding:9px 12px;font-size:13px;color:#555">${i.dept}</td><td style="padding:9px 12px"><span style="background:${i.bg};color:${i.color};padding:3px 8px;border-radius:99px;font-size:11px;font-weight:700">${i.issue}</span></td></tr>`).join("");
+            const html = `<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto"><div style="background:#1a1a2e;padding:20px 28px;border-radius:10px 10px 0 0"><h2 style="color:#fff;margin:0;font-size:17px">${title}</h2><p style="color:#aaa;margin:4px 0 0;font-size:12px">Date: ${dateStr} · Push notification could not be delivered</p></div><div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:20px 28px"><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f7fafc"><th style="padding:9px 12px;text-align:left;font-size:12px">Name</th><th style="padding:9px 12px;text-align:left;font-size:12px">ID</th><th style="padding:9px 12px;text-align:left;font-size:12px">Dept</th><th style="padding:9px 12px;text-align:left;font-size:12px">Issue</th></tr></thead><tbody>${rows}</tbody></table><p style="font-size:12px;color:#888;margin-top:16px">Grav HR System · Automated alert</p></div></div>`;
+            for (const hr of toList) {
+                await emailService._send({ to: [hr], subject: `${title} [${dateStr}]`, htmlContent: html, textContent: body + "\n\n" + issues.map(i => `${i.name} (${i.empId}) — ${i.issue}`).join("\n") }).catch(() => { });
+            }
+        } catch (_) { }
+    }
+}
+
+// ── Cron runners ─────────────────────────────────────────────────────────────
+
+async function runCheckinAlert() {
+    try {
+        const s = await getNotifSettings();
+        if (!s.checkin_missing) return;
+        const today = istDateStr();
+        const onLeave = await getLeaveEmployeeIds(today);
+        const doc = await DailyAttendance.findOne({ dateStr: today }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department _id").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const missing = [];
+        for (const emp of doc.employees) {
+            if (emp.inTime) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            const ed = empMap[emp.biometricId];
+            if (ed && onLeave.has(String(ed._id))) continue;
+            missing.push({ name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId, empId: emp.biometricId || "—", dept: ed?.department || "—", issue: "No Check-In", bg: "#fee2e2", color: "#b91c1c" });
+        }
+        if (!missing.length) return;
+
+        const names = missing.slice(0, 3).map(m => m.name).join(", ") + (missing.length > 3 ? ` +${missing.length - 3} more` : "");
+        await notifyHR(`⚠️ ${missing.length} employee(s) haven't checked in`, `${names} — no punch & no approved leave as of 10:15 AM.`, missing, today);
+        console.log(`[PunchNotif] 10:15 check-in: ${missing.length} missing`);
+    } catch (e) { console.error("[PunchNotif] checkin:", e.message); }
+}
+
+async function runLunchAlert(type) {
+    try {
+        const s = await getNotifSettings();
+        if (!s.lunch_missing) return;
+        const today = istDateStr();
+        const doc = await DailyAttendance.findOne({ dateStr: today }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const missing = [];
+        for (const emp of doc.employees) {
+            if (!emp.inTime) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["AB", "WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            // Only operator-type employees have lunch punches tracked
+            if (emp.employeeType !== "operator") continue;
+            if (type === "lunch_in" && !emp.lunchIn) { /* missing */ }
+            else if (type === "lunch_out" && emp.lunchIn && !emp.lunchOut) { /* missing */ }
+            else continue;
+            const ed = empMap[emp.biometricId];
+            missing.push({ name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId, empId: emp.biometricId || "—", dept: ed?.department || "—", issue: type === "lunch_in" ? "No Lunch-In" : "No Lunch-Out", bg: "#fef3c7", color: "#92400e" });
+        }
+        if (!missing.length) return;
+        const label = type === "lunch_in" ? "lunch-in" : "lunch-out";
+        await notifyHR(`🍽️ ${missing.length} employee(s) missing ${label} punch`, `${missing.length} operator(s) haven't recorded ${label}.`, missing, today);
+        console.log(`[PunchNotif] ${label}: ${missing.length} missing`);
+    } catch (e) { console.error("[PunchNotif] lunch:", e.message); }
+}
+
+async function runCheckoutAlert() {
+    try {
+        const s = await getNotifSettings();
+        if (!s.checkout_missing) return;
+        const today = istDateStr();
+        const doc = await DailyAttendance.findOne({ dateStr: today }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const missing = [];
+        for (const emp of doc.employees) {
+            if (!emp.inTime || emp.finalOut) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["AB", "WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            const ed = empMap[emp.biometricId];
+            missing.push({ name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId, empId: emp.biometricId || "—", dept: ed?.department || "—", issue: "No Check-Out", bg: "#ffedd5", color: "#9a3412" });
+        }
+        if (!missing.length) return;
+        await notifyHR(`🚪 ${missing.length} employee(s) missing check-out`, `${missing.length} employee(s) punched in but haven't checked out.`, missing, today);
+        console.log(`[PunchNotif] 18:00 checkout: ${missing.length} missing`);
+    } catch (e) { console.error("[PunchNotif] checkout:", e.message); }
+}
+
+async function runYesterdayDigest() {
+    try {
+        const s = await getNotifSettings();
+        if (!s.yesterday_digest) return;
+        const yesterday = istDateStr(-1);
+        const onLeave = await getLeaveEmployeeIds(yesterday);
+        const doc = await DailyAttendance.findOne({ dateStr: yesterday }).lean();
+        if (!doc?.employees?.length) return;
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department _id").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const issues = [];
+        for (const emp of doc.employees) {
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            const ed = empMap[emp.biometricId];
+            if (ed && onLeave.has(String(ed._id))) continue;
+            const name = ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId;
+            const dept = ed?.department || "—";
+            const empId = emp.biometricId || "—";
+            if (!emp.inTime && !emp.hrFinalStatus) issues.push({ name, empId, dept, issue: "Absent / No Record", bg: "#fee2e2", color: "#b91c1c" });
+            else if (emp.inTime && !emp.finalOut && !emp.isMissPunchSettled) issues.push({ name, empId, dept, issue: "Missing Check-Out", bg: "#ffedd5", color: "#9a3412" });
+            else if (emp.inTime && !emp.lunchIn && emp.employeeType === "operator" && !emp.isMissPunchSettled) issues.push({ name, empId, dept, issue: "No Lunch-In", bg: "#fef3c7", color: "#92400e" });
+        }
+        if (!issues.length) return;
+
+        // Push summary
+        await notifyHR(`📋 Yesterday's unresolved punch issues [${yesterday}]`, `${issues.length} unresolved attendance issue(s) from yesterday need fixing.`, issues, yesterday);
+
+        // Digest email ALWAYS sent regardless of push status
+        if (emailService?._send) {
+            try {
+                const HRDept = require("../../models/HR_Models/HRDepartment");
+                const hrList = await HRDept.find({ isActive: { $ne: false } }).select("email name").lean();
+                const toList = hrList.filter(h => h.email).map(h => ({ email: h.email, name: h.name }));
+                const rows = issues.map(i => `<tr><td style="padding:8px 12px;font-size:13px">${i.name}</td><td style="padding:8px 12px;font-size:13px;color:#555">${i.empId}</td><td style="padding:8px 12px;font-size:13px;color:#555">${i.dept}</td><td style="padding:8px 12px"><span style="background:${i.bg};color:${i.color};padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700">${i.issue}</span></td></tr>`).join("");
+                const html = `<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto"><div style="background:#1a1a2e;padding:20px 28px;border-radius:10px 10px 0 0"><h2 style="color:#fff;margin:0;font-size:17px">📋 Yesterday's Attendance Digest</h2><p style="color:#aaa;margin:4px 0 0;font-size:12px">${yesterday} · ${issues.length} unresolved issue(s)</p></div><div style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 10px 10px;padding:20px 28px"><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f7fafc"><th style="padding:9px 12px;text-align:left;font-size:12px">Name</th><th style="padding:9px 12px;text-align:left;font-size:12px">ID</th><th style="padding:9px 12px;text-align:left;font-size:12px">Dept</th><th style="padding:9px 12px;text-align:left;font-size:12px">Issue</th></tr></thead><tbody>${rows}</tbody></table><p style="font-size:11px;color:#888;margin-top:16px">Grav HR System · Please log in and resolve before payroll.</p></div></div>`;
+                for (const hr of toList) {
+                    await emailService._send({ to: [hr], subject: `📋 Attendance Digest [${yesterday}] — ${issues.length} issues`, htmlContent: html, textContent: `Yesterday digest for ${yesterday}:\n\n` + issues.map(i => `${i.name} (${i.empId}) — ${i.issue}`).join("\n") }).catch(() => { });
+                }
+            } catch (_) { }
+        }
+        console.log(`[PunchNotif] Yesterday digest: ${issues.length} issues`);
+    } catch (e) { console.error("[PunchNotif] digest:", e.message); }
+}
+
+// ── Start crons — call once from server.js ────────────────────────────────────
+function startPunchNotificationCrons() {
+    const tz = { timezone: "Asia/Kolkata", scheduled: true };
+    cron.schedule("15 10 * * 1-6", runCheckinAlert, tz); // 10:15 Mon–Sat
+    cron.schedule("30 13 * * 1-6", () => runLunchAlert("lunch_in"), tz); // 13:30
+    cron.schedule("30 14 * * 1-6", () => runLunchAlert("lunch_out"), tz); // 14:30
+    cron.schedule("0 18  * * 1-6", runCheckoutAlert, tz); // 18:00
+    cron.schedule("0 9   * * *", runYesterdayDigest, tz); // 09:00 daily
+    console.log("[PunchNotif] ✅ 5 punch notification crons scheduled (IST)");
+}
+
+// ── Notification settings API routes ──────────────────────────────────────────
+
+// GET /api/hr/attendance/notification-settings
+router.get("/notification-settings", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        let s = await HRNotifSettings.findOne({ singleton: "global" }).lean();
+        if (!s) s = await HRNotifSettings.create({ singleton: "global" });
+        res.json({ success: true, data: s });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /api/hr/attendance/notification-settings
+router.put("/notification-settings", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const allowed = ["checkin_missing", "lunch_missing", "checkout_missing", "yesterday_digest"];
+        const update = {};
+        allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+        const s = await HRNotifSettings.findOneAndUpdate({ singleton: "global" }, { $set: update }, { new: true, upsert: true });
+        res.json({ success: true, data: s });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/hr/attendance/notification-subscribe  — save FCM token for this HR user
+router.post("/notification-subscribe", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { fcmToken } = req.body;
+        if (!fcmToken) return res.status(400).json({ success: false, message: "fcmToken required" });
+        try {
+            const HRDept = require("../../models/HR_Models/HRDepartment");
+            const hr = await HRDept.findById(req.user.id);
+            if (hr) {
+                if (!hr.fcmTokens) hr.fcmTokens = [];
+                if (!hr.fcmTokens.includes(fcmToken)) {
+                    hr.fcmTokens = [...hr.fcmTokens.slice(-4), fcmToken]; // keep last 5
+                    await hr.save();
+                }
+            }
+        } catch (_) { }
+        res.json({ success: true, message: "Token saved" });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /api/hr/attendance/notification-test
+router.post("/notification-test", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { messaging } = require("../../config/firebaseAdmin");
+        const HRDept = require("../../models/HR_Models/HRDepartment");
+        const hr = await HRDept.findById(req.user.id).select("fcmTokens").lean();
+        const tokens = hr?.fcmTokens || [];
+        if (!tokens.length) return res.json({ success: false, message: "No push tokens registered. Enable notifications first." });
+        let sent = 0;
+        for (const token of tokens) {
+            try { await messaging.send({ token, notification: { title: "✅ HRMS Alerts Active", body: "Punch notifications are working!" }, webpush: { notification: { title: "✅ HRMS Alerts Active", body: "Punch notifications are working!", icon: "/logo.png" } } }); sent++; } catch (_) { }
+        }
+        res.json({ success: true, message: `Test sent to ${sent} device(s)` });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/hr/attendance/missed-punches?date=YYYY-MM-DD — live badge for HR UI
+router.get("/missed-punches", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const dateStr = req.query.date || istDateStr();
+        const onLeave = await getLeaveEmployeeIds(dateStr);
+        const doc = await DailyAttendance.findOne({ dateStr }).lean();
+        if (!doc?.employees?.length) return res.json({ success: true, data: [], count: 0 });
+
+        const bioIds = doc.employees.map(e => e.biometricId).filter(Boolean);
+        const empDocs = await Employee.find({ biometricId: { $in: bioIds } }).select("firstName lastName biometricId department designation _id").lean();
+        const empMap = Object.fromEntries(empDocs.map(e => [e.biometricId, e]));
+
+        const issues = [];
+        for (const emp of doc.employees) {
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            const ed = empMap[emp.biometricId];
+            if (["WO", "PH", "on_leave", "FH", "NH", "OH", "RH"].includes(st)) continue;
+            if (ed && onLeave.has(String(ed._id))) continue;
+            const base = {
+                biometricId: emp.biometricId,
+                name: ed ? `${ed.firstName} ${ed.lastName}` : emp.employeeName || emp.biometricId,
+                department: ed?.department || "—",
+                inTime: emp.inTime, finalOut: emp.finalOut, lunchIn: emp.lunchIn,
+            };
+            if (!emp.inTime && !emp.hrFinalStatus) issues.push({ ...base, issueType: "no_checkin", severity: "high" });
+            else if (emp.inTime && !emp.finalOut) issues.push({ ...base, issueType: "no_checkout", severity: "medium" });
+            else if (emp.inTime && !emp.lunchIn && emp.employeeType === "operator") issues.push({ ...base, issueType: "no_lunch_in", severity: "low" });
+            else if (emp.lunchIn && !emp.lunchOut) issues.push({ ...base, issueType: "no_lunch_out", severity: "low" });
+        }
+        res.json({ success: true, data: issues, count: issues.length, date: dateStr });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/hr/attendance/calendar?biometricId=xxx&yearMonth=YYYY-MM
+router.get("/calendar", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { biometricId, employeeId, yearMonth } = req.query;
+        if (!yearMonth || !/^\d{4}-\d{2}$/.test(yearMonth))
+            return res.status(400).json({ success: false, message: "yearMonth required (YYYY-MM)" });
+
+        let bid = biometricId;
+        if (!bid && employeeId) {
+            const emp = await Employee.findById(employeeId).select("biometricId").lean();
+            bid = emp?.biometricId;
+        }
+        if (!bid) return res.status(400).json({ success: false, message: "biometricId or employeeId required" });
+
+        bid = String(bid).toUpperCase();
+        const [y, m] = yearMonth.split("-").map(Number);
+        const from = `${yearMonth}-01`;
+        const last = new Date(y, m, 0).getDate();
+        const to = `${yearMonth}-${String(last).padStart(2, "0")}`;
+
+        const docs = await DailyAttendance.find({ dateStr: { $gte: from, $lte: to } }).lean();
+        const summary = { present: 0, absent: 0, onLeave: 0, halfDay: 0, weeklyOff: 0, late: 0 };
+        const data = [];
+
+        for (const doc of docs) {
+            const emp = (doc.employees || []).find(e => e.biometricId === bid);
+            if (!emp) continue;
+            const st = emp.hrFinalStatus || emp.systemPrediction;
+            if (["P", "P*", "P~", "MP"].includes(st)) summary.present++;
+            else if (st === "AB") summary.absent++;
+            else if (st?.startsWith("L-") || st === "LWP" || st === "CO") summary.onLeave++;
+            else if (st === "HD") summary.halfDay++;
+            else if (["WO", "FH", "NH", "OH", "RH"].includes(st)) summary.weeklyOff++;
+            if (emp.isLate) summary.late++;
+            data.push({ date: doc.dateStr, ...emp });
+        }
+
+        res.json({ success: true, data, summary });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  EXPORT HELPERS FOR OTHER ROUTE FILES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -4416,3 +5009,5 @@ router.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports = router;
 module.exports.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports.applyApprovedLeavesForDate = applyApprovedLeavesForDate;
+module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
+module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;

@@ -25,7 +25,8 @@ const allowedOrigins = [
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
   "http://10.99.21.15:3000",
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
-  "https://grav-cms-dncs.vercel.app"
+  "https://grav-cms-dncs.vercel.app",
+  "https://crm.grav.in"
 ];
 
 app.use(
@@ -326,7 +327,7 @@ const connectDB = async () => {
     console.log("✅ MongoDB connected successfully");
 
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
-    productionSyncService.initialize();
+    // productionSyncService.initialize();
   } catch (error) {
     console.error("❌ MongoDB connection error:", error.message);
     process.exit(1);
@@ -341,8 +342,11 @@ const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
 const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
 
+const PackagingDispatchDepartment = require("./models/PackagingDispatchDepartment");
+
 const Measurement = require("./models/Customer_Models/Measurement");
 const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
+const ProductionSupervisorDepartment = require("./models/ProductionSupervisorDepartment");
 
 
 const createDefaultCuttingMaster = async () => {
@@ -376,6 +380,33 @@ const createDefaultCuttingMaster = async () => {
   }
 };
 
+async function createDefaultProductionSupervisor() {
+  try {
+    const existing = await ProductionSupervisorDepartment.findOne({ email: "p1supervisor@grav.in" });
+    if (existing) {
+      console.log("✓ Default Production Supervisor already exists");
+      return;
+    }
+
+    const hashed = await bcrypt.hash("P1supervisor@12345", 10);
+
+    await ProductionSupervisorDepartment.create({
+      name: "Production Supervisor",
+      email: "p1supervisor@grav.in",
+      password: hashed,                    // ✅ use the hashed value
+      employeeId: "PSUP001",
+      phone: "",
+      role: "production_supervisor",
+      department: "Production Supervisor",
+      isActive: true,
+    });
+
+    console.log("✅ Default Production Supervisor created: p1supervisor@grav.in");
+  } catch (err) {
+    console.error("❌ Failed to create default Production Supervisor:", err);
+  }
+}
+
 const createDefaultAccountant = async () => {
   try {
     const existingAccountant = await AccountantDepartment.findOne({
@@ -407,9 +438,42 @@ const createDefaultAccountant = async () => {
   }
 };
 
+const createDefaultPackagingDispatch = async () => {
+  try {
+    const existingPackagingDispatch = await PackagingDispatchDepartment.findOne({
+      role: "packaging_dispatch",
+      department: "Packaging & Dispatch",
+    });
+
+    if (existingPackagingDispatch) {
+      console.log("✅ Packaging & Dispatch user already exists, skipping creation");
+      return;
+    }
+
+    const defaultPackagingDispatch = new PackagingDispatchDepartment({
+      name: "Dispatch Admin",
+      email: "dispatch@grav.in",
+      password: "Dispatch@12345", // will be hashed automatically
+      employeeId: "PKG001",
+      phone: "9999999999",
+      department: "Packaging & Dispatch",
+      role: "packaging_dispatch",
+      isActive: true,
+    });
+
+    await defaultPackagingDispatch.save();
+
+    console.log("✅ Default Packaging & Dispatch user created successfully");
+  } catch (error) {
+    console.error("❌ Packaging & Dispatch creation failed:", error.message);
+  }
+};
+
 // Update the database connection section
 connectDB().then(async () => {
   await createDefaultAccountant(); // ✅ ADD THIS
+  await createDefaultPackagingDispatch();
+  await createDefaultProductionSupervisor();
 });
 //changes
 
@@ -483,6 +547,10 @@ const employeeRoutes = require("./routes/HrRoutes/Employee-Section");
 // HR Profile Routes
 const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 
+const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
+app.use("/api/hr/overview", hrOverviewRoutes);
+
+
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
@@ -515,6 +583,10 @@ app.use("/api/customer/employees", employeeMpcRoutes);
 
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
+
+
+const productionCompletionRoutes = require("./routes/CMS_Routes/Manufacturing/Production/productionCompletionRoutes.js");
+app.use("/api/cms/manufacturing/production-completion", productionCompletionRoutes);
 
 /* ===================
   CMS ROUTES
@@ -571,6 +643,9 @@ app.use(
   manufacturingOrderRoutes,
 );
 
+const packagingDispatchViewRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingDispatchViewRoutes");
+app.use("/api/cms/manufacturing/packaging-dispatch-view", packagingDispatchViewRoutes);
+
 const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes");
 app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
 
@@ -594,6 +669,9 @@ app.use("/api/cms/production/dashboard", productionDashboardRoutes);
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionMachineLayout);
 
+
+const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
+app.use("/api/cms/manufacturing/packaging", packagingRoutes);
 
 
 // In your main server.js or app.js
@@ -619,7 +697,6 @@ app.use("/api/cms/sales", quotationRoutes);
 // ─── GOOGLE WORKSPACE ROUTES ────────────────────────────────
 const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
-
 
 // HR Department Routes
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
@@ -664,6 +741,10 @@ app.use("/api/hr/payroll", payRollRouter);
 const payslipRouter = require("./routes/HrRoutes/Payslip_section");
 app.use("/api/hr/payslip", payslipRouter);
 
+
+const empAttendance = require("./routes/Employee_Routes/employeeAttendance");
+app.use("/api/employee/attendance", empAttendance);
+
 // Accountant Department Routes
 const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
 app.use("/api/accountant/customers", accountantCustomersRoutes);
@@ -683,6 +764,9 @@ app.use("/api/vendor/work-orders", vendorWO);
 // Employee Routes
 const employeeLoginRoutes = require("./routes/Employee_Routes/login.js");
 app.use("/api/employee/auth", employeeLoginRoutes);
+
+const publicProfileAPI = require("./routes/Employee_Routes/publicProfileAPI");
+app.use("/employee", publicProfileAPI);
 
 const employeeAuthRoutes = require("./routes/Employee_Routes/employeeAuth");
 app.use("/api/employee", employeeAuthRoutes);
@@ -1307,6 +1391,9 @@ app.get("/", (req, res) => {
   });
 });
 
+const payslipRoutes = require('./routes/Employee_Routes/Payslip');
+app.use('/api/employee/payslip', payslipRoutes);
+
 /* =====================
     PRODUCTION SYNC MANAGEMENT ROUTES
   ===================== */
@@ -1327,6 +1414,15 @@ app.post("/api/cms/production/cleanup/manual", async (req, res) => {
     res.status(500).json({ success: false, message: "Error during manual cleanup", error: error.message });
   }
 });
+
+
+if (attendanceRouter.startHourlyAttendanceSync) {
+  attendanceRouter.startHourlyAttendanceSync();
+  console.log("✅ Hourly attendance sync cron initialized");
+} else {
+  console.warn("⚠️ Hourly attendance sync not available");
+}
+
 
 // Graceful shutdown
 let isShuttingDown = false;
