@@ -254,7 +254,7 @@ async function callGemini(apiKey, geminiFiles, prompt) {
                 const url = `${GEMINI_BASE}/models/${modelName}:generateContent?key=${apiKey}`;
                 const body = {
                     contents: [{ parts }],
-                    generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
+                    generationConfig: { temperature: 0.2, maxOutputTokens: 32768 },
                 };
 
                 const res = await fetch(url, {
@@ -312,15 +312,62 @@ async function callGemini(apiKey, geminiFiles, prompt) {
     throw lastError || new Error("All Gemini models failed");
 }
 
-// ── Build Gemini prompt ───────────────────────────────────────────────────────
-function buildPrompt(participantNames) {
+function buildPrompt(participantNames, timeline) {
     const names = participantNames.join(", ");
+
+    // Build a plain-text timeline block Gemini can read.
+    // Format: [HH:MM:SS] {SpeakerName} spoke for {N}s
+    let timelineBlock = "";
+    if (Array.isArray(timeline) && timeline.length > 0) {
+        const first = timeline[0].startMs;
+        const fmt = (ms) => {
+            const s = Math.max(0, Math.floor((ms - first) / 1000));
+            const hh = String(Math.floor(s / 3600)).padStart(2, "0");
+            const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+            const ss = String(s % 60).padStart(2, "0");
+            return `${hh}:${mm}:${ss}`;
+        };
+        const lines = timeline.map((t, i) =>
+            `${String(i + 1).padStart(3, "0")}. [${fmt(t.startMs)}] ${t.speaker} speaks (${(t.durationMs / 1000).toFixed(1)}s)`
+        );
+        timelineBlock = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AUTHORITATIVE CHRONOLOGICAL TIMELINE — USE THIS FOR ORDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is the TRUE chronological order of who spoke when during the meeting.
+Each line shows: turn number, timestamp (relative to meeting start), speaker, and how long they spoke.
+
+${lines.join("\n")}
+
+YOU MUST USE THIS TIMELINE TO ORDER THE CONVERSATION SECTION.
+Do not order turns by which audio file you listened to first.
+Go turn-by-turn in the timeline above, find what that speaker said at that timestamp in their audio file, and output the line.
+If the timeline says turn 1 is Ritushree at 00:00:00, the FIRST line of CONVERSATION must be Ritushree's opening words.
+If the timeline says turn 42 is Rakesh at 00:38:12, the LAST line of CONVERSATION must be Rakesh's closing words.
+`;
+    }
+
     return `These are individual voice recording files from a single meeting.
 Each audio file contains ONLY ONE person's voice.
 The participants in this meeting are: ${names}.
 
 
 IMPORTANT: Analyze ALL audio files together. Reconstruct the full conversation in the ORDER it happened — based on what each person said in response to others.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ABSOLUTE RULES — READ CAREFULLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. DO NOT skip any speaker turn. Every sentence a participant speaks MUST appear in the CONVERSATION section, even if it seems unimportant (greetings, filler, asides, jokes, repeated phrases).
+2. DO NOT summarize or merge multiple sentences from one speaker into a single line — one speaker turn = one line.
+3. DO NOT drop short utterances ("hmm", "okay", "yes", "got it", "noted") — include them.
+4. If a speaker's words are unclear, transcribe best-effort and append "[unclear]" rather than dropping the line.
+5. If two speakers overlap, show them in two consecutive lines in the order they started speaking.
+6. Translate any Hindi / Odia / Hinglish / other language into English, but keep proper nouns (names, product names, file names) unchanged.
+7. A single speaker usually appears MANY TIMES in CONVERSATION — not once.
+8. PARTICIPANTS section = ONLY people whose VOICES are in the audio. If a name is only mentioned by others but has no audio file, put it in MEETING SUMMARY as a mentioned person, NOT in PARTICIPANTS.
+9. ORDER THE CONVERSATION CHRONOLOGICALLY using the timeline above. The first turn in the timeline is the first line of CONVERSATION. The last turn is the last line.
+
 
 Respond in this EXACT format (do not change the section headers):
 
@@ -413,6 +460,7 @@ Rules:
 - Show the conversation in correct sequence as it happened
 - Keep quotes natural — paraphrase if exact words unclear`;
 }
+
 
 // ── Parse Gemini response into structured sections ────────────────────────────
 function parseResponse(text) {
@@ -568,9 +616,77 @@ router.post(
             }
 
             const recordings = snap.docs.map(d => d.data());
-            console.log(`\n[Pipeline] 🚀 Starting conveyor belt — ${recordings.length} file(s) for meet: ${meetId}`);
+            console.log(`\n[Pipeline] 🚀 Firestore has ${recordings.length} recording row(s) for meet: ${meetId}`);
 
             const drive = getDriveClient();
+
+            // ── BELT-AND-BRACES: also scan Drive folder for ANY (1)/(2)/... files ──
+            // If a user rejoined and a Firestore row was overwritten, the (1).webm
+            // file is still in Drive. We union-merge Drive scan results with
+            // Firestore rows, keyed by driveFileId, so NO audio file is missed.
+            try {
+                const recordingsByDriveId = new Map(
+                    recordings.filter(r => r.driveFileId).map(r => [r.driveFileId, r])
+                );
+
+                // Navigate to the meeting folder: CoWork Audio Recording / meeting / {meetId}
+                const findFolder = async (name, parentId) => {
+                    const q = parentId
+                        ? `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`
+                        : `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+                    const resp = await drive.files.list({
+                        q, fields: "files(id,name)", pageSize: 1, supportsAllDrives: true, includeItemsFromAllDrives: true,
+                    });
+                    return resp.data.files?.[0]?.id || null;
+                };
+
+                const rootId = await findFolder("CoWork Audio Recording", null);
+                if (rootId) {
+                    const mtgRootId = await findFolder("meeting", rootId);
+                    if (mtgRootId) {
+                        const meetFolderId = await findFolder(meetId, mtgRootId);
+                        if (meetFolderId) {
+                            const filesResp = await drive.files.list({
+                                q: `'${meetFolderId}' in parents and trashed=false and (mimeType contains 'audio' or name contains '.webm' or name contains '.mp4' or name contains '.ogg')`,
+                                fields: "files(id,name,mimeType,size)",
+                                pageSize: 500,
+                                supportsAllDrives: true,
+                                includeItemsFromAllDrives: true,
+                            });
+                            const driveFiles = filesResp.data.files || [];
+                            console.log(`[Pipeline] 🗂️  Drive folder scan found ${driveFiles.length} audio file(s) in meet ${meetId}`);
+
+                            for (const f of driveFiles) {
+                                if (recordingsByDriveId.has(f.id)) continue; // already covered by Firestore
+
+                                // Parse filename: E015_RakeshBiswal_audio_M042 (1).webm
+                                const m = f.name.match(/^([A-Za-z0-9]+)_([A-Za-z0-9]+)_audio_/);
+                                const employeeId = m ? m[1] : "Unknown";
+                                const employeeName = m ? m[2].replace(/([A-Z])/g, " $1").trim() : f.name;
+
+                                const syntheticRec = {
+                                    meetId,
+                                    employeeId,
+                                    employeeName,
+                                    firstName: employeeName.split(" ")[0],
+                                    fileName: f.name,
+                                    mimeType: f.mimeType || "audio/webm",
+                                    driveFileId: f.id,
+                                    driveViewUrl: `https://drive.google.com/file/d/${f.id}/view`,
+                                    status: "uploaded",
+                                    isSynthetic: true, // flag — not from Firestore
+                                };
+                                recordings.push(syntheticRec);
+                                console.log(`[Pipeline] ➕ Picked up extra Drive file: ${f.name}`);
+                            }
+                        }
+                    }
+                }
+            } catch (scanErr) {
+                console.warn(`[Pipeline] ⚠️  Drive folder scan failed (continuing with Firestore rows only): ${scanErr.message}`);
+            }
+
+            console.log(`[Pipeline] 📦 TOTAL files to process: ${recordings.length}`);
             const participantNames = [];
 
             // ═══════════════════════════════════════════════════════════════════
@@ -629,8 +745,30 @@ router.post(
 
             console.log(`\n[Pipeline] 🎯 ${uploadedGeminiFiles.length}/${recordings.length} file(s) ready — sending to Gemini...`);
 
+            // ── Build a chronological timeline from everyone's speechIntervals ──
+            // Each participant's hook logged {startMs, endMs, durationMs} for every
+            // unmute→mute transition. Merging all of these and sorting by startMs
+            // gives Gemini the TRUE order of speaker turns across the whole meeting.
+            const timeline = [];
+            for (const rec of recordings) {
+                if (!Array.isArray(rec.speechIntervals)) continue;
+                const speaker = rec.employeeName || rec.firstName || rec.employeeId || "Unknown";
+                for (const iv of rec.speechIntervals) {
+                    if (typeof iv.startMs !== "number" || typeof iv.endMs !== "number") continue;
+                    timeline.push({
+                        speaker,
+                        employeeId: rec.employeeId,
+                        startMs: iv.startMs,
+                        endMs: iv.endMs,
+                        durationMs: iv.durationMs || (iv.endMs - iv.startMs),
+                    });
+                }
+            }
+            timeline.sort((a, b) => a.startMs - b.startMs);
+            console.log(`[Pipeline] 🕒 Timeline built: ${timeline.length} speaker turn(s) across ${new Set(timeline.map(t => t.speaker)).size} speaker(s)`);
+
             // ── Send File URI references + prompt → Gemini generateContent ────
-            const prompt = buildPrompt(participantNames);
+            const prompt = buildPrompt(participantNames, timeline);
             const rawText = await callGemini(apiKey, uploadedGeminiFiles, prompt);
 
             // ── Self-Cleaning: remove all files from Gemini File API ──────────

@@ -5,7 +5,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
- 
+
 const http = require("http");
 const { Server } = require("socket.io");
 const activeMeetingRecordings = new Map();
@@ -162,6 +162,17 @@ io.on("connection", (socket) => {
     activeMeetingRecordings.set(meetId, { startedBy, startedByName, startedAt });
     io.to(`meeting_${meetId}`).emit("recording_started", { meetId, startedBy, startedByName, startedAt });
   });
+  // Each participant broadcasts their own recording+upload status → relay to room
+  socket.on("participant_status", ({ meetId, employeeId, employeeName, recordingState, uploadState }) => {
+    if (!meetId || !employeeId) return;
+    io.to(`meeting_${meetId}`).emit("participant_status", {
+      employeeId,
+      employeeName,
+      recordingState,   // "recording" | "paused" | "not_rec" | "failed"
+      uploadState,      // "idle" | "uploading" | "uploaded" | "failed"
+      timestamp: Date.now(),
+    });
+  });
 
   // CEO/TL stops recording → broadcast to all in meeting room
   socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
@@ -297,8 +308,10 @@ io.on("connection", (socket) => {
 });
 
 
+
 // 1. At the top with your other requires:
 const transcriptModule = require("./routes/task_routes/transcript.routes");
+
 
 // 2. With your other app.use() route registrations:
 app.use("/cowork", transcriptModule.router);
