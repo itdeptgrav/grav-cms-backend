@@ -3762,10 +3762,10 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
 
         // Status cell styles
         const STATUS_STYLE = {
-            "P": { font: "FF375623", fill: "FFC6EFCE" },
-            "A": { font: "FF9C0006", fill: "FFFFC7CE" },
+            "P": { font: "FF000000", fill: null },  // no background — present is default
+            "A": { font: "FF9C0006", fill: "FFFFC7CE" },  // red (unchanged)
             "HD": { font: "FF7D4701", fill: "FFFFEB9C" },
-            "WO": { font: "FF595959", fill: "FFF2F2F2" },
+            "WO": { font: "FF375623", fill: "FFC6EFCE" },  // green — weekly off stands out
             "CO": { font: "FF0D4A8C", fill: "FFBDD7EE" },
             "CL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
             "SL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
