@@ -111,7 +111,6 @@ function computeEmployeePayroll(employee, ctx) {
         const dt = new Date(dateStr + "T00:00:00");
         const dow = dt.getDay();
 
-        // Pre-joining days: completely excluded — not payable, not LOP
         if (d < firstActiveDay) {
             dayBreakdown.push({
                 dateStr, dayOfWeek: dow,
@@ -235,7 +234,7 @@ function computeEmployeePayroll(employee, ctx) {
         }
     }
 
-    // ── CL Auto-Adjustment — gated on 24-day probation ───────────────────────
+    // ── CL Auto-Adjustment ────────────────────────────────────────────────────
     if (clEligible && settings.clAutoAdjust?.enabled && stats.absentDays > 0) {
         const consumeFromBalance = settings.clAutoAdjust.consumeFromBalance !== false;
         const maxCLPerMonth = settings.clAutoAdjust.maxABForAdjustment ?? 2;
@@ -277,8 +276,6 @@ function computeEmployeePayroll(employee, ctx) {
     }
 
     // ── Divisor ───────────────────────────────────────────────────────────────
-    // Divisor = calendar days in the month. Same for ALL employees.
-    // 31 for March, 30 for April, etc.  No special cases.
     const divisor = daysInMonth;
 
     // ── Earnings ──────────────────────────────────────────────────────────────
@@ -293,22 +290,16 @@ function computeEmployeePayroll(employee, ctx) {
         sundayExtraPayDays = stats.workingSundayDays;
     }
 
-    // payableDays comes directly from the day loop.
-    // Pre-joining days are skipped entirely (not payable, not LOP).
-    // Only actual absences after joining count as LOP.
-    // payableDays + lopDays + preJoiningDays = daysInMonth
     const effectivePayableDays = payableDays + sundayExtraPayDays;
 
-    // Calculate pro-rated gross, basic, and HRA based on payable days
     const grossEarned = roundMoney(perDayRate * effectivePayableDays, settings.roundingMode);
 
     const basicRatio = fullGross > 0 ? fullBasic / fullGross : 0.5;
     const hraRatio = fullGross > 0 ? fullHra / fullGross : 0.5;
 
-    // Calculate earned basic and HRA from grossEarned to avoid rounding mismatch
     const basicEarned = roundMoney(grossEarned * basicRatio, settings.roundingMode);
-    const hraEarned = grossEarned - basicEarned;  // Force exact match: HRA = Gross - Basic (no separate rounding)
-    const specialEarned = 0;  // specialEarned is always 0 when basic + HRA = gross
+    const hraEarned = grossEarned - basicEarned;
+    const specialEarned = 0;
 
     // ── Deductions ────────────────────────────────────────────────────────────
     const epfCap = salaryCfg?.epfCapAmount ?? 1800;
@@ -316,7 +307,6 @@ function computeEmployeePayroll(employee, ctx) {
     const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
     const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
-    // CRITICAL FIX: PF and ESIC should be calculated on EARNED (pro-rated) BASIC, not full month
     const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
     const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
     const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
@@ -895,11 +885,7 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
             remarks,
         } = req.body;
 
-        // divisor = daysInMonth (same as compute engine)
         const divisor = item.workingDays || new Date(item.year, item.month, 0).getDate() || 31;
-        // activeCap = max payable days for this employee
-        // For mid-month joiners: activeDaysInMonth (can't be paid for days before joining)
-        // For regular employees: divisor (= daysInMonth)
         const activeCap = (item.preJoiningDays > 0 && item.activeDaysInMonth != null)
             ? item.activeDaysInMonth
             : divisor;
@@ -914,7 +900,6 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
 
         let newPayableDays;
         let newLopDays;
-        // Both fields are independent — accept whatever the user sends
         if (payableDays !== undefined) {
             newPayableDays = Math.max(0, Math.min(Number(payableDays), activeCap));
         } else {
@@ -928,11 +913,10 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
 
         const perDay = fullGross / Math.max(1, divisor);
         const basicRatio = fullBasic / Math.max(1, fullGross);
-        const hraRatio = fullHra / Math.max(1, fullGross);
 
         const grossEarnedBase = Math.round(perDay * newPayableDays);
         const basicEarned = Math.round(grossEarnedBase * basicRatio);
-        const hraEarned = grossEarnedBase - basicEarned;  // Force exact match
+        const hraEarned = grossEarnedBase - basicEarned;
         const specialEarned = 0;
 
         const ot = overtime !== undefined ? Number(overtime) : (item.earnings?.overtime || 0);
@@ -948,7 +932,6 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
         const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
         const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
-        // CRITICAL FIX: Calculate on EARNED (pro-rated) BASIC
         const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
         const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
         const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
@@ -1158,7 +1141,31 @@ function formatVal(v) {
     return String(v);
 }
 
-// ── GET /export ───────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  GET /export  ──  Salary Sheet in company format (matches reference Excel)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//  Column layout (A = always blank, data starts at B):
+//
+//  B  Emp Code         C  Name             D  Department      E  Designation
+//  F  Gross Salary*    G  Basic*           H  HRA*            I  Food Allowance*
+//  J  Days of Month    K  Actual Days      L  Gross Salary†   M  BAS†
+//  N  HRA†             O  Tot Earnings     P  ESIEMPLYE       Q  ESIEMPR
+//  R  LN/ADV           S  PFEMPCONT        T  PFEMPR
+//  U  Tot Deductions   V  Net Salary
+//
+//  * = monthly rate (CTC component), † = earned/prorated this month
+//  Food Allowance is CTC-only and NOT included in Tot Earnings or Gross earned.
+//
+//  Color key (header bands):
+//    Violet  → Title / company branding
+//    Slate   → Identity columns (B–E)
+//    Blue    → Monthly CTC rate columns (F–I)
+//    Cyan    → Attendance day columns (J–K)
+//    Green   → Earned-this-month columns (L–O)
+//    Rose    → Deduction columns (P–U)
+//    Emerald → Net Salary column (V)
+//
 router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const ExcelJS = require("exceljs");
@@ -1166,7 +1173,8 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         const year = parseInt(req.query.year) || new Date().getFullYear();
 
         const items = await PayrollItem.find({ month, year })
-            .sort({ department: 1, employeeName: 1 }).lean();
+            .sort({ department: 1, employeeName: 1 })
+            .lean();
 
         if (items.length === 0) {
             return res.status(404).json({
@@ -1177,162 +1185,312 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
 
         const employees = await Employee.find({
             _id: { $in: items.map((i) => i.employeeId) },
-        }).select("firstName middleName lastName biometricId designation jobTitle department salary bankDetails dateOfJoining").lean();
+        })
+            .select("firstName middleName lastName biometricId designation jobTitle department salary bankDetails dateOfJoining")
+            .lean();
 
-        const empById = new Map(employees.map((e) => [String(e._id), decryptEmployeeDoc(e)]));
+        const empById = new Map(
+            employees.map((e) => [String(e._id), decryptEmployeeDoc(e)])
+        );
 
+        // ── Workbook & worksheet ─────────────────────────────────────────────
         const wb = new ExcelJS.Workbook();
         wb.creator = "Grav Clothing HRMS";
-        const ws = wb.addWorksheet("Salary Register", {
+
+        const ws = wb.addWorksheet("SalarySheetTab", {
             views: [{ state: "frozen", ySplit: 4 }],
             pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
         });
 
+        // ── Column widths (22 cols: A–V) ──────────────────────────────────────
+        const COL_WIDTHS = [
+            3,    // A – blank spacer
+            12,   // B – Emp Code
+            30,   // C – Name
+            20,   // D – Department
+            22,   // E – Designation
+            13,   // F – Gross Salary (rate)
+            11,   // G – Basic (rate)
+            11,   // H – HRA (rate)
+            14,   // I – Food Allowance
+            10,   // J – Days of Month
+            10,   // K – Actual Days
+            13,   // L – Gross Salary (earned)
+            11,   // M – BAS
+            11,   // N – HRA
+            13,   // O – Tot Earnings
+            11,   // P – ESIEMPLYE
+            11,   // Q – ESIEMPR
+            11,   // R – LN/ADV
+            11,   // S – PFEMPCONT
+            11,   // T – PFEMPR
+            14,   // U – Tot Deductions
+            13,   // V – Net Salary
+        ];
+        COL_WIDTHS.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+
+        // ── Color palette ─────────────────────────────────────────────────────
+        // Header fills — one distinct color per logical section
+        const HDR = {
+            identity: "FF1E293B",   // slate-800   B–E
+            rate: "FF1D4ED8",   // blue-700    F–I  (monthly CTC)
+            days: "FF0E7490",   // cyan-700    J–K
+            earned: "FF166534",   // green-800   L–O
+            ded: "FF9F1239",   // rose-800    P–U
+            net: "FF065F46",   // emerald-900 V
+        };
+        // Data-row section background tints (very light, for zebra+section effect)
+        const TINT = {
+            identity: "FFFFFFFF",   // white
+            rate: "FFEFF6FF",   // blue-50
+            days: "FFF0FDFA",   // cyan-50
+            earned: "FFF0FDF4",   // green-50
+            ded: "FFFFF1F2",   // rose-50
+            net: "FFD1FAE5",   // emerald-100 (a bit stronger so it stands out)
+        };
+        // Stripe for even rows (applied on top of tints using a slight darkening)
+        const STRIPE = "FFF1F5F9"; // slate-100
+
+        // Returns the header fill ARGB for a given 1-based column number
+        function hdrFill(colNum) {
+            if (colNum >= 2 && colNum <= 5) return HDR.identity;
+            if (colNum >= 6 && colNum <= 9) return HDR.rate;
+            if (colNum >= 10 && colNum <= 11) return HDR.days;
+            if (colNum >= 12 && colNum <= 15) return HDR.earned;
+            if (colNum >= 16 && colNum <= 21) return HDR.ded;
+            if (colNum === 22) return HDR.net;
+            return HDR.identity;
+        }
+
+        // Returns the data-cell background ARGB for a given column + row parity
+        function cellFill(colNum, isEvenRow) {
+            // Net salary always gets the strong tint regardless of row parity
+            if (colNum === 22) return TINT.net;
+            const base =
+                colNum >= 2 && colNum <= 5 ? TINT.identity :
+                    colNum >= 6 && colNum <= 9 ? TINT.rate :
+                        colNum >= 10 && colNum <= 11 ? TINT.days :
+                            colNum >= 12 && colNum <= 15 ? TINT.earned :
+                                colNum >= 16 && colNum <= 21 ? TINT.ded : "FFFFFFFF";
+            // Even rows: use the stripe color for identity/days/earned/ded sections
+            // Rate and net keep their tint always so they stay visually distinct
+            if (isEvenRow && colNum !== 22 && !(colNum >= 6 && colNum <= 9)) {
+                return STRIPE;
+            }
+            return base;
+        }
+
+        const solid = (argb) => ({ type: "pattern", pattern: "solid", fgColor: { argb } });
+        const border = (t = "thin", argb = "FFD1D5DB") => ({
+            top: { style: t, color: { argb } }, bottom: { style: t, color: { argb } },
+            left: { style: t, color: { argb } }, right: { style: t, color: { argb } },
+        });
+
+        // ── Row 1 — Title ────────────────────────────────────────────────────
         ws.mergeCells(1, 1, 1, 22);
-        const title = ws.getCell(1, 1);
-        title.value = `GRAV CLOTHING — SALARY REGISTER for ${MONTH_NAMES[month]} ${year}`;
-        title.font = { size: 14, bold: true, color: { argb: "FFFFFFFF" } };
-        title.alignment = { vertical: "middle", horizontal: "center" };
-        title.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF581C87" } };
+        const r1 = ws.getCell(1, 1);
+        r1.value = `GRAV CLOTHING  ·  Salary Sheet  ·  ${MONTH_NAMES[month]} ${year}`;
+        r1.font = { name: "Arial", size: 13, bold: true, color: { argb: "FFFFFFFF" } };
+        r1.fill = solid("FF5B21B6");   // violet-700
+        r1.alignment = { horizontal: "center", vertical: "middle" };
         ws.getRow(1).height = 30;
 
-        const h1 = [
-            "Sl.\nNo", "Name of the Employee", "Designation",
-            "Rate of wages payable", null, null,
-            "Total No. of\nDays of Month",
-            "Total attendance\nunits of work done",
-            "Wages actually paid", null,
-            "Overtime\nworked",
-            "Gross Wages\nPayable",
-            "Employee's\nPF",
-            "ESI\n(Employee)",
-            "Employer\nPF",
-            "ESI\n(Employer)",
-            "Salary\nAdvance",
-            "Other\nDeduct.",
-            "Total\nDedc.",
-            "Net Wages\nPaid",
-            "Date of\nPayment",
-            "Bank Transfer /\nSignature",
+        // ── Row 2 — Selection / sub-title ────────────────────────────────────
+        ws.mergeCells(2, 1, 2, 22);
+        const r2 = ws.getCell(2, 1);
+        r2.value = `Selection :- ${MONTH_NAMES[month].slice(0, 3).toUpperCase()}-${year}`;
+        r2.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF4C1D95" } };  // violet-900
+        r2.fill = solid("FFEDE9FE");   // violet-100
+        r2.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
+        ws.getRow(2).height = 18;
+
+        // ── Row 3 — Section-label banner ─────────────────────────────────────
+        // Merge cells per section and label them so readers know what each group means
+        const SECTIONS = [
+            { start: 2, end: 5, label: "Employee Details", bg: "FF1E293B" },
+            { start: 6, end: 9, label: "Monthly CTC", bg: "FF1D4ED8" },
+            { start: 10, end: 11, label: "Attendance", bg: "FF0E7490" },
+            { start: 12, end: 15, label: "Earned This Month", bg: "FF166534" },
+            { start: 16, end: 21, label: "Deductions", bg: "FF9F1239" },
+            { start: 22, end: 22, label: "Net Salary", bg: "FF065F46" },
         ];
-        const h2 = [
-            "", "", "",
-            "Basic", "HRA", "Total Salary",
-            "", "",
-            "Basic", "HRA",
-            "", "", "", "", "", "", "", "", "", "", "", "",
-        ];
-
-        const r2 = ws.getRow(2);
-        const r3 = ws.getRow(3);
-        h1.forEach((v, i) => { if (v !== null) r2.getCell(i + 1).value = v; });
-        h2.forEach((v, i) => { r3.getCell(i + 1).value = v; });
-
-        [1, 2, 3, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22].forEach((c) => ws.mergeCells(2, c, 3, c));
-        ws.mergeCells(2, 4, 2, 6);
-        ws.mergeCells(2, 9, 2, 10);
-
-        [r2, r3].forEach((r) => {
-            r.eachCell((cell) => {
-                cell.font = { size: 9, bold: true, color: { argb: "FFFFFFFF" } };
-                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F2937" } };
-                cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-                cell.border = {
-                    top: { style: "thin", color: { argb: "FF000000" } },
-                    bottom: { style: "thin", color: { argb: "FF000000" } },
-                    left: { style: "thin", color: { argb: "FF000000" } },
-                    right: { style: "thin", color: { argb: "FF000000" } },
-                };
-            });
+        SECTIONS.forEach(({ start, end, label, bg }) => {
+            if (start !== end) ws.mergeCells(3, start, 3, end);
+            const cell = ws.getCell(3, start);
+            cell.value = label;
+            cell.font = { name: "Arial", size: 7.5, bold: true, color: { argb: "FFFFFFFF" }, italic: true };
+            cell.fill = solid(bg);
+            cell.alignment = { horizontal: "center", vertical: "middle" };
+            cell.border = border("thin", "FF000000");
         });
-        r2.height = 36; r3.height = 22;
+        ws.getRow(3).height = 13;
 
-        const widths = [5, 26, 16, 10, 10, 12, 8, 10, 10, 10, 9, 13, 10, 10, 10, 10, 10, 10, 11, 13, 12, 18];
-        widths.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+        // ── Row 4 — Column headers ───────────────────────────────────────────
+        const HEADERS = [
+            "",                          // 1  A – blank
+            "Emp Code",                  // 2  B
+            "Name",                      // 3  C
+            "Department",                // 4  D
+            "Designation",               // 5  E
+            "Gross Salary",              // 6  F – monthly rate
+            "Basic",                     // 7  G – monthly rate
+            "HRA",                       // 8  H – monthly rate
+            "Food\nAllowance",           // 9  I – CTC only
+            "No. of Days\nof the Month", // 10 J
+            "Actual Days\nWork Done",    // 11 K
+            "Gross Salary",              // 12 L – earned
+            "BAS",                       // 13 M – earned basic
+            "HRA",                       // 14 N – earned HRA
+            "Tot Earnings",              // 15 O
+            "ESIEMPLYE",                 // 16 P
+            "ESIEMPR",                   // 17 Q
+            "LN/ADV",                    // 18 R
+            "PFEMPCONT",                 // 19 S
+            "PFEMPR",                    // 20 T
+            "Tot Deductions",            // 21 U
+            "Net Salary",                // 22 V
+        ];
+
+        const hRow = ws.getRow(4);
+        HEADERS.forEach((label, i) => {
+            const colNum = i + 1;
+            const cell = hRow.getCell(colNum);
+            cell.value = label;
+            if (!label) return;
+            cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.fill = solid(hdrFill(colNum));
+            cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+            cell.border = border("thin", "FF00000033");
+        });
+        hRow.height = 38;
+
+        // ── Data rows (start at row 5) ────────────────────────────────────────
+        const DATA_START = 5;
+        const daysInMonth = new Date(year, month, 0).getDate();
+        const moneyFmt = "#,##0";
+        const daysFmt = "0.##";
 
         items.forEach((it, idx) => {
-            const row = ws.getRow(4 + idx);
             const emp = empById.get(String(it.employeeId)) || {};
-
-            const rateBasic = it.rateBasic || emp.salary?.basic || 0;
-            const rateHra = it.rateHra || emp.salary?.hra || 0;
-            const rateGross = it.rateGross || emp.salary?.gross || 0;
             const e = it.earnings || {};
             const d = it.deductions || {};
+            const foodAllow = Number(emp.salary?.foodAllowance || 0);
+            const lnAdv = (d.loanDeduction || 0) + (d.advanceDeduction || 0);
+            const grossEarned = e.grossEarnings || 0;
+            const isEvenRow = idx % 2 === 1;
 
-            const daysForRegister = new Date(year, month, 0).getDate();
-            row.getCell(1).value = idx + 1;
-            row.getCell(2).value = it.employeeName || "";
-            row.getCell(3).value = it.designation || emp.designation || emp.jobTitle || "";
-            row.getCell(4).value = rateBasic;
-            row.getCell(5).value = rateHra;
-            row.getCell(6).value = rateGross;
-            row.getCell(7).value = daysForRegister;
-            row.getCell(8).value = it.payableDays || Math.round((it.presentDays || 0) + (it.paidLeaveDays || 0));
-            row.getCell(9).value = e.basicSalary || 0;
-            row.getCell(10).value = e.houseRentAllowance || 0;
-            row.getCell(11).value = e.overtime || 0;
-            row.getCell(12).value = e.grossEarnings || 0;
-            row.getCell(13).value = d.providentFund || 0;
-            row.getCell(14).value = d.esic || 0;
-            row.getCell(15).value = d.employerPF || d.providentFund || 0;
-            row.getCell(16).value = d.employerESIC || 0;
-            row.getCell(17).value = d.advanceDeduction || 0;
-            row.getCell(18).value = d.otherDeductions || 0;
-            row.getCell(19).value = d.totalDeductions || 0;
-            row.getCell(20).value = it.roundedNetPay ?? it.netPay ?? 0;
-            row.getCell(21).value = it.paymentDate ? new Date(it.paymentDate).toLocaleDateString("en-IN") : "";
-            row.getCell(22).value = emp.bankDetails?.accountNumber ? `A/C: ${emp.bankDetails.accountNumber}` : "";
+            const values = [
+                "",                                    // 1  A
+                it.biometricId || "",                // 2  B – Emp Code
+                it.employeeName || "",                // 3  C – Name
+                it.department || "",                // 4  D – Department
+                it.designation || "",                // 5  E – Designation
+                it.rateGross || 0,                 // 6  F – Gross Salary (rate)
+                it.rateBasic || 0,                 // 7  G – Basic (rate)
+                it.rateHra || 0,                 // 8  H – HRA (rate)
+                foodAllow,                             // 9  I – Food Allowance
+                daysInMonth,                           // 10 J – Days of Month
+                it.payableDays ?? 0,                 // 11 K – Actual Days
+                grossEarned,                           // 12 L – Gross Salary (earned)
+                e.basicSalary || 0,                 // 13 M – BAS
+                e.houseRentAllowance || 0,             // 14 N – HRA
+                grossEarned,                           // 15 O – Tot Earnings
+                d.esic || 0,                 // 16 P – ESIEMPLYE
+                d.employerESIC || 0,                 // 17 Q – ESIEMPR
+                lnAdv,                                 // 18 R – LN/ADV
+                d.providentFund || 0,                 // 19 S – PFEMPCONT
+                d.employerPF || d.providentFund || 0,  // 20 T – PFEMPR
+                d.totalDeductions || 0,                // 21 U – Tot Deductions
+                it.roundedNetPay ?? it.netPay ?? 0,   // 22 V – Net Salary
+            ];
 
-            if (it.preJoiningDays > 0) {
-                const doj = it.dateOfJoining
-                    ? new Date(it.dateOfJoining).toLocaleDateString("en-IN")
-                    : "";
-                row.getCell(2).value = `${it.employeeName || ""}\n(Joined: ${doj})`;
-            }
+            const row = ws.getRow(DATA_START + idx);
+            values.forEach((v, i) => { row.getCell(i + 1).value = v; });
 
-            row.eachCell((cell, col) => {
-                cell.font = { size: 9 };
+            row.eachCell({ includeEmpty: true }, (cell, colNum) => {
+                // Skip col A (blank spacer)
+                if (colNum === 1) return;
+
+                cell.font = { name: "Arial", size: 9 };
+                cell.fill = solid(cellFill(colNum, isEvenRow));
                 cell.alignment = {
                     vertical: "middle",
-                    horizontal: col <= 3 ? "left" : "right",
-                    indent: col <= 3 ? 1 : 0,
-                    wrapText: col === 2,
+                    horizontal: colNum <= 5 ? "left" : "right",
+                    indent: colNum >= 2 && colNum <= 5 ? 1 : 0,
                 };
-                if (col >= 4 && col !== 21 && col !== 22) cell.numFmt = "#,##0";
-                cell.border = {
-                    top: { style: "thin", color: { argb: "FFD1D5DB" } },
-                    bottom: { style: "thin", color: { argb: "FFD1D5DB" } },
-                    left: { style: "thin", color: { argb: "FFD1D5DB" } },
-                    right: { style: "thin", color: { argb: "FFD1D5DB" } },
-                };
+                if (colNum >= 6 && colNum !== 10) {
+                    cell.numFmt = colNum === 11 ? daysFmt : moneyFmt;
+                }
+                cell.border = border("thin");
+
+                // Make the Net Salary value bold and use a deep green text
+                if (colNum === 22) {
+                    cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FF065F46" } };
+                }
+                // Deduction totals in muted rose text
+                if (colNum === 21) {
+                    cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FF9F1239" } };
+                }
             });
-            row.height = it.preJoiningDays > 0 ? 30 : 22;
+
+            row.height = 19;
         });
 
-        const tr = ws.getRow(4 + items.length);
-        tr.getCell(1).value = "";
-        tr.getCell(2).value = "TOTAL";
-        const sumE = (k) => items.reduce((a, i) => a + (i.earnings?.[k] || 0), 0);
-        const sumD = (k) => items.reduce((a, i) => a + (i.deductions?.[k] || 0), 0);
-        tr.getCell(9).value = sumE("basicSalary");
-        tr.getCell(10).value = sumE("houseRentAllowance");
-        tr.getCell(11).value = sumE("overtime");
-        tr.getCell(12).value = sumE("grossEarnings");
-        tr.getCell(13).value = sumD("providentFund");
-        tr.getCell(14).value = sumD("esic");
-        tr.getCell(15).value = sumD("employerPF") || sumD("providentFund");
-        tr.getCell(16).value = sumD("employerESIC");
-        tr.getCell(17).value = sumD("advanceDeduction");
-        tr.getCell(18).value = sumD("otherDeductions");
-        tr.getCell(19).value = sumD("totalDeductions");
-        tr.getCell(20).value = items.reduce((a, i) => a + (i.roundedNetPay ?? i.netPay ?? 0), 0);
+        // ── Summary row ───────────────────────────────────────────────────────
+        const sumRow = ws.getRow(DATA_START + items.length);
 
-        tr.eachCell((cell, col) => {
-            cell.font = { size: 9, bold: true };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFEF3C7" } };
-            cell.alignment = { vertical: "middle", horizontal: col <= 3 ? "left" : "right", indent: col <= 3 ? 1 : 0 };
-            if (col >= 4) cell.numFmt = "#,##0";
+        sumRow.getCell(2).value = "Summary";
+        sumRow.getCell(3).value = `Count - ${items.length}`;
+
+        const totals = {
+            6: items.reduce((a, i) => a + (i.rateGross || 0), 0),
+            7: items.reduce((a, i) => a + (i.rateBasic || 0), 0),
+            8: items.reduce((a, i) => a + (i.rateHra || 0), 0),
+            9: items.reduce((a, i) => a + Number(empById.get(String(i.employeeId))?.salary?.foodAllowance || 0), 0),
+            10: daysInMonth,
+            11: items.reduce((a, i) => a + (i.payableDays || 0), 0),
+            12: items.reduce((a, i) => a + (i.earnings?.grossEarnings || 0), 0),
+            13: items.reduce((a, i) => a + (i.earnings?.basicSalary || 0), 0),
+            14: items.reduce((a, i) => a + (i.earnings?.houseRentAllowance || 0), 0),
+            15: items.reduce((a, i) => a + (i.earnings?.grossEarnings || 0), 0),
+            16: items.reduce((a, i) => a + (i.deductions?.esic || 0), 0),
+            17: items.reduce((a, i) => a + (i.deductions?.employerESIC || 0), 0),
+            18: items.reduce((a, i) => a + ((i.deductions?.loanDeduction || 0) + (i.deductions?.advanceDeduction || 0)), 0),
+            19: items.reduce((a, i) => a + (i.deductions?.providentFund || 0), 0),
+            20: items.reduce((a, i) => a + (i.deductions?.employerPF || i.deductions?.providentFund || 0), 0),
+            21: items.reduce((a, i) => a + (i.deductions?.totalDeductions || 0), 0),
+            22: items.reduce((a, i) => a + (i.roundedNetPay ?? i.netPay ?? 0), 0),
+        };
+
+        Object.entries(totals).forEach(([col, val]) => {
+            sumRow.getCell(parseInt(col)).value = val;
+        });
+
+        sumRow.eachCell({ includeEmpty: false }, (cell, colNum) => {
+            if (colNum === 1) return;
+            // Section-tinted summary fills — slightly darker than data tints
+            const sumFill =
+                colNum >= 2 && colNum <= 5 ? "FFFBFAFF" :
+                    colNum >= 6 && colNum <= 9 ? "FFDBEAFE" :  // blue-100
+                        colNum >= 10 && colNum <= 11 ? "FFCFFAFE" :  // cyan-100
+                            colNum >= 12 && colNum <= 15 ? "FFDCFCE7" :  // green-100
+                                colNum >= 16 && colNum <= 21 ? "FFFFE4E6" :  // rose-100
+                                    colNum === 22 ? "FFA7F3D0" :   // emerald-200
+                                        "FFFEFCE8";
+
+            cell.font = {
+                name: "Arial", size: 9, bold: true,
+                color: { argb: colNum === 22 ? "FF065F46" : colNum === 21 ? "FF9F1239" : "FF111827" },
+            };
+            cell.fill = solid(sumFill);
+            cell.alignment = {
+                vertical: "middle",
+                horizontal: colNum <= 5 ? "left" : "right",
+                indent: colNum >= 2 && colNum <= 5 ? 1 : 0,
+            };
+            if (colNum >= 6 && colNum !== 10) {
+                cell.numFmt = colNum === 11 ? daysFmt : moneyFmt;
+            }
             cell.border = {
                 top: { style: "medium", color: { argb: "FF000000" } },
                 bottom: { style: "medium", color: { argb: "FF000000" } },
@@ -1340,10 +1498,11 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
                 right: { style: "thin", color: { argb: "FFD1D5DB" } },
             };
         });
-        tr.height = 26;
+        sumRow.height = 22;
 
+        // ── Stream to client ──────────────────────────────────────────────────
         const buffer = await wb.xlsx.writeBuffer();
-        const filename = `salary_register_${year}-${String(month).padStart(2, "0")}.xlsx`;
+        const filename = `salary_sheet_${year}-${String(month).padStart(2, "0")}.xlsx`;
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
         res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
         res.send(buffer);
@@ -1352,7 +1511,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
 
 // ── DELETE /run ───────────────────────────────────────────────────────────────
 router.delete("/run", EmployeeAuthMiddlewear, async (req, res) => {
