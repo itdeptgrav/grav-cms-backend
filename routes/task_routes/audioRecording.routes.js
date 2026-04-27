@@ -16,6 +16,9 @@
  *   3. CEO/TL clicks Stop → frontend emits socket "recording_stop"
  *   4. Each browser calls /audio/finalize → backend merges chunks → Drive → Firebase
  *   5. Temp chunk files are deleted
+ * 
+ * 
+
  */
 
 const express = require("express");
@@ -324,11 +327,13 @@ module.exports = function (io) {
                 const actualFileName = driveResult.fileName;
 
                 // Save metadata to Firebase
-                // For rejoin: use unique doc ID with timestamp so old record is not overwritten
+                // ALWAYS use a unique doc ID so no recording segment ever gets
+                // overwritten — covers: rejoins in a new tab, stop-then-restart
+                // within the same session, multiple host recordings in the same
+                // meeting, etc. The driveFileId field is itself unique, so we
+                // prefer that in the docId when available.
                 const isRejoin = req.body.isRejoin === true || req.body.isRejoin === "true";
-                const docId = isRejoin
-                    ? `${meetId}_${employeeId}_${Date.now()}`
-                    : `${meetId}_${employeeId}`;
+                const docId = `${meetId}_${employeeId}_${Date.now()}`;
 
                 const firestoreData = {
                     meetId,
