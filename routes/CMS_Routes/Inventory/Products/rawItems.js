@@ -1,11 +1,8 @@
 // routes/Cms_routes/Inventory/Products/rawItems.js
-// FIXES:
-// 1. Added pagination to GET / route
-// 2. Fixed PUT route - removed sellingPrice references (not in schema)
-// 3. Fixed POST route - removed sellingPrice references
 
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
@@ -19,6 +16,30 @@ const RAW_ITEM_CATEGORIES = [
 ];
 
 router.use(EmployeeAuthMiddleware);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: derive status from quantity vs minStock (do NOT trust DB status field)
+// ─────────────────────────────────────────────────────────────────────────────
+const computeStatus = (qty, minStock) => {
+  const q = Number(qty) || 0;
+  const m = Number(minStock) || 0;
+  if (q <= 0) return "Out of Stock";
+  if (q <= m) return "Low Stock";
+  return "In Stock";
+};
+
+// Apply computed status to a plain rawItem object (and its variants)
+const applyComputedStatus = (item) => {
+  if (!item) return item;
+  item.status = computeStatus(item.quantity, item.minStock);
+  if (Array.isArray(item.variants)) {
+    item.variants = item.variants.map(v => ({
+      ...v,
+      status: computeStatus(v.quantity, v.minStock ?? item.minStock)
+    }));
+  }
+  return item;
+};
 
 // ✅ GET all raw items with pagination, search, and filter
 router.get("/", async (req, res) => {
@@ -46,10 +67,6 @@ router.get("/", async (req, res) => {
       ];
     }
 
-    if (status) {
-      filter.status = status;
-    }
-
     if (category) {
       filter.$or = [
         { category: category },
@@ -57,40 +74,49 @@ router.get("/", async (req, res) => {
       ];
     }
 
-    // Get paginated items (exclude stockTransactions for performance)
-    const rawItems = await RawItem.find(filter)
+    // Get items (exclude stockTransactions for performance)
+    let rawItems = await RawItem.find(filter)
       .select("-stockTransactions")
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email")
       .populate("primaryVendor", "companyName")
       .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limitNum);
+      .lean();
 
-    // Get total count for pagination
-    const totalItems = await RawItem.countDocuments(filter);
+    // ── Apply computed status to every item & variant ──
+    rawItems = rawItems.map(applyComputedStatus);
 
-    // Get global statistics (unfiltered)
-    const total = await RawItem.countDocuments();
-    const lowStock = await RawItem.countDocuments({ status: "Low Stock" });
-    const outOfStock = await RawItem.countDocuments({ status: "Out of Stock" });
+    // ── If filtering by status, apply AFTER status computation ──
+    if (status) {
+      rawItems = rawItems.filter(it => it.status === status);
+    }
 
-    // Calculate variants count
-    let totalVariants = 0;
-    rawItems.forEach(item => {
-      if (item.variants && Array.isArray(item.variants)) {
-        totalVariants += item.variants.length;
-      }
+    // Pagination after filter
+    const totalItems = rawItems.length;
+    const paged = rawItems.slice(skip, skip + limitNum);
+
+    // ── Stats from computed statuses (full DB scan, lean) ──
+    const allForStats = await RawItem.find({})
+      .select("quantity minStock variants")
+      .lean();
+
+    let total = 0, lowStock = 0, outOfStock = 0, totalVariants = 0;
+    allForStats.forEach(it => {
+      total++;
+      const s = computeStatus(it.quantity, it.minStock);
+      if (s === "Low Stock") lowStock++;
+      else if (s === "Out of Stock") outOfStock++;
+      if (Array.isArray(it.variants)) totalVariants += it.variants.length;
     });
 
     res.json({
       success: true,
-      rawItems,
+      rawItems: paged,
       pagination: {
         total: totalItems,
         page: pageNum,
         limit: limitNum,
-        totalPages: Math.ceil(totalItems / limitNum),
+        totalPages: Math.ceil(totalItems / limitNum) || 1,
         hasNextPage: pageNum < Math.ceil(totalItems / limitNum),
         hasPrevPage: pageNum > 1
       },
@@ -167,11 +193,16 @@ router.get("/:id", async (req, res) => {
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email")
       .populate("primaryVendor", "companyName")
-      .populate("alternateVendors", "companyName");
+      .populate("alternateVendors", "companyName")
+      .populate("vendorNicknames.vendor", "companyName contactPerson email phone")
+      .lean();
 
     if (!rawItem) {
       return res.status(404).json({ success: false, message: "Raw item not found" });
     }
+
+    // Apply computed status
+    applyComputedStatus(rawItem);
 
     res.json({ success: true, rawItem });
 
@@ -239,13 +270,11 @@ router.post("/", async (req, res) => {
     const randomNum = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
     const sku = `RAW-${categoryCode}-${nameCode}-${randomNum}`;
 
-    // Check for duplicate SKU
     const existingItem = await RawItem.findOne({ sku });
     if (existingItem) {
       return res.status(400).json({ success: false, message: "An item with similar SKU already exists. Please try again." });
     }
 
-    // Process variants - only fields that exist in the schema
     let processedVariants = [];
     if (variants && Array.isArray(variants)) {
       processedVariants = variants.map(variant => ({
@@ -257,7 +286,6 @@ router.post("/", async (req, res) => {
       }));
     }
 
-    // Calculate total quantity from variants
     const totalQuantity = processedVariants.reduce((total, variant) => {
       return total + (variant.quantity || 0);
     }, 0);
@@ -304,7 +332,6 @@ router.post("/", async (req, res) => {
 
   } catch (error) {
     console.error("Error creating raw item:", error);
-
     if (error.code === 11000) {
       return res.status(400).json({ success: false, message: "Item with this SKU already exists" });
     }
@@ -315,7 +342,6 @@ router.post("/", async (req, res) => {
         errors: error.errors
       });
     }
-
     res.status(500).json({
       success: false,
       message: "Server error while creating raw item: " + error.message
@@ -323,7 +349,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// ✅ UPDATE raw item - FIXED: removed sellingPrice (not in schema)
+// ✅ UPDATE raw item
 router.put("/:id", async (req, res) => {
   try {
     const {
@@ -347,10 +373,8 @@ router.put("/:id", async (req, res) => {
       return res.status(404).json({ success: false, message: "Raw item not found" });
     }
 
-    // Update basic fields
     if (name !== undefined && name.trim()) rawItem.name = name.trim();
 
-    // Handle category
     if (category !== undefined || customCategory !== undefined) {
       if (customCategory && customCategory.trim()) {
         rawItem.category = "";
@@ -361,7 +385,6 @@ router.put("/:id", async (req, res) => {
       }
     }
 
-    // Handle unit
     if (unit !== undefined || customUnit !== undefined) {
       if (customUnit && customUnit.trim()) {
         rawItem.unit = "";
@@ -375,7 +398,6 @@ router.put("/:id", async (req, res) => {
     if (minStock !== undefined && !isNaN(minStock)) rawItem.minStock = parseFloat(minStock);
     if (maxStock !== undefined && !isNaN(maxStock)) rawItem.maxStock = parseFloat(maxStock);
 
-    // Update discounts
     if (discounts !== undefined) {
       rawItem.discounts = Array.isArray(discounts)
         ? discounts
@@ -387,7 +409,6 @@ router.put("/:id", async (req, res) => {
         : [];
     }
 
-    // Update attributes
     if (attributes !== undefined) {
       rawItem.attributes = Array.isArray(attributes)
         ? attributes
@@ -399,7 +420,6 @@ router.put("/:id", async (req, res) => {
         : [];
     }
 
-    // Update variants - only schema fields
     if (variants !== undefined) {
       rawItem.variants = Array.isArray(variants)
         ? variants.map(variant => ({
@@ -412,7 +432,6 @@ router.put("/:id", async (req, res) => {
           }))
         : [];
 
-      // Recalculate total quantity from variants if variants exist
       if (rawItem.variants.length > 0) {
         rawItem.quantity = rawItem.variants.reduce((sum, v) => sum + (v.quantity || 0), 0);
       }
@@ -429,7 +448,11 @@ router.put("/:id", async (req, res) => {
     const updatedRawItem = await RawItem.findById(rawItem._id)
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email")
-      .populate("primaryVendor", "companyName");
+      .populate("primaryVendor", "companyName")
+      .populate("vendorNicknames.vendor", "companyName")
+      .lean();
+
+    applyComputedStatus(updatedRawItem);
 
     res.json({
       success: true,
@@ -439,7 +462,6 @@ router.put("/:id", async (req, res) => {
 
   } catch (error) {
     console.error("Error updating raw item:", error);
-
     if (error.name === 'ValidationError') {
       return res.status(400).json({
         success: false,
@@ -447,7 +469,6 @@ router.put("/:id", async (req, res) => {
         errors: error.errors
       });
     }
-
     res.status(500).json({
       success: false,
       message: "Server error while updating raw item: " + error.message
@@ -470,16 +491,182 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
-// ✅ GET variants for a raw item
-router.get("/:id/variants", async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// VENDOR NICKNAMES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ✅ GET all vendor nicknames for a raw item
+router.get("/:id/vendor-nicknames", async (req, res) => {
   try {
-    const rawItem = await RawItem.findById(req.params.id).select("variants attributes name sku");
+    const rawItem = await RawItem.findById(req.params.id)
+      .select("name sku vendorNicknames")
+      .populate("vendorNicknames.vendor", "companyName contactPerson email phone")
+      .lean();
+
     if (!rawItem) {
       return res.status(404).json({ success: false, message: "Raw item not found" });
     }
+
     res.json({
       success: true,
-      variants: rawItem.variants || [],
+      vendorNicknames: rawItem.vendorNicknames || [],
+      item: { name: rawItem.name, sku: rawItem.sku }
+    });
+  } catch (error) {
+    console.error("Error fetching vendor nicknames:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ✅ ADD a vendor nickname
+router.post("/:id/vendor-nicknames", async (req, res) => {
+  try {
+    const { vendor, nickname, notes } = req.body;
+
+    if (!vendor || !mongoose.Types.ObjectId.isValid(vendor)) {
+      return res.status(400).json({ success: false, message: "Valid vendor is required" });
+    }
+    if (!nickname || !nickname.trim()) {
+      return res.status(400).json({ success: false, message: "Nickname is required" });
+    }
+
+    const vendorDoc = await Vendor.findById(vendor).select("companyName");
+    if (!vendorDoc) {
+      return res.status(404).json({ success: false, message: "Vendor not found" });
+    }
+
+    const rawItem = await RawItem.findById(req.params.id);
+    if (!rawItem) {
+      return res.status(404).json({ success: false, message: "Raw item not found" });
+    }
+
+    // Block duplicate vendor entry
+    const existing = (rawItem.vendorNicknames || []).find(
+      vn => vn.vendor.toString() === vendor
+    );
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message: `${vendorDoc.companyName} already has a nickname assigned. Edit the existing entry instead.`
+      });
+    }
+
+    rawItem.vendorNicknames.push({
+      vendor,
+      nickname: nickname.trim(),
+      notes: (notes || "").trim()
+    });
+    rawItem.updatedBy = req.user.id;
+    await rawItem.save();
+
+    const updated = await RawItem.findById(rawItem._id)
+      .select("vendorNicknames")
+      .populate("vendorNicknames.vendor", "companyName contactPerson email phone");
+
+    res.status(201).json({
+      success: true,
+      message: "Vendor nickname added successfully",
+      vendorNicknames: updated.vendorNicknames
+    });
+  } catch (error) {
+    console.error("Error adding vendor nickname:", error);
+    res.status(500).json({ success: false, message: "Server error: " + error.message });
+  }
+});
+
+// ✅ UPDATE a vendor nickname
+router.put("/:id/vendor-nicknames/:nicknameId", async (req, res) => {
+  try {
+    const { nickname, notes, vendor } = req.body;
+
+    const rawItem = await RawItem.findById(req.params.id);
+    if (!rawItem) {
+      return res.status(404).json({ success: false, message: "Raw item not found" });
+    }
+
+    const entry = rawItem.vendorNicknames.id(req.params.nicknameId);
+    if (!entry) {
+      return res.status(404).json({ success: false, message: "Vendor nickname entry not found" });
+    }
+
+    if (vendor && mongoose.Types.ObjectId.isValid(vendor)) {
+      // Make sure no other entry already uses this vendor
+      const collision = rawItem.vendorNicknames.find(
+        vn => vn._id.toString() !== req.params.nicknameId && vn.vendor.toString() === vendor
+      );
+      if (collision) {
+        return res.status(400).json({
+          success: false,
+          message: "Another nickname already exists for that vendor"
+        });
+      }
+      entry.vendor = vendor;
+    }
+    if (nickname !== undefined && nickname.trim()) entry.nickname = nickname.trim();
+    if (notes !== undefined) entry.notes = (notes || "").trim();
+
+    rawItem.updatedBy = req.user.id;
+    await rawItem.save();
+
+    const updated = await RawItem.findById(rawItem._id)
+      .select("vendorNicknames")
+      .populate("vendorNicknames.vendor", "companyName contactPerson email phone");
+
+    res.json({
+      success: true,
+      message: "Vendor nickname updated successfully",
+      vendorNicknames: updated.vendorNicknames
+    });
+  } catch (error) {
+    console.error("Error updating vendor nickname:", error);
+    res.status(500).json({ success: false, message: "Server error: " + error.message });
+  }
+});
+
+// ✅ DELETE a vendor nickname
+router.delete("/:id/vendor-nicknames/:nicknameId", async (req, res) => {
+  try {
+    const rawItem = await RawItem.findById(req.params.id);
+    if (!rawItem) {
+      return res.status(404).json({ success: false, message: "Raw item not found" });
+    }
+
+    const entry = rawItem.vendorNicknames.id(req.params.nicknameId);
+    if (!entry) {
+      return res.status(404).json({ success: false, message: "Vendor nickname entry not found" });
+    }
+
+    entry.deleteOne();
+    rawItem.updatedBy = req.user.id;
+    await rawItem.save();
+
+    res.json({ success: true, message: "Vendor nickname removed" });
+  } catch (error) {
+    console.error("Error deleting vendor nickname:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (Existing variant endpoints unchanged below)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get("/:id/variants", async (req, res) => {
+  try {
+    const rawItem = await RawItem.findById(req.params.id).select("variants attributes name sku minStock").lean();
+    if (!rawItem) {
+      return res.status(404).json({ success: false, message: "Raw item not found" });
+    }
+
+    // Apply computed status to variants
+    const variants = (rawItem.variants || []).map(v => ({
+      ...v,
+      status: computeStatus(v.quantity, v.minStock ?? rawItem.minStock)
+    }));
+
+    res.json({
+      success: true,
+      variants,
       attributes: rawItem.attributes || [],
       item: { name: rawItem.name, sku: rawItem.sku }
     });
@@ -489,7 +676,6 @@ router.get("/:id/variants", async (req, res) => {
   }
 });
 
-// ✅ ADD STOCK to specific variant
 router.post("/:id/variants/:variantId/add-stock", async (req, res) => {
   try {
     const { quantity, supplier, supplierId, unitPrice, purchaseOrder, purchaseOrderId, invoiceNumber, reason, notes } = req.body;
@@ -551,7 +737,6 @@ router.post("/:id/variants/:variantId/add-stock", async (req, res) => {
   }
 });
 
-// ✅ REDUCE stock from specific variant
 router.post("/:id/variants/:variantId/reduce-stock", async (req, res) => {
   try {
     const { quantity, reason, notes } = req.body;
@@ -605,15 +790,15 @@ router.post("/:id/variants/:variantId/reduce-stock", async (req, res) => {
   }
 });
 
-// ✅ GET stock transactions for a raw item
 router.get("/:id/transactions", async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
 
     const rawItem = await RawItem.findById(req.params.id)
-      .select("stockTransactions name sku quantity status")
+      .select("stockTransactions name sku quantity minStock")
       .populate("stockTransactions.performedBy", "name email")
-      .populate("stockTransactions.supplierId", "companyName");
+      .populate("stockTransactions.supplierId", "companyName")
+      .lean();
 
     if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
 
@@ -635,6 +820,8 @@ router.get("/:id/transactions", async (req, res) => {
       .filter(tx => tx.supplier && tx.supplier.trim())
       .map(tx => tx.supplier))];
 
+    const computedStatus = computeStatus(rawItem.quantity, rawItem.minStock);
+
     res.json({
       success: true,
       transactions: paginatedTransactions,
@@ -646,9 +833,14 @@ router.get("/:id/transactions", async (req, res) => {
         totalReductions,
         uniqueVendors: uniqueVendors.length,
         currentStock: rawItem.quantity,
-        status: rawItem.status
+        status: computedStatus
       },
-      item: { name: rawItem.name, sku: rawItem.sku, quantity: rawItem.quantity, status: rawItem.status }
+      item: {
+        name: rawItem.name,
+        sku: rawItem.sku,
+        quantity: rawItem.quantity,
+        status: computedStatus
+      }
     });
 
   } catch (error) {
@@ -657,15 +849,15 @@ router.get("/:id/transactions", async (req, res) => {
   }
 });
 
-// ✅ GET variant transactions
 router.get("/:id/variants/:variantId/transactions", async (req, res) => {
   try {
     const { page = 1, limit = 10 } = req.query;
 
     const rawItem = await RawItem.findById(req.params.id)
-      .select("stockTransactions name sku variants")
+      .select("stockTransactions name sku variants minStock")
       .populate("stockTransactions.performedBy", "name email")
-      .populate("stockTransactions.supplierId", "companyName");
+      .populate("stockTransactions.supplierId", "companyName")
+      .lean();
 
     if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
 
@@ -690,7 +882,7 @@ router.get("/:id/variants/:variantId/transactions", async (req, res) => {
         combination: variant.combination,
         sku: variant.sku,
         quantity: variant.quantity,
-        status: variant.status,
+        status: computeStatus(variant.quantity, variant.minStock ?? rawItem.minStock),
         minStock: variant.minStock,
         maxStock: variant.maxStock
       },
@@ -703,7 +895,6 @@ router.get("/:id/variants/:variantId/transactions", async (req, res) => {
   }
 });
 
-// ✅ GET purchase orders for a raw item
 router.get("/:id/purchase-orders", async (req, res) => {
   try {
     const rawItem = await RawItem.findById(req.params.id).select("name sku");
@@ -749,7 +940,6 @@ router.get("/:id/purchase-orders", async (req, res) => {
   }
 });
 
-// ✅ GET suppliers for a raw item
 router.get("/:id/suppliers", async (req, res) => {
   try {
     const rawItem = await RawItem.findById(req.params.id)
