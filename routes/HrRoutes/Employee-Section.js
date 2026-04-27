@@ -369,7 +369,12 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
     const { page = 1, limit = 10, department, status, search } = req.query;
 
     let filter = {};
-    if (department && department !== "all") filter.department = department;
+
+    // FIX: Case-insensitive department match — employee records may store "PRODUCTION"
+    // while the departments API returns "Production". Regex handles any casing.
+    if (department && department !== "all")
+      filter.department = { $regex: new RegExp(`^${department.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") };
+
     if (status && status !== "all") filter.status = status;
     if (search) {
       filter.$or = [
@@ -394,7 +399,10 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
         .select("-password -temporaryPassword -__v")
         .lean(),
       Employee.countDocuments(filter),
+      // FIX: deptStats must respect the active/inactive tab — add $match on status only
+      // (intentionally excludes department + search so the strip always shows all depts)
       Employee.aggregate([
+        ...(status && status !== "all" ? [{ $match: { status } }] : []),
         { $group: { _id: "$department", count: { $sum: 1 } } },
         { $sort: { count: -1 } },
       ]),
@@ -669,6 +677,7 @@ router.get("/department/employees", EmployeeAuthMiddlewear, async (req, res) => 
 });
 
 // ─── SOFT DELETE ──────────────────────────────────────────────────────────────
+// ─── SOFT DELETE ──────────────────────────────────────────────────────────────
 router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
@@ -676,12 +685,22 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       return res.status(403).json({ success: false, message: "Only HR managers can delete employees" });
     }
 
-    const employee = await Employee.findById(req.params.id);
-    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
+    // BEFORE (broken): loads full doc then calls .save() → triggers full validation
+    // → fails on stale enum values like gender:"Male" stored before schema tightening
+    //
+    // const employee = await Employee.findById(req.params.id);
+    // employee.isActive = false;
+    // employee.status = "inactive";
+    // await employee.save();
 
-    employee.isActive = false;
-    employee.status = "inactive";
-    await employee.save();
+    // AFTER: direct update, runValidators:false — only touches these two fields
+    const employee = await Employee.findByIdAndUpdate(
+      req.params.id,
+      { $set: { isActive: false, status: "inactive" } },
+      { new: true, runValidators: false }
+    );
+
+    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
 
     res.status(200).json({ success: true, message: "Employee deactivated successfully" });
   } catch (error) {

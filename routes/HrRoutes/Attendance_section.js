@@ -2317,11 +2317,55 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
         }
 
         const bid = biometricId.toUpperCase();
-        const dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
-        if (!dayDoc) return res.status(404).json({ success: false, message: `No record for ${biometricId} on ${dateStr}` });
+
+        // ── Upsert: find or create the DailyAttendance doc and employee entry ──
+        let dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
+
+        if (!dayDoc) {
+            const existingDay = await DailyAttendance.findOne({ dateStr });
+            const empRecord = await Employee.findOne({
+                $or: [{ biometricId: bid }, { "basicInfo.biometricId": bid }, { "workInfo.biometricId": bid }],
+            }).lean();
+            const settings2 = await AttendanceSettings.getConfig();
+            const empType2 = resolveEmployeeType(empRecord, settings2);
+            const shift2 = settings2.shifts?.[empType2] || settings2.shifts?.executive || { start: "09:30", end: "18:30" };
+            const newEntry = {
+                biometricId: bid,
+                employeeDbId: empRecord?._id || null,
+                identityId: extractIdentity(empRecord) || "",
+                employeeName: extractName(empRecord, bid),
+                department: extractDepartment(empRecord),
+                designation: extractDesignation(empRecord),
+                employeeType: empType2,
+                shiftStart: shift2.start || "09:30",
+                shiftEnd: shift2.end || "18:30",
+                systemPrediction: "AB",
+                hrFinalStatus: null,
+                rawPunches: [],
+                punchCount: 0,
+                netWorkMins: 0, totalBreakMins: 0, totalSpanMins: 0,
+                otMins: 0, lateMins: 0, lateDisplay: "",
+                isLate: false, isEarlyDeparture: false, hasOT: false, hasMissPunch: false,
+                attendanceValue: 0,
+            };
+            if (existingDay) {
+                existingDay.employees.push(newEntry);
+                await existingDay.save();
+                dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
+            } else {
+                const [y2, m2, d2] = dateStr.split("-").map(Number);
+                await DailyAttendance.create({
+                    dateStr,
+                    date: new Date(Date.UTC(y2, m2 - 1, d2)),
+                    yearMonth: dateStr.slice(0, 7),
+                    employees: [newEntry],
+                });
+                dayDoc = await DailyAttendance.findOne({ dateStr, "employees.biometricId": bid });
+            }
+        }
 
         const empIdx = dayDoc.employees.findIndex((e) => e.biometricId === bid);
-        if (empIdx === -1) return res.status(404).json({ success: false, message: `Employee ${biometricId} not in day doc` });
+        if (empIdx === -1) return res.status(500).json({ success: false, message: "Failed to locate employee entry after upsert" });
 
         const emp = dayDoc.employees[empIdx];
 
@@ -3427,7 +3471,8 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// Muster Excel export — unchanged; Phase 2 will update for FH/NH/etc
+// ═══════════════════════════════════════════════════════════════════════════
+//  MUSTER ROLL EXPORT — matches Grav Clothing attendance sheet template exactly
 // ═══════════════════════════════════════════════════════════════════════════
 router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     try {
@@ -3438,15 +3483,16 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         const lastDay = new Date(yr, mo, 0).getDate();
         const from = `${yearMonth}-01`;
         const to = `${yearMonth}-${String(lastDay).padStart(2, "0")}`;
+        const monthLabel = new Date(from + "T00:00:00").toLocaleDateString("en-IN", { month: "long", year: "numeric" }).toUpperCase();
 
         const settings = await AttendanceSettings.getConfig();
         const thresholds = settings.lateHalfDayPolicy?.cumulativeLateMinsThreshold || { operator: 30, executive: 40 };
-        const labels = settings.displayLabels || {};
-        const L = (s) => labels[s] || s;
 
         const holidayMap = await loadHolidayMap(from, to);
 
         const today = new Date(); today.setHours(0, 0, 0, 0);
+
+        // Build allDays array
         const allDays = [];
         for (let d = 1; d <= lastDay; d++) {
             const dateStr = `${yearMonth}-${String(d).padStart(2, "0")}`;
@@ -3457,17 +3503,32 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
             const isWorkingSunday = !!hol && hol.type === "working_sunday";
             allDays.push({
                 day: d, dateStr,
-                dayName: dt.toLocaleDateString("en-IN", { weekday: "short" }),
-                dayLetter: dt.toLocaleDateString("en-IN", { weekday: "short" }).charAt(0),
+                dayAbbr: dt.toLocaleDateString("en-IN", { weekday: "short" }).substring(0, 3).toUpperCase(),
                 isSunday: dow === 0,
                 isFuture: dt > today,
                 isDeclaredHoliday,
                 isWorkingSunday,
                 holiday: isDeclaredHoliday ? hol : null,
                 holidayStatus: isDeclaredHoliday ? holidayTypeToStatus(hol.type) : null,
+                holidayName: isDeclaredHoliday ? hol.name : null,
             });
         }
 
+        // Map internal status codes to sheet abbreviations
+        function toSheetCode(status) {
+            const map = {
+                "P": "P", "P*": "P", "P~": "P", "MP": "P", "WFH": "P",
+                "AB": "A", "LWP": "A",
+                "HD": "HD",
+                "WO": "WO", "OH": "WO", "RH": "WO",
+                "CO": "CO",
+                "L-CL": "CL", "L-SL": "SL", "L-EL": "PL",
+                "FH": "FH", "NH": "NH", "PH": "FH",
+            };
+            return map[status] || "";
+        }
+
+        // Load employees
         const allActive = await Employee.find({
             $or: [{ status: "active" }, { status: { $exists: false } }, { isActive: true }],
         }).lean();
@@ -3478,131 +3539,120 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         const dayDocs = await DailyAttendance.find({ yearMonth }).sort({ dateStr: 1 }).lean();
         const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
 
-        const PAID_CODES = [
-            "P", "P*", "P~", "HD", "MP",
-            "WO", "FH", "NH", "OH", "RH", "PH",
-            "L-CL", "L-SL", "L-EL", "WFH", "CO",
-        ];
-
         const employees = [];
         const running = new Map();
 
-        for (const emp of filteredActive) {
-            const bid = extractBiometricId(emp);
-            if (!bid) continue;
-            const key = String(bid).toUpperCase();
-            const empType = resolveEmployeeType(emp, settings);
-
+        // Helper: build day codes for one employee key given their basic info
+        function buildEmpRow(key, empName, empDept, empDesig, empType) {
             const row = {
                 biometricId: key,
-                empCode: extractIdentity(emp) || key.replace(/^GR/, ""),
-                employeeName: extractName(emp),
-                department: extractDepartment(emp),
-                designation: extractDesignation(emp),
+                employeeName: empName,
+                department: empDept,
+                designation: empDesig,
                 employeeType: empType,
-                days: {},
-                totals: {
-                    P: 0, "P*": 0, "P~": 0, HD: 0, AB: 0, MP: 0, WO: 0, PH: 0,
-                    FH: 0, NH: 0, OH: 0, RH: 0, leaves: 0,
-                    totalLateMins: 0, totalOtMins: 0, totalNetWorkMins: 0,
-                    totalAttendance: 0,
-                    sundayWorked: 0, holidayWorked: 0,
-                },
+                dayCodes: {},        // dateStr -> sheet code
+                hrOverrides: new Set(), // dateStrings where hrFinalStatus was applied
+                totals: { P: 0, A: 0, HD: 0, WO: 0, CO: 0, CL: 0, SL: 0, PL: 0, NHFH: 0, Total: 0 },
             };
             running.set(key, 0);
 
             for (const cal of allDays) {
-                if (cal.isFuture) { row.days[cal.dateStr] = { status: "—", isFuture: true }; continue; }
+                if (cal.isFuture) { row.dayCodes[cal.dateStr] = ""; continue; }
 
                 const dayDoc = byDate.get(cal.dateStr);
                 const entry = dayDoc ? (dayDoc.employees || []).find((e) => e.biometricId === key) : null;
 
-                // HOLIDAY → applies to everyone
+                let sheetCode = "";
+
                 if (cal.isDeclaredHoliday) {
                     const hs = cal.holidayStatus;
                     const didPunch = !!entry && (entry.punchCount || 0) > 0;
-                    row.days[cal.dateStr] = {
-                        status: hs,
-                        punchedOnHoliday: didPunch,
-                        otMins: entry?.otMins || 0,
-                        netWorkMins: entry?.netWorkMins || 0,
-                        hrOverride: !!entry?.hrFinalStatus,
-                    };
-                    row.totals[hs] = (row.totals[hs] || 0) + 1;
-                    row.totals.totalAttendance++;
-                    if (didPunch) {
-                        row.totals.holidayWorked++;
-                        row.totals.totalOtMins += entry.otMins || 0;
-                        row.totals.totalNetWorkMins += entry.netWorkMins || 0;
-                    }
-                    continue;
-                }
-
-                // SUNDAY
-                if (cal.isSunday && !cal.isWorkingSunday) {
+                    sheetCode = didPunch ? "P" : toSheetCode(hs);
+                    if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch) row.totals.NHFH++;
+                    else if (didPunch) row.totals.P++;
+                    // HR override on a holiday (e.g., someone HR-marked absent on a holiday)
+                    if (didPunch && (entry?.hrFinalStatus || (entry?.rawPunches || []).some(p => p.source === 'manual'))) row.hrOverrides.add(cal.dateStr);
+                } else if (cal.isSunday && !cal.isWorkingSunday) {
                     const didPunch = !!entry && (entry.punchCount || 0) > 0;
                     if (didPunch) {
-                        let status = entry.systemPrediction;
-                        const finalStatus = entry.hrFinalStatus || status;
-                        row.days[cal.dateStr] = {
-                            status: finalStatus,
-                            netWorkMins: entry.netWorkMins || 0,
-                            lateMins: entry.lateMins || 0,
-                            otMins: entry.otMins || 0,
-                            hrOverride: !!entry.hrFinalStatus,
-                            isSundayWorked: true,
-                        };
-                        if (row.totals[finalStatus] !== undefined) row.totals[finalStatus]++;
-                        row.totals.sundayWorked++;
-                        row.totals.totalAttendance++;
-                        row.totals.totalLateMins += entry.lateMins || 0;
-                        row.totals.totalOtMins += entry.otMins || 0;
-                        row.totals.totalNetWorkMins += entry.netWorkMins || 0;
+                        const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
+                        sheetCode = toSheetCode(finalStatus) || "P";
+                        row.totals.P++;
+                        if (entry.hrFinalStatus || (entry.rawPunches || []).some(p => p.source === 'manual' || p.source === 'miss_punch')) row.hrOverrides.add(cal.dateStr);
                     } else {
-                        row.days[cal.dateStr] = { status: "WO" };
+                        sheetCode = "WO";
                         row.totals.WO++;
-                        row.totals.totalAttendance++;
                     }
-                    continue;
+                } else if (!dayDoc || !entry) {
+                    sheetCode = dayDoc ? "A" : "";
+                    if (dayDoc) row.totals.A++;
+                } else {
+                    // Normal working day
+                    let cum = running.get(key) || 0;
+                    let status = entry.systemPrediction;
+                    if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
+                        cum += entry.lateMins;
+                        const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
+                        if (cum >= thr) { status = "HD"; cum = 0; }
+                    }
+                    running.set(key, cum);
+                    const finalStatus = entry.hrFinalStatus || status;
+                    sheetCode = toSheetCode(finalStatus);
+
+                    // Track HR override
+                    // HR override: explicit status change OR manually edited punch times
+                    const hasManualPunch = (entry.rawPunches || []).some(p => p.source === 'manual' || p.source === 'miss_punch');
+                    if (entry.hrFinalStatus || hasManualPunch) row.hrOverrides.add(cal.dateStr);
+
+                    if (["P", "P*", "P~", "MP", "WFH"].includes(finalStatus)) row.totals.P++;
+                    else if (finalStatus === "AB" || finalStatus === "LWP") row.totals.A++;
+                    else if (finalStatus === "HD") row.totals.HD++;
+                    else if (finalStatus === "WO") row.totals.WO++;
+                    else if (finalStatus === "CO") row.totals.CO++;
+                    else if (finalStatus === "L-CL") row.totals.CL++;
+                    else if (finalStatus === "L-SL") row.totals.SL++;
+                    else if (finalStatus === "L-EL") row.totals.PL++;
+                    else if (["FH", "NH", "OH", "RH", "PH"].includes(finalStatus)) row.totals.NHFH++;
                 }
-
-                // Normal working day
-                if (!dayDoc) { row.days[cal.dateStr] = { status: "—" }; continue; }
-                if (!entry) { row.days[cal.dateStr] = { status: "AB" }; row.totals.AB++; continue; }
-
-                let cum = running.get(key) || 0;
-                let status = entry.systemPrediction;
-                let promoted = false;
-                if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
-                    cum += entry.lateMins;
-                    const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
-                    if (cum >= thr) { status = "HD"; promoted = true; cum = 0; }
-                }
-                running.set(key, cum);
-                const finalStatus = entry.hrFinalStatus || status;
-
-                row.days[cal.dateStr] = {
-                    status: finalStatus,
-                    netWorkMins: entry.netWorkMins || 0,
-                    lateMins: entry.lateMins || 0,
-                    otMins: entry.otMins || 0,
-                    hrOverride: !!entry.hrFinalStatus,
-                    wasPromoted: promoted,
-                };
-                if (row.totals[finalStatus] !== undefined) row.totals[finalStatus]++;
-                if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(finalStatus)) row.totals.leaves++;
-                if (PAID_CODES.includes(finalStatus)) row.totals.totalAttendance++;
-
-                row.totals.totalLateMins += entry.lateMins || 0;
-                row.totals.totalOtMins += entry.otMins || 0;
-                row.totals.totalNetWorkMins += entry.netWorkMins || 0;
+                row.dayCodes[cal.dateStr] = sheetCode;
             }
 
-            const worked = row.totals.P + row.totals["P*"] + row.totals["P~"] + row.totals.MP;
-            const workable = allDays.filter(d => !d.isSunday && !d.isFuture && !d.isDeclaredHoliday).length;
-            row.attendanceRate = workable > 0 ? Math.round((worked / workable) * 100) : 0;
-            employees.push(row);
+            row.totals.Total = row.totals.P + row.totals.A + row.totals.HD + row.totals.WO
+                + row.totals.CO + row.totals.CL + row.totals.SL + row.totals.PL + row.totals.NHFH;
+            return row;
         }
+
+        // ── Process employees from Employee collection ──
+        const processedBids = new Set();
+        for (const emp of filteredActive) {
+            const bid = extractBiometricId(emp);
+            if (!bid) continue;
+            const key = String(bid).toUpperCase();
+            if (processedBids.has(key)) continue;
+            processedBids.add(key);
+            const empType = resolveEmployeeType(emp, settings);
+            employees.push(buildEmpRow(key, extractName(emp), extractDepartment(emp), extractDesignation(emp), empType));
+        }
+
+        // ── Also include any employees found in attendance records but missing above ──
+        // (ghost employees: in biometric device but Employee doc missing/no-biometric-ID)
+        for (const dayDoc of dayDocs) {
+            for (const entry of (dayDoc.employees || [])) {
+                const key = String(entry.biometricId || "").toUpperCase();
+                if (!key || processedBids.has(key)) continue;
+                if (department && department !== "all" && entry.department !== department) continue;
+                processedBids.add(key);
+                employees.push(buildEmpRow(
+                    key,
+                    entry.employeeName || key,
+                    entry.department || "—",
+                    entry.designation || "—",
+                    entry.employeeType || "operator"
+                ));
+            }
+        }
+
+        // Sort by department then name (matching uploaded sheet style)
         employees.sort((a, b) => {
             if (a.department !== b.department) return (a.department || "").localeCompare(b.department || "");
             return (a.employeeName || "").localeCompare(b.employeeName || "");
@@ -3613,378 +3663,220 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         wb.creator = "Grav Clothing HRMS";
         wb.created = new Date();
         const ws = wb.addWorksheet("Attendance", {
-            views: [{ state: "frozen", xSplit: 3, ySplit: 7, showGridLines: false }],
+            views: [{ state: "frozen", xSplit: 4, ySplit: 4, showGridLines: true }],
             pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
         });
 
-        const monthLabel = new Date(from + "T00:00:00").toLocaleDateString("en-IN", { month: "long", year: "numeric" });
-        // cols: #, Name, Dept, 1..lastDay, Total-Att, P, A, HD, MP, WO, LV, HW, Rate
-        const dayStart = 4;
-        const totalAttCol = dayStart + lastDay;
-        const afterCols = ["P", "A", "HD", "MP", "WO", "LV", "HW", "RATE"];
-        const totalCols = 3 + lastDay + 1 + afterCols.length;
+        // Column widths
+        ws.getColumn(1).width = 6;   // Sr
+        ws.getColumn(2).width = 24;  // Name
+        ws.getColumn(3).width = 14;  // Dept
+        ws.getColumn(4).width = 20;  // Designation
+        for (let d = 1; d <= lastDay; d++) ws.getColumn(4 + d).width = 4;
+        const sumStart = 4 + lastDay + 1;
+        const sumCols = ["P", "A", "HD", "WO", "CO", "CL", "SL", "PL", "NH/FH", "Total Days"];
+        sumCols.forEach((_, i) => { ws.getColumn(sumStart + i).width = 7; });
 
-        const STATUS = {
-            P: { font: "FF16A34A", fill: "FFDCFCE7" },
-            "P*": { font: "FF854D0E", fill: "FFFEF9C3" },
-            "P~": { font: "FF9A3412", fill: "FFFFEDD5" },
-            HD: { font: "FF92400E", fill: "FFFEF3C7" },
-            MP: { font: "FF9D174D", fill: "FFFCE7F3" },
-            AB: { font: "FF991B1B", fill: "FFFEE2E2" },
-            LWP: { font: "FF991B1B", fill: "FFFEE2E2" },
-            WO: { font: "FF475569", fill: "FFF1F5F9" },
-            PH: { font: "FF1E40AF", fill: "FFDBEAFE" },
-            FH: { font: "FF3730A3", fill: "FFE0E7FF" },
-            NH: { font: "FF831843", fill: "FFFCE7F3" },
-            OH: { font: "FF134E4A", fill: "FFCCFBF1" },
-            RH: { font: "FF78350F", fill: "FFFEF3C7" },
-            "L-CL": { font: "FF5B21B6", fill: "FFEDE9FE" },
-            "L-SL": { font: "FF5B21B6", fill: "FFEDE9FE" },
-            "L-EL": { font: "FF5B21B6", fill: "FFEDE9FE" },
-            WFH: { font: "FF155E75", fill: "FFCFFAFE" },
-            CO: { font: "FF0F766E", fill: "FFCCFBF1" },
-            "—": { font: "FFCBD5E1", fill: null },
-        };
+        const totalCols = 4 + lastDay + sumCols.length;
 
-        const THEME = {
-            heroStart: "FF0F172A", heroMid: "FF581C87",
-            accent: "FF7C3AED", accentText: "FFE9D5FF",
-            bg: "FFFFFFFF", bgAlt: "FFF8FAFC",
-            border: "FFE2E8F0",
-            textPrimary: "FF0F172A", textSecondary: "FF64748B", textMuted: "FF94A3B8",
-            sundayBg: "FFFEE2E2", sundayText: "FF991B1B",
-            holidayBg: "FFE0E7FF", holidayText: "FF3730A3",
-            totalAttBg: "FFDCFCE7", totalAttText: "FF166534",
-        };
+        // ── Row 1: Title ──
+        ws.mergeCells(1, 1, 1, totalCols);
+        const titleCell = ws.getCell("A1");
+        titleCell.value = `MONTHLY ATTENDANCE SHEET \u2014 ${monthLabel}`;
+        titleCell.font = { name: "Arial", size: 14, bold: true };
+        titleCell.alignment = { horizontal: "center", vertical: "middle" };
+        titleCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
+        titleCell.border = { top: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" }, bottom: { style: "thin" } };
+        ws.getRow(1).height = 22;
 
-        ws.mergeCells(1, 1, 2, totalCols);
-        const hero = ws.getCell(1, 1);
-        hero.value = {
-            richText: [
-                { text: "GRAV CLOTHING\n", font: { name: "Calibri", size: 10, bold: true, color: { argb: THEME.accentText }, italic: true } },
-                { text: `Muster Roll · ${monthLabel}`, font: { name: "Calibri", size: 22, bold: true, color: { argb: "FFFFFFFF" } } },
-            ]
-        };
-        hero.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroMid } };
-        hero.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        hero.border = {
-            top: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "medium", color: { argb: THEME.heroStart } },
-            right: { style: "medium", color: { argb: THEME.heroStart } },
-        };
-        ws.getRow(1).height = 20;
-        ws.getRow(2).height = 30;
+        // ── Row 2: Legend + holiday note ──
+        // Legend spans cols 1 to 12ish
+        const legendText = "P = Present\t\tA= Absent\t\tHD = Half Day\t\tWO = Week Off\t\tCL = Casual Leave\t\tSL = Sick Leave\t\tPL = Privilege Leave\t\t[ Purple border = HR Override ]";
+        ws.mergeCells(2, 1, 2, Math.min(totalCols - 3, 30));
+        const legendCell = ws.getCell(2, 1);
+        legendCell.value = legendText;
+        legendCell.font = { name: "Arial", size: 8 };
+        legendCell.alignment = { vertical: "middle" };
+        ws.getRow(2).height = 14;
 
-        // Stats bar
-        const grand = {
-            P: employees.reduce((a, e) => a + e.totals.P + e.totals["P*"] + e.totals["P~"], 0),
-            A: employees.reduce((a, e) => a + e.totals.AB, 0),
-            HD: employees.reduce((a, e) => a + e.totals.HD, 0),
-            MP: employees.reduce((a, e) => a + e.totals.MP, 0),
-            WO: employees.reduce((a, e) => a + e.totals.WO, 0),
-            L: employees.reduce((a, e) => a + e.totals.leaves, 0),
-            H: employees.reduce((a, e) => a + e.totals.FH + e.totals.NH + e.totals.OH + e.totals.RH, 0),
-            HW: employees.reduce((a, e) => a + e.totals.holidayWorked, 0),
-            SW: employees.reduce((a, e) => a + e.totals.sundayWorked, 0),
-            OT: employees.reduce((a, e) => a + e.totals.totalOtMins, 0),
-            TA: employees.reduce((a, e) => a + e.totals.totalAttendance, 0),
-        };
-        const hm = (m) => { if (!m || m <= 0) return "—"; const h = Math.floor(m / 60), mm = m % 60; return `${h}h ${String(mm).padStart(2, "0")}m`; };
-
-        const workingDaysInMonth = allDays.filter(d => !d.isSunday && !d.isFuture && !d.isDeclaredHoliday).length;
-        const holidayCount = allDays.filter(d => d.isDeclaredHoliday).length;
-        const sundayCount = allDays.filter(d => d.isSunday && !d.isWorkingSunday).length;
-
-        ws.mergeCells(3, 1, 3, totalCols);
-        const statsBar = ws.getCell(3, 1);
-        statsBar.value = `${employees.length} employees  ·  ${workingDaysInMonth} working days  ·  ${sundayCount} Sundays  ·  ${holidayCount} holidays  ·  Total Attendance ${grand.TA}  ·  Present ${grand.P}  ·  Absent ${grand.A}  ·  MP ${grand.MP}  ·  WO ${grand.WO}  ·  Leaves ${grand.L}  ·  Holiday Worked ${grand.HW}  ·  Sunday Worked ${grand.SW}  ·  OT ${hm(grand.OT)}`;
-        statsBar.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroStart } };
-        statsBar.font = { name: "Calibri", size: 9, color: { argb: THEME.accentText } };
-        statsBar.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        statsBar.border = {
-            bottom: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "medium", color: { argb: THEME.heroStart } },
-            right: { style: "medium", color: { argb: THEME.heroStart } },
-        };
-        ws.getRow(3).height = 28;
-        ws.getRow(4).height = 8;
-
-        // Legend
-        ws.mergeCells(5, 1, 5, totalCols);
-        const legend = ws.getCell(5, 1);
-        legend.value = `LEGEND:   ${L("P")} Present  ·  ${L("P*")} Late  ·  ${L("P~")} Early Out  ·  ${L("HD")} Half Day  ·  ${L("MP")} Miss Punch  ·  ${L("AB")} Absent  ·  ${L("WO")} Weekly Off  ·  ${L("FH")} Festival  ·  ${L("NH")} National  ·  ${L("OH")} Optional  ·  ${L("RH")} Restricted  ·  ${L("L-CL")} Casual  ·  ${L("L-SL")} Sick  ·  ${L("L-EL")} Earned  ·  ${L("WFH")} WFH  ·  ${L("CO")} Comp Off  ·  ★ = worked on holiday/Sunday`;
-        legend.font = { name: "Calibri", size: 9, color: { argb: THEME.textSecondary }, italic: true };
-        legend.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-        legend.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.bgAlt } };
-        ws.getRow(5).height = 22;
-        ws.getRow(6).height = 4;
-
-        // Day header
-        const headerRow = ws.getRow(7);
-        headerRow.getCell(1).value = "#";
-        headerRow.getCell(2).value = "EMPLOYEE";
-        headerRow.getCell(3).value = "DEPARTMENT";
-        for (let i = 0; i < lastDay; i++) {
-            const cal = allDays[i];
-            const cell = headerRow.getCell(dayStart + i);
-            cell.value = {
-                richText: [
-                    { text: `${cal.dayLetter}\n`, font: { name: "Calibri", size: 7, color: { argb: cal.isSunday ? THEME.sundayText : cal.isDeclaredHoliday ? THEME.holidayText : THEME.textMuted } } },
-                    { text: `${cal.day}`, font: { name: "Calibri", size: 10, bold: true, color: { argb: cal.isSunday ? THEME.sundayText : cal.isDeclaredHoliday ? THEME.holidayText : "FFFFFFFF" } } },
-                ]
-            };
+        // Holiday notes on right side of row 2 (if any holidays)
+        const holidays = [...holidayMap.values()].filter(h => h.type !== "working_sunday").sort((a, b) => a.date.localeCompare(b.date));
+        if (holidays.length > 0) {
+            const h = holidays[0];
+            const [y2, m2, d2] = h.date.split("-").map(Number);
+            const ordinals = ["", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "11th", "12th", "13th", "14th", "15th", "16th", "17th", "18th", "19th", "20th", "21st", "22nd", "23rd", "24th", "25th", "26th", "27th", "28th", "29th", "30th", "31st"];
+            const mn = new Date(h.date + "T00:00:00").toLocaleDateString("en-IN", { month: "long" });
+            const noteCol = Math.max(Math.min(totalCols - sumCols.length + 1, totalCols - 2), 1);
+            ws.mergeCells(2, noteCol, 2, totalCols);
+            const noteCell = ws.getCell(2, noteCol);
+            noteCell.value = `${ordinals[d2]} ${mn} ${y2}\t\t${h.name}`;
+            noteCell.font = { name: "Arial", size: 8, italic: true };
+            noteCell.alignment = { horizontal: "right", vertical: "middle" };
         }
-        headerRow.getCell(totalAttCol).value = "TOTAL\nATT";
-        afterCols.forEach((h, i) => { headerRow.getCell(totalAttCol + 1 + i).value = h; });
 
-        headerRow.eachCell((c, colNum) => {
-            const isDay = colNum >= dayStart && colNum < dayStart + lastDay;
-            const isSunday = isDay && allDays[colNum - dayStart]?.isSunday;
-            const isHoliday = isDay && allDays[colNum - dayStart]?.isDeclaredHoliday;
-            const isTotalAtt = colNum === totalAttCol;
+        // ── Row 3: Column headers ──
+        ws.getRow(3).height = 16;
+        const hdr = ws.getRow(3);
+        hdr.getCell(1).value = "Sr.  No.";
+        hdr.getCell(2).value = "Employee Name";
+        hdr.getCell(3).value = "Department";
+        hdr.getCell(4).value = "Designation";
+        for (let d = 1; d <= lastDay; d++) {
+            hdr.getCell(4 + d).value = d;
+        }
+        sumCols.forEach((h, i) => { hdr.getCell(sumStart + i).value = h; });
 
-            let fill = THEME.heroMid;
-            if (isSunday) fill = THEME.sundayBg;
-            else if (isHoliday) fill = THEME.holidayBg;
-            else if (isTotalAtt) fill = "FF065F46";
-            c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: fill } };
-            if (!isDay) c.font = { bold: true, size: 9, color: { argb: "FFFFFFFF" } };
-            c.alignment = { horizontal: colNum === 2 ? "left" : "center", vertical: "middle", wrapText: true, indent: colNum === 2 ? 1 : 0 };
-            c.border = {
-                top: { style: "thin", color: { argb: THEME.heroStart } },
-                bottom: { style: "medium", color: { argb: THEME.heroStart } },
-                left: { style: "thin", color: { argb: "FF4C1D95" } },
-                right: { style: "thin", color: { argb: "FF4C1D95" } },
-            };
+        hdr.eachCell((cell, col) => {
+            const isDay = col >= 5 && col < sumStart;
+            const isSumCol = col >= sumStart;
+            const isTitleCol = col <= 4;
+            cell.font = { name: "Arial", size: 9, bold: true };
+            cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+            if (isTitleCol) {
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } };
+            } else if (isSumCol) {
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF4B942" } };
+            } else {
+                const dayIdx = col - 5;
+                const cal = allDays[dayIdx];
+                if (cal?.isSunday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
+                else if (cal?.isDeclaredHoliday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFB4C6E7" } };
+                else cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } };
+            }
+            cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
         });
-        headerRow.height = 34;
 
-        ws.getColumn(1).width = 5;
-        ws.getColumn(2).width = 28;
-        ws.getColumn(3).width = 16;
-        for (let i = 0; i < lastDay; i++) ws.getColumn(dayStart + i).width = 4;
-        ws.getColumn(totalAttCol).width = 8;
-        for (let i = 0; i < afterCols.length - 1; i++) ws.getColumn(totalAttCol + 1 + i).width = 5.5;
-        ws.getColumn(totalAttCol + afterCols.length).width = 7; // rate
+        // ── Row 4: Day-of-week abbreviations ──
+        ws.getRow(4).height = 14;
+        const dowRow = ws.getRow(4);
+        for (let d = 1; d <= lastDay; d++) {
+            const cal = allDays[d - 1];
+            const cell = dowRow.getCell(4 + d);
+            cell.value = cal.dayAbbr;
+            cell.font = { name: "Arial", size: 7, bold: false };
+            cell.alignment = { horizontal: "center", vertical: "middle" };
+            if (cal.isSunday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } };
+            else if (cal.isDeclaredHoliday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFB4C6E7" } };
+            cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+        }
 
-        // Data rows
-        let rowIdx = 8;
+        // Status cell styles
+        const STATUS_STYLE = {
+            "P": { font: "FF375623", fill: "FFC6EFCE" },
+            "A": { font: "FF9C0006", fill: "FFFFC7CE" },
+            "HD": { font: "FF7D4701", fill: "FFFFEB9C" },
+            "WO": { font: "FF595959", fill: "FFF2F2F2" },
+            "CO": { font: "FF0D4A8C", fill: "FFBDD7EE" },
+            "CL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+            "SL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+            "PL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+            "FH": { font: "FF1F4E79", fill: "FFDCE6F1" },
+            "NH": { font: "FF7B1E46", fill: "FFFCE4EC" },
+            "": { font: "FFAAAAAA", fill: null },
+        };
+
+        // Column totals for TOTALS row
+        const colTotals = new Array(totalCols + 1).fill(0);
+
+        // ── Employee rows (starting from row 5) ──
         employees.forEach((emp, i) => {
-            const r = ws.getRow(rowIdx);
+            const rowNum = 5 + i;
+            const r = ws.getRow(rowNum);
+            r.height = 15;
+
             r.getCell(1).value = i + 1;
-            r.getCell(2).value = {
-                richText: [
-                    { text: `${emp.employeeName}\n`, font: { name: "Calibri", size: 10, bold: true, color: { argb: THEME.textPrimary } } },
-                    { text: `${emp.designation} · ${emp.employeeType === "executive" ? "EXE" : "OPR"}`, font: { name: "Calibri", size: 8, color: { argb: THEME.textMuted } } },
-                ]
-            };
+            r.getCell(2).value = emp.employeeName;
             r.getCell(3).value = emp.department;
+            r.getCell(4).value = emp.designation;
 
-            for (let di = 0; di < lastDay; di++) {
-                const cal = allDays[di];
-                const d = emp.days[cal.dateStr] || { status: "—" };
-                const cfg = STATUS[d.status] || STATUS["—"];
-                const cell = r.getCell(dayStart + di);
-
-                // Show label + star if worked on holiday or Sunday
-                const star = (d.punchedOnHoliday || d.isSundayWorked) ? "★" : "";
-                cell.value = star ? `${L(d.status)}${star}` : L(d.status);
-
-                if (cfg.fill) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cfg.fill } };
-                cell.font = { name: "Calibri", size: 8, bold: !!cfg.fill, color: { argb: cfg.font } };
-                cell.alignment = { horizontal: "center", vertical: "middle" };
-
-                if (d.hrOverride) {
-                    cell.border = {
-                        top: { style: "medium", color: { argb: THEME.accent } },
-                        bottom: { style: "medium", color: { argb: THEME.accent } },
-                        left: { style: "medium", color: { argb: THEME.accent } },
-                        right: { style: "medium", color: { argb: THEME.accent } },
-                    };
-                } else {
-                    cell.border = {
-                        top: { style: "thin", color: { argb: THEME.border } },
-                        bottom: { style: "thin", color: { argb: THEME.border } },
-                        left: { style: "thin", color: { argb: THEME.border } },
-                        right: { style: "thin", color: { argb: THEME.border } },
-                    };
-                }
-                if ((d.otMins || 0) > 0) {
-                    cell.border = { ...cell.border, bottom: { style: "thick", color: { argb: "FF4338CA" } } };
-                }
-            }
-
-            // Total Attendance
-            const taCell = r.getCell(totalAttCol);
-            taCell.value = emp.totals.totalAttendance || 0;
-            taCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.totalAttBg } };
-            taCell.font = { name: "Calibri", size: 11, bold: true, color: { argb: THEME.totalAttText } };
-            taCell.alignment = { horizontal: "center", vertical: "middle" };
-            taCell.border = {
-                top: { style: "thin", color: { argb: THEME.border } },
-                bottom: { style: "thin", color: { argb: THEME.border } },
-                left: { style: "medium", color: { argb: "FF065F46" } },
-                right: { style: "medium", color: { argb: "FF065F46" } },
-            };
-
-            // Individual totals: P, A, HD, MP, WO, LV, HW
-            const presentCount = emp.totals.P + emp.totals["P*"] + emp.totals["P~"];
-            const totalsData = [
-                { v: presentCount || "—", fill: presentCount ? "FFDCFCE7" : THEME.bgAlt, font: presentCount ? "FF166534" : THEME.textMuted },
-                { v: emp.totals.AB || "—", fill: emp.totals.AB ? "FFFECACA" : THEME.bgAlt, font: emp.totals.AB ? "FF991B1B" : THEME.textMuted },
-                { v: emp.totals.HD || "—", fill: emp.totals.HD ? "FFFEF3C7" : THEME.bgAlt, font: emp.totals.HD ? "FF854D0E" : THEME.textMuted },
-                { v: emp.totals.MP || "—", fill: emp.totals.MP ? "FFFCE7F3" : THEME.bgAlt, font: emp.totals.MP ? "FF9D174D" : THEME.textMuted },
-                { v: emp.totals.WO || "—", fill: emp.totals.WO ? "FFF1F5F9" : THEME.bgAlt, font: emp.totals.WO ? "FF475569" : THEME.textMuted },
-                { v: emp.totals.leaves || "—", fill: emp.totals.leaves ? "FFEDE9FE" : THEME.bgAlt, font: emp.totals.leaves ? "FF6B21A8" : THEME.textMuted },
-                { v: emp.totals.holidayWorked || "—", fill: emp.totals.holidayWorked ? "FFFEF3C7" : THEME.bgAlt, font: emp.totals.holidayWorked ? "FF854D0E" : THEME.textMuted },
-            ];
-            totalsData.forEach((t, ti) => {
-                const cell = r.getCell(totalAttCol + 1 + ti);
-                cell.value = t.v;
-                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: t.fill } };
-                cell.font = { name: "Calibri", size: 9, bold: true, color: { argb: t.font } };
-                cell.alignment = { horizontal: "center", vertical: "middle" };
-                cell.border = {
-                    top: { style: "thin", color: { argb: THEME.border } },
-                    bottom: { style: "thin", color: { argb: THEME.border } },
-                    left: { style: "thin", color: { argb: THEME.border } },
-                    right: { style: "thin", color: { argb: THEME.border } },
-                };
+            // Style first 4 cols
+            [1, 2, 3, 4].forEach(col => {
+                const cell = r.getCell(col);
+                const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: altBg } };
+                cell.font = { name: "Arial", size: 9 };
+                cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+                if (col === 1) cell.alignment = { horizontal: "center", vertical: "middle" };
+                else cell.alignment = { horizontal: "left", vertical: "middle" };
             });
 
-            const rate = emp.attendanceRate;
-            const rateFill = rate >= 95 ? "FF16A34A" : rate >= 85 ? "FFCA8A04" : rate >= 70 ? "FFEA580C" : "FFDC2626";
-            const rateCell = r.getCell(totalAttCol + afterCols.length);
-            rateCell.value = `${rate}%`;
-            rateCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: rateFill } };
-            rateCell.font = { name: "Calibri", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
-            rateCell.alignment = { horizontal: "center", vertical: "middle" };
-            rateCell.border = {
-                top: { style: "thin", color: { argb: THEME.border } },
-                bottom: { style: "thin", color: { argb: THEME.border } },
-                left: { style: "thin", color: { argb: THEME.border } },
-                right: { style: "thin", color: { argb: THEME.border } },
-            };
-
-            [1, 2, 3].forEach((c) => {
-                const cell = r.getCell(c);
-                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: i % 2 === 0 ? THEME.bg : THEME.bgAlt } };
-                if (c === 1) {
-                    cell.font = { name: "Calibri", size: 9, color: { argb: THEME.textMuted } };
-                    cell.alignment = { horizontal: "center", vertical: "middle" };
-                } else if (c === 3) {
-                    cell.font = { name: "Calibri", size: 9, color: { argb: THEME.textSecondary } };
-                    cell.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-                } else {
-                    cell.alignment = { vertical: "middle", horizontal: "left", indent: 1, wrapText: true };
+            // Day cells
+            allDays.forEach((cal, di) => {
+                const cell = r.getCell(5 + di);
+                const code = emp.dayCodes[cal.dateStr] || "";
+                const isHrOverride = emp.hrOverrides.has(cal.dateStr);
+                cell.value = code;
+                const st = STATUS_STYLE[code] || STATUS_STYLE[""];
+                cell.font = { name: "Arial", size: 8, bold: !!code, color: { argb: st.font } };
+                cell.alignment = { horizontal: "center", vertical: "middle" };
+                if (st.fill) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: st.fill } };
+                else {
+                    const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+                    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cal.isSunday ? "FFFFF0F0" : altBg } };
                 }
-                cell.border = {
-                    top: { style: "thin", color: { argb: THEME.border } },
-                    bottom: { style: "thin", color: { argb: THEME.border } },
-                    left: { style: "thin", color: { argb: THEME.border } },
-                    right: { style: "thin", color: { argb: THEME.border } },
-                };
+                // HR override: thick purple border + note
+                if (isHrOverride) {
+                    cell.border = {
+                        top: { style: "medium", color: { argb: "FF7C3AED" } },
+                        left: { style: "medium", color: { argb: "FF7C3AED" } },
+                        right: { style: "medium", color: { argb: "FF7C3AED" } },
+                        bottom: { style: "medium", color: { argb: "FF7C3AED" } },
+                    };
+                    cell.note = { texts: [{ font: { bold: true, size: 9, color: { argb: "FF7C3AED" } }, text: "HR Override" }] };
+                } else {
+                    cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+                }
             });
-            r.height = 28;
-            rowIdx++;
+
+            // Summary columns
+            const vals = [emp.totals.P, emp.totals.A, emp.totals.HD, emp.totals.WO, emp.totals.CO, emp.totals.CL, emp.totals.SL, emp.totals.PL, emp.totals.NHFH, emp.totals.Total];
+            vals.forEach((v, si) => {
+                const cell = r.getCell(sumStart + si);
+                cell.value = v;
+                cell.font = { name: "Arial", size: 9, bold: si === sumCols.length - 1 };
+                cell.alignment = { horizontal: "center", vertical: "middle" };
+                const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+                cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: si === sumCols.length - 1 ? "FFF4B942" : altBg } };
+                cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } };
+                colTotals[sumStart + si] = (colTotals[sumStart + si] || 0) + v;
+            });
         });
 
-        // Footer
-        const footerRow = ws.getRow(rowIdx);
-        ws.mergeCells(rowIdx, 1, rowIdx, 3);
-        footerRow.getCell(1).value = "COMPANY TOTAL";
-        footerRow.getCell(1).font = { name: "Calibri", size: 11, bold: true, color: { argb: "FFFFFFFF" } };
-        footerRow.getCell(1).alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-        footerRow.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroMid } };
+        // ── TOTALS row ──
+        const totRow = ws.getRow(5 + employees.length);
+        totRow.height = 16;
+        ws.mergeCells(5 + employees.length, 1, 5 + employees.length, 4);
+        const totLabel = totRow.getCell(1);
+        totLabel.value = "TOTALS";
+        totLabel.font = { name: "Arial", size: 10, bold: true };
+        totLabel.alignment = { horizontal: "center", vertical: "middle" };
+        totLabel.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } };
+        totLabel.border = { top: { style: "medium" }, left: { style: "medium" }, right: { style: "thin" }, bottom: { style: "medium" } };
 
-        for (let di = 0; di < lastDay; di++) {
-            const cal = allDays[di];
-            let presentToday = 0;
-            for (const e of employees) {
-                const d = e.days[cal.dateStr];
-                if (d && ["P", "P*", "P~"].includes(d.status)) presentToday++;
+        // Day totals (count of P in each day)
+        allDays.forEach((cal, di) => {
+            const cell = totRow.getCell(5 + di);
+            if (!cal.isFuture) {
+                const cnt = employees.filter(e => e.dayCodes[cal.dateStr] === "P").length;
+                cell.value = cnt || 0;
+            } else {
+                cell.value = 0;
             }
-            const cell = footerRow.getCell(dayStart + di);
-            cell.value = cal.isFuture ? "" : presentToday;
-            cell.font = { name: "Calibri", size: 8, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.font = { name: "Arial", size: 9, bold: true };
             cell.alignment = { horizontal: "center", vertical: "middle" };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cal.isSunday ? "FF7F1D1D" : cal.isDeclaredHoliday ? "FF3730A3" : THEME.heroStart } };
-            cell.border = {
-                top: { style: "medium", color: { argb: THEME.heroStart } },
-                bottom: { style: "medium", color: { argb: THEME.heroStart } },
-                left: { style: "thin", color: { argb: "FF334155" } },
-                right: { style: "thin", color: { argb: "FF334155" } },
-            };
-        }
-
-        const taFooter = footerRow.getCell(totalAttCol);
-        taFooter.value = grand.TA;
-        taFooter.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FFFFFFFF" } };
-        taFooter.alignment = { horizontal: "center", vertical: "middle" };
-        taFooter.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF065F46" } };
-        taFooter.border = {
-            top: { style: "medium", color: { argb: THEME.heroStart } },
-            bottom: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "medium", color: { argb: "FF065F46" } },
-            right: { style: "medium", color: { argb: "FF065F46" } },
-        };
-
-        [grand.P, grand.A, grand.HD, grand.MP, grand.WO, grand.L, grand.HW].forEach((v, ti) => {
-            const cell = footerRow.getCell(totalAttCol + 1 + ti);
-            cell.value = v;
-            cell.font = { name: "Calibri", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
-            cell.alignment = { horizontal: "center", vertical: "middle" };
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.heroMid } };
-            cell.border = {
-                top: { style: "medium", color: { argb: THEME.heroStart } },
-                bottom: { style: "medium", color: { argb: THEME.heroStart } },
-                left: { style: "thin", color: { argb: "FF4C1D95" } },
-                right: { style: "thin", color: { argb: "FF4C1D95" } },
-            };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cal.isSunday ? "FFFFC7CE" : cal.isDeclaredHoliday ? "FFB4C6E7" : "FF8EA9C1" } };
+            cell.border = { top: { style: "medium" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "medium" } };
         });
 
-        const avgRate = employees.length ? Math.round(employees.reduce((a, e) => a + e.attendanceRate, 0) / employees.length) : 0;
-        const rateFooter = footerRow.getCell(totalAttCol + afterCols.length);
-        rateFooter.value = `${avgRate}%`;
-        rateFooter.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FFFFFFFF" } };
-        rateFooter.alignment = { horizontal: "center", vertical: "middle" };
-        rateFooter.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.accent } };
-        rateFooter.border = {
-            top: { style: "medium", color: { argb: THEME.heroStart } },
-            bottom: { style: "medium", color: { argb: THEME.heroStart } },
-            left: { style: "thin", color: { argb: "FF4C1D95" } },
-            right: { style: "medium", color: { argb: THEME.heroStart } },
-        };
-        footerRow.height = 28;
-
-        // Holiday listing
-        const activeHolidays = [...holidayMap.values()].filter(h => h.type !== "working_sunday").sort((a, b) => a.date.localeCompare(b.date));
-        if (activeHolidays.length > 0) {
-            const holStartRow = rowIdx + 2;
-            ws.mergeCells(holStartRow, 1, holStartRow, totalCols);
-            const holHeader = ws.getCell(holStartRow, 1);
-            holHeader.value = `HOLIDAYS THIS MONTH  ·  ${activeHolidays.length} total`;
-            holHeader.font = { name: "Calibri", size: 10, bold: true, color: { argb: "FFFFFFFF" } };
-            holHeader.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-            holHeader.fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.holidayText } };
-            ws.getRow(holStartRow).height = 22;
-
-            activeHolidays.forEach((h, idx) => {
-                const r = ws.getRow(holStartRow + 1 + idx);
-                ws.mergeCells(holStartRow + 1 + idx, 1, holStartRow + 1 + idx, Math.min(3, totalCols));
-                ws.mergeCells(holStartRow + 1 + idx, 4, holStartRow + 1 + idx, totalCols);
-                const typeMap = { national: "NH · National", company: "FH · Festival", optional: "OH · Optional", restricted: "RH · Restricted" };
-                r.getCell(1).value = h.date;
-                r.getCell(1).font = { name: "Consolas", size: 10, bold: true, color: { argb: THEME.holidayText } };
-                r.getCell(1).alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-                r.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: THEME.holidayBg } };
-                r.getCell(4).value = `${typeMap[h.type] || "PH"}  ·  ${h.name}${h.description ? `  —  ${h.description}` : ""}`;
-                r.getCell(4).font = { name: "Calibri", size: 10, color: { argb: THEME.textPrimary } };
-                r.getCell(4).alignment = { horizontal: "left", vertical: "middle", indent: 1 };
-                r.getCell(4).fill = { type: "pattern", pattern: "solid", fgColor: { argb: idx % 2 === 0 ? THEME.bg : THEME.bgAlt } };
-                r.height = 20;
-            });
-        }
+        // Summary col totals
+        sumCols.forEach((_, si) => {
+            const cell = totRow.getCell(sumStart + si);
+            cell.value = colTotals[sumStart + si] || 0;
+            cell.font = { name: "Arial", size: 10, bold: true };
+            cell.alignment = { horizontal: "center", vertical: "middle" };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF4B942" } };
+            cell.border = { top: { style: "medium" }, left: { style: "thin" }, right: si === sumCols.length - 1 ? { style: "medium" } : { style: "thin" }, bottom: { style: "medium" } };
+        });
 
         const buffer = await wb.xlsx.writeBuffer();
         const filename = `attendance_${yearMonth}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
