@@ -393,14 +393,14 @@ const seedCEOUser = async () => {
       return;
     }
     await CEODepartment.create({
-      name:       "Chief Executive Officer",
-      email:      "ceo@grav.in",
-      password:   "Ceo@12345",
+      name: "Chief Executive Officer",
+      email: "ceo@grav.in",
+      password: "Ceo@12345",
       employeeId: "CEO001",
-      phone:      "",
+      phone: "",
       department: "Executive Office",
-      role:       "ceo",
-      isActive:   true,
+      role: "ceo",
+      isActive: true,
     });
     console.log("✅ Seeded default CEO user: ceo@grav.in / Ceo@12345 (CEO001)");
   } catch (err) {
@@ -417,14 +417,14 @@ const seedQCUser = async () => {
       return;
     }
     await QCDepartment.create({
-      name:       "QC Inspector 1",
-      email:      "qc1@grav.in",
-      password:   "Qc1@12345",
+      name: "QC Inspector 1",
+      email: "qc1@grav.in",
+      password: "Qc1@12345",
       employeeId: "QC001",
-      phone:      "",
+      phone: "",
       department: "Quality Control",
-      role:       "quality_control",
-      isActive:   true,
+      role: "quality_control",
+      isActive: true,
     });
     console.log("✅ Seeded default QC user: qc1@grav.in / Qc1@12345 (QC001)");
   } catch (err) {
@@ -589,6 +589,14 @@ const overwriteExistingMeasurements = async () => {
     console.error("❌ Measurement overwrite failed:", error.message);
   }
 };
+
+// CEO Routes
+const ceoHrRoutes = require("./routes/CEO_Routes/hr");
+app.use("/api/ceo/hr", ceoHrRoutes);
+
+const ceoProductionRoutes = require("./routes/CEO_Routes/production");
+app.use("/api/ceo/production", ceoProductionRoutes);
+
 
 /* =====================
     Normal Employees ROUTES
