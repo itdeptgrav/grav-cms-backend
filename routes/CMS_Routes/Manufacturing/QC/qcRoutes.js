@@ -240,58 +240,96 @@ router.post("/mark-defect", async (req, res) => {
 });
 
 // ─── GET /defects?date=YYYY-MM-DD  OR  ?startDate=&endDate= ─────────────────
+// ─── GET /defects?date=YYYY-MM-DD  OR  ?startDate=&endDate= ─────────────────
 router.get("/defects", async (req, res) => {
-    try {
-        const { date, startDate, endDate } = req.query;
-        const filter = {};
-        if (date) filter.date = date;
-        else if (startDate || endDate) {
-            filter.date = {};
-            if (startDate) filter.date.$gte = startDate;
-            if (endDate) filter.date.$lte = endDate;
-        } else {
-            filter.date = istDateString();
-        }
-
-        const defects = await DefectRecord.find(filter).sort({ markedAt: -1 }).lean();
-
-        // Resolve operation names per WO once
-        const woIds = [...new Set(defects.map((d) => d.workOrderId).filter(Boolean).map(String))];
-        const wos = await WorkOrder.find({ _id: { $in: woIds } }).select("workOrderNumber operations").lean();
-        const woMap = new Map(wos.map((w) => [w._id.toString(), w]));
-
-        const enriched = defects.map((d) => {
-            const wo = d.workOrderId ? woMap.get(d.workOrderId.toString()) : null;
-            const opLookup = new Map();
-            (wo?.operations || []).forEach((op) => {
-                if (op.operationCode) opLookup.set(op.operationCode.trim().toLowerCase(), op.operationType);
-            });
-            return {
-                ...d,
-                workOrderNumber: wo?.workOrderNumber || `WO-${d.workOrderShortId}`,
-                operations: (d.operations || []).map((c) => ({
-                    code: c,
-                    name: opLookup.get(c.trim().toLowerCase()) || "",
-                })),
-            };
-        });
-
-        // Per-operator summary
-        const byOperator = {};
-        enriched.forEach((d) => {
-            byOperator[d.operatorName] = (byOperator[d.operatorName] || 0) + 1;
-        });
-
-        res.json({
-            success: true,
-            defects: enriched,
-            total: enriched.length,
-            byOperator,
-        });
-    } catch (err) {
-        console.error("[QC defects] error:", err);
-        res.status(500).json({ success: false, message: err.message });
+  try {
+    const { date, startDate, endDate } = req.query;
+    const filter = {};
+    if (date) filter.date = date;
+    else if (startDate || endDate) {
+      filter.date = {};
+      if (startDate) filter.date.$gte = startDate;
+      if (endDate)   filter.date.$lte = endDate;
+    } else {
+      filter.date = istDateString();
     }
+
+    const defects = await DefectRecord.find(filter).sort({ markedAt: -1 }).lean();
+
+    // ── Resolve WOs (for op-name lookup + product info) ──────────────────────
+    const woIds = [...new Set(defects.map((d) => d.workOrderId).filter(Boolean).map(String))];
+    const wos = await WorkOrder.find({ _id: { $in: woIds } })
+      .select("workOrderNumber operations stockItemName stockItemReference variantAttributes stockItemId")
+      .lean();
+    const woMap = new Map(wos.map((w) => [w._id.toString(), w]));
+
+    // ── Pull StockItem images for each WO's referenced product ───────────────
+    const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
+    const stockItemIds = [...new Set(wos.map((w) => w.stockItemId).filter(Boolean).map(String))];
+    const stockItems = await StockItem.find({ _id: { $in: stockItemIds } })
+      .select("name images variants genderCategory")
+      .lean();
+    const siMap = new Map(stockItems.map((si) => [si._id.toString(), si]));
+
+    // ── Helper: pick the best image for a WO ─────────────────────────────────
+    const resolveProductImage = (wo) => {
+      if (!wo) return null;
+      const si = wo.stockItemId ? siMap.get(wo.stockItemId.toString()) : null;
+      if (!si) return null;
+
+      // Try matching variant first
+      if (wo.variantAttributes?.length && si.variants?.length) {
+        const match = si.variants.find((v) =>
+          (v.attributes || []).every((va) =>
+            wo.variantAttributes.some(
+              (woAttr) =>
+                woAttr.name?.toLowerCase() === va.name?.toLowerCase() &&
+                String(woAttr.value).toLowerCase() === String(va.value).toLowerCase()
+            )
+          )
+        );
+        if (match?.images?.[0]) return match.images[0];
+      }
+      // Fallback to main StockItem image
+      return si.images?.[0] || null;
+    };
+
+    const enriched = defects.map((d) => {
+      const wo = d.workOrderId ? woMap.get(d.workOrderId.toString()) : null;
+
+      const opLookup = new Map();
+      (wo?.operations || []).forEach((op) => {
+        if (op.operationCode) opLookup.set(op.operationCode.trim().toLowerCase(), op.operationType);
+      });
+
+      return {
+        ...d,
+        workOrderNumber: wo?.workOrderNumber || `WO-${d.workOrderShortId}`,
+        productName:     wo?.stockItemName || "Unknown Product",
+        productImage:    resolveProductImage(wo),
+        variantAttributes: wo?.variantAttributes || [],
+        operations: (d.operations || []).map((c) => ({
+          code: c,
+          name: opLookup.get(c.trim().toLowerCase()) || "",
+        })),
+      };
+    });
+
+    const byOperator = {};
+    enriched.forEach((d) => {
+      byOperator[d.operatorName] = (byOperator[d.operatorName] || 0) + 1;
+    });
+
+    res.json({
+      success: true,
+      defects: enriched,
+      total: enriched.length,
+      byOperator,
+    });
+  } catch (err) {
+    console.error("[QC defects] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 module.exports = router;
