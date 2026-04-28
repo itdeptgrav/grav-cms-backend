@@ -128,7 +128,7 @@ async function _buildPath(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
-async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false }) {
+async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open" }) {
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
   const path = await _buildPath(parentTaskId);
@@ -154,9 +154,22 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     deadlineStatus: deadlineStatus(dueDate),
     deadlineColor: deadlineColor(dueDate),
     progressPercent: 0,
-    status: "open",
+    status: status || "open",
     groupId: groupId || null,
     isFolder: isFolder || false,
+    isRepeat: isRepeat || false,
+    repeatConfig: isRepeat && repeatConfig ? repeatConfig : null,
+    isThirdParty: isThirdParty || false,
+    thirdPartyConfig: isThirdParty && thirdPartyConfig ? thirdPartyConfig : null,
+    vendorUpdates: [],
+    thirdPartyStatus: isThirdParty ? "pending_confirmation" : null,
+    lastUpdateAt: null,
+    isGoal: isGoal || false,
+    goalConfig: isGoal && goalConfig ? goalConfig : null,
+    goalAchieved: isGoal ? 0 : null,
+    goalUpdates: [],
+    hasTimer: isRepeat || isThirdParty || isGoal ? null : (hasTimer !== false),
+    fixedDeadline: (!isRepeat && !isThirdParty && !isGoal && !hasTimer) ? fixedDeadline || null : null,
     // Hierarchy
     parentTaskId: parentTaskId || null,
     isRoot: !parentTaskId,
@@ -224,12 +237,14 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
   if (!task.assigneeIds.includes(employeeId)) throw new Error("Not assigned to this task.");
   if (task.confirmedBy?.includes(employeeId)) throw new Error("Already confirmed.");
 
-  // If no dueDate exists yet (new flow), require deadline approval first
-  if (!task.dueDate && task.status !== "deadline_approved") {
-    if (task.status === "pending_deadline_approval") {
-      throw new Error("Your deadline proposal is pending approval. Please wait.");
+  // Repeat and third-party tasks skip deadline requirement — they confirm directly
+  if (!task.isRepeat && !task.isThirdParty && !task.isGoal && task.hasTimer !== false) {
+    if (!task.dueDate && task.status !== "deadline_approved") {
+      if (task.status === "pending_deadline_approval") {
+        throw new Error("Your deadline proposal is pending approval. Please wait.");
+      }
+      throw new Error("Please propose a deadline and get it approved before confirming.");
     }
-    throw new Error("Please propose a deadline and get it approved before confirming.");
   }
 
   await ref.update({
@@ -439,6 +454,7 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
+  // Socket: emit to all task participants including creator (for live updates)
   const allParticipants = [...new Set([
     ...(task.assigneeIds || []),
     task.assignedBy,
@@ -447,11 +463,13 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
   ])].filter(Boolean);
 
   const msgForSocket = { ...msg, createdAt: isoTime };
-  // Socket room is TASK-SPECIFIC: "task_chat_T001", "task_chat_T002", etc.
   socket.emitToMany(allParticipants, "task_chat_message", { taskId, message: msgForSocket });
 
   if (messageType !== "system") {
-    const notifyIds = allParticipants.filter(id => id !== senderId);
+    // Notifications: only assignees, NOT the CEO/creator (task.assignedBy)
+    // CEO created the task so they're always in assignedBy — they don't need
+    // a notification for every message sent in their own assigned tasks
+    const notifyIds = (task.assigneeIds || []).filter(id => id !== senderId);
     if (notifyIds.length) {
       await _notifyMany({
         recipientIds: notifyIds,
@@ -486,6 +504,9 @@ async function getTaskWithDetails(taskId) {
   const task = { id: doc.id, ...doc.data() };
   // Default isFolder — older tasks saved before this field existed will be false
   if (task.isFolder === undefined) task.isFolder = false;
+  if (task.isRepeat === undefined) task.isRepeat = false;
+  if (task.isThirdParty === undefined) task.isThirdParty = false;
+  if (task.isGoal === undefined) task.isGoal = false;
 
   // Timestamps
   if (task.createdAt?.toDate) task.createdAt = task.createdAt.toDate().toISOString();
@@ -651,6 +672,12 @@ async function listTasksWithHierarchy(employeeId, role) {
   return tasks.map(t => ({
     ...t,
     taskId: t.taskId || t.id,
+    isFolder: t.isFolder || false,
+    isRepeat: t.isRepeat || false,
+    isThirdParty: t.isThirdParty || false,
+    isGoal: t.isGoal || false,
+    hasTimer: t.hasTimer !== false,
+    fixedDeadline: t.fixedDeadline || null,
     deadlineStatus: deadlineStatus(t.dueDate),
     deadlineColor: deadlineColor(t.dueDate),
     createdAt: t.createdAt?.toDate?.()?.toISOString() || t.createdAt,
