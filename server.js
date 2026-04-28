@@ -163,6 +163,17 @@ io.on("connection", (socket) => {
     activeMeetingRecordings.set(meetId, { startedBy, startedByName, startedAt });
     io.to(`meeting_${meetId}`).emit("recording_started", { meetId, startedBy, startedByName, startedAt });
   });
+  // Each participant broadcasts their own recording+upload status → relay to room
+  socket.on("participant_status", ({ meetId, employeeId, employeeName, recordingState, uploadState }) => {
+    if (!meetId || !employeeId) return;
+    io.to(`meeting_${meetId}`).emit("participant_status", {
+      employeeId,
+      employeeName,
+      recordingState,   // "recording" | "paused" | "not_rec" | "failed"
+      uploadState,      // "idle" | "uploading" | "uploaded" | "failed"
+      timestamp: Date.now(),
+    });
+  });
 
   // CEO/TL stops recording → broadcast to all in meeting room
   socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
@@ -298,8 +309,10 @@ io.on("connection", (socket) => {
 });
 
 
+
 // 1. At the top with your other requires:
 const transcriptModule = require("./routes/task_routes/transcript.routes");
+
 
 // 2. With your other app.use() route registrations:
 app.use("/cowork", transcriptModule.router);
@@ -323,6 +336,8 @@ const connectDB = async () => {
 
 connectDB().then(async () => {
   await createDefaultCuttingMaster();
+  seedQCUser();
+
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
@@ -334,6 +349,7 @@ const PackagingDispatchDepartment = require("./models/PackagingDispatchDepartmen
 const Measurement = require("./models/Customer_Models/Measurement");
 const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
 const ProductionSupervisorDepartment = require("./models/ProductionSupervisorDepartment");
+const QCDepartment = require("./models/QCDepartment");
 
 
 const createDefaultCuttingMaster = async () => {
@@ -364,6 +380,30 @@ const createDefaultCuttingMaster = async () => {
     console.log("✅ Default Cutting Master created successfully");
   } catch (error) {
     console.error("❌ Cutting Master creation failed:", error.message);
+  }
+};
+
+// ✅ Auto-create default QC user
+const seedQCUser = async () => {
+  try {
+    const existing = await QCDepartment.findOne({ email: "qc1@grav.in" });
+    if (existing) {
+      console.log("ℹ️  QC user already exists: qc1@grav.in");
+      return;
+    }
+    await QCDepartment.create({
+      name:       "QC Inspector 1",
+      email:      "qc1@grav.in",
+      password:   "Qc1@12345",
+      employeeId: "QC001",
+      phone:      "",
+      department: "Quality Control",
+      role:       "quality_control",
+      isActive:   true,
+    });
+    console.log("✅ Seeded default QC user: qc1@grav.in / Qc1@12345 (QC001)");
+  } catch (err) {
+    console.error("❌ QC seed error:", err);
   }
 };
 
@@ -622,6 +662,10 @@ app.use(
 // Measurement Routes
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
 app.use("/api/cms/measurements", measurementRoutes);
+
+
+const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
+app.use("/api/cms/manufacturing/qc", qcRoutes);
 
 // Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");

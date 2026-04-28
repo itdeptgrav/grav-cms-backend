@@ -116,7 +116,7 @@ router.post(
                 roomName,
                 createdBy: employeeId,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000), // 8 hours
+                expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours — matches token TTL
                 active: true,
             });
 
@@ -302,11 +302,15 @@ router.post(
 );
 
 // ── Helper: build a LiveKit JWT token ─────────────────────────────────────────
+// ttl: "24h" — meeting can run a full day without token expiring.
+// The meeting still ends when the host clicks "End for All" or when the
+// Firestore `status` is set to "ended" — TTL is just the cap on a single
+// participant's token session, not the meeting length.
 async function buildToken(roomName, identity, participantName, isAdmin = false) {
     const at = new AccessToken(LK_KEY, LK_SECRET, {
         identity,
         name: participantName,
-        ttl: "4h",
+        ttl: "24h",
     });
 
     at.addGrant({

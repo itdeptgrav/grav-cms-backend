@@ -69,7 +69,7 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder } = req.body;
+    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
@@ -90,6 +90,23 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
         if (emp?.role === "tl") { initialStatus = "pending_tl_approval"; break; }
       }
     }
+    // Repeat tasks always start as pending confirmation — employee must accept before work begins
+    const repeatFlag = isRepeat === true || isRepeat === "true";
+    if (repeatFlag) initialStatus = "repeat_pending_confirmation";
+    const thirdPartyFlag = isThirdParty === true || isThirdParty === "true";
+    const goalFlag = isGoal === true || isGoal === "true";
+
+    // Auto-priority: count existing open tasks for the first assignee → assign next priority
+    let autoPriority = (typeof priority === "number" ? priority : Number(priority)) || null;
+    if (!autoPriority && assigneeIds?.length > 0) {
+      const { db } = require("../../config/firebaseAdmin");
+      const existing = await db.collection("cowork_tasks")
+        .where("assigneeIds", "array-contains", assigneeIds[0])
+        .where("status", "not-in", ["done", "cancelled"])
+        .get();
+      autoPriority = Math.min(existing.size + 1, 5);
+    }
+    if (!autoPriority) autoPriority = 1;
 
     const task = await svc.createTask({
       title: title.trim(), description, notes,
@@ -98,12 +115,20 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       assignedByRole: requesterRole,
       assigneeIds: assigneeIds || [],
       dueDate: null,
-      priority: (typeof priority === "number" ? priority : Number(priority)) || 5,
+      priority: autoPriority,
       parentTaskId: parentTaskId || null,
       groupId: groupId || null,
       createdByTl: createdByTl || false,
       status: initialStatus,
       isFolder: folderFlag,
+      isRepeat: repeatFlag,
+      repeatConfig: (repeatFlag && repeatConfig) ? repeatConfig : null,
+      isThirdParty: thirdPartyFlag,
+      thirdPartyConfig: (thirdPartyFlag && thirdPartyConfig) ? thirdPartyConfig : null,
+      isGoal: goalFlag,
+      goalConfig: (goalFlag && goalConfig) ? goalConfig : null,
+      hasTimer: hasTimer !== false && hasTimer !== "false",
+      fixedDeadline: fixedDeadline || null,
       // Mark whether this is a CEO-created root task (for visibility filtering)
       createdByCeo: requesterRole === "ceo" && !parentTaskId,
       createdByTl: requesterRole === "tl",
@@ -152,6 +177,351 @@ router.post("/task/:taskId/confirm", verifyCoworkToken, verifyEmployeeToken, asy
     const result = await svc.confirmTaskReceipt({ taskId: req.params.taskId, employeeId: req.coworkUser.employeeId, employeeName: req.coworkUser.name });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── REPEAT TASK CONFIRM — employee accepts the repeat task ────────────────────
+// Changes status: repeat_pending_confirmation → repeat_active
+// Unlocks chat and daily submissions
+router.post("/task/:taskId/repeat-confirm", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, name: employeeName } = req.coworkUser;
+    const { db, admin } = require("../../config/firebaseAdmin");
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+
+    const task = snap.data();
+    if (!task.isRepeat) return res.status(400).json({ error: "Not a repeat task" });
+    if (!task.assigneeIds?.includes(employeeId)) return res.status(403).json({ error: "Not assigned to this task" });
+    if (task.status === "repeat_active") return res.json({ success: true, message: "Already active" });
+    if (task.status !== "repeat_pending_confirmation") return res.status(400).json({ error: "Task is not pending confirmation" });
+
+    await taskRef.update({
+      status: "repeat_active",
+      repeatConfirmedBy: employeeId,
+      repeatConfirmedByName: employeeName,
+      repeatConfirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Post system message to chat unlocking it
+    const msgId = require("uuid").v4();
+    await db.collection("cowork_tasks").doc(taskId).collection("chat").doc(msgId).set({
+      messageId: msgId, taskId,
+      senderId: employeeId, senderName: employeeName,
+      text: `✅ ${employeeName} confirmed this repeat task. Daily submissions are now active.`,
+      attachments: [], messageType: "system", mention: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await taskRef.update({
+      chatMessageCount: admin.firestore.FieldValue.increment(1),
+      lastChatAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastChatPreview: `${employeeName} confirmed the repeat task`,
+    });
+
+    res.json({ success: true, status: "repeat_active" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── REPEAT TASK SUBMIT — employee submits a daily slot ────────────────────────
+// POST /cowork/task/:taskId/repeat-submit
+// Body: { date, slotIndex, comment, files: [{ name, url, type, ... }] }
+router.post("/task/:taskId/repeat-submit", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, name: employeeName } = req.coworkUser;
+    const { date, slotIndex, comment, files } = req.body;
+    const { db, admin } = require("../../config/firebaseAdmin");
+
+    if (!date || slotIndex === undefined) return res.status(400).json({ error: "date and slotIndex required" });
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+
+    const task = snap.data();
+    if (!task.isRepeat) return res.status(400).json({ error: "Not a repeat task" });
+    if (!task.assigneeIds?.includes(employeeId)) return res.status(403).json({ error: "Not assigned" });
+
+    const slotKey = `slot_${slotIndex}`;
+
+    // Check not already submitted
+    if (task.repeatSubmissions?.[date]?.[slotKey]) {
+      return res.status(400).json({ error: "Already submitted for this slot today" });
+    }
+
+    const submissionData = {
+      submittedAt: new Date().toISOString(),
+      submittedBy: employeeId,
+      submittedByName: employeeName,
+      comment: comment || "",
+      files: files || [],
+      slotIndex,
+    };
+
+    // Save submission using dot-notation key
+    await taskRef.update({
+      [`repeatSubmissions.${date}.${slotKey}`]: submissionData,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Post to task chat
+    const { v4: uuidv4 } = require("uuid");
+    const msgId = uuidv4();
+    const hasFiles = files?.length > 0;
+    const chatText = [
+      `📋 Slot ${slotIndex + 1} submitted`,
+      comment ? `"${comment}"` : null,
+      hasFiles ? `${files.length} file${files.length > 1 ? "s" : ""} attached` : null,
+    ].filter(Boolean).join(" — ");
+
+    await db.collection("cowork_tasks").doc(taskId).collection("chat").doc(msgId).set({
+      messageId: msgId, taskId,
+      senderId: employeeId, senderName: employeeName,
+      text: chatText,
+      attachments: files?.map(f => ({ url: f.url, name: f.name, type: f.type || "file", downloadUrl: f.downloadUrl || f.url })) || [],
+      messageType: hasFiles ? "attachment" : "text",
+      isRepeatSubmission: true,
+      repeatDate: date,
+      repeatSlot: slotIndex,
+      mention: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await taskRef.update({
+      chatMessageCount: admin.firestore.FieldValue.increment(1),
+      lastChatAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastChatPreview: `${employeeName}: Slot ${slotIndex + 1} submitted`,
+    });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── THIRD-PARTY UPDATE — employee logs a vendor update ───────────────────────
+router.post("/task/:taskId/third-party-update", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, name: employeeName } = req.coworkUser;
+    const { type, message, files, amount, paymentNote } = req.body;
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const { v4: uuidv4 } = require("uuid");
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isThirdParty) return res.status(400).json({ error: "Not a third-party task" });
+    if (!task.assigneeIds?.includes(employeeId)) return res.status(403).json({ error: "Not assigned" });
+
+    const updateId = uuidv4();
+    const updateEntry = {
+      id: updateId, type, message: message || "",
+      files: files || [],
+      loggedBy: employeeId, loggedByName: employeeName,
+      createdAt: new Date().toISOString(),
+      ...(type === "payment_request" ? { amount, paymentNote: paymentNote || "", paymentStatus: null } : {}),
+    };
+
+    // Determine thirdPartyStatus from update type
+    const statusMap = {
+      vendor_contacted: "waiting_vendor", vendor_replied: "vendor_responded",
+      follow_up: "in_follow_up", delay_reported: "delayed",
+      quote_received: "vendor_responded", order_dispatched: "vendor_responded",
+      payment_request: task.thirdPartyStatus || "in_progress",
+      resolved: "completed_pending_review",
+    };
+
+    const taskFieldUpdate = {
+      vendorUpdates: admin.firestore.FieldValue.arrayUnion(updateEntry),
+      thirdPartyStatus: statusMap[type] || task.thirdPartyStatus,
+      lastUpdateAt: admin.firestore.FieldValue.serverTimestamp(),
+      isStale: false,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // Resolved → submit for CEO/TL approval
+    if (type === "resolved") {
+      taskFieldUpdate.completionStatus = "submitted";
+      taskFieldUpdate.submittedBy = employeeId;
+      taskFieldUpdate.submittedByName = employeeName;
+      taskFieldUpdate.submittedAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+
+    await taskRef.update(taskFieldUpdate);
+
+    // Post to task chat
+    const msgId = uuidv4();
+    const UPDATE_LABELS = { vendor_contacted: "📞 Vendor Contacted", vendor_replied: "💬 Vendor Replied", follow_up: "🔄 Following Up", delay_reported: "⚠️ Delay Reported", quote_received: "📄 Quote Received", payment_request: "💰 Payment Request", order_dispatched: "🚚 Order Dispatched" };
+    const chatText = [UPDATE_LABELS[type] || type, message, amount ? `₹${Number(amount).toLocaleString("en-IN")}` : null].filter(Boolean).join(" — ");
+    await db.collection("cowork_tasks").doc(taskId).collection("chat").doc(msgId).set({
+      messageId: msgId, taskId, senderId: employeeId, senderName: employeeName,
+      text: chatText,
+      attachments: files?.map(f => ({ url: f.url, name: f.name, type: f.type || "file", downloadUrl: f.downloadUrl || f.url })) || [],
+      messageType: files?.length ? "attachment" : "text",
+      isThirdPartyUpdate: true, updateType: type, mention: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await taskRef.update({
+      chatMessageCount: admin.firestore.FieldValue.increment(1),
+      lastChatAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastChatPreview: `${employeeName}: ${UPDATE_LABELS[type] || type}`,
+    });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ── THIRD-PARTY COMPLETE — CEO/TL marks task as done ─────────────────────────
+router.post("/task/:taskId/third-party-complete", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, name: approverName, role } = req.coworkUser;
+    if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO/TL can complete third-party tasks" });
+
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const { v4: uuidv4 } = require("uuid");
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isThirdParty) return res.status(400).json({ error: "Not a third-party task" });
+    if (task.completionStatus !== "submitted") return res.status(400).json({ error: "Task has not been submitted for completion yet" });
+
+    await taskRef.update({
+      status: "done",
+      completionStatus: "approved",
+      thirdPartyStatus: "completed",
+      approvedBy: employeeId,
+      approvedByName: approverName,
+      approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Post system message to chat
+    const msgId = uuidv4();
+    await db.collection("cowork_tasks").doc(taskId).collection("chat").doc(msgId).set({
+      messageId: msgId, taskId,
+      senderId: employeeId, senderName: approverName,
+      text: `✅ Task marked as Completed by ${approverName}`,
+      attachments: [], messageType: "system",
+      isThirdPartyUpdate: true, updateType: "completed", mention: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await taskRef.update({
+      chatMessageCount: admin.firestore.FieldValue.increment(1),
+      lastChatAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastChatPreview: `${approverName}: Task Completed ✅`,
+    });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── THIRD-PARTY PAYMENT ACTION — CEO/TL approves or rejects payment request ──
+router.post("/task/:taskId/third-party-payment-action", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, name: approverName, role } = req.coworkUser;
+    const { updateId, action } = req.body; // action: "approved" | "rejected"
+    if (!["approved", "rejected"].includes(action)) return res.status(400).json({ error: "Invalid action" });
+    if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO/TL can approve payments" });
+
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+
+    const task = snap.data();
+    const updates = task.vendorUpdates || [];
+    const updatedUpdates = updates.map(u =>
+      u.id === updateId ? { ...u, paymentStatus: action, approvedBy: employeeId, approvedByName: approverName, approvedAt: new Date().toISOString() } : u
+    );
+
+    await taskRef.update({
+      vendorUpdates: updatedUpdates,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Notify in chat
+    const { v4: uuidv4 } = require("uuid");
+    const msgId = uuidv4();
+    await db.collection("cowork_tasks").doc(taskId).collection("chat").doc(msgId).set({
+      messageId: msgId, taskId, senderId: employeeId, senderName: approverName,
+      text: `💰 Payment request ${action === "approved" ? "✅ Approved" : "❌ Rejected"} by ${approverName}`,
+      attachments: [], messageType: "system", isThirdPartyUpdate: true, updateType: "payment_action", mention: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await taskRef.update({ chatMessageCount: admin.firestore.FieldValue.increment(1), lastChatAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GOAL UPDATE — employee logs additive progress ─────────────────────────────
+router.post("/task/:taskId/goal-update", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, name: employeeName } = req.coworkUser;
+    const { addedValue, currentValue, note } = req.body;
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const { v4: uuidv4 } = require("uuid");
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
+    if (!task.assigneeIds?.includes(employeeId)) return res.status(403).json({ error: "Not assigned" });
+
+    const val = parseFloat(addedValue);
+    if (isNaN(val) || val < 0) return res.status(400).json({ error: "Invalid value" });
+
+    const updateId = uuidv4();
+    const updateEntry = {
+      id: updateId,
+      addedValue: val,
+      currentValue: currentValue !== undefined ? parseFloat(currentValue) : null,
+      note: note || "",
+      loggedBy: employeeId,
+      loggedByName: employeeName,
+      createdAt: new Date().toISOString(),
+    };
+
+    const newAchieved = (task.goalAchieved || 0) + val;
+    const target = task.goalConfig?.targetValue || 0;
+    const pct = target > 0 ? Math.round((newAchieved / target) * 100) : 0;
+
+    await taskRef.update({
+      goalUpdates: admin.firestore.FieldValue.arrayUnion(updateEntry),
+      goalAchieved: newAchieved,
+      progressPercent: Math.min(pct, 100),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Post to chat
+    const msgId = uuidv4();
+    const gc = task.goalConfig || {};
+    const unitLabel = gc.unit || (gc.goalType === "amount" ? "₹" : gc.goalType === "percentage" ? "%" : "");
+    const chatText = `📈 Progress update: +${unitLabel}${Number(val).toLocaleString("en-IN")} added${note ? ` — "${note}"` : ""}. Total: ${pct}% achieved.`;
+    await db.collection("cowork_tasks").doc(taskId).collection("chat").doc(msgId).set({
+      messageId: msgId, taskId, senderId: employeeId, senderName: employeeName,
+      text: chatText, attachments: [], messageType: "text",
+      isGoalUpdate: true, mention: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await taskRef.update({
+      chatMessageCount: admin.firestore.FieldValue.increment(1),
+      lastChatAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastChatPreview: chatText,
+    });
+
+    res.json({ success: true, goalAchieved: newAchieved, progressPercent: pct });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── 3. START ──────────────────────────────────────────────────────────────────
@@ -507,5 +877,34 @@ router.post("/task/:taskId/draft-chat", verifyCoworkToken, verifyEmployeeToken, 
     res.status(201).json({ success: true, message: msg });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
+
+// ── UPDATE VENDOR CONFIG — assignee or CEO/TL can edit vendor details ────────
+router.patch("/task/:taskId/update-vendor-config", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, role } = req.coworkUser;
+    const { thirdPartyConfig } = req.body;
+    const { db, admin } = require("../../config/firebaseAdmin");
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isThirdParty) return res.status(400).json({ error: "Not a third-party task" });
+
+    const canEdit = ["ceo", "tl"].includes(role) || task.assigneeIds?.includes(employeeId);
+    if (!canEdit) return res.status(403).json({ error: "Not allowed" });
+
+    await taskRef.update({
+      thirdPartyConfig: { ...(task.thirdPartyConfig || {}), ...thirdPartyConfig },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+module.exports = router;
+
 
 module.exports = router;
