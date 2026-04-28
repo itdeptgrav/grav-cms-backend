@@ -726,7 +726,8 @@ router.patch("/task/:taskId/deadline", verifyCoworkToken, verifyCeoToken, async 
 });
 
 // ── 14. DELETE TASK (CEO only) ────────────────────────────────────────────────
-router.delete("/task/:taskId", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.delete("/task/:taskId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  if (!["ceo", "tl"].includes(req.coworkUser.role)) return res.status(403).json({ error: "Only CEO or TL can delete tasks" });
   try {
     const result = await svc.deleteTask({ taskId: req.params.taskId, deletedBy: req.coworkUser.employeeId });
     res.json(result);
@@ -837,6 +838,10 @@ router.post("/task/:taskId/tl-counter-deadline", verifyCoworkToken, verifyEmploy
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+
+
+
+
 // ── EMPLOYEE RESPOND TO TL COUNTER-PROPOSAL ────────────────────────────────────
 router.post("/task/:taskId/respond-tl-counter", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
@@ -851,6 +856,85 @@ router.post("/task/:taskId/respond-tl-counter", verifyCoworkToken, verifyEmploye
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+
+
+// ── DEADLINE EXTENSION REQUEST — Third-Party / Goal / Repeat tasks ────────────
+router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { proposedDate, reason } = req.body;
+    if (!proposedDate) return res.status(400).json({ error: "proposedDate required" });
+
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+
+    if (!task.isThirdParty && !task.isGoal && !task.isRepeat)
+      return res.status(400).json({ error: "Only third-party, goal, or repeat tasks support this flow" });
+
+    if (!task.assigneeIds?.includes(req.coworkUser.employeeId))
+      return res.status(403).json({ error: "Only assigned employees can request an extension" });
+
+    await taskRef.update({
+      deadlineExtRequest: {
+        proposedDate,
+        reason: reason || "",
+        requestedBy: req.coworkUser.employeeId,
+        requestedByName: req.coworkUser.name,
+        requestedAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: "pending",
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEADLINE EXTENSION REVIEW — CEO/TL approves/rejects/sets new date ─────────
+router.post("/task/:taskId/review-deadline-extension", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { action, newDate } = req.body; // action: "approve" | "reject" | "counter"
+    if (!["approve", "reject", "counter"].includes(action))
+      return res.status(400).json({ error: "action must be approve, reject, or counter" });
+    if (action !== "reject" && !newDate)
+      return res.status(400).json({ error: "newDate required for approve/counter" });
+
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const { role } = req.coworkUser;
+    if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO/TL can review extensions" });
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.deadlineExtRequest || task.deadlineExtRequest.status !== "pending")
+      return res.status(400).json({ error: "No pending extension request" });
+
+    const update = {
+      "deadlineExtRequest.status": action === "approve" ? "approved" : action === "counter" ? "countered" : "rejected",
+      "deadlineExtRequest.reviewedBy": req.coworkUser.employeeId,
+      "deadlineExtRequest.reviewedByName": req.coworkUser.name,
+      "deadlineExtRequest.reviewedAt": admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (action === "approve") {
+      update.fixedDeadline = task.deadlineExtRequest.proposedDate;
+      update["deadlineExtRequest.approvedDate"] = task.deadlineExtRequest.proposedDate;
+    } else if (action === "counter") {
+      update.fixedDeadline = newDate;
+      update["deadlineExtRequest.counterDate"] = newDate;
+    }
+
+    await taskRef.update(update);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── DRAFT CHAT (GET) ──────────────────────────────────────────────────────────
@@ -904,7 +988,140 @@ router.patch("/task/:taskId/update-vendor-config", verifyCoworkToken, verifyEmpl
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── GOAL ACTIVITIES — save full activities array ──────────────────────────────
+router.post("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { employeeId, role } = req.coworkUser;
+    const { activities, submitted, submittedAt } = req.body;
+    const { db, admin } = require("../../config/firebaseAdmin");
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
+
+    // Only assignee can save activities
+    const canEdit = task.assigneeIds?.includes(employeeId) || ["ceo", "tl"].includes(role);
+    if (!canEdit) return res.status(403).json({ error: "Not allowed" });
+
+    if (!Array.isArray(activities)) return res.status(400).json({ error: "activities must be an array" });
+
+    const updateData = {
+      goalActivities: activities,
+      goalActivitiesUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (submitted !== undefined) {
+      updateData.goalActivitiesSubmitted = submitted;
+      if (submitted && submittedAt) updateData.goalActivitiesSubmittedAt = submittedAt;
+    }
+
+    await taskRef.update(updateData);
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GOAL ACTIVITIES — get current activities ──────────────────────────────────
+router.get("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { db } = require("../../config/firebaseAdmin");
+
+    const snap = await db.collection("cowork_tasks").doc(taskId).get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
+
+    res.json({
+      activities: task.goalActivities || [],
+      submitted: task.goalActivitiesSubmitted || false,
+      submittedAt: task.goalActivitiesSubmittedAt || null,
+      updatedAt: task.goalActivitiesUpdatedAt || null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
 
+// ── GOAL ACTIVITY: REQUEST REPORT on a specific component ────────────────────
+// X (CEO/TL) calls this to flag a component as needing a report from Y
+router.post("/task/:taskId/goal-activity/:activityId/request-report", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId, activityId } = req.params;
+    const { role, name: requesterName, employeeId } = req.coworkUser;
+    if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO or TL can request reports" });
 
-module.exports = router;
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
+
+    const activities = task.goalActivities || [];
+    const idx = activities.findIndex(a => a.id === activityId);
+    if (idx === -1) return res.status(404).json({ error: "Component not found" });
+
+    const now = new Date().toISOString();
+    activities[idx] = {
+      ...activities[idx],
+      reportRequested: true,
+      reportRequestedAt: now,
+      reportRequestedBy: requesterName,
+      reportRequestedById: employeeId,
+    };
+
+    await taskRef.update({
+      goalActivities: activities,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GOAL ACTIVITY: SUBMIT REPORT for a specific component ────────────────────
+// Y (assignee) submits text + file references after uploading files to Drive
+router.post("/task/:taskId/goal-activity/:activityId/submit-report", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId, activityId } = req.params;
+    const { employeeId, name: submitterName } = req.coworkUser;
+    const { text, files } = req.body; // files: [{name, driveUrl, mimeType}]
+
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+    if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
+    if (!task.assigneeIds?.includes(employeeId)) return res.status(403).json({ error: "Not assigned" });
+
+    const activities = task.goalActivities || [];
+    const idx = activities.findIndex(a => a.id === activityId);
+    if (idx === -1) return res.status(404).json({ error: "Component not found" });
+
+    const now = new Date().toISOString();
+    activities[idx] = {
+      ...activities[idx],
+      report: {
+        text: text || "",
+        files: files || [],
+        submittedAt: now,
+        submittedBy: submitterName,
+        submittedById: employeeId,
+      },
+      reportSubmitted: true,
+    };
+
+    await taskRef.update({
+      goalActivities: activities,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});

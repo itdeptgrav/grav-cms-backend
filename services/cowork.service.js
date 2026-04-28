@@ -420,10 +420,16 @@ async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, tex
   // Determine message type from attachments if not provided
   const resolvedType = messageType !== "text" ? messageType
     : attachments.length > 0 ? (attachments[0].type || "image") : "text";
+  // Strip undefined fields from each attachment — Firestore rejects undefined values
+  const cleanAttachments = (attachments || []).map(a => {
+    const clean = {};
+    Object.entries(a).forEach(([k, v]) => { if (v !== undefined) clean[k] = v; });
+    return clean;
+  });
 
   const msg = {
     messageId, threadType: "direct", threadId: conversationId, senderId: fromEmployeeId,
-    senderName, text: text || "", attachments, messageType: resolvedType,
+    senderName, text: text || "", attachments: cleanAttachments, messageType: resolvedType,
     type: resolvedType, readBy: [fromEmployeeId],
     createdAt: timestamp,
   };
