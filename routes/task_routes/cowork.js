@@ -37,6 +37,7 @@ router.post("/setup/seed-ceo", async (req, res) => {
 // ── Me ────────────────────────────────────────────────────
 router.get("/me", verifyCoworkToken, verifyEmployeeToken, (req, res) => {
   const { authUid, employeeId, role, name, employeeData } = req.coworkUser;
+  console.log(`yugyu`, req.coworkUser);
   res.json({
     authUid, employeeId, role, name,
     tempPassword: employeeData?.passwordChanged === false ? employeeData?.tempPassword : null,
