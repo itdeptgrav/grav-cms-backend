@@ -2676,6 +2676,43 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  DELETE /remove-from-month
+//  Removes ALL attendance entries for a given biometricId across every
+//  DailyAttendance document in the specified yearMonth (YYYY-MM).
+//  Use-case: purge a stale ghost biometric ID (e.g. "080") after the device
+//  was updated to the canonical ID ("0080") so the ghost row no longer
+//  pollutes reports and exports for that month.
+// ═══════════════════════════════════════════════════════════════════════════
+router.delete("/remove-from-month", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { biometricId, yearMonth } = req.query;
+        if (!biometricId || !yearMonth) {
+            return res.status(400).json({ success: false, message: "biometricId and yearMonth required" });
+        }
+        if (!/^\d{4}-\d{2}$/.test(yearMonth)) {
+            return res.status(400).json({ success: false, message: "yearMonth must be YYYY-MM" });
+        }
+
+        const bid = String(biometricId).toUpperCase();
+
+        // Pull the employee sub-document from every day in this month
+        const result = await DailyAttendance.updateMany(
+            { yearMonth, "employees.biometricId": bid },
+            { $pull: { employees: { biometricId: bid } } }
+        );
+
+        res.json({
+            success: true,
+            message: `Removed ${bid} from ${result.modifiedCount} day(s) in ${yearMonth}`,
+            daysModified: result.modifiedCount,
+        });
+    } catch (err) {
+        console.error("[REMOVE-FROM-MONTH]", err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  GET /export-daily  — Unified Manpower Intelligence Report
 //
 //  Design philosophy:
@@ -3540,7 +3577,6 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
 
         const employees = [];
-        const running = new Map();
 
         // Helper: build day codes for one employee key given their basic info
         function buildEmpRow(key, empName, empDept, empDesig, empType) {
@@ -3554,7 +3590,6 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                 hrOverrides: new Set(), // dateStrings where hrFinalStatus was applied
                 totals: { P: 0, A: 0, HD: 0, WO: 0, CO: 0, CL: 0, SL: 0, PL: 0, NHFH: 0, Total: 0 },
             };
-            running.set(key, 0);
 
             for (const cal of allDays) {
                 if (cal.isFuture) { row.dayCodes[cal.dateStr] = ""; continue; }
@@ -3577,6 +3612,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                     if (didPunch) {
                         const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
                         sheetCode = toSheetCode(finalStatus) || "P";
+                        // Sunday worked → counts in P column (matches EP in the web summary)
                         row.totals.P++;
                         if (entry.hrFinalStatus || (entry.rawPunches || []).some(p => p.source === 'manual' || p.source === 'miss_punch')) row.hrOverrides.add(cal.dateStr);
                     } else {
@@ -3587,20 +3623,13 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                     sheetCode = dayDoc ? "A" : "";
                     if (dayDoc) row.totals.A++;
                 } else {
-                    // Normal working day
-                    let cum = running.get(key) || 0;
-                    let status = entry.systemPrediction;
-                    if (settings.lateHalfDayPolicy?.enabled && entry.isLate && (entry.lateMins || 0) > 0) {
-                        cum += entry.lateMins;
-                        const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
-                        if (cum >= thr) { status = "HD"; cum = 0; }
-                    }
-                    running.set(key, cum);
-                    const finalStatus = entry.hrFinalStatus || status;
+                    // Normal working day — use the stored systemPrediction (already has
+                    // auto-HD promotion baked in from sync) so the export matches the web
+                    // summary exactly. Do NOT re-run cumulative late promotion here.
+                    const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
                     sheetCode = toSheetCode(finalStatus);
 
                     // Track HR override
-                    // HR override: explicit status change OR manually edited punch times
                     const hasManualPunch = (entry.rawPunches || []).some(p => p.source === 'manual' || p.source === 'miss_punch');
                     if (entry.hrFinalStatus || hasManualPunch) row.hrOverrides.add(cal.dateStr);
 
@@ -3617,8 +3646,12 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                 row.dayCodes[cal.dateStr] = sheetCode;
             }
 
-            row.totals.Total = row.totals.P + row.totals.A + row.totals.HD + row.totals.WO
-                + row.totals.CO + row.totals.CL + row.totals.SL + row.totals.PL + row.totals.NHFH;
+            // Total = paid/present days + approved leaves, minus unpaid absents
+            // Leaves (CL/SL/PL/CO) count positively — they are approved paid days
+            // Absent (A) subtracts — employee had no leave approval and was absent
+            row.totals.Total = row.totals.P + row.totals.HD + row.totals.WO
+                + row.totals.CO + row.totals.CL + row.totals.SL + row.totals.PL + row.totals.NHFH
+                - row.totals.A;
             return row;
         }
 
