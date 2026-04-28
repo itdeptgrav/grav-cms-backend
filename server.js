@@ -337,7 +337,7 @@ const connectDB = async () => {
 connectDB().then(async () => {
   await createDefaultCuttingMaster();
   seedQCUser();
-
+  seedCEOUser();
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
@@ -350,6 +350,7 @@ const Measurement = require("./models/Customer_Models/Measurement");
 const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/StockItem");
 const ProductionSupervisorDepartment = require("./models/ProductionSupervisorDepartment");
 const QCDepartment = require("./models/QCDepartment");
+const CEODepartment = require("./models/CEODepartment");
 
 
 const createDefaultCuttingMaster = async () => {
@@ -380,6 +381,30 @@ const createDefaultCuttingMaster = async () => {
     console.log("✅ Default Cutting Master created successfully");
   } catch (error) {
     console.error("❌ Cutting Master creation failed:", error.message);
+  }
+};
+
+// ✅ Auto-create default CEO user
+const seedCEOUser = async () => {
+  try {
+    const existing = await CEODepartment.findOne({ email: "ceo@grav.in" });
+    if (existing) {
+      console.log("ℹ️  CEO user already exists: ceo@grav.in");
+      return;
+    }
+    await CEODepartment.create({
+      name:       "Chief Executive Officer",
+      email:      "ceo@grav.in",
+      password:   "Ceo@12345",
+      employeeId: "CEO001",
+      phone:      "",
+      department: "Executive Office",
+      role:       "ceo",
+      isActive:   true,
+    });
+    console.log("✅ Seeded default CEO user: ceo@grav.in / Ceo@12345 (CEO001)");
+  } catch (err) {
+    console.error("❌ CEO seed error:", err);
   }
 };
 
