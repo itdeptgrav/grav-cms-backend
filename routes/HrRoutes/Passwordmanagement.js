@@ -8,6 +8,12 @@ const HRDepartment = require("../../models/HRDepartment");
 const SalesDepartment = require("../../models/SalesDepartment");
 const AccountantDepartment = require("../../models/Accountant_model/AccountantDepartment");
 const CuttingMasterDepartment = require("../../models/CuttingMasterDepartment");
+const ProjectManager = require("../../models/ProjectManager");
+const MpcMeasurement = require("../../models/MpcMeasurement");
+const PackagingDispatchDepartment = require("../../models/PackagingDispatchDepartment");
+const ProductionSupervisorDepartment = require("../../models/ProductionSupervisorDepartment");
+const QCDepartment = require("../../models/QCDepartment");
+const CEODepartment = require("../../models/CEODepartment");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 // Helper function to generate default password (must match login route)
@@ -44,11 +50,17 @@ function hrOnly(req, res, next) {
 // ─── Helper: resolve model by userType ───────────────────────────────────────
 function getModelByType(userType) {
     switch (userType) {
+        case "hr": return HRDepartment;
         case "sales": return SalesDepartment;
         case "accountant": return AccountantDepartment;
         case "cutting-master": return CuttingMasterDepartment;
-        case "hr": return HRDepartment;
-        default: return Employee;         // regular employees
+        case "project_manager": return ProjectManager;
+        case "mpc-measurement": return MpcMeasurement;
+        case "packaging-dispatch": return PackagingDispatchDepartment;
+        case "production-supervisor": return ProductionSupervisorDepartment;
+        case "qc": return QCDepartment;
+        case "ceo": return CEODepartment;
+        default: return Employee; // regular employees
     }
 }
 
@@ -62,9 +74,6 @@ function getUserName(user, userType) {
 
 // Helper to get user email from different models
 function getUserEmail(user, userType) {
-    if (userType === "employee") {
-        return user.email;
-    }
     return user.email;
 }
 
@@ -90,6 +99,7 @@ router.get(
             const { search = "", department = "", userType = "all", page = 1, limit = 20 } = req.query;
             const skip = (Number(page) - 1) * Number(limit);
 
+            // Query builder for department models (name, email, phone, employeeId fields)
             const buildQuery = (extra = {}) => {
                 const q = { isActive: true, ...extra };
                 if (search) {
@@ -104,6 +114,7 @@ router.get(
                 return q;
             };
 
+            // Query builder for Employee model (firstName/lastName split)
             const buildEmployeeQuery = () => {
                 const q = { isActive: true };
                 if (search) {
@@ -121,7 +132,7 @@ router.get(
 
             let results = [];
 
-            // Fetch from each collection unless filtered
+            // ── Employee (biometric/HRMS staff) ──────────────────────────────
             if (userType === "all" || userType === "employee") {
                 const emps = await Employee.find(buildEmployeeQuery())
                     .select("firstName lastName email phone biometricId department jobTitle createdAt isActive dateOfBirth")
@@ -143,24 +154,27 @@ router.get(
                 );
             }
 
-            if (userType === "all" || userType === "sales") {
-                const sales = await SalesDepartment.find(buildQuery()).select("name email phone employeeId department role createdAt isActive").lean();
-                results.push(...sales.map((u) => ({ ...u, userType: "sales" })));
-            }
+            // ── Department models ─────────────────────────────────────────────
+            const deptTypes = [
+                { key: "hr", Model: HRDepartment, label: "HR" },
+                { key: "sales", Model: SalesDepartment, label: "Sales" },
+                { key: "accountant", Model: AccountantDepartment, label: "Accountant" },
+                { key: "cutting-master", Model: CuttingMasterDepartment, label: "Cutting Master" },
+                { key: "project_manager", Model: ProjectManager, label: "Project Manager" },
+                { key: "mpc-measurement", Model: MpcMeasurement, label: "MPC Measurement" },
+                { key: "packaging-dispatch", Model: PackagingDispatchDepartment, label: "Packaging & Dispatch" },
+                { key: "production-supervisor", Model: ProductionSupervisorDepartment, label: "Production Supervisor" },
+                { key: "qc", Model: QCDepartment, label: "QC" },
+                { key: "ceo", Model: CEODepartment, label: "CEO" },
+            ];
 
-            if (userType === "all" || userType === "accountant") {
-                const acc = await AccountantDepartment.find(buildQuery()).select("name email phone employeeId department role createdAt isActive").lean();
-                results.push(...acc.map((u) => ({ ...u, userType: "accountant" })));
-            }
-
-            if (userType === "all" || userType === "cutting-master") {
-                const cm = await CuttingMasterDepartment.find(buildQuery()).select("name email phone employeeId department role createdAt isActive").lean();
-                results.push(...cm.map((u) => ({ ...u, userType: "cutting-master" })));
-            }
-
-            if (userType === "all" || userType === "hr") {
-                const hr = await HRDepartment.find(buildQuery()).select("name email phone employeeId department role createdAt isActive").lean();
-                results.push(...hr.map((u) => ({ ...u, userType: "hr" })));
+            for (const { key, Model } of deptTypes) {
+                if (userType === "all" || userType === key) {
+                    const users = await Model.find(buildQuery())
+                        .select("name email phone employeeId department role createdAt isActive")
+                        .lean();
+                    results.push(...users.map((u) => ({ ...u, userType: key })));
+                }
             }
 
             // Sort by name, paginate
@@ -226,7 +240,6 @@ router.patch(
             const salt = await bcrypt.genSalt(10);
             const hashed = await bcrypt.hash(newPassword, salt);
 
-            // Update password
             await Model.findByIdAndUpdate(id, { password: hashed });
 
             const userName = getUserName(user, userType);
@@ -270,7 +283,6 @@ router.post(
 
             // For employees, reset to default password format
             if (userType === "employee") {
-                // Check if employee has firstName and dateOfBirth
                 if (!user.firstName || !user.dateOfBirth) {
                     return res.status(400).json({
                         success: false,
@@ -288,7 +300,7 @@ router.post(
                     });
                 }
             } else {
-                // For other departments, generate a secure temporary password
+                // For all department accounts, generate a secure temporary password
                 const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789@#$!";
                 tempPassword = "";
                 tempPassword += "ABCDEFGHJKLMNPQRSTUVWXYZ"[Math.floor(Math.random() * 24)];
@@ -302,11 +314,9 @@ router.post(
                 userName = user.name || user.email;
             }
 
-            // Hash the password
             const salt = await bcrypt.genSalt(10);
             const hashed = await bcrypt.hash(tempPassword, salt);
 
-            // Update password
             await Model.findByIdAndUpdate(id, { password: hashed });
 
             res.status(200).json({
