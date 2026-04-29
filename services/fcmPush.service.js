@@ -10,23 +10,36 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
     const db = admin.firestore();
 
     try {
-        // Fetch tokens for all recipients
-        const tokenDocs = await Promise.all(
-            recipientIds.map(id => db.collection("cowork_fcm_tokens").doc(id).get())
-        );
+        // Read tokens from BOTH storage locations:
+        // 1. cowork_fcm_tokens/{id}.tokens  — saved by browser via useFCMToken.ts
+        // 2. cowork_employees/{id}.fcmTokens — saved by backend saveFCMToken()
+        const [fcmDocs, empDocs] = await Promise.all([
+            Promise.all(recipientIds.map(id => db.collection("cowork_fcm_tokens").doc(id).get())),
+            Promise.all(recipientIds.map(id => db.collection("cowork_employees").doc(id).get())),
+        ]);
 
-        const validDocs = tokenDocs.filter(d => d.exists && (d.data()?.tokens?.length || d.data()?.token));
-        // Support both new (tokens array) and legacy (single token) format
-        const tokens = [...new Set(
-            validDocs.flatMap(d => {
-                const data = d.data();
-                if (data.tokens?.length) return data.tokens;        // new: array
-                if (data.token) return [data.token];                 // legacy: single
-                return [];
-            })
-        )];
+        const allTokens = new Set();
 
-        if (!tokens.length) return; // no devices registered yet
+        fcmDocs.forEach(d => {
+            if (!d.exists) return;
+            const data = d.data();
+            (data.tokens || []).forEach(t => t && allTokens.add(t));
+            if (data.token) allTokens.add(data.token);
+            if (data.latestToken) allTokens.add(data.latestToken);
+        });
+
+        empDocs.forEach(d => {
+            if (!d.exists) return;
+            const data = d.data();
+            (data.fcmTokens || []).forEach(t => t && allTokens.add(t));
+        });
+
+        const tokens = [...allTokens].filter(Boolean);
+
+        if (!tokens.length) {
+            console.log(`[FCM] No tokens found for: ${recipientIds.join(", ")}`);
+            return;
+        }
 
         const message = {
             notification: { title, body },
@@ -50,7 +63,8 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
         const response = await admin.messaging().sendEachForMulticast(message);
         console.log(`[FCM] ${response.successCount}/${tokens.length} delivered`);
 
-        // Remove stale/invalid tokens
+        // Remove stale/invalid tokens from cowork_fcm_tokens
+        const staleTokens = [];
         response.responses.forEach((resp, idx) => {
             if (!resp.success) {
                 const code = resp.error?.code;
@@ -58,10 +72,39 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                     code === "messaging/invalid-registration-token" ||
                     code === "messaging/registration-token-not-registered"
                 ) {
-                    validDocs[idx]?.ref?.delete().catch(() => { });
+                    staleTokens.push(tokens[idx]);
                 }
             }
         });
+        if (staleTokens.length) {
+            console.log(`[FCM] Removing ${staleTokens.length} stale token(s)`);
+            // Remove from cowork_fcm_tokens
+            await Promise.all(
+                recipientIds.map(async id => {
+                    const ref = db.collection("cowork_fcm_tokens").doc(id);
+                    const snap = await ref.get();
+                    if (!snap.exists) return;
+                    const existing = snap.data().tokens || [];
+                    const cleaned = existing.filter(t => !staleTokens.includes(t));
+                    if (cleaned.length !== existing.length) {
+                        await ref.update({ tokens: cleaned });
+                    }
+                })
+            );
+            // Remove from cowork_employees
+            await Promise.all(
+                recipientIds.map(async id => {
+                    const ref = db.collection("cowork_employees").doc(id);
+                    const snap = await ref.get();
+                    if (!snap.exists) return;
+                    const existing = snap.data().fcmTokens || [];
+                    const cleaned = existing.filter(t => !staleTokens.includes(t));
+                    if (cleaned.length !== existing.length) {
+                        await ref.update({ fcmTokens: cleaned });
+                    }
+                })
+            );
+        }
     } catch (err) {
         console.error("[FCM] sendPushToEmployees error:", err.message);
     }
