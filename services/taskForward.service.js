@@ -56,6 +56,64 @@ function _fmtDurationChat(targetDate) {
 }
 
 // ─── Notify helper ────────────────────────────────────────
+// Build rich multiline body for push notification based on event type
+function _buildRichBody(type, body, data = {}) {
+  const lines = [body || ""];
+  if (type === "task_assigned" || type === "task_forwarded") {
+    if (data.priority) lines.push(`Priority: ${data.priority}`);
+    if (data.dueDate) lines.push(`Due: ${data.dueDate}`);
+    if (data.description) lines.push(String(data.description).slice(0, 60));
+  } else if (type === "task_chat") {
+    if (data.taskTitle) lines.push(`Task: ${data.taskTitle}`);
+  } else if (type === "daily_report") {
+    if (data.taskTitle) lines.push(`Task: ${data.taskTitle}`);
+  } else if (type === "completion_rejected" || type === "completion_ceo_rejected") {
+    if (data.reason) lines.push(`Reason: ${data.reason}`);
+  } else if (type === "deadline_changed") {
+    if (data.taskTitle) lines.push(`Task: ${data.taskTitle}`);
+  } else if (type === "goal_final_submit") {
+    if (data.componentCount) lines.push(`Components: ${data.componentCount}`);
+    if (data.submittedAt) lines.push(`Submitted: ${data.submittedAt}`);
+  } else if (type === "goal_component_done") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.progress) lines.push(`Progress: ${data.progress}`);
+    if (data.reportText) lines.push(String(data.reportText).slice(0, 60));
+  } else if (type === "goal_report_submitted") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.fileCount) lines.push(`Attachments: ${data.fileCount} file${data.fileCount !== 1 ? "s" : ""}`);
+    if (data.reportText) lines.push(String(data.reportText).slice(0, 80));
+  }
+  return lines.filter(Boolean).join("\n");
+}
+
+// Clear event type label for push title
+function _buildTitle(type, title) {
+  const labels = {
+    task_assigned: "📋 Task Assigned",
+    task_confirmed: "✅ Task Confirmed",
+    task_started: "▶️ Work Started",
+    task_forwarded: "↪️ Task Forwarded",
+    task_deleted: "🗑️ Task Deleted",
+    task_chat: "💬 Task Chat",
+    daily_report: "📊 Progress Report",
+    deadline_changed: "⏰ Deadline Changed",
+    completion_submitted: "📤 Work Submitted",
+    completion_tl_approved: "✅ TL Approved",
+    completion_ceo_approved: "🏆 Task Complete",
+    completion_rejected: "❌ Work Rejected",
+    completion_ceo_rejected: "❌ CEO Rejected",
+    goal_final_submit: "🚀 Goal Submitted",
+    goal_component_done: "✅ Component Done",
+    goal_report_submitted: "📋 Report Submitted",
+  };
+  const label = labels[type];
+  if (!label) return title;
+  // Extract the task/context name from title (after · or :)
+  const parts = title.split(/[·:]/);
+  const context = parts.length > 1 ? parts.slice(1).join("·").trim() : "";
+  return context ? `${label} · ${context}` : `${label}`;
+}
+
 async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
   const batch = db.batch();
@@ -69,10 +127,12 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
   await batch.commit();
   socket.emitToMany(recipientIds, "new_notification", { type, title, body, data });
 
-  // FCM push — always fires immediately, no cooldown
+  // FCM push with rich title + multiline body
   try {
     const { sendPushToEmployees } = require("./fcmPush.service");
-    await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
+    const richTitle = _buildTitle(type, title);
+    const richBody = _buildRichBody(type, body, data || {});
+    await sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) });
   } catch (e) { console.error("[FCM taskForward]", e.message); }
 
   // Email — 20-min cooldown per sender→receiver pair
@@ -780,8 +840,8 @@ async function deleteTask({ taskId, deletedBy }) {
     await _notifyMany({
       recipientIds: task.assigneeIds,
       type: "task_deleted",
-      title: `Task deleted: ${task.title}`,
-      body: `The task "${task.title}" has been deleted.`,
+      title: `🗑️ Task Deleted · ${task.title}`,
+      body: `The task "${task.title}" has been permanently deleted by the admin.`,
       data: { taskId, taskTitle: task.title },
       senderId: deletedBy,
       senderName: deletedBy,
