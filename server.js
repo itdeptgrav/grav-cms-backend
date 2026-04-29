@@ -1553,8 +1553,9 @@ server.listen(PORT, () => {
         const participants = meet.participants || [];
         if (!participants.length) continue;
 
-        const title = `Meeting in 15 minutes: ${meet.title}`;
-        const body = `"${meet.title}" starts soon. Get ready to join.`;
+           const title = `⏰ Meeting Starting Soon · ${meet.title}`;
+        const body = `"${meet.title}" starts in 15 minutes. Get ready to join.`;
+
 
         await sendPushToEmployees(participants, title, body, { type: "meet_reminder", meetId });
 
