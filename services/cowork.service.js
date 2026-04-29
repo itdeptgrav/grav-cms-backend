@@ -216,7 +216,7 @@ async function deleteCoworkGroup(groupId, requestingEmployeeId) {
     await _notifyMany({
       recipientIds: othersToNotify,
       type: "group_deleted",
-      title: `Group deleted: ${groupName}`,
+      title: `🗑️ Group Deleted · ${groupName}`,
       body: `The group "${groupName}" has been deleted.`,
       data: { groupId, groupName },
       senderId: requestingEmployeeId,
@@ -246,7 +246,7 @@ async function addGroupMember(groupId, requestingEmployeeId, employeeIdToAdd) {
   if (memberIds.includes(employeeIdToAdd)) throw new Error("Employee is already a member.");
   const updated = [...memberIds, employeeIdToAdd];
   await db.collection("cowork_groups").doc(groupId).update({ memberIds: updated, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-  await _notifyMany({ recipientIds: [employeeIdToAdd], type: "group_added", title: `Added to: ${snap.data().name}`, body: `You were added to group "${snap.data().name}"`, data: { groupId, groupName: snap.data().name }, senderId: requestingEmployeeId, senderName: "CoWork" });
+  await _notifyMany({ recipientIds: [employeeIdToAdd], type: "group_added", title: `➕ Added to Group · ${snap.data().name}`, body: `You were added to group "${snap.data().name}"`, data: { groupId, groupName: snap.data().name }, senderId: requestingEmployeeId, senderName: "CoWork" });
   return { memberIds: updated };
 }
 
@@ -263,7 +263,7 @@ async function removeGroupMember(groupId, requestingEmployeeId, employeeIdToRemo
   await _notifyMany({
     recipientIds: [employeeIdToRemove],
     type: "group_removed",
-    title: `Removed from: ${snap.data().name}`,
+    title: `🚫 Removed from Group · ${snap.data().name}`,
     body: `You have been removed from "${snap.data().name}"`,
     data: { groupId, groupName: snap.data().name },
     senderId: requestingEmployeeId,
@@ -490,7 +490,7 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
 
   const recipients = participants.filter(id => id !== createdBy);
   socket.emitToMany(recipients, "new_meet", { meetId, title, dateTime, googleMeetLink });
-  await _notifyMany({ recipientIds: recipients, type: "meet_scheduled", title: `Meeting: ${title}`, body: new Date(dateTime).toLocaleString("en-IN"), data: { meetId, meetTitle: title, dateTime }, senderId: createdBy, senderName: createdBy });
+  await _notifyMany({ recipientIds: recipients, type: "meet_scheduled", title: `📅 Meeting Scheduled · ${title}`, body: new Date(dateTime).toLocaleString("en-IN"), data: { meetId, meetTitle: title, dateTime }, senderId: createdBy, senderName: createdBy });
   return data;
 }
 
@@ -553,7 +553,7 @@ async function cancelCoworkMeet({ meetId, cancelledBy, cancelledByName }) {
   await _notifyMany({
     recipientIds: recipients,
     type: "meet_cancelled",
-    title: `Meeting Cancelled: ${meet.title}`,
+    title: `❌ Meeting Cancelled · ${meet.title}`,
     body: `Cancelled by ${cancelledByName}`,
     data: { meetId, meetTitle: meet.title },
     senderId: cancelledBy,
@@ -598,7 +598,7 @@ async function updateCoworkMeet({ meetId, updatedBy, title, description, dateTim
   await _notifyMany({
     recipientIds: recipients,
     type: "meet_updated",
-    title: `Meeting Updated: ${updates.title || meet.title}`,
+    title: `📅 Meeting Updated · ${updates.title || meet.title}`,
     body: `New time: ${new Date(updates.dateTime || meet.dateTime).toLocaleString("en-IN")}`,
     data: { meetId, meetTitle: updates.title || meet.title, dateTime: updates.dateTime || meet.dateTime },
     senderId: updatedBy,
@@ -846,6 +846,28 @@ async function markNotificationsRead(employeeId) {
 }
 
 // ── INTERNAL ──────────────────────────────────────────────
+// Clear event type label for push notification title
+function _buildTitle(type, title) {
+  const labels = {
+    direct_message: "💬 Direct Message",
+    group_message: "👥 Group Message",
+    group_added: "➕ Added to Group",
+    group_deleted: "🗑️ Group Deleted",
+    meet_scheduled: "📅 Meeting Scheduled",
+    meet_cancelled: "❌ Meeting Cancelled",
+    meet_updated: "📅 Meeting Updated",
+    meet_reminder: "⏰ Meeting Starting",
+    request: "📨 New Request",
+    request_approved: "✅ Request Approved",
+    request_rejected: "❌ Request Rejected",
+  };
+  const label = labels[type];
+  if (!label) return title;
+  const parts = title.split(/[·:]/);
+  const context = parts.length > 1 ? parts.slice(1).join("·").trim() : "";
+  return context ? `${label} · ${context}` : label;
+}
+
 // Build a rich multiline body for push notifications based on type + data
 function _buildRichBody(type, body, data = {}) {
   const lines = [body || ""];
@@ -902,8 +924,9 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
   // FCM push with rich multiline body
   try {
     const { sendPushToEmployees } = require("./fcmPush.service");
+    const richTitle = _buildTitle(type, title);
     const richBody = _buildRichBody(type, body, data || {});
-    await sendPushToEmployees(recipientIds, title, richBody, { type, ...(data || {}) });
+    await sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) });
   } catch (e) { console.error("FCM push:", e.message); }
 
   // Email — 20-min cooldown per sender→receiver pair
