@@ -389,7 +389,7 @@ async function sendGroupMessage({ groupId, senderId, senderName, text, attachmen
     temp: false
   });
 
-  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `${senderName} in ${group.name}`, body: text.slice(0, 80), data: { groupId, messageId, groupName: group.name }, senderId, senderName });
+  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `👥 ${group.name} · ${senderName}`, body: text.slice(0, 80), data: { groupId, messageId, groupName: group.name }, senderId, senderName });
   return msg;
 }
 
@@ -458,7 +458,7 @@ async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, tex
     temp: false
   });
 
-  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `${senderName}`, body: text.slice(0, 80), data: { conversationId, messageId }, senderId: fromEmployeeId, senderName });
+  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `💬 DM · ${senderName}`, body: text.slice(0, 80), data: { conversationId, messageId }, senderId: fromEmployeeId, senderName });
   return { messageData: msg, conversationId };
 }
 
@@ -846,6 +846,46 @@ async function markNotificationsRead(employeeId) {
 }
 
 // ── INTERNAL ──────────────────────────────────────────────
+// Build a rich multiline body for push notifications based on type + data
+function _buildRichBody(type, body, data = {}) {
+  const lines = [body || ""];
+  if (type === "task_assigned" || type === "task_forwarded") {
+    if (data.priority) lines.push(`Priority: ${data.priority}`);
+    if (data.dueDate) lines.push(`Due: ${data.dueDate}`);
+    if (data.description) lines.push(data.description.slice(0, 60));
+  } else if (type === "direct_message") {
+    // body already has the message — no extra lines needed
+  } else if (type === "group_message") {
+    // body already has message text
+  } else if (type === "task_chat") {
+    if (data.taskTitle) lines.push(`In: ${data.taskTitle}`);
+  } else if (type === "meet_scheduled") {
+    if (data.dateTime) lines.push(`Time: ${new Date(data.dateTime).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}`);
+    if (data.meetTitle) lines.push(`Meeting: ${data.meetTitle}`);
+  } else if (type === "goal_final_submit") {
+    if (data.componentCount) lines.push(`Components: ${data.componentCount}`);
+    if (data.submittedAt) lines.push(`Submitted: ${data.submittedAt}`);
+  } else if (type === "goal_component_done") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.progress) lines.push(`Progress: ${data.progress}`);
+    if (data.reportText) lines.push(data.reportText.slice(0, 60));
+  } else if (type === "goal_report_submitted") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.fileCount) lines.push(`Attachments: ${data.fileCount} file${data.fileCount !== 1 ? "s" : ""}`);
+    if (data.reportText) lines.push(data.reportText.slice(0, 80));
+  } else if (type === "completion_rejected" || type === "completion_ceo_rejected") {
+    if (data.reason) lines.push(`Reason: ${data.reason}`);
+  } else if (type === "deadline_changed") {
+    // body already has old→new deadline
+  } else if (type === "request") {
+    if (data.priority) lines.push(`Priority: ${data.priority}`);
+    if (data.dueDate) lines.push(`Due: ${data.dueDate}`);
+    if (data.message) lines.push(data.message.slice(0, 60));
+  }
+  // Filter empty lines and join
+  return lines.filter(Boolean).join("\n");
+}
+
 async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
   const batch = db.batch();
@@ -859,10 +899,11 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
 
   socket.emitToMany(recipientIds, "new_notification", { type, title, body });
 
-  // FCM push — always fires, no cooldown
+  // FCM push with rich multiline body
   try {
     const { sendPushToEmployees } = require("./fcmPush.service");
-    await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
+    const richBody = _buildRichBody(type, body, data || {});
+    await sendPushToEmployees(recipientIds, title, richBody, { type, ...(data || {}) });
   } catch (e) { console.error("FCM push:", e.message); }
 
   // Email — 20-min cooldown per sender→receiver pair
