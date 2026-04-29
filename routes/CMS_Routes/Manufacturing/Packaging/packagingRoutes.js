@@ -414,6 +414,219 @@ router.post("/fetch-order", async (req, res) => {
   }
 });
 
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GET /active-mos
+// Lists measurement-conversion MOs that still have unpackaged employee units.
+// Used by the UIN-based packaging flow (alternative to barcode scanning).
+// ═════════════════════════════════════════════════════════════════════════════
+router.get("/active-mos", async (req, res) => {
+  try {
+    const { search = "" } = req.query;
+
+    const moQuery = {
+      requestType: "measurement_conversion",
+      status: "quotation_sales_approved",
+    };
+    if (search) {
+      const re = new RegExp(search.trim(), "i");
+      moQuery.$or = [
+        { "customerInfo.name": re },
+        { requestId: re },
+        { measurementName: re },
+      ];
+    }
+
+    const mos = await CustomerRequest.find(moQuery)
+      .select("requestId customerInfo measurementName createdAt")
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    const result = [];
+    for (const mo of mos) {
+      const docs = await EmployeeProductionProgress.find({
+        manufacturingOrderId: mo._id,
+        isFullyPackaged: { $ne: true },
+      })
+        .select("employeeId totalUnits packagedUnits")
+        .lean();
+
+      if (!docs.length) continue;
+
+      const totalEmployees = new Set(docs.map((d) => d.employeeId?.toString())).size;
+      const remainingUnits = docs.reduce(
+        (s, d) => s + Math.max(0, (d.totalUnits || 0) - (d.packagedUnits || 0)),
+        0
+      );
+      if (remainingUnits === 0) continue;
+
+      result.push({
+        _id: mo._id,
+        moNumber: `MO-${mo.requestId}`,
+        requestId: mo.requestId,
+        customerName: mo.customerInfo?.name || "—",
+        measurementName: mo.measurementName || null,
+        totalEmployees,
+        remainingUnits,
+      });
+    }
+
+    return res.json({ success: true, manufacturingOrders: result });
+  } catch (err) {
+    console.error("Active MOs error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POST /fetch-by-uins
+// Body: { moId, uins: ["UIN1", "UIN2", ...] }
+// Returns the same { groups, invalid, ... } shape as /fetch-order, so the
+// existing FetchResultView and /done flow work unchanged.
+// ═════════════════════════════════════════════════════════════════════════════
+router.post("/fetch-by-uins", async (req, res) => {
+  try {
+    const { moId, uins } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(moId)) {
+      return res.status(400).json({ success: false, message: "Invalid MO id" });
+    }
+    if (!Array.isArray(uins) || !uins.length) {
+      return res.status(400).json({ success: false, message: "No UINs provided" });
+    }
+
+    const cleanUins = [...new Set(uins.map((u) => (u || "").trim()).filter(Boolean))];
+    if (!cleanUins.length) {
+      return res.status(400).json({ success: false, message: "No valid UINs" });
+    }
+
+    const mo = await CustomerRequest.findById(moId)
+      .select("requestId requestType customerInfo")
+      .lean();
+    if (!mo) return res.status(404).json({ success: false, message: "MO not found" });
+
+    const docs = await EmployeeProductionProgress.find({
+      manufacturingOrderId: moId,
+      employeeUIN: { $in: cleanUins },
+    }).lean();
+
+    const foundUins = new Set(docs.map((d) => d.employeeUIN));
+    const invalid = cleanUins
+      .filter((u) => !foundUins.has(u))
+      .map((u) => ({ barcode: u, reason: "UIN not found in this MO" }));
+
+    if (!docs.length) {
+      return res.status(400).json({
+        success: false,
+        message: "No employees match the provided UINs",
+        invalid,
+      });
+    }
+
+    // Group employee progress docs by workOrderId
+    const woGroups = new Map();
+    for (const doc of docs) {
+      const woKey = doc.workOrderId.toString();
+      if (!woGroups.has(woKey)) woGroups.set(woKey, []);
+      woGroups.get(woKey).push(doc);
+    }
+
+    const woIds = [...woGroups.keys()];
+    const wos = await WorkOrder.find({ _id: { $in: woIds } }).lean();
+    const woMap = new Map(wos.map((w) => [w._id.toString(), w]));
+
+    const groups = [];
+    const fullyPackagedEmployees = [];
+
+    for (const [woKey, empDocs] of woGroups) {
+      const wo = woMap.get(woKey);
+      if (!wo) continue;
+
+      const perEmployee = [];
+      for (const emp of empDocs) {
+        const alreadyPackagedUnits = new Set(
+          (emp.packagingHistory || []).flatMap((h) => h.unitNumbers || [])
+        );
+
+        // All assigned units that haven't been packaged yet
+        const unpackagedUnits = [];
+        for (let u = emp.unitStart; u <= emp.unitEnd; u++) {
+          if (!alreadyPackagedUnits.has(u)) unpackagedUnits.push(u);
+        }
+
+        if (!unpackagedUnits.length) {
+          fullyPackagedEmployees.push({
+            barcode: `${emp.employeeUIN} → ${wo.stockItemName}`,
+            reason: "Already fully packaged",
+          });
+          continue;
+        }
+
+        perEmployee.push({
+          progressDocId: emp._id,
+          employeeId: emp.employeeId,
+          employeeName: emp.employeeName,
+          employeeUIN: emp.employeeUIN,
+          gender: emp.gender,
+          productName: wo.stockItemName,
+          unitStart: emp.unitStart,
+          unitEnd: emp.unitEnd,
+          totalUnits: emp.totalUnits,
+          completedUnits: emp.completedUnits || 0,
+          alreadyPackaged: emp.packagedUnits || 0,
+          scannedUnits: unpackagedUnits,
+          scannedCount: unpackagedUnits.length,
+          packagingCapacity: unpackagedUnits.length,
+          willPackage: unpackagedUnits.length,
+        });
+      }
+
+      if (!perEmployee.length) continue;
+
+      groups.push({
+        workOrderId: wo._id,
+        workOrderShortId: wo._id.toString().slice(-8),
+        workOrderNumber: wo.workOrderNumber,
+        stockItemName: wo.stockItemName,
+        stockItemReference: wo.stockItemReference,
+        variantAttributes: wo.variantAttributes || [],
+        quantity: wo.quantity,
+        moInfo: {
+          _id: mo._id,
+          moNumber: `MO-${mo.requestId}`,
+          customerName: mo.customerInfo?.name || "",
+          requestType: mo.requestType,
+        },
+        isMeasurement: true,
+        scannedUnits: perEmployee.flatMap((e) => e.scannedUnits).sort((a, b) => a - b),
+        scannedCount: perEmployee.reduce((s, e) => s + e.scannedCount, 0),
+        employees: perEmployee,
+      });
+    }
+
+    if (!groups.length) {
+      return res.status(400).json({
+        success: false,
+        message: "All matched employees are already fully packaged",
+        invalid: [...invalid, ...fullyPackagedEmployees],
+      });
+    }
+
+    const totalValid = groups.reduce((s, g) => s + g.scannedCount, 0);
+
+    return res.json({
+      success: true,
+      groups,
+      invalid: [...invalid, ...fullyPackagedEmployees],
+      totalScanned: totalValid,
+      totalValid,
+    });
+  } catch (err) {
+    console.error("Fetch by UINs error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /done
 // ═════════════════════════════════════════════════════════════════════════════
