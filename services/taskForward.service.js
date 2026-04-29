@@ -212,7 +212,7 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     await _notifyMany({
       recipientIds: assigneeIds,
       type: "task_assigned",
-      title: parentTaskId ? `New subtask: ${title}` : `New task: ${title}`,
+      title: parentTaskId ? `📌 New Subtask · ${title}` : `📋 Task Assigned · ${title}`,
       body: notes?.slice(0, 80) || description?.slice(0, 80) || "You have been assigned a task.",
       data: { taskId, taskTitle: title, priority, dueDate, description, parentTaskId: parentTaskId || "" },
       senderId: assignedBy,
@@ -254,7 +254,7 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
   });
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
-  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `${employeeName} confirmed: ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
+  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `✅ Confirmed · ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
   socket.emitToMany([...new Set(notifyIds)], "task_confirmed", { taskId, employeeId, employeeName });
   return { success: true };
 }
@@ -277,7 +277,7 @@ async function markTaskStarted({ taskId, employeeId, employeeName }) {
   });
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
-  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_started", title: `${employeeName} started: ${task.title}`, body: `Work has begun on "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
+  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_started", title: `▶️ Work Started · ${task.title}`, body: `Work has begun on "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
   socket.emitToMany([...new Set(notifyIds)], "task_started", { taskId, employeeId, employeeName });
   return { success: true };
 }
@@ -474,8 +474,8 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
       await _notifyMany({
         recipientIds: notifyIds,
         type: "task_chat",
-        title: `${senderName} in ${task.title} (${taskId})`,
-        body: (text || "📎 attachment").slice(0, 80),
+        title: `💬 Task Chat · ${task.title}`,
+        body: `${senderName}: ${(text || "📎 attachment").slice(0, 60)}`,
         data: { taskId, taskTitle: task.title },
         senderId,
         senderName,
