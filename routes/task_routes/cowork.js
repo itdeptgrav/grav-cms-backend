@@ -336,7 +336,7 @@ router.post("/direct-message/notify", verifyCoworkToken, verifyEmployeeToken, as
     if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
     // Only send push notification + email — do NOT write to Firestore again
     const { sendPushToEmployees } = require("../../services/fcmPush.service");
-    await sendPushToEmployees([toEmployeeId], req.coworkUser.name, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
+    await sendPushToEmployees([toEmployeeId], `💬 DM · ${req.coworkUser.name}`, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
     try {
       const { sendNotificationEmail } = require("../../services/emailNotifications.service");
       const empDoc = await db.collection("cowork_employees").doc(toEmployeeId).get();
@@ -360,7 +360,7 @@ router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, as
     if (!recipients.length) return res.json({ success: true });
     // Only send push notification + email — do NOT write to Firestore again
     const { sendPushToEmployees } = require("../../services/fcmPush.service");
-    await sendPushToEmployees(recipients, `${req.coworkUser.name} in ${group.name}`, (text || "📎 Attachment").slice(0, 80), { type: "group_message", groupId });
+    await sendPushToEmployees(recipients, `👥 ${group.name} · ${req.coworkUser.name}`, (text || "📎 Attachment").slice(0, 80), { type: "group_message", groupId });
     try {
       const { sendNotificationEmail } = require("../../services/emailNotifications.service");
       const empDocs = await Promise.all(recipients.map(id => db.collection("cowork_employees").doc(id).get()));
