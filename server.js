@@ -594,7 +594,7 @@ const overwriteExistingMeasurements = async () => {
 const ceoHrRoutes = require("./routes/CEO_Routes/hr");
 app.use("/api/ceo/hr", ceoHrRoutes);
 
-const ceoProductionRoutes = require("./routes/CEO_Routes/production");
+const ceoProductionRoutes = require("./routes/CEO_Routes/Production");
 app.use("/api/ceo/production", ceoProductionRoutes);
 
 
