@@ -261,6 +261,17 @@ router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, as
       });
     } catch (e) { console.error("[password_reset email]", e.message); }
 
+    // Push notification for password reset
+    try {
+      const { sendPushToEmployees } = require("../../services/fcmPush.service");
+      await sendPushToEmployees(
+        [employeeId],
+        "🔐 Password Reset",
+        "Your CoWork password was reset. Please log in with your new password.",
+        { type: "password_reset" }
+      );
+    } catch (e) { console.error("[password_reset push]", e.message); }
+
     console.log(`[ResetPassword] ${employeeId} session revoked by ${req.coworkUser.employeeId}`);
     return res.json({
       success: true,
@@ -621,7 +632,7 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
     // Notify employee via push + email
     try {
       const { sendPushToEmployees } = require("../../services/fcmPush.service");
-      await sendPushToEmployees([employeeId], "Your role has been updated", `Your CoWork role is now ${role === "tl" ? "Team Lead" : "Employee"}`, { type: "role_changed" });
+      await sendPushToEmployees([employeeId], `👤 Role Changed`, `Your CoWork role is now ${role === "tl" ? "Team Lead" : "Employee"}. Please log in again.`, { type: "role_changed" });
     } catch (e) { console.error("[role_changed push]", e.message); }
     try {
       const { sendNotificationEmail } = require("../../services/emailNotifications.service");
