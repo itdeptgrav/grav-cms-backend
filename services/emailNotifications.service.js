@@ -204,6 +204,49 @@ async function sendNotificationEmail({ senderId, senderName, receiverId, receive
         html = _wrap("Password Reset", `<p>Your password was reset by ${senderName}.</p><p>You have been logged out. Please log in with your new password.</p>${_btn("Log In", LOGIN_URL)}`);
     }
 
+    // GOAL TASK ACTIVITIES
+    else if (type === "goal_final_submit") {
+        subject = `Goal roadmap submitted: ${data.taskTitle || ""}`;
+        html = _wrap("Goal Roadmap Submitted", `
+            <p><strong>${senderName}</strong> has submitted the activity roadmap for goal task <strong>${data.taskTitle || ""}</strong>.</p>
+            ${_table(
+            _row("Task", data.taskTitle || ""),
+            _row("Components", data.componentCount ? `${data.componentCount} component${data.componentCount !== 1 ? "s" : ""}` : "—"),
+            _row("Submitted At", data.submittedAt || "")
+        )}
+            <p>Please review the submitted plan.</p>
+            ${_btn("Review Goal Task", `${app}/tasks`)}
+        `);
+    }
+    else if (type === "goal_component_done") {
+        subject = `Component completed: ${data.componentTitle || ""} — ${data.taskTitle || ""}`;
+        html = _wrap("Goal Component Marked Done", `
+            <p><strong>${senderName}</strong> completed a component in goal task <strong>${data.taskTitle || ""}</strong>.</p>
+            ${_table(
+            _row("Task", data.taskTitle || ""),
+            _row("Component", data.componentTitle || ""),
+            _row("Completed At", data.doneAt || ""),
+            _row("Progress", data.progress || "")
+        )}
+            ${data.reportText ? `<p><strong>Report notes:</strong></p>${_quote(data.reportText, "#22C55E")}` : ""}
+            ${_btn("View Task", `${app}/tasks`)}
+        `);
+    }
+    else if (type === "goal_report_submitted") {
+        subject = `Report submitted for: ${data.componentTitle || ""} — ${data.taskTitle || ""}`;
+        html = _wrap("Goal Component Report Submitted", `
+            <p><strong>${senderName}</strong> submitted a completion report for component <strong>${data.componentTitle || ""}</strong> in goal task <strong>${data.taskTitle || ""}</strong>.</p>
+            ${_table(
+            _row("Task", data.taskTitle || ""),
+            _row("Component", data.componentTitle || ""),
+            _row("Submitted At", data.submittedAt || ""),
+            data.fileCount ? _row("Attachments", `${data.fileCount} file${data.fileCount !== 1 ? "s" : ""}`) : ""
+        )}
+            ${data.reportText ? `<p><strong>Report:</strong></p>${_quote(data.reportText, "#2563EB")}` : ""}
+            ${_btn("View Report", `${app}/tasks`)}
+        `);
+    }
+
     // FALLBACK
     else {
         html = _wrap(title, `<p>${body}</p>${_btn("Open CoWork", app)}`);

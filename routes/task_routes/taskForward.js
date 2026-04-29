@@ -1021,6 +1021,37 @@ router.post("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeTo
 
     await taskRef.update(updateData);
 
+    // ── Email: notify CEO/TL when Y does Final Submit ──
+    if (submitted === true && !task.goalActivitiesSubmitted) {
+      try {
+        const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+        const { db: _db } = require("../../config/firebaseAdmin");
+        // Get all head employees (CEO/TL) to notify
+        const headIds = [task.assignedBy, ...(task.confirmedBy || [])].filter(Boolean);
+        const uniqueHeads = [...new Set(headIds)];
+        const submitter = await _db.collection("cowork_employees").doc(employeeId).get();
+        const submitterName = submitter.exists ? submitter.data().name : "Employee";
+        for (const headId of uniqueHeads) {
+          const headDoc = await _db.collection("cowork_employees").doc(headId).get();
+          if (!headDoc.exists || !headDoc.data().email) continue;
+          const head = headDoc.data();
+          await sendNotificationEmail({
+            senderId: employeeId, senderName: submitterName,
+            receiverId: headId, receiverName: head.name, receiverEmail: head.email,
+            type: "goal_final_submit",
+            title: `Goal roadmap submitted: ${task.title}`,
+            body: `${submitterName} submitted the activity roadmap for "${task.title}"`,
+            data: {
+              taskTitle: task.title,
+              taskId,
+              componentCount: (activities || []).length,
+              submittedAt: submittedAt || new Date().toISOString(),
+            },
+          });
+        }
+      } catch (emailErr) { console.error("[Email] goal_final_submit:", emailErr.message); }
+    }
+
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1080,6 +1111,51 @@ router.post("/task/:taskId/goal-activity/:activityId/request-report", verifyCowo
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // ── Email: notify CEO/TL when Y submits report + marks done ──
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const { db: _db } = require("../../config/firebaseAdmin");
+      const activity = activities[idx];
+      const headIds = [task.assignedBy, ...(task.confirmedBy || [])].filter(Boolean);
+      const uniqueHeads = [...new Set(headIds)];
+      const doneCount = activities.filter(a => a.status === "done").length;
+      for (const headId of uniqueHeads) {
+        const headDoc = await _db.collection("cowork_employees").doc(headId).get();
+        if (!headDoc.exists || !headDoc.data().email) continue;
+        const head = headDoc.data();
+        // Email 1: Component done
+        await sendNotificationEmail({
+          senderId: employeeId, senderName: submitterName,
+          receiverId: headId, receiverName: head.name, receiverEmail: head.email,
+          type: "goal_component_done",
+          title: `Component completed: ${activity.heading} — ${task.title}`,
+          body: `${submitterName} completed "${activity.heading}" in "${task.title}"`,
+          data: {
+            taskTitle: task.title, taskId,
+            componentTitle: activity.heading,
+            doneAt: now,
+            progress: `${doneCount}/${activities.length} components done`,
+            reportText: (text || "").slice(0, 200),
+          },
+        });
+        // Email 2: Report submitted
+        await sendNotificationEmail({
+          senderId: employeeId, senderName: submitterName,
+          receiverId: headId, receiverName: head.name, receiverEmail: head.email,
+          type: "goal_report_submitted",
+          title: `Report submitted: ${activity.heading} — ${task.title}`,
+          body: `${submitterName} submitted a completion report for "${activity.heading}"`,
+          data: {
+            taskTitle: task.title, taskId,
+            componentTitle: activity.heading,
+            submittedAt: now,
+            fileCount: (files || []).length,
+            reportText: (text || "").slice(0, 200),
+          },
+        });
+      }
+    } catch (emailErr) { console.error("[Email] goal_component_done/report:", emailErr.message); }
+
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1121,6 +1197,51 @@ router.post("/task/:taskId/goal-activity/:activityId/submit-report", verifyCowor
       goalActivities: activities,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // ── Email: notify CEO/TL when Y submits report + marks done ──
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      const { db: _db } = require("../../config/firebaseAdmin");
+      const activity = activities[idx];
+      const headIds = [task.assignedBy, ...(task.confirmedBy || [])].filter(Boolean);
+      const uniqueHeads = [...new Set(headIds)];
+      const doneCount = activities.filter(a => a.status === "done").length;
+      for (const headId of uniqueHeads) {
+        const headDoc = await _db.collection("cowork_employees").doc(headId).get();
+        if (!headDoc.exists || !headDoc.data().email) continue;
+        const head = headDoc.data();
+        // Email 1: Component done
+        await sendNotificationEmail({
+          senderId: employeeId, senderName: submitterName,
+          receiverId: headId, receiverName: head.name, receiverEmail: head.email,
+          type: "goal_component_done",
+          title: `Component completed: ${activity.heading} — ${task.title}`,
+          body: `${submitterName} completed "${activity.heading}" in "${task.title}"`,
+          data: {
+            taskTitle: task.title, taskId,
+            componentTitle: activity.heading,
+            doneAt: now,
+            progress: `${doneCount}/${activities.length} components done`,
+            reportText: (text || "").slice(0, 200),
+          },
+        });
+        // Email 2: Report submitted
+        await sendNotificationEmail({
+          senderId: employeeId, senderName: submitterName,
+          receiverId: headId, receiverName: head.name, receiverEmail: head.email,
+          type: "goal_report_submitted",
+          title: `Report submitted: ${activity.heading} — ${task.title}`,
+          body: `${submitterName} submitted a completion report for "${activity.heading}"`,
+          data: {
+            taskTitle: task.title, taskId,
+            componentTitle: activity.heading,
+            submittedAt: now,
+            fileCount: (files || []).length,
+            reportText: (text || "").slice(0, 200),
+          },
+        });
+      }
+    } catch (emailErr) { console.error("[Email] goal_component_done/report:", emailErr.message); }
 
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
