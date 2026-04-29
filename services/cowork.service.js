@@ -142,9 +142,22 @@ async function getCoworkEmployee(employeeId) {
 }
 
 async function saveFCMToken(employeeId, token) {
-  await db.collection("cowork_employees").doc(employeeId).update({
-    fcmTokens: admin.firestore.FieldValue.arrayUnion(token)
-  });
+  // Save to BOTH locations so fcmPush.service.js finds tokens regardless of save path
+  await Promise.all([
+    // Location 1: cowork_employees.fcmTokens (legacy backend path)
+    db.collection("cowork_employees").doc(employeeId).update({
+      fcmTokens: admin.firestore.FieldValue.arrayUnion(token),
+    }),
+    // Location 2: cowork_fcm_tokens.tokens (frontend useFCMToken.ts path)
+    db.collection("cowork_fcm_tokens").doc(employeeId).set({
+      employeeId,
+      tokens: admin.firestore.FieldValue.arrayUnion(token),
+      latestToken: token,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      platform: "web",
+    }, { merge: true }),
+  ]);
+  // Also keep RTDB in sync
   await rtdb.ref(`cowork/employees/${employeeId}/fcmTokens`).push(token);
 }
 
@@ -645,7 +658,7 @@ async function assignCoworkTask({ title, description, assignedBy, assigneeIds, a
   await _notifyMany({
     recipientIds: assigneeIds,
     type: "task_assigned",
-    title: `New task: ${title}`,
+    title: `📋 Task Assigned · ${title}`,
     body: description?.slice(0, 80) || "New task assigned.",
     data: { taskId, taskTitle: title, description },
     senderId: assignedBy,
@@ -713,7 +726,7 @@ async function updateTaskProgress({ taskId, employeeId, progressPercent, note })
   await _notifyMany({
     recipientIds: recipients,
     type: "task_update",
-    title: `Task: ${task.title}`,
+    title: `📊 Task Update · ${task.title}`,
     body: `${employeeId} → ${progressPercent}%`,
     data: { taskId, taskTitle: task.title, progressPercent },
     senderId: employeeId,
@@ -849,15 +862,15 @@ async function markNotificationsRead(employeeId) {
 // Clear event type label for push notification title
 function _buildTitle(type, title) {
   const labels = {
-    direct_message: "💬 Direct Message",
-    group_message: "👥 Group Message",
-    group_added: "➕ Added to Group",
-    group_deleted: "🗑️ Group Deleted",
-    meet_scheduled: "📅 Meeting Scheduled",
-    meet_cancelled: "❌ Meeting Cancelled",
-    meet_updated: "📅 Meeting Updated",
-    meet_reminder: "⏰ Meeting Starting",
-    request: "📨 New Request",
+    direct_message:   "💬 Direct Message",
+    group_message:    "👥 Group Message",
+    group_added:      "➕ Added to Group",
+    group_deleted:    "🗑️ Group Deleted",
+    meet_scheduled:   "📅 Meeting Scheduled",
+    meet_cancelled:   "❌ Meeting Cancelled",
+    meet_updated:     "📅 Meeting Updated",
+    meet_reminder:    "⏰ Meeting Starting",
+    request:          "📨 New Request",
     request_approved: "✅ Request Approved",
     request_rejected: "❌ Request Rejected",
   };
@@ -921,34 +934,39 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
 
   socket.emitToMany(recipientIds, "new_notification", { type, title, body });
 
-  // FCM push with rich multiline body
-  try {
-    const { sendPushToEmployees } = require("./fcmPush.service");
-    const richTitle = _buildTitle(type, title);
-    const richBody = _buildRichBody(type, body, data || {});
-    await sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) });
-  } catch (e) { console.error("FCM push:", e.message); }
+  // FCM push — fire immediately, do NOT await (prevents blocking the caller)
+  setImmediate(() => {
+    try {
+      const { sendPushToEmployees } = require("./fcmPush.service");
+      const richTitle = _buildTitle(type, title);
+      const richBody  = _buildRichBody(type, body, data || {});
+      sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) })
+        .catch(e => console.error("[FCM push]", e.message));
+    } catch (e) { console.error("[FCM push init]", e.message); }
+  });
 
-  // Email — 20-min cooldown per sender→receiver pair
-  try {
-    const { sendNotificationEmail } = require("./emailNotifications.service");
-    const empDocs = await Promise.all(
-      recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
-    );
-    for (const empDoc of empDocs) {
-      if (!empDoc.exists) continue;
-      const emp = empDoc.data();
-      if (!emp.email) continue;
-      await sendNotificationEmail({
-        senderId: senderId || "system",
-        senderName: senderName || "CoWork",
-        receiverId: emp.employeeId || empDoc.id,
-        receiverName: emp.name || empDoc.id,
-        receiverEmail: emp.email,
-        type, title, body, data: data || {},
-      });
-    }
-  } catch (e) { console.error("Email notify:", e.message); }
+  // Email — fire async, do NOT await (slow API call, should not block push)
+  setImmediate(async () => {
+    try {
+      const { sendNotificationEmail } = require("./emailNotifications.service");
+      const empDocs = await Promise.all(
+        recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
+      );
+      for (const empDoc of empDocs) {
+        if (!empDoc.exists) continue;
+        const emp = empDoc.data();
+        if (!emp.email) continue;
+        await sendNotificationEmail({
+          senderId: senderId || "system",
+          senderName: senderName || "CoWork",
+          receiverId: emp.employeeId || empDoc.id,
+          receiverName: emp.name || empDoc.id,
+          receiverEmail: emp.email,
+          type, title, body, data: data || {},
+        });
+      }
+    } catch (e) { console.error("[Email notify]", e.message); }
+  });
 }
 
 // ── GET WITH FALLBACK ────────────────────────────────────
