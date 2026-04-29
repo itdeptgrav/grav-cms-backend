@@ -289,6 +289,35 @@ router.get("/live", ceoAuth, async (req, res) => {
                 curr = { identityId: opId, name: currName, profilePhoto: c?.profilePhoto || empData?.profilePhoto || null };
             }
             const mRef = machMap[mId] || {};
+            // Group sessions by operator for machine card display
+            // (same operator can have multiple sign-in/sign-out cycles)
+            const opSummaryMap = new Map();
+            for (const op of opsData) {
+                const key = op.identityId;
+                if (!opSummaryMap.has(key)) {
+                    opSummaryMap.set(key, {
+                        identityId: key,
+                        name: op.name,
+                        profilePhoto: op.profilePhoto,
+                        pieces: 0,
+                        earliestSignIn: null,
+                        latestSignOut: null,
+                        isActiveNow: false,
+                    });
+                }
+                const s = opSummaryMap.get(key);
+                s.pieces += op.uniquePieces;
+                if (op.signInTime && (!s.earliestSignIn || new Date(op.signInTime) < new Date(s.earliestSignIn))) {
+                    s.earliestSignIn = op.signInTime;
+                }
+                if (op.signOutTime && (!s.latestSignOut || new Date(op.signOutTime) > new Date(s.latestSignOut))) {
+                    s.latestSignOut = op.signOutTime;
+                }
+                if (op.isActive) s.isActiveNow = true;
+            }
+            const operatorSummaries = Array.from(opSummaryMap.values())
+                .sort((a, b) => (a.isActiveNow ? -1 : 1) - (b.isActiveNow ? -1 : 1));
+
             machinesData.push({
                 machineId: mId,
                 machineName: mInfo.name || mRef.name || "Unknown",
@@ -298,6 +327,7 @@ router.get("/live", ceoAuth, async (req, res) => {
                 status: machine.currentOperatorIdentityId ? "busy" : machScans > 0 ? "used_today" : "free",
                 currentOperator: curr,
                 operators: opsData.sort((a, b) => (a.isActive ? -1 : 1) - (b.isActive ? -1 : 1)),
+                operatorSummaries,  // grouped per unique operator for card display
                 totalScans: machScans,
                 uniquePiecesCompleted: machUniqPieces,
             });
@@ -880,109 +910,6 @@ router.get("/machine-detail/:machineId", ceoAuth, async (req, res) => {
         res.status(500).json({ success: false, message: "Server error: " + err.message });
     }
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AUTO-SIGNOUT CRON — runs at 11:00 PM IST every day
-//
-// Purpose: Operators who forget to sign out on the device will be automatically
-//          signed out. The signOutTime is set to their actual biometric checkout
-//          time from DailyAttendance (the last punch = final_out).
-//          If no biometric finalOut exists, we use 11 PM IST as the signout time.
-//
-// Why 11 PM: Factory shift ends by ~6:30 PM. By 11 PM we can safely assume
-//            anyone still "signed in" has forgotten. We use attendance data
-//            to get the real checkout time, not 11 PM.
-// ─────────────────────────────────────────────────────────────────────────────
-const autoSignoutCron = (() => {
-    let timer = null;
-
-    async function runAutoSignout() {
-        try {
-            const ProductionTracking = require("../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
-            const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
-
-            // Get today in IST
-            const now = new Date();
-            const istNow = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
-            const dateStr = istNow.toISOString().split("T")[0];
-
-            console.log(`[AutoSignout] Running for ${dateStr}`);
-
-            // Load today's tracking doc
-            const todayUTCStart = new Date(dateStr + "T00:00:00.000Z");
-            const todayUTCEnd = new Date(dateStr + "T00:00:00.000Z");
-            todayUTCEnd.setUTCDate(todayUTCEnd.getUTCDate() + 1);
-
-            const trackingDoc = await ProductionTracking.findOne({
-                date: { $gte: todayUTCStart, $lt: todayUTCEnd }
-            });
-            if (!trackingDoc) { console.log("[AutoSignout] No tracking doc for today"); return; }
-
-            // Load attendance for real checkout times
-            const attendanceDoc = await DailyAttendance.findOne({ dateStr }).lean();
-            const checkoutMap = new Map(); // opId → Date (actual checkout time)
-            for (const emp of attendanceDoc?.employees || []) {
-                if (!emp.finalOut) continue;
-                if (emp.biometricId) checkoutMap.set(emp.biometricId, new Date(emp.finalOut));
-                if (emp.identityId && emp.identityId !== emp.biometricId) checkoutMap.set(emp.identityId, new Date(emp.finalOut));
-            }
-
-            // Fallback time: 11 PM IST = 17:30 UTC
-            const fallbackSignout = new Date(dateStr + "T17:30:00.000Z");
-
-            let signedOutCount = 0;
-            let modified = false;
-
-            for (const machine of trackingDoc.machines || []) {
-                for (const op of machine.operators || []) {
-                    if (op.signOutTime) continue; // already signed out
-                    // Check if this session was for today
-                    const signInDate = op.signInTime ? new Date(op.signInTime).toISOString().split("T")[0] : null;
-                    if (signInDate !== dateStr) continue; // stale from previous day — skip
-
-                    // Use attendance checkout time, or fallback to 11 PM IST
-                    const checkoutTime = checkoutMap.get(op.operatorIdentityId) || fallbackSignout;
-                    op.signOutTime = checkoutTime;
-                    if (machine.currentOperatorIdentityId === op.operatorIdentityId) {
-                        machine.currentOperatorIdentityId = null;
-                    }
-                    signedOutCount++;
-                    modified = true;
-                }
-            }
-
-            if (modified) {
-                await trackingDoc.save();
-                console.log(`[AutoSignout] Signed out ${signedOutCount} operators for ${dateStr}`);
-            } else {
-                console.log(`[AutoSignout] No operators needed sign-out for ${dateStr}`);
-            }
-        } catch (err) {
-            console.error("[AutoSignout] Error:", err.message);
-        }
-    }
-
-    function scheduleNext() {
-        // Calculate ms until next 11 PM IST (= 17:30 UTC)
-        const now = new Date();
-        const istNow = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
-        const istTomorrow = new Date(istNow);
-        istTomorrow.setUTCHours(17, 30, 0, 0); // 11 PM IST = 17:30 UTC
-        if (istTomorrow <= istNow) {
-            istTomorrow.setUTCDate(istTomorrow.getUTCDate() + 1);
-        }
-        const msUntil = istTomorrow.getTime() - now.getTime();
-        console.log(`[AutoSignout] Next run in ${Math.round(msUntil / 60000)} minutes`);
-        timer = setTimeout(() => { runAutoSignout(); scheduleNext(); }, msUntil);
-    }
-
-    return { start: () => { scheduleNext(); }, stop: () => { if (timer) clearTimeout(timer); }, run: runAutoSignout };
-})();
-
-// Start the cron when this module loads
-autoSignoutCron.start();
-// Export so server.js can stop it on shutdown if needed
-module.exports.autoSignoutCron = autoSignoutCron;
 
 
 module.exports = router;

@@ -597,6 +597,15 @@ app.use("/api/ceo/hr", ceoHrRoutes);
 const ceoProductionRoutes = require("./routes/CEO_Routes/Production");
 app.use("/api/ceo/production", ceoProductionRoutes);
 
+const ceoQcRoutes = require("./routes/CEO_Routes/qc");
+app.use("/api/ceo/qc", ceoQcRoutes);
+
+const ceoDispatchRoutes = require("./routes/CEO_Routes/dispatch");
+app.use("/api/ceo/dispatch", ceoDispatchRoutes);
+
+const ceoCuttingRoutes = require("./routes/CEO_Routes/cutting");
+app.use("/api/ceo/cutting", ceoCuttingRoutes);
+
 
 /* =====================
     Normal Employees ROUTES
