@@ -862,15 +862,15 @@ async function markNotificationsRead(employeeId) {
 // Clear event type label for push notification title
 function _buildTitle(type, title) {
   const labels = {
-    direct_message:   "💬 Direct Message",
-    group_message:    "👥 Group Message",
-    group_added:      "➕ Added to Group",
-    group_deleted:    "🗑️ Group Deleted",
-    meet_scheduled:   "📅 Meeting Scheduled",
-    meet_cancelled:   "❌ Meeting Cancelled",
-    meet_updated:     "📅 Meeting Updated",
-    meet_reminder:    "⏰ Meeting Starting",
-    request:          "📨 New Request",
+    direct_message: "💬 Direct Message",
+    group_message: "👥 Group Message",
+    group_added: "➕ Added to Group",
+    group_deleted: "🗑️ Group Deleted",
+    meet_scheduled: "📅 Meeting Scheduled",
+    meet_cancelled: "❌ Meeting Cancelled",
+    meet_updated: "📅 Meeting Updated",
+    meet_reminder: "⏰ Meeting Starting",
+    request: "📨 New Request",
     request_approved: "✅ Request Approved",
     request_rejected: "❌ Request Rejected",
   };
@@ -939,7 +939,7 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
     try {
       const { sendPushToEmployees } = require("./fcmPush.service");
       const richTitle = _buildTitle(type, title);
-      const richBody  = _buildRichBody(type, body, data || {});
+      const richBody = _buildRichBody(type, body, data || {});
       sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) })
         .catch(e => console.error("[FCM push]", e.message));
     } catch (e) { console.error("[FCM push init]", e.message); }
