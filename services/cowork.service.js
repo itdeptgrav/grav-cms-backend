@@ -142,9 +142,22 @@ async function getCoworkEmployee(employeeId) {
 }
 
 async function saveFCMToken(employeeId, token) {
-  await db.collection("cowork_employees").doc(employeeId).update({
-    fcmTokens: admin.firestore.FieldValue.arrayUnion(token)
-  });
+  // Save to BOTH locations so fcmPush.service.js finds tokens regardless of save path
+  await Promise.all([
+    // Location 1: cowork_employees.fcmTokens (legacy backend path)
+    db.collection("cowork_employees").doc(employeeId).update({
+      fcmTokens: admin.firestore.FieldValue.arrayUnion(token),
+    }),
+    // Location 2: cowork_fcm_tokens.tokens (frontend useFCMToken.ts path)
+    db.collection("cowork_fcm_tokens").doc(employeeId).set({
+      employeeId,
+      tokens: admin.firestore.FieldValue.arrayUnion(token),
+      latestToken: token,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      platform: "web",
+    }, { merge: true }),
+  ]);
+  // Also keep RTDB in sync
   await rtdb.ref(`cowork/employees/${employeeId}/fcmTokens`).push(token);
 }
 
@@ -216,7 +229,7 @@ async function deleteCoworkGroup(groupId, requestingEmployeeId) {
     await _notifyMany({
       recipientIds: othersToNotify,
       type: "group_deleted",
-      title: `Group deleted: ${groupName}`,
+      title: `🗑️ Group Deleted · ${groupName}`,
       body: `The group "${groupName}" has been deleted.`,
       data: { groupId, groupName },
       senderId: requestingEmployeeId,
@@ -246,7 +259,7 @@ async function addGroupMember(groupId, requestingEmployeeId, employeeIdToAdd) {
   if (memberIds.includes(employeeIdToAdd)) throw new Error("Employee is already a member.");
   const updated = [...memberIds, employeeIdToAdd];
   await db.collection("cowork_groups").doc(groupId).update({ memberIds: updated, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-  await _notifyMany({ recipientIds: [employeeIdToAdd], type: "group_added", title: `Added to: ${snap.data().name}`, body: `You were added to group "${snap.data().name}"`, data: { groupId, groupName: snap.data().name }, senderId: requestingEmployeeId, senderName: "CoWork" });
+  await _notifyMany({ recipientIds: [employeeIdToAdd], type: "group_added", title: `➕ Added to Group · ${snap.data().name}`, body: `You were added to group "${snap.data().name}"`, data: { groupId, groupName: snap.data().name }, senderId: requestingEmployeeId, senderName: "CoWork" });
   return { memberIds: updated };
 }
 
@@ -263,7 +276,7 @@ async function removeGroupMember(groupId, requestingEmployeeId, employeeIdToRemo
   await _notifyMany({
     recipientIds: [employeeIdToRemove],
     type: "group_removed",
-    title: `Removed from: ${snap.data().name}`,
+    title: `🚫 Removed from Group · ${snap.data().name}`,
     body: `You have been removed from "${snap.data().name}"`,
     data: { groupId, groupName: snap.data().name },
     senderId: requestingEmployeeId,
@@ -389,7 +402,7 @@ async function sendGroupMessage({ groupId, senderId, senderName, text, attachmen
     temp: false
   });
 
-  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `${senderName} in ${group.name}`, body: text.slice(0, 80), data: { groupId, messageId, groupName: group.name }, senderId, senderName });
+  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `👥 ${group.name} · ${senderName}`, body: text.slice(0, 80), data: { groupId, messageId, groupName: group.name }, senderId, senderName });
   return msg;
 }
 
@@ -458,7 +471,7 @@ async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, tex
     temp: false
   });
 
-  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `${senderName}`, body: text.slice(0, 80), data: { conversationId, messageId }, senderId: fromEmployeeId, senderName });
+  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `💬 DM · ${senderName}`, body: text.slice(0, 80), data: { conversationId, messageId }, senderId: fromEmployeeId, senderName });
   return { messageData: msg, conversationId };
 }
 
@@ -490,7 +503,7 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
 
   const recipients = participants.filter(id => id !== createdBy);
   socket.emitToMany(recipients, "new_meet", { meetId, title, dateTime, googleMeetLink });
-  await _notifyMany({ recipientIds: recipients, type: "meet_scheduled", title: `Meeting: ${title}`, body: new Date(dateTime).toLocaleString("en-IN"), data: { meetId, meetTitle: title, dateTime }, senderId: createdBy, senderName: createdBy });
+  await _notifyMany({ recipientIds: recipients, type: "meet_scheduled", title: `📅 Meeting Scheduled · ${title}`, body: new Date(dateTime).toLocaleString("en-IN"), data: { meetId, meetTitle: title, dateTime }, senderId: createdBy, senderName: createdBy });
   return data;
 }
 
@@ -553,7 +566,7 @@ async function cancelCoworkMeet({ meetId, cancelledBy, cancelledByName }) {
   await _notifyMany({
     recipientIds: recipients,
     type: "meet_cancelled",
-    title: `Meeting Cancelled: ${meet.title}`,
+    title: `❌ Meeting Cancelled · ${meet.title}`,
     body: `Cancelled by ${cancelledByName}`,
     data: { meetId, meetTitle: meet.title },
     senderId: cancelledBy,
@@ -598,7 +611,7 @@ async function updateCoworkMeet({ meetId, updatedBy, title, description, dateTim
   await _notifyMany({
     recipientIds: recipients,
     type: "meet_updated",
-    title: `Meeting Updated: ${updates.title || meet.title}`,
+    title: `📅 Meeting Updated · ${updates.title || meet.title}`,
     body: `New time: ${new Date(updates.dateTime || meet.dateTime).toLocaleString("en-IN")}`,
     data: { meetId, meetTitle: updates.title || meet.title, dateTime: updates.dateTime || meet.dateTime },
     senderId: updatedBy,
@@ -645,7 +658,7 @@ async function assignCoworkTask({ title, description, assignedBy, assigneeIds, a
   await _notifyMany({
     recipientIds: assigneeIds,
     type: "task_assigned",
-    title: `New task: ${title}`,
+    title: `📋 Task Assigned · ${title}`,
     body: description?.slice(0, 80) || "New task assigned.",
     data: { taskId, taskTitle: title, description },
     senderId: assignedBy,
@@ -713,7 +726,7 @@ async function updateTaskProgress({ taskId, employeeId, progressPercent, note })
   await _notifyMany({
     recipientIds: recipients,
     type: "task_update",
-    title: `Task: ${task.title}`,
+    title: `📊 Task Update · ${task.title}`,
     body: `${employeeId} → ${progressPercent}%`,
     data: { taskId, taskTitle: task.title, progressPercent },
     senderId: employeeId,
@@ -846,6 +859,68 @@ async function markNotificationsRead(employeeId) {
 }
 
 // ── INTERNAL ──────────────────────────────────────────────
+// Clear event type label for push notification title
+function _buildTitle(type, title) {
+  const labels = {
+    direct_message: "💬 Direct Message",
+    group_message: "👥 Group Message",
+    group_added: "➕ Added to Group",
+    group_deleted: "🗑️ Group Deleted",
+    meet_scheduled: "📅 Meeting Scheduled",
+    meet_cancelled: "❌ Meeting Cancelled",
+    meet_updated: "📅 Meeting Updated",
+    meet_reminder: "⏰ Meeting Starting",
+    request: "📨 New Request",
+    request_approved: "✅ Request Approved",
+    request_rejected: "❌ Request Rejected",
+  };
+  const label = labels[type];
+  if (!label) return title;
+  const parts = title.split(/[·:]/);
+  const context = parts.length > 1 ? parts.slice(1).join("·").trim() : "";
+  return context ? `${label} · ${context}` : label;
+}
+
+// Build a rich multiline body for push notifications based on type + data
+function _buildRichBody(type, body, data = {}) {
+  const lines = [body || ""];
+  if (type === "task_assigned" || type === "task_forwarded") {
+    if (data.priority) lines.push(`Priority: ${data.priority}`);
+    if (data.dueDate) lines.push(`Due: ${data.dueDate}`);
+    if (data.description) lines.push(data.description.slice(0, 60));
+  } else if (type === "direct_message") {
+    // body already has the message — no extra lines needed
+  } else if (type === "group_message") {
+    // body already has message text
+  } else if (type === "task_chat") {
+    if (data.taskTitle) lines.push(`In: ${data.taskTitle}`);
+  } else if (type === "meet_scheduled") {
+    if (data.dateTime) lines.push(`Time: ${new Date(data.dateTime).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}`);
+    if (data.meetTitle) lines.push(`Meeting: ${data.meetTitle}`);
+  } else if (type === "goal_final_submit") {
+    if (data.componentCount) lines.push(`Components: ${data.componentCount}`);
+    if (data.submittedAt) lines.push(`Submitted: ${data.submittedAt}`);
+  } else if (type === "goal_component_done") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.progress) lines.push(`Progress: ${data.progress}`);
+    if (data.reportText) lines.push(data.reportText.slice(0, 60));
+  } else if (type === "goal_report_submitted") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.fileCount) lines.push(`Attachments: ${data.fileCount} file${data.fileCount !== 1 ? "s" : ""}`);
+    if (data.reportText) lines.push(data.reportText.slice(0, 80));
+  } else if (type === "completion_rejected" || type === "completion_ceo_rejected") {
+    if (data.reason) lines.push(`Reason: ${data.reason}`);
+  } else if (type === "deadline_changed") {
+    // body already has old→new deadline
+  } else if (type === "request") {
+    if (data.priority) lines.push(`Priority: ${data.priority}`);
+    if (data.dueDate) lines.push(`Due: ${data.dueDate}`);
+    if (data.message) lines.push(data.message.slice(0, 60));
+  }
+  // Filter empty lines and join
+  return lines.filter(Boolean).join("\n");
+}
+
 async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
   const batch = db.batch();
@@ -859,32 +934,39 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
 
   socket.emitToMany(recipientIds, "new_notification", { type, title, body });
 
-  // FCM push — always fires, no cooldown
-  try {
-    const { sendPushToEmployees } = require("./fcmPush.service");
-    await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
-  } catch (e) { console.error("FCM push:", e.message); }
+  // FCM push — fire immediately, do NOT await (prevents blocking the caller)
+  setImmediate(() => {
+    try {
+      const { sendPushToEmployees } = require("./fcmPush.service");
+      const richTitle = _buildTitle(type, title);
+      const richBody = _buildRichBody(type, body, data || {});
+      sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) })
+        .catch(e => console.error("[FCM push]", e.message));
+    } catch (e) { console.error("[FCM push init]", e.message); }
+  });
 
-  // Email — 20-min cooldown per sender→receiver pair
-  try {
-    const { sendNotificationEmail } = require("./emailNotifications.service");
-    const empDocs = await Promise.all(
-      recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
-    );
-    for (const empDoc of empDocs) {
-      if (!empDoc.exists) continue;
-      const emp = empDoc.data();
-      if (!emp.email) continue;
-      await sendNotificationEmail({
-        senderId: senderId || "system",
-        senderName: senderName || "CoWork",
-        receiverId: emp.employeeId || empDoc.id,
-        receiverName: emp.name || empDoc.id,
-        receiverEmail: emp.email,
-        type, title, body, data: data || {},
-      });
-    }
-  } catch (e) { console.error("Email notify:", e.message); }
+  // Email — fire async, do NOT await (slow API call, should not block push)
+  setImmediate(async () => {
+    try {
+      const { sendNotificationEmail } = require("./emailNotifications.service");
+      const empDocs = await Promise.all(
+        recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
+      );
+      for (const empDoc of empDocs) {
+        if (!empDoc.exists) continue;
+        const emp = empDoc.data();
+        if (!emp.email) continue;
+        await sendNotificationEmail({
+          senderId: senderId || "system",
+          senderName: senderName || "CoWork",
+          receiverId: emp.employeeId || empDoc.id,
+          receiverName: emp.name || empDoc.id,
+          receiverEmail: emp.email,
+          type, title, body, data: data || {},
+        });
+      }
+    } catch (e) { console.error("[Email notify]", e.message); }
+  });
 }
 
 // ── GET WITH FALLBACK ────────────────────────────────────

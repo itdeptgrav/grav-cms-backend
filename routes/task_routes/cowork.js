@@ -261,6 +261,17 @@ router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, as
       });
     } catch (e) { console.error("[password_reset email]", e.message); }
 
+    // Push notification for password reset
+    try {
+      const { sendPushToEmployees } = require("../../services/fcmPush.service");
+      await sendPushToEmployees(
+        [employeeId],
+        "🔐 Password Reset",
+        "Your CoWork password was reset. Please log in with your new password.",
+        { type: "password_reset" }
+      );
+    } catch (e) { console.error("[password_reset push]", e.message); }
+
     console.log(`[ResetPassword] ${employeeId} session revoked by ${req.coworkUser.employeeId}`);
     return res.json({
       success: true,
@@ -325,7 +336,7 @@ router.post("/direct-message/notify", verifyCoworkToken, verifyEmployeeToken, as
     if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
     // Only send push notification + email — do NOT write to Firestore again
     const { sendPushToEmployees } = require("../../services/fcmPush.service");
-    await sendPushToEmployees([toEmployeeId], req.coworkUser.name, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
+    await sendPushToEmployees([toEmployeeId], `💬 DM · ${req.coworkUser.name}`, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
     try {
       const { sendNotificationEmail } = require("../../services/emailNotifications.service");
       const empDoc = await db.collection("cowork_employees").doc(toEmployeeId).get();
@@ -349,7 +360,7 @@ router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, as
     if (!recipients.length) return res.json({ success: true });
     // Only send push notification + email — do NOT write to Firestore again
     const { sendPushToEmployees } = require("../../services/fcmPush.service");
-    await sendPushToEmployees(recipients, `${req.coworkUser.name} in ${group.name}`, (text || "📎 Attachment").slice(0, 80), { type: "group_message", groupId });
+    await sendPushToEmployees(recipients, `👥 ${group.name} · ${req.coworkUser.name}`, (text || "📎 Attachment").slice(0, 80), { type: "group_message", groupId });
     try {
       const { sendNotificationEmail } = require("../../services/emailNotifications.service");
       const empDocs = await Promise.all(recipients.map(id => db.collection("cowork_employees").doc(id).get()));
@@ -621,7 +632,7 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
     // Notify employee via push + email
     try {
       const { sendPushToEmployees } = require("../../services/fcmPush.service");
-      await sendPushToEmployees([employeeId], "Your role has been updated", `Your CoWork role is now ${role === "tl" ? "Team Lead" : "Employee"}`, { type: "role_changed" });
+      await sendPushToEmployees([employeeId], `👤 Role Changed`, `Your CoWork role is now ${role === "tl" ? "Team Lead" : "Employee"}. Please log in again.`, { type: "role_changed" });
     } catch (e) { console.error("[role_changed push]", e.message); }
     try {
       const { sendNotificationEmail } = require("../../services/emailNotifications.service");
