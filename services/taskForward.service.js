@@ -56,6 +56,64 @@ function _fmtDurationChat(targetDate) {
 }
 
 // ─── Notify helper ────────────────────────────────────────
+// Build rich multiline body for push notification based on event type
+function _buildRichBody(type, body, data = {}) {
+  const lines = [body || ""];
+  if (type === "task_assigned" || type === "task_forwarded") {
+    if (data.priority) lines.push(`Priority: ${data.priority}`);
+    if (data.dueDate) lines.push(`Due: ${data.dueDate}`);
+    if (data.description) lines.push(String(data.description).slice(0, 60));
+  } else if (type === "task_chat") {
+    if (data.taskTitle) lines.push(`Task: ${data.taskTitle}`);
+  } else if (type === "daily_report") {
+    if (data.taskTitle) lines.push(`Task: ${data.taskTitle}`);
+  } else if (type === "completion_rejected" || type === "completion_ceo_rejected") {
+    if (data.reason) lines.push(`Reason: ${data.reason}`);
+  } else if (type === "deadline_changed") {
+    if (data.taskTitle) lines.push(`Task: ${data.taskTitle}`);
+  } else if (type === "goal_final_submit") {
+    if (data.componentCount) lines.push(`Components: ${data.componentCount}`);
+    if (data.submittedAt) lines.push(`Submitted: ${data.submittedAt}`);
+  } else if (type === "goal_component_done") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.progress) lines.push(`Progress: ${data.progress}`);
+    if (data.reportText) lines.push(String(data.reportText).slice(0, 60));
+  } else if (type === "goal_report_submitted") {
+    if (data.componentTitle) lines.push(`Component: ${data.componentTitle}`);
+    if (data.fileCount) lines.push(`Attachments: ${data.fileCount} file${data.fileCount !== 1 ? "s" : ""}`);
+    if (data.reportText) lines.push(String(data.reportText).slice(0, 80));
+  }
+  return lines.filter(Boolean).join("\n");
+}
+
+// Clear event type label for push title
+function _buildTitle(type, title) {
+  const labels = {
+    task_assigned: "📋 Task Assigned",
+    task_confirmed: "✅ Task Confirmed",
+    task_started: "▶️ Work Started",
+    task_forwarded: "↪️ Task Forwarded",
+    task_deleted: "🗑️ Task Deleted",
+    task_chat: "💬 Task Chat",
+    daily_report: "📊 Progress Report",
+    deadline_changed: "⏰ Deadline Changed",
+    completion_submitted: "📤 Work Submitted",
+    completion_tl_approved: "✅ TL Approved",
+    completion_ceo_approved: "🏆 Task Complete",
+    completion_rejected: "❌ Work Rejected",
+    completion_ceo_rejected: "❌ CEO Rejected",
+    goal_final_submit: "🚀 Goal Submitted",
+    goal_component_done: "✅ Component Done",
+    goal_report_submitted: "📋 Report Submitted",
+  };
+  const label = labels[type];
+  if (!label) return title;
+  // Extract the task/context name from title (after · or :)
+  const parts = title.split(/[·:]/);
+  const context = parts.length > 1 ? parts.slice(1).join("·").trim() : "";
+  return context ? `${label} · ${context}` : `${label}`;
+}
+
 async function _notifyMany({ recipientIds, type, title, body, data, senderId, senderName }) {
   if (!recipientIds?.length) return;
   const batch = db.batch();
@@ -69,32 +127,39 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
   await batch.commit();
   socket.emitToMany(recipientIds, "new_notification", { type, title, body, data });
 
-  // FCM push — always fires immediately, no cooldown
-  try {
-    const { sendPushToEmployees } = require("./fcmPush.service");
-    await sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) });
-  } catch (e) { console.error("[FCM taskForward]", e.message); }
+  // FCM push — fire immediately without awaiting (realtime delivery)
+  setImmediate(() => {
+    try {
+      const { sendPushToEmployees } = require("./fcmPush.service");
+      const richTitle = _buildTitle(type, title);
+      const richBody = _buildRichBody(type, body, data || {});
+      sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) })
+        .catch(e => console.error("[FCM taskForward]", e.message));
+    } catch (e) { console.error("[FCM taskForward init]", e.message); }
+  });
 
-  // Email — 20-min cooldown per sender→receiver pair
-  try {
-    const { sendNotificationEmail } = require("./emailNotifications.service");
-    const empDocs = await Promise.all(
-      recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
-    );
-    for (const empDoc of empDocs) {
-      if (!empDoc.exists) continue;
-      const emp = empDoc.data();
-      if (!emp.email) continue;
-      await sendNotificationEmail({
-        senderId: senderId || "system",
-        senderName: senderName || "CoWork",
-        receiverId: emp.employeeId || empDoc.id,
-        receiverName: emp.name || empDoc.id,
-        receiverEmail: emp.email,
-        type, title, body, data: data || {},
-      });
-    }
-  } catch (e) { console.error("[Email taskForward]", e.message); }
+  // Email — fire async without awaiting (slow, must not delay push)
+  setImmediate(async () => {
+    try {
+      const { sendNotificationEmail } = require("./emailNotifications.service");
+      const empDocs = await Promise.all(
+        recipientIds.map(id => db.collection("cowork_employees").doc(id).get())
+      );
+      for (const empDoc of empDocs) {
+        if (!empDoc.exists) continue;
+        const emp = empDoc.data();
+        if (!emp.email) continue;
+        await sendNotificationEmail({
+          senderId: senderId || "system",
+          senderName: senderName || "CoWork",
+          receiverId: emp.employeeId || empDoc.id,
+          receiverName: emp.name || empDoc.id,
+          receiverEmail: emp.email,
+          type, title, body, data: data || {},
+        });
+      }
+    } catch (e) { console.error("[Email taskForward]", e.message); }
+  });
 }
 
 // ─── ID generator ─────────────────────────────────────────
@@ -212,7 +277,7 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     await _notifyMany({
       recipientIds: assigneeIds,
       type: "task_assigned",
-      title: parentTaskId ? `New subtask: ${title}` : `New task: ${title}`,
+      title: parentTaskId ? `📌 New Subtask · ${title}` : `📋 Task Assigned · ${title}`,
       body: notes?.slice(0, 80) || description?.slice(0, 80) || "You have been assigned a task.",
       data: { taskId, taskTitle: title, priority, dueDate, description, parentTaskId: parentTaskId || "" },
       senderId: assignedBy,
@@ -254,7 +319,7 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
   });
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
-  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `${employeeName} confirmed: ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
+  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `✅ Confirmed · ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
   socket.emitToMany([...new Set(notifyIds)], "task_confirmed", { taskId, employeeId, employeeName });
   return { success: true };
 }
@@ -277,7 +342,7 @@ async function markTaskStarted({ taskId, employeeId, employeeName }) {
   });
 
   const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(id => id && id !== employeeId);
-  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_started", title: `${employeeName} started: ${task.title}`, body: `Work has begun on "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
+  await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_started", title: `▶️ Work Started · ${task.title}`, body: `Work has begun on "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
   socket.emitToMany([...new Set(notifyIds)], "task_started", { taskId, employeeId, employeeName });
   return { success: true };
 }
@@ -379,7 +444,7 @@ async function submitDailyReport({ taskId, employeeId, employeeName, message, im
   await _notifyMany({
     recipientIds: [...new Set(notifyIds)],
     type: "daily_report",
-    title: `Daily report: ${task.title}`,
+    title: `📊 Progress Report · ${task.title}`,
     body: `${employeeName}: ${message.slice(0, 60)} · ${progressPercent}%`,
     data: { taskId, taskTitle: task.title },
     senderId: employeeId,
@@ -474,8 +539,8 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
       await _notifyMany({
         recipientIds: notifyIds,
         type: "task_chat",
-        title: `${senderName} in ${task.title} (${taskId})`,
-        body: (text || "📎 attachment").slice(0, 80),
+        title: `💬 Task Chat · ${task.title}`,
+        body: `${senderName}: ${(text || "📎 attachment").slice(0, 60)}`,
         data: { taskId, taskTitle: task.title },
         senderId,
         senderName,
@@ -720,7 +785,7 @@ async function editTaskDeadline({ taskId, newDueDate, reason, editedBy, editedBy
   await _notifyMany({
     recipientIds: (task.assigneeIds || []).filter(id => id !== editedBy),
     type: "deadline_changed",
-    title: `Deadline updated: ${task.title}`,
+    title: `⏰ Deadline Changed · ${task.title}`,
     body: `${reason.trim()}`,
     data: { taskId, taskTitle: task.title },
     senderId: editedBy,
@@ -780,8 +845,8 @@ async function deleteTask({ taskId, deletedBy }) {
     await _notifyMany({
       recipientIds: task.assigneeIds,
       type: "task_deleted",
-      title: `Task deleted: ${task.title}`,
-      body: `The task "${task.title}" has been deleted.`,
+      title: `🗑️ Task Deleted · ${task.title}`,
+      body: `The task "${task.title}" has been permanently deleted by the admin.`,
       data: { taskId, taskTitle: task.title },
       senderId: deletedBy,
       senderName: deletedBy,
@@ -891,7 +956,7 @@ async function submitCompletionRequest({ taskId, employeeId, employeeName, messa
   await _notifyMany({
     recipientIds: [...new Set(notifyIds)],
     type: "completion_submitted",
-    title: `Work submitted: ${task.title}`,
+    title: `📤 Work Submitted · ${task.title}`,
     body: `${employeeName} submitted for review`,
     data: { taskId, taskTitle: task.title },
     senderId: employeeId,
@@ -955,11 +1020,11 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
       const ceoSnap = await db.collection("cowork_employees").where("role", "==", "ceo").limit(1).get();
       const ceoIds = ceoSnap.docs.map(d => d.data().employeeId).filter(Boolean);
       if (ceoIds.length) {
-        await _notifyMany({ recipientIds: ceoIds, type: "completion_tl_approved", title: `TL approved: ${task.title}`, body: `${reviewerName} approved. Your review needed.`, data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
+        await _notifyMany({ recipientIds: ceoIds, type: "completion_tl_approved", title: `✅ TL Approved · ${task.title}`, body: `${reviewerName} approved. Your review needed.`, data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
         socket.emitToMany(ceoIds, "task_completion_tl_approved", { taskId, tlReview });
       }
       if (submitterId && submitterId !== reviewerId) {
-        await _notifyMany({ recipientIds: [submitterId], type: "completion_tl_approved", title: `Work approved by TL: ${task.title}`, body: `${reviewerName} approved. CEO review pending.`, data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
+        await _notifyMany({ recipientIds: [submitterId], type: "completion_tl_approved", title: `✅ TL Approved · ${task.title}`, body: `${reviewerName} approved. CEO review pending.`, data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName });
       }
     }
 
@@ -971,7 +1036,7 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
     await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ ${reviewerName} rejected.\n📝 Reason: ${rejectionReason.trim()}`, messageType: "system" });
 
     if (submitterId) {
-      await _notifyMany({ recipientIds: [submitterId], type: "completion_rejected", title: `Work rejected: ${task.title}`, body: `Reason: ${rejectionReason.trim()}`, data: { taskId, taskTitle: task.title, reason: rejectionReason.trim() }, senderId: reviewerId, senderName: reviewerName });
+      await _notifyMany({ recipientIds: [submitterId], type: "completion_rejected", title: `❌ Work Rejected · ${task.title}`, body: `Reason: ${rejectionReason.trim()}`, data: { taskId, taskTitle: task.title, reason: rejectionReason.trim() }, senderId: reviewerId, senderName: reviewerName });
       socket.emitToMany([submitterId], "task_completion_rejected", { taskId, tlReview });
     }
   }
@@ -1138,7 +1203,7 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
   await _notifyMany({
     recipientIds: [...new Set(notifyIds)],
     type: "deadline_proposed",
-    title: `Deadline proposed for: ${task.title}`,
+    title: `📅 Deadline Proposed · ${task.title}`,
     body: `${employeeName} proposed a deadline for "${task.title}"`,
     data: { taskId, taskTitle: task.title, proposedDate },
     senderId: employeeId,
@@ -1247,7 +1312,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     await _notifyMany({
       recipientIds: task.assigneeIds || [],
       type: "deadline_approved",
-      title: `Deadline approved for: ${task.title}`,
+      title: `✅ Deadline Approved · ${task.title}`,
       body: `Your proposed deadline was approved. Please confirm the task.`,
       data: { taskId, taskTitle: task.title },
       senderId: approverId,
@@ -1292,7 +1357,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     await _notifyMany({
       recipientIds: task.assigneeIds || [],
       type: "deadline_rejected",
-      title: `Deadline rejected for: ${task.title}`,
+      title: `❌ Deadline Rejected · ${task.title}`,
       body: `Reason: ${rejectionReason.trim()}`,
       data: { taskId, taskTitle: task.title },
       senderId: approverId,
@@ -1360,7 +1425,7 @@ async function tlCounterProposeDeadline({ taskId, proposerId, proposerName, coun
   await _notifyMany({
     recipientIds: task.assigneeIds || [],
     type: "deadline_counter_proposed",
-    title: `New deadline suggested for: ${task.title}`,
+    title: `📅 New Deadline Suggested · ${task.title}`,
     body: wasExtensionContext
       ? `${proposerName} suggested +${_fmtSecs(typedSecs)} extension`
       : `${proposerName} suggested ${_fmtSecs(typedSecs)} to complete`,
@@ -1451,7 +1516,7 @@ async function employeeRespondToTlCounter({ taskId, employeeId, employeeName, ac
     await _notifyMany({
       recipientIds: [task.assignedBy],
       type: "deadline_accepted",
-      title: `Deadline accepted: ${task.title}`,
+      title: `✅ Deadline Accepted · ${task.title}`,
       body: `${employeeName} accepted your suggested deadline.`,
       data: { taskId, taskTitle: task.title },
       senderId: employeeId, senderName: employeeName,
@@ -1477,7 +1542,7 @@ async function employeeRespondToTlCounter({ taskId, employeeId, employeeName, ac
     await _notifyMany({
       recipientIds: [task.assignedBy],
       type: "deadline_counter_rejected",
-      title: `Deadline rejected: ${task.title}`,
+      title: `❌ Deadline Counter Rejected · ${task.title}`,
       body: `${employeeName} rejected your suggested deadline${rejectMessage ? `: ${rejectMessage.trim()}` : ""}.`,
       data: { taskId, taskTitle: task.title },
       senderId: employeeId, senderName: employeeName,
