@@ -7,9 +7,16 @@ const {
   getTaskLists, getAllTasks, getAllTasksFlat, getTasksInList,
   createGoogleTask, createSubtask, updateGoogleTask,
 } = require("./services/googleTasksService");
-const { getInboxMessages, getEmailBody, getUnreadCount, searchEmails } = require("./services/googleGmailService");
+const { getInboxMessages, getEmailBody, getUnreadCount, searchEmails, getEmailsForUser, getAllInbox } = require("./services/googleGmailService");
 const { getCalendars, getUpcomingEvents, getTodayEvents, createEvent } = require("./services/googleCalendarService");
 const { getRecentFiles, searchFiles } = require("./services/googleDriveService");
+const {
+  getEmployeeAuthUrl,
+  saveEmployeeGmailToken,
+  getEmployeeGmailToken,
+  disconnectEmployeeGmail,
+  getEmployeeInbox,
+} = require("./services/googleEmployeeGmailService");
 
 // Chat service - load safely in case not set up yet
 let chatService = null;
@@ -219,6 +226,111 @@ router.get("/drive/search", async (req, res) => {
   try {
     if (!req.query.q) return res.status(400).json({ success: false, message: "q required" });
     res.json({ success: true, data: await searchFiles(req.query.q) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+// ── GMAIL: per-user scoped to their registered email ─────────────────────────────────
+// GET /api/google/gmail/my-inbox?email=xxx&max=30
+router.get("/gmail/my-inbox", async (req, res) => {
+  try {
+    const { email, max } = req.query;
+    if (!email) return res.status(400).json({ success: false, message: "email query param required" });
+    const maxResults = parseInt(max) || 30;
+    const data = await getEmailsForUser(email, maxResults);
+    res.json({ success: true, data, email });
+  } catch (err) {
+    console.error("[gmail/my-inbox]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/google/gmail/all-inbox?max=30
+router.get("/gmail/all-inbox", async (req, res) => {
+  try {
+    const maxResults = parseInt(req.query.max) || 30;
+    const data = await getAllInbox(maxResults);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error("[gmail/all-inbox]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+// ── PER-EMPLOYEE GMAIL ────────────────────────────────────────────────────────
+
+// GET /api/google/employee-gmail/auth-url?employeeId=E001
+// Returns OAuth URL for this employee to connect their personal Gmail
+router.get("/employee-gmail/auth-url", (req, res) => {
+  try {
+    const { employeeId } = req.query;
+    if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
+    const url = getEmployeeAuthUrl(employeeId);
+    res.json({ success: true, url });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/google/employee-gmail/callback?code=xxx&state=E001
+// Called by Google after employee authorizes — saves token to Firestore
+router.get("/employee-gmail/callback", async (req, res) => {
+  try {
+    const { code, state: employeeId } = req.query;
+    if (!code || !employeeId) return res.status(400).json({ success: false, message: "Missing code or employeeId" });
+    const { connectedEmail } = await saveEmployeeGmailToken(employeeId, code);
+    // Redirect back to CoWork settings with success param
+    const frontendUrl = process.env.COWORK_FRONTEND_URL || "http://localhost:3000";
+    res.redirect(`${frontendUrl}/coworking/settings?gmail=connected&email=${encodeURIComponent(connectedEmail)}`);
+  } catch (err) {
+    console.error("[employee-gmail/callback]", err.message);
+    const frontendUrl = process.env.COWORK_FRONTEND_URL || "http://localhost:3000";
+    res.redirect(`${frontendUrl}/coworking/settings?gmail=error&message=${encodeURIComponent(err.message)}`);
+  }
+});
+
+// GET /api/google/employee-gmail/inbox?employeeId=E001&max=30
+// Returns this employee's own Gmail inbox
+router.get("/employee-gmail/inbox", async (req, res) => {
+  try {
+    const { employeeId, max } = req.query;
+    if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
+    const result = await getEmployeeInbox(employeeId, parseInt(max) || 30);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("[employee-gmail/inbox]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/google/employee-gmail/status?employeeId=E001
+// Check if this employee has Gmail connected
+router.get("/employee-gmail/status", async (req, res) => {
+  try {
+    const { employeeId } = req.query;
+    if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
+    const token = await getEmployeeGmailToken(employeeId);
+    res.json({
+      success: true,
+      connected: !!token,
+      connectedEmail: token?.connectedEmail || null,
+      connectedAt: token?.connectedAt || null,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// DELETE /api/google/employee-gmail/disconnect?employeeId=E001
+router.delete("/employee-gmail/disconnect", async (req, res) => {
+  try {
+    const { employeeId } = req.query;
+    if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
+    await disconnectEmployeeGmail(employeeId);
+    res.json({ success: true, message: "Gmail disconnected" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
