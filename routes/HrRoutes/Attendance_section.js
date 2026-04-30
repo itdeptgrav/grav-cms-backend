@@ -5040,3 +5040,4 @@ module.exports.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports.applyApprovedLeavesForDate = applyApprovedLeavesForDate;
 module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
 module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
+module.exports.syncTodayOnly = syncTodayOnly;

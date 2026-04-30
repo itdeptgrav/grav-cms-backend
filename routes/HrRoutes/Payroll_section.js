@@ -8,6 +8,8 @@ const PayrollSettings = require("../../models/HR_Models/Payrollsettings");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+const { Expo } = require("expo-server-sdk");
+const expo = new Expo();
 const { CompanyHoliday, LeaveBalance, LeaveConfig } =
     require("../../models/HR_Models/LeaveManagement");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
@@ -728,6 +730,53 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
         payrollRun.processedAt = new Date();
         await payrollRun.save();
 
+        // ── Send push notifications (inline — same as test endpoint) ─────
+        let pushResult = { sent: 0, failed: 0, details: [] };
+        try {
+            // Find ALL employees with push tokens (same query as test endpoint)
+            const empWithTokens = await Employee.find({
+                pushToken: { $ne: null, $exists: true },
+                $or: [{ status: "active" }, { isActive: true }],
+            }).select("pushToken firstName lastName").lean();
+
+            console.log(`[PAYROLL-PUSH] Found ${empWithTokens.length} employee(s) with push tokens`);
+
+            const messages = [];
+            for (const emp of empWithTokens) {
+                if (!Expo.isExpoPushToken(emp.pushToken)) {
+                    console.log(`[PAYROLL-PUSH] Skipping invalid token: ${emp.pushToken}`);
+                    continue;
+                }
+                messages.push({
+                    to: emp.pushToken,
+                    sound: "default",
+                    title: "💰 Payslip Generated",
+                    body: `Hi ${emp.firstName}, your payslip for ${MONTH_NAMES[month]} ${year} has been processed. Open the app to view details.`,
+                    data: { type: "payroll", month, year, screen: "Salary" },
+                    channelId: "payroll",
+                    priority: "high",
+                });
+            }
+
+            console.log(`[PAYROLL-PUSH] Sending ${messages.length} notification(s)...`);
+
+            if (messages.length > 0) {
+                const chunks = expo.chunkPushNotifications(messages);
+                for (const chunk of chunks) {
+                    const receipts = await expo.sendPushNotificationsAsync(chunk);
+                    console.log(`[PAYROLL-PUSH] Receipts:`, JSON.stringify(receipts));
+                    for (const r of receipts) {
+                        if (r.status === "ok") pushResult.sent++;
+                        else pushResult.failed++;
+                    }
+                }
+            }
+            console.log(`[PAYROLL-PUSH] ✓ Done: ${pushResult.sent} sent, ${pushResult.failed} failed`);
+        } catch (pushErr) {
+            console.error("[PAYROLL-PUSH] ✗ Error:", pushErr.message, pushErr.stack);
+            pushResult.error = pushErr.message;
+        }
+
         res.json({
             success: true,
             message: `Payroll processed for ${employees.length} employees`,
@@ -739,6 +788,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     totalPF, totalESIC,
                     clAdjustmentsApplied: clBalanceUpdates.length,
                 },
+                pushNotifications: pushResult,
             },
         });
     } catch (err) {
@@ -1014,7 +1064,60 @@ router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
         );
 
         await Payroll.updateOne({ month, year }, { $set: { status: "paid" } });
-        res.json({ success: true, message: `${result.modifiedCount} items marked as paid` });
+
+        // ── Send "salary paid" push notifications (inline) ─────────────
+        let pushResult = { sent: 0, failed: 0 };
+        if (result.modifiedCount > 0) {
+            try {
+                const paidItems = await PayrollItem.find({ month, year, status: "paid" })
+                    .select("employeeId")
+                    .lean();
+                const employeeIds = paidItems.map(i => i.employeeId);
+
+                const empWithTokens = await Employee.find({
+                    _id: { $in: employeeIds },
+                    pushToken: { $ne: null, $exists: true },
+                }).select("pushToken firstName").lean();
+
+                console.log(`[PAYROLL-PAID-PUSH] Found ${empWithTokens.length} employee(s) with tokens`);
+
+                const messages = [];
+                for (const emp of empWithTokens) {
+                    if (!Expo.isExpoPushToken(emp.pushToken)) continue;
+                    messages.push({
+                        to: emp.pushToken,
+                        sound: "default",
+                        title: "✅ Salary Credited",
+                        body: `Hi ${emp.firstName}, your salary for ${MONTH_NAMES[month]} ${year} has been credited. Open the app to view your payslip.`,
+                        data: { type: "payroll", month, year, screen: "Salary" },
+                        channelId: "payroll",
+                        priority: "high",
+                    });
+                }
+
+                if (messages.length > 0) {
+                    const chunks = expo.chunkPushNotifications(messages);
+                    for (const chunk of chunks) {
+                        const receipts = await expo.sendPushNotificationsAsync(chunk);
+                        console.log(`[PAYROLL-PAID-PUSH] Receipts:`, JSON.stringify(receipts));
+                        for (const r of receipts) {
+                            if (r.status === "ok") pushResult.sent++;
+                            else pushResult.failed++;
+                        }
+                    }
+                }
+                console.log(`[PAYROLL-PAID-PUSH] ✓ Done: ${pushResult.sent} sent, ${pushResult.failed} failed`);
+            } catch (pushErr) {
+                console.error("[PAYROLL-PAID-PUSH] ✗ Error:", pushErr.message);
+                pushResult.error = pushErr.message;
+            }
+        }
+
+        res.json({
+            success: true,
+            message: `${result.modifiedCount} items marked as paid`,
+            pushNotifications: pushResult,
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
