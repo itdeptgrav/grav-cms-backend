@@ -21,6 +21,7 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
+const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -42,6 +43,87 @@ const parseBarcode = (barcodeId) => {
   } catch {
     return { success: false };
   }
+};
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: resolve EmployeeMpc enrichment for a list of employees.
+//
+// We match on BOTH _id and UIN because:
+//   - EmployeeProductionProgress.employeeId may or may not be the EmployeeMpc._id
+//     depending on the conversion flow
+//   - employeeUIN is a reliable secondary key
+//
+// Returns Map<lookupKey, { department, designation, aliases }>
+// where lookupKey is either the empMpcId.toString() or the UIN string.
+// ─────────────────────────────────────────────────────────────────────────────
+async function buildMpcEnrichmentMap({ employeeIds = [], uins = [] } = {}) {
+  const cleanIds = [...new Set(
+    employeeIds
+      .filter(Boolean)
+      .map((id) => id.toString())
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+  )];
+  const cleanUins = [...new Set(uins.filter(Boolean).map((u) => u.toString().toUpperCase()))];
+
+  if (!cleanIds.length && !cleanUins.length) return new Map();
+
+  const orFilter = [];
+  if (cleanIds.length) orFilter.push({ _id: { $in: cleanIds } });
+  if (cleanUins.length) orFilter.push({ uin: { $in: cleanUins } });
+
+  const docs = await EmployeeMpc.find({ $or: orFilter })
+    .select("_id uin name department designation products")
+    .lean();
+
+  const map = new Map();
+  for (const doc of docs) {
+    const aliasMap = new Map();
+    for (const p of doc.products || []) {
+      if (!p.productName) continue;
+      const pid = p.productId?.toString();
+      if (!pid) continue;
+      const variantKey = p.variantId?.toString() || "default";
+      aliasMap.set(`${pid}_${variantKey}`, p.productName);
+      // Plain productId fallback (used when variant doesn't match)
+      if (!aliasMap.has(pid)) aliasMap.set(pid, p.productName);
+    }
+
+    const entry = {
+      department: doc.department || "",
+      designation: doc.designation || "",
+      aliases: aliasMap,
+    };
+
+    // Index by both _id AND UIN so the caller can look up either way
+    map.set(doc._id.toString(), entry);
+    if (doc.uin) map.set(doc.uin.toUpperCase(), entry);
+  }
+  return map;
+}
+
+const lookupMpc = (mpcMap, emp) => {
+  if (!emp) return null;
+  // Try _id first
+  const byId = emp.employeeId ? mpcMap.get(emp.employeeId.toString()) : null;
+  if (byId) return byId;
+  // Fallback: UIN
+  const uin = emp.employeeUIN?.toUpperCase();
+  return uin ? mpcMap.get(uin) || null : null;
+};
+
+const resolveAlias = (mpcEntry, wo) => {
+  if (!mpcEntry || !wo?.stockItemId) return null;
+  const productId = wo.stockItemId.toString();
+  const variantId = wo.variantAttributes?.[0]?.variantId?.toString();
+  if (variantId) {
+    const v = mpcEntry.aliases.get(`${productId}_${variantId}`);
+    if (v) return v;
+  }
+  return mpcEntry.aliases.get(`${productId}_default`)
+    || mpcEntry.aliases.get(productId)
+    || null;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +319,280 @@ async function commitBulkPackaging({ workOrderId, scannedUnits, packagedBy, note
   };
 }
 
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GET /logs-by-mo
+// Returns packaging events grouped by MO, then by person (for measurement) or
+// by product (for bulk). Used by the overview page.
+// Query: from, to, type (all|measurement|bulk), page, limit
+// ═════════════════════════════════════════════════════════════════════════════
+router.get("/logs-by-mo", async (req, res) => {
+  try {
+    const { from, to, type = "all", page = 1, limit = 25 } = req.query;
+
+    // Date filter
+    const dateRange = {};
+    if (from) {
+      const f = new Date(from); f.setHours(0, 0, 0, 0);
+      dateRange.from = f;
+    }
+    if (to) {
+      const t = new Date(to); t.setHours(23, 59, 59, 999);
+      dateRange.to = t;
+    }
+    const inRange = (d) => {
+      if (!d) return false;
+      const dt = new Date(d);
+      if (dateRange.from && dt < dateRange.from) return false;
+      if (dateRange.to && dt > dateRange.to) return false;
+      return true;
+    };
+
+    // Find all WOs with packagingRecords
+    const allWOs = await WorkOrder.find({ "packagingRecords.0": { $exists: true } })
+      .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity customerRequestId packagingRecords packagedQuantity")
+      .lean();
+
+    // Group by MO
+    const moMap = new Map(); // moId -> { wos: [], totalEvents, totalUnits, ... }
+    for (const wo of allWOs) {
+      const moId = wo.customerRequestId?.toString();
+      if (!moId) continue;
+      if (!moMap.has(moId)) moMap.set(moId, { wos: [] });
+      moMap.get(moId).wos.push(wo);
+    }
+
+    // Fetch MO details
+    const moIds = [...moMap.keys()];
+    const mos = await CustomerRequest.find({ _id: { $in: moIds } })
+      .select("requestId customerInfo requestType")
+      .lean();
+    const moDetailMap = new Map(mos.map((m) => [m._id.toString(), m]));
+
+    // Build per-MO summaries
+    const result = [];
+    for (const [moId, agg] of moMap) {
+      const mo = moDetailMap.get(moId);
+      if (!mo) continue;
+      const isMeasurement = mo.requestType === "measurement_conversion";
+
+      // Filter by type
+      if (type === "measurement" && !isMeasurement) continue;
+      if (type === "bulk" && isMeasurement) continue;
+
+      // ── Personwise breakdown (for measurement MOs) ────────────────────────
+      // Collect all relevant packagingRecords from all WOs of this MO that
+      // are person-wise and within date range. Group by employee.
+      let personEvents = [];
+      let bulkEvents = [];
+      let moTotalUnits = 0;
+      let firstAt = null;
+      let lastAt = null;
+
+      for (const wo of agg.wos) {
+        for (const rec of wo.packagingRecords || []) {
+          if (!inRange(rec.packagedAt)) continue;
+          moTotalUnits += rec.packagedQuantity || 0;
+          const ts = new Date(rec.packagedAt);
+          if (!firstAt || ts < firstAt) firstAt = ts;
+          if (!lastAt || ts > lastAt) lastAt = ts;
+
+          const woMeta = {
+            workOrderId: wo._id,
+            workOrderNumber: wo.workOrderNumber,
+            stockItemName: wo.stockItemName,
+            stockItemReference: wo.stockItemReference,
+            variantAttributes: wo.variantAttributes || [],
+            totalQuantity: wo.quantity,
+          };
+
+          if (rec.packagingType === "person_wise") {
+            personEvents.push({
+              ...woMeta,
+              packagedAt: rec.packagedAt,
+              packagedBy: rec.packagedBy,
+              packagedQuantity: rec.packagedQuantity,
+              unitNumbers: rec.unitNumbers || [],
+              employeeIds: rec.employeeIds || [],
+              employeeNames: rec.employeeNames || [],
+              notes: rec.notes || "",
+            });
+          } else {
+            bulkEvents.push({
+              ...woMeta,
+              packagedAt: rec.packagedAt,
+              packagedBy: rec.packagedBy,
+              packagedQuantity: rec.packagedQuantity,
+              unitNumbers: rec.unitNumbers || [],
+              notes: rec.notes || "",
+            });
+          }
+        }
+      }
+
+      if (!personEvents.length && !bulkEvents.length) continue;
+
+      // ── Person-wise: regroup by employee using EmployeeProductionProgress ─
+      // Match each unit number back to the employee who owned that unit range
+      let personGroups = [];
+      if (isMeasurement && personEvents.length) {
+        const empProgressDocs = await EmployeeProductionProgress.find({
+          manufacturingOrderId: moId,
+        })
+          .select("employeeId employeeName employeeUIN gender workOrderId unitStart unitEnd packagingHistory")
+          .lean();
+
+        const empMap = new Map(); // empId -> { name, UIN, gender, products: [{wo, units, packagedAt[]}] }
+
+        for (const ep of empProgressDocs) {
+          const empKey = ep.employeeId?.toString();
+          if (!empKey) continue;
+
+          // Filter packagingHistory by date range
+          const relevantHistory = (ep.packagingHistory || []).filter((h) =>
+            inRange(h.packagedAt)
+          );
+          if (!relevantHistory.length) continue;
+
+          const wo = agg.wos.find((w) => w._id.toString() === ep.workOrderId.toString());
+          if (!wo) continue;
+
+          if (!empMap.has(empKey)) {
+            empMap.set(empKey, {
+              employeeId: ep.employeeId,
+              employeeName: ep.employeeName,
+              employeeUIN: ep.employeeUIN,
+              gender: ep.gender,
+              products: [],
+              totalUnits: 0,
+              firstAt: null,
+              lastAt: null,
+            });
+          }
+          const empRec = empMap.get(empKey);
+
+          // Build product entry — collect all unit numbers + history events
+          const allUnits = relevantHistory.flatMap((h) => h.unitNumbers || []);
+          const totalQty = relevantHistory.reduce((s, h) => s + (h.packagedQuantity || 0), 0);
+
+          relevantHistory.forEach((h) => {
+            const ts = new Date(h.packagedAt);
+            if (!empRec.firstAt || ts < empRec.firstAt) empRec.firstAt = ts;
+            if (!empRec.lastAt || ts > empRec.lastAt) empRec.lastAt = ts;
+          });
+
+          empRec.products.push({
+            workOrderId: wo._id,
+            workOrderNumber: wo.workOrderNumber,
+            productName: wo.stockItemName,
+            stockItemReference: wo.stockItemReference,
+            variantAttributes: wo.variantAttributes || [],
+            unitNumbers: [...new Set(allUnits)].sort((a, b) => a - b),
+            totalQuantity: totalQty,
+            events: relevantHistory.map((h) => ({
+              packagedAt: h.packagedAt,
+              packagedBy: h.packagedBy,
+              quantity: h.packagedQuantity,
+              units: h.unitNumbers || [],
+              notes: h.notes || "",
+            })),
+          });
+          empRec.totalUnits += totalQty;
+        }
+
+        personGroups = [...empMap.values()].sort((a, b) =>
+          (a.employeeName || "").localeCompare(b.employeeName || "")
+        );
+      }
+
+      // ── Bulk-wise: aggregate by WO ────────────────────────────────────────
+      let bulkGroups = [];
+      if (bulkEvents.length) {
+        const bulkMap = new Map(); // workOrderId -> { wo, totalQty, events: [] }
+        for (const ev of bulkEvents) {
+          const woKey = ev.workOrderId.toString();
+          if (!bulkMap.has(woKey)) {
+            bulkMap.set(woKey, {
+              workOrderId: ev.workOrderId,
+              workOrderNumber: ev.workOrderNumber,
+              productName: ev.stockItemName,
+              stockItemReference: ev.stockItemReference,
+              variantAttributes: ev.variantAttributes,
+              totalQuantity: ev.totalQuantity,
+              packagedTotal: 0,
+              events: [],
+            });
+          }
+          const r = bulkMap.get(woKey);
+          r.packagedTotal += ev.packagedQuantity || 0;
+          r.events.push({
+            packagedAt: ev.packagedAt,
+            packagedBy: ev.packagedBy,
+            quantity: ev.packagedQuantity,
+            units: ev.unitNumbers,
+            notes: ev.notes,
+          });
+        }
+        bulkGroups = [...bulkMap.values()].sort((a, b) =>
+          (a.productName || "").localeCompare(b.productName || "")
+        );
+      }
+
+      result.push({
+        moId,
+        moNumber: `MO-${mo.requestId}`,
+        requestId: mo.requestId,
+        customerName: mo.customerInfo?.name || "—",
+        requestType: mo.requestType,
+        isMeasurement,
+        firstPackagedAt: firstAt,
+        lastPackagedAt: lastAt,
+        totalUnitsPackaged: moTotalUnits,
+        totalEvents: personEvents.length + bulkEvents.length,
+        personGroups,
+        bulkGroups,
+      });
+    }
+
+    // Sort MOs by most recent activity
+    result.sort((a, b) => new Date(b.lastPackagedAt) - new Date(a.lastPackagedAt));
+
+    // Paginate
+    const pageNum = Math.max(1, parseInt(page, 10));
+    const limitNum = Math.max(1, parseInt(limit, 10));
+    const paged = result.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+
+    // Totals
+    const totals = result.reduce(
+      (acc, mo) => {
+        acc.totalMOs++;
+        acc.totalUnits += mo.totalUnitsPackaged;
+        acc.totalEvents += mo.totalEvents;
+        if (mo.isMeasurement) acc.measurementMOs++;
+        else acc.bulkMOs++;
+        return acc;
+      },
+      { totalMOs: 0, totalUnits: 0, totalEvents: 0, measurementMOs: 0, bulkMOs: 0 }
+    );
+
+    return res.json({
+      success: true,
+      manufacturingOrders: paged,
+      totals,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: result.length,
+        totalPages: Math.ceil(result.length / limitNum),
+      },
+    });
+  } catch (err) {
+    console.error("Logs-by-MO error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /fetch-order
 // ═════════════════════════════════════════════════════════════════════════════
@@ -326,11 +682,11 @@ router.post("/fetch-order", async (req, res) => {
         quantity: wo.quantity,
         moInfo: mo
           ? {
-              _id: mo._id,
-              moNumber: `MO-${mo.requestId}`,
-              customerName: mo.customerInfo?.name || "",
-              requestType: mo.requestType,
-            }
+            _id: mo._id,
+            moNumber: `MO-${mo.requestId}`,
+            customerName: mo.customerInfo?.name || "",
+            requestType: mo.requestType,
+          }
           : null,
         isMeasurement,
         scannedUnits: validScans.map((s) => s.unitNumber).sort((a, b) => a - b),
@@ -339,6 +695,15 @@ router.post("/fetch-order", async (req, res) => {
 
       if (isMeasurement) {
         const empDocs = await EmployeeProductionProgress.find({ workOrderId: wo._id }).lean();
+
+        // Resolve MPC enrichment (department/designation/alias)
+        const empMpcIds = empDocs.map((e) => e.employeeId);
+        const customerId = mo?.customerInfo?.customerId || mo?.customerInfo?._id;
+        const mpcMap = await buildMpcEnrichmentMap({
+          employeeIds: empDocs.map((e) => e.employeeId),
+          uins: empDocs.map((e) => e.employeeUIN),
+        });
+
         const perEmployee = [];
 
         for (const emp of empDocs) {
@@ -352,13 +717,20 @@ router.post("/fetch-order", async (req, res) => {
           );
           const newUnitsToPackage = unitsOfThisEmp.filter((u) => !alreadyPackagedUnitsSet.has(u));
 
+          const mpcEntry = lookupMpc(mpcMap, emp);
+          const aliasName = resolveAlias(mpcEntry, wo);
+
           perEmployee.push({
             progressDocId: emp._id,
             employeeId: emp.employeeId,
             employeeName: emp.employeeName,
             employeeUIN: emp.employeeUIN,
             gender: emp.gender,
-            productName: wo.stockItemName,
+            department: mpcEntry?.department || "",
+            designation: mpcEntry?.designation || "",
+            productName: aliasName || wo.stockItemName, // alias preferred, WO name fallback
+            productAliasName: aliasName || null,        // raw alias (for label printing)
+            productCanonicalName: wo.stockItemName,     // WO name kept for reference
             unitStart: emp.unitStart,
             unitEnd: emp.unitEnd,
             totalUnits: emp.totalUnits,
@@ -535,6 +907,14 @@ router.post("/fetch-by-uins", async (req, res) => {
     const wos = await WorkOrder.find({ _id: { $in: woIds } }).lean();
     const woMap = new Map(wos.map((w) => [w._id.toString(), w]));
 
+    // Resolve MPC enrichment for ALL employees once (shared across WOs)
+    const allEmpIds = docs.map((d) => d.employeeId);
+    const customerId = mo?.customerInfo?.customerId || mo?.customerInfo?._id;
+    const mpcMap = await buildMpcEnrichmentMap({
+      employeeIds: docs.map((d) => d.employeeId),
+      uins: docs.map((d) => d.employeeUIN),
+    });
+
     const groups = [];
     const fullyPackagedEmployees = [];
 
@@ -547,13 +927,10 @@ router.post("/fetch-by-uins", async (req, res) => {
         const alreadyPackagedUnits = new Set(
           (emp.packagingHistory || []).flatMap((h) => h.unitNumbers || [])
         );
-
-        // All assigned units that haven't been packaged yet
         const unpackagedUnits = [];
         for (let u = emp.unitStart; u <= emp.unitEnd; u++) {
           if (!alreadyPackagedUnits.has(u)) unpackagedUnits.push(u);
         }
-
         if (!unpackagedUnits.length) {
           fullyPackagedEmployees.push({
             barcode: `${emp.employeeUIN} → ${wo.stockItemName}`,
@@ -562,13 +939,20 @@ router.post("/fetch-by-uins", async (req, res) => {
           continue;
         }
 
+        const mpcEntry = lookupMpc(mpcMap, emp);
+        const aliasName = resolveAlias(mpcEntry, wo);
+
         perEmployee.push({
           progressDocId: emp._id,
           employeeId: emp.employeeId,
           employeeName: emp.employeeName,
           employeeUIN: emp.employeeUIN,
           gender: emp.gender,
-          productName: wo.stockItemName,
+          department: mpcEntry?.department || "",
+          designation: mpcEntry?.designation || "",
+          productName: aliasName || wo.stockItemName,
+          productAliasName: aliasName || null,
+          productCanonicalName: wo.stockItemName,
           unitStart: emp.unitStart,
           unitEnd: emp.unitEnd,
           totalUnits: emp.totalUnits,
@@ -672,8 +1056,8 @@ router.post("/done", async (req, res) => {
           );
           const newlyPackagedUnits = scannedUnitsForThisEmp.filter(
             (u) => u >= (doc.unitStart || 0) &&
-                   u <= (doc.unitEnd || 0) &&
-                   !alreadyPackagedUnits.has(u)
+              u <= (doc.unitEnd || 0) &&
+              !alreadyPackagedUnits.has(u)
           );
           if (!newlyPackagedUnits.length) continue;
 
