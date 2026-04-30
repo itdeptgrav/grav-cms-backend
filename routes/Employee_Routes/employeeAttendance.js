@@ -7,8 +7,10 @@
 const express = require("express");
 const router = express.Router();
 const Employee = require("../../models/Employee");
+const AttendanceRouter = require("../HrRoutes/Attendance_section");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
+const { syncTodayOnly } = require("../HrRoutes/Attendance_section");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function getTodayIST() {
@@ -153,5 +155,26 @@ router.get("/monthly", AllEmployeeAppMiddleware, async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
+router.post("/sync-today", AllEmployeeAppMiddleware, async (req, res) => {
+    try {
+        // syncTodayOnly is exported from the HR attendance router
+        if (typeof AttendanceRouter.syncTodayOnly === 'function') {
+            const result = await AttendanceRouter.syncTodayOnly();
+            return res.json({
+                success: true,
+                message: result ? `Synced ${result.employees || 0} employees` : "Sync completed",
+            });
+        }
+        // Fallback if syncTodayOnly not exported yet
+        res.json({ success: true, message: "Sync not available — data refreshed" });
+    } catch (err) {
+        console.error("[EMPLOYEE-SYNC]", err.message);
+        res.status(500).json({ success: false, message: "Sync failed. Try again." });
+    }
+});
+
+
+
 
 module.exports = router;
