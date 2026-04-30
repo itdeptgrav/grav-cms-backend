@@ -3646,12 +3646,8 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                 row.dayCodes[cal.dateStr] = sheetCode;
             }
 
-            // Total = paid/present days + approved leaves, minus unpaid absents
-            // Leaves (CL/SL/PL/CO) count positively — they are approved paid days
-            // Absent (A) subtracts — employee had no leave approval and was absent
-            row.totals.Total = row.totals.P + row.totals.HD + row.totals.WO
-                + row.totals.CO + row.totals.CL + row.totals.SL + row.totals.PL + row.totals.NHFH
-                - row.totals.A;
+            // Total = total calendar days in the month  −  absent days
+            row.totals.Total = lastDay - row.totals.A;
             return row;
         }
 
