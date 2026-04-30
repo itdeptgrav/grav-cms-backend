@@ -89,22 +89,22 @@ function _buildRichBody(type, body, data = {}) {
 // Clear event type label for push title
 function _buildTitle(type, title) {
   const labels = {
-    task_assigned:          "📋 Task Assigned",
-    task_confirmed:         "✅ Task Confirmed",
-    task_started:           "▶️ Work Started",
-    task_forwarded:         "↪️ Task Forwarded",
-    task_deleted:           "🗑️ Task Deleted",
-    task_chat:              "💬 Task Chat",
-    daily_report:           "📊 Progress Report",
-    deadline_changed:       "⏰ Deadline Changed",
-    completion_submitted:   "📤 Work Submitted",
+    task_assigned: "📋 Task Assigned",
+    task_confirmed: "✅ Task Confirmed",
+    task_started: "▶️ Work Started",
+    task_forwarded: "↪️ Task Forwarded",
+    task_deleted: "🗑️ Task Deleted",
+    task_chat: "💬 Task Chat",
+    daily_report: "📊 Progress Report",
+    deadline_changed: "⏰ Deadline Changed",
+    completion_submitted: "📤 Work Submitted",
     completion_tl_approved: "✅ TL Approved",
-    completion_ceo_approved:"🏆 Task Complete",
-    completion_rejected:    "❌ Work Rejected",
-    completion_ceo_rejected:"❌ CEO Rejected",
-    goal_final_submit:      "🚀 Goal Submitted",
-    goal_component_done:    "✅ Component Done",
-    goal_report_submitted:  "📋 Report Submitted",
+    completion_ceo_approved: "🏆 Task Complete",
+    completion_rejected: "❌ Work Rejected",
+    completion_ceo_rejected: "❌ CEO Rejected",
+    goal_final_submit: "🚀 Goal Submitted",
+    goal_component_done: "✅ Component Done",
+    goal_report_submitted: "📋 Report Submitted",
   };
   const label = labels[type];
   if (!label) return title;
@@ -132,7 +132,7 @@ async function _notifyMany({ recipientIds, type, title, body, data, senderId, se
     try {
       const { sendPushToEmployees } = require("./fcmPush.service");
       const richTitle = _buildTitle(type, title);
-      const richBody  = _buildRichBody(type, body, data || {});
+      const richBody = _buildRichBody(type, body, data || {});
       sendPushToEmployees(recipientIds, richTitle, richBody, { type, ...(data || {}) })
         .catch(e => console.error("[FCM taskForward]", e.message));
     } catch (e) { console.error("[FCM taskForward init]", e.message); }
