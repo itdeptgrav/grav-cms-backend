@@ -606,7 +606,11 @@ app.use("/api/ceo/dispatch", ceoDispatchRoutes);
 const ceoCuttingRoutes = require("./routes/CEO_Routes/cutting");
 app.use("/api/ceo/cutting", ceoCuttingRoutes);
 
+const ceoInventoryRoutes = require("./routes/CEO_Routes/inventory");
+app.use("/api/ceo/inventory", ceoInventoryRoutes);
 
+const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
+app.use("/api/ceo/merchandiser", merchandiserRoutes);
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -1562,7 +1566,7 @@ server.listen(PORT, () => {
         const participants = meet.participants || [];
         if (!participants.length) continue;
 
-           const title = `⏰ Meeting Starting Soon · ${meet.title}`;
+        const title = `⏰ Meeting Starting Soon · ${meet.title}`;
         const body = `"${meet.title}" starts in 15 minutes. Get ready to join.`;
 
 
