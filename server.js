@@ -633,9 +633,6 @@ app.use("/api/employees", employeeRoutes);
 const pushTokenRoutes = require("./routes/Employee_Routes/pushToken");
 app.use("/api/employee", pushTokenRoutes);
 
-const testPushRoutes = require("./routes/Employee_Routes/testPush");
-app.use("/api/employee", testPushRoutes);
-
 /* =====================
     Customer ROUTES
   ===================== */
@@ -801,6 +798,7 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 
 const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
 app.use("/api/hr/payroll", payrollRoutes);
+
 
 const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
 app.use("/hr/attendance", attendanceRouter);

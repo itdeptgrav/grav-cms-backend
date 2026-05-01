@@ -73,12 +73,10 @@ function computeEmployeePayroll(employee, ctx) {
     const { month, year, settings, salaryCfg, holidayMap, attendanceByDate, leaveBalance, leaveConfig } = ctx;
     const daysInMonth = new Date(year, month, 0).getDate();
 
-    // ── DOJ ──────────────────────────────────────────────────────────────────
     const firstActiveDay = firstActiveDayOfMonth(employee.dateOfJoining, month, year, daysInMonth);
     const preJoiningDays = Math.max(0, firstActiveDay - 1);
     const activeDaysInMonth = daysInMonth - preJoiningDays;
 
-    // ── 24-day CL eligibility ─────────────────────────────────────────────────
     const daysSinceDOJ = calendarDaysSinceDOJ(employee.dateOfJoining, month, year);
     const clEligible = daysSinceDOJ >= 24;
 
@@ -277,10 +275,8 @@ function computeEmployeePayroll(employee, ctx) {
         }
     }
 
-    // ── Divisor ───────────────────────────────────────────────────────────────
     const divisor = daysInMonth;
 
-    // ── Earnings ──────────────────────────────────────────────────────────────
     const fullGross = Number(employee.salary?.gross || 0);
     const fullBasic = Number(employee.salary?.basic || 0);
     const fullHra = Number(employee.salary?.hra || 0);
@@ -303,7 +299,6 @@ function computeEmployeePayroll(employee, ctx) {
     const hraEarned = grossEarned - basicEarned;
     const specialEarned = 0;
 
-    // ── Deductions ────────────────────────────────────────────────────────────
     const epfCap = salaryCfg?.epfCapAmount ?? 1800;
     const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
     const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
@@ -318,7 +313,6 @@ function computeEmployeePayroll(employee, ctx) {
     const netPay = grossEarned - totalDeductions;
     const roundedNetPay = settings.roundNetPay ? Math.round(netPay) : netPay;
 
-    // ── Leave balance snapshot ────────────────────────────────────────────────
     const leaveBalanceSnapshot = (() => {
         const clEnt = clEligible ? (leaveBalance?.entitlement?.CL ?? CL_ENT_DEFAULT) : 0;
         const slEnt = leaveBalance?.entitlement?.SL ?? SL_ENT_DEFAULT;
@@ -471,6 +465,144 @@ async function loadMonthContext(month, year) {
     }
 
     return { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HELPER: Send push notifications for payroll events
+//  *** EXTRACTED & FIXED — single source of truth for push logic ***
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function sendPayrollPushNotifications(month, year, type = "generated", employeeIdFilter = null) {
+    const result = { sent: 0, failed: 0, details: [] };
+
+    try {
+        // *** FIXED: Query excludes both null AND empty string ***
+        const tokenQuery = {
+            pushToken: { $exists: true, $nin: [null, ""] },
+            $or: [{ status: "active" }, { isActive: true }],
+        };
+
+        // If filtering by specific employees (e.g., mark-paid only for paid items)
+        if (employeeIdFilter && employeeIdFilter.length > 0) {
+            tokenQuery._id = { $in: employeeIdFilter };
+        }
+
+        console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] ── Querying employees...`);
+        console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] Query:`, JSON.stringify(tokenQuery));
+
+        const empWithTokens = await Employee.find(tokenQuery)
+            .select("pushToken firstName lastName profilePhoto")
+            .lean();
+
+        console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] Found ${empWithTokens.length} employee(s) with push tokens`);
+
+        if (empWithTokens.length === 0) {
+            console.warn(`[PAYROLL-PUSH-${type.toUpperCase()}] ❌ No employees with valid push tokens found!`);
+            console.warn(`[PAYROLL-PUSH-${type.toUpperCase()}]    Run this MongoDB query to check:`);
+            console.warn(`[PAYROLL-PUSH-${type.toUpperCase()}]    db.employees.find({pushToken:{$nin:[null,""]}, $or:[{status:"active"},{isActive:true}]}, {firstName:1, pushToken:1})`);
+            return result;
+        }
+
+        const messages = [];
+        const skippedInvalid = [];
+
+        for (const emp of empWithTokens) {
+            if (!Expo.isExpoPushToken(emp.pushToken)) {
+                console.warn(`[PAYROLL-PUSH-${type.toUpperCase()}] ⚠ Invalid token for ${emp.firstName}: "${emp.pushToken}" — cleaning up`);
+                skippedInvalid.push(emp._id);
+                continue;
+            }
+
+            const title = type === "paid"
+                ? "Salary Credited"
+                : "Payslip Generated";
+            const body = type === "paid"
+                ? `Hi ${emp.firstName}, your salary for ${MONTH_NAMES[month]} ${year} has been credited to your account. Tap to view your payslip.`
+                : `Hi ${emp.firstName}, your payslip for ${MONTH_NAMES[month]} ${year} has been processed. Open the app to view details.`;
+
+            messages.push({
+                to: emp.pushToken,
+                sound: "default",
+                title,
+                body,
+                data: {
+                    type: "payroll",
+                    month,
+                    year,
+                    screen: "Salary",
+                    profilePhoto: emp.profilePhoto?.url || null,
+                },
+                categoryId: "payroll",
+                channelId: "payroll",
+                priority: "high",
+                badge: 1,
+            });
+            console.log(`[PAYROLL-PUSH-${type.toUpperCase()}]   → ${emp.firstName} ${emp.lastName || ""} | ${emp.pushToken.substring(0, 35)}...`);
+        }
+
+        // Clean up invalid tokens
+        if (skippedInvalid.length > 0) {
+            await Employee.updateMany(
+                { _id: { $in: skippedInvalid } },
+                { $set: { pushToken: null } }
+            ).catch(e => console.warn("[PAYROLL-PUSH] Cleanup error:", e.message));
+            console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] Cleaned ${skippedInvalid.length} invalid token(s)`);
+        }
+
+        if (messages.length === 0) {
+            console.warn(`[PAYROLL-PUSH-${type.toUpperCase()}] No valid messages to send after filtering`);
+            return result;
+        }
+
+        console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] Sending ${messages.length} notification(s) via Expo...`);
+
+        const chunks = expo.chunkPushNotifications(messages);
+        const staleTokenIds = [];
+
+        for (const chunk of chunks) {
+            try {
+                const receipts = await expo.sendPushNotificationsAsync(chunk);
+                console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] Receipts:`, JSON.stringify(receipts));
+
+                for (let i = 0; i < receipts.length; i++) {
+                    const receipt = receipts[i];
+                    if (receipt.status === "ok") {
+                        result.sent++;
+                        console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] ✓ OK → ${chunk[i].to.substring(0, 35)}...`);
+                    } else {
+                        result.failed++;
+                        console.warn(`[PAYROLL-PUSH-${type.toUpperCase()}] ✗ FAIL → ${chunk[i].to}: ${receipt.message || JSON.stringify(receipt.details)}`);
+
+                        // Mark stale device tokens for cleanup
+                        if (receipt.details?.error === "DeviceNotRegistered") {
+                            const staleEmp = empWithTokens.find(e => e.pushToken === chunk[i].to);
+                            if (staleEmp) staleTokenIds.push(staleEmp._id);
+                        }
+                    }
+                }
+            } catch (chunkErr) {
+                console.error(`[PAYROLL-PUSH-${type.toUpperCase()}] CHUNK ERROR:`, chunkErr.message);
+                result.failed += chunk.length;
+            }
+        }
+
+        // Clean up DeviceNotRegistered tokens
+        if (staleTokenIds.length > 0) {
+            await Employee.updateMany(
+                { _id: { $in: staleTokenIds } },
+                { $set: { pushToken: null } }
+            ).catch(e => console.warn("[PAYROLL-PUSH] Stale cleanup error:", e.message));
+            console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] Cleaned ${staleTokenIds.length} stale (DeviceNotRegistered) token(s)`);
+        }
+
+        console.log(`[PAYROLL-PUSH-${type.toUpperCase()}] ══ DONE: ${result.sent} sent, ${result.failed} failed ══`);
+    } catch (pushErr) {
+        console.error(`[PAYROLL-PUSH-${type.toUpperCase()}] ❌ CRITICAL ERROR:`, pushErr.message);
+        console.error(`[PAYROLL-PUSH-${type.toUpperCase()}] Stack:`, pushErr.stack);
+        result.error = pushErr.message;
+    }
+
+    return result;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -730,52 +862,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
         payrollRun.processedAt = new Date();
         await payrollRun.save();
 
-        // ── Send push notifications (inline — same as test endpoint) ─────
-        let pushResult = { sent: 0, failed: 0, details: [] };
-        try {
-            // Find ALL employees with push tokens (same query as test endpoint)
-            const empWithTokens = await Employee.find({
-                pushToken: { $ne: null, $exists: true },
-                $or: [{ status: "active" }, { isActive: true }],
-            }).select("pushToken firstName lastName").lean();
-
-            console.log(`[PAYROLL-PUSH] Found ${empWithTokens.length} employee(s) with push tokens`);
-
-            const messages = [];
-            for (const emp of empWithTokens) {
-                if (!Expo.isExpoPushToken(emp.pushToken)) {
-                    console.log(`[PAYROLL-PUSH] Skipping invalid token: ${emp.pushToken}`);
-                    continue;
-                }
-                messages.push({
-                    to: emp.pushToken,
-                    sound: "default",
-                    title: "💰 Payslip Generated",
-                    body: `Hi ${emp.firstName}, your payslip for ${MONTH_NAMES[month]} ${year} has been processed. Open the app to view details.`,
-                    data: { type: "payroll", month, year, screen: "Salary" },
-                    channelId: "payroll",
-                    priority: "high",
-                });
-            }
-
-            console.log(`[PAYROLL-PUSH] Sending ${messages.length} notification(s)...`);
-
-            if (messages.length > 0) {
-                const chunks = expo.chunkPushNotifications(messages);
-                for (const chunk of chunks) {
-                    const receipts = await expo.sendPushNotificationsAsync(chunk);
-                    console.log(`[PAYROLL-PUSH] Receipts:`, JSON.stringify(receipts));
-                    for (const r of receipts) {
-                        if (r.status === "ok") pushResult.sent++;
-                        else pushResult.failed++;
-                    }
-                }
-            }
-            console.log(`[PAYROLL-PUSH] ✓ Done: ${pushResult.sent} sent, ${pushResult.failed} failed`);
-        } catch (pushErr) {
-            console.error("[PAYROLL-PUSH] ✗ Error:", pushErr.message, pushErr.stack);
-            pushResult.error = pushErr.message;
-        }
+        // *** FIXED: Use the extracted helper with corrected query ***
+        // No push notification on /run — only sent when marked as paid
 
         res.json({
             success: true,
@@ -788,7 +876,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
                     totalPF, totalESIC,
                     clAdjustmentsApplied: clBalanceUpdates.length,
                 },
-                pushNotifications: pushResult,
             },
         });
     } catch (err) {
@@ -1065,52 +1152,18 @@ router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
 
         await Payroll.updateOne({ month, year }, { $set: { status: "paid" } });
 
-        // ── Send "salary paid" push notifications (inline) ─────────────
+        // *** FIXED: Use the extracted helper with corrected query ***
         let pushResult = { sent: 0, failed: 0 };
         if (result.modifiedCount > 0) {
-            try {
-                const paidItems = await PayrollItem.find({ month, year, status: "paid" })
-                    .select("employeeId")
-                    .lean();
-                const employeeIds = paidItems.map(i => i.employeeId);
+            // Get employee IDs from paid items to target notifications
+            const paidItems = await PayrollItem.find({ month, year, status: "paid" })
+                .select("employeeId")
+                .lean();
+            const employeeIds = paidItems.map(i => i.employeeId);
 
-                const empWithTokens = await Employee.find({
-                    _id: { $in: employeeIds },
-                    pushToken: { $ne: null, $exists: true },
-                }).select("pushToken firstName").lean();
-
-                console.log(`[PAYROLL-PAID-PUSH] Found ${empWithTokens.length} employee(s) with tokens`);
-
-                const messages = [];
-                for (const emp of empWithTokens) {
-                    if (!Expo.isExpoPushToken(emp.pushToken)) continue;
-                    messages.push({
-                        to: emp.pushToken,
-                        sound: "default",
-                        title: "✅ Salary Credited",
-                        body: `Hi ${emp.firstName}, your salary for ${MONTH_NAMES[month]} ${year} has been credited. Open the app to view your payslip.`,
-                        data: { type: "payroll", month, year, screen: "Salary" },
-                        channelId: "payroll",
-                        priority: "high",
-                    });
-                }
-
-                if (messages.length > 0) {
-                    const chunks = expo.chunkPushNotifications(messages);
-                    for (const chunk of chunks) {
-                        const receipts = await expo.sendPushNotificationsAsync(chunk);
-                        console.log(`[PAYROLL-PAID-PUSH] Receipts:`, JSON.stringify(receipts));
-                        for (const r of receipts) {
-                            if (r.status === "ok") pushResult.sent++;
-                            else pushResult.failed++;
-                        }
-                    }
-                }
-                console.log(`[PAYROLL-PAID-PUSH] ✓ Done: ${pushResult.sent} sent, ${pushResult.failed} failed`);
-            } catch (pushErr) {
-                console.error("[PAYROLL-PAID-PUSH] ✗ Error:", pushErr.message);
-                pushResult.error = pushErr.message;
-            }
+            pushResult = await sendPayrollPushNotifications(month, year, "paid", employeeIds);
+        } else {
+            console.log(`[PAYROLL-MARK-PAID] No items were modified (already paid or no processed items)`);
         }
 
         res.json({
@@ -1245,30 +1298,8 @@ function formatVal(v) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  GET /export  ──  Salary Sheet in company format (matches reference Excel)
+//  GET /export
 // ═════════════════════════════════════════════════════════════════════════════
-//
-//  Column layout (A = always blank, data starts at B):
-//
-//  B  Emp Code         C  Name             D  Department      E  Designation
-//  F  Gross Salary*    G  Basic*           H  HRA*            I  Food Allowance*
-//  J  Days of Month    K  Actual Days      L  Gross Salary†   M  BAS†
-//  N  HRA†             O  Tot Earnings     P  ESIEMPLYE       Q  ESIEMPR
-//  R  LN/ADV           S  PFEMPCONT        T  PFEMPR
-//  U  Tot Deductions   V  Net Salary
-//
-//  * = monthly rate (CTC component), † = earned/prorated this month
-//  Food Allowance is CTC-only and NOT included in Tot Earnings or Gross earned.
-//
-//  Color key (header bands):
-//    Violet  → Title / company branding
-//    Slate   → Identity columns (B–E)
-//    Blue    → Monthly CTC rate columns (F–I)
-//    Cyan    → Attendance day columns (J–K)
-//    Green   → Earned-this-month columns (L–O)
-//    Rose    → Deduction columns (P–U)
-//    Emerald → Net Salary column (V)
-//
 router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const ExcelJS = require("exceljs");
@@ -1296,7 +1327,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
             employees.map((e) => [String(e._id), decryptEmployeeDoc(e)])
         );
 
-        // ── Workbook & worksheet ─────────────────────────────────────────────
         const wb = new ExcelJS.Workbook();
         wb.creator = "Grav Clothing HRMS";
 
@@ -1305,56 +1335,21 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
             pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
         });
 
-        // ── Column widths (22 cols: A–V) ──────────────────────────────────────
         const COL_WIDTHS = [
-            3,    // A – blank spacer
-            12,   // B – Emp Code
-            30,   // C – Name
-            20,   // D – Department
-            22,   // E – Designation
-            13,   // F – Gross Salary (rate)
-            11,   // G – Basic (rate)
-            11,   // H – HRA (rate)
-            14,   // I – Food Allowance
-            10,   // J – Days of Month
-            10,   // K – Actual Days
-            13,   // L – Gross Salary (earned)
-            11,   // M – BAS
-            11,   // N – HRA
-            13,   // O – Tot Earnings
-            11,   // P – ESIEMPLYE
-            11,   // Q – ESIEMPR
-            11,   // R – LN/ADV
-            11,   // S – PFEMPCONT
-            11,   // T – PFEMPR
-            14,   // U – Tot Deductions
-            13,   // V – Net Salary
+            3, 12, 30, 20, 22, 13, 11, 11, 14, 10, 10, 13, 11, 11, 13, 11, 11, 11, 11, 11, 14, 13,
         ];
         COL_WIDTHS.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
 
-        // ── Color palette ─────────────────────────────────────────────────────
-        // Header fills — one distinct color per logical section
         const HDR = {
-            identity: "FF1E293B",   // slate-800   B–E
-            rate: "FF1D4ED8",   // blue-700    F–I  (monthly CTC)
-            days: "FF0E7490",   // cyan-700    J–K
-            earned: "FF166534",   // green-800   L–O
-            ded: "FF9F1239",   // rose-800    P–U
-            net: "FF065F46",   // emerald-900 V
+            identity: "FF1E293B", rate: "FF1D4ED8", days: "FF0E7490",
+            earned: "FF166534", ded: "FF9F1239", net: "FF065F46",
         };
-        // Data-row section background tints (very light, for zebra+section effect)
         const TINT = {
-            identity: "FFFFFFFF",   // white
-            rate: "FFEFF6FF",   // blue-50
-            days: "FFF0FDFA",   // cyan-50
-            earned: "FFF0FDF4",   // green-50
-            ded: "FFFFF1F2",   // rose-50
-            net: "FFD1FAE5",   // emerald-100 (a bit stronger so it stands out)
+            identity: "FFFFFFFF", rate: "FFEFF6FF", days: "FFF0FDFA",
+            earned: "FFF0FDF4", ded: "FFFFF1F2", net: "FFD1FAE5",
         };
-        // Stripe for even rows (applied on top of tints using a slight darkening)
-        const STRIPE = "FFF1F5F9"; // slate-100
+        const STRIPE = "FFF1F5F9";
 
-        // Returns the header fill ARGB for a given 1-based column number
         function hdrFill(colNum) {
             if (colNum >= 2 && colNum <= 5) return HDR.identity;
             if (colNum >= 6 && colNum <= 9) return HDR.rate;
@@ -1365,9 +1360,7 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
             return HDR.identity;
         }
 
-        // Returns the data-cell background ARGB for a given column + row parity
         function cellFill(colNum, isEvenRow) {
-            // Net salary always gets the strong tint regardless of row parity
             if (colNum === 22) return TINT.net;
             const base =
                 colNum >= 2 && colNum <= 5 ? TINT.identity :
@@ -1375,8 +1368,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
                         colNum >= 10 && colNum <= 11 ? TINT.days :
                             colNum >= 12 && colNum <= 15 ? TINT.earned :
                                 colNum >= 16 && colNum <= 21 ? TINT.ded : "FFFFFFFF";
-            // Even rows: use the stripe color for identity/days/earned/ded sections
-            // Rate and net keep their tint always so they stay visually distinct
             if (isEvenRow && colNum !== 22 && !(colNum >= 6 && colNum <= 9)) {
                 return STRIPE;
             }
@@ -1389,26 +1380,22 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
             left: { style: t, color: { argb } }, right: { style: t, color: { argb } },
         });
 
-        // ── Row 1 — Title ────────────────────────────────────────────────────
         ws.mergeCells(1, 1, 1, 22);
         const r1 = ws.getCell(1, 1);
         r1.value = `GRAV CLOTHING  ·  Salary Sheet  ·  ${MONTH_NAMES[month]} ${year}`;
         r1.font = { name: "Arial", size: 13, bold: true, color: { argb: "FFFFFFFF" } };
-        r1.fill = solid("FF5B21B6");   // violet-700
+        r1.fill = solid("FF5B21B6");
         r1.alignment = { horizontal: "center", vertical: "middle" };
         ws.getRow(1).height = 30;
 
-        // ── Row 2 — Selection / sub-title ────────────────────────────────────
         ws.mergeCells(2, 1, 2, 22);
         const r2 = ws.getCell(2, 1);
         r2.value = `Selection :- ${MONTH_NAMES[month].slice(0, 3).toUpperCase()}-${year}`;
-        r2.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF4C1D95" } };  // violet-900
-        r2.fill = solid("FFEDE9FE");   // violet-100
+        r2.font = { name: "Arial", size: 10, bold: true, color: { argb: "FF4C1D95" } };
+        r2.fill = solid("FFEDE9FE");
         r2.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
         ws.getRow(2).height = 18;
 
-        // ── Row 3 — Section-label banner ─────────────────────────────────────
-        // Merge cells per section and label them so readers know what each group means
         const SECTIONS = [
             { start: 2, end: 5, label: "Employee Details", bg: "FF1E293B" },
             { start: 6, end: 9, label: "Monthly CTC", bg: "FF1D4ED8" },
@@ -1428,30 +1415,13 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         });
         ws.getRow(3).height = 13;
 
-        // ── Row 4 — Column headers ───────────────────────────────────────────
         const HEADERS = [
-            "",                          // 1  A – blank
-            "Emp Code",                  // 2  B
-            "Name",                      // 3  C
-            "Department",                // 4  D
-            "Designation",               // 5  E
-            "Gross Salary",              // 6  F – monthly rate
-            "Basic",                     // 7  G – monthly rate
-            "HRA",                       // 8  H – monthly rate
-            "Food\nAllowance",           // 9  I – CTC only
-            "No. of Days\nof the Month", // 10 J
-            "Actual Days\nWork Done",    // 11 K
-            "Gross Salary",              // 12 L – earned
-            "BAS",                       // 13 M – earned basic
-            "HRA",                       // 14 N – earned HRA
-            "Tot Earnings",              // 15 O
-            "ESIEMPLYE",                 // 16 P
-            "ESIEMPR",                   // 17 Q
-            "LN/ADV",                    // 18 R
-            "PFEMPCONT",                 // 19 S
-            "PFEMPR",                    // 20 T
-            "Tot Deductions",            // 21 U
-            "Net Salary",                // 22 V
+            "", "Emp Code", "Name", "Department", "Designation",
+            "Gross Salary", "Basic", "HRA", "Food\nAllowance",
+            "No. of Days\nof the Month", "Actual Days\nWork Done",
+            "Gross Salary", "BAS", "HRA", "Tot Earnings",
+            "ESIEMPLYE", "ESIEMPR", "LN/ADV", "PFEMPCONT", "PFEMPR",
+            "Tot Deductions", "Net Salary",
         ];
 
         const hRow = ws.getRow(4);
@@ -1467,7 +1437,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         });
         hRow.height = 38;
 
-        // ── Data rows (start at row 5) ────────────────────────────────────────
         const DATA_START = 5;
         const daysInMonth = new Date(year, month, 0).getDate();
         const moneyFmt = "#,##0";
@@ -1483,37 +1452,19 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
             const isEvenRow = idx % 2 === 1;
 
             const values = [
-                "",                                    // 1  A
-                it.biometricId || "",                // 2  B – Emp Code
-                it.employeeName || "",                // 3  C – Name
-                it.department || "",                // 4  D – Department
-                it.designation || "",                // 5  E – Designation
-                it.rateGross || 0,                 // 6  F – Gross Salary (rate)
-                it.rateBasic || 0,                 // 7  G – Basic (rate)
-                it.rateHra || 0,                 // 8  H – HRA (rate)
-                foodAllow,                             // 9  I – Food Allowance
-                daysInMonth,                           // 10 J – Days of Month
-                it.payableDays ?? 0,                 // 11 K – Actual Days
-                grossEarned,                           // 12 L – Gross Salary (earned)
-                e.basicSalary || 0,                 // 13 M – BAS
-                e.houseRentAllowance || 0,             // 14 N – HRA
-                grossEarned,                           // 15 O – Tot Earnings
-                d.esic || 0,                 // 16 P – ESIEMPLYE
-                d.employerESIC || 0,                 // 17 Q – ESIEMPR
-                lnAdv,                                 // 18 R – LN/ADV
-                d.providentFund || 0,                 // 19 S – PFEMPCONT
-                d.employerPF || d.providentFund || 0,  // 20 T – PFEMPR
-                d.totalDeductions || 0,                // 21 U – Tot Deductions
-                it.roundedNetPay ?? it.netPay ?? 0,   // 22 V – Net Salary
+                "", it.biometricId || "", it.employeeName || "", it.department || "", it.designation || "",
+                it.rateGross || 0, it.rateBasic || 0, it.rateHra || 0, foodAllow,
+                daysInMonth, it.payableDays ?? 0,
+                grossEarned, e.basicSalary || 0, e.houseRentAllowance || 0, grossEarned,
+                d.esic || 0, d.employerESIC || 0, lnAdv, d.providentFund || 0, d.employerPF || d.providentFund || 0,
+                d.totalDeductions || 0, it.roundedNetPay ?? it.netPay ?? 0,
             ];
 
             const row = ws.getRow(DATA_START + idx);
             values.forEach((v, i) => { row.getCell(i + 1).value = v; });
 
             row.eachCell({ includeEmpty: true }, (cell, colNum) => {
-                // Skip col A (blank spacer)
                 if (colNum === 1) return;
-
                 cell.font = { name: "Arial", size: 9 };
                 cell.fill = solid(cellFill(colNum, isEvenRow));
                 cell.alignment = {
@@ -1525,23 +1476,17 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
                     cell.numFmt = colNum === 11 ? daysFmt : moneyFmt;
                 }
                 cell.border = border("thin");
-
-                // Make the Net Salary value bold and use a deep green text
                 if (colNum === 22) {
                     cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FF065F46" } };
                 }
-                // Deduction totals in muted rose text
                 if (colNum === 21) {
                     cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FF9F1239" } };
                 }
             });
-
             row.height = 19;
         });
 
-        // ── Summary row ───────────────────────────────────────────────────────
         const sumRow = ws.getRow(DATA_START + items.length);
-
         sumRow.getCell(2).value = "Summary";
         sumRow.getCell(3).value = `Count - ${items.length}`;
 
@@ -1571,15 +1516,13 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
 
         sumRow.eachCell({ includeEmpty: false }, (cell, colNum) => {
             if (colNum === 1) return;
-            // Section-tinted summary fills — slightly darker than data tints
             const sumFill =
                 colNum >= 2 && colNum <= 5 ? "FFFBFAFF" :
-                    colNum >= 6 && colNum <= 9 ? "FFDBEAFE" :  // blue-100
-                        colNum >= 10 && colNum <= 11 ? "FFCFFAFE" :  // cyan-100
-                            colNum >= 12 && colNum <= 15 ? "FFDCFCE7" :  // green-100
-                                colNum >= 16 && colNum <= 21 ? "FFFFE4E6" :  // rose-100
-                                    colNum === 22 ? "FFA7F3D0" :   // emerald-200
-                                        "FFFEFCE8";
+                    colNum >= 6 && colNum <= 9 ? "FFDBEAFE" :
+                        colNum >= 10 && colNum <= 11 ? "FFCFFAFE" :
+                            colNum >= 12 && colNum <= 15 ? "FFDCFCE7" :
+                                colNum >= 16 && colNum <= 21 ? "FFFFE4E6" :
+                                    colNum === 22 ? "FFA7F3D0" : "FFFEFCE8";
 
             cell.font = {
                 name: "Arial", size: 9, bold: true,
@@ -1603,7 +1546,6 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
         });
         sumRow.height = 22;
 
-        // ── Stream to client ──────────────────────────────────────────────────
         const buffer = await wb.xlsx.writeBuffer();
         const filename = `salary_sheet_${year}-${String(month).padStart(2, "0")}.xlsx`;
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
