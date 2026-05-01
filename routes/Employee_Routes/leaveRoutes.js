@@ -24,6 +24,7 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const multer = require("multer");
+const { notifyManagerOnLeaveApply, notifySecondaryOnPrimaryApproval, notifyEmployeeOnLeaveAction } = require("../../services/leaveNotification.service");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 
 // multer — memory storage, max 10 MB, PDF + images only
@@ -412,9 +413,19 @@ router.post("/manager/add-on-behalf", AllEmployeeAppMiddleware, async (req, res)
 
         if (status === "hr_approved") {
             try {
-                await LeaveBalance.findOneAndUpdate({ employeeId, year },
-                    { $setOnInsert: { employeeId, biometricId: targetEmp.biometricId || "", year, entitlement: { CL: config.clPerYear, SL: config.slPerYear, PL: 0 }, consumed: { CL: 0, SL: 0, PL: 0 } }, $inc: { [`consumed.${leaveType}`]: totalDays } },
-                    { upsert: true });
+                const existBal = await LeaveBalance.findOne({ employeeId, year });
+                if (existBal) {
+                    existBal.consumed[leaveType] = (existBal.consumed[leaveType] || 0) + totalDays;
+                    await existBal.save();
+                } else {
+                    const initConsumed = { CL: 0, SL: 0, PL: 0 };
+                    initConsumed[leaveType] = totalDays;
+                    await LeaveBalance.create({
+                        employeeId, biometricId: targetEmp.biometricId || "", year,
+                        entitlement: { CL: config.clPerYear, SL: config.slPerYear, PL: 0 },
+                        consumed: initConsumed,
+                    });
+                }
             } catch (e) { console.warn("[MGR-ONBEHALF] balance:", e.message); }
             try {
                 const { applyLeaveToAttendance } = require("../HrRoutes/Attendance_section");
@@ -647,6 +658,10 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
             }
         } catch (_) { }
 
+        notifyManagerOnLeaveApply(emp, app).catch(e =>
+            console.warn("[LEAVE-PUSH] Manager notification failed:", e.message)
+        );
+
         const responseMsg = requiresDocument
             ? `Leave application submitted. Note: You need to submit supporting documents for ${totalDays} days of Sick Leave.`
             : "Leave application submitted successfully";
@@ -865,6 +880,11 @@ router.patch("/manager/:id/approve", AllEmployeeAppMiddleware, async (req, res) 
                 }
             } catch (_) { }
 
+            notifySecondaryOnPrimaryApproval(app).catch(e =>
+                console.warn("[LEAVE-PUSH] Secondary manager notification failed:", e.message)
+            );
+
+
             return res.json({ success: true, data: app, message: "Leave approved by primary manager. Awaiting secondary manager approval." });
         }
 
@@ -880,20 +900,21 @@ router.patch("/manager/:id/approve", AllEmployeeAppMiddleware, async (req, res) 
         // Consume balance
         const year = new Date(app.fromDate).getFullYear();
         const config = await LC.getConfig();
-        await LB.findOneAndUpdate(
-            { employeeId: app.employeeId, year },
-            {
-                $setOnInsert: {
-                    employeeId: app.employeeId,
-                    biometricId: app.biometricId || "",
-                    year,
-                    entitlement: { CL: config.clPerYear, SL: config.slPerYear, PL: 0 },
-                    consumed: { CL: 0, SL: 0, PL: 0 },
-                },
-                $inc: { [`consumed.${app.leaveType}`]: app.totalDays },
-            },
-            { upsert: true }
-        );
+        const existingBal = await LB.findOne({ employeeId: app.employeeId, year });
+        if (existingBal) {
+            existingBal.consumed[app.leaveType] = (existingBal.consumed[app.leaveType] || 0) + app.totalDays;
+            await existingBal.save();
+        } else {
+            const newConsumed = { CL: 0, SL: 0, PL: 0 };
+            newConsumed[app.leaveType] = app.totalDays;
+            await LB.create({
+                employeeId: app.employeeId,
+                biometricId: app.biometricId || "",
+                year,
+                entitlement: { CL: config.clPerYear, SL: config.slPerYear, PL: 0 },
+                consumed: newConsumed,
+            });
+        }
 
         // Sync to attendance
         let attendanceResult = { applied: 0, skipped: 0 };
@@ -917,6 +938,11 @@ router.patch("/manager/:id/approve", AllEmployeeAppMiddleware, async (req, res) 
                 });
             }
         } catch (_) { }
+
+        const mgrName = mgr?.managerName || "Manager";
+        notifyEmployeeOnLeaveAction(app, "approved", mgrName).catch(e =>
+            console.warn("[LEAVE-PUSH] Employee approval notification failed:", e.message)
+        );
 
         res.json({
             success: true,
@@ -971,6 +997,11 @@ router.patch("/manager/:id/reject", AllEmployeeAppMiddleware, async (req, res) =
                 });
             }
         } catch (_) { }
+
+        const rejMgrName = mgr?.managerName || "Manager";
+        notifyEmployeeOnLeaveAction(app, "rejected", rejMgrName).catch(e =>
+            console.warn("[LEAVE-PUSH] Employee rejection notification failed:", e.message)
+        );
 
         res.json({ success: true, data: app, message: "Leave rejected by manager" });
     } catch (err) {
