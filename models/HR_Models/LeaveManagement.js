@@ -158,6 +158,7 @@ const leaveApplicationSchema = new mongoose.Schema(
         cancelledAt: { type: Date },
         cancelReason: { type: String },
 
+        
         appliedToAttendance: { type: Boolean, default: false },
         appliedAt: { type: Date },
     },
