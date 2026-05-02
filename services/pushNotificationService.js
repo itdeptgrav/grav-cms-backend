@@ -12,9 +12,9 @@ async function sendPayrollNotifications(month, year, employeeIds = [], type = "g
             "July", "August", "September", "October", "November", "December",
         ];
 
-        // *** FIXED: Query filter excludes both null AND empty string ***
+        // Find employees with push tokens
         const filter = {
-            pushToken: { $exists: true, $nin: [null, ""] },
+            pushToken: { $ne: null, $exists: true },
             $or: [{ status: "active" }, { isActive: true }],
         };
         if (employeeIds.length > 0) {
@@ -22,7 +22,6 @@ async function sendPayrollNotifications(month, year, employeeIds = [], type = "g
         }
 
         console.log("[PUSH] ── Querying employees with push tokens...");
-        console.log("[PUSH] Query filter:", JSON.stringify(filter));
 
         const employees = await Employee.find(filter)
             .select("pushToken firstName lastName biometricId status isActive")
@@ -31,11 +30,7 @@ async function sendPayrollNotifications(month, year, employeeIds = [], type = "g
         console.log(`[PUSH] Found ${employees.length} employee(s) with push tokens`);
 
         if (employees.length === 0) {
-            console.log("[PUSH] ❌ No employees with push tokens found");
-            console.log("[PUSH]    Check that:");
-            console.log("[PUSH]    1. Employees have status 'active' or isActive: true");
-            console.log("[PUSH]    2. pushToken field is saved (not null/empty)");
-            console.log("[PUSH]    3. Mobile app has registered tokens successfully");
+            console.log("[PUSH] No employees with push tokens found — check that employees have status 'active' or isActive: true");
             return { sent: 0, failed: 0 };
         }
 

@@ -4,6 +4,11 @@ const router = express.Router();
 
 const Employee = require("../../models/Employee");
 const { PayrollItem } = require("../../models/HR_Models/Payroll");
+
+// ★ FIX: Import BOTH middlewares
+// AllEmployeeAppMiddleware works with cookie auth (used by mobile app)
+// EmployeeAuthMiddlewear works with Authorization header (used by HR dashboard)
+const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 const MONTH_NAMES = [
@@ -105,13 +110,19 @@ function buildPayslipPayload(item, employee) {
     };
 }
 
-// ── GET /history - Get payslip history for employee ────────────────────────
-router.get("/:employeeId/history", EmployeeAuthMiddlewear, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════
+//  ★ EMPLOYEE-FACING ROUTES — use AllEmployeeAppMiddleware (cookie auth)
+//    This is what makes the mobile app work. The cookie-based middleware
+//    accepts the employee_token cookie that the mobile app sends.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── GET /:employeeId/history — Payslip history ────────────────────────────
+router.get("/:employeeId/history", AllEmployeeAppMiddleware, async (req, res) => {
     try {
         const { user } = req;
         const { employeeId } = req.params;
 
-        // Authorization check - only allow access to own payslips or HR
+        // Authorization: employee can only see their own payslips
         if (user.role !== "hr_manager" && String(user.id) !== String(employeeId)) {
             return res.status(403).json({
                 success: false,
@@ -119,10 +130,9 @@ router.get("/:employeeId/history", EmployeeAuthMiddlewear, async (req, res) => {
             });
         }
 
-        // ONLY show paid payslips to employees (not processed)
         const items = await PayrollItem.find({
             employeeId,
-            status: "paid"  // Only paid payslips are visible
+            status: "paid"
         })
             .sort({ year: -1, month: -1 })
             .limit(24)
@@ -148,15 +158,14 @@ router.get("/:employeeId/history", EmployeeAuthMiddlewear, async (req, res) => {
     }
 });
 
-// ── GET /:employeeId - Get single payslip ──────────────────────────────────
-router.get("/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
+// ── GET /:employeeId — Single payslip with full details ───────────────────
+router.get("/:employeeId", AllEmployeeAppMiddleware, async (req, res) => {
     try {
         const { user } = req;
         const { employeeId } = req.params;
         const month = parseInt(req.query.month) || new Date().getMonth() + 1;
         const year = parseInt(req.query.year) || new Date().getFullYear();
 
-        // Authorization check
         if (user.role !== "hr_manager" && String(user.id) !== String(employeeId)) {
             return res.status(403).json({ success: false, message: "Access denied" });
         }
@@ -166,10 +175,7 @@ router.get("/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
             .lean();
 
         if (!employee) {
-            return res.status(404).json({
-                success: false,
-                message: "Employee not found"
-            });
+            return res.status(404).json({ success: false, message: "Employee not found" });
         }
 
         const item = await PayrollItem.findOne({ employeeId, month, year }).lean();
@@ -187,16 +193,17 @@ router.get("/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
     } catch (err) {
         console.error("[PAYSLIP-GET]", err);
         if (err.name === "CastError") {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid employee ID"
-            });
+            return res.status(400).json({ success: false, message: "Invalid employee ID" });
         }
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// ── GET /employees - List employees (for HR dropdown in payslip generator) ──
+// ═══════════════════════════════════════════════════════════════════════════
+//  HR-ONLY ROUTE — keeps EmployeeAuthMiddlewear (Authorization header)
+//  This is only used by the HR dashboard payslip generator dropdown.
+// ═══════════════════════════════════════════════════════════════════════════
+
 router.get("/employees", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { search = "", department = "", limit = 50 } = req.query;

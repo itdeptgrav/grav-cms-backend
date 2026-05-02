@@ -235,6 +235,8 @@ const employeeSchema = new mongoose.Schema({
   emailSentAt: { type: Date },
   emailError: { type: String },
 
+  pushToken: { type: String, default: null },
+
   // ─── SYSTEM ──────────────────────────────────────────────────────────────────
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
   createdAt: { type: Date, default: Date.now },
