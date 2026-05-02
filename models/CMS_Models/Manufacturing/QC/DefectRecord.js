@@ -1,8 +1,6 @@
 const mongoose = require("mongoose");
 
-// One doc per defect mark. Kept minimal as per spec — only
-// MO, WO, scanned barcode, operator, the operations they did,
-// plus a date string for fast date-range queries.
+// One doc per (barcode, operator, operation) defect mark.
 const DefectRecordSchema = new mongoose.Schema({
   date: { type: String, required: true, index: true }, // YYYY-MM-DD (IST)
 
@@ -10,12 +8,15 @@ const DefectRecordSchema = new mongoose.Schema({
   workOrderShortId: { type: String, required: true },
   workOrderId:      { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder" },
 
-  moRequestId:          { type: String }, // CustomerRequest.requestId
+  moRequestId:          { type: String },
   manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
 
   operatorId:   { type: String },
   operatorName: { type: String, required: true },
-  operations:   [{ type: String }], // operation codes only — names are looked up
+
+  // Single operation per record now
+  operationCode: { type: String, required: true, index: true },
+  operationName: { type: String }, // snapshot at mark time; routes also re-resolve from WO
 
   markedByQCName: { type: String },
   markedByQCId:   { type: String },
@@ -25,5 +26,10 @@ const DefectRecordSchema = new mongoose.Schema({
 
 DefectRecordSchema.index({ date: 1, operatorId: 1 });
 DefectRecordSchema.index({ markedAt: -1 });
+// Prevent the same op being marked twice for the same piece+operator
+DefectRecordSchema.index(
+  { barcodeId: 1, operatorId: 1, operationCode: 1 },
+  { unique: true, partialFilterExpression: { operatorId: { $exists: true, $ne: null } } }
+);
 
 module.exports = mongoose.model("DefectRecord", DefectRecordSchema);
