@@ -54,7 +54,7 @@ function buildPayslipPayload(item, employee) {
     const daysInMonth = item.daysInMonth ?? new Date(item.year, item.month, 0).getDate();
 
     return {
-        company: { name: "Grav Clothing", tagline: "GRAV CLOTHING LIMITED" },
+        company: { name: "Grav Clothing ( OPC ) Pvt Ltd", tagline: "Grav Clothing ( OPC ) Pvt Ltd" },
         period: { month: item.month, year: item.year, label: `${MONTH_NAMES[item.month]} ${item.year}` },
         employee: {
             id: employee._id,
