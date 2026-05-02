@@ -611,6 +611,8 @@ app.use("/api/ceo/inventory", ceoInventoryRoutes);
 
 const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
 app.use("/api/ceo/merchandiser", merchandiserRoutes);
+
+
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -627,6 +629,9 @@ app.use("/api/hr/overview", hrOverviewRoutes);
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
+
+const pushTokenRoutes = require("./routes/Employee_Routes/pushToken");
+app.use("/api/employee", pushTokenRoutes);
 
 /* =====================
     Customer ROUTES
@@ -793,6 +798,7 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 
 const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
 app.use("/api/hr/payroll", payrollRoutes);
+
 
 const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
 app.use("/hr/attendance", attendanceRouter);

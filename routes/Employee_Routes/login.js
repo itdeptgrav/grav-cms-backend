@@ -140,7 +140,6 @@ router.post("/login", async (req, res) => {
       maxAge: maxAge,
     });
 
-    // Return employee data
     res.status(200).json({
       success: true,
       message: "Employee login successful",
@@ -157,6 +156,7 @@ router.post("/login", async (req, res) => {
           profilePhoto: employee.profilePhoto?.url || null,
           role: employee.role || "employee",
         },
+        token,
       },
     });
   } catch (err) {
