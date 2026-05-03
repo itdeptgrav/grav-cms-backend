@@ -402,7 +402,8 @@ async function sendGroupMessage({ groupId, senderId, senderName, text, attachmen
     temp: false
   });
 
-  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `👥 ${group.name} · ${senderName}`, body: text.slice(0, 80), data: { groupId, messageId, groupName: group.name }, senderId, senderName });
+  const _gmBody = text ? text.slice(0, 80) : (attachments[0]?.type === "image" ? "📷 Photo" : attachments[0]?.type === "voice" ? "🎤 Voice message" : attachments[0]?.type === "pdf" ? "📄 Document" : attachments.length ? "📎 Attachment" : "");
+  await _notifyMany({ recipientIds: recipients, type: "group_message", title: `👥 ${group.name} · ${senderName}`, body: _gmBody, data: { groupId, messageId, groupName: group.name }, senderId, senderName });
   return msg;
 }
 
@@ -471,7 +472,8 @@ async function sendDirectMessage({ fromEmployeeId, toEmployeeId, senderName, tex
     temp: false
   });
 
-  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `💬 DM · ${senderName}`, body: text.slice(0, 80), data: { conversationId, messageId }, senderId: fromEmployeeId, senderName });
+  const _dmBody = text ? text.slice(0, 80) : (cleanAttachments[0]?.type === "image" ? "📷 Photo" : cleanAttachments[0]?.type === "voice" ? "🎤 Voice message" : cleanAttachments[0]?.type === "pdf" ? "📄 Document" : cleanAttachments.length ? "📎 Attachment" : "");
+  await _notifyMany({ recipientIds: [toEmployeeId], type: "direct_message", title: `💬 DM · ${senderName}`, body: _dmBody, data: { conversationId, messageId }, senderId: fromEmployeeId, senderName });
   return { messageData: msg, conversationId };
 }
 
