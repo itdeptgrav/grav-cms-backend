@@ -14,7 +14,7 @@ const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
 
 router.use(EmployeeAuthMiddleware);
 
-// ─── GST RULE (single source of truth) ────────────────────────────────────────
+// ─── GST RULE ─────────────────────────────────────────────────────────────────
 const getGSTPercentage = (unitPrice) => {
   const price = parseFloat(unitPrice) || 0;
   return price < 2499 ? 5 : 18;
@@ -34,13 +34,11 @@ const calculateItemTotals = (quantity, unitPrice, gstPercentage) => {
   };
 };
 
-
 // CREATE quotation for a request
 router.post("/requests/:requestId/quotation", async (req, res) => {
   try {
     const { requestId } = req.params;
     const quotationData = req.body;
-
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
 
@@ -168,7 +166,369 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
   }
 });
 
-// Payment submission status
+// ═══════════════════════════════════════════════════════════════════════════════
+// BATCH ADD EMPLOYEES TO MEASUREMENT-PO  (NEW)
+//
+// Body: { employeeIds: [id1, id2, id3, ...] }
+//
+// Loads request + measurement ONCE, processes each employee sequentially,
+// caches WO docs across the loop so multiple employees adding to the same WO
+// keep allocating non-overlapping unit ranges, then saves everything once.
+//
+// Returns per-employee results (succeeded/failed/skipped) so the UI can show
+// exactly what happened.
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post("/requests/:requestId/add-employees-batch", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { employeeIds } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(requestId)) {
+      return res.status(400).json({ success: false, message: "Invalid request id" });
+    }
+    if (!Array.isArray(employeeIds) || employeeIds.length === 0) {
+      return res.status(400).json({ success: false, message: "employeeIds array required" });
+    }
+
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (request.requestType !== "measurement_conversion" || !request.measurementId) {
+      return res.status(400).json({ success: false, message: "Only available for measurement POs" });
+    }
+
+    const measurement = await Measurement.findById(request.measurementId);
+    if (!measurement) return res.status(404).json({ success: false, message: "Measurement not found" });
+
+    // Caches that persist across the entire batch
+    const woCache = new Map();           // woIdStr -> WO doc (loaded once, mutated, saved at end)
+    const woOriginalQty = new Map();     // woIdStr -> qty BEFORE this batch (for proportional raw-material calc)
+    const woMaxUnitCache = new Map();    // woIdStr -> current max unitEnd (advances as we allocate)
+    const queuedProgressDocs = [];
+    const perEmployeeResults = [];
+
+    for (const employeeId of employeeIds) {
+      const result = {
+        employeeId,
+        employeeName: null,
+        success: false,
+        addedProducts: [],
+        skippedProducts: [],
+        error: null,
+      };
+
+      try {
+        if (!mongoose.Types.ObjectId.isValid(employeeId)) {
+          result.error = "Invalid employee id";
+          perEmployeeResults.push(result);
+          continue;
+        }
+
+        const employee = await EmployeeMpc.findById(employeeId)
+          .populate("products.productId", "name reference")
+          .lean();
+
+        if (!employee) { result.error = "Employee not found"; perEmployeeResults.push(result); continue; }
+        result.employeeName = employee.name;
+
+        if (measurement.organizationId.toString() !== employee.customerId?.toString()) {
+          result.error = "Employee not in this organization";
+          perEmployeeResults.push(result); continue;
+        }
+
+        const alreadyExists = (measurement.employeeMeasurements || []).some(
+          (e) => e.employeeId?.toString() === employeeId.toString()
+        );
+        if (alreadyExists) {
+          result.error = "Already in PO";
+          perEmployeeResults.push(result); continue;
+        }
+
+        if (!employee.products || employee.products.length === 0) {
+          result.error = "No products assigned";
+          perEmployeeResults.push(result); continue;
+        }
+
+        const productsToAddToMeasurement = [];
+        const employeeProgressDocs = [];
+
+        for (const empProd of employee.products) {
+          const empProdId = (empProd.productId?._id || empProd.productId)?.toString();
+          const empVariantId = empProd.variantId?.toString() || null;
+          const qty = empProd.quantity || 1;
+          const empProdName = empProd.productName?.trim() || empProd.productId?.name || "Unknown";
+
+          if (!empProdId) {
+            result.skippedProducts.push({ productName: empProdName, reason: "Missing productId" });
+            continue;
+          }
+
+          // Locate request item
+          const reqItem = request.items.find((it) => {
+            const iid = (it.stockItemId?._id || it.stockItemId)?.toString();
+            return iid === empProdId;
+          });
+          if (!reqItem) {
+            result.skippedProducts.push({ productName: empProdName, reason: "Not in PO" });
+            continue;
+          }
+
+          // Locate matching WO — first check cache, fall back to DB query
+          let matchingWO = null;
+
+          // Try cache first
+          for (const cachedWO of woCache.values()) {
+            if (cachedWO.stockItemId.toString() !== reqItem.stockItemId.toString()) continue;
+            if (empVariantId && cachedWO.variantId === empVariantId) { matchingWO = cachedWO; break; }
+          }
+
+          if (!matchingWO) {
+            const candidateWOs = await WorkOrder.find({
+              customerRequestId: request._id,
+              stockItemId: reqItem.stockItemId,
+            });
+
+            let foundWO = null;
+            if (empVariantId) foundWO = candidateWOs.find((w) => w.variantId === empVariantId);
+            if (!foundWO && candidateWOs.length > 0) foundWO = candidateWOs[0];
+
+            if (foundWO) {
+              const woIdStr = foundWO._id.toString();
+              if (woCache.has(woIdStr)) {
+                matchingWO = woCache.get(woIdStr);
+              } else {
+                woCache.set(woIdStr, foundWO);
+                woOriginalQty.set(woIdStr, foundWO.quantity || 0);
+
+                const lastProgress = await EmployeeProductionProgress.find({ workOrderId: foundWO._id })
+                  .select("unitEnd")
+                  .sort({ unitEnd: -1 })
+                  .limit(1)
+                  .lean();
+                woMaxUnitCache.set(woIdStr, lastProgress[0]?.unitEnd || 0);
+                matchingWO = foundWO;
+              }
+            }
+          }
+
+          if (!matchingWO) {
+            result.skippedProducts.push({ productName: empProdName, reason: "No matching work order" });
+            continue;
+          }
+
+          const blockedStatuses = ["completed", "cancelled", "forwarded"];
+          if (blockedStatuses.includes(matchingWO.status)) {
+            result.skippedProducts.push({ productName: empProdName, reason: `WO is ${matchingWO.status}` });
+            continue;
+          }
+
+          const woIdStr = matchingWO._id.toString();
+
+          // Find request variant matching this WO
+          let reqVariant = null;
+          if (empVariantId) {
+            reqVariant = reqItem.variants.find((v) => v.variantId && v.variantId.toString() === empVariantId);
+          }
+          if (!reqVariant && matchingWO.variantAttributes?.length) {
+            reqVariant = reqItem.variants.find((v) => {
+              if (!v.attributes || v.attributes.length === 0) return false;
+              return matchingWO.variantAttributes.every((wa) =>
+                v.attributes.find((a) => a.name === wa.name && a.value === wa.value)
+              );
+            });
+          }
+          if (!reqVariant && reqItem.variants.length > 0) reqVariant = reqItem.variants[0];
+
+          if (!reqVariant) {
+            result.skippedProducts.push({ productName: empProdName, reason: "No variant entry to extend" });
+            continue;
+          }
+
+          // Allocate unit range from in-memory cursor
+          const currentMax = woMaxUnitCache.get(woIdStr);
+          const unitStart = currentMax + 1;
+          const unitEnd = currentMax + qty;
+          woMaxUnitCache.set(woIdStr, unitEnd);
+
+          const woNumber = matchingWO.workOrderNumber;
+          const assignedBarcodeIds = [];
+          for (let u = unitStart; u <= unitEnd; u++) {
+            assignedBarcodeIds.push(`${woNumber}-${u.toString().padStart(3, "0")}`);
+          }
+
+          // Mutate WO quantity in-memory (raw materials recalc once per WO at end)
+          matchingWO.quantity = (matchingWO.quantity || 0) + qty;
+
+          // Mutate request item in-memory
+          const oldVariantQty = reqVariant.quantity || 0;
+          reqVariant.quantity = oldVariantQty + qty;
+          reqItem.totalQuantity = (reqItem.totalQuantity || 0) + qty;
+
+          if (oldVariantQty > 0 && reqVariant.estimatedPrice) {
+            const perUnitPrice = reqVariant.estimatedPrice / oldVariantQty;
+            const newVariantPrice = perUnitPrice * reqVariant.quantity;
+            const priceDelta = newVariantPrice - reqVariant.estimatedPrice;
+            reqVariant.estimatedPrice = parseFloat(newVariantPrice.toFixed(2));
+            reqItem.totalEstimatedPrice = parseFloat(((reqItem.totalEstimatedPrice || 0) + priceDelta).toFixed(2));
+          }
+
+          productsToAddToMeasurement.push({
+            productId: empProd.productId?._id || empProd.productId,
+            productName: empProdName,
+            variantId: empProd.variantId || null,
+            variantName: "Default",
+            quantity: qty,
+            measurements: [],
+            measuredAt: new Date(),
+            qrGenerated: false,
+            qrGeneratedAt: null,
+          });
+
+          employeeProgressDocs.push({
+            workOrderId: matchingWO._id,
+            manufacturingOrderId: request._id,
+            measurementId: measurement._id,
+            orderType: "measurement_conversion",
+            employeeId: employee._id,
+            employeeName: employee.name,
+            employeeUIN: employee.uin,
+            gender: employee.gender,
+            unitStart, unitEnd, totalUnits: qty,
+            assignedBarcodeIds,
+            productName: empProdName,
+          });
+
+          result.addedProducts.push({
+            productName: empProdName,
+            unitStart, unitEnd, totalUnits: qty,
+          });
+        }
+
+        if (productsToAddToMeasurement.length === 0) {
+          result.error = "No products could be added — all skipped";
+          perEmployeeResults.push(result);
+          continue;
+        }
+
+        // Push to measurement
+        measurement.employeeMeasurements.push({
+          employeeId: employee._id,
+          employeeName: employee.name,
+          employeeUIN: employee.uin,
+          gender: employee.gender,
+          products: productsToAddToMeasurement,
+          noProductAssigned: false,
+          categoryMeasurements: [],
+          isCompleted: false,
+          remarks: "",
+        });
+
+        if (!(measurement.registeredEmployeeIds || []).some((id) => id.toString() === employee._id.toString())) {
+          measurement.registeredEmployeeIds = measurement.registeredEmployeeIds || [];
+          measurement.registeredEmployeeIds.push(employee._id);
+        }
+        if (!(measurement.poCreatedForEmployeeIds || []).some((id) => id.toString() === employee._id.toString())) {
+          measurement.poCreatedForEmployeeIds = measurement.poCreatedForEmployeeIds || [];
+          measurement.poCreatedForEmployeeIds.push(employee._id);
+        }
+
+        queuedProgressDocs.push(...employeeProgressDocs);
+        result.success = true;
+        perEmployeeResults.push(result);
+      } catch (innerErr) {
+        console.error(`[batch-add] Error processing employee ${employeeId}:`, innerErr);
+        result.error = innerErr.message || "Processing error";
+        perEmployeeResults.push(result);
+      }
+    }
+
+    // ── Update each touched WO once: raw materials proportional + cost ───
+    for (const wo of woCache.values()) {
+      const woIdStr = wo._id.toString();
+      const oldQty = woOriginalQty.get(woIdStr);
+      const newQty = wo.quantity;
+
+      if (wo.rawMaterials && wo.rawMaterials.length > 0 && oldQty > 0 && newQty > oldQty) {
+        for (const rm of wo.rawMaterials) {
+          const perUnitQty = (rm.quantityRequired || 0) / oldQty;
+          const perUnitCost = (rm.totalCost || 0) / oldQty;
+          rm.quantityRequired = parseFloat((perUnitQty * newQty).toFixed(4));
+          rm.totalCost = parseFloat((perUnitCost * newQty).toFixed(2));
+        }
+      }
+      wo.estimatedCost = (wo.rawMaterials || []).reduce((s, rm) => s + (rm.totalCost || 0), 0);
+      await wo.save();
+    }
+
+    // Update measurement counts for newly-added employees
+    const newlyAdded = perEmployeeResults.filter((r) => r.success).length;
+    if (newlyAdded > 0) {
+      measurement.totalRegisteredEmployees = (measurement.totalRegisteredEmployees || 0) + newlyAdded;
+      measurement.pendingEmployees = (measurement.pendingEmployees || 0) + newlyAdded;
+    }
+
+    await measurement.save();
+    request.markModified("items");
+    request.updatedAt = new Date();
+    await request.save();
+
+    // Create progress docs
+    for (const pd of queuedProgressDocs) {
+      try {
+        await EmployeeProductionProgress.findOneAndUpdate(
+          { workOrderId: pd.workOrderId, employeeId: pd.employeeId },
+          {
+            $set: {
+              measurementId: pd.measurementId,
+              manufacturingOrderId: pd.manufacturingOrderId,
+              orderType: pd.orderType,
+              employeeName: pd.employeeName,
+              employeeUIN: pd.employeeUIN,
+              gender: pd.gender,
+              unitStart: pd.unitStart,
+              unitEnd: pd.unitEnd,
+              totalUnits: pd.totalUnits,
+              assignedBarcodeIds: pd.assignedBarcodeIds,
+              completedUnits: 0,
+              completedUnitNumbers: [],
+              completionPercentage: 0,
+              lastSyncedAt: new Date(),
+            },
+          },
+          { upsert: true, new: true }
+        );
+      } catch (progressErr) {
+        console.error(`[batch-add] Progress doc error for ${pd.employeeName}:`, progressErr.message);
+      }
+    }
+
+    const successCount = perEmployeeResults.filter((r) => r.success).length;
+    const failCount = perEmployeeResults.length - successCount;
+    const totalUnits = perEmployeeResults.reduce(
+      (s, r) => s + (r.addedProducts?.reduce((s2, p) => s2 + p.totalUnits, 0) || 0),
+      0
+    );
+
+    res.json({
+      success: true,
+      message: `Added ${successCount} of ${employeeIds.length} employee(s) · ${totalUnits} unit(s) total${failCount > 0 ? ` · ${failCount} skipped` : ""}`,
+      summary: {
+        total: employeeIds.length,
+        succeeded: successCount,
+        failed: failCount,
+        totalUnits,
+      },
+      results: perEmployeeResults,
+    });
+  } catch (err) {
+    console.error("add-employees-batch error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while adding employees",
+      error: process.env.NODE_ENV === "development" ? err.message : undefined,
+    });
+  }
+});
+
 router.put("/payment-submissions/:submissionId/status", async (req, res) => {
   try {
     const { submissionId } = req.params;
@@ -254,7 +614,6 @@ router.get("/requests/:requestId/quotation/:quotationId/payment-submissions", as
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SALES APPROVAL — Creates WOs + EmployeeProductionProgress docs
-// FIX: Tightened employee-product matching to prevent ghost/wrong assignments
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => {
   try {
@@ -276,28 +635,20 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     request.updatedAt = new Date();
     request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== 'sales_approval_required');
 
-    // ── Determine order type ─────────────────────────────────────────────
     const isMeasurementOrder = !!(request.requestType === 'measurement_conversion' || request.measurementId);
     const orderType = isMeasurementOrder ? 'measurement_conversion' : 'customer_request';
 
-    // ── Load measurement if this is a measurement order ──────────────────
     let measurement = null;
     if (isMeasurementOrder && request.measurementId) {
       measurement = await Measurement.findById(request.measurementId)
         .select('_id employeeMeasurements')
         .lean();
-      if (measurement) {
-        console.log(`[sales-approve] Loaded measurement ${measurement._id} with ${measurement.employeeMeasurements?.length || 0} employees`);
-      } else {
-        console.warn(`[sales-approve] Measurement ${request.measurementId} not found — will skip employee tracking creation`);
-      }
     }
 
     const createdWorkOrders = [];
     const skippedVariants = [];
     const createdProgressDocs = [];
 
-    // ── Create Work Orders ───────────────────────────────────────────────
     for (const item of request.items) {
       const stockItem = await StockItem.findById(item.stockItemId);
       if (!stockItem) { console.warn(`StockItem not found: ${item.stockItemId}`); continue; }
@@ -377,56 +728,25 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           autoSelectedVariant: usedFallback
         });
 
-        // ─────────────────────────────────────────────────────────────────
-        // CREATE EmployeeProductionProgress docs for measurement orders
-        // ─────────────────────────────────────────────────────────────────
         if (isMeasurementOrder && measurement) {
           const stockIdStr = item.stockItemId.toString();
           const woVariantIdStr = variantData._id.toString();
 
-          // ── FIXED: Find employees assigned to THIS specific product+variant ──
           const employeeEntries = [];
           for (const empM of measurement.employeeMeasurements || []) {
-
             const productEntry = (empM.products || []).find((p) => {
-              // ── Step 1: Match by productId ──────────────────────────────
               const pIdMatch = p.productId?.toString() === stockIdStr;
-
               if (!pIdMatch) {
-                // ── Step 2: productId exists but doesn't match → hard reject ──
-                // Only fall through to name match if this product entry has
-                // NO productId stored at all (legacy/older measurement data)
                 if (p.productId) return false;
-
-                // Legacy fallback: match by name
                 if (p.productName !== item.stockItemName) return false;
-
-                // Name matched — also check variant if both sides have it
-                if (woVariantIdStr && p.variantId) {
-                  return p.variantId.toString() === woVariantIdStr;
-                }
-                // Name matched, variant info missing on one side → accept
+                if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
                 return true;
               }
-
-              // ── Step 3: productId matched — now check variant ────────────
-              if (woVariantIdStr && p.variantId) {
-                // Both sides have variant info → must match exactly
-                return p.variantId.toString() === woVariantIdStr;
-              }
-
-              if (woVariantIdStr && !p.variantId) {
-                // WO has a variant but measurement entry doesn't store variantId
-                // (older measurement data) — fall back to name confirm
-                return p.productName === item.stockItemName;
-              }
-
-              // productId matched, no variant to disambiguate → accept
+              if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
+              if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
               return true;
             });
-
             if (!productEntry) continue;
-
             employeeEntries.push({
               employeeId: empM.employeeId,
               employeeName: empM.employeeName,
@@ -438,17 +758,6 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
 
           if (employeeEntries.length > 0) {
             const woNumber = workOrder.workOrderNumber;
-
-            // Safety check: total assigned units must not exceed WO quantity
-            const totalAssigned = employeeEntries.reduce((sum, e) => sum + e.quantity, 0);
-            if (totalAssigned > workOrder.quantity) {
-              console.warn(
-                `[sales-approve] WO ${woNumber} (${workOrder.stockItemName}): ` +
-                `employee total units (${totalAssigned}) exceeds WO quantity (${workOrder.quantity}). ` +
-                `Check measurement data.`
-              );
-            }
-
             let unitCursor = 1;
             for (const emp of employeeEntries) {
               const unitStart = unitCursor;
@@ -470,8 +779,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
                       employeeName: emp.employeeName,
                       employeeUIN: emp.employeeUIN,
                       gender: emp.gender,
-                      unitStart,
-                      unitEnd,
+                      unitStart, unitEnd,
                       totalUnits: emp.quantity,
                       assignedBarcodeIds,
                       completedUnits: 0,
@@ -482,85 +790,470 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
                   },
                   { upsert: true, new: true }
                 );
-
                 createdProgressDocs.push({
-                  employeeName: emp.employeeName,
-                  employeeUIN: emp.employeeUIN,
+                  employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
                   productName: workOrder.stockItemName,
-                  unitStart, unitEnd,
-                  totalUnits: emp.quantity,
+                  unitStart, unitEnd, totalUnits: emp.quantity,
                   barcodeCount: assignedBarcodeIds.length,
                 });
               } catch (progressErr) {
-                console.error(`[sales-approve] Error creating progress doc for ${emp.employeeName}:`, progressErr.message);
+                console.error(`[sales-approve] Progress doc error for ${emp.employeeName}:`, progressErr.message);
               }
-
               unitCursor = unitEnd + 1;
             }
-
-            console.log(`[sales-approve] Created ${employeeEntries.length} progress doc(s) for WO ${woNumber} (${workOrder.stockItemName})`);
-          } else {
-            // No employees matched this WO — log clearly so it's easy to spot
-            console.warn(
-              `[sales-approve] No employees matched WO for "${workOrder.stockItemName}" ` +
-              `(stockItemId: ${stockIdStr}, variantId: ${woVariantIdStr}). ` +
-              `Check measurement.employeeMeasurements[].products entries.`
-            );
           }
         }
-        // ─────────────────────────────────────────────────────────────────
       }
     }
 
     await request.save();
 
-    const autoCount = createdWorkOrders.filter(wo => wo.autoSelectedVariant).length;
     let msg = createdWorkOrders.length > 0
-      ? `Quotation approved and ${createdWorkOrders.length} work order(s) created${autoCount > 0 ? ` (${autoCount} with auto-selected variants)` : ''}`
+      ? `Quotation approved and ${createdWorkOrders.length} work order(s) created`
       : "Quotation approved but no work orders were created";
-
-    if (createdProgressDocs.length > 0) {
-      msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
-    }
+    if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
       employeeTrackingCreated: createdProgressDocs.length,
-      employeeTrackingDetails: createdProgressDocs.length > 0 ? createdProgressDocs : undefined,
     });
   } catch (error) {
     console.error("Error processing sales approval:", error);
-    res.status(500).json({ success: false, message: "Server error while processing approval", error: process.env.NODE_ENV === 'development' ? error.message : undefined });
+    res.status(500).json({ success: false, message: "Server error while processing approval" });
   }
 });
 
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADD EMPLOYEE TO MEASUREMENT-PO  (NEW)
+//
+// Two endpoints:
+//   GET  /requests/:requestId/search-employees-for-add?query=...
+//   POST /requests/:requestId/add-employee  { employeeId }
+//
+// The POST cascades through:
+//   1. Measurement.employeeMeasurements  → push entry (empty measurement values)
+//   2. CustomerRequest.items[].variants[].quantity → increment per matched product
+//   3. WorkOrder.quantity + rawMaterials proportional update
+//   4. EmployeeProductionProgress → create new doc with appended unit range
+// ═══════════════════════════════════════════════════════════════════════════════
+
+router.get("/requests/:requestId/search-employees-for-add", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { query = "" } = req.query;
+
+    if (!query || query.trim().length < 2) {
+      return res.json({ success: true, results: [] });
+    }
+    if (!mongoose.Types.ObjectId.isValid(requestId)) {
+      return res.status(400).json({ success: false, message: "Invalid request id" });
+    }
+
+    const request = await CustomerRequest.findById(requestId)
+      .select("customerId measurementId requestType")
+      .lean();
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (request.requestType !== "measurement_conversion" || !request.measurementId) {
+      return res.status(400).json({ success: false, message: "Available only for measurement POs" });
+    }
+
+    const measurement = await Measurement.findById(request.measurementId)
+      .select("organizationId employeeMeasurements")
+      .lean();
+    if (!measurement) return res.status(404).json({ success: false, message: "Measurement not found" });
+
+    // Already-added IDs to filter out
+    const existingEmpIds = new Set(
+      (measurement.employeeMeasurements || [])
+        .map((e) => e.employeeId?.toString())
+        .filter(Boolean)
+    );
+
+    const re = new RegExp(query.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const employees = await EmployeeMpc.find({
+      customerId: measurement.organizationId,
+      status: "active",
+      $or: [{ uin: re }, { name: re }],
+    })
+      .populate("products.productId", "name reference genderCategory")
+      .limit(15)
+      .lean();
+
+    const results = employees
+      .filter((e) => !existingEmpIds.has(e._id.toString()))
+      .map((e) => ({
+        employeeId: e._id,
+        name: e.name,
+        uin: e.uin,
+        gender: e.gender,
+        department: e.department || "",
+        designation: e.designation || "",
+        productCount: (e.products || []).length,
+        products: (e.products || []).map((p) => ({
+          productId: (p.productId?._id || p.productId)?.toString(),
+          productName:
+            p.productName?.trim() || p.productId?.name || "Unknown",
+          variantId: p.variantId?.toString() || null,
+          quantity: p.quantity || 1,
+        })),
+      }));
+
+    res.json({ success: true, results });
+  } catch (err) {
+    console.error("search-employees-for-add error:", err);
+    res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+router.post("/requests/:requestId/add-employee", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { employeeId } = req.body;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(requestId) ||
+      !mongoose.Types.ObjectId.isValid(employeeId)
+    ) {
+      return res.status(400).json({ success: false, message: "Invalid IDs" });
+    }
+
+    // ── 1. Load resources ────────────────────────────────────────────────
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (request.requestType !== "measurement_conversion" || !request.measurementId) {
+      return res.status(400).json({ success: false, message: "Only available for measurement POs" });
+    }
+
+    const employee = await EmployeeMpc.findById(employeeId)
+      .populate("products.productId", "name reference")
+      .lean();
+    if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
+    if (!employee.products || employee.products.length === 0) {
+      return res.status(400).json({ success: false, message: "Employee has no products assigned" });
+    }
+
+    const measurement = await Measurement.findById(request.measurementId);
+    if (!measurement) return res.status(404).json({ success: false, message: "Measurement not found" });
+
+    // Belongs to same org?
+    if (measurement.organizationId.toString() !== employee.customerId?.toString()) {
+      return res.status(400).json({
+        success: false,
+        message: "Employee is not part of this organization",
+      });
+    }
+
+    // Already added?
+    const alreadyExists = (measurement.employeeMeasurements || []).some(
+      (e) => e.employeeId?.toString() === employeeId.toString()
+    );
+    if (alreadyExists) {
+      return res.status(400).json({ success: false, message: "Employee already added to this PO" });
+    }
+
+    // ── 2. For each product the employee has, find matching item + WO ────
+    const woUpdates = [];                  // { wo, reqItem, reqVariant, qty }
+    const productsToAddToMeasurement = []; // entries pushed into measurement.employeeMeasurements
+    const newProgressDocsToCreate = [];    // queued doc creations
+    const skippedProducts = [];
+
+    for (const empProd of employee.products) {
+      const empProdId = (empProd.productId?._id || empProd.productId)?.toString();
+      const empVariantId = empProd.variantId?.toString() || null;
+      const qty = empProd.quantity || 1;
+      const empProdName =
+        empProd.productName?.trim() || empProd.productId?.name || "Unknown";
+
+      if (!empProdId) {
+        skippedProducts.push({ productName: empProdName, reason: "Missing productId" });
+        continue;
+      }
+
+      // Locate the item in request.items by stockItemId
+      const reqItem = request.items.find((it) => {
+        const iid = (it.stockItemId?._id || it.stockItemId)?.toString();
+        return iid === empProdId;
+      });
+      if (!reqItem) {
+        skippedProducts.push({ productName: empProdName, reason: "Product not in this PO" });
+        continue;
+      }
+
+      // Locate matching WO (by stockItemId + variantId if possible)
+      const candidateWOs = await WorkOrder.find({
+        customerRequestId: request._id,
+        stockItemId: reqItem.stockItemId,
+      });
+
+      let matchingWO = null;
+      if (empVariantId) {
+        matchingWO = candidateWOs.find((w) => w.variantId === empVariantId);
+      }
+      if (!matchingWO && candidateWOs.length === 1) {
+        // single variant — safe fallback
+        matchingWO = candidateWOs[0];
+      }
+      if (!matchingWO && candidateWOs.length > 0) {
+        // multiple WOs but no variant match — pick first as last resort
+        matchingWO = candidateWOs[0];
+      }
+
+      if (!matchingWO) {
+        skippedProducts.push({ productName: empProdName, reason: "No matching work order found" });
+        continue;
+      }
+
+      // Block if WO is already past production
+      const blockedStatuses = ["completed", "cancelled", "forwarded"];
+      if (blockedStatuses.includes(matchingWO.status)) {
+        skippedProducts.push({
+          productName: empProdName,
+          reason: `Work order is ${matchingWO.status} — cannot extend`,
+        });
+        continue;
+      }
+
+      // Find which variant on reqItem corresponds to this WO
+      let reqVariant = null;
+      if (empVariantId) {
+        reqVariant = reqItem.variants.find(
+          (v) => v.variantId && v.variantId.toString() === empVariantId
+        );
+      }
+      if (!reqVariant) {
+        // Match by attributes against WO's variantAttributes
+        if (matchingWO.variantAttributes?.length) {
+          reqVariant = reqItem.variants.find((v) => {
+            if (!v.attributes || v.attributes.length === 0) return false;
+            return matchingWO.variantAttributes.every((wa) =>
+              v.attributes.find((a) => a.name === wa.name && a.value === wa.value)
+            );
+          });
+        }
+      }
+      if (!reqVariant && reqItem.variants.length === 1) reqVariant = reqItem.variants[0];
+      if (!reqVariant && reqItem.variants.length > 0) reqVariant = reqItem.variants[0];
+
+      if (!reqVariant) {
+        skippedProducts.push({ productName: empProdName, reason: "No variant entry to extend" });
+        continue;
+      }
+
+      // Compute next unit range for new progress doc
+      const lastProgress = await EmployeeProductionProgress.find({
+        workOrderId: matchingWO._id,
+      })
+        .select("unitEnd")
+        .sort({ unitEnd: -1 })
+        .limit(1)
+        .lean();
+      const currentMaxUnit = lastProgress[0]?.unitEnd || 0;
+      const unitStart = currentMaxUnit + 1;
+      const unitEnd = currentMaxUnit + qty;
+
+      const woNumber = matchingWO.workOrderNumber;
+      const assignedBarcodeIds = [];
+      for (let u = unitStart; u <= unitEnd; u++) {
+        assignedBarcodeIds.push(`${woNumber}-${u.toString().padStart(3, "0")}`);
+      }
+
+      woUpdates.push({ wo: matchingWO, reqItem, reqVariant, qty });
+
+      newProgressDocsToCreate.push({
+        workOrderId: matchingWO._id,
+        manufacturingOrderId: request._id,
+        measurementId: measurement._id,
+        orderType: "measurement_conversion",
+        employeeId: employee._id,
+        employeeName: employee.name,
+        employeeUIN: employee.uin,
+        gender: employee.gender,
+        unitStart,
+        unitEnd,
+        totalUnits: qty,
+        assignedBarcodeIds,
+        productName: empProdName,
+      });
+
+      productsToAddToMeasurement.push({
+        productId: empProd.productId?._id || empProd.productId,
+        productName: empProdName,
+        variantId: empProd.variantId || null,
+        variantName: "Default",
+        quantity: qty,
+        measurements: [], // empty — user fills in via measurement edit later
+        measuredAt: new Date(),
+        qrGenerated: false,
+        qrGeneratedAt: null,
+      });
+    }
+
+    if (woUpdates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No products could be added — all skipped",
+        skippedProducts,
+      });
+    }
+
+    // ── 3. Apply WO updates: quantity, rawMaterials proportional, cost ──
+    for (const u of woUpdates) {
+      const oldWOQty = u.wo.quantity || 0;
+      u.wo.quantity = oldWOQty + u.qty;
+
+      if (u.wo.rawMaterials && u.wo.rawMaterials.length > 0 && oldWOQty > 0) {
+        for (const rm of u.wo.rawMaterials) {
+          const perUnitQty = (rm.quantityRequired || 0) / oldWOQty;
+          const perUnitCost = (rm.totalCost || 0) / oldWOQty;
+          rm.quantityRequired = parseFloat((perUnitQty * u.wo.quantity).toFixed(4));
+          rm.totalCost = parseFloat((perUnitCost * u.wo.quantity).toFixed(2));
+        }
+      }
+      u.wo.estimatedCost = (u.wo.rawMaterials || []).reduce(
+        (s, rm) => s + (rm.totalCost || 0),
+        0
+      );
+      await u.wo.save();
+
+      // ── 4. Update request item totals ───────────────────────────────
+      const oldVariantQty = u.reqVariant.quantity || 0;
+      u.reqVariant.quantity = oldVariantQty + u.qty;
+      u.reqItem.totalQuantity = (u.reqItem.totalQuantity || 0) + u.qty;
+
+      if (oldVariantQty > 0 && u.reqVariant.estimatedPrice) {
+        const perUnitPrice = u.reqVariant.estimatedPrice / oldVariantQty;
+        const newVariantPrice = perUnitPrice * u.reqVariant.quantity;
+        const priceDelta = newVariantPrice - u.reqVariant.estimatedPrice;
+        u.reqVariant.estimatedPrice = parseFloat(newVariantPrice.toFixed(2));
+        u.reqItem.totalEstimatedPrice = parseFloat(
+          ((u.reqItem.totalEstimatedPrice || 0) + priceDelta).toFixed(2)
+        );
+      }
+    }
+
+    // ── 5. Push to measurement.employeeMeasurements ──────────────────
+    measurement.employeeMeasurements.push({
+      employeeId: employee._id,
+      employeeName: employee.name,
+      employeeUIN: employee.uin,
+      gender: employee.gender,
+      products: productsToAddToMeasurement,
+      noProductAssigned: false,
+      categoryMeasurements: [],
+      isCompleted: false,
+      remarks: "",
+    });
+
+    measurement.totalRegisteredEmployees =
+      (measurement.totalRegisteredEmployees || 0) + 1;
+    measurement.pendingEmployees = (measurement.pendingEmployees || 0) + 1;
+
+    if (
+      !(measurement.registeredEmployeeIds || []).some(
+        (id) => id.toString() === employee._id.toString()
+      )
+    ) {
+      measurement.registeredEmployeeIds = measurement.registeredEmployeeIds || [];
+      measurement.registeredEmployeeIds.push(employee._id);
+    }
+    if (
+      !(measurement.poCreatedForEmployeeIds || []).some(
+        (id) => id.toString() === employee._id.toString()
+      )
+    ) {
+      measurement.poCreatedForEmployeeIds = measurement.poCreatedForEmployeeIds || [];
+      measurement.poCreatedForEmployeeIds.push(employee._id);
+    }
+
+    await measurement.save();
+
+    // ── 6. Save the request ──────────────────────────────────────────
+    request.markModified("items");
+    request.updatedAt = new Date();
+    await request.save();
+
+    // ── 7. Create progress docs ──────────────────────────────────────
+    const createdProgressDetails = [];
+    for (const pd of newProgressDocsToCreate) {
+      try {
+        await EmployeeProductionProgress.findOneAndUpdate(
+          { workOrderId: pd.workOrderId, employeeId: pd.employeeId },
+          {
+            $set: {
+              measurementId: pd.measurementId,
+              manufacturingOrderId: pd.manufacturingOrderId,
+              orderType: pd.orderType,
+              employeeName: pd.employeeName,
+              employeeUIN: pd.employeeUIN,
+              gender: pd.gender,
+              unitStart: pd.unitStart,
+              unitEnd: pd.unitEnd,
+              totalUnits: pd.totalUnits,
+              assignedBarcodeIds: pd.assignedBarcodeIds,
+              completedUnits: 0,
+              completedUnitNumbers: [],
+              completionPercentage: 0,
+              lastSyncedAt: new Date(),
+            },
+          },
+          { upsert: true, new: true }
+        );
+        createdProgressDetails.push({
+          productName: pd.productName,
+          unitStart: pd.unitStart,
+          unitEnd: pd.unitEnd,
+          totalUnits: pd.totalUnits,
+        });
+      } catch (progressErr) {
+        console.error(
+          `[add-employee] Progress doc error for ${pd.employeeName} on WO ${pd.workOrderId}:`,
+          progressErr.message
+        );
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${employee.name} added · ${createdProgressDetails.length} product(s) · ${createdProgressDetails.reduce((s, p) => s + p.totalUnits, 0)} unit(s)`,
+      added: {
+        employee: { name: employee.name, uin: employee.uin, gender: employee.gender },
+        productCount: createdProgressDetails.length,
+        totalUnits: createdProgressDetails.reduce((s, p) => s + p.totalUnits, 0),
+        details: createdProgressDetails,
+      },
+      skippedProducts: skippedProducts.length > 0 ? skippedProducts : undefined,
+    });
+  } catch (err) {
+    console.error("add-employee error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while adding employee",
+      error: process.env.NODE_ENV === "development" ? err.message : undefined,
+    });
+  }
+});
+
+
+// ── Existing endpoints below ─────────────────────────────────────────────────
 
 router.get('/:measurementId/po-persons-export', async (req, res) => {
   try {
     const { measurementId } = req.params;
-
     if (!mongoose.Types.ObjectId.isValid(measurementId)) {
       return res.status(400).json({ success: false, message: 'Valid measurement ID required' });
     }
-
     const measurement = await Measurement.findById(measurementId)
       .populate({ path: 'employeeMeasurements.products.productId', select: '_id name' })
       .lean();
+    if (!measurement) return res.status(404).json({ success: false, message: 'Measurement not found' });
 
-    if (!measurement) {
-      return res.status(404).json({ success: false, message: 'Measurement not found' });
-    }
-
-    // Fetch MPC employees to get their display product names
     const empIds = measurement.employeeMeasurements.map(e => e.employeeId).filter(Boolean);
-
     const mpcEmployees = await EmployeeMpc.find({ _id: { $in: empIds } })
       .select('_id products department designation')
       .lean();
 
-    // Build map: employeeId → productId → mpcProductName
     const mpcNameMap = new Map();
     const mpcDetailsMap = new Map();
     mpcEmployees.forEach(emp => {
@@ -574,33 +1267,24 @@ router.get('/:measurementId/po-persons-export', async (req, res) => {
       mpcNameMap.set(eid, prodMap);
     });
 
-    // Build CSV
     const headers = ['#', 'Employee Name', 'UIN', 'Gender', 'Department', 'Designation', 'Products'];
     const rows = measurement.employeeMeasurements.map((emp, idx) => {
       const eid = emp.employeeId?.toString();
       const mpcDets = mpcDetailsMap.get(eid) || {};
       const prodMap = mpcNameMap.get(eid) || new Map();
-
       const productsStr = (emp.products || []).map(p => {
         const pid = (p.productId?._id || p.productId)?.toString();
         const displayName = (pid && prodMap.get(pid)) || p.productName || p.productId?.name || 'Unknown';
         return `${displayName} x${p.quantity || 1}`;
       }).join(' | ');
-
       return [
-        idx + 1,
-        `"${emp.employeeName || ''}"`,
-        emp.employeeUIN || '',
-        emp.gender || '',
-        `"${mpcDets.department || ''}"`,
-        `"${mpcDets.designation || ''}"`,
-        `"${productsStr}"`,
+        idx + 1, `"${emp.employeeName || ''}"`, emp.employeeUIN || '', emp.gender || '',
+        `"${mpcDets.department || ''}"`, `"${mpcDets.designation || ''}"`, `"${productsStr}"`,
       ].join(',');
     });
 
     const csv = ['\uFEFF', headers.join(','), ...rows].join('\n');
     const safeName = (measurement.name || 'measurement').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
-
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}_persons.csv"`);
     res.send(csv);
@@ -611,7 +1295,6 @@ router.get('/:measurementId/po-persons-export', async (req, res) => {
 });
 
 
-// REJECT quotation
 router.post("/requests/:requestId/quotation/reject", async (req, res) => {
   try {
     const { reason } = req.body;
@@ -671,44 +1354,24 @@ router.get("/requests/:requestId/quotations/:quotationId/download", async (req, 
 });
 
 
-
 router.delete("/requests/:requestId", async (req, res) => {
   try {
     const { requestId } = req.params;
-
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
 
-    // ── If this request originated from a measurement, clear its PO fields ──
     if (request.measurementId) {
       await Measurement.findByIdAndUpdate(request.measurementId, {
         $set: {
-          convertedToPO: false,
-          poRequestId: null,
-          poConversionDate: null,
-          convertedBy: null,
-          poCreatedForEmployeeIds: [],
+          convertedToPO: false, poRequestId: null, poConversionDate: null,
+          convertedBy: null, poCreatedForEmployeeIds: [],
         },
       });
-      console.log(`[delete-request] Reset PO fields on measurement ${request.measurementId}`);
     }
-
-    // ── Delete associated work orders if any ────────────────────────────────
-    if (WorkOrder) {
-      const woResult = await WorkOrder.deleteMany({ customerRequestId: request._id });
-      if (woResult.deletedCount) {
-        console.log(`[delete-request] Deleted ${woResult.deletedCount} work order(s) for request ${requestId}`);
-      }
-    }
-
-    // ── Delete the CustomerRequest itself ────────────────────────────────────
+    if (WorkOrder) await WorkOrder.deleteMany({ customerRequestId: request._id });
     await CustomerRequest.findByIdAndDelete(requestId);
 
-    res.json({
-      success: true,
-      message: "PO/Quotation removed successfully",
-      measurementReset: !!request.measurementId,
-    });
+    res.json({ success: true, message: "PO/Quotation removed successfully", measurementReset: !!request.measurementId });
   } catch (error) {
     console.error("Error deleting request:", error);
     res.status(500).json({ success: false, message: "Server error while removing PO/Quotation" });
@@ -716,60 +1379,29 @@ router.delete("/requests/:requestId", async (req, res) => {
 });
 
 
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET /requests/:requestId/po-breakdown
-// Realtime PO breakdown for PDF generation.
-// For measurement_conversion POs, expands items into rows keyed by
-// (stockItemId, variantId, MPC alias name, gender), summing quantities across
-// employees. For non-measurement POs, returns the quotation items as-is.
-// Rows are sorted by: productName (alpha) → gender (Male, Female, Unisex, Kids).
+// (unchanged)
 // ═══════════════════════════════════════════════════════════════════════════════
 router.get("/requests/:requestId/po-breakdown", async (req, res) => {
   try {
     const { requestId } = req.params;
-
     const request = await CustomerRequest.findById(requestId)
       .populate("items.stockItemId", "name genderCategory hsnCode reference")
       .lean();
-
-    if (!request) {
-      return res.status(404).json({ success: false, message: "Request not found" });
-    }
-    if (!request.quotations || request.quotations.length === 0) {
-      return res.status(400).json({ success: false, message: "No quotation found for this request" });
-    }
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!request.quotations || request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });
 
     const quotation = request.quotations[0];
+    const isMeasurementPO = request.requestType === "measurement_conversion" && !!request.measurementId;
+    if (!isMeasurementPO) return res.json({ success: true, quotation, request });
 
-    // ── Non-measurement POs: no breakdown needed, return as-is ────────────
-    const isMeasurementPO =
-      request.requestType === "measurement_conversion" && !!request.measurementId;
+    const measurement = await Measurement.findById(request.measurementId).select("employeeMeasurements").lean();
+    if (!measurement) return res.json({ success: true, quotation, request });
 
-    if (!isMeasurementPO) {
-      return res.json({ success: true, quotation, request });
-    }
+    const empIds = (measurement.employeeMeasurements || []).map((e) => e.employeeId).filter(Boolean);
+    const mpcEmployees = await EmployeeMpc.find({ _id: { $in: empIds } }).select("_id products").lean();
 
-    // ── Load measurement ──────────────────────────────────────────────────
-    const measurement = await Measurement.findById(request.measurementId)
-      .select("employeeMeasurements")
-      .lean();
-
-    if (!measurement) {
-      console.warn(`[po-breakdown] Measurement ${request.measurementId} not found, falling back to stored quotation`);
-      return res.json({ success: true, quotation, request });
-    }
-
-    // ── Load EmployeeMpc records for alias lookup ─────────────────────────
-    const empIds = (measurement.employeeMeasurements || [])
-      .map((e) => e.employeeId)
-      .filter(Boolean);
-
-    const mpcEmployees = await EmployeeMpc.find({ _id: { $in: empIds } })
-      .select("_id products")
-      .lean();
-
-    // Map<empIdStr, Map<"pid::vid"|"pid::_noVar_"|pid, aliasProductName>>
     const mpcAliasMap = new Map();
     for (const emp of mpcEmployees) {
       const eid = emp._id.toString();
@@ -780,70 +1412,46 @@ router.get("/requests/:requestId/po-breakdown", async (req, res) => {
         const vidStr = p.variantId?.toString() || null;
         const alias = (p.productName || "").trim();
         if (!alias) continue;
-
         if (vidStr) lookup.set(`${pidStr}::${vidStr}`, alias);
         else lookup.set(`${pidStr}::_noVar_`, alias);
-        // fallback bucket (first one wins)
         if (!lookup.has(pidStr)) lookup.set(pidStr, alias);
       }
       mpcAliasMap.set(eid, lookup);
     }
 
-    // ── Helper: attribute-equal match for quotation item lookup ──────────
     const attrsEqual = (a = [], b = []) => {
       if (a.length !== b.length) return false;
-      return a.every((x) =>
-        b.some((y) => y.name === x.name && y.value === x.value)
-      );
+      return a.every((x) => b.some((y) => y.name === x.name && y.value === x.value));
     };
 
-    // ── Bucket: key = "pid::vid::alias::gender" ───────────────────────────
     const bucketMap = new Map();
-
     for (const empM of measurement.employeeMeasurements || []) {
       const eid = empM.employeeId?.toString();
-
       const aliasLookup = mpcAliasMap.get(eid) || new Map();
-
       for (const prod of empM.products || []) {
         const pidStr = prod.productId?.toString();
         if (!pidStr) continue;
         const vidStr = prod.variantId?.toString() || null;
         const qty = Number(prod.quantity) || 0;
         if (qty <= 0) continue;
-
         const reqItemForGender = request.items.find(i => {
           const iPid = (i.stockItemId?._id || i.stockItemId)?.toString();
           return iPid === pidStr;
         });
         const gender = reqItemForGender?.stockItemId?.genderCategory || "Unisex";
-
-        // Resolve alias — prefer variant-specific, then product-only, then measurement's own stored name
         let aliasName =
           (vidStr && aliasLookup.get(`${pidStr}::${vidStr}`)) ||
           aliasLookup.get(`${pidStr}::_noVar_`) ||
           aliasLookup.get(pidStr) ||
-          (prod.productName || "").trim() ||
-          "Unknown";
-
+          (prod.productName || "").trim() || "Unknown";
         const bucketKey = `${pidStr}::${vidStr || "noVar"}::${aliasName}::${gender}`;
-
         if (!bucketMap.has(bucketKey)) {
-          // Find the corresponding request item + variant to pull attributes/reference
           const reqItem = request.items.find((i) => {
             const iPid = (i.stockItemId?._id || i.stockItemId)?.toString();
             return iPid === pidStr;
           });
-
           let reqVariant = null;
-          if (reqItem) {
-            // try match by attribute set if measurement variant attrs exist somewhere,
-            // otherwise fall back to the first variant under this stockItem
-            // (we don't have attrs on measurement.products[] so we'll rely on index position of variant in stockItem — use first for now)
-            reqVariant = reqItem.variants?.[0] || null;
-          }
-
-          // Match quotation item by stockItemId + attribute equality
+          if (reqItem) reqVariant = reqItem.variants?.[0] || null;
           let quotItem = null;
           if (reqItem && reqVariant) {
             quotItem = quotation.items.find((qi) => {
@@ -852,55 +1460,31 @@ router.get("/requests/:requestId/po-breakdown", async (req, res) => {
               return attrsEqual(qi.attributes || [], reqVariant.attributes || []);
             });
           }
-          // Fallback — first quotation item with matching stockItemId
           if (!quotItem) {
             quotItem = quotation.items.find((qi) => {
               const qiPid = (qi.stockItemId?._id || qi.stockItemId)?.toString();
               return qiPid === pidStr;
             });
           }
-
           const unitPrice = Number(quotItem?.unitPrice) || 0;
-          const gstPercentage =
-            quotItem?.gstPercentage != null
-              ? Number(quotItem.gstPercentage)
-              : getGSTPercentage(unitPrice);
-
+          const gstPercentage = quotItem?.gstPercentage != null ? Number(quotItem.gstPercentage) : getGSTPercentage(unitPrice);
           bucketMap.set(bucketKey, {
-            stockItemId: pidStr,
-            variantId: vidStr,
+            stockItemId: pidStr, variantId: vidStr,
             itemName: gender ? `${aliasName} (${gender})` : aliasName,
-            itemCode:
-              quotItem?.itemCode ||
-              reqItem?.stockItemReference ||
-              reqItem?.stockItemId?.reference ||
-              "",
-            hsnCode:
-              quotItem?.hsnCode ||
-              reqItem?.stockItemId?.hsnCode ||
-              "",
+            itemCode: quotItem?.itemCode || reqItem?.stockItemReference || reqItem?.stockItemId?.reference || "",
+            hsnCode: quotItem?.hsnCode || reqItem?.stockItemId?.hsnCode || "",
             gender,
             attributes: reqVariant?.attributes || quotItem?.attributes || [],
-            unitPrice,
-            gstPercentage,
-            quantity: 0,
-            priceBeforeGST: 0,
-            gstAmount: 0,
-            priceIncludingGST: 0,
+            unitPrice, gstPercentage, quantity: 0,
+            priceBeforeGST: 0, gstAmount: 0, priceIncludingGST: 0,
           });
         }
-
         bucketMap.get(bucketKey).quantity += qty;
       }
     }
 
-    // ── Finalise rows: compute totals, sort ───────────────────────────────
     const rows = Array.from(bucketMap.values()).map((r) => {
-      const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(
-        r.quantity,
-        r.unitPrice,
-        r.gstPercentage
-      );
+      const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(r.quantity, r.unitPrice, r.gstPercentage);
       return { ...r, priceBeforeGST, gstAmount, priceIncludingGST };
     });
 
@@ -911,13 +1495,11 @@ router.get("/requests/:requestId/po-breakdown", async (req, res) => {
       const ga = genderOrder[a.gender] || 99;
       const gb = genderOrder[b.gender] || 99;
       if (ga !== gb) return ga - gb;
-      // tie-break by attribute signature so rows stay stable
       const aSig = (a.attributes || []).map((x) => `${x.name}=${x.value}`).join("|");
       const bSig = (b.attributes || []).map((x) => `${x.name}=${x.value}`).join("|");
       return aSig.localeCompare(bSig);
     });
 
-    // ── Rebuild quotation totals from broken-down rows ────────────────────
     const subtotalBeforeGST = rows.reduce((s, r) => s + r.priceBeforeGST, 0);
     const totalGST = rows.reduce((s, r) => s + r.gstAmount, 0);
     const customCharges = quotation.customAdditionalCharges || [];
@@ -926,39 +1508,23 @@ router.get("/requests/:requestId/po-breakdown", async (req, res) => {
     const grandTotal = subtotalBeforeGST + totalGST + shipping + customTotal;
 
     const brokenDownQuotation = {
-      ...quotation,
-      items: rows,
+      ...quotation, items: rows,
       subtotalBeforeGST: parseFloat(subtotalBeforeGST.toFixed(2)),
       totalGST: parseFloat(totalGST.toFixed(2)),
       grandTotal: parseFloat(grandTotal.toFixed(2)),
       paymentSchedule: (quotation.paymentSchedule || []).map((p) => ({
-        ...p,
-        amount: parseFloat(
-          ((grandTotal * (Number(p.percentage) || 0)) / 100).toFixed(2)
-        ),
+        ...p, amount: parseFloat(((grandTotal * (Number(p.percentage) || 0)) / 100).toFixed(2)),
       })),
     };
 
     res.json({
-      success: true,
-      quotation: brokenDownQuotation,
-      request,
-      meta: {
-        breakdownApplied: true,
-        rowCount: rows.length,
-        source: "measurement_mpc_aliases",
-      },
+      success: true, quotation: brokenDownQuotation, request,
+      meta: { breakdownApplied: true, rowCount: rows.length, source: "measurement_mpc_aliases" },
     });
   } catch (error) {
     console.error("Error generating PO breakdown:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while generating PO breakdown",
-      error: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+    res.status(500).json({ success: false, message: "Server error while generating PO breakdown" });
   }
 });
-
-
 
 module.exports = router;
