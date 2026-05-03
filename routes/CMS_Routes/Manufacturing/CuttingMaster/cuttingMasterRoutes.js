@@ -46,6 +46,135 @@ router.get("/manufacturing-orders", async (req, res) => {
   }
 });
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /cutting-history-bulk
+// Returns bulk-order cutting activity grouped by customer.
+// Uses WorkOrder.updatedAt as the cut timestamp proxy (filtered by cuttingProgress.completed > 0).
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/cutting-history-bulk", async (req, res) => {
+  try {
+    const { from, to, q } = req.query;
+
+    const fromDate = from
+      ? new Date(`${from}T00:00:00.000`)
+      : new Date(new Date().setHours(0, 0, 0, 0));
+    const toDate = to
+      ? new Date(`${to}T23:59:59.999`)
+      : new Date();
+
+    const searchQuery = (q || "").trim().toLowerCase();
+
+    // ── Find non-measurement (bulk) customer requests ────────────────────
+    const bulkRequests = await CustomerRequest.find({
+      requestType: { $ne: "measurement_conversion" },
+      status: "quotation_sales_approved",
+    })
+      .select("_id requestId customerInfo")
+      .lean();
+
+    if (bulkRequests.length === 0) {
+      return res.json({
+        success: true,
+        bulkGroups: [],
+        stats: { totalCustomers: 0, totalWorkOrders: 0, totalPieces: 0 },
+      });
+    }
+
+    const bulkRequestMap = new Map();
+    bulkRequests.forEach((r) => bulkRequestMap.set(r._id.toString(), r));
+
+    // ── Find their WOs that have had cutting activity in date range ──────
+    const bulkWOs = await WorkOrder.find({
+      customerRequestId: {
+        $in: bulkRequests.map((r) => new mongoose.Types.ObjectId(r._id)),
+      },
+      "cuttingProgress.completed": { $gt: 0 },
+      updatedAt: { $gte: fromDate, $lte: toDate },
+    })
+      .select(
+        "_id workOrderNumber customerRequestId stockItemName variantAttributes " +
+          "cuttingProgress cuttingStatus quantity updatedAt"
+      )
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    // ── Group by customer ────────────────────────────────────────────────
+    const bulkGroupsMap = new Map();
+
+    for (const wo of bulkWOs) {
+      const reqDoc = bulkRequestMap.get(wo.customerRequestId.toString());
+      const customerName = reqDoc?.customerInfo?.name || "Unknown Customer";
+      const requestRef = reqDoc?.requestId || "—";
+
+      // Search filter
+      if (searchQuery) {
+        const variantStr = (wo.variantAttributes || [])
+          .map((a) => `${a.name}:${a.value}`)
+          .join(" ")
+          .toLowerCase();
+        const hay = [
+          wo.workOrderNumber,
+          wo.stockItemName,
+          customerName,
+          requestRef,
+          variantStr,
+        ]
+          .join(" ")
+          .toLowerCase();
+        if (!hay.includes(searchQuery)) continue;
+      }
+
+      const groupKey = `${customerName}::${requestRef}`;
+
+      if (!bulkGroupsMap.has(groupKey)) {
+        bulkGroupsMap.set(groupKey, {
+          customerName,
+          requestRef,
+          workOrders: [],
+          totalPieces: 0,
+        });
+      }
+
+      const group = bulkGroupsMap.get(groupKey);
+      group.workOrders.push({
+        _id: wo._id,
+        workOrderNumber: wo.workOrderNumber,
+        productName: wo.stockItemName,
+        variantAttributes: wo.variantAttributes || [],
+        qtyCut: wo.cuttingProgress?.completed || 0,
+        totalQty: wo.quantity || 0,
+        status: wo.cuttingStatus || "pending",
+        cutAt: wo.updatedAt,
+      });
+      group.totalPieces += wo.cuttingProgress?.completed || 0;
+    }
+
+    // Sort groups by latest cut activity
+    const bulkGroups = [...bulkGroupsMap.values()].sort((a, b) => {
+      const aLatest = Math.max(
+        ...a.workOrders.map((w) => new Date(w.cutAt).getTime())
+      );
+      const bLatest = Math.max(
+        ...b.workOrders.map((w) => new Date(w.cutAt).getTime())
+      );
+      return bLatest - aLatest;
+    });
+
+    const stats = {
+      totalCustomers: bulkGroups.length,
+      totalWorkOrders: bulkGroups.reduce((s, g) => s + g.workOrders.length, 0),
+      totalPieces: bulkGroups.reduce((s, g) => s + g.totalPieces, 0),
+    };
+
+    res.json({ success: true, bulkGroups, stats });
+  } catch (error) {
+    console.error("cutting-history-bulk error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET specific MO with its work orders
 // ─────────────────────────────────────────────────────────────────────────────
