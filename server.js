@@ -715,6 +715,9 @@ app.use("/api/ceo/inventory", ceoInventoryRoutes);
 const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
 app.use("/api/ceo/merchandiser", merchandiserRoutes);
 
+const ceoOverviewRoutes = require("./routes/CEO_Routes/overview");
+app.use("/api/ceo/overview", ceoOverviewRoutes);
+
 /* =====================
     Normal Employees ROUTES
   ===================== */
