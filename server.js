@@ -26,7 +26,7 @@ const allowedOrigins = [
   "http://10.99.21.15:3000",
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
   "https://grav-cms-dncs.vercel.app",
-  "https://crm.grav.in"
+  "https://crm.grav.in",
 ];
 
 app.use(
@@ -145,8 +145,16 @@ io.on("connection", (socket) => {
       console.log(`Socket ${socket.id} joined meeting_${meetId}`);
       if (activeMeetingRecordings.has(meetId)) {
         const info = activeMeetingRecordings.get(meetId);
-        socket.emit("recording_started", { meetId, startedBy: info.startedBy, startedByName: info.startedByName, startedAt: info.startedAt, lateJoin: true });
-        console.log(`[Recording] Late joiner auto-notified for meeting_${meetId}`);
+        socket.emit("recording_started", {
+          meetId,
+          startedBy: info.startedBy,
+          startedByName: info.startedByName,
+          startedAt: info.startedAt,
+          lateJoin: true,
+        });
+        console.log(
+          `[Recording] Late joiner auto-notified for meeting_${meetId}`,
+        );
       }
     }
   });
@@ -160,107 +168,191 @@ io.on("connection", (socket) => {
   socket.on("recording_start", ({ meetId, startedBy, startedByName }) => {
     if (!meetId) return;
     const startedAt = new Date().toISOString();
-    activeMeetingRecordings.set(meetId, { startedBy, startedByName, startedAt });
-    io.to(`meeting_${meetId}`).emit("recording_started", { meetId, startedBy, startedByName, startedAt });
-  });
-  // Each participant broadcasts their own recording+upload status → relay to room
-  socket.on("participant_status", ({ meetId, employeeId, employeeName, recordingState, uploadState }) => {
-    if (!meetId || !employeeId) return;
-    io.to(`meeting_${meetId}`).emit("participant_status", {
-      employeeId,
-      employeeName,
-      recordingState,   // "recording" | "paused" | "not_rec" | "failed"
-      uploadState,      // "idle" | "uploading" | "uploaded" | "failed"
-      timestamp: Date.now(),
+    activeMeetingRecordings.set(meetId, {
+      startedBy,
+      startedByName,
+      startedAt,
+    });
+    io.to(`meeting_${meetId}`).emit("recording_started", {
+      meetId,
+      startedBy,
+      startedByName,
+      startedAt,
     });
   });
+  // Each participant broadcasts their own recording+upload status → relay to room
+  socket.on(
+    "participant_status",
+    ({ meetId, employeeId, employeeName, recordingState, uploadState }) => {
+      if (!meetId || !employeeId) return;
+      io.to(`meeting_${meetId}`).emit("participant_status", {
+        employeeId,
+        employeeName,
+        recordingState, // "recording" | "paused" | "not_rec" | "failed"
+        uploadState, // "idle" | "uploading" | "uploaded" | "failed"
+        timestamp: Date.now(),
+      });
+    },
+  );
 
   // CEO/TL stops recording → broadcast to all in meeting room
   socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
     if (!meetId) return;
     activeMeetingRecordings.delete(meetId);
-    io.to(`meeting_${meetId}`).emit("recording_stopped", { meetId, stoppedBy, stoppedByName, stoppedAt: new Date().toISOString() });
+    io.to(`meeting_${meetId}`).emit("recording_stopped", {
+      meetId,
+      stoppedBy,
+      stoppedByName,
+      stoppedAt: new Date().toISOString(),
+    });
   });
 
   // ── DM AUDIO CALLS ────────────────────────────────────────────────────
   // Legacy relay — old DMCallManager emits call_invite, relay as call_incoming to receiver
-  socket.on("call_invite", ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
-    if (!toEmployeeId || !fromEmployeeId) return;
-    console.log(`[Call-legacy] ${fromEmployeeId} → ${toEmployeeId}`);
-    io.to(String(toEmployeeId)).emit("call_incoming", { fromEmployeeId, fromName, convId });
-  });
+  socket.on(
+    "call_invite",
+    ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
+      if (!toEmployeeId || !fromEmployeeId) return;
+      console.log(`[Call-legacy] ${fromEmployeeId} → ${toEmployeeId}`);
+      io.to(String(toEmployeeId)).emit("call_incoming", {
+        fromEmployeeId,
+        fromName,
+        convId,
+      });
+    },
+  );
 
   // STEP 1 — Caller initiates: create LiveKit room + generate CALLER token
   // then ring the callee via socket
-  socket.on("call_request", async ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
-    if (!toEmployeeId || !fromEmployeeId || !convId) return;
-    try {
-      const { AccessToken, RoomServiceClient } = require("livekit-server-sdk");
-      const LK_URL = process.env.LIVEKIT_URL || "";
-      const LK_KEY = process.env.LIVEKIT_API_KEY || "";
-      const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
-
-      const roomName = `dm-call-${convId}`;
-      const httpUrl = LK_URL.replace("wss://", "https://").replace("ws://", "http://");
-
-      // Create the LiveKit room (ignore "already exists" error)
+  socket.on(
+    "call_request",
+    async ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
+      if (!toEmployeeId || !fromEmployeeId || !convId) return;
       try {
-        const svc = new RoomServiceClient(httpUrl, LK_KEY, LK_SECRET);
-        await svc.createRoom({ name: roomName, emptyTimeout: 120, maxParticipants: 2 });
+        const {
+          AccessToken,
+          RoomServiceClient,
+        } = require("livekit-server-sdk");
+        const LK_URL = process.env.LIVEKIT_URL || "";
+        const LK_KEY = process.env.LIVEKIT_API_KEY || "";
+        const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
+
+        const roomName = `dm-call-${convId}`;
+        const httpUrl = LK_URL.replace("wss://", "https://").replace(
+          "ws://",
+          "http://",
+        );
+
+        // Create the LiveKit room (ignore "already exists" error)
+        try {
+          const svc = new RoomServiceClient(httpUrl, LK_KEY, LK_SECRET);
+          await svc.createRoom({
+            name: roomName,
+            emptyTimeout: 120,
+            maxParticipants: 2,
+          });
+        } catch (e) {
+          if (!e.message?.includes("already exists"))
+            console.warn("[call_request] createRoom:", e.message);
+        }
+
+        // Generate token for CALLER
+        const callerAt = new AccessToken(LK_KEY, LK_SECRET, {
+          identity: fromEmployeeId,
+          name: fromName,
+          ttl: "1h",
+        });
+        callerAt.addGrant({
+          roomJoin: true,
+          room: roomName,
+          canPublish: true,
+          canSubscribe: true,
+        });
+        const callerToken = await callerAt.toJwt();
+
+        // Send token directly back to caller's socket
+        socket.emit("call_token_ready", {
+          token: callerToken,
+          url: LK_URL,
+          roomName,
+          convId,
+        });
+
+        // Ring the callee
+        console.log(
+          `[Call] ${fromEmployeeId} → ${toEmployeeId} room=${roomName}`,
+        );
+        io.to(String(toEmployeeId)).emit("call_incoming", {
+          fromEmployeeId,
+          fromName,
+          convId,
+          roomName,
+        });
       } catch (e) {
-        if (!e.message?.includes("already exists")) console.warn("[call_request] createRoom:", e.message);
+        console.error("[call_request] error:", e.message);
+        socket.emit("call_error", {
+          message: "Could not start call: " + e.message,
+        });
       }
-
-      // Generate token for CALLER
-      const callerAt = new AccessToken(LK_KEY, LK_SECRET, { identity: fromEmployeeId, name: fromName, ttl: "1h" });
-      callerAt.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
-      const callerToken = await callerAt.toJwt();
-
-      // Send token directly back to caller's socket
-      socket.emit("call_token_ready", { token: callerToken, url: LK_URL, roomName, convId });
-
-      // Ring the callee
-      console.log(`[Call] ${fromEmployeeId} → ${toEmployeeId} room=${roomName}`);
-      io.to(String(toEmployeeId)).emit("call_incoming", { fromEmployeeId, fromName, convId, roomName });
-
-    } catch (e) {
-      console.error("[call_request] error:", e.message);
-      socket.emit("call_error", { message: "Could not start call: " + e.message });
-    }
-  });
+    },
+  );
 
   // STEP 2 — Callee accepts: generate CALLEE token + notify caller
-  socket.on("call_accept", async ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
-    if (!toEmployeeId || !fromEmployeeId || !convId) return;
-    try {
-      const { AccessToken } = require("livekit-server-sdk");
-      const LK_URL = process.env.LIVEKIT_URL || "";
-      const LK_KEY = process.env.LIVEKIT_API_KEY || "";
-      const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
+  socket.on(
+    "call_accept",
+    async ({ toEmployeeId, fromEmployeeId, fromName, convId }) => {
+      if (!toEmployeeId || !fromEmployeeId || !convId) return;
+      try {
+        const { AccessToken } = require("livekit-server-sdk");
+        const LK_URL = process.env.LIVEKIT_URL || "";
+        const LK_KEY = process.env.LIVEKIT_API_KEY || "";
+        const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
 
-      const roomName = `dm-call-${convId}`;
+        const roomName = `dm-call-${convId}`;
 
-      // Generate token for CALLEE
-      const calleeAt = new AccessToken(LK_KEY, LK_SECRET, { identity: fromEmployeeId, name: fromName, ttl: "1h" });
-      calleeAt.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
-      const calleeToken = await calleeAt.toJwt();
+        // Generate token for CALLEE
+        const calleeAt = new AccessToken(LK_KEY, LK_SECRET, {
+          identity: fromEmployeeId,
+          name: fromName,
+          ttl: "1h",
+        });
+        calleeAt.addGrant({
+          roomJoin: true,
+          room: roomName,
+          canPublish: true,
+          canSubscribe: true,
+        });
+        const calleeToken = await calleeAt.toJwt();
 
-      // Send token to callee's socket
-      socket.emit("call_token_ready", { token: calleeToken, url: LK_URL, roomName, convId });
+        // Send token to callee's socket
+        socket.emit("call_token_ready", {
+          token: calleeToken,
+          url: LK_URL,
+          roomName,
+          convId,
+        });
 
-      // Notify caller that call was answered
-      io.to(String(toEmployeeId)).emit("call_answered", { fromEmployeeId, convId });
-
-    } catch (e) {
-      console.error("[call_accept] error:", e.message);
-      socket.emit("call_error", { message: "Could not join call: " + e.message });
-    }
-  });
+        // Notify caller that call was answered
+        io.to(String(toEmployeeId)).emit("call_answered", {
+          fromEmployeeId,
+          convId,
+        });
+      } catch (e) {
+        console.error("[call_accept] error:", e.message);
+        socket.emit("call_error", {
+          message: "Could not join call: " + e.message,
+        });
+      }
+    },
+  );
 
   // Callee rejects
   socket.on("call_reject", ({ toEmployeeId, fromEmployeeId, convId }) => {
     if (!toEmployeeId) return;
-    io.to(String(toEmployeeId)).emit("call_rejected", { fromEmployeeId, convId });
+    io.to(String(toEmployeeId)).emit("call_rejected", {
+      fromEmployeeId,
+      convId,
+    });
   });
 
   // Either party ends the call
@@ -278,8 +370,16 @@ io.on("connection", (socket) => {
       const LK_KEY = process.env.LIVEKIT_API_KEY || "";
       const LK_SECRET = process.env.LIVEKIT_API_SECRET || "";
       const roomName = `dm-call-${convId}`;
-      const at = new AccessToken(LK_KEY, LK_SECRET, { identity: employeeId, ttl: "1h" });
-      at.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
+      const at = new AccessToken(LK_KEY, LK_SECRET, {
+        identity: employeeId,
+        ttl: "1h",
+      });
+      at.addGrant({
+        roomJoin: true,
+        room: roomName,
+        canPublish: true,
+        canSubscribe: true,
+      });
       const token = await at.toJwt();
       socket.emit("call_token_ready", { token, url: LK_URL, roomName, convId });
     } catch (e) {
@@ -308,15 +408,11 @@ io.on("connection", (socket) => {
   });
 });
 
-
-
 // 1. At the top with your other requires:
 const transcriptModule = require("./routes/task_routes/transcript.routes");
 
-
 // 2. With your other app.use() route registrations:
 app.use("/cowork", transcriptModule.router);
-
 
 // ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
@@ -351,7 +447,6 @@ const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/Stoc
 const ProductionSupervisorDepartment = require("./models/ProductionSupervisorDepartment");
 const QCDepartment = require("./models/QCDepartment");
 const CEODepartment = require("./models/CEODepartment");
-
 
 const createDefaultCuttingMaster = async () => {
   try {
@@ -434,7 +529,9 @@ const seedQCUser = async () => {
 
 async function createDefaultProductionSupervisor() {
   try {
-    const existing = await ProductionSupervisorDepartment.findOne({ email: "p1supervisor@grav.in" });
+    const existing = await ProductionSupervisorDepartment.findOne({
+      email: "p1supervisor@grav.in",
+    });
     if (existing) {
       console.log("✓ Default Production Supervisor already exists");
       return;
@@ -445,7 +542,7 @@ async function createDefaultProductionSupervisor() {
     await ProductionSupervisorDepartment.create({
       name: "Production Supervisor",
       email: "p1supervisor@grav.in",
-      password: hashed,                    // ✅ use the hashed value
+      password: hashed, // ✅ use the hashed value
       employeeId: "PSUP001",
       phone: "",
       role: "production_supervisor",
@@ -453,7 +550,9 @@ async function createDefaultProductionSupervisor() {
       isActive: true,
     });
 
-    console.log("✅ Default Production Supervisor created: p1supervisor@grav.in");
+    console.log(
+      "✅ Default Production Supervisor created: p1supervisor@grav.in",
+    );
   } catch (err) {
     console.error("❌ Failed to create default Production Supervisor:", err);
   }
@@ -492,13 +591,17 @@ const createDefaultAccountant = async () => {
 
 const createDefaultPackagingDispatch = async () => {
   try {
-    const existingPackagingDispatch = await PackagingDispatchDepartment.findOne({
-      role: "packaging_dispatch",
-      department: "Packaging & Dispatch",
-    });
+    const existingPackagingDispatch = await PackagingDispatchDepartment.findOne(
+      {
+        role: "packaging_dispatch",
+        department: "Packaging & Dispatch",
+      },
+    );
 
     if (existingPackagingDispatch) {
-      console.log("✅ Packaging & Dispatch user already exists, skipping creation");
+      console.log(
+        "✅ Packaging & Dispatch user already exists, skipping creation",
+      );
       return;
     }
 
@@ -612,7 +715,6 @@ app.use("/api/ceo/inventory", ceoInventoryRoutes);
 const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
 app.use("/api/ceo/merchandiser", merchandiserRoutes);
 
-
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -624,7 +726,6 @@ const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 
 const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
 app.use("/api/hr/overview", hrOverviewRoutes);
-
 
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
@@ -662,9 +763,11 @@ app.use("/api/customer/employees", employeeMpcRoutes);
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
-
 const productionCompletionRoutes = require("./routes/CMS_Routes/Manufacturing/Production/productionCompletionRoutes.js");
-app.use("/api/cms/manufacturing/production-completion", productionCompletionRoutes);
+app.use(
+  "/api/cms/manufacturing/production-completion",
+  productionCompletionRoutes,
+);
 
 /* ===================
   CMS ROUTES
@@ -714,7 +817,6 @@ app.use(
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
 app.use("/api/cms/measurements", measurementRoutes);
 
-
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
 
@@ -726,7 +828,10 @@ app.use(
 );
 
 const packagingDispatchViewRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingDispatchViewRoutes");
-app.use("/api/cms/manufacturing/packaging-dispatch-view", packagingDispatchViewRoutes);
+app.use(
+  "/api/cms/manufacturing/packaging-dispatch-view",
+  packagingDispatchViewRoutes,
+);
 
 const workOrderRoutes = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderRoutes");
 app.use("/api/cms/manufacturing/work-orders", workOrderRoutes);
@@ -747,14 +852,11 @@ app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
 app.use("/api/cms/production/dashboard", productionDashboardRoutes);
 
-
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", productionMachineLayout);
 
-
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);
-
 
 // In your main server.js or app.js
 const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Production/workFlowTrackRoutes.js");
@@ -781,6 +883,9 @@ const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
 
 // HR Department Routes
+const appVersionRoutes = require("./routes/HrRoutes/appVersionRoutes");
+app.use("/api/hr/app", appVersionRoutes);
+
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
 app.use("/api/hr/departments", hrDepartmentRoutes);
 
@@ -798,7 +903,6 @@ app.use("/api/hr/vendors", vendorDetailsRoutes);
 
 const payrollRoutes = require("./routes/HrRoutes/Payroll_section");
 app.use("/api/hr/payroll", payrollRoutes);
-
 
 const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
 app.use("/hr/attendance", attendanceRouter);
@@ -823,7 +927,6 @@ app.use("/api/hr/payroll", payRollRouter);
 
 const payslipRouter = require("./routes/HrRoutes/Payslip_section");
 app.use("/api/hr/payslip", payslipRouter);
-
 
 const empAttendance = require("./routes/Employee_Routes/employeeAttendance");
 app.use("/api/employee/attendance", empAttendance);
@@ -877,11 +980,8 @@ app.use("/api/cms/manufacturing/cutting-master", bulkCuttingRoutes);
 const vendorAuthRoutes = require("./routes/Vendor_Routes/vendorAuthRoutes"); // NEW FILE
 app.use("/api/vendor", vendorAuthRoutes);
 
-
 const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-scanner-hardware-routes.js"); // NEW FILE
 app.use("/api/barcode-devices", barcodeScannerRoutes);
-
-
 
 app.use("/cowork", require("./routes/task_routes/taskForward.js"));
 // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
@@ -905,12 +1005,11 @@ app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
 
 // Fix: askAI.routes exports an object, use .router
 const askAITest = require("./routes/task_routes/askAI.routes");
-console.log('askAI.routes exports:', Object.keys(askAITest));
+console.log("askAI.routes exports:", Object.keys(askAITest));
 app.use("/cowork", askAITest);
 
-
-const crossOrgRoutes = require('./routes/Customer_Routes/cross-org-assign.js');
-app.use('/api/customer/employees/cross-org', crossOrgRoutes);
+const crossOrgRoutes = require("./routes/Customer_Routes/cross-org-assign.js");
+app.use("/api/customer/employees/cross-org", crossOrgRoutes);
 
 /* =====================================================================
    INLINE: Barcode Scanner Tracking Routes
@@ -926,8 +1025,10 @@ const Operation = require("./models/CMS_Models/Inventory/Configurations/Operatio
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-const isBarcodeId = (id) => id && typeof id === "string" && id.startsWith("WO-");
-const isEmployeeId = (id) => id && typeof id === "string" && id.startsWith("GR");
+const isBarcodeId = (id) =>
+  id && typeof id === "string" && id.startsWith("WO-");
+const isEmployeeId = (id) =>
+  id && typeof id === "string" && id.startsWith("GR");
 
 const parseBarcode = (barcodeId) => {
   try {
@@ -970,19 +1071,28 @@ const extractEmployeeIdFromUrl = (value) => {
   }
 };
 
-
 app.post("/api/cms/production/tracking/scan", async (req, res) => {
   try {
-    const { scanId: rawScanId, machineId, timeStamp, activeOps = "" } = req.body;
+    const {
+      scanId: rawScanId,
+      machineId,
+      timeStamp,
+      activeOps = "",
+    } = req.body;
     const scanId = extractEmployeeIdFromUrl(rawScanId);
 
     if (!scanId || !machineId || !timeStamp) {
-      return res.status(400).json({ success: false, message: "scanId, machineId, and timeStamp are required" });
+      return res.status(400).json({
+        success: false,
+        message: "scanId, machineId, and timeStamp are required",
+      });
     }
 
     const scanTime = new Date(timeStamp);
     if (isNaN(scanTime.getTime())) {
-      return res.status(400).json({ success: false, message: "Invalid timeStamp format" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid timeStamp format" });
     }
 
     const scanDate = new Date(scanTime);
@@ -995,14 +1105,20 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
 
     const machine = await Machine.findById(machineId);
     if (!machine) {
-      return res.status(400).json({ success: false, message: "Machine not found" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Machine not found" });
     }
 
     let machineTracking = trackingDoc.machines.find(
       (m) => m.machineId.toString() === machineId,
     );
     if (!machineTracking) {
-      trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
+      trackingDoc.machines.push({
+        machineId,
+        currentOperatorIdentityId: null,
+        operators: [],
+      });
       machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
     }
 
@@ -1017,10 +1133,14 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
       }
 
       const operatorTracking = machineTracking.operators.find(
-        (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+        (op) =>
+          op.operatorIdentityId === machineTracking.currentOperatorIdentityId &&
+          !op.signOutTime,
       );
       if (!operatorTracking) {
-        return res.status(400).json({ success: false, message: "Operator session not found" });
+        return res
+          .status(400)
+          .json({ success: false, message: "Operator session not found" });
       }
 
       // Store scan with active operations snapshot
@@ -1038,9 +1158,15 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
       try {
         const parsedBarcode = parseBarcode(scanId);
         if (parsedBarcode.success && io) {
-          let workOrder = await findWorkOrderByShortId(parsedBarcode.workOrderShortId);
+          let workOrder = await findWorkOrderByShortId(
+            parsedBarcode.workOrderShortId,
+          );
           if (!workOrder) {
-            try { workOrder = await WorkOrder.findById(parsedBarcode.workOrderShortId); } catch { }
+            try {
+              workOrder = await WorkOrder.findById(
+                parsedBarcode.workOrderShortId,
+              );
+            } catch {}
           }
           if (workOrder) {
             io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
@@ -1094,7 +1220,8 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
         });
       }
 
-      const employeeName = `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
+      const employeeName =
+        `${operator.firstName || ""} ${operator.lastName || ""}`.trim();
 
       // Sign out from any other machine
       for (const m of trackingDoc.machines) {
@@ -1120,11 +1247,15 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
           machineTracking.currentOperatorIdentityId = null;
           await trackingDoc.save();
           try {
-            if (io) io.emit("operator-status-update", {
-              machineId, machineName: machine.name, employeeName,
-              message: `${employeeName} signed out`, timestamp: new Date(),
-            });
-          } catch { }
+            if (io)
+              io.emit("operator-status-update", {
+                machineId,
+                machineName: machine.name,
+                employeeName,
+                message: `${employeeName} signed out`,
+                timestamp: new Date(),
+              });
+          } catch {}
           return res.json({
             success: true,
             message: `${employeeName} signed out`,
@@ -1134,13 +1265,17 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
             scanCount: 0,
           });
         }
-        return res.status(400).json({ success: false, message: "Operator session not found" });
+        return res
+          .status(400)
+          .json({ success: false, message: "Operator session not found" });
       }
 
       // Different operator signed in → sign out existing, sign in new
       if (machineTracking.currentOperatorIdentityId) {
         const existingSession = machineTracking.operators.find(
-          (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+          (op) =>
+            op.operatorIdentityId ===
+              machineTracking.currentOperatorIdentityId && !op.signOutTime,
         );
         if (existingSession) existingSession.signOutTime = scanTime;
       }
@@ -1156,11 +1291,15 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
       await trackingDoc.save();
 
       try {
-        if (io) io.emit("operator-status-update", {
-          machineId, machineName: machine.name, employeeName,
-          status: `${employeeName} signed in to ${machine.name}`, timestamp: new Date(),
-        });
-      } catch { }
+        if (io)
+          io.emit("operator-status-update", {
+            machineId,
+            machineName: machine.name,
+            employeeName,
+            status: `${employeeName} signed in to ${machine.name}`,
+            timestamp: new Date(),
+          });
+      } catch {}
 
       return res.json({
         success: true,
@@ -1172,24 +1311,34 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
       });
     }
 
-    return res.status(400).json({ success: false, message: "Invalid scan ID format" });
-
+    return res
+      .status(400)
+      .json({ success: false, message: "Invalid scan ID format" });
   } catch (error) {
     console.error("Error processing scan:", error);
-    res.status(500).json({ success: false, message: "Server error while processing scan", error: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Server error while processing scan",
+      error: error.message,
+    });
   }
 });
-
 
 app.post("/api/cms/production/employee-sync/manual", async (req, res) => {
   try {
     await productionSyncService.manualEmployeeSync();
-    res.json({ success: true, message: "Employee sync completed successfully" });
+    res.json({
+      success: true,
+      message: "Employee sync completed successfully",
+    });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Error during employee sync", error: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Error during employee sync",
+      error: error.message,
+    });
   }
 });
-
 
 // ── POST /api/cms/production/tracking/bulk-scans ──────────────────────────────
 
@@ -1197,10 +1346,17 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
   try {
     const { scans } = req.body;
     if (!scans || !Array.isArray(scans) || scans.length === 0) {
-      return res.status(400).json({ success: false, message: "Scans array is required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Scans array is required" });
     }
 
-    const results = { total: scans.length, successful: 0, failed: 0, errors: [] };
+    const results = {
+      total: scans.length,
+      successful: 0,
+      failed: 0,
+      errors: [],
+    };
     const scansByDate = {};
 
     for (const scanData of scans) {
@@ -1219,15 +1375,26 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
       const scanDate = new Date(scanTime);
       scanDate.setHours(0, 0, 0, 0);
       const dateKey = scanDate.toISOString();
-      if (!scansByDate[dateKey]) scansByDate[dateKey] = { date: scanDate, machines: {} };
-      if (!scansByDate[dateKey].machines[machineId]) scansByDate[dateKey].machines[machineId] = { machineId, scans: [] };
-      scansByDate[dateKey].machines[machineId].scans.push({ ...scanData, timeStamp: scanTime });
+      if (!scansByDate[dateKey])
+        scansByDate[dateKey] = { date: scanDate, machines: {} };
+      if (!scansByDate[dateKey].machines[machineId])
+        scansByDate[dateKey].machines[machineId] = { machineId, scans: [] };
+      scansByDate[dateKey].machines[machineId].scans.push({
+        ...scanData,
+        timeStamp: scanTime,
+      });
     }
 
     for (const dateKey in scansByDate) {
       const dateGroup = scansByDate[dateKey];
-      let trackingDoc = await ProductionTracking.findOne({ date: dateGroup.date });
-      if (!trackingDoc) trackingDoc = new ProductionTracking({ date: dateGroup.date, machines: [] });
+      let trackingDoc = await ProductionTracking.findOne({
+        date: dateGroup.date,
+      });
+      if (!trackingDoc)
+        trackingDoc = new ProductionTracking({
+          date: dateGroup.date,
+          machines: [],
+        });
 
       for (const machineId in dateGroup.machines) {
         const machineData = dateGroup.machines[machineId];
@@ -1242,8 +1409,13 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
           (m) => m.machineId && m.machineId.toString() === machineId,
         );
         if (!machineTracking) {
-          trackingDoc.machines.push({ machineId, currentOperatorIdentityId: null, operators: [] });
-          machineTracking = trackingDoc.machines[trackingDoc.machines.length - 1];
+          trackingDoc.machines.push({
+            machineId,
+            currentOperatorIdentityId: null,
+            operators: [],
+          });
+          machineTracking =
+            trackingDoc.machines[trackingDoc.machines.length - 1];
         }
 
         for (const scan of machineData.scans) {
@@ -1252,7 +1424,9 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
               const { employeeName, employeeId, action } = scan;
               if (action === "signout") {
                 const session = machineTracking.operators.find(
-                  (op) => op.operatorIdentityId === (employeeId || scan.scanId) && !op.signOutTime,
+                  (op) =>
+                    op.operatorIdentityId === (employeeId || scan.scanId) &&
+                    !op.signOutTime,
                 );
                 if (session) {
                   session.signOutTime = scan.timeStamp;
@@ -1261,7 +1435,10 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
               } else {
                 if (machineTracking.currentOperatorIdentityId) {
                   const existing = machineTracking.operators.find(
-                    (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+                    (op) =>
+                      op.operatorIdentityId ===
+                        machineTracking.currentOperatorIdentityId &&
+                      !op.signOutTime,
                   );
                   if (existing) existing.signOutTime = scan.timeStamp;
                 }
@@ -1272,15 +1449,21 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
                   signOutTime: null,
                   barcodeScans: [],
                 });
-                machineTracking.currentOperatorIdentityId = employeeId || scan.scanId;
+                machineTracking.currentOperatorIdentityId =
+                  employeeId || scan.scanId;
               }
             } else {
               // Barcode scan — store with activeOps snapshot
-              if (!machineTracking.currentOperatorIdentityId) throw new Error("No operator signed in");
+              if (!machineTracking.currentOperatorIdentityId)
+                throw new Error("No operator signed in");
               const operatorSession = machineTracking.operators.find(
-                (op) => op.operatorIdentityId === machineTracking.currentOperatorIdentityId && !op.signOutTime,
+                (op) =>
+                  op.operatorIdentityId ===
+                    machineTracking.currentOperatorIdentityId &&
+                  !op.signOutTime,
               );
-              if (!operatorSession) throw new Error("Operator session not found");
+              if (!operatorSession)
+                throw new Error("Operator session not found");
               operatorSession.barcodeScans.push({
                 barcodeId: scan.scanId,
                 timeStamp: scan.timeStamp,
@@ -1290,7 +1473,10 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
             results.successful++;
           } catch (scanError) {
             results.failed++;
-            results.errors.push({ scanId: scan.scanId, error: scanError.message });
+            results.errors.push({
+              scanId: scan.scanId,
+              error: scanError.message,
+            });
           }
         }
       }
@@ -1304,7 +1490,11 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
     });
   } catch (error) {
     console.error("Bulk scan error:", error);
-    res.status(500).json({ success: false, message: "Server error processing bulk scans", error: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Server error processing bulk scans",
+      error: error.message,
+    });
   }
 });
 
@@ -1320,7 +1510,14 @@ app.get("/api/cms/production/tracking/status/today", async (req, res) => {
       .lean();
 
     if (!trackingDoc) {
-      return res.json({ success: true, message: "No tracking data for today", date: today, machines: [], totalScans: 0, totalMachines: 0 });
+      return res.json({
+        success: true,
+        message: "No tracking data for today",
+        date: today,
+        machines: [],
+        totalScans: 0,
+        totalMachines: 0,
+      });
     }
 
     let totalScans = 0;
@@ -1331,16 +1528,23 @@ app.get("/api/cms/production/tracking/status/today", async (req, res) => {
       const operatorsWithDetails = [];
 
       for (const operator of machine.operators) {
-        const employeeDoc = await Employee.findOne({ identityId: operator.operatorIdentityId })
-          .select("firstName lastName identityId");
+        const employeeDoc = await Employee.findOne({
+          identityId: operator.operatorIdentityId,
+        }).select("firstName lastName identityId");
         machineScans += operator.barcodeScans.length;
         totalScans += operator.barcodeScans.length;
         operatorsWithDetails.push({
           identityId: operator.operatorIdentityId,
-          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          name: employeeDoc
+            ? `${employeeDoc.firstName} ${employeeDoc.lastName}`
+            : "Unknown Operator",
           signInTime: operator.signInTime,
           signOutTime: operator.signOutTime,
-          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp, activeOps: s.activeOps || "" })),
+          barcodeScans: operator.barcodeScans.map((s) => ({
+            barcodeId: s.barcodeId,
+            timeStamp: s.timeStamp,
+            activeOps: s.activeOps || "",
+          })),
           scanCount: operator.barcodeScans.length,
           isActive: !operator.signOutTime,
         });
@@ -1348,10 +1552,18 @@ app.get("/api/cms/production/tracking/status/today", async (req, res) => {
 
       let currentOperator = null;
       if (machine.currentOperatorIdentityId) {
-        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
+        const empDoc = await Employee.findOne({
+          identityId: machine.currentOperatorIdentityId,
+        }).select("firstName lastName identityId");
         currentOperator = empDoc
-          ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
-          : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
+          ? {
+              identityId: empDoc.identityId,
+              name: `${empDoc.firstName} ${empDoc.lastName}`,
+            }
+          : {
+              identityId: machine.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
       }
 
       machinesStatus.push({
@@ -1364,10 +1576,18 @@ app.get("/api/cms/production/tracking/status/today", async (req, res) => {
       });
     }
 
-    res.json({ success: true, date: trackingDoc.date, totalMachines: trackingDoc.machines.length, totalScans, machines: machinesStatus });
+    res.json({
+      success: true,
+      date: trackingDoc.date,
+      totalMachines: trackingDoc.machines.length,
+      totalScans,
+      machines: machinesStatus,
+    });
   } catch (error) {
     console.error("Error getting today's status:", error);
-    res.status(500).json({ success: false, message: "Server error", error: error.message });
+    res
+      .status(500)
+      .json({ success: false, message: "Server error", error: error.message });
   }
 });
 
@@ -1384,7 +1604,14 @@ app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
       .lean();
 
     if (!trackingDoc) {
-      return res.json({ success: true, message: `No tracking data for ${date}`, date: queryDate, machines: [], totalScans: 0, totalMachines: 0 });
+      return res.json({
+        success: true,
+        message: `No tracking data for ${date}`,
+        date: queryDate,
+        machines: [],
+        totalScans: 0,
+        totalMachines: 0,
+      });
     }
 
     let totalScans = 0;
@@ -1395,16 +1622,23 @@ app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
       const operatorsWithDetails = [];
 
       for (const operator of machine.operators) {
-        const employeeDoc = await Employee.findOne({ identityId: operator.operatorIdentityId })
-          .select("firstName lastName identityId");
+        const employeeDoc = await Employee.findOne({
+          identityId: operator.operatorIdentityId,
+        }).select("firstName lastName identityId");
         machineScans += operator.barcodeScans.length;
         totalScans += operator.barcodeScans.length;
         operatorsWithDetails.push({
           identityId: operator.operatorIdentityId,
-          name: employeeDoc ? `${employeeDoc.firstName} ${employeeDoc.lastName}` : "Unknown Operator",
+          name: employeeDoc
+            ? `${employeeDoc.firstName} ${employeeDoc.lastName}`
+            : "Unknown Operator",
           signInTime: operator.signInTime,
           signOutTime: operator.signOutTime,
-          barcodeScans: operator.barcodeScans.map((s) => ({ barcodeId: s.barcodeId, timeStamp: s.timeStamp, activeOps: s.activeOps || "" })),
+          barcodeScans: operator.barcodeScans.map((s) => ({
+            barcodeId: s.barcodeId,
+            timeStamp: s.timeStamp,
+            activeOps: s.activeOps || "",
+          })),
           scanCount: operator.barcodeScans.length,
           isActive: !operator.signOutTime,
         });
@@ -1412,10 +1646,18 @@ app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
 
       let currentOperator = null;
       if (machine.currentOperatorIdentityId) {
-        const empDoc = await Employee.findOne({ identityId: machine.currentOperatorIdentityId }).select("firstName lastName identityId");
+        const empDoc = await Employee.findOne({
+          identityId: machine.currentOperatorIdentityId,
+        }).select("firstName lastName identityId");
         currentOperator = empDoc
-          ? { identityId: empDoc.identityId, name: `${empDoc.firstName} ${empDoc.lastName}` }
-          : { identityId: machine.currentOperatorIdentityId, name: "Unknown Operator" };
+          ? {
+              identityId: empDoc.identityId,
+              name: `${empDoc.firstName} ${empDoc.lastName}`,
+            }
+          : {
+              identityId: machine.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
       }
 
       machinesStatus.push({
@@ -1428,10 +1670,18 @@ app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
       });
     }
 
-    res.json({ success: true, date: trackingDoc.date, totalMachines: trackingDoc.machines.length, totalScans, machines: machinesStatus });
+    res.json({
+      success: true,
+      date: trackingDoc.date,
+      totalMachines: trackingDoc.machines.length,
+      totalScans,
+      machines: machinesStatus,
+    });
   } catch (error) {
     console.error("Error getting date status:", error);
-    res.status(500).json({ success: false, message: "Server error", error: error.message });
+    res
+      .status(500)
+      .json({ success: false, message: "Server error", error: error.message });
   }
 });
 
@@ -1442,7 +1692,8 @@ app.get("/api/health", (req, res) => {
   res.status(200).json({
     success: true,
     message: "Backend server is running 🚀",
-    database: mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+    database:
+      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
     productionSync: {
       enabled: true,
       syncInterval: "Every 20 minutes",
@@ -1457,7 +1708,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     socket: "running",
-    connections: io.engine.clientsCount
+    connections: io.engine.clientsCount,
   });
 });
 
@@ -1474,8 +1725,8 @@ app.get("/", (req, res) => {
   });
 });
 
-const payslipRoutes = require('./routes/Employee_Routes/Payslip');
-app.use('/api/employee/payslip', payslipRoutes);
+const payslipRoutes = require("./routes/Employee_Routes/Payslip");
+app.use("/api/employee/payslip", payslipRoutes);
 
 /* =====================
     PRODUCTION SYNC MANAGEMENT ROUTES
@@ -1485,19 +1736,41 @@ app.post("/api/cms/production/sync/manual", async (req, res) => {
     await productionSyncService.manualSync();
     res.json({ success: true, message: "Manual sync completed successfully" });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Error during manual sync", error: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Error during manual sync",
+      error: error.message,
+    });
   }
 });
 
 app.post("/api/cms/production/cleanup/manual", async (req, res) => {
   try {
     await productionSyncService.manualCleanup();
-    res.json({ success: true, message: "Manual cleanup completed successfully" });
+    res.json({
+      success: true,
+      message: "Manual cleanup completed successfully",
+    });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Error during manual cleanup", error: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Error during manual cleanup",
+      error: error.message,
+    });
   }
 });
 
+app.get("/api/app/version", (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      latestVersion: process.env.APP_LATEST_VERSION || "1.0.0",
+      minVersion: process.env.APP_MIN_VERSION || "1.0.0",
+      updateUrl: "https://cms.grav.in/app/download",
+      message: "A new version of GRAV is available. Please update to continue.",
+    },
+  });
+});
 
 if (attendanceRouter.startHourlyAttendanceSync) {
   attendanceRouter.startHourlyAttendanceSync();
@@ -1505,7 +1778,6 @@ if (attendanceRouter.startHourlyAttendanceSync) {
 } else {
   console.warn("⚠️ Hourly attendance sync not available");
 }
-
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -1547,63 +1819,74 @@ server.listen(PORT, () => {
 
   // ── Meeting 15-min reminder cron — runs every 5 minutes ──────────────────
   const _reminderSent = new Set();
-  setInterval(async () => {
-    try {
-      const { db } = require("./config/firebaseAdmin");
-      const { sendPushToEmployees } = require("./services/fcmPush.service");
-      const { sendNotificationEmail } = require("./services/emailNotifications.service");
+  setInterval(
+    async () => {
+      try {
+        const { db } = require("./config/firebaseAdmin");
+        const { sendPushToEmployees } = require("./services/fcmPush.service");
+        const {
+          sendNotificationEmail,
+        } = require("./services/emailNotifications.service");
 
-      const now = Date.now();
-      const windowStart = new Date(now + 10 * 60 * 1000).toISOString();
-      const windowEnd = new Date(now + 20 * 60 * 1000).toISOString();
+        const now = Date.now();
+        const windowStart = new Date(now + 10 * 60 * 1000).toISOString();
+        const windowEnd = new Date(now + 20 * 60 * 1000).toISOString();
 
-      const snap = await db.collection("cowork_scheduled_meets")
-        .where("isCancelled", "==", false)
-        .where("dateTime", ">=", windowStart)
-        .where("dateTime", "<=", windowEnd)
-        .get();
+        const snap = await db
+          .collection("cowork_scheduled_meets")
+          .where("isCancelled", "==", false)
+          .where("dateTime", ">=", windowStart)
+          .where("dateTime", "<=", windowEnd)
+          .get();
 
-      for (const doc of snap.docs) {
-        const meet = doc.data();
-        const meetId = meet.meetId || doc.id;
-        if (_reminderSent.has(meetId)) continue;
-        _reminderSent.add(meetId);
+        for (const doc of snap.docs) {
+          const meet = doc.data();
+          const meetId = meet.meetId || doc.id;
+          if (_reminderSent.has(meetId)) continue;
+          _reminderSent.add(meetId);
 
-        const participants = meet.participants || [];
-        if (!participants.length) continue;
+          const participants = meet.participants || [];
+          if (!participants.length) continue;
 
-        const title = `⏰ Meeting Starting Soon · ${meet.title}`;
-        const body = `"${meet.title}" starts in 15 minutes. Get ready to join.`;
+          const title = `⏰ Meeting Starting Soon · ${meet.title}`;
+          const body = `"${meet.title}" starts in 15 minutes. Get ready to join.`;
 
-
-        await sendPushToEmployees(participants, title, body, { type: "meet_reminder", meetId });
-
-        const empDocs = await Promise.all(
-          participants.map(id => db.collection("cowork_employees").doc(id).get())
-        );
-        for (const empDoc of empDocs) {
-          if (!empDoc.exists) continue;
-          const emp = empDoc.data();
-          if (!emp.email) continue;
-          await sendNotificationEmail({
-            senderId: meet.createdBy || "system",
-            senderName: "CoWork",
-            receiverId: emp.employeeId || empDoc.id,
-            receiverName: emp.name || empDoc.id,
-            receiverEmail: emp.email,
+          await sendPushToEmployees(participants, title, body, {
             type: "meet_reminder",
-            title,
-            body,
-            data: { meetId, meetTitle: meet.title, dateTime: meet.dateTime },
+            meetId,
           });
+
+          const empDocs = await Promise.all(
+            participants.map((id) =>
+              db.collection("cowork_employees").doc(id).get(),
+            ),
+          );
+          for (const empDoc of empDocs) {
+            if (!empDoc.exists) continue;
+            const emp = empDoc.data();
+            if (!emp.email) continue;
+            await sendNotificationEmail({
+              senderId: meet.createdBy || "system",
+              senderName: "CoWork",
+              receiverId: emp.employeeId || empDoc.id,
+              receiverName: emp.name || empDoc.id,
+              receiverEmail: emp.email,
+              type: "meet_reminder",
+              title,
+              body,
+              data: { meetId, meetTitle: meet.title, dateTime: meet.dateTime },
+            });
+          }
+          console.log(
+            `[MeetReminder] Sent for meetId=${meetId} to ${participants.length} participants`,
+          );
         }
-        console.log(`[MeetReminder] Sent for meetId=${meetId} to ${participants.length} participants`);
+
+        if (_reminderSent.size > 500) _reminderSent.clear();
+      } catch (e) {
+        console.error("[MeetReminder cron]", e.message);
       }
-
-      if (_reminderSent.size > 500) _reminderSent.clear();
-
-    } catch (e) {
-      console.error("[MeetReminder cron]", e.message);
-    }
-  }, 5 * 60 * 1000);
+    },
+    5 * 60 * 1000,
+  );
 });
