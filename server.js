@@ -883,7 +883,7 @@ const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
 
 // HR Department Routes
-const appVersionRoutes = require("./routes/HrRoutes/appVersionRoutes");
+const appVersionRoutes = require("./routes/HrRoutes/Appversionroutes");
 app.use("/api/hr/app", appVersionRoutes);
 
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
