@@ -2,7 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");
-const AppVersion = require("../../models/AppVersion");
+const AppVersion = require("../../models/Appversion");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 
