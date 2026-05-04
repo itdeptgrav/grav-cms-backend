@@ -715,6 +715,9 @@ app.use("/api/ceo/inventory", ceoInventoryRoutes);
 const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
 app.use("/api/ceo/merchandiser", merchandiserRoutes);
 
+const ceoOverviewRoutes = require("./routes/CEO_Routes/overview");
+app.use("/api/ceo/overview", ceoOverviewRoutes);
+
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -883,7 +886,7 @@ const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
 
 // HR Department Routes
-const appVersionRoutes = require("./routes/HrRoutes/appVersionRoutes");
+const appVersionRoutes = require("./routes/HrRoutes/Appversionroutes");
 app.use("/api/hr/app", appVersionRoutes);
 
 const hrDepartmentRoutes = require("./routes/HrRoutes/Departments");
