@@ -8,219 +8,259 @@ const PurchaseOrder = require("../../../../models/CMS_Models/Inventory/Operation
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 
-// Apply auth middleware
 router.use(EmployeeAuthMiddleware);
 
-// ✅ GET inventory overview statistics
+// ✅ GET inventory overview — optimized with aggregation pipelines
 router.get("/", async (req, res) => {
   try {
-    // Get all counts and statistics in parallel for better performance
-    const [
-      rawItemsCount,
-      stockItemsCount,
-      purchaseOrdersCount,
-      vendorsCount,
-      rawItems,
-      stockItems,
-      purchaseOrders
-    ] = await Promise.all([
-      RawItem.countDocuments(),
-      StockItem.countDocuments(),
-      PurchaseOrder.countDocuments(),
-      Vendor.countDocuments({ status: "Active" }),
-      RawItem.find({}).select("quantity minStock maxStock status sellingPrice"),
-      StockItem.find({}).select("quantityOnHand minStock maxStock status salesPrice inventoryValue"),
-      PurchaseOrder.find({}).select("totalAmount status totalReceived totalPending")
-    ]);
-
-    // Raw Items Statistics
-    const rawItemsOutOfStock = rawItems.filter(item => item.status === "Out of Stock").length;
-    const rawItemsLowStock = rawItems.filter(item => item.status === "Low Stock").length;
-    const rawItemsInStock = rawItems.filter(item => item.status === "In Stock").length;
-    
-    const rawItemsTotalQuantity = rawItems.reduce((sum, item) => sum + (item.quantity || 0), 0);
-    const rawItemsTotalValue = rawItems.reduce((sum, item) => 
-      sum + ((item.quantity || 0) * (item.sellingPrice || 0)), 0);
-
-    // Stock Items Statistics
-    const stockItemsOutOfStock = stockItems.filter(item => item.status === "Out of Stock").length;
-    const stockItemsLowStock = stockItems.filter(item => item.status === "Low Stock").length;
-    const stockItemsInStock = stockItems.filter(item => item.status === "In Stock").length;
-    
-    const stockItemsTotalQuantity = stockItems.reduce((sum, item) => sum + (item.quantityOnHand || 0), 0);
-    const stockItemsTotalValue = stockItems.reduce((sum, item) => sum + (item.inventoryValue || 0), 0);
-
-    // Purchase Orders Statistics
-    const poDraft = purchaseOrders.filter(po => po.status === "DRAFT").length;
-    const poIssued = purchaseOrders.filter(po => po.status === "ISSUED").length;
-    const poPartiallyReceived = purchaseOrders.filter(po => po.status === "PARTIALLY_RECEIVED").length;
-    const poCompleted = purchaseOrders.filter(po => po.status === "COMPLETED").length;
-    const poCancelled = purchaseOrders.filter(po => po.status === "CANCELLED").length;
-    
-    const poTotalValue = purchaseOrders.reduce((sum, po) => sum + (po.totalAmount || 0), 0);
-    const poPendingValue = purchaseOrders
-      .filter(po => po.status !== "COMPLETED" && po.status !== "CANCELLED")
-      .reduce((sum, po) => sum + (po.totalAmount || 0), 0);
-    
-    const poTotalReceived = purchaseOrders.reduce((sum, po) => sum + (po.totalReceived || 0), 0);
-    const poTotalPending = purchaseOrders.reduce((sum, po) => sum + (po.totalPending || 0), 0);
-
-    // Vendor Statistics
-    const activeVendors = vendorsCount;
-    
-    // Recent Activities (last 7 days)
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    
-    const [recentRawItems, recentPurchaseOrders] = await Promise.all([
-      RawItem.find({
-        createdAt: { $gte: sevenDaysAgo }
-      })
-      .select("name sku quantity status createdAt")
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .lean(),
-      
-      PurchaseOrder.find({
-        createdAt: { $gte: sevenDaysAgo }
-      })
-      .select("poNumber vendorName totalAmount status createdAt")
-      .populate("vendor", "companyName")
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .lean()
-    ]);
 
-    // Critical Items (items below minimum stock)
-    const criticalRawItems = await RawItem.find({
-      $expr: { $lte: ["$quantity", "$minStock"] },
-      quantity: { $gt: 0 }
-    })
-    .select("name sku quantity minStock status")
-    .sort({ quantity: 1 })
-    .limit(5)
-    .lean();
-
-    const criticalStockItems = await StockItem.find({
-      $expr: { $lte: ["$quantityOnHand", "$minStock"] },
-      quantityOnHand: { $gt: 0 }
-    })
-    .select("name reference quantityOnHand minStock status")
-    .sort({ quantityOnHand: 1 })
-    .limit(5)
-    .lean();
-
-    // Monthly purchase order value (last 6 months)
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-    
-    const monthlyPOData = await PurchaseOrder.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: sixMonthsAgo },
-          status: { $in: ["ISSUED", "PARTIALLY_RECEIVED", "COMPLETED"] }
-        }
-      },
-      {
-        $group: {
-          _id: {
-            year: { $year: "$createdAt" },
-            month: { $month: "$createdAt" }
+    // ── Run EVERYTHING in parallel ─────────────────────────────────────────
+    const [
+      rawItemsAgg,
+      stockItemsAgg,
+      purchaseOrdersAgg,
+      activeVendorsCount,
+      recentRawItems,
+      recentPurchaseOrders,
+      criticalRawItems,
+      criticalStockItems,
+      topVendorsByPO,
+    ] = await Promise.all([
+      // ── Raw Items aggregation (single DB call replaces find + JS filtering)
+      RawItem.aggregate([
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            inStock: { $sum: { $cond: [{ $eq: ["$status", "In Stock"] }, 1, 0] } },
+            lowStock: { $sum: { $cond: [{ $eq: ["$status", "Low Stock"] }, 1, 0] } },
+            outOfStock: { $sum: { $cond: [{ $eq: ["$status", "Out of Stock"] }, 1, 0] } },
+            totalQuantity: { $sum: { $ifNull: ["$quantity", 0] } },
+            totalValue: {
+              $sum: {
+                $multiply: [
+                  { $ifNull: ["$quantity", 0] },
+                  { $ifNull: ["$sellingPrice", 0] },
+                ],
+              },
+            },
           },
-          totalAmount: { $sum: "$totalAmount" },
-          count: { $sum: 1 }
-        }
-      },
-      {
-        $sort: { "_id.year": 1, "_id.month": 1 }
-      },
-      {
-        $limit: 6
-      }
+        },
+      ]),
+
+      // ── Stock Items aggregation
+      StockItem.aggregate([
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            inStock: { $sum: { $cond: [{ $eq: ["$status", "In Stock"] }, 1, 0] } },
+            lowStock: { $sum: { $cond: [{ $eq: ["$status", "Low Stock"] }, 1, 0] } },
+            outOfStock: { $sum: { $cond: [{ $eq: ["$status", "Out of Stock"] }, 1, 0] } },
+            totalQuantity: { $sum: { $ifNull: ["$quantityOnHand", 0] } },
+            totalValue: { $sum: { $ifNull: ["$inventoryValue", 0] } },
+          },
+        },
+      ]),
+
+      // ── Purchase Orders aggregation
+      PurchaseOrder.aggregate([
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            draft: { $sum: { $cond: [{ $eq: ["$status", "DRAFT"] }, 1, 0] } },
+            issued: { $sum: { $cond: [{ $eq: ["$status", "ISSUED"] }, 1, 0] } },
+            partiallyReceived: { $sum: { $cond: [{ $eq: ["$status", "PARTIALLY_RECEIVED"] }, 1, 0] } },
+            completed: { $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, 1, 0] } },
+            cancelled: { $sum: { $cond: [{ $eq: ["$status", "CANCELLED"] }, 1, 0] } },
+            totalValue: { $sum: { $ifNull: ["$totalAmount", 0] } },
+            pendingValue: {
+              $sum: {
+                $cond: [
+                  { $not: { $in: ["$status", ["COMPLETED", "CANCELLED"]] } },
+                  { $ifNull: ["$totalAmount", 0] },
+                  0,
+                ],
+              },
+            },
+            totalReceived: { $sum: { $ifNull: ["$totalReceived", 0] } },
+            totalPending: { $sum: { $ifNull: ["$totalPending", 0] } },
+          },
+        },
+      ]),
+
+      // ── Active vendor count
+      Vendor.countDocuments({ status: "Active" }),
+
+      // ── Recent raw items (last 7 days)
+      RawItem.find({ createdAt: { $gte: sevenDaysAgo } })
+        .select("name sku quantity status createdAt")
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean(),
+
+      // ── Recent POs (last 7 days)
+      PurchaseOrder.find({ createdAt: { $gte: sevenDaysAgo } })
+        .select("poNumber vendorName totalAmount status createdAt vendor")
+        .populate("vendor", "companyName")
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean(),
+
+      // ── Critical raw items (at or below min stock)
+      RawItem.find({
+        $expr: { $lte: ["$quantity", "$minStock"] },
+      })
+        .select("name sku quantity minStock status")
+        .sort({ quantity: 1 })
+        .limit(5)
+        .lean(),
+
+      // ── Critical stock items
+      StockItem.find({
+        $expr: { $lte: ["$quantityOnHand", "$minStock"] },
+      })
+        .select("name reference quantityOnHand minStock status")
+        .sort({ quantityOnHand: 1 })
+        .limit(5)
+        .lean(),
+
+      // ── Top 5 vendors by total PO value
+      PurchaseOrder.aggregate([
+        { $match: { status: { $ne: "CANCELLED" } } },
+        {
+          $group: {
+            _id: "$vendor",
+            vendorName: { $first: "$vendorName" },
+            totalValue: { $sum: { $ifNull: ["$totalAmount", 0] } },
+            poCount: { $sum: 1 },
+          },
+        },
+        { $sort: { totalValue: -1 } },
+        { $limit: 5 },
+        {
+          $lookup: {
+            from: "vendors",
+            localField: "_id",
+            foreignField: "_id",
+            as: "vendorDoc",
+          },
+        },
+        {
+          $project: {
+            _id: 1,
+            vendorName: {
+              $ifNull: [{ $arrayElemAt: ["$vendorDoc.companyName", 0] }, "$vendorName"],
+            },
+            totalValue: 1,
+            poCount: 1,
+          },
+        },
+      ]),
     ]);
 
-    // Format monthly data
-    const monthlyData = monthlyPOData.map(item => ({
-      month: `${item._id.year}-${item._id.month.toString().padStart(2, '0')}`,
-      amount: item.totalAmount,
-      count: item.count
-    }));
+    // ── Unwrap aggregation results (they return arrays) ────────────────────
+    const r = rawItemsAgg[0] || { total: 0, inStock: 0, lowStock: 0, outOfStock: 0, totalQuantity: 0, totalValue: 0 };
+    const s = stockItemsAgg[0] || { total: 0, inStock: 0, lowStock: 0, outOfStock: 0, totalQuantity: 0, totalValue: 0 };
+    const p = purchaseOrdersAgg[0] || {
+      total: 0, draft: 0, issued: 0, partiallyReceived: 0, completed: 0, cancelled: 0,
+      totalValue: 0, pendingValue: 0, totalReceived: 0, totalPending: 0,
+    };
 
     res.json({
       success: true,
       stats: {
-        // Raw Items
         rawItems: {
-          total: rawItemsCount,
-          outOfStock: rawItemsOutOfStock,
-          lowStock: rawItemsLowStock,
-          inStock: rawItemsInStock,
-          totalQuantity: rawItemsTotalQuantity,
-          totalValue: rawItemsTotalValue
+          total: r.total,
+          inStock: r.inStock,
+          lowStock: r.lowStock,
+          outOfStock: r.outOfStock,
+          totalQuantity: r.totalQuantity,
+          totalValue: r.totalValue,
         },
-        
-        // Stock Items
         stockItems: {
-          total: stockItemsCount,
-          outOfStock: stockItemsOutOfStock,
-          lowStock: stockItemsLowStock,
-          inStock: stockItemsInStock,
-          totalQuantity: stockItemsTotalQuantity,
-          totalValue: stockItemsTotalValue
+          total: s.total,
+          inStock: s.inStock,
+          lowStock: s.lowStock,
+          outOfStock: s.outOfStock,
+          totalQuantity: s.totalQuantity,
+          totalValue: s.totalValue,
         },
-        
-        // Purchase Orders
         purchaseOrders: {
-          total: purchaseOrdersCount,
-          draft: poDraft,
-          issued: poIssued,
-          partiallyReceived: poPartiallyReceived,
-          completed: poCompleted,
-          cancelled: poCancelled,
-          totalValue: poTotalValue,
-          pendingValue: poPendingValue,
-          totalReceived: poTotalReceived,
-          totalPending: poTotalPending
+          total: p.total,
+          draft: p.draft,
+          issued: p.issued,
+          partiallyReceived: p.partiallyReceived,
+          completed: p.completed,
+          cancelled: p.cancelled,
+          totalValue: p.totalValue,
+          pendingValue: p.pendingValue,
+          totalReceived: p.totalReceived,
+          totalPending: p.totalPending,
         },
-        
-        // Vendors
         vendors: {
-          active: activeVendors
+          active: activeVendorsCount,
         },
-        
-        // Overall Inventory
         overall: {
-          totalItems: rawItemsCount + stockItemsCount,
-          totalValue: rawItemsTotalValue + stockItemsTotalValue,
-          totalStockQuantity: rawItemsTotalQuantity + stockItemsTotalQuantity
-        }
+          totalItems: r.total + s.total,
+          totalValue: r.totalValue + s.totalValue,
+          totalStockQuantity: r.totalQuantity + s.totalQuantity,
+        },
       },
-      
-      // Recent Activities
       recentActivities: {
         rawItems: recentRawItems,
-        purchaseOrders: recentPurchaseOrders
+        purchaseOrders: recentPurchaseOrders,
       },
-      
-      // Critical Items
       criticalItems: {
         rawItems: criticalRawItems,
-        stockItems: criticalStockItems
+        stockItems: criticalStockItems,
       },
-      
-      // Charts Data
-      charts: {
-        monthlyPurchases: monthlyData
-      }
+      topVendors: topVendorsByPO,
     });
-
   } catch (error) {
     console.error("Error fetching inventory overview:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while fetching inventory overview"
+      message: "Server error while fetching inventory overview",
     });
   }
 });
 
 module.exports = router;
+
+
+
+// Ok let's move to next work ok means at the time of delivery /GRN interface ok...
+
+
+
+// ->  first of all the ui need to make nermal because the box are showing too much large size ok... so make them short as need ok...
+
+
+
+// -> and the most important thing is, basically here there is an feature need to introduce that is generate barcode ok... so that there is an barcode will be an feature for generate barcode where  each barcode will have an UID ok which also need to store in the database ok..
+
+
+
+// -> So the interface will be like once he enter the Delivered qty , then against that qty, he will goona now generate barcode/barcodes for that specific raw-item-variant ok ..
+
+
+
+// So basically just thing that there is an GRN happen for cotton-fabric-black ok of around 780 metre ok..
+
+
+
+// So as you know 780 metre's means if we consider in fabric roll/packet, then definitely we can say so many packets are goona delivered right..? so basically at the time of generating the barcode(click on generate barcode then it will ask for set Quantity and then set unit where all the registered units will be goona showcase ok, but bydefault suggest the units which are the conversion unit of that corresponding raw-item defined unit ok(conversion unit means both viceversa ok means don't consider the parent or child like thing ok, conversion means you just thing that corresponding raw-item defined unit which is associated with other units in any form ok these need to suggest ok))...
+
+
+// So ask the user for set quantity, set unit type ok that's it ok... then upon click on generate, automatically an document will be goona generate ok and in the frontend side that mondodb  document id need to print in the QR code ok.. that's it. and in the database/schema, keep the record of the raw item document id, corresponding attribute-variant name , corresponding po id(if available ok, so keep it optional ok) ok that's it ok.. if you thing to keep some other slight info then also you can but it shouldn't affect storage ok so don't keep extra ordianry ok...
+// -> and also basically in the raw-item list page, keep an button for generate barcode in the header/top so that
+// -> and 2nd thing is , basically create one more section in the inventory ok which is basilcly for generating the qr code ok.
+// So the interface will ask for the 
+// So let's do that ok  
+
+
+
