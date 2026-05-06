@@ -16,6 +16,7 @@ const app = express();
 
 const allowedOrigins = [
   "http://localhost:3000",
+  "http://localhost:8081",
   "http://localhost:3001",
   "https://grav-cms.vercel.app",
   "https://cms.grav.in",
@@ -938,13 +939,108 @@ app.use("/api/hr/payslip", payslipRouter);
 const empAttendance = require("./routes/Employee_Routes/employeeAttendance");
 app.use("/api/employee/attendance", empAttendance);
 
-// Accountant Department Routes
-const accountantCustomersRoutes = require("./routes/Accountant_Routes/customersRoutes");
-app.use("/api/accountant/customers", accountantCustomersRoutes);
+// ═══════════════════════════════════════════════════════════════════════════
+// ACCOUNTANT DEPARTMENT ROUTES — ALL 17 ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Path conventions:
+//   /api/accountant/tally/reports/...   → tallyReports.js (books reports:
+//                                          trial-balance, day-book, P&L,
+//                                          balance-sheet, cash-flow)
+//   /api/accountant/reports/...         → reports.js (operational reports:
+//                                          gst, receivables-aging,
+//                                          payables-aging)
 
-// Accountant Vendor Routes
-const accountantVendorRoutes = require("./routes/Accountant_Routes/vendors");
-app.use("/api/accountant/vendors", accountantVendorRoutes);
+console.log("[accountant] mounting routes…");
+
+// ── Operational routes ────────────────────────────────────────────────
+app.use(
+  "/api/accountant/dashboard",
+  require("./routes/Accountant_Routes/dashboard"),
+);
+app.use(
+  "/api/accountant/expenses",
+  require("./routes/Accountant_Routes/expenses"),
+);
+app.use(
+  "/api/accountant/invoices",
+  require("./routes/Accountant_Routes/invoices"),
+);
+app.use(
+  "/api/accountant/vendors",
+  require("./routes/Accountant_Routes/vendors"),
+);
+app.use(
+  "/api/accountant/customers",
+  require("./routes/Accountant_Routes/customersRoutes"),
+);
+app.use(
+  "/api/accountant/journal-entries",
+  require("./routes/Accountant_Routes/journalEntries"),
+);
+app.use(
+  "/api/accountant/payroll",
+  require("./routes/Accountant_Routes/payroll"),
+);
+app.use(
+  "/api/accountant/settings",
+  require("./routes/Accountant_Routes/settings"),
+);
+app.use(
+  "/api/accountant/tax-filings",
+  require("./routes/Accountant_Routes/taxFilings"),
+);
+app.use(
+  "/api/accountant/bank-transactions",
+  require("./routes/Accountant_Routes/bankTransactions"),
+);
+app.use(
+  "/api/accountant/budgets",
+  require("./routes/Accountant_Routes/budgets"),
+);
+app.use(
+  "/api/accountant/reports",
+  require("./routes/Accountant_Routes/reports"),
+);
+
+// ── Books / Vouchers / Import ─────────────────────────────────────────
+app.use(
+  "/api/accountant/chart-of-accounts",
+  require("./routes/Accountant_Routes/tallyChartOfAccounts"),
+);
+app.use(
+  "/api/accountant/tally/companies",
+  require("./routes/Accountant_Routes/tallyCompanies"),
+);
+app.use(
+  "/api/accountant/tally/import",
+  require("./routes/Accountant_Routes/tallyImport"),
+);
+app.use(
+  "/api/accountant/tally/reports",
+  require("./routes/Accountant_Routes/tallyReports"),
+);
+app.use(
+  "/api/accountant/vouchers",
+  require("./routes/Accountant_Routes/tallyVouchers"),
+);
+
+// ── Health probe (open in browser to verify mounting) ────────────────
+// http://localhost:5000/api/accountant/_health
+app.get("/api/accountant/_health", (req, res) => {
+  res.json({
+    ok: true,
+    timestamp: new Date().toISOString(),
+    message: "Accountant module is mounted ✓",
+  });
+});
+
+console.log("[accountant] ✓ all 17 routes mounted");
+
+// ═══════════════════════════════════════════════════════════════════════════
+// END ACCOUNTANT ROUTES
+// ═══════════════════════════════════════════════════════════════════════════
+
 const vendorProfileRoutes = require("./routes/Vendor_Routes/profile.js");
 app.use("/api/vendor/profile", vendorProfileRoutes);
 
@@ -1735,6 +1831,10 @@ app.get("/", (req, res) => {
 const payslipRoutes = require("./routes/Employee_Routes/Payslip");
 app.use("/api/employee/payslip", payslipRoutes);
 
+const overtimeRoutes = require("./routes/Employee_Routes/Overtimeroutes");
+app.use("/api/employee/overtime", overtimeRoutes);
+overtimeRoutes.startOvertimeReminders(io);
+
 /* =====================
     PRODUCTION SYNC MANAGEMENT ROUTES
   ===================== */
@@ -1785,6 +1885,10 @@ if (attendanceRouter.startHourlyAttendanceSync) {
 } else {
   console.warn("⚠️ Hourly attendance sync not available");
 }
+
+// Start persistent OT reminder notifications (random 5-20 min intervals)
+overtimeRoutes.startOvertimeReminders(io);
+console.log("✅ Overtime reminder cron initialized");
 
 // Graceful shutdown
 let isShuttingDown = false;

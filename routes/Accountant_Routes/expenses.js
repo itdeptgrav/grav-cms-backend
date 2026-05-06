@@ -3,10 +3,10 @@
 
 const express = require("express");
 const router = express.Router();
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const { Expense, ActivityLog } = require("../../models/Accountant_model/AccountantModels");
 
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // Helper: get financial year string
 const getFinancialYear = (date = new Date()) => {

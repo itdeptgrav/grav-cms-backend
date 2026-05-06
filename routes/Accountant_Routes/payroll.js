@@ -3,11 +3,11 @@
 
 const express = require("express");
 const router = express.Router();
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const { Payroll, PayrollItem } = require("../../models/HR_Models/Payroll");
 const Employee = require("../../models/Employee");
 
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // ── GET payroll runs list ──
 router.get("/runs", async (req, res) => {

@@ -3,7 +3,7 @@
 
 const express = require("express");
 const router = express.Router();
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const Customer = require("../../models/Customer_Models/Customer");
 const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
@@ -12,7 +12,7 @@ const {
   Expense, Invoice, BankTransaction, TaxFiling,
 } = require("../../models/Accountant_model/AccountantModels");
 
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // ── Accounts Receivable Aging Report ──
 router.get("/receivables-aging", async (req, res) => {
