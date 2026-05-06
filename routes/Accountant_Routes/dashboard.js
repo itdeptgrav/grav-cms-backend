@@ -4,7 +4,7 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const Customer = require("../../models/Customer_Models/Customer");
 const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
@@ -21,7 +21,7 @@ const {
   AccountantSettings,
 } = require("../../models/Accountant_model/AccountantModels");
 
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // ═══════════════════════════════════════════════════════════════
 // GET /api/accountant/dashboard - Main Dashboard Overview

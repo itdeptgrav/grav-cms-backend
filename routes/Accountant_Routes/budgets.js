@@ -1,10 +1,10 @@
 // routes/Accountant_Routes/budgets.js
 const express = require("express");
 const router = express.Router();
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const { Budget, Expense, ActivityLog } = require("../../models/Accountant_model/AccountantModels");
 
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // GET all budgets
 router.get("/", async (req, res) => {

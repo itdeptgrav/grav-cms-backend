@@ -331,22 +331,24 @@ router.get("/group/:groupId/members", verifyCoworkToken, verifyEmployeeToken, as
 
 // ── Notify-only endpoints (frontend already wrote to Firestore, just need push+email) ──
 router.post("/direct-message/notify", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  // Always respond 200 immediately — push/email are fire-and-forget
+  const { toEmployeeId, text, messageType } = req.body;
+  if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
+  res.json({ success: true }); // respond immediately, don't block on FCM
+  // Fire FCM push async
   try {
-    const { toEmployeeId, text, messageType } = req.body;
-    if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
-    // Only send push notification + email — do NOT write to Firestore again
     const { sendPushToEmployees } = require("../../services/fcmPush.service");
     await sendPushToEmployees([toEmployeeId], `💬 DM · ${req.coworkUser.name}`, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
-    try {
-      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
-      const empDoc = await db.collection("cowork_employees").doc(toEmployeeId).get();
-      if (empDoc.exists && empDoc.data().email) {
-        const emp = empDoc.data();
-        await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: toEmployeeId, receiverName: emp.name, receiverEmail: emp.email, type: "direct_message", title: req.coworkUser.name, body: (text || "📎 Attachment").slice(0, 80), data: {} });
-      }
-    } catch (e) { console.error("[dm notify email]", e.message); }
-    res.json({ success: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) { console.error("[dm notify FCM]", e.message); }
+  // Fire email async
+  try {
+    const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+    const empDoc = await db.collection("cowork_employees").doc(toEmployeeId).get();
+    if (empDoc.exists && empDoc.data().email) {
+      const emp = empDoc.data();
+      await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: toEmployeeId, receiverName: emp.name, receiverEmail: emp.email, type: "direct_message", title: req.coworkUser.name, body: (text || "📎 Attachment").slice(0, 80), data: {} });
+    }
+  } catch (e) { console.error("[dm notify email]", e.message); }
 });
 
 router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
@@ -372,7 +374,10 @@ router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, as
       }
     } catch (e) { console.error("[group notify email]", e.message); }
     res.json({ success: true });
-  } catch (e) { res.status(400).json({ error: e.message }); }
+  } catch (e) { 
+    console.error("[group notify]", e.message);
+    res.json({ success: true }); // never fail — push is best-effort
+  }
 });
 
 router.post("/group/:groupId/message", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
