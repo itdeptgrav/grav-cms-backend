@@ -15,7 +15,7 @@ const customFieldSchema = new mongoose.Schema(
       default: "text",
     },
   },
-  { _id: false }
+  { _id: false },
 );
 
 const employeeSchema = new mongoose.Schema({
@@ -37,14 +37,14 @@ const employeeSchema = new mongoose.Schema({
 
   phone: { type: String },
   alternatePhone: { type: String },
-  extension: { type: String },           // office extension number
+  extension: { type: String }, // office extension number
 
   dateOfBirth: { type: Date },
-  gender: { type: String, enum: ["male", "female", "other", ""], default: "" },
+  gender: { type: String, enum: ["Male", "Female", "Other", ""], default: "" },
   bloodGroup: { type: String },
   maritalStatus: {
     type: String,
-    enum: ["single", "married", "divorced", "widowed", ""],
+    enum: ["Single", "Married", "Divorced", "Widowed", ""],
     default: "",
   },
   marriageDate: { type: Date },
@@ -90,7 +90,7 @@ const employeeSchema = new mongoose.Schema({
   department: { type: String },
   departmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Department" },
   designation: { type: String, trim: true },
-  jobPosition: { type: String },       // kept for backward compat
+  jobPosition: { type: String }, // kept for backward compat
   jobTitle: { type: String },
 
   primaryManager: {
@@ -137,9 +137,9 @@ const employeeSchema = new mongoose.Schema({
     // ── PF (auto) ─────────────────────────────────────────────────────────────
     epf: { type: mongoose.Schema.Types.Mixed, default: 0 },
     edli: { type: mongoose.Schema.Types.Mixed, default: 0 },
-    edliOverride: { type: Boolean, default: false },  // kept as boolean
+    edliOverride: { type: Boolean, default: false }, // kept as boolean
     adminCharges: { type: mongoose.Schema.Types.Mixed, default: 0 },
-    adminOverride: { type: Boolean, default: false },  // kept as boolean
+    adminOverride: { type: Boolean, default: false }, // kept as boolean
 
     // ── ESI on Basic ─────────────────────────────────────────────────────────
     eeesic: { type: mongoose.Schema.Types.Mixed, default: 0 },
@@ -161,7 +161,11 @@ const employeeSchema = new mongoose.Schema({
     bankName: { type: String },
     accountNumber: { type: String },
     ifscCode: { type: String },
-    accountType: { type: String, enum: ["savings", "current", ""], default: "" },
+    accountType: {
+      type: String,
+      enum: ["savings", "current", ""],
+      default: "",
+    },
     branchName: { type: String },
   },
 
@@ -244,16 +248,22 @@ const employeeSchema = new mongoose.Schema({
 });
 
 // ─── INDEXES ────────────────────────────────────────────────────────────────────
-employeeSchema.index({ email: 1 }, { unique: true, sparse: true });
 employeeSchema.index({ biometricId: 1 }, { unique: true, sparse: true });
 employeeSchema.index({ identityId: 1 }, { unique: true, sparse: true });
+employeeSchema.index({ email: 1 }, { unique: true, sparse: true });
 
 // ─── PRE-SAVE HOOKS ──────────────────────────────────────────────────────────────
 employeeSchema.pre("save", async function (next) {
-  if (!this.salary) { this.updatedAt = Date.now(); return next(); }
+  if (!this.salary) {
+    this.updatedAt = Date.now();
+    return next();
+  }
   try {
     const SalaryConfig = require("./Salaryconfig");
-    const { decryptSalaryFields, encryptSalaryFields } = require("../utils/salaryEncryption");
+    const {
+      decryptSalaryFields,
+      encryptSalaryFields,
+    } = require("../utils/salaryEncryption");
 
     const cfg = await SalaryConfig.getSingleton();
 
@@ -276,8 +286,12 @@ employeeSchema.pre("save", async function (next) {
     const hra = Math.round(gross * hraPct);
 
     const epf = Math.round(Math.min(basic * eepfPct, epfCapAmount));
-    const edli = s.edliOverride ? (s.edli || 0) : Math.round(Math.min(basic * edliPct, edliCapAmount));
-    const adminCharges = s.adminOverride ? (s.adminCharges || 0) : Math.round(basic * adminPct);
+    const edli = s.edliOverride
+      ? s.edli || 0
+      : Math.round(Math.min(basic * edliPct, edliCapAmount));
+    const adminCharges = s.adminOverride
+      ? s.adminCharges || 0
+      : Math.round(basic * adminPct);
 
     const esiApplicable = basic <= esiWageLimit;
     const eeesic = esiApplicable ? Math.ceil(basic * eeEsicPct) : 0;
@@ -290,13 +304,22 @@ employeeSchema.pre("save", async function (next) {
 
     // ── 2. Build the plain calculated object ─────────────────────────────────
     const calculated = {
-      gross, basic, hra,
-      epf, edli, adminCharges,
+      gross,
+      basic,
+      hra,
+      epf,
+      edli,
+      adminCharges,
       edliOverride: this.salary.edliOverride || false,
       adminOverride: this.salary.adminOverride || false,
-      eeesic, erEsic, foodAllowance,
-      employerCost, totalDeduction, netSalary,
-      allowances: hra, deductions: totalDeduction,
+      eeesic,
+      erEsic,
+      foodAllowance,
+      employerCost,
+      totalDeduction,
+      netSalary,
+      allowances: hra,
+      deductions: totalDeduction,
     };
 
     // ── 3. Encrypt all monetary fields before persisting ─────────────────────
@@ -308,7 +331,9 @@ employeeSchema.pre("save", async function (next) {
     this.salary = encrypted;
     this.updatedAt = Date.now();
     next();
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Hash password before saving
