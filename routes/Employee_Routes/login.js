@@ -33,13 +33,10 @@ const extractDateComponents = (dateOfBirth) => {
   };
 };
 
-const generateDefaultPassword = (firstName, dateOfBirth) => {
-  if (!firstName || !dateOfBirth) return null;
-  const formattedFirstName =
-    firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
-  const dc = extractDateComponents(dateOfBirth);
-  if (!dc) return null;
-  return `${formattedFirstName}@${String(dc.month).padStart(2, "0")}${String(dc.day).padStart(2, "0")}${dc.year}`;
+// Default password = employee's mobile number
+const generateDefaultPassword = (phone) => {
+  if (!phone) return null;
+  return phone.trim();
 };
 
 // Helper: populate and format employee response
@@ -121,11 +118,8 @@ router.post("/login", async (req, res) => {
         isMatch = await bcrypt.compare(password, employee.password);
       else isMatch = password === employee.password;
     }
-    if (!isMatch && employee.firstName && employee.dateOfBirth) {
-      const defaultPassword = generateDefaultPassword(
-        employee.firstName,
-        employee.dateOfBirth,
-      );
+    if (!isMatch && employee.phone) {
+      const defaultPassword = generateDefaultPassword(employee.phone);
       if (defaultPassword && password === defaultPassword) {
         isMatch = true;
         const salt = await bcrypt.genSalt(10);
