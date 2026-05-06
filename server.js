@@ -737,6 +737,10 @@ app.use("/api/employees", employeeRoutes);
 const pushTokenRoutes = require("./routes/Employee_Routes/pushToken");
 app.use("/api/employee", pushTokenRoutes);
 
+
+const barcodeRoutes = require("./routes/CMS_Routes/Inventory/Operations/barcodes");
+app.use("/api/cms/inventory/barcodes", barcodeRoutes);
+
 /* =====================
     Customer ROUTES
   ===================== */

@@ -62,3 +62,9 @@ const VendorAuthMiddleware = (req, res, next) => {
 };
 
 module.exports = VendorAuthMiddleware;
+
+
+
+// Ok Excellent, now let's move to another topic ok where this scan will happen ...
+
+// 

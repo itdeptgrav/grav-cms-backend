@@ -22,6 +22,8 @@ const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
+const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+
 
 router.use(EmployeeAuthMiddleware);
 
@@ -43,6 +45,20 @@ const parseBarcode = (barcodeId) => {
   } catch {
     return { success: false };
   }
+};
+
+
+// Iron-station identifiers
+const IRON_MACHINE_IDS = new Set([
+  "69f9bbf4ff2c75e73c2ec865",
+  "69f9bc0fff2c75e73c2ec879",
+]);
+const IRON_OP_REGEX = /^IRON[-_]?\d*$/i;
+
+const isOptionalProduct = (name) => {
+  if (!name) return false;
+  const n = name.toLowerCase();
+  return n.includes("apron") || n.includes("jacket");
 };
 
 
@@ -321,12 +337,491 @@ async function commitBulkPackaging({ workOrderId, scannedUnits, packagedBy, note
 
 
 
+// ───────────────────────────────────────────────────────────────────────────
+// Add this require near the top of packagingRoutes.js (alongside other models):
+//
+// const ProductionTracking = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/ProductionTracking");
+//
+// Then paste the route below right before `module.exports = router;`
+// ───────────────────────────────────────────────────────────────────────────
+
+
 // ═════════════════════════════════════════════════════════════════════════════
-// GET /logs-by-mo
-// Returns packaging events grouped by MO, then by person (for measurement) or
-// by product (for bulk). Used by the overview page.
-// Query: from, to, type (all|measurement|bulk), page, limit
+// GET /pending-pieces
+//
+// Walks ProductionTracking docs from the last 5 days, picks scans on the iron
+// machines (or fallback: scans tagged with an IRON_xx active op), and groups
+// them into:
+//
+//   ready.measurementGroups       → measurement persons whose every remaining
+//                                    (non-packaged) unit has been ironed
+//   ready.bulkGroups              → bulk WOs with scanned-but-not-yet-packaged
+//                                    units
+//   inProgress.measurementGroups  → measurement persons with partial iron scans
+//
+// Persons whose packaging is fully done are skipped.
 // ═════════════════════════════════════════════════════════════════════════════
+router.get("/pending-pieces", async (req, res) => {
+  try {
+    // ── 1. Date window: last 5 days ──────────────────────────────────────
+    const now = new Date();
+    const fromDate = new Date(now);
+    fromDate.setDate(fromDate.getDate() - 5);
+    fromDate.setHours(0, 0, 0, 0);
+ 
+    // ── 2. Pull ProductionTracking docs in the window ────────────────────
+    const trackingDocs = await ProductionTracking.find({
+      date: { $gte: fromDate, $lte: now },
+    })
+      .select("date machines")
+      .lean();
+ 
+    // ── 3. Collect iron scans: barcodeId → latest timestamp ──────────────
+    const ironScans = new Map();
+    for (const td of trackingDocs) {
+      for (const machine of td.machines || []) {
+        const machineIdStr = machine.machineId?.toString();
+        const isIronMachine = IRON_MACHINE_IDS.has(machineIdStr);
+ 
+        for (const op of machine.operators || []) {
+          for (const scan of op.barcodeScans || []) {
+            const scanIsIronOp = (scan.activeOps || []).some((c) =>
+              IRON_OP_REGEX.test((c || "").trim())
+            );
+            if (!isIronMachine && !scanIsIronOp) continue;
+ 
+            const ts = new Date(scan.timeStamp);
+            const existing = ironScans.get(scan.barcodeId);
+            if (!existing || ts > existing) ironScans.set(scan.barcodeId, ts);
+          }
+        }
+      }
+    }
+ 
+    // ── 4. Parse barcodes → group by WO short id ─────────────────────────
+    const scansByWO = new Map();
+    for (const [barcodeId, ts] of ironScans) {
+      const parsed = parseBarcode(barcodeId);
+      if (!parsed.success || isNaN(parsed.unitNumber)) continue;
+      if (!scansByWO.has(parsed.workOrderShortId)) {
+        scansByWO.set(parsed.workOrderShortId, new Map());
+      }
+      scansByWO.get(parsed.workOrderShortId).set(parsed.unitNumber, ts);
+    }
+ 
+    if (scansByWO.size === 0) {
+      return res.json({
+        success: true,
+        ready: { measurementGroups: [], bulkGroups: [] },
+        inProgress: { measurementGroups: [] },
+        stats: emptyStats(fromDate, now),
+      });
+    }
+ 
+    // ── 5. Resolve WOs that have scans (for short-id lookup) ─────────────
+    const allWOs = await WorkOrder.find({})
+      .select(
+        "_id workOrderNumber stockItemName stockItemReference quantity " +
+          "customerRequestId packagingRecords variantAttributes variantId stockItemId status"
+      )
+      .lean();
+ 
+    const woByShortId = new Map();
+    for (const shortId of scansByWO.keys()) {
+      const wo = allWOs.find((w) => w._id.toString().slice(-8) === shortId);
+      if (wo) woByShortId.set(shortId, wo);
+    }
+ 
+    // ── 6. Resolve MOs ────────────────────────────────────────────────────
+    const moIds = [
+      ...new Set(
+        [...woByShortId.values()]
+          .map((w) => w.customerRequestId?.toString())
+          .filter(Boolean)
+      ),
+    ];
+    const mos = await CustomerRequest.find({ _id: { $in: moIds } })
+      .select("requestId customerInfo requestType")
+      .lean();
+    const moMap = new Map(mos.map((m) => [m._id.toString(), m]));
+ 
+    // ── 7. Split into measurement vs bulk ────────────────────────────────
+    // measurementByMo: moId -> { woScans: Map<woId, Map<unit, ts>> }
+    const measurementByMo = new Map();
+    const bulkEntries = [];
+ 
+    for (const [shortId, wo] of woByShortId) {
+      const moId = wo.customerRequestId?.toString();
+      const mo = moId ? moMap.get(moId) : null;
+      if (!mo) continue;
+      const isMeasurement = mo.requestType === "measurement_conversion";
+      const woScans = scansByWO.get(shortId);
+ 
+      if (isMeasurement) {
+        if (!measurementByMo.has(moId)) {
+          measurementByMo.set(moId, { woScans: new Map() });
+        }
+        measurementByMo.get(moId).woScans.set(wo._id.toString(), woScans);
+      } else {
+        bulkEntries.push({ mo, wo, scans: woScans });
+      }
+    }
+ 
+    // ── 8. Process measurement MOs ───────────────────────────────────────
+    const measMoIds = [...measurementByMo.keys()];
+    let allProgressDocs = [];
+    if (measMoIds.length > 0) {
+      allProgressDocs = await EmployeeProductionProgress.find({
+        manufacturingOrderId: { $in: measMoIds },
+      }).lean();
+    }
+ 
+    // ── FIX: Fetch ALL WOs referenced by these progress docs (not just
+    //   the ones with iron scans). Without this, products without scans
+    //   showed up as "Unknown" because their WO was never in the cache.
+    const allProgressWoIds = [
+      ...new Set(
+        allProgressDocs
+          .map((pd) => pd.workOrderId?.toString())
+          .filter(Boolean)
+      ),
+    ];
+    const allRelevantWOs = allProgressWoIds.length
+      ? await WorkOrder.find({ _id: { $in: allProgressWoIds } })
+          .select(
+            "_id workOrderNumber stockItemName stockItemReference quantity stockItemId variantAttributes packagingRecords"
+          )
+          .lean()
+      : [];
+    const woFullMap = new Map(
+      allRelevantWOs.map((w) => [w._id.toString(), w])
+    );
+ 
+    // Group progress docs by (moId, employeeId)
+    const personProgressMap = new Map();
+    for (const pd of allProgressDocs) {
+      const key = `${pd.manufacturingOrderId.toString()}::${pd.employeeId.toString()}`;
+      if (!personProgressMap.has(key)) personProgressMap.set(key, []);
+      personProgressMap.get(key).push(pd);
+    }
+ 
+    const mpcMap = await buildMpcEnrichmentMap({
+      employeeIds: allProgressDocs.map((p) => p.employeeId),
+      uins: allProgressDocs.map((p) => p.employeeUIN),
+    });
+ 
+    // moId -> { ready: [], inProgress: [] }
+    const measurementResults = new Map();
+ 
+    for (const [key, progressDocs] of personProgressMap) {
+      const [moId] = key.split("::");
+      const moEntry = measurementByMo.get(moId);
+      if (!moEntry) continue;
+ 
+      const firstDoc = progressDocs[0];
+      const mpcEntry = lookupMpc(mpcMap, firstDoc);
+ 
+      let allFullyPackaged = true;
+      let hasAnyScans = false;
+      let activeProducts = 0;
+      let essentialActiveProducts = 0;
+      let fullyScannedActiveProducts = 0;
+      let essentialFullyScannedProducts = 0;
+      const productStatuses = [];
+ 
+      for (const pd of progressDocs) {
+        if (!pd.isFullyPackaged) allFullyPackaged = false;
+        if (pd.isFullyPackaged) continue;
+ 
+        const woId = pd.workOrderId.toString();
+        const wo = woFullMap.get(woId); // ← always present now
+        if (!wo) continue;
+ 
+        const woScans = moEntry.woScans.get(woId) || new Map();
+ 
+        const alreadyPackagedSet = new Set(
+          (pd.packagingHistory || []).flatMap((h) => h.unitNumbers || [])
+        );
+ 
+        const myUnits = [];
+        for (let u = pd.unitStart; u <= pd.unitEnd; u++) myUnits.push(u);
+ 
+        const remainingUnits = myUnits.filter((u) => !alreadyPackagedSet.has(u));
+        if (remainingUnits.length === 0) continue;
+ 
+        const scannedRemaining = remainingUnits.filter((u) => woScans.has(u));
+ 
+        const aliasName = resolveAlias(mpcEntry, wo);
+        const productName = aliasName || wo.stockItemName || "Unknown";
+ 
+        // Check both alias and canonical name for the optional tokens
+        const isOptional =
+          isOptionalProduct(productName) || isOptionalProduct(wo.stockItemName);
+ 
+        activeProducts++;
+        if (!isOptional) essentialActiveProducts++;
+ 
+        if (scannedRemaining.length > 0) hasAnyScans = true;
+ 
+        const isFullyScanned =
+          scannedRemaining.length === remainingUnits.length &&
+          remainingUnits.length > 0;
+        if (isFullyScanned) {
+          fullyScannedActiveProducts++;
+          if (!isOptional) essentialFullyScannedProducts++;
+        }
+ 
+        const latestTs =
+          scannedRemaining.length > 0
+            ? new Date(
+                Math.max(
+                  ...scannedRemaining.map((u) => woScans.get(u).getTime())
+                )
+              )
+            : null;
+ 
+        productStatuses.push({
+          workOrderId: pd.workOrderId,
+          workOrderNumber: wo.workOrderNumber,
+          productName,
+          isOptional,
+          unitStart: pd.unitStart,
+          unitEnd: pd.unitEnd,
+          totalUnits: remainingUnits.length,
+          scannedCount: scannedRemaining.length,
+          scannedUnits: scannedRemaining.sort((a, b) => a - b),
+          progressPercentage:
+            remainingUnits.length > 0
+              ? Math.round(
+                  (scannedRemaining.length / remainingUnits.length) * 100
+                )
+              : 0,
+          lastScannedAt: latestTs,
+        });
+      }
+ 
+      if (allFullyPackaged) continue;
+      if (!hasAnyScans) continue;
+      if (activeProducts === 0) continue;
+ 
+      // ── READY logic: apron/jacket are excluded from the gating check ──
+      // If the person has at least one ESSENTIAL product, only essentials
+      // need to be fully scanned. Optional products (apron/jacket) display
+      // alongside but don't block ready status.
+      // If ALL products are optional (edge case), fall back to all-complete.
+      let isReady;
+      if (essentialActiveProducts > 0) {
+        isReady = essentialFullyScannedProducts === essentialActiveProducts;
+      } else {
+        isReady = fullyScannedActiveProducts === activeProducts;
+      }
+ 
+      // Sort: essential first, then optional, both alpha
+      productStatuses.sort((a, b) => {
+        if (a.isOptional !== b.isOptional) return a.isOptional ? 1 : -1;
+        return (a.productName || "").localeCompare(b.productName || "");
+      });
+ 
+      const overallTotalUnits = productStatuses.reduce((s, p) => s + p.totalUnits, 0);
+      const overallScannedUnits = productStatuses.reduce((s, p) => s + p.scannedCount, 0);
+      const overallPct =
+        overallTotalUnits > 0
+          ? Math.round((overallScannedUnits / overallTotalUnits) * 100)
+          : 0;
+ 
+      // Essential-only counters for in-progress progress bars
+      const essentialTotalUnits = productStatuses
+        .filter((p) => !p.isOptional)
+        .reduce((s, p) => s + p.totalUnits, 0);
+      const essentialScannedUnits = productStatuses
+        .filter((p) => !p.isOptional)
+        .reduce((s, p) => s + p.scannedCount, 0);
+      const essentialPct =
+        essentialTotalUnits > 0
+          ? Math.round((essentialScannedUnits / essentialTotalUnits) * 100)
+          : 0;
+ 
+      const latestOverall =
+        productStatuses
+          .map((p) => p.lastScannedAt)
+          .filter(Boolean)
+          .sort((a, b) => b - a)[0] || null;
+ 
+      const personEntry = {
+        employeeId: firstDoc.employeeId,
+        employeeName: firstDoc.employeeName,
+        employeeUIN: firstDoc.employeeUIN,
+        gender: firstDoc.gender,
+        department: mpcEntry?.department || "",
+        designation: mpcEntry?.designation || "",
+        products: productStatuses,
+        totalProducts: activeProducts,
+        essentialProducts: essentialActiveProducts,
+        scannedProducts: fullyScannedActiveProducts,
+        essentialScannedProducts: essentialFullyScannedProducts,
+        overallTotalUnits,
+        overallScannedUnits,
+        overallPct,
+        essentialTotalUnits,
+        essentialScannedUnits,
+        essentialPct,
+        lastScannedAt: latestOverall,
+      };
+ 
+      if (!measurementResults.has(moId)) {
+        measurementResults.set(moId, { ready: [], inProgress: [] });
+      }
+      const bucket = measurementResults.get(moId);
+      if (isReady) bucket.ready.push(personEntry);
+      else bucket.inProgress.push(personEntry);
+    }
+ 
+    // ── 9. Build measurement output groups ───────────────────────────────
+    const readyMeasurementGroups = [];
+    const inProgressMeasurementGroups = [];
+ 
+    for (const [moId, results] of measurementResults) {
+      const mo = moMap.get(moId);
+      if (!mo) continue;
+ 
+      if (results.ready.length > 0) {
+        readyMeasurementGroups.push({
+          moId,
+          moNumber: `MO-${mo.requestId}`,
+          requestId: mo.requestId,
+          organizationName: mo.customerInfo?.name || "—",
+          persons: results.ready.sort((a, b) =>
+            (a.employeeName || "").localeCompare(b.employeeName || "")
+          ),
+          personCount: results.ready.length,
+          totalUnits: results.ready.reduce((s, p) => s + p.overallTotalUnits, 0),
+        });
+      }
+      if (results.inProgress.length > 0) {
+        inProgressMeasurementGroups.push({
+          moId,
+          moNumber: `MO-${mo.requestId}`,
+          requestId: mo.requestId,
+          organizationName: mo.customerInfo?.name || "—",
+          persons: results.inProgress.sort((a, b) => b.essentialPct - a.essentialPct),
+          personCount: results.inProgress.length,
+          totalScannedUnits: results.inProgress.reduce((s, p) => s + p.essentialScannedUnits, 0),
+          totalRequiredUnits: results.inProgress.reduce((s, p) => s + p.essentialTotalUnits, 0),
+        });
+      }
+    }
+ 
+    readyMeasurementGroups.sort((a, b) =>
+      a.organizationName.localeCompare(b.organizationName)
+    );
+    inProgressMeasurementGroups.sort((a, b) =>
+      a.organizationName.localeCompare(b.organizationName)
+    );
+ 
+    // ── 10. Build bulk output groups ─────────────────────────────────────
+    const bulkByMo = new Map();
+    for (const { mo, wo, scans } of bulkEntries) {
+      const moId = mo._id.toString();
+ 
+      const alreadyPackaged = new Set(
+        (wo.packagingRecords || []).flatMap((r) => r.unitNumbers || [])
+      );
+ 
+      const readyEntries = [];
+      let alreadyPackagedFromScans = 0;
+      let lastScannedAt = null;
+      for (const [unit, ts] of scans) {
+        if (alreadyPackaged.has(unit)) {
+          alreadyPackagedFromScans++;
+          continue;
+        }
+        readyEntries.push({ unit, ts });
+        if (!lastScannedAt || ts > lastScannedAt) lastScannedAt = ts;
+      }
+ 
+      if (readyEntries.length === 0) continue;
+      readyEntries.sort((a, b) => a.unit - b.unit);
+ 
+      if (!bulkByMo.has(moId)) bulkByMo.set(moId, { mo, workOrders: [] });
+      bulkByMo.get(moId).workOrders.push({
+        workOrderId: wo._id,
+        workOrderNumber: wo.workOrderNumber,
+        productName: wo.stockItemName,
+        stockItemReference: wo.stockItemReference || "",
+        variantAttributes: wo.variantAttributes || [],
+        totalQty: wo.quantity || 0,
+        readyToPackageCount: readyEntries.length,
+        scannedUnits: readyEntries.map((e) => e.unit),
+        alreadyPackagedFromScans,
+        lastScannedAt,
+      });
+    }
+ 
+    const readyBulkGroups = [];
+    for (const [moId, { mo, workOrders }] of bulkByMo) {
+      readyBulkGroups.push({
+        moId,
+        moNumber: `MO-${mo.requestId}`,
+        requestId: mo.requestId,
+        customerName: mo.customerInfo?.name || "—",
+        workOrders: workOrders.sort((a, b) =>
+          (a.productName || "").localeCompare(b.productName || "")
+        ),
+        workOrderCount: workOrders.length,
+        totalReadyUnits: workOrders.reduce((s, w) => s + w.readyToPackageCount, 0),
+      });
+    }
+    readyBulkGroups.sort((a, b) => a.customerName.localeCompare(b.customerName));
+ 
+    // ── 11. Stats ────────────────────────────────────────────────────────
+    const stats = {
+      readyPersonsCount: readyMeasurementGroups.reduce((s, g) => s + g.personCount, 0),
+      readyOrgsCount: readyMeasurementGroups.length + readyBulkGroups.length,
+      readyTotalUnits:
+        readyMeasurementGroups.reduce((s, g) => s + g.totalUnits, 0) +
+        readyBulkGroups.reduce((s, g) => s + g.totalReadyUnits, 0),
+      inProgressPersonsCount: inProgressMeasurementGroups.reduce((s, g) => s + g.personCount, 0),
+      bulkOrdersCount: readyBulkGroups.length,
+      bulkReadyUnits: readyBulkGroups.reduce((s, g) => s + g.totalReadyUnits, 0),
+      ironScansConsidered: ironScans.size,
+      dateRangeFrom: fromDate.toISOString(),
+      dateRangeTo: now.toISOString(),
+    };
+ 
+    return res.json({
+      success: true,
+      ready: {
+        measurementGroups: readyMeasurementGroups,
+        bulkGroups: readyBulkGroups,
+      },
+      inProgress: {
+        measurementGroups: inProgressMeasurementGroups,
+      },
+      stats,
+    });
+  } catch (err) {
+    console.error("pending-pieces error:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+function emptyStats(fromDate, now) {
+  return {
+    readyPersonsCount: 0,
+    readyOrgsCount: 0,
+    readyTotalUnits: 0,
+    inProgressPersonsCount: 0,
+    bulkOrdersCount: 0,
+    bulkReadyUnits: 0,
+    ironScansConsidered: 0,
+    dateRangeFrom: fromDate.toISOString(),
+    dateRangeTo: now.toISOString(),
+  };
+}
+
+
 router.get("/logs-by-mo", async (req, res) => {
   try {
     const { from, to, type = "all", page = 1, limit = 25 } = req.query;
@@ -592,6 +1087,10 @@ router.get("/logs-by-mo", async (req, res) => {
     return res.status(500).json({ success: false, message: "Server error", error: err.message });
   }
 });
+
+
+
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /fetch-order
@@ -1248,3 +1747,6 @@ router.get("/logs", async (req, res) => {
 });
 
 module.exports = router;
+
+
+// Basically the data is not showing why, see how the remaining products are not showing/the needed products are not showing for that person     
