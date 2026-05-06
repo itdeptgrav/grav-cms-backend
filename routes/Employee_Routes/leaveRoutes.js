@@ -90,7 +90,12 @@ async function ensureBalance(employeeId, year, biometricId, config) {
   return bal;
 }
 
-async function countMonthlyUsage(employeeId, fromDate, leaveTypeFilter) {
+async function countMonthlyUsage(
+  employeeId,
+  fromDate,
+  leaveTypeFilter,
+  excludeId,
+) {
   const month = new Date(fromDate).getMonth() + 1;
   const year = new Date(fromDate).getFullYear();
   const mStr = String(month).padStart(2, "0");
@@ -103,6 +108,7 @@ async function countMonthlyUsage(employeeId, fromDate, leaveTypeFilter) {
     toDate: { $gte: monthStart },
   };
   if (leaveTypeFilter) filter.leaveType = leaveTypeFilter;
+  if (excludeId) filter._id = { $ne: excludeId };
   const existing = await LeaveApplication.find(filter).lean();
   let used = 0;
   for (const a of existing) {
@@ -976,13 +982,11 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       toDate: { $gte: nF },
     });
     if (oc)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `Conflicts with ${oc.fromDate}–${oc.toDate}`,
-          code: "OVERLAP",
-        });
+      return res.status(400).json({
+        success: false,
+        message: `Conflicts with ${oc.fromDate}–${oc.toDate}`,
+        code: "OVERLAP",
+      });
 
     // Recalculate paid vs LWP for new type/dates
     const config = await LeaveConfig.getConfig();
@@ -997,7 +1001,12 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
 
     if (nType === "CL") {
       const maxCLMonth = config.maxCLPerMonth || 3;
-      const { used: clUsed } = await countMonthlyUsage(a.employeeId, nF, "CL");
+      const { used: clUsed } = await countMonthlyUsage(
+        a.employeeId,
+        nF,
+        "CL",
+        a._id,
+      );
       effectiveAvailable = Math.min(
         effectiveAvailable,
         Math.max(0, maxCLMonth - clUsed),
@@ -1020,13 +1029,23 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       a.employeeId,
       nF,
       null,
+      a._id,
     );
     effectiveAvailable = Math.min(
       effectiveAvailable,
       Math.max(0, monthlyCap - totalMonthUsed),
     );
 
-    const paidDays = Math.min(totalDays, effectiveAvailable);
+    // If manager specified paidDays (from cart UI), use it — but cap at effectiveAvailable
+    let paidDays;
+    if (req.body.paidDays !== undefined && req.body.paidDays !== null) {
+      paidDays = Math.max(
+        0,
+        Math.min(Number(req.body.paidDays), effectiveAvailable, totalDays),
+      );
+    } else {
+      paidDays = Math.min(totalDays, effectiveAvailable);
+    }
     const lwpDays = Math.max(0, totalDays - paidDays);
 
     // Update
