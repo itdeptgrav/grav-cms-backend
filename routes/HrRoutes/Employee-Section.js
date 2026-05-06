@@ -202,8 +202,9 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
       });
     }
 
-    const temporaryPassword = Math.random().toString(36).slice(-8);
-    console.log("Generated temporary password:", temporaryPassword);
+    // Password = employee's mobile number (fallback to "password123" if no phone)
+    const temporaryPassword =
+      (employeeData.phone || "").trim() || "password123";
 
     const newEmployee = new Employee({
       ...employeeData,
@@ -270,13 +271,11 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     // Decrypt salary in the response so the client gets plain numbers back
     if (resp.salary) resp.salary = decryptSalaryFields(resp.salary);
 
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Employee created successfully",
-        data: resp,
-      });
+    res.status(201).json({
+      success: true,
+      message: "Employee created successfully",
+      data: resp,
+    });
   } catch (error) {
     console.error("Create employee error:", error);
     if (error.name === "ValidationError") {

@@ -5,31 +5,12 @@ const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
 const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
-const {
-  decryptSalaryFields,
-} = require("../../utils/salaryEncryption");
+const { decryptSalaryFields } = require("../../utils/salaryEncryption");
 
-// Helper function to generate default password (must match login route)
-const generateDefaultPassword = (firstName, dateOfBirth) => {
-  if (!firstName || !dateOfBirth) return null;
-
-  const formattedFirstName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase();
-
-  let date;
-  if (typeof dateOfBirth === 'string') {
-    date = new Date(dateOfBirth);
-  } else {
-    date = dateOfBirth;
-  }
-
-  if (isNaN(date.getTime())) return null;
-
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(date.getUTCDate()).padStart(2, '0');
-  const dobString = `${month}${day}${year}`;
-
-  return `${formattedFirstName}@${dobString}`;
+// Default password = employee's mobile number
+const generateDefaultPassword = (phone) => {
+  if (!phone) return null;
+  return phone.trim();
 };
 
 // Get employee profile - COMPLETE VERSION with all fields
@@ -60,29 +41,36 @@ router.get("/profile", AllEmployeeAppMiddleware, async (req, res) => {
     responseData.phoneNumber = employee.phone || "";
 
     // Add full name
-    responseData.fullName = `${employee.firstName || ''} ${employee.lastName || ''}`.trim();
+    responseData.fullName =
+      `${employee.firstName || ""} ${employee.lastName || ""}`.trim();
 
     // Format date of joining if exists
     if (employee.dateOfJoining) {
-      responseData.formattedDateOfJoining = new Date(employee.dateOfJoining).toLocaleDateString('en-IN', {
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric'
+      responseData.formattedDateOfJoining = new Date(
+        employee.dateOfJoining,
+      ).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
       });
     }
 
     // Format date of birth if exists
     if (employee.dateOfBirth) {
-      responseData.formattedDateOfBirth = new Date(employee.dateOfBirth).toLocaleDateString('en-IN', {
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric'
+      responseData.formattedDateOfBirth = new Date(
+        employee.dateOfBirth,
+      ).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
       });
     }
 
     // Add default values for missing fields to prevent frontend errors
-    responseData.designation = employee.jobTitle || employee.designation || "Not Assigned";
-    responseData.jobPosition = employee.jobPosition || employee.jobTitle || "Not Assigned";
+    responseData.designation =
+      employee.jobTitle || employee.designation || "Not Assigned";
+    responseData.jobPosition =
+      employee.jobPosition || employee.jobTitle || "Not Assigned";
 
     // Ensure email is returned
     responseData.email = employee.email || "";
@@ -111,8 +99,9 @@ router.get("/profile", AllEmployeeAppMiddleware, async (req, res) => {
 // Get employee profile for editing (returns all editable fields)
 router.get("/profile/edit", AllEmployeeAppMiddleware, async (req, res) => {
   try {
-    const employee = await Employee.findById(req.user.id)
-      .select("-password -temporaryPassword -__v");
+    const employee = await Employee.findById(req.user.id).select(
+      "-password -temporaryPassword -__v",
+    );
 
     if (!employee) {
       return res.status(404).json({
@@ -249,8 +238,8 @@ router.put("/profile", AllEmployeeAppMiddleware, async (req, res) => {
     });
 
     // Also remove any field that starts with $ (MongoDB operators)
-    Object.keys(updateData).forEach(key => {
-      if (key.startsWith('$')) {
+    Object.keys(updateData).forEach((key) => {
+      if (key.startsWith("$")) {
         delete updateData[key];
       }
     });
@@ -262,7 +251,7 @@ router.put("/profile", AllEmployeeAppMiddleware, async (req, res) => {
       {
         new: true,
         runValidators: true,
-      }
+      },
     ).select("-password -temporaryPassword -__v");
 
     if (!updatedEmployee) {
@@ -318,7 +307,9 @@ router.put("/change-password", AllEmployeeAppMiddleware, async (req, res) => {
     }
 
     // Find employee with password
-    const employee = await Employee.findById(user.id).select("+password firstName dateOfBirth");
+    const employee = await Employee.findById(user.id).select(
+      "+password firstName dateOfBirth",
+    );
     if (!employee) {
       return res.status(404).json({
         success: false,
@@ -331,10 +322,13 @@ router.put("/change-password", AllEmployeeAppMiddleware, async (req, res) => {
 
     // Method 1: Check with stored hashed password
     if (employee.password) {
-      if (employee.password.startsWith('$2')) {
-        isPasswordValid = await bcrypt.compare(currentPassword, employee.password);
+      if (employee.password.startsWith("$2")) {
+        isPasswordValid = await bcrypt.compare(
+          currentPassword,
+          employee.password,
+        );
       } else {
-        isPasswordValid = (currentPassword === employee.password);
+        isPasswordValid = currentPassword === employee.password;
       }
     }
 
@@ -342,9 +336,9 @@ router.put("/change-password", AllEmployeeAppMiddleware, async (req, res) => {
     if (!isPasswordValid && employee.firstName && employee.dateOfBirth) {
       const defaultPassword = generateDefaultPassword(
         employee.firstName,
-        employee.dateOfBirth
+        employee.dateOfBirth,
       );
-      isPasswordValid = (currentPassword === defaultPassword);
+      isPasswordValid = currentPassword === defaultPassword;
     }
 
     if (!isPasswordValid) {
@@ -384,7 +378,9 @@ router.get("/dashboard", AllEmployeeAppMiddleware, async (req, res) => {
 
     // Get employee details
     const employee = await Employee.findById(user.id)
-      .select("firstName lastName department jobTitle dateOfJoining phone email designation")
+      .select(
+        "firstName lastName department jobTitle dateOfJoining phone email designation",
+      )
       .lean();
 
     if (!employee) {
@@ -411,7 +407,7 @@ router.get("/dashboard", AllEmployeeAppMiddleware, async (req, res) => {
       const years = today.getFullYear() - joinDate.getFullYear();
       const months = today.getMonth() - joinDate.getMonth();
 
-      tenure = `${years} year${years !== 1 ? 's' : ''}, ${months} month${months !== 1 ? 's' : ''}`;
+      tenure = `${years} year${years !== 1 ? "s" : ""}, ${months} month${months !== 1 ? "s" : ""}`;
     }
 
     // Get upcoming birthdays (within next 30 days)
@@ -424,8 +420,8 @@ router.get("/dashboard", AllEmployeeAppMiddleware, async (req, res) => {
       {
         $match: {
           isActive: true,
-          dateOfBirth: { $exists: true, $ne: null }
-        }
+          dateOfBirth: { $exists: true, $ne: null },
+        },
       },
       {
         $addFields: {
@@ -433,35 +429,35 @@ router.get("/dashboard", AllEmployeeAppMiddleware, async (req, res) => {
             $dateFromParts: {
               year: today.getFullYear(),
               month: { $month: "$dateOfBirth" },
-              day: { $dayOfMonth: "$dateOfBirth" }
-            }
-          }
-        }
+              day: { $dayOfMonth: "$dateOfBirth" },
+            },
+          },
+        },
       },
       {
         $match: {
           $expr: {
             $and: [
               { $gte: ["$birthdayThisYear", today] },
-              { $lte: ["$birthdayThisYear", nextMonth] }
-            ]
-          }
-        }
+              { $lte: ["$birthdayThisYear", nextMonth] },
+            ],
+          },
+        },
       },
       {
-        $sort: { birthdayThisYear: 1 }
+        $sort: { birthdayThisYear: 1 },
       },
       {
-        $limit: 5
+        $limit: 5,
       },
       {
         $project: {
           firstName: 1,
           lastName: 1,
           dateOfBirth: 1,
-          "profilePhoto.url": 1
-        }
-      }
+          "profilePhoto.url": 1,
+        },
+      },
     ]);
 
     res.status(200).json({
@@ -500,7 +496,7 @@ router.get("/salary", AllEmployeeAppMiddleware, async (req, res) => {
     if (!employee) {
       return res.status(404).json({
         success: false,
-        message: "Employee not found"
+        message: "Employee not found",
       });
     }
 
@@ -528,7 +524,7 @@ router.get("/salary", AllEmployeeAppMiddleware, async (req, res) => {
     console.error("Get salary error:", error);
     res.status(500).json({
       success: false,
-      message: "Error fetching salary"
+      message: "Error fetching salary",
     });
   }
 });
@@ -537,7 +533,9 @@ router.get("/salary", AllEmployeeAppMiddleware, async (req, res) => {
 router.get("/basic-info", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const employee = await Employee.findById(req.user.id)
-      .select("firstName lastName profilePhoto.url role department phone email designation jobTitle")
+      .select(
+        "firstName lastName profilePhoto.url role department phone email designation jobTitle",
+      )
       .lean();
 
     if (!employee) {
@@ -550,13 +548,14 @@ router.get("/basic-info", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(200).json({
       success: true,
       data: {
-        name: `${employee.firstName || ''} ${employee.lastName || ''}`.trim(),
+        name: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
         firstName: employee.firstName,
         lastName: employee.lastName,
         profilePhoto: employee.profilePhoto?.url || null,
         role: employee.role || "employee",
         department: employee.department || "Not Assigned",
-        designation: employee.designation || employee.jobTitle || "Not Assigned",
+        designation:
+          employee.designation || employee.jobTitle || "Not Assigned",
         phoneNumber: employee.phone || "Not provided",
         email: employee.email || "Not provided",
       },
@@ -569,6 +568,5 @@ router.get("/basic-info", AllEmployeeAppMiddleware, async (req, res) => {
     });
   }
 });
-
 
 module.exports = router;
