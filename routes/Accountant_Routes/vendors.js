@@ -4,10 +4,10 @@ const express = require("express");
 const router = express.Router();
 const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 
 // Apply accountant auth middleware to all routes
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // ✅ GET all vendors with financial stats
 router.get("/", async (req, res) => {

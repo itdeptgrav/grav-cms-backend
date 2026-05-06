@@ -3,12 +3,12 @@
 
 const express = require("express");
 const router = express.Router();
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const { Invoice, AccountantSettings, ActivityLog } = require("../../models/Accountant_model/AccountantModels");
 const Customer = require("../../models/Customer_Models/Customer");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // Helper: number to words for Indian currency
 const numberToWords = (num) => {

@@ -1,10 +1,10 @@
 // routes/Accountant_Routes/settings.js
 const express = require("express");
 const router = express.Router();
-const AccountantAuthMiddlewaer = require("../../Middlewear/AccountantAuthMiddlewaer");
+const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const { AccountantSettings, ActivityLog } = require("../../models/Accountant_model/AccountantModels");
 
-router.use(AccountantAuthMiddlewaer.accountantAuth);
+router.use(AccountantAuthMiddleware.accountantAuth);
 
 // GET settings
 router.get("/", async (req, res) => {
