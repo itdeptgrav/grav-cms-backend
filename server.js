@@ -2038,11 +2038,7 @@ server.listen(PORT, () => {
       } catch (e) {
         console.error("[MeetReminder cron]", e.message);
       }
-
-      if (_reminderSent.size > 500) _reminderSent.clear();
-
-    } catch (e) {
-      console.error("[MeetReminder cron]", e.message);
-    }
-  }, 5 * 60 * 1000);
+    },
+    5 * 60 * 1000,
+  );
 });
