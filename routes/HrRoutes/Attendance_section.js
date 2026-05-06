@@ -1403,7 +1403,7 @@ async function syncDayForce(dateStr, empCode = "ALL") {
   console.log(`[SYNC-FORCE] ${dateStr}: ${employees.length} rows`);
   // Apply pending OT grace for this date
   try {
-    const { applyPendingGrace } = require("../Employee_Routes/overtimeRoutes");
+    const { applyPendingGrace } = require("../Employee_Routes/OvertimeRoutes");
     const graceResult = await applyPendingGrace(dateStr);
     if (graceResult.applied > 0)
       console.log(
