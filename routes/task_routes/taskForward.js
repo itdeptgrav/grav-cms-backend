@@ -69,7 +69,7 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline } = req.body;
+    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
@@ -99,12 +99,17 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     // Auto-priority: count existing open tasks for the first assignee → assign next priority
     let autoPriority = (typeof priority === "number" ? priority : Number(priority)) || null;
     if (!autoPriority && assigneeIds?.length > 0) {
-      const { db } = require("../../config/firebaseAdmin");
-      const existing = await db.collection("cowork_tasks")
-        .where("assigneeIds", "array-contains", assigneeIds[0])
-        .where("status", "not-in", ["done", "cancelled"])
-        .get();
-      autoPriority = Math.min(existing.size + 1, 5);
+      try {
+        const { db } = require("../../config/firebaseAdmin");
+        const existing = await db.collection("cowork_tasks")
+          .where("assigneeIds", "array-contains", assigneeIds[0])
+          .where("status", "not-in", ["done", "cancelled"])
+          .get();
+        autoPriority = existing.size + 1;
+      } catch (e) {
+        console.warn("[task/create] auto-priority fallback:", e.message);
+        autoPriority = 1;
+      }
     }
     if (!autoPriority) autoPriority = 1;
 
@@ -129,6 +134,10 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       goalConfig: (goalFlag && goalConfig) ? goalConfig : null,
       hasTimer: hasTimer !== false && hasTimer !== "false",
       fixedDeadline: fixedDeadline || null,
+      isSelfAssigned: isSelfAssigned === true || isSelfAssigned === "true",
+      visibleTo: Array.isArray(visibleTo) ? visibleTo : (visibleTo ? [visibleTo] : []),
+      approverId: approverId || null,
+      approverName: approverName || null,
       // Mark whether this is a CEO-created root task (for visibility filtering)
       createdByCeo: requesterRole === "ceo" && !parentTaskId,
       createdByTl: requesterRole === "tl",
@@ -182,6 +191,165 @@ router.post("/task/:taskId/confirm", verifyCoworkToken, verifyEmployeeToken, asy
 // ── REPEAT TASK CONFIRM — employee accepts the repeat task ────────────────────
 // Changes status: repeat_pending_confirmation → repeat_active
 // Unlocks chat and daily submissions
+// ── FORCE REPAIR: hit this once to fix all self-assign tasks ─────────────────
+// GET /cowork/task/force-repair-self-assign
+router.get("/task/force-repair-self-assign", async (req, res) => {
+  try {
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const snap = await db.collection("cowork_tasks").get();
+    const results = [];
+
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      // A task is self-assigned if approverName is set OR assignedBy === assigneeIds[0]
+      const isSelf = d.approverName || (d.assignedBy && d.assigneeIds?.length && d.assignedBy === d.assigneeIds[0]);
+      if (!isSelf) continue;
+
+      // Find the approver employeeId by looking up cowork_employees by name
+      let approverId = d.approverId;
+      if (!approverId && d.approverName) {
+        const empSnap = await db.collection("cowork_employees")
+          .where("name", "==", d.approverName).get();
+        if (!empSnap.empty) {
+          approverId = empSnap.docs[0].id;
+        }
+      }
+
+      const updates = {
+        isSelfAssigned: true,
+        selfAssignApproved: d.selfAssignApproved ?? false,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      if (approverId) {
+        updates.approverId = approverId;
+        updates.visibleTo = admin.firestore.FieldValue.arrayUnion(approverId);
+      }
+
+      await doc.ref.update(updates);
+      results.push({ taskId: d.taskId, title: d.title, approverName: d.approverName, approverId });
+    }
+
+    res.json({ fixed: results.length, tasks: results });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DEBUG: check what self-assign tasks exist and their fields ───────────────
+router.get("/task/self-assign-debug/:employeeId", async (req, res) => {
+  try {
+    const { db } = require("../../config/firebaseAdmin");
+    const { employeeId } = req.params;
+
+    // Query 1: approverId match
+    const snap1 = await db.collection("cowork_tasks").where("approverId", "==", employeeId).get();
+    // Query 2: visibleTo match
+    const snap2 = await db.collection("cowork_tasks").where("visibleTo", "array-contains", employeeId).get();
+    // Query 3: ALL tasks with isSelfAssigned=true
+    const snap3 = await db.collection("cowork_tasks").where("isSelfAssigned", "==", true).get();
+
+    res.json({
+      byApproverId: snap1.docs.map(d => ({ taskId: d.data().taskId, title: d.data().title, approverId: d.data().approverId, isSelfAssigned: d.data().isSelfAssigned, visibleTo: d.data().visibleTo, selfAssignApproved: d.data().selfAssignApproved })),
+      byVisibleTo: snap2.docs.map(d => ({ taskId: d.data().taskId, title: d.data().title, approverId: d.data().approverId, isSelfAssigned: d.data().isSelfAssigned, visibleTo: d.data().visibleTo })),
+      allSelfAssigned: snap3.docs.map(d => ({ taskId: d.data().taskId, title: d.data().title, approverId: d.data().approverId, visibleTo: d.data().visibleTo, selfAssignApproved: d.data().selfAssignApproved })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Self-assign repair: fix old tasks missing approverId/visibleTo ───────────
+// Call: POST /cowork/task/self-assign-repair { taskId, approverId, approverName }
+router.post("/task/self-assign-repair", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId, approverId, approverName } = req.body;
+    const { db, admin } = require("../../config/firebaseAdmin");
+    if (!taskId || !approverId) return res.status(400).json({ error: "taskId and approverId required" });
+    const ref = db.collection("cowork_tasks").doc(taskId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    await ref.update({
+      isSelfAssigned: true,
+      approverId,
+      approverName: approverName || approverId,
+      visibleTo: admin.firestore.FieldValue.arrayUnion(approverId),
+      selfAssignApproved: snap.data().selfAssignApproved ?? false,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ success: true, message: "Task repaired. Approver will now see it." });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Self-assign task: approver approves or rejects ────────────────────────────
+router.post("/task/:taskId/self-assign-approve", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { approved, rejectionReason } = req.body;
+    const { employeeId, name: approverName } = req.coworkUser;
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const { sendPushToEmployees } = require("../../services/fcmPush.service");
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+
+    const task = snap.data();
+    if (!task.isSelfAssigned) return res.status(400).json({ error: "Not a self-assigned task" });
+    if (task.approverId !== employeeId) return res.status(403).json({ error: "You are not the approver for this task" });
+    if (task.selfAssignApproved === true) return res.status(400).json({ error: "Already approved" });
+
+    if (approved) {
+      await taskRef.update({
+        selfAssignApproved: true,
+        selfAssignApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+        selfAssignApprovedBy: employeeId,
+        selfAssignApprovedByName: approverName,
+        status: "confirmed",
+        confirmedBy: admin.firestore.FieldValue.arrayUnion(task.assigneeIds[0]),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Notify the task creator (self-assignee)
+      if (task.assigneeIds?.length) {
+        await sendPushToEmployees(
+          task.assigneeIds,
+          `✅ Self-Task Approved · ${task.title}`,
+          `${approverName} approved your self-assigned task. You can now begin work.`,
+          { type: "self_assign_approved", taskId }
+        );
+      }
+      return res.json({ success: true, message: "Task approved. Employee can now begin work." });
+
+    } else {
+      await taskRef.update({
+        selfAssignApproved: false,
+        selfAssignRejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+        selfAssignRejectedBy: employeeId,
+        selfAssignRejectedByName: approverName,
+        selfAssignRejectionReason: rejectionReason || "",
+        status: "cancelled",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      if (task.assigneeIds?.length) {
+        await sendPushToEmployees(
+          task.assigneeIds,
+          `❌ Self-Task Rejected · ${task.title}`,
+          `${approverName} rejected your self-assigned task${rejectionReason ? ": " + rejectionReason : "."}`,
+          { type: "self_assign_rejected", taskId }
+        );
+      }
+      return res.json({ success: true, message: "Task rejected." });
+    }
+
+  } catch (e) {
+    console.error("[self-assign-approve]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.post("/task/:taskId/repeat-confirm", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { taskId } = req.params;
@@ -692,11 +860,12 @@ router.get("/task/list-hierarchy", verifyCoworkToken, verifyEmployeeToken, async
     let filtered = allTasks;
 
     if (role === "ceo") {
-      // CEO sees tasks they created OR tasks assigned to them (e.g. TL assigned to CEO)
+      // CEO sees: tasks they created OR assigned to them OR self-assign tasks where CEO is approver
       filtered = allTasks.filter(t => {
         const assignedToMe = (t.assigneeIds || []).includes(employeeId);
         const createdByMe = t.assignedBy === employeeId || t.createdByCeo === true || t.assignedByRole === "ceo";
-        return assignedToMe || createdByMe;
+        const isMyApproval = t.approverId === employeeId || (Array.isArray(t.visibleTo) && t.visibleTo.includes(employeeId));
+        return assignedToMe || createdByMe || isMyApproval;
       });
     } else if (role === "tl") {
       // TL: sees tasks they created OR tasks assigned to them — handled in service

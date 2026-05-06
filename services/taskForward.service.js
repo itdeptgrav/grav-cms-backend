@@ -193,7 +193,7 @@ async function _buildPath(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
-async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open" }) {
+async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null }) {
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
   const path = await _buildPath(parentTaskId);
@@ -248,6 +248,12 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     originalAssignedBy: assignedBy,
     createdByTl: createdByTl || assignedByRole === "tl",
     createdByCeo: createdByCeo || assignedByRole === "ceo",
+    // Self-assign fields
+    isSelfAssigned: isSelfAssigned || false,
+    visibleTo: visibleTo || [],
+    approverId: approverId || null,
+    approverName: approverName || null,
+    selfAssignApproved: isSelfAssigned ? false : null,
     // Reports & thread
     dailyReportCount: 0,
     chatMessageCount: 0,
@@ -302,8 +308,14 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
   if (!task.assigneeIds.includes(employeeId)) throw new Error("Not assigned to this task.");
   if (task.confirmedBy?.includes(employeeId)) throw new Error("Already confirmed.");
 
-  // Repeat and third-party tasks skip deadline requirement — they confirm directly
-  if (!task.isRepeat && !task.isThirdParty && !task.isGoal && task.hasTimer !== false) {
+  // Repeat, third-party, goal, and TIMER tasks skip deadline requirement — they confirm directly
+  // hasTimer === true  → timer task, no deadline needed, confirm directly
+  // hasTimer === false → deadline set by CEO at creation, confirm directly
+  // hasTimer === undefined → old task, still needs deadline flow
+  const needsDeadlineCheck = !task.isRepeat && !task.isThirdParty && !task.isGoal
+    && task.hasTimer !== true   // timer tasks skip — no deadline needed
+    && task.hasTimer !== false; // deadline tasks skip — CEO already set dueDate
+  if (needsDeadlineCheck) {
     if (!task.dueDate && task.status !== "deadline_approved") {
       if (task.status === "pending_deadline_approval") {
         throw new Error("Your deadline proposal is pending approval. Please wait.");
@@ -669,6 +681,36 @@ async function listTasksWithHierarchy(employeeId, role) {
     snap.docs.forEach(addDoc);
   }
 
+  // ── Self-assigned tasks: approver visibility ──────────────────────────────
+  // NO try/catch — let errors surface so we can see what's failing
+  const selfAssignSnap = await db.collection("cowork_tasks")
+    .where("approverId", "==", employeeId)
+    .get();
+  console.log(`[listTasks] approverId query for ${employeeId}: ${selfAssignSnap.size} results`);
+  for (const d of selfAssignSnap.docs) {
+    const data = d.data();
+    console.log(`  → found: ${data.taskId} "${data.title}" approverId=${data.approverId}`);
+    addDoc(d);
+    const subtaskIds = data.subtaskIds || [];
+    if (subtaskIds.length) {
+      const subDocs = await Promise.all(subtaskIds.map(id => db.collection("cowork_tasks").doc(id).get()));
+      subDocs.filter(s => s.exists).forEach(addDoc);
+    }
+  }
+
+  const visibleSnap = await db.collection("cowork_tasks")
+    .where("visibleTo", "array-contains", employeeId)
+    .get();
+  console.log(`[listTasks] visibleTo query for ${employeeId}: ${visibleSnap.size} results`);
+  for (const d of visibleSnap.docs) {
+    addDoc(d);
+    const subtaskIds = d.data().subtaskIds || [];
+    if (subtaskIds.length) {
+      const subDocs = await Promise.all(subtaskIds.map(id => db.collection("cowork_tasks").doc(id).get()));
+      subDocs.filter(s => s.exists).forEach(addDoc);
+    }
+  }
+
   // ── Walk UP (for TL only) ─────────────────────────────────────────────────
   // TL needs parent context to show hierarchy correctly.
   // CEO does not need walkUp — they see their own root tasks directly.
@@ -683,9 +725,7 @@ async function listTasksWithHierarchy(employeeId, role) {
   };
 
   // ── Walk DOWN ─────────────────────────────────────────────────────────────
-  // For CEO: only include subtasks the CEO personally created (createdByCeo true OR assignedBy === CEO).
-  //          This prevents TL-created subtasks from leaking into CEO view.
-  // For TL / Employee: include all subtasks they are connected to (already fetched above via assigneeIds).
+  // CEO sees ALL subtasks under their root tasks — including self-assigned ones by employees.
   const walkDownForCeo = async (taskData) => {
     const ids = taskData.subtaskIds || [];
     if (!ids.length) return;
@@ -694,15 +734,8 @@ async function listTasksWithHierarchy(employeeId, role) {
     const docs = await Promise.all(unseen.map(id => db.collection("cowork_tasks").doc(id).get()));
     for (const doc of docs) {
       if (!doc.exists) continue;
-      const d = doc.data();
-      // Only include subtask if CEO created it — block TL-created subtasks
-      const isCeoCreated = d.createdByCeo === true
-        || d.assignedBy === employeeId
-        || d.assignedByRole === "ceo";
-      if (isCeoCreated) {
-        addDoc(doc);
-        await walkDownForCeo(d);
-      }
+      addDoc(doc);
+      await walkDownForCeo(doc.data());
     }
   };
 
@@ -723,8 +756,8 @@ async function listTasksWithHierarchy(employeeId, role) {
   const initialTasks = [...tasks];
 
   if (role === "ceo") {
-    // CEO: walkDown with CEO-only filter, NO walkUp
-    await Promise.all(initialTasks.map(t => walkDownForCeo(t)));
+    // CEO: full walkDown on all their tasks — see all subtasks including self-assigned ones
+    await Promise.all(initialTasks.map(t => walkDownForAll(t)));
   } else if (role === "tl") {
     // TL: full walkUp + full walkDown
     await Promise.all([
