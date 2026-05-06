@@ -1,31 +1,12 @@
 "use strict";
-/**
- * LeaveManagement.js — v4 (GRAV Clothing)
- * ═══════════════════════════════════════════════════════════════════════════════
- * Models:
- *  1. LeaveConfig             — HR-configurable dynamic parameters (single document)
- *  2. LeaveBalance            — yearly leave entitlements & consumed per employee
- *  3. LeaveApplication        — individual leave requests (Employee → Manager → HR flow)
- *  4. CompanyHoliday          — holidays defined by HR, shown on both calendars
- *  5. RegularizationRequest   — miss-punch / attendance correction requests
- *                                (Employee → Manager → HR → applied to attendance)
- *
- * v4 changes:
- *  - RegularizationRequest: added proposedPunchType, proposedPunchTime, proposedPunchAction
- *    to support punch-specific regularization from the employee web/mobile app
- *  - RegularizationRequest: added proposedPunches[] array for multi-punch corrections
- *  - RegularizationRequest: added originalSnapshot.rawPunches field
- */
-
 const mongoose = require("mongoose");
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  1. LEAVE CONFIG  (single document — HR admin panel changes these)
+//  1. LEAVE CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 const leaveConfigSchema = new mongoose.Schema(
   {
     singleton: { type: String, default: "global", unique: true },
-
     initialWaitingDays: { type: Number, default: 24 },
     clPerYear: { type: Number, default: 5 },
     slPerYear: { type: Number, default: 5 },
@@ -35,26 +16,19 @@ const leaveConfigSchema = new mongoose.Schema(
     maxCLPerMonth: { type: Number, default: 3 },
     maxLeaveDaysPerMonth: { type: Number, default: 10 },
     maxLeaveDaysPerMonthOdisha: { type: Number, default: 7 },
-    maxCLPerApplication: { type: Number, default: 3 },
-    maxLeaveDaysPerApplication: { type: Number, default: 7 },
-    maxLeaveDaysPerMonth: { type: Number, default: 10 },
-    maxLeaveDaysPerMonthOdisha: { type: Number, default: 10 },
-
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
   },
   { timestamps: true },
 );
-
 leaveConfigSchema.statics.getConfig = async function () {
   let cfg = await this.findOne({ singleton: "global" });
   if (!cfg) cfg = await this.create({ singleton: "global" });
   return cfg;
 };
-
 const LeaveConfig = mongoose.model("LeaveConfig", leaveConfigSchema);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  2. LEAVE BALANCE  (per employee per year)
+//  2. LEAVE BALANCE
 // ─────────────────────────────────────────────────────────────────────────────
 const leaveBalanceSchema = new mongoose.Schema(
   {
@@ -66,22 +40,18 @@ const leaveBalanceSchema = new mongoose.Schema(
     },
     biometricId: { type: String, index: true },
     year: { type: Number, required: true },
-
     entitlement: {
       CL: { type: Number, default: 0 },
       SL: { type: Number, default: 0 },
       PL: { type: Number, default: 0 },
     },
-
     consumed: {
       CL: { type: Number, default: 0 },
       SL: { type: Number, default: 0 },
       PL: { type: Number, default: 0 },
     },
-
     plEligible: { type: Boolean, default: false },
     plGrantedDate: { type: Date },
-
     lastUpdatedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "HRDepartment",
@@ -89,7 +59,6 @@ const leaveBalanceSchema = new mongoose.Schema(
   },
   { timestamps: true },
 );
-
 leaveBalanceSchema.virtual("available").get(function () {
   return {
     CL: Math.max(0, (this.entitlement.CL || 0) - (this.consumed.CL || 0)),
@@ -97,11 +66,9 @@ leaveBalanceSchema.virtual("available").get(function () {
     PL: Math.max(0, (this.entitlement.PL || 0) - (this.consumed.PL || 0)),
   };
 });
-
 leaveBalanceSchema.set("toJSON", { virtuals: true });
 leaveBalanceSchema.set("toObject", { virtuals: true });
 leaveBalanceSchema.index({ employeeId: 1, year: 1 }, { unique: true });
-
 leaveBalanceSchema.statics.getOrCreate = async function (
   employeeId,
   year,
@@ -111,11 +78,10 @@ leaveBalanceSchema.statics.getOrCreate = async function (
   if (!bal) bal = await this.create({ employeeId, year, biometricId });
   return bal;
 };
-
 const LeaveBalance = mongoose.model("LeaveBalance", leaveBalanceSchema);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  3. LEAVE APPLICATION
+//  3. LEAVE APPLICATION — with paidDays + lwpDays for LWP breakdown
 // ─────────────────────────────────────────────────────────────────────────────
 const leaveApplicationSchema = new mongoose.Schema(
   {
@@ -135,6 +101,8 @@ const leaveApplicationSchema = new mongoose.Schema(
     fromDate: { type: String, required: true },
     toDate: { type: String, required: true },
     totalDays: { type: Number, required: true },
+    paidDays: { type: Number, default: null },
+    lwpDays: { type: Number, default: 0 },
     reason: { type: String, required: true },
     isHalfDay: { type: Boolean, default: false },
     halfDaySlot: {
@@ -148,6 +116,9 @@ const leaveApplicationSchema = new mongoose.Schema(
     documentFileId: { type: String, default: null },
     documentFileName: { type: String, default: null },
     documentUploadedAt: { type: Date, default: null },
+
+    addedByHR: { type: Boolean, default: false },
+    addedByHRId: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
 
     status: {
       type: String,
@@ -170,7 +141,6 @@ const leaveApplicationSchema = new mongoose.Schema(
         type: { type: String, enum: ["primary", "secondary"] },
       },
     ],
-
     managerDecisions: [
       {
         managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
@@ -188,28 +158,24 @@ const leaveApplicationSchema = new mongoose.Schema(
     rejectedBy: { type: mongoose.Schema.Types.ObjectId },
     rejectedAt: { type: Date },
     rejectionReason: { type: String },
-
     cancelledBy: { type: mongoose.Schema.Types.ObjectId },
     cancelledAt: { type: Date },
     cancelReason: { type: String },
-
     appliedToAttendance: { type: Boolean, default: false },
     appliedAt: { type: Date },
   },
   { timestamps: true },
 );
-
 leaveApplicationSchema.index({ employeeId: 1, status: 1 });
 leaveApplicationSchema.index({ status: 1, department: 1 });
 leaveApplicationSchema.index({ fromDate: 1, toDate: 1 });
-
 const LeaveApplication = mongoose.model(
   "LeaveApplication",
   leaveApplicationSchema,
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  4. COMPANY HOLIDAY  (defined by HR, shown on all calendars)
+//  4. COMPANY HOLIDAY
 // ─────────────────────────────────────────────────────────────────────────────
 const companyHolidaySchema = new mongoose.Schema(
   {
@@ -225,59 +191,13 @@ const companyHolidaySchema = new mongoose.Schema(
   },
   { timestamps: true },
 );
-
 const CompanyHoliday = mongoose.model("CompanyHoliday", companyHolidaySchema);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  5. REGULARIZATION REQUEST  (miss-punch & attendance corrections)
+//  5. REGULARIZATION REQUEST
 // ─────────────────────────────────────────────────────────────────────────────
-//  Employee on mobile/web app → files a request saying "on date X my actual
-//  in-time was 9:12am but device didn't record it" OR "my lunch-out was at
-//  1:30pm but I forgot to scan lunch-in".
-//
-//  Flow:
-//    1. Employee submits → status = pending
-//    2. Manager(s) review → status = manager_approved | manager_rejected
-//    3. HR finalises → status = hr_approved | hr_rejected
-//    4. On hr_approved, the corrected punches / times are written into
-//       DailyAttendance and metrics recomputed for that day.
-//
-//  Request types:
-//    miss_punch        — one or more punches entirely missing
-//    punch_correction  — a specific punch has the wrong time (e.g. wrong scan)
-//    late_arrival      — employee admits to being late, optionally with reason
-//    early_departure   — employee admits early out (reason)
-//    wrong_status      — dispute the system-predicted status (AB when really WO)
-//    other             — catch-all
-//
-//  Punch actions (proposedPunchAction):
-//    add    — punch was never recorded; add it with proposedPunchTime
-//    remove — punch recorded erroneously; delete it
-//    modify — punch exists but at wrong time; replace with proposedPunchTime
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Sub-schema for individual punch corrections in proposedPunches[]
-const proposedPunchSchema = new mongoose.Schema(
-  {
-    punchType: {
-      type: String,
-      enum: ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out"],
-      required: true,
-    },
-    action: {
-      type: String,
-      enum: ["add", "remove", "modify"],
-      required: true,
-    },
-    punchTime: { type: String, default: null }, // "HH:MM" 24-hr — required for add/modify
-    reason: { type: String, default: "" },
-  },
-  { _id: false },
-);
-
 const regularizationRequestSchema = new mongoose.Schema(
   {
-    // Applicant
     employeeId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Employee",
@@ -289,78 +209,46 @@ const regularizationRequestSchema = new mongoose.Schema(
     designation: { type: String },
     department: { type: String },
 
-    // Request basics
-    requestType: {
+    dateStr: { type: String, required: true },
+    type: {
       type: String,
       enum: [
         "miss_punch",
-        "punch_correction",
-        "late_arrival",
-        "early_departure",
         "wrong_status",
+        "forgot_punch",
+        "client_visit",
         "other",
       ],
-      default: "miss_punch",
       required: true,
     },
-    dateStr: { type: String, required: true, index: true }, // "YYYY-MM-DD" — day this is for
     reason: { type: String, required: true },
+    requestedStatus: { type: String },
 
-    // ── Simple (whole-day) corrections ─────────────────────────────────
-    // Use these for common miss_punch / late / early_departure requests
-    proposedInTime: { type: String, default: null }, // "HH:MM" (24-hr)
-    proposedOutTime: { type: String, default: null },
-    proposedStatus: {
-      type: String,
-      enum: [
-        "P",
-        "P*",
-        "P~",
-        "HD",
-        "AB",
-        "WO",
-        "PH",
-        "L-CL",
-        "L-SL",
-        "L-EL",
-        "LWP",
-        "MP",
-        "WFH",
-        "CO",
-        null,
-        "",
-      ],
-      default: null,
-    },
-    proposedRemarks: { type: String, default: null },
-
-    // ── Punch-specific corrections (NEW) ───────────────────────────────
-    // Use these for punch_correction requests where individual punches
-    // need to be added, removed, or changed.
-    //
-    // Quick single-punch shorthand:
     proposedPunchType: {
       type: String,
-      enum: ["in", "lunch_out", "lunch_in", "tea_out", "tea_in", "out", null],
+      enum: ["in", "out", null],
       default: null,
     },
-    proposedPunchTime: { type: String, default: null }, // "HH:MM" 24-hr
+    proposedPunchTime: { type: Date, default: null },
     proposedPunchAction: {
       type: String,
-      enum: ["add", "remove", "modify", null],
+      enum: ["add", "replace", "remove", null],
       default: null,
     },
+    proposedPunches: [
+      {
+        punchType: { type: String, enum: ["in", "out"] },
+        punchTime: { type: Date },
+        action: { type: String, enum: ["add", "replace", "remove"] },
+        note: { type: String },
+      },
+    ],
 
-    // Multi-punch correction list (for complex scenarios):
-    proposedPunches: { type: [proposedPunchSchema], default: [] },
-
-    // Supporting document (optional — e.g. client-visit proof)
     documentUrl: { type: String, default: null },
     documentFileId: { type: String, default: null },
     documentFileName: { type: String, default: null },
     documentUploadedAt: { type: Date, default: null },
 
-    // Snapshot of the original day record at time of filing
     originalSnapshot: {
       inTime: { type: Date, default: null },
       finalOut: { type: Date, default: null },
@@ -370,11 +258,9 @@ const regularizationRequestSchema = new mongoose.Schema(
       lateMins: { type: Number, default: 0 },
       otMins: { type: Number, default: 0 },
       punchCount: { type: Number, default: 0 },
-      // Raw punches snapshot so HR can see exactly what was on the device
       rawPunches: { type: Array, default: [] },
     },
 
-    // ── Approval workflow ────────────────────────────────────────────────
     status: {
       type: String,
       enum: [
@@ -388,7 +274,6 @@ const regularizationRequestSchema = new mongoose.Schema(
       default: "pending",
       index: true,
     },
-
     managersNotified: [
       {
         managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
@@ -396,7 +281,6 @@ const regularizationRequestSchema = new mongoose.Schema(
         type: { type: String, enum: ["primary", "secondary"] },
       },
     ],
-
     managerDecisions: [
       {
         managerId: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
@@ -407,29 +291,23 @@ const regularizationRequestSchema = new mongoose.Schema(
         decidedAt: { type: Date },
       },
     ],
-
     hrApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
     hrApprovedAt: { type: Date },
     hrRemarks: { type: String },
     rejectedBy: { type: mongoose.Schema.Types.ObjectId },
     rejectedAt: { type: Date },
     rejectionReason: { type: String },
-
     cancelledBy: { type: mongoose.Schema.Types.ObjectId },
     cancelledAt: { type: Date },
     cancelReason: { type: String },
-
-    // After HR approval → the DailyAttendance doc was updated
     appliedToAttendance: { type: Boolean, default: false },
     appliedAt: { type: Date },
   },
   { timestamps: true },
 );
-
 regularizationRequestSchema.index({ employeeId: 1, status: 1 });
 regularizationRequestSchema.index({ status: 1, department: 1 });
 regularizationRequestSchema.index({ dateStr: 1 });
-
 const RegularizationRequest = mongoose.model(
   "RegularizationRequest",
   regularizationRequestSchema,
