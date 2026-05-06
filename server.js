@@ -1535,6 +1535,47 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   transcriptModule.startCron();
 
+  // ── One-time repair: fix self-assigned tasks missing approverId ──────────
+  (async () => {
+    try {
+      const { db, admin } = require("./config/firebaseAdmin");
+      let fixed = 0;
+
+      // Get ALL tasks and fix in memory — catches every edge case
+      const allSnap = await db.collection("cowork_tasks").get();
+      for (const doc of allSnap.docs) {
+        const d = doc.data();
+        const updates = {};
+
+        // Has visibleTo but no approverId → set approverId from visibleTo[0]
+        if (!d.approverId && Array.isArray(d.visibleTo) && d.visibleTo.length > 0) {
+          updates.approverId = d.visibleTo[0];
+        }
+        // Has approverId but isSelfAssigned not set → set it
+        const resolvedApproverId = updates.approverId || d.approverId;
+        if (resolvedApproverId && !d.isSelfAssigned) {
+          updates.isSelfAssigned = true;
+          updates.selfAssignApproved = d.selfAssignApproved ?? false;
+        }
+        // Has isSelfAssigned=true but no visibleTo → set visibleTo from approverId
+        if (d.isSelfAssigned && resolvedApproverId && (!Array.isArray(d.visibleTo) || !d.visibleTo.includes(resolvedApproverId))) {
+          updates.visibleTo = admin.firestore.FieldValue.arrayUnion(resolvedApproverId);
+        }
+
+        if (Object.keys(updates).length > 0) {
+          updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+          await doc.ref.update(updates);
+          fixed++;
+          console.log(`  ↳ Repaired task ${d.taskId || doc.id}: approverId=${resolvedApproverId}`);
+        }
+      }
+      if (fixed > 0) console.log(`✅ Self-assign repair: fixed ${fixed} tasks`);
+      else console.log("✅ Self-assign repair: all tasks OK");
+    } catch (e) {
+      console.warn("⚠️ Self-assign repair skipped:", e.message);
+    }
+  })();
+
   // ── Meeting 15-min reminder cron — runs every 5 minutes ──────────────────
   const _reminderSent = new Set();
   setInterval(async () => {
