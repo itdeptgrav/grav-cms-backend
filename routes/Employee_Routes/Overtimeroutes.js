@@ -42,8 +42,12 @@ async function detectStayOver(biometricId, dateStr) {
   if (!entry || !entry.finalOut) return null;
 
   const outDate = new Date(entry.finalOut);
-  const outHour = outDate.getHours();
-  const outMin = outDate.getMinutes();
+  // Convert to IST (UTC+5:30) — Render runs in UTC
+  const istOffset = 5.5 * 60; // minutes
+  const utcMins = outDate.getUTCHours() * 60 + outDate.getUTCMinutes();
+  const istMins = utcMins + istOffset;
+  const outHour = Math.floor(istMins / 60) % 24;
+  const outMin = Math.floor(istMins % 60);
   const outTotalMins = outHour * 60 + outMin;
   const scheduledOutMins = SCHEDULED_OUT_HOUR * 60 + SCHEDULED_OUT_MIN;
   if (outTotalMins < scheduledOutMins + MIN_STAY_OVER_MINS) return null;
@@ -570,7 +574,9 @@ async function detectAndNotifyStayOvers(dateStr, io) {
     for (const entry of dayDoc.employees) {
       if (!entry.finalOut || !entry.biometricId) continue;
       const outDate = new Date(entry.finalOut);
-      const outMins = outDate.getHours() * 60 + outDate.getMinutes();
+      const istOffset = 5.5 * 60;
+      const outMins =
+        outDate.getUTCHours() * 60 + outDate.getUTCMinutes() + istOffset;
       if (outMins < scheduledOutMins + MIN_STAY_OVER_MINS) continue;
 
       const emp = await Employee.findOne({ biometricId: entry.biometricId })
