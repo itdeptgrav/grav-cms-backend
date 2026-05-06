@@ -374,7 +374,7 @@ router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, as
       }
     } catch (e) { console.error("[group notify email]", e.message); }
     res.json({ success: true });
-  } catch (e) { 
+  } catch (e) {
     console.error("[group notify]", e.message);
     res.json({ success: true }); // never fail — push is best-effort
   }

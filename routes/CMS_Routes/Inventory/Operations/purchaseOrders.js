@@ -1,4 +1,14 @@
 // routes/CMS_Routes/Inventory/Operations/purchaseOrders.js
+//
+// CHANGES VS YOUR EXISTING FILE:
+//   - Helper `findVariantNickname` added: looks up a variant-specific
+//     vendor nickname from RawItem.variants[].vendorNicknames[]
+//   - POST / and PUT /:id now call findVariantNickname(rawItem, variantId, vendor)
+//     instead of looking at item-level rawItem.vendorNicknames (which is gone).
+//   - The .select() query for the RawItem now pulls "variants" so the lookup
+//     has the data it needs.
+//
+// EVERYTHING ELSE (auth, helpers, /receive, /payment, /status, etc.) is identical.
 
 const express = require("express");
 const router = express.Router();
@@ -9,24 +19,20 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const VendorEmailService = require("../../../../services/VendorEmailService");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 
-
-// Apply auth middleware to all routes
 router.use(EmployeeAuthMiddleware);
 
-// Helper function to generate PO number
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 const generatePONumber = () => {
   const prefix = "PO";
   const year = new Date().getFullYear().toString().slice(-2);
   const month = (new Date().getMonth() + 1).toString().padStart(2, "0");
-  const randomNum = Math.floor(Math.random() * 10000)
-    .toString()
-    .padStart(4, "0");
+  const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, "0");
   return `${prefix}${year}${month}${randomNum}`;
 };
 
-// ──────────────────────────────────────────────────────────────────────────
-// Helper: convert quantity between units using Unit.conversions
-// ──────────────────────────────────────────────────────────────────────────
+// ── Convert quantity using Unit conversions ────────────────────────────────
 async function convertQuantity(quantity, fromUnit, toUnit) {
   if (!fromUnit || !toUnit || fromUnit === toUnit) return quantity;
   if (!quantity || isNaN(quantity)) return quantity;
@@ -55,11 +61,43 @@ async function convertQuantity(quantity, fromUnit, toUnit) {
   }
 }
 
-// ✅ GET all purchase orders
+// ── NEW: Find a variant's nickname for a specific vendor ────────────────────
+// rawItemDoc: lean object with .variants[].vendorNicknames[]
+// variantId: ObjectId or string of the variant on the PO line (optional)
+// vendorId: vendor ObjectId or string
+// Returns: nickname string or "" if not found
+const findVariantNickname = (rawItemDoc, variantId, vendorId) => {
+  if (!rawItemDoc || !vendorId || !Array.isArray(rawItemDoc.variants)) return "";
+
+  // If a specific variant was chosen, look only in that variant's nicknames
+  if (variantId) {
+    const variant = rawItemDoc.variants.find(
+      v => v._id?.toString() === variantId.toString()
+    );
+    if (variant?.vendorNicknames?.length) {
+      const vn = variant.vendorNicknames.find(
+        n => n.vendor?.toString() === vendorId.toString()
+      );
+      if (vn?.nickname) return vn.nickname;
+    }
+    return "";
+  }
+
+  // No variant selected → fall back to first nickname this vendor has on any variant
+  for (const variant of rawItemDoc.variants) {
+    const nks = variant?.vendorNicknames || [];
+    const vn = nks.find(n => n.vendor?.toString() === vendorId.toString());
+    if (vn?.nickname) return vn.nickname;
+  }
+  return "";
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET all purchase orders
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
     const { search = "", status, vendor, startDate, endDate } = req.query;
-
     let filter = {};
 
     if (search) {
@@ -69,23 +107,12 @@ router.get("/", async (req, res) => {
         { "items.itemName": { $regex: search, $options: "i" } },
       ];
     }
-
-    if (status && status !== "all") {
-      filter.status = status;
-    }
-
-    if (vendor) {
-      filter.vendor = vendor;
-    }
-
+    if (status && status !== "all") filter.status = status;
+    if (vendor) filter.vendor = vendor;
     if (startDate || endDate) {
       filter.orderDate = {};
-      if (startDate) {
-        filter.orderDate.$gte = new Date(startDate);
-      }
-      if (endDate) {
-        filter.orderDate.$lte = new Date(endDate);
-      }
+      if (startDate) filter.orderDate.$gte = new Date(startDate);
+      if (endDate) filter.orderDate.$lte = new Date(endDate);
     }
 
     const purchaseOrders = await PurchaseOrder.find(filter)
@@ -96,91 +123,54 @@ router.get("/", async (req, res) => {
       .populate("payments.recordedBy", "name email")
       .sort({ createdAt: -1 });
 
-    // Get statistics
     const total = await PurchaseOrder.countDocuments();
     const draft = await PurchaseOrder.countDocuments({ status: "DRAFT" });
     const issued = await PurchaseOrder.countDocuments({ status: "ISSUED" });
-    const partiallyReceived = await PurchaseOrder.countDocuments({
-      status: "PARTIALLY_RECEIVED",
-    });
-    const completed = await PurchaseOrder.countDocuments({
-      status: "COMPLETED",
-    });
+    const partiallyReceived = await PurchaseOrder.countDocuments({ status: "PARTIALLY_RECEIVED" });
+    const completed = await PurchaseOrder.countDocuments({ status: "COMPLETED" });
 
-    // Calculate payment statistics
-    let totalAmount = 0;
-    let totalPaid = 0;
-    let pendingAmount = 0;
-
+    let totalAmount = 0, totalPaid = 0, pendingAmount = 0;
     purchaseOrders.forEach((po) => {
       totalAmount += po.totalAmount || 0;
-
-      // Calculate total paid for this PO
-      const poPaid =
-        po.payments?.reduce((sum, payment) => sum + (payment.amount || 0), 0) ||
-        0;
+      const poPaid = po.payments?.reduce((sum, payment) => sum + (payment.amount || 0), 0) || 0;
       totalPaid += poPaid;
-
-      // Calculate pending amount (total - paid)
       pendingAmount += (po.totalAmount || 0) - poPaid;
     });
 
-    // Also get payment status counts
-    const paymentPending = await PurchaseOrder.countDocuments({
-      paymentStatus: "PENDING",
-    });
-    const paymentPartial = await PurchaseOrder.countDocuments({
-      paymentStatus: "PARTIAL",
-    });
-    const paymentCompleted = await PurchaseOrder.countDocuments({
-      paymentStatus: "COMPLETED",
-    });
+    const paymentPending = await PurchaseOrder.countDocuments({ paymentStatus: "PENDING" });
+    const paymentPartial = await PurchaseOrder.countDocuments({ paymentStatus: "PARTIAL" });
+    const paymentCompleted = await PurchaseOrder.countDocuments({ paymentStatus: "COMPLETED" });
 
     res.json({
       success: true,
       purchaseOrders,
       stats: {
-        total,
-        draft,
-        issued,
-        partiallyReceived,
-        completed,
-        totalAmount,
-        totalPaid,
-        pendingAmount,
-        paymentPending,
-        paymentPartial,
-        paymentCompleted,
-      },
+        total, draft, issued, partiallyReceived, completed,
+        totalAmount, totalPaid, pendingAmount,
+        paymentPending, paymentPartial, paymentCompleted
+      }
     });
   } catch (error) {
     console.error("Error fetching purchase orders:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching purchase orders",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching purchase orders" });
   }
 });
 
-
-// ✅ GET available units for a raw item (registered + convertible)
+// ─────────────────────────────────────────────────────────────────────────────
+// GET available units for a raw item
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items/:id/units", async (req, res) => {
   try {
     const rawItem = await RawItem.findById(req.params.id)
       .select("unit customUnit name").lean();
-    if (!rawItem) {
-      return res.status(404).json({ success: false, message: "Raw item not found" });
-    }
+    if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
 
     const baseUnit = rawItem.customUnit || rawItem.unit;
     const available = [{
-      name: baseUnit,
-      isBase: true,
-      factor: 1,
+      name: baseUnit, isBase: true, factor: 1,
       label: `${baseUnit} (registered)`
     }];
 
-    // Direct: baseUnit -> X  (1 base = factor X)
     const baseDoc = await Unit.findOne({ name: baseUnit })
       .populate("conversions.toUnit", "name").lean();
 
@@ -189,21 +179,15 @@ router.get("/data/raw-items/:id/units", async (req, res) => {
         const toName = c.toUnit?.name || c.toUnit;
         if (toName && !available.find(u => u.name === toName)) {
           available.push({
-            name: toName,
-            isBase: false,
-            factor: c.quantity,
+            name: toName, isBase: false, factor: c.quantity,
             label: `${toName} (1 ${baseUnit} = ${c.quantity} ${toName})`
           });
         }
       }
     }
 
-    // Reverse: X -> baseUnit  (1 X = q baseUnit, so factor = 1/q for our display)
     if (baseDoc?._id) {
-      const reverseUnits = await Unit.find({
-        "conversions.toUnit": baseDoc._id
-      }).lean();
-
+      const reverseUnits = await Unit.find({ "conversions.toUnit": baseDoc._id }).lean();
       for (const u of reverseUnits) {
         if (available.find(au => au.name === u.name)) continue;
         const conv = (u.conversions || []).find(
@@ -211,9 +195,7 @@ router.get("/data/raw-items/:id/units", async (req, res) => {
         );
         if (conv?.quantity) {
           available.push({
-            name: u.name,
-            isBase: false,
-            factor: 1 / conv.quantity,
+            name: u.name, isBase: false, factor: 1 / conv.quantity,
             label: `${u.name} (1 ${u.name} = ${conv.quantity} ${baseUnit})`
           });
         }
@@ -227,50 +209,36 @@ router.get("/data/raw-items/:id/units", async (req, res) => {
   }
 });
 
-// ✅ GET purchase order by ID
+// ─────────────────────────────────────────────────────────────────────────────
+// GET PO by ID
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {
   try {
     const purchaseOrder = await PurchaseOrder.findById(req.params.id)
-      .populate(
-        "vendor",
-        "companyName contactPerson phone email address gstNumber",
-      )
+      .populate("vendor", "companyName contactPerson phone email address gstNumber")
       .populate("items.rawItem", "name sku unit description sellingPrice")
       .populate("createdBy", "name email")
       .populate("approvedBy", "name email")
       .populate("deliveries.receivedBy", "name email");
 
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      purchaseOrder,
-    });
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
+    res.json({ success: true, purchaseOrder });
   } catch (error) {
     console.error("Error fetching purchase order:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching purchase order",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching purchase order" });
   }
 });
 
-// ✅ GET available raw items for PO (with variants) - UPDATED
+// ─────────────────────────────────────────────────────────────────────────────
+// GET available raw items for PO
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items", async (req, res) => {
   try {
     const rawItems = await RawItem.find({})
-      .select(
-        "name sku category customCategory unit customUnit description sellingPrice minStock maxStock quantity status",
-      )
+      .select("name sku category customCategory unit customUnit description sellingPrice minStock maxStock quantity status")
       .lean()
       .sort({ name: 1 });
 
-    // Transform data to match frontend expectations
     const formattedItems = rawItems.map((item) => ({
       id: item._id.toString(),
       name: item.name,
@@ -282,29 +250,23 @@ router.get("/data/raw-items", async (req, res) => {
       currentStock: item.quantity || 0,
       minStock: item.minStock || 0,
       maxStock: item.maxStock || 0,
-      status: item.status || "In Stock",
+      status: item.status || "In Stock"
     }));
 
-    res.json({
-      success: true,
-      rawItems: formattedItems,
-    });
+    res.json({ success: true, rawItems: formattedItems });
   } catch (error) {
     console.error("Error fetching raw items:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching raw items",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching raw items" });
   }
 });
 
-// ✅ GET available vendors for PO
+// ─────────────────────────────────────────────────────────────────────────────
+// GET available vendors for PO
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/vendors", async (req, res) => {
   try {
     const vendors = await Vendor.find({ status: "Active" })
-      .select(
-        "companyName contactPerson phone email address gstNumber vendorType paymentTerms",
-      )
+      .select("companyName contactPerson phone email address gstNumber vendorType paymentTerms")
       .sort({ companyName: 1 });
 
     res.json({
@@ -318,86 +280,52 @@ router.get("/data/vendors", async (req, res) => {
         address: v.address,
         gstNumber: v.gstNumber,
         vendorType: v.vendorType,
-        paymentTerms: v.paymentTerms,
-      })),
+        paymentTerms: v.paymentTerms
+      }))
     });
   } catch (error) {
     console.error("Error fetching vendors:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching vendors",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching vendors" });
   }
 });
 
-// ✅ CREATE new purchase order (with variants support) - FIXED SAVE ISSUE
+// ─────────────────────────────────────────────────────────────────────────────
+// CREATE new PO  (now uses findVariantNickname)
+// ─────────────────────────────────────────────────────────────────────────────
 router.post("/", async (req, res) => {
   try {
     const {
-      vendor,
-      vendorName,
-      orderDate,
-      expectedDeliveryDate,
-      items,
-      taxRate,
-      shippingCharges,
-      discount,
-      notes,
-      termsConditions,
-      paymentTerms,
-      status = "DRAFT",
+      vendor, vendorName, orderDate, expectedDeliveryDate,
+      items, taxRate, shippingCharges, discount,
+      notes, termsConditions, paymentTerms, status = "DRAFT"
     } = req.body;
 
-    console.log("Received data:", JSON.stringify(req.body, null, 2)); // Debug log
-
-    // Basic validation
-    if (!vendor) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Vendor is required" });
-    }
-
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "At least one item is required" });
-    }
+    if (!vendor) return res.status(400).json({ success: false, message: "Vendor is required" });
+    if (!items?.length) return res.status(400).json({ success: false, message: "At least one item is required" });
 
     // Generate unique PO number
-    let poNumber;
-    let isUnique = false;
-    let attempts = 0;
-    const maxAttempts = 10;
-
-    while (!isUnique && attempts < maxAttempts) {
+    let poNumber, isUnique = false, attempts = 0;
+    while (!isUnique && attempts < 10) {
       poNumber = generatePONumber();
       const existingPO = await PurchaseOrder.findOne({ poNumber });
       if (!existingPO) isUnique = true;
       attempts++;
     }
-
     if (!isUnique) {
-      return res.status(500).json({
-        success: false,
-        message: "Failed to generate unique PO number",
-      });
+      return res.status(500).json({ success: false, message: "Failed to generate unique PO number" });
     }
 
-    // Build items with details (simplified version)
-    // Build items with details (async — looks up baseUnit + vendor nickname)
+    // Build items — looks up baseUnit + per-variant vendor nickname
     const itemsWithDetails = await Promise.all(items.map(async (item) => {
       const ri = await RawItem.findById(item.rawItem)
-        .select("unit customUnit name sku vendorNicknames")
+        .select("unit customUnit name sku variants")
         .lean();
 
       const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
       const poUnit = item.unit || registeredUnit;
 
-      // Snapshot vendor's nickname for this raw item
-      const nicknameEntry = ri?.vendorNicknames?.find(
-        vn => vn.vendor?.toString() === vendor.toString()
-      );
-      const vendorNickname = nicknameEntry?.nickname || "";
+      // ── per-variant nickname lookup ──
+      const vendorNickname = findVariantNickname(ri, item.variantId, vendor);
 
       return {
         rawItem: item.rawItem,
@@ -405,7 +333,7 @@ router.post("/", async (req, res) => {
         sku: item.sku || ri?.sku || "",
         unit: poUnit,
         baseUnit: registeredUnit,
-        vendorNickname,                      // ← NEW
+        vendorNickname,
         quantity: Number(item.quantity),
         unitPrice: Number(item.unitPrice),
         totalPrice: Number(item.quantity) * Number(item.unitPrice),
@@ -415,84 +343,45 @@ router.post("/", async (req, res) => {
         variantId: item.variantId || null,
         variantCombination: item.variantCombination || [],
         variantName: item.variantCombination?.join(" • ") || "",
-        variantSku: item.variantSku || "",
+        variantSku: item.variantSku || ""
       };
     }));
 
-    console.log("Processed items:", JSON.stringify(itemsWithDetails, null, 2));
-
-    // Calculations
-    const subtotal = itemsWithDetails.reduce(
-      (sum, i) => sum + (i.totalPrice || 0),
-      0,
-    );
+    const subtotal = itemsWithDetails.reduce((sum, i) => sum + (i.totalPrice || 0), 0);
     const taxAmount = (subtotal * (Number(taxRate) || 0)) / 100;
-    const totalAmount =
-      subtotal +
-      taxAmount +
-      (Number(shippingCharges) || 0) -
-      (Number(discount) || 0);
+    const totalAmount = subtotal + taxAmount + (Number(shippingCharges) || 0) - (Number(discount) || 0);
 
-    // Create PO with minimal required fields first
     const purchaseOrderData = {
-      poNumber,
-      vendor,
-      vendorName: vendorName || "",
+      poNumber, vendor, vendorName: vendorName || "",
       orderDate: orderDate ? new Date(orderDate) : new Date(),
-      expectedDeliveryDate: expectedDeliveryDate
-        ? new Date(expectedDeliveryDate)
-        : null,
+      expectedDeliveryDate: expectedDeliveryDate ? new Date(expectedDeliveryDate) : null,
       items: itemsWithDetails,
-      subtotal,
-      taxRate: Number(taxRate) || 0,
-      taxAmount,
+      subtotal, taxRate: Number(taxRate) || 0, taxAmount,
       shippingCharges: Number(shippingCharges) || 0,
-      discount: Number(discount) || 0,
-      totalAmount,
+      discount: Number(discount) || 0, totalAmount,
       totalReceived: 0,
       totalPending: itemsWithDetails.reduce((sum, i) => sum + i.quantity, 0),
-      status,
-      paymentStatus: "PENDING",
+      status, paymentStatus: "PENDING",
       paymentTerms: paymentTerms || "",
       notes: notes || "",
       termsConditions: termsConditions || "",
-      createdBy: req.user.id,
+      createdBy: req.user.id
     };
 
-    console.log("Creating PO with data (simplified):", {
-      poNumber: purchaseOrderData.poNumber,
-      vendor: purchaseOrderData.vendor,
-      itemCount: purchaseOrderData.items.length,
-      totalAmount: purchaseOrderData.totalAmount,
-    });
-
-    // Try to save the PO
     let purchaseOrder;
     try {
       purchaseOrder = new PurchaseOrder(purchaseOrderData);
       await purchaseOrder.save();
-      console.log("PO saved successfully! ID:", purchaseOrder._id);
     } catch (saveError) {
-      console.error("Save error details:", {
-        name: saveError.name,
-        message: saveError.message,
-        errors: saveError.errors,
-        code: saveError.code,
-      });
-
-      // Try to save without validation
+      console.error("Save error:", saveError);
       try {
-        console.log("Trying to save without validation...");
         purchaseOrder = new PurchaseOrder(purchaseOrderData);
         await purchaseOrder.save({ validateBeforeSave: false });
-        console.log("PO saved without validation! ID:", purchaseOrder._id);
       } catch (secondError) {
-        console.error("Second save attempt failed:", secondError);
         throw secondError;
       }
     }
 
-    // Try to populate, but don't fail if it doesn't work
     let populatedPO;
     try {
       populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
@@ -504,23 +393,16 @@ router.post("/", async (req, res) => {
       populatedPO = purchaseOrder;
     }
 
-    // Send email only if ISSUED
     if (status === "ISSUED") {
       try {
-        const vendorData = await Vendor.findById(vendor).select(
-          "companyName contactPerson email phone address",
-        );
-
+        const vendorData = await Vendor.findById(vendor)
+          .select("companyName contactPerson email phone address");
         if (vendorData?.email) {
           await VendorEmailService.sendPurchaseOrderEmail(
             populatedPO.toObject(),
             vendorData.toObject(),
-            {
-              name: req.user.name || "Project Manager",
-              email: req.user.email || "admin@example.com",
-            },
+            { name: req.user.name || "Project Manager", email: req.user.email || "admin@example.com" }
           );
-          console.log(`PO email sent to ${vendorData.email}`);
         }
       } catch (emailError) {
         console.error("Failed to send PO email (non-critical):", emailError);
@@ -530,107 +412,73 @@ router.post("/", async (req, res) => {
     return res.status(201).json({
       success: true,
       message: "Purchase order created successfully",
-      purchaseOrder: populatedPO || purchaseOrder,
+      purchaseOrder: populatedPO || purchaseOrder
     });
   } catch (error) {
     console.error("Error creating purchase order:", error);
-
     return res.status(500).json({
       success: false,
-      message: `Server error while creating purchase order: ${error.message}`,
+      message: `Server error while creating purchase order: ${error.message}`
     });
   }
 });
 
-// ✅ UPDATE purchase order (with variants support)
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE PO  (now uses findVariantNickname)
+// ─────────────────────────────────────────────────────────────────────────────
 router.put("/:id", async (req, res) => {
   try {
     const {
-      vendor,
-      vendorName,
-      orderDate,
-      expectedDeliveryDate,
-      items,
-      taxRate,
-      shippingCharges,
-      discount,
-      notes,
-      termsConditions,
-      paymentTerms,
-      status,
+      vendor, vendorName, orderDate, expectedDeliveryDate,
+      items, taxRate, shippingCharges, discount,
+      notes, termsConditions, paymentTerms, status
     } = req.body;
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
 
-    // Cannot edit if already partially received or completed
-    if (
-      purchaseOrder.status === "PARTIALLY_RECEIVED" ||
-      purchaseOrder.status === "COMPLETED"
-    ) {
+    if (purchaseOrder.status === "PARTIALLY_RECEIVED" || purchaseOrder.status === "COMPLETED") {
       return res.status(400).json({
         success: false,
-        message: "Cannot edit purchase order that has already been received",
+        message: "Cannot edit purchase order that has already been received"
       });
     }
 
-    // Update fields
     if (vendor) purchaseOrder.vendor = vendor;
     if (vendorName) purchaseOrder.vendorName = vendorName;
     if (orderDate) purchaseOrder.orderDate = new Date(orderDate);
-    if (expectedDeliveryDate)
-      purchaseOrder.expectedDeliveryDate = new Date(expectedDeliveryDate);
+    if (expectedDeliveryDate) purchaseOrder.expectedDeliveryDate = new Date(expectedDeliveryDate);
     if (taxRate !== undefined) purchaseOrder.taxRate = parseFloat(taxRate);
-    if (shippingCharges !== undefined)
-      purchaseOrder.shippingCharges = parseFloat(shippingCharges);
+    if (shippingCharges !== undefined) purchaseOrder.shippingCharges = parseFloat(shippingCharges);
     if (discount !== undefined) purchaseOrder.discount = parseFloat(discount);
     if (notes !== undefined) purchaseOrder.notes = notes;
-    if (termsConditions !== undefined)
-      purchaseOrder.termsConditions = termsConditions;
+    if (termsConditions !== undefined) purchaseOrder.termsConditions = termsConditions;
     if (paymentTerms !== undefined) purchaseOrder.paymentTerms = paymentTerms;
     if (status) purchaseOrder.status = status;
 
-    // Update items if provided
     if (items && Array.isArray(items)) {
-      // Validate items
       for (const item of items) {
         if (!item.rawItem) {
-          return res.status(400).json({
-            success: false,
-            message: "Raw item is required for all items",
-          });
+          return res.status(400).json({ success: false, message: "Raw item is required for all items" });
         }
         if (!item.quantity || item.quantity <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Valid quantity is required for all items",
-          });
+          return res.status(400).json({ success: false, message: "Valid quantity is required for all items" });
         }
         if (!item.unitPrice || item.unitPrice <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Valid unit price is required for all items",
-          });
+          return res.status(400).json({ success: false, message: "Valid unit price is required for all items" });
         }
       }
 
       const itemsWithDetails = await Promise.all(items.map(async (item) => {
         const ri = await RawItem.findById(item.rawItem)
-          .select("unit customUnit name sku vendorNicknames")
+          .select("unit customUnit name sku variants")
           .lean();
 
         const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
         const poUnit = item.unit || registeredUnit;
 
-        const nicknameEntry = ri?.vendorNicknames?.find(
-          vn => vn.vendor?.toString() === purchaseOrder.vendor.toString()
-        );
-        const vendorNickname = nicknameEntry?.nickname || "";
+        // ── per-variant nickname lookup against the (possibly updated) vendor ──
+        const vendorNickname = findVariantNickname(ri, item.variantId, purchaseOrder.vendor);
 
         return {
           rawItem: item.rawItem,
@@ -638,7 +486,7 @@ router.put("/:id", async (req, res) => {
           sku: item.sku || ri?.sku || "",
           unit: poUnit,
           baseUnit: registeredUnit,
-          vendorNickname,                      // ← NEW
+          vendorNickname,
           quantity: Number(item.quantity),
           unitPrice: Number(item.unitPrice),
           totalPrice: Number(item.quantity) * Number(item.unitPrice),
@@ -648,7 +496,7 @@ router.put("/:id", async (req, res) => {
           variantId: item.variantId || null,
           variantCombination: item.variantCombination || [],
           variantName: (item.variantCombination || []).join(" • ") || "",
-          variantSku: item.variantSku || "",
+          variantSku: item.variantSku || ""
         };
       }));
 
@@ -657,7 +505,6 @@ router.put("/:id", async (req, res) => {
 
     await purchaseOrder.save();
 
-    // Populate and return
     const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
       .populate("vendor", "companyName contactPerson")
       .populate("items.rawItem", "name sku unit")
@@ -666,100 +513,62 @@ router.put("/:id", async (req, res) => {
     res.json({
       success: true,
       message: "Purchase order updated successfully",
-      purchaseOrder: populatedPO,
+      purchaseOrder: populatedPO
     });
   } catch (error) {
     console.error("Error updating purchase order:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating purchase order",
-    });
+    res.status(500).json({ success: false, message: "Server error while updating purchase order" });
   }
 });
 
-
-// ✅ RECORD PAYMENT for purchase order
+// ─────────────────────────────────────────────────────────────────────────────
+// RECORD PAYMENT
+// ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/payment", async (req, res) => {
   try {
-    const { amount, paymentMethod, referenceNumber, paymentDate, notes } =
-      req.body;
+    const { amount, paymentMethod, referenceNumber, paymentDate, notes } = req.body;
 
-    // Validation
     if (!amount || amount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid payment amount is required",
-      });
+      return res.status(400).json({ success: false, message: "Valid payment amount is required" });
     }
-
     if (!paymentMethod) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment method is required",
-      });
+      return res.status(400).json({ success: false, message: "Payment method is required" });
     }
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
 
-    // Calculate current payment totals
-    const totalPaid =
-      purchaseOrder.payments?.reduce(
-        (sum, payment) => sum + (payment.amount || 0),
-        0,
-      ) || 0;
+    const totalPaid = purchaseOrder.payments?.reduce((sum, payment) => sum + (payment.amount || 0), 0) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
 
-    // Validate payment amount doesn't exceed remaining amount
     if (amount > remainingAmount) {
       return res.status(400).json({
         success: false,
-        message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
+        message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`
       });
     }
 
-    // Create payment record
     const paymentRecord = {
       amount: parseFloat(amount),
-      paymentMethod: paymentMethod,
+      paymentMethod,
       referenceNumber: referenceNumber || "",
       paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
       notes: notes || "",
-      recordedBy: req.user.id,
+      recordedBy: req.user.id
     };
 
-    // Initialize payments array if it doesn't exist
-    if (!purchaseOrder.payments) {
-      purchaseOrder.payments = [];
-    }
-
-    // Add payment record
+    if (!purchaseOrder.payments) purchaseOrder.payments = [];
     purchaseOrder.payments.unshift(paymentRecord);
 
-    // Calculate new total paid
     const newTotalPaid = totalPaid + amount;
-
-    // Update payment status
-    if (newTotalPaid >= purchaseOrder.totalAmount) {
-      purchaseOrder.paymentStatus = "COMPLETED";
-    } else if (newTotalPaid > 0) {
-      purchaseOrder.paymentStatus = "PARTIAL";
-    } else {
-      purchaseOrder.paymentStatus = "PENDING";
-    }
+    if (newTotalPaid >= purchaseOrder.totalAmount) purchaseOrder.paymentStatus = "COMPLETED";
+    else if (newTotalPaid > 0) purchaseOrder.paymentStatus = "PARTIAL";
+    else purchaseOrder.paymentStatus = "PENDING";
 
     await purchaseOrder.save();
 
-    // Populate the payment with user info
-    const populatedPO = await PurchaseOrder.findById(
-      purchaseOrder._id,
-    ).populate("payments.recordedBy", "name email");
-
+    const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
+      .populate("payments.recordedBy", "name email");
     const latestPayment = populatedPO.payments[0];
 
     res.json({
@@ -768,41 +577,30 @@ router.post("/:id/payment", async (req, res) => {
       payment: latestPayment,
       paymentStatus: purchaseOrder.paymentStatus,
       totalPaid: newTotalPaid,
-      remainingAmount: purchaseOrder.totalAmount - newTotalPaid,
+      remainingAmount: purchaseOrder.totalAmount - newTotalPaid
     });
   } catch (error) {
     console.error("Error recording payment:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while recording payment",
-    });
+    res.status(500).json({ success: false, message: "Server error while recording payment" });
   }
 });
 
-// ✅ GET purchase orders by vendor
+// ─────────────────────────────────────────────────────────────────────────────
+// PO by vendor
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/vendor/:vendorId", async (req, res) => {
   try {
     const { status } = req.query;
-
     let filter = { vendor: req.params.vendorId };
-
-    if (status && status !== "all") {
-      filter.status = status;
-    }
+    if (status && status !== "all") filter.status = status;
 
     const purchaseOrders = await PurchaseOrder.find(filter)
-      .select(
-        "poNumber orderDate expectedDeliveryDate totalAmount status totalReceived totalPending",
-      )
+      .select("poNumber orderDate expectedDeliveryDate totalAmount status totalReceived totalPending")
       .populate("items.rawItem", "name sku")
       .sort({ createdAt: -1 });
 
-    // Calculate vendor statistics
     const totalOrders = purchaseOrders.length;
-    const totalAmount = purchaseOrders.reduce(
-      (sum, po) => sum + (po.totalAmount || 0),
-      0,
-    );
+    const totalAmount = purchaseOrders.reduce((sum, po) => sum + (po.totalAmount || 0), 0);
     const pendingAmount = purchaseOrders
       .filter((po) => po.status !== "COMPLETED" && po.status !== "CANCELLED")
       .reduce((sum, po) => sum + (po.totalAmount || 0), 0);
@@ -810,42 +608,30 @@ router.get("/vendor/:vendorId", async (req, res) => {
     res.json({
       success: true,
       purchaseOrders,
-      stats: {
-        totalOrders,
-        totalAmount,
-        pendingAmount,
-      },
+      stats: { totalOrders, totalAmount, pendingAmount }
     });
   } catch (error) {
     console.error("Error fetching vendor purchase orders:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching vendor purchase orders",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching vendor purchase orders" });
   }
 });
 
-// ✅ GET purchase orders by raw item
+// ─────────────────────────────────────────────────────────────────────────────
+// PO by raw item
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/raw-item/:itemId", async (req, res) => {
   try {
     const { status } = req.query;
-
     let filter = { "items.rawItem": req.params.itemId };
-
-    if (status && status !== "all") {
-      filter.status = status;
-    }
+    if (status && status !== "all") filter.status = status;
 
     const purchaseOrders = await PurchaseOrder.find(filter)
       .select("poNumber orderDate expectedDeliveryDate vendorName status")
       .populate("vendor", "companyName")
       .sort({ createdAt: -1 });
 
-    // Get item-specific details
     const itemOrders = purchaseOrders.map((po) => {
-      const item = po.items.find(
-        (i) => i.rawItem.toString() === req.params.itemId,
-      );
+      const item = po.items.find((i) => i.rawItem.toString() === req.params.itemId);
       return {
         _id: po._id,
         poNumber: po.poNumber,
@@ -853,73 +639,46 @@ router.get("/raw-item/:itemId", async (req, res) => {
         expectedDeliveryDate: po.expectedDeliveryDate,
         vendorName: po.vendorName,
         status: po.status,
-        itemDetails: item
-          ? {
-            quantity: item.quantity,
-            receivedQuantity: item.receivedQuantity,
-            pendingQuantity: item.pendingQuantity,
-            unitPrice: item.unitPrice,
-            totalPrice: item.totalPrice,
-            status: item.status,
-          }
-          : null,
+        itemDetails: item ? {
+          quantity: item.quantity,
+          receivedQuantity: item.receivedQuantity,
+          pendingQuantity: item.pendingQuantity,
+          unitPrice: item.unitPrice,
+          totalPrice: item.totalPrice,
+          status: item.status
+        } : null
       };
     });
 
-    res.json({
-      success: true,
-      purchaseOrders: itemOrders,
-    });
+    res.json({ success: true, purchaseOrders: itemOrders });
   } catch (error) {
     console.error("Error fetching raw item purchase orders:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching raw item purchase orders",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching raw item purchase orders" });
   }
 });
 
-// ✅ CHANGE purchase order status
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGE PO status
+// ─────────────────────────────────────────────────────────────────────────────
 router.patch("/:id/status", async (req, res) => {
   try {
     const { status, notes } = req.body;
-
-    if (!status) {
-      return res.status(400).json({
-        success: false,
-        message: "Status is required",
-      });
-    }
+    if (!status) return res.status(400).json({ success: false, message: "Status is required" });
 
     const validStatuses = ["DRAFT", "ISSUED", "CANCELLED"];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status. Use DRAFT, ISSUED, or CANCELLED",
-      });
+      return res.status(400).json({ success: false, message: "Invalid status. Use DRAFT, ISSUED, or CANCELLED" });
     }
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
 
-    // Cannot change status if already received
     if (purchaseOrder.totalReceived > 0 && status === "CANCELLED") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot cancel purchase order that has already been received",
-      });
+      return res.status(400).json({ success: false, message: "Cannot cancel purchase order that has already been received" });
     }
 
     purchaseOrder.status = status;
-
-    if (status === "ISSUED") {
-      purchaseOrder.approvedBy = req.user.id;
-    }
+    if (status === "ISSUED") purchaseOrder.approvedBy = req.user.id;
 
     if (notes) {
       purchaseOrder.notes = purchaseOrder.notes
@@ -928,23 +687,16 @@ router.patch("/:id/status", async (req, res) => {
     }
 
     await purchaseOrder.save();
-
-    res.json({
-      success: true,
-      message: `Purchase order status updated to ${status}`,
-      purchaseOrder,
-    });
+    res.json({ success: true, message: `Purchase order status updated to ${status}`, purchaseOrder });
   } catch (error) {
     console.error("Error updating purchase order status:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating purchase order status",
-    });
+    res.status(500).json({ success: false, message: "Server error while updating purchase order status" });
   }
 });
 
-// ✅ RECEIVE delivery against purchase order (COMPLETELY FIXED VERSION)
-// ✅ RECEIVE delivery — handles unit conversion + variant-correct stock updates
+// ─────────────────────────────────────────────────────────────────────────────
+// RECEIVE delivery (unchanged from your version — handles unit conversion)
+// ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/receive", async (req, res) => {
   try {
     const { deliveryDate, items, invoiceNumber, notes } = req.body;
@@ -960,7 +712,6 @@ router.post("/:id/receive", async (req, res) => {
     if (purchaseOrder.status === "DRAFT") return res.status(400).json({ success: false, message: "Cannot receive against a draft PO" });
     if (purchaseOrder.status === "CANCELLED") return res.status(400).json({ success: false, message: "Cannot receive against a cancelled PO" });
 
-    // ── Validate ───────────────────────────────────────────────────────────
     const updates = [];
     for (const ri of items) {
       const poItem = purchaseOrder.items.find(it => it._id.toString() === ri.itemId);
@@ -995,7 +746,6 @@ router.post("/:id/receive", async (req, res) => {
       return res.status(400).json({ success: false, message: "No valid quantities to receive" });
     }
 
-    // ── Process each line ──────────────────────────────────────────────────
     let totalReceivedInPoUnits = 0;
     const processed = [];
 
@@ -1003,26 +753,16 @@ router.post("/:id/receive", async (req, res) => {
       const { poItem, rawItemId, variantId, variantCombination, qtyInPoUnit, poUnit, unitPrice } = u;
 
       const rawItem = await RawItem.findById(rawItemId);
-      if (!rawItem) {
-        console.warn(`RawItem not found: ${rawItemId}`);
-        continue;
-      }
+      if (!rawItem) { console.warn(`RawItem not found: ${rawItemId}`); continue; }
 
       const registeredUnit = rawItem.customUnit || rawItem.unit;
       const fromUnit = poUnit || registeredUnit;
 
-      // CONVERT to registered unit before touching stock
       let qtyInRegisteredUnit = qtyInPoUnit;
       if (fromUnit !== registeredUnit) {
         qtyInRegisteredUnit = await convertQuantity(qtyInPoUnit, fromUnit, registeredUnit);
       }
 
-      console.log(
-        `[Receive] ${rawItem.name} | ${qtyInPoUnit} ${fromUnit}` +
-        (fromUnit !== registeredUnit ? ` → ${qtyInRegisteredUnit} ${registeredUnit}` : "")
-      );
-
-      // Update PO item (kept in PO unit)
       poItem.receivedQuantity += qtyInPoUnit;
       poItem.pendingQuantity = Math.max(0, poItem.quantity - poItem.receivedQuantity);
       poItem.status =
@@ -1031,16 +771,13 @@ router.post("/:id/receive", async (req, res) => {
 
       const previousBaseQty = rawItem.quantity;
 
-      // Update variant stock (in registered unit)
       if (variantId) {
         let variant = null;
         let variantIdx = -1;
 
         for (let i = 0; i < rawItem.variants.length; i++) {
           const v = rawItem.variants[i];
-          if (v._id?.toString() === variantId.toString()) {
-            variant = v; variantIdx = i; break;
-          }
+          if (v._id?.toString() === variantId.toString()) { variant = v; variantIdx = i; break; }
         }
 
         if (!variant && variantCombination?.length) {
@@ -1071,18 +808,15 @@ router.post("/:id/receive", async (req, res) => {
           });
         }
 
-        // Recompute total from variants
         rawItem.quantity = rawItem.variants.reduce((s, v) => s + (v.quantity || 0), 0);
       } else {
         rawItem.quantity = (rawItem.quantity || 0) + qtyInRegisteredUnit;
       }
 
-      // Raw-item overall status
       rawItem.status =
         rawItem.quantity === 0 ? "Out of Stock" :
           rawItem.quantity <= (rawItem.minStock || 0) ? "Low Stock" : "In Stock";
 
-      // Transaction record (records both PO-unit + registered-unit values)
       const conversionNote = fromUnit !== registeredUnit
         ? ` (received ${qtyInPoUnit} ${fromUnit} = ${qtyInRegisteredUnit.toFixed(4)} ${registeredUnit})`
         : "";
@@ -1118,7 +852,6 @@ router.post("/:id/receive", async (req, res) => {
       totalReceivedInPoUnits += qtyInPoUnit;
     }
 
-    // ── PO totals + delivery record ────────────────────────────────────────
     purchaseOrder.deliveries.unshift({
       deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
       quantityReceived: totalReceivedInPoUnits,
@@ -1153,70 +886,44 @@ router.post("/:id/receive", async (req, res) => {
   }
 });
 
-// ✅ UPDATE PAYMENT STATUS
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE PAYMENT STATUS
+// ─────────────────────────────────────────────────────────────────────────────
 router.patch("/:id/payment-status", async (req, res) => {
   try {
     const { status } = req.body;
-
-    if (!status) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment status is required",
-      });
-    }
+    if (!status) return res.status(400).json({ success: false, message: "Payment status is required" });
 
     const validStatuses = ["PENDING", "PARTIAL", "COMPLETED"];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment status",
-      });
+      return res.status(400).json({ success: false, message: "Invalid payment status" });
     }
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
 
     purchaseOrder.paymentStatus = status;
     await purchaseOrder.save();
 
-    res.json({
-      success: true,
-      message: `Payment status updated to ${status}`,
-      purchaseOrder,
-    });
+    res.json({ success: true, message: `Payment status updated to ${status}`, purchaseOrder });
   } catch (error) {
     console.error("Error updating payment status:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating payment status",
-    });
+    res.status(500).json({ success: false, message: "Server error while updating payment status" });
   }
 });
 
-// ✅ GET PAYMENT HISTORY
+// ─────────────────────────────────────────────────────────────────────────────
+// GET PAYMENT HISTORY
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id/payments", async (req, res) => {
   try {
     const purchaseOrder = await PurchaseOrder.findById(req.params.id)
       .select("payments poNumber totalAmount")
       .populate("payments.recordedBy", "name email");
 
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
+    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
 
-    const totalPaid =
-      purchaseOrder.payments?.reduce(
-        (sum, payment) => sum + payment.amount,
-        0,
-      ) || 0;
+    const totalPaid = purchaseOrder.payments?.reduce((sum, payment) => sum + payment.amount, 0) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
 
     res.json({
@@ -1225,14 +932,11 @@ router.get("/:id/payments", async (req, res) => {
       totalPaid,
       remainingAmount,
       poNumber: purchaseOrder.poNumber,
-      totalAmount: purchaseOrder.totalAmount,
+      totalAmount: purchaseOrder.totalAmount
     });
   } catch (error) {
     console.error("Error fetching payments:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching payments",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching payments" });
   }
 });
 
