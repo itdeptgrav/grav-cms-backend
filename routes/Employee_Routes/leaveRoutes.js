@@ -90,7 +90,12 @@ async function ensureBalance(employeeId, year, biometricId, config) {
   return bal;
 }
 
-async function countMonthlyUsage(employeeId, fromDate, leaveTypeFilter) {
+async function countMonthlyUsage(
+  employeeId,
+  fromDate,
+  leaveTypeFilter,
+  excludeId,
+) {
   const month = new Date(fromDate).getMonth() + 1;
   const year = new Date(fromDate).getFullYear();
   const mStr = String(month).padStart(2, "0");
@@ -103,6 +108,7 @@ async function countMonthlyUsage(employeeId, fromDate, leaveTypeFilter) {
     toDate: { $gte: monthStart },
   };
   if (leaveTypeFilter) filter.leaveType = leaveTypeFilter;
+  if (excludeId) filter._id = { $ne: excludeId };
   const existing = await LeaveApplication.find(filter).lean();
   let used = 0;
   for (const a of existing) {
@@ -358,21 +364,17 @@ router.post(
       const year = new Date(fromDate).getFullYear();
       const wd = workingDaysSinceJoining(te.dateOfJoining);
       if (wd < config.initialWaitingDays)
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: `Waiting period not complete (${wd}/${config.initialWaitingDays})`,
-            code: "WAITING_PERIOD",
-          });
+        return res.status(400).json({
+          success: false,
+          message: `Waiting period not complete (${wd}/${config.initialWaitingDays})`,
+          code: "WAITING_PERIOD",
+        });
       if (leaveType === "PL" && wd < config.daysRequiredForPL)
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: `Not eligible for PL (${wd}/${config.daysRequiredForPL})`,
-            code: "PL_NOT_ELIGIBLE",
-          });
+        return res.status(400).json({
+          success: false,
+          message: `Not eligible for PL (${wd}/${config.daysRequiredForPL})`,
+          code: "PL_NOT_ELIGIBLE",
+        });
       const totalDays = isHalfDay ? 0.5 : countLeaveDays(fromDate, toDate);
       if (totalDays <= 0)
         return res
@@ -385,13 +387,11 @@ router.post(
         toDate: { $gte: fromDate },
       });
       if (oc)
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: `Already has leave ${oc.fromDate}–${oc.toDate}`,
-            code: "OVERLAP",
-          });
+        return res.status(400).json({
+          success: false,
+          message: `Already has leave ${oc.fromDate}–${oc.toDate}`,
+          code: "OVERLAP",
+        });
 
       // ── LWP split: allow even if balance insufficient ──
       const bal = await ensureBalance(employeeId, year, te.biometricId, config);
@@ -498,16 +498,14 @@ router.post(
           console.warn("[MGR]", e.message);
         }
       }
-      res
-        .status(201)
-        .json({
-          success: true,
-          data: app,
-          message:
-            st === "hr_approved"
-              ? `Leave approved for ${te.firstName}. ${lwpDays > 0 ? `(${paidDays} paid + ${lwpDays} LWP)` : ""}`
-              : "Routed to secondary manager.",
-        });
+      res.status(201).json({
+        success: true,
+        data: app,
+        message:
+          st === "hr_approved"
+            ? `Leave approved for ${te.firstName}. ${lwpDays > 0 ? `(${paidDays} paid + ${lwpDays} LWP)` : ""}`
+            : "Routed to secondary manager.",
+      });
     } catch (err) {
       console.error("[MGR]", err);
       res.status(500).json({ success: false, message: err.message });
@@ -574,21 +572,17 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
     // Waiting period (hard block — can't apply at all)
     const wd = workingDaysSinceJoining(emp.dateOfJoining);
     if (wd < config.initialWaitingDays)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `Complete ${config.initialWaitingDays} working days first. You have ${wd}.`,
-          code: "WAITING_PERIOD",
-        });
+      return res.status(400).json({
+        success: false,
+        message: `Complete ${config.initialWaitingDays} working days first. You have ${wd}.`,
+        code: "WAITING_PERIOD",
+      });
     if (leaveType === "PL" && wd < config.daysRequiredForPL)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `PL available after ${config.daysRequiredForPL} days. You have ${wd}.`,
-          code: "PL_NOT_ELIGIBLE",
-        });
+      return res.status(400).json({
+        success: false,
+        message: `PL available after ${config.daysRequiredForPL} days. You have ${wd}.`,
+        code: "PL_NOT_ELIGIBLE",
+      });
 
     // Calculate days
     const [fsy, fsm, fsd] = fromDate.split("-").map(Number);
@@ -598,13 +592,11 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         new Date(tsy, tsm - 1, tsd).getTime() &&
       new Date(fsy, fsm - 1, fsd).getDay() === 6
     )
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Saturday is not a valid leave day.",
-          code: "SATURDAY_BLOCKED",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Saturday is not a valid leave day.",
+        code: "SATURDAY_BLOCKED",
+      });
     const totalDays = isHalfDay ? 0.5 : countLeaveDays(fromDate, toDate);
     if (totalDays <= 0)
       return res
@@ -619,13 +611,11 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       toDate: { $gte: fromDate },
     });
     if (oc)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `Already have leave ${oc.fromDate}–${oc.toDate}.`,
-          code: "OVERLAP",
-        });
+      return res.status(400).json({
+        success: false,
+        message: `Already have leave ${oc.fromDate}–${oc.toDate}.`,
+        code: "OVERLAP",
+      });
 
     // ══════════════════════════════════════════════════════════════════
     //  CALCULATE PAID vs LWP BREAKDOWN — no longer blocks
@@ -859,13 +849,11 @@ router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
       toDate: { $gte: nF },
     });
     if (c)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `Conflicts with ${c.fromDate}–${c.toDate}`,
-          code: "OVERLAP",
-        });
+      return res.status(400).json({
+        success: false,
+        message: `Conflicts with ${c.fromDate}–${c.toDate}`,
+        code: "OVERLAP",
+      });
     a.fromDate = nF;
     a.toDate = nT;
     a.totalDays = nt;
@@ -948,6 +936,154 @@ router.post(
     }
   },
 );
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANAGER EDIT — HOD can adjust dates, leave type, reason before approving
+// ═══════════════════════════════════════════════════════════════════════════════
+router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
+  try {
+    const myId = req.user.id;
+    const a = await LeaveApplication.findOne({
+      _id: req.params.id,
+      "managersNotified.managerId": myId,
+    });
+    if (!a)
+      return res.status(404).json({ success: false, message: "Not found" });
+    if (!["pending", "manager_approved"].includes(a.status))
+      return res
+        .status(400)
+        .json({ success: false, message: `Cannot edit — ${a.status}` });
+
+    const { fromDate, toDate, leaveType, reason, isHalfDay, halfDaySlot } =
+      req.body;
+    const nF = fromDate || a.fromDate;
+    const nT =
+      isHalfDay || (isHalfDay === undefined && a.isHalfDay)
+        ? nF
+        : toDate || a.toDate;
+    const nType = leaveType || a.leaveType;
+    if (!["CL", "SL", "PL"].includes(nType))
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid leave type" });
+
+    const totalDays = (isHalfDay !== undefined ? isHalfDay : a.isHalfDay)
+      ? 0.5
+      : countLeaveDays(nF, nT);
+    if (totalDays <= 0)
+      return res.status(400).json({ success: false, message: "No valid days" });
+
+    // Overlap check (exclude self)
+    const oc = await LeaveApplication.findOne({
+      _id: { $ne: req.params.id },
+      employeeId: a.employeeId,
+      status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
+      fromDate: { $lte: nT },
+      toDate: { $gte: nF },
+    });
+    if (oc)
+      return res.status(400).json({
+        success: false,
+        message: `Conflicts with ${oc.fromDate}–${oc.toDate}`,
+        code: "OVERLAP",
+      });
+
+    // Recalculate paid vs LWP for new type/dates
+    const config = await LeaveConfig.getConfig();
+    const year = new Date(nF).getFullYear();
+    const bal = await ensureBalance(a.employeeId, year, a.biometricId, config);
+    const le = {
+      CL: config.clPerYear,
+      SL: config.slPerYear,
+      PL: bal.plEligible ? config.plPerYear : 0,
+    };
+    let effectiveAvailable = Math.max(0, le[nType] - bal.consumed[nType]);
+
+    if (nType === "CL") {
+      const maxCLMonth = config.maxCLPerMonth || 3;
+      const { used: clUsed } = await countMonthlyUsage(
+        a.employeeId,
+        nF,
+        "CL",
+        a._id,
+      );
+      effectiveAvailable = Math.min(
+        effectiveAvailable,
+        Math.max(0, maxCLMonth - clUsed),
+      );
+    }
+
+    const emp = await Employee.findById(a.employeeId).select("address").lean();
+    const empState = (
+      emp?.address?.current?.state ||
+      emp?.address?.permanent?.state ||
+      ""
+    )
+      .toLowerCase()
+      .trim();
+    const isOdisha = ["odisha", "orissa"].includes(empState);
+    const monthlyCap = isOdisha
+      ? config.maxLeaveDaysPerMonthOdisha || 7
+      : config.maxLeaveDaysPerMonth || 10;
+    const { used: totalMonthUsed } = await countMonthlyUsage(
+      a.employeeId,
+      nF,
+      null,
+      a._id,
+    );
+    effectiveAvailable = Math.min(
+      effectiveAvailable,
+      Math.max(0, monthlyCap - totalMonthUsed),
+    );
+
+    // If manager specified paidDays (from cart UI), use it — but cap at effectiveAvailable
+    let paidDays;
+    if (req.body.paidDays !== undefined && req.body.paidDays !== null) {
+      paidDays = Math.max(
+        0,
+        Math.min(Number(req.body.paidDays), effectiveAvailable, totalDays),
+      );
+    } else {
+      paidDays = Math.min(totalDays, effectiveAvailable);
+    }
+    const lwpDays = Math.max(0, totalDays - paidDays);
+
+    // Update
+    a.fromDate = nF;
+    a.toDate = nT;
+    a.leaveType = nType;
+    a.totalDays = totalDays;
+    a.paidDays = paidDays;
+    a.lwpDays = lwpDays;
+    if (reason !== undefined) a.reason = reason;
+    if (isHalfDay !== undefined) {
+      a.isHalfDay = isHalfDay;
+      a.halfDaySlot = isHalfDay ? halfDaySlot || "first_half" : null;
+    }
+    a.requiresDocument =
+      nType === "SL" && totalDays > config.slDocumentThreshold;
+
+    const mgr = await Employee.findById(myId)
+      .select("firstName lastName")
+      .lean();
+    const mgrName = mgr ? `${mgr.firstName} ${mgr.lastName}`.trim() : "Manager";
+    a.hrRemarks = `Edited by ${mgrName}: ${paidDays} ${nType} paid, ${lwpDays} LOP`;
+
+    await a.save();
+    console.log(
+      `[MGR-EDIT] ${mgrName} edited leave ${a._id}: ${nType} ${nF}→${nT}, paid=${paidDays}, lwp=${lwpDays}`,
+    );
+
+    res.json({
+      success: true,
+      data: a,
+      message: `Updated: ${paidDays} ${nType} (paid) + ${lwpDays} LOP`,
+    });
+  } catch (e) {
+    console.error("[MGR-EDIT]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MANAGER APPROVAL/REJECT — only deducts paidDays from balance (not LWP)
