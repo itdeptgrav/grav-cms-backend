@@ -801,6 +801,13 @@ app.use("/api/cms/vendors", vendorRoutes);
 const rawItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/rawItems");
 app.use("/api/cms/raw-items", rawItemsRoutes);
 
+// ✅ Sibling route — no conflict
+const stockAdjRoutes = require("./routes/CMS_Routes/Inventory/Products/stockAdjustments");
+app.use("/api/cms/inventory/stock-adjustments", stockAdjRoutes);
+
+const rawItemBarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/rawItemBarcodeRoutes");
+app.use("/api/cms/manufacturing/cutting-master/raw-item-barcode", rawItemBarcodeRoutes);
+
 const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems");
 app.use("/api/cms/stock-items", stockItemsRoutes);
 
