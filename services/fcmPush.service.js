@@ -55,9 +55,15 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             const fcmDoc = fcmDocs[i];
             if (fcmDoc.exists) {
                 const d = fcmDoc.data();
+                // Old format: tokens array
                 (d.tokens || []).forEach(t => t && tokens.add(t));
                 if (d.token) tokens.add(d.token);
+                // Always use latestToken — most recent registration
                 if (d.latestToken) tokens.add(d.latestToken);
+                // New format: device_* keys — one per device, replaces stale tokens
+                Object.keys(d).filter(k => k.startsWith("device_")).forEach(k => {
+                    if (d[k]) tokens.add(d[k]);
+                });
             } else {
                 console.log(`[FCM]   ⚠️  ${id}: no doc in cowork_fcm_tokens`);
             }
@@ -212,11 +218,19 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                 const fcmRef = db.collection("cowork_fcm_tokens").doc(id);
                 const fcmSnap = await fcmRef.get();
                 if (fcmSnap.exists) {
-                    const existing = fcmSnap.data().tokens || [];
+                    const d = fcmSnap.data();
+                    const updates = {};
+                    // Clean old tokens array
+                    const existing = d.tokens || [];
                     const cleaned = existing.filter(t => !staleTokens.includes(t));
-                    if (cleaned.length !== existing.length) {
-                        await fcmRef.update({ tokens: cleaned });
-                    }
+                    if (cleaned.length !== existing.length) updates.tokens = cleaned;
+                    // Clean new device_* keys
+                    Object.keys(d).filter(k => k.startsWith("device_")).forEach(k => {
+                        if (staleTokens.includes(d[k])) updates[k] = admin.firestore.FieldValue.delete();
+                    });
+                    // Clean latestToken if stale
+                    if (d.latestToken && staleTokens.includes(d.latestToken)) updates.latestToken = null;
+                    if (Object.keys(updates).length) await fcmRef.update(updates);
                 }
                 // Clean cowork_employees
                 const empRef = db.collection("cowork_employees").doc(id);
