@@ -192,7 +192,8 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                 if (
                     code === "messaging/invalid-registration-token" ||
                     code === "messaging/registration-token-not-registered" ||
-                    code === "messaging/invalid-argument"
+                    code === "messaging/invalid-argument" ||
+                    code === "messaging/third-party-auth-error"
                 ) {
                     staleTokens.push(allTokens[idx]);
                 }
