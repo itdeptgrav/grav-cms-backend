@@ -113,10 +113,8 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
         console.log(`[FCM] Sending to ${fcmTokens.length} FCM token(s) total`);
 
         const message = {
-            // Top-level notification (Android background, some web)
-            notification: { title, body },
-
-            // Data payload (always included — sw.js reads this)
+            // Data-only payload — service worker (onBackgroundMessage) controls display
+            // This prevents Chrome from auto-showing AND onBackgroundMessage double-firing
             data: dataPayload,
 
             // ── Web Push (Chrome, Firefox, Edge, desktop) ──
@@ -125,8 +123,8 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                 notification: {
                     title,
                     body,
-                    icon: "/icons/icon-192x192.png",
-                    badge: "/icons/badge-72x72.png",
+                    icon: "/icon-192.png",
+                    badge: "/icon-192.png",
                     requireInteraction: false,
                     vibrate: [200, 100, 200],
                     tag: `cowork-${data.type || "notif"}-${Date.now()}`,
