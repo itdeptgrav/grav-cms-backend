@@ -97,6 +97,12 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             try { const p = JSON.parse(t); return !(p && p.endpoint && p.keys); } catch { return true; }
         });
 
+        // ── 2. Build payload ─────────────────────────────────────────────────
+        const dataPayload = Object.fromEntries(
+            Object.entries({ title, body, type: "", url: "/coworking", ...data })
+                .map(([k, v]) => [k, String(v ?? "")])
+        );
+
         // Send iOS Web Push
         if (iosTokens.length) {
             console.log(`[WebPush] Sending to ${iosTokens.length} iOS subscription(s)`);
@@ -105,12 +111,6 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
 
         if (!fcmTokens.length) return;
         console.log(`[FCM] Sending to ${fcmTokens.length} FCM token(s) total`);
-
-        // ── 2. Build FCM message ──────────────────────────────────────────────
-        const dataPayload = Object.fromEntries(
-            Object.entries({ title, body, type: "", url: "/coworking", ...data })
-                .map(([k, v]) => [k, String(v ?? "")])
-        );
 
         const message = {
             // Top-level notification (Android background, some web)
