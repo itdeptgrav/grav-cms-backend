@@ -13,7 +13,7 @@ const webpush = require("web-push");
 // Get these from Firebase Console → Project Settings → Cloud Messaging → Web Push certificates
 const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
-const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:admin@grav.in";
+const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:rakesh.biswal@grav.in";
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
     webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
