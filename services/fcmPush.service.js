@@ -214,33 +214,45 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
         if (staleTokens.length) {
             console.log(`[FCM] Removing ${staleTokens.length} stale token(s) from Firestore`);
             await Promise.all(recipientIds.map(async id => {
-                // Clean cowork_fcm_tokens
-                const fcmRef = db.collection("cowork_fcm_tokens").doc(id);
-                const fcmSnap = await fcmRef.get();
-                if (fcmSnap.exists) {
-                    const d = fcmSnap.data();
-                    const updates = {};
-                    // Clean old tokens array
-                    const existing = d.tokens || [];
-                    const cleaned = existing.filter(t => !staleTokens.includes(t));
-                    if (cleaned.length !== existing.length) updates.tokens = cleaned;
-                    // Clean new device_* keys
-                    Object.keys(d).filter(k => k.startsWith("device_")).forEach(k => {
-                        if (staleTokens.includes(d[k])) updates[k] = admin.firestore.FieldValue.delete();
-                    });
-                    // Clean latestToken if stale
-                    if (d.latestToken && staleTokens.includes(d.latestToken)) updates.latestToken = null;
-                    if (Object.keys(updates).length) await fcmRef.update(updates);
-                }
-                // Clean cowork_employees
-                const empRef = db.collection("cowork_employees").doc(id);
-                const empSnap = await empRef.get();
-                if (empSnap.exists) {
-                    const existing = empSnap.data().fcmTokens || [];
-                    const cleaned = existing.filter(t => !staleTokens.includes(t));
-                    if (cleaned.length !== existing.length) {
-                        await empRef.update({ fcmTokens: cleaned });
+                try {
+                    const fcmRef = db.collection("cowork_fcm_tokens").doc(id);
+                    const fcmSnap = await fcmRef.get();
+                    if (fcmSnap.exists) {
+                        const d = fcmSnap.data();
+                        // Clean tokens array
+                        const existing = d.tokens || [];
+                        const cleaned = existing.filter(t => !staleTokens.includes(t));
+                        // Separate safe keys (only alphanumeric/underscore) from bad keys (old format with special chars)
+                        const safeUpdates = {};
+                        if (cleaned.length !== existing.length) safeUpdates.tokens = cleaned;
+                        if (d.latestToken && staleTokens.includes(d.latestToken)) safeUpdates.latestToken = null;
+                        // Find stale device keys
+                        const allDevKeys = Object.keys(d).filter(k => k.startsWith('dev'));
+                        const staleDevKeys = allDevKeys.filter(k => staleTokens.includes(d[k]));
+                        const safeDevKeys = staleDevKeys.filter(k => /^[a-zA-Z0-9_]+$/.test(k));
+                        const unsafeDevKeys = staleDevKeys.filter(k => !/^[a-zA-Z0-9_]+$/.test(k));
+                        // Delete safe keys via update
+                        safeDevKeys.forEach(k => { safeUpdates[k] = admin.firestore.FieldValue.delete(); });
+                        if (Object.keys(safeUpdates).length) await fcmRef.update(safeUpdates);
+                        // Rewrite entire doc to remove unsafe keys (old bad format)
+                        if (unsafeDevKeys.length) {
+                            const newDoc = {};
+                            Object.keys(d).forEach(k => { if (!unsafeDevKeys.includes(k)) newDoc[k] = d[k]; });
+                            newDoc.tokens = cleaned;
+                            await fcmRef.set(newDoc);
+                            console.log(`[FCM] Purged ${unsafeDevKeys.length} bad-format key(s) for ${id}`);
+                        }
                     }
+                    // Clean cowork_employees
+                    const empRef = db.collection("cowork_employees").doc(id);
+                    const empSnap = await empRef.get();
+                    if (empSnap.exists) {
+                        const existing = empSnap.data().fcmTokens || [];
+                        const cleaned = existing.filter(t => !staleTokens.includes(t));
+                        if (cleaned.length !== existing.length) await empRef.update({ fcmTokens: cleaned });
+                    }
+                } catch (cleanErr) {
+                    console.warn(`[FCM] Cleanup error for ${id}:`, cleanErr.message);
                 }
             }));
         }
