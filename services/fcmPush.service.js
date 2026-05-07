@@ -7,6 +7,32 @@
  */
 const admin = require("firebase-admin");
 
+const webpush = require("web-push");
+
+// VAPID keys — must match NEXT_PUBLIC_FIREBASE_VAPID_KEY on frontend
+// Get these from Firebase Console → Project Settings → Cloud Messaging → Web Push certificates
+const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY || "";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:admin@grav.in";
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+}
+
+async function sendIOSWebPush(subscriptionJSON, title, body, data = {}) {
+    try {
+        const subscription = typeof subscriptionJSON === "string"
+            ? JSON.parse(subscriptionJSON) : subscriptionJSON;
+        const payload = JSON.stringify({ title, body, data });
+        await webpush.sendNotification(subscription, payload);
+        console.log("[WebPush] ✓ iOS push sent");
+        return true;
+    } catch (e) {
+        console.warn("[WebPush] ✗ iOS push failed:", e.message);
+        return false;
+    }
+}
+
 async function sendPushToEmployees(recipientIds, title, body, data = {}) {
     if (!recipientIds?.length) return;
     const db = admin.firestore();
@@ -29,9 +55,15 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             const fcmDoc = fcmDocs[i];
             if (fcmDoc.exists) {
                 const d = fcmDoc.data();
+                // Old format: tokens array
                 (d.tokens || []).forEach(t => t && tokens.add(t));
                 if (d.token) tokens.add(d.token);
+                // Always use latestToken — most recent registration
                 if (d.latestToken) tokens.add(d.latestToken);
+                // New format: device_* keys — one per device, replaces stale tokens
+                Object.keys(d).filter(k => k.startsWith("device_")).forEach(k => {
+                    if (d[k]) tokens.add(d[k]);
+                });
             } else {
                 console.log(`[FCM]   ⚠️  ${id}: no doc in cowork_fcm_tokens`);
             }
@@ -57,13 +89,28 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             return;
         }
 
-        console.log(`[FCM] Sending to ${allTokens.length} token(s) total`);
+        // ── Separate iOS Web Push subscriptions from FCM tokens ──────────────
+        const iosTokens = allTokens.filter(t => {
+            try { const p = JSON.parse(t); return p && p.endpoint && p.keys; } catch { return false; }
+        });
+        const fcmTokens = allTokens.filter(t => {
+            try { const p = JSON.parse(t); return !(p && p.endpoint && p.keys); } catch { return true; }
+        });
 
-        // ── 2. Build FCM message ──────────────────────────────────────────────
+        // ── 2. Build payload ─────────────────────────────────────────────────
         const dataPayload = Object.fromEntries(
             Object.entries({ title, body, type: "", url: "/coworking", ...data })
                 .map(([k, v]) => [k, String(v ?? "")])
         );
+
+        // Send iOS Web Push
+        if (iosTokens.length) {
+            console.log(`[WebPush] Sending to ${iosTokens.length} iOS subscription(s)`);
+            await Promise.all(iosTokens.map(t => sendIOSWebPush(t, title, body, dataPayload)));
+        }
+
+        if (!fcmTokens.length) return;
+        console.log(`[FCM] Sending to ${fcmTokens.length} FCM token(s) total`);
 
         const message = {
             // Top-level notification (Android background, some web)
@@ -125,7 +172,7 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                 },
             },
 
-            tokens: allTokens,
+            tokens: fcmTokens,
         };
 
         // ── 3. Send ───────────────────────────────────────────────────────────
@@ -171,11 +218,19 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                 const fcmRef = db.collection("cowork_fcm_tokens").doc(id);
                 const fcmSnap = await fcmRef.get();
                 if (fcmSnap.exists) {
-                    const existing = fcmSnap.data().tokens || [];
+                    const d = fcmSnap.data();
+                    const updates = {};
+                    // Clean old tokens array
+                    const existing = d.tokens || [];
                     const cleaned = existing.filter(t => !staleTokens.includes(t));
-                    if (cleaned.length !== existing.length) {
-                        await fcmRef.update({ tokens: cleaned });
-                    }
+                    if (cleaned.length !== existing.length) updates.tokens = cleaned;
+                    // Clean new device_* keys
+                    Object.keys(d).filter(k => k.startsWith("device_")).forEach(k => {
+                        if (staleTokens.includes(d[k])) updates[k] = admin.firestore.FieldValue.delete();
+                    });
+                    // Clean latestToken if stale
+                    if (d.latestToken && staleTokens.includes(d.latestToken)) updates.latestToken = null;
+                    if (Object.keys(updates).length) await fcmRef.update(updates);
                 }
                 // Clean cowork_employees
                 const empRef = db.collection("cowork_employees").doc(id);
