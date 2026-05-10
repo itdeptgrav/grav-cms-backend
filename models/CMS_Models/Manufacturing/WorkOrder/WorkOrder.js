@@ -241,6 +241,20 @@ const workOrderSchema = new mongoose.Schema(
 
     rawMaterials: [rawMaterialAllocationSchema],
     timeline: timelineSchema,
+
+    assignedDeadline: {
+      type: Date,
+      default: null,
+    },
+    assignedDeadlineMeta: {
+      assignedAt: { type: Date, default: null },
+      assignedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "SalesDepartment",
+        default: null,
+      },
+    },
+
     productionCompletion: productionCompletionSchema,
 
     specialInstructions: [{ type: String, trim: true }],
