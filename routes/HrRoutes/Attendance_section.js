@@ -1856,6 +1856,18 @@ async function applyMonthlyLatePromotion(dayDoc, settings) {
   });
 }
 
+async function checkPreJoining(bid, dateStr) {
+  // Returns dojStr if date is before joining, null otherwise
+  const emp = await Employee.findOne({
+    $or: [{ biometricId: bid }, { "basicInfo.biometricId": bid }],
+  })
+    .select("dateOfJoining")
+    .lean();
+  if (!emp?.dateOfJoining) return null;
+  const dojStr = new Date(emp.dateOfJoining).toISOString().split("T")[0];
+  return dateStr < dojStr ? dojStr : null;
+}
+
 const recomputeSummary = (emps) =>
   buildSummary(
     emps.map((e) => ({
@@ -2296,6 +2308,7 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "from and to required" });
+
     const allActive = await Employee.find({
       $or: [
         { status: "active" },
@@ -2303,18 +2316,22 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         { isActive: true },
       ],
     }).lean();
+
     const settings = await AttendanceSettings.getConfig();
     const thresholds = settings.lateHalfDayPolicy
       ?.cumulativeLateMinsThreshold || { operator: 30, executive: 40 };
+
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
         : allActive;
+
     const days = await DailyAttendance.find({
       dateStr: { $gte: from, $lte: to },
     })
       .sort({ dateStr: 1 })
       .lean();
+
     const holidayMap = await loadHolidayMap(from, to);
     const syncedDates = new Set(days.map((d) => d.dateStr));
     const workingDates = workingDaysInRange(from, to);
@@ -2331,9 +2348,22 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         description: h.description || "",
         statusCode: holidayTypeToStatus(h.type),
       }));
+
     const perEmp = new Map(),
       running = new Map();
     let lastYM = null;
+
+    // ── DOJ map: build before any loop so we can skip pre-joining dates ──────
+    const dojMap = new Map();
+    for (const emp2 of allActive) {
+      const bid2 = extractBiometricId(emp2);
+      if (!bid2 || !emp2.dateOfJoining) continue;
+      const d2 = new Date(emp2.dateOfJoining);
+      if (!isNaN(d2.getTime())) {
+        dojMap.set(String(bid2).toUpperCase(), d2.toISOString().split("T")[0]);
+      }
+    }
+
     const agg = {
       from,
       to,
@@ -2365,10 +2395,16 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
       holidayCount: activeHolidays.length,
       holidays: activeHolidays,
     };
+
     for (const emp of filteredActive) {
       const bid = extractBiometricId(emp);
       if (!bid) continue;
       const key = String(bid).toUpperCase();
+
+      // ── Skip employees who hadn't joined during this period at all ─────────
+      const empDoj = dojMap.get(key);
+      if (empDoj && empDoj > to) continue;
+
       const empType = resolveEmployeeType(emp, settings);
       perEmp.set(key, {
         biometricId: key,
@@ -2405,6 +2441,7 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         totalAttendance: 0,
       });
     }
+
     for (const d of days) {
       if (d.yearMonth !== lastYM) {
         running.clear();
@@ -2414,10 +2451,17 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         isSunday = dt.getDay() === 0;
       const hol = holidayMap.get(d.dateStr),
         isDeclaredHoliday = !!hol && hol.type !== "working_sunday";
+
       for (const e of d.employees || []) {
         if (department && department !== "all" && e.department !== department)
           continue;
+
         const key = e.biometricId;
+
+        // ── Skip pre-joining dates — don't count WO / AB / holiday / anything ──
+        const empDojCheck = dojMap.get(key);
+        if (empDojCheck && d.dateStr < empDojCheck) continue;
+
         if (!perEmp.has(key))
           perEmp.set(key, {
             biometricId: e.biometricId,
@@ -2453,6 +2497,7 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
             holidayWorked: 0,
             totalAttendance: 0,
           });
+
         const b = perEmp.get(key);
         b.recordedDays++;
         if (!isSunday) b.recordedWorkingDays++;
@@ -2464,6 +2509,7 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
           b.holidayWorked++;
           agg.holidayWorkedCount++;
         }
+
         let cum = running.get(key) || 0,
           status = e.systemPrediction,
           promoted = false;
@@ -2481,6 +2527,7 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
           }
         }
         running.set(key, cum);
+
         const final = e.hrFinalStatus || status;
         if (b.days[final] !== undefined) b.days[final]++;
         if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(final))
@@ -2523,18 +2570,25 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
         if (promoted) agg.autoPromotedHDs++;
       }
     }
+
+    // ── Missing days: only count from employee's active start date ───────────
     const workingSyncedDates = workingDates.filter((d) => syncedDates.has(d));
     for (const [key, b] of perEmp) {
       if (b.isGhost) continue;
+      const empDoj = dojMap.get(key);
+      const activeWorkingSynced = workingSyncedDates.filter(
+        (d) => !empDoj || d >= empDoj,
+      );
       const missing = Math.max(
         0,
-        workingSyncedDates.length - b.recordedWorkingDays,
+        activeWorkingSynced.length - b.recordedWorkingDays,
       );
       if (missing > 0) {
         b.days.AB += missing;
         agg.AB += missing;
       }
     }
+
     const employees = [...perEmp.values()].sort((a, b) =>
       (a.employeeName || "").localeCompare(b.employeeName || ""),
     );
@@ -2550,83 +2604,200 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. GET /employee-detail
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    const { biometricId, from, to } = req.query;
-    if (!biometricId || !from || !to)
+    const { biometricId, employeeId, from, to } = req.query;
+    if (!from || !to)
       return res
         .status(400)
-        .json({ success: false, message: "biometricId, from, to required" });
-    const bid = String(biometricId).toUpperCase();
+        .json({ success: false, message: "from and to required" });
+
+    let bid = biometricId;
+    if (!bid && employeeId) {
+      const emp = await Employee.findById(employeeId)
+        .select("biometricId")
+        .lean();
+      bid = emp?.biometricId;
+    }
+    if (!bid)
+      return res.status(400).json({
+        success: false,
+        message: "biometricId or employeeId required",
+      });
+    bid = String(bid).toUpperCase();
+
     const settings = await AttendanceSettings.getConfig();
     const thresholds = settings.lateHalfDayPolicy
-      ?.cumulativeLateMinsThreshold || { operator: 30, executive: 40 };
+      ?.cumulativeLateMinsThreshold || {
+      operator: 30,
+      executive: 40,
+    };
+
+    const empDoc = await Employee.findOne({
+      $or: [
+        { biometricId: bid },
+        { "basicInfo.biometricId": bid },
+        { "workInfo.biometricId": bid },
+      ],
+    }).lean();
+
+    // ── DOJ guard ────────────────────────────────────────────────────────────
+    const dojRaw = empDoc?.dateOfJoining;
+    const dojStr = dojRaw ? new Date(dojRaw).toISOString().split("T")[0] : null;
+
     const days = await DailyAttendance.find({
       dateStr: { $gte: from, $lte: to },
     })
       .sort({ dateStr: 1 })
       .lean();
+
     const holidayMap = await loadHolidayMap(from, to);
+
+    // Build approved-leave map
+    const leaveAppsQuery = {
+      fromDate: { $lte: to },
+      toDate: { $gte: from },
+    };
+    if (empDoc) {
+      leaveAppsQuery.$or = [{ biometricId: bid }, { employeeId: empDoc._id }];
+    } else {
+      leaveAppsQuery.biometricId = bid;
+    }
+    const allLeaveApps = await getLeaveApplication()
+      .find(leaveAppsQuery)
+      .sort({ applicationDate: -1 })
+      .lean();
+    const approvedLeaveByDate = new Map();
+    for (const lv of allLeaveApps) {
+      if (lv.status !== "hr_approved") continue;
+      const s = new Date(lv.fromDate + "T00:00:00"),
+        e = new Date(lv.toDate + "T00:00:00");
+      for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+        const ds = dateStrOf(new Date(d));
+        if (!approvedLeaveByDate.has(ds))
+          approvedLeaveByDate.set(
+            ds,
+            LEAVE_TYPE_TO_STATUS[lv.leaveType] || "L-CL",
+          );
+      }
+    }
+
+    // Build calendar
     const start = new Date(from + "T00:00:00"),
       end = new Date(to + "T00:00:00");
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const calendar = [];
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      if (d > today) continue;
       const ds = dateStrOf(new Date(d)),
-        dow = d.getDay(),
-        hol = holidayMap.get(ds);
+        dow = d.getDay();
       calendar.push({
         dateStr: ds,
         dayName: new Date(d).toLocaleDateString("en-IN", { weekday: "short" }),
+        fullDayName: new Date(d).toLocaleDateString("en-IN", {
+          weekday: "long",
+        }),
         dayNum: d.getDate(),
+        monthName: new Date(d).toLocaleDateString("en-IN", { month: "short" }),
         isSunday: dow === 0,
+        isFuture: d > today,
         restStatus: resolveRestDayStatus(ds, dow, holidayMap),
-        holiday: hol || null,
-        isHoliday: !!hol && hol.type !== "working_sunday",
-        holidayName: hol && hol.type !== "working_sunday" ? hol.name : null,
-        holidayType: hol && hol.type !== "working_sunday" ? hol.type : null,
+        holiday: holidayMap.get(ds) || null,
       });
     }
+
     const byDate = new Map(days.map((d) => [d.dateStr, d]));
     const running = new Map();
-    let lastYM = null,
-      empMeta = null;
-    const rows = [],
-      stats = {
-        P: 0,
-        "P*": 0,
-        "P~": 0,
-        HD: 0,
-        AB: 0,
-        MP: 0,
-        WO: 0,
-        PH: 0,
-        FH: 0,
-        NH: 0,
-        OH: 0,
-        RH: 0,
-        "L-CL": 0,
-        "L-SL": 0,
-        "L-EL": 0,
-        LWP: 0,
-        WFH: 0,
-        CO: 0,
-        leaves: 0,
-        unsynced: 0,
-        effectivePresent: 0,
-        totalLateMins: 0,
-        totalOtMins: 0,
-        totalNetWorkMins: 0,
-        sundayWorked: 0,
-        holidayWorked: 0,
-        totalAttendance: 0,
-      };
+    let lastYM = null;
+    let empMeta = null;
+    const rows = [];
+    const stats = {
+      P: 0,
+      "P*": 0,
+      "P~": 0,
+      HD: 0,
+      AB: 0,
+      MP: 0,
+      WO: 0,
+      PH: 0,
+      FH: 0,
+      NH: 0,
+      OH: 0,
+      RH: 0,
+      "L-CL": 0,
+      "L-SL": 0,
+      "L-EL": 0,
+      LWP: 0,
+      WFH: 0,
+      CO: 0,
+      leaves: 0,
+      unsynced: 0,
+      effectivePresent: 0,
+      sundayWorked: 0,
+      totalLateMins: 0,
+      totalOtMins: 0,
+      totalNetWorkMins: 0,
+      totalBreakMins: 0,
+      autoPromotedHDs: 0,
+      hrOverrides: 0,
+      totalAttendance: 0,
+    };
+
     for (const cal of calendar) {
+      // ── PRE-JOINING guard ─────────────────────────────────────────────────
+      if (dojStr && cal.dateStr < dojStr) {
+        rows.push({
+          ...cal,
+          status: "PRE-JOINING",
+          label: "—",
+          synced: false,
+          preJoining: true,
+        });
+        continue; // skip all counting for this date
+      }
+
+      if (cal.isFuture) {
+        const leaveCode = approvedLeaveByDate.get(cal.dateStr);
+        if (leaveCode) {
+          rows.push({
+            ...cal,
+            status: leaveCode,
+            label: getDisplayLabel(leaveCode, settings),
+            synced: false,
+          });
+          if (stats[leaveCode] !== undefined) stats[leaveCode]++;
+          stats.leaves++;
+          stats.totalAttendance++;
+        } else if (cal.restStatus) {
+          rows.push({
+            ...cal,
+            status: cal.restStatus,
+            label: getDisplayLabel(cal.restStatus, settings),
+            synced: false,
+          });
+        } else {
+          rows.push({ ...cal, status: "FUTURE", label: "—", synced: false });
+        }
+        continue;
+      }
+
       const dayDoc = byDate.get(cal.dateStr);
       if (!dayDoc) {
-        if (cal.restStatus) {
+        const leaveCode = approvedLeaveByDate.get(cal.dateStr);
+        if (leaveCode) {
+          rows.push({
+            ...cal,
+            status: leaveCode,
+            label: getDisplayLabel(leaveCode, settings),
+            synced: false,
+          });
+          if (stats[leaveCode] !== undefined) stats[leaveCode]++;
+          stats.leaves++;
+          stats.totalAttendance++;
+        } else if (cal.restStatus) {
           rows.push({
             ...cal,
             status: cal.restStatus,
@@ -2646,7 +2817,15 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
         }
         continue;
       }
-      const entry = (dayDoc.employees || []).find((e) => e.biometricId === bid);
+
+      const entry =
+        (dayDoc.employees || []).find((e) => e.biometricId === bid) ||
+        (empDoc
+          ? (dayDoc.employees || []).find(
+              (e) => e.employeeDbId?.toString() === empDoc._id.toString(),
+            )
+          : null);
+
       if (!entry) {
         const s = cal.restStatus || "AB";
         rows.push({
@@ -2659,10 +2838,12 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
         if (s !== "AB") stats.totalAttendance++;
         continue;
       }
+
       if (dayDoc.yearMonth !== lastYM) {
         running.clear();
         lastYM = dayDoc.yearMonth;
       }
+
       if (!empMeta)
         empMeta = {
           employeeName: entry.employeeName,
@@ -2671,11 +2852,15 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
           employeeType: entry.employeeType,
           identityId: entry.identityId,
           biometricId: entry.biometricId,
+          shiftStart: entry.shiftStart,
+          shiftEnd: entry.shiftEnd,
           isGhost: !!entry.isGhost,
         };
+
       let cum = running.get(bid) || 0,
         status = entry.systemPrediction,
         promoted = false;
+
       if (
         settings.lateHalfDayPolicy?.enabled &&
         entry.isLate &&
@@ -2684,79 +2869,109 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
         cum += entry.lateMins;
         const thr = thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
         if (cum >= thr) {
-          status = "HD";
           promoted = true;
+          status = "HD";
           cum = 0;
         }
       }
       running.set(bid, cum);
-      const finalStatus = entry.hrFinalStatus || status;
-      if (isEffectivelyPresent({ ...entry, systemPrediction: finalStatus }))
+
+      const effectiveStatus = entry.hrFinalStatus || status;
+      if (entry.hrFinalStatus) stats.hrOverrides++;
+
+      if (["P", "P*", "P~", "MP", "WFH"].includes(effectiveStatus)) {
         stats.effectivePresent++;
-      if (stats[finalStatus] !== undefined) stats[finalStatus]++;
-      if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(finalStatus))
+        stats.totalAttendance++;
+      } else if (effectiveStatus === "HD") {
+        stats.totalAttendance++;
+      } else if (
+        ["WO", "FH", "NH", "OH", "RH", "PH"].includes(effectiveStatus)
+      ) {
+        stats.totalAttendance++;
+      } else if (
+        ["L-CL", "L-SL", "L-EL", "CO", "LWP"].includes(effectiveStatus)
+      ) {
         stats.leaves++;
-      const paidCodes = [
-        "P",
-        "P*",
-        "P~",
-        "HD",
-        "MP",
-        "WO",
-        "FH",
-        "NH",
-        "OH",
-        "RH",
-        "PH",
-        "L-CL",
-        "L-SL",
-        "L-EL",
-        "WFH",
-        "CO",
-      ];
-      if (paidCodes.includes(finalStatus)) stats.totalAttendance++;
+        stats.totalAttendance++;
+      }
+
+      if (stats[effectiveStatus] !== undefined) stats[effectiveStatus]++;
+      if (promoted) stats.autoPromotedHDs++;
       stats.totalLateMins += entry.lateMins || 0;
       stats.totalOtMins += entry.otMins || 0;
       stats.totalNetWorkMins += entry.netWorkMins || 0;
-      const punched = (entry.punchCount || 0) > 0,
-        isSundayWorked = cal.isSunday && !cal.isHoliday && punched,
-        punchedOnHoliday = cal.isHoliday && punched;
-      if (isSundayWorked) stats.sundayWorked++;
-      if (punchedOnHoliday) stats.holidayWorked++;
+      stats.totalBreakMins += entry.totalBreakMins || 0;
+      if (entry.isSundayWorked) stats.sundayWorked++;
+
       rows.push({
         ...cal,
-        status: finalStatus,
-        label: getDisplayLabel(finalStatus, settings),
+        status: effectiveStatus,
+        label: getDisplayLabel(effectiveStatus, settings),
         synced: true,
-        isSundayWorked,
-        punchedOnHoliday,
+        punchCount: entry.punchCount || 0,
+        rawPunches: entry.rawPunches || [],
         inTime: entry.inTime,
+        finalOut: entry.finalOut,
         lunchOut: entry.lunchOut,
         lunchIn: entry.lunchIn,
         teaOut: entry.teaOut,
         teaIn: entry.teaIn,
-        finalOut: entry.finalOut,
-        punchCount: entry.punchCount,
-        rawPunches: entry.rawPunches || [],
         netWorkMins: entry.netWorkMins || 0,
         totalBreakMins: entry.totalBreakMins || 0,
-        lateMins: entry.lateMins || 0,
         otMins: entry.otMins || 0,
-        isLate: entry.isLate,
-        isEarlyDeparture: entry.isEarlyDeparture,
-        hasMissPunch: entry.hasMissPunch,
-        hasOT: entry.hasOT,
-        earlyDepartureMins: entry.earlyDepartureMins || 0,
+        lateMins: entry.lateMins || 0,
+        lateDisplay: entry.lateDisplay || "",
+        isLate: !!entry.isLate,
+        isSundayWorked: !!entry.isSundayWorked,
+        isHoliday: !!entry.isHoliday,
+        holidayName: entry.holidayName || null,
+        punchedOnHoliday: !!entry.punchedOnHoliday,
+        hrFinalStatus: entry.hrFinalStatus || null,
+        hrRemarks: entry.hrRemarks || null,
+        hrOverride: !!entry.hrFinalStatus,
+        systemPrediction: entry.systemPrediction,
         shiftStart: entry.shiftStart,
         shiftEnd: entry.shiftEnd,
         appliedExtraGraceMins: entry.appliedExtraGraceMins || 0,
         wasPromotedToHalfDay: promoted,
         cumulativeLateMins: cum,
-        hrFinalStatus: entry.hrFinalStatus || null,
-        hrRemarks: entry.hrRemarks || null,
-        systemPrediction: entry.systemPrediction,
+        isEarlyDeparture: !!entry.isEarlyDeparture,
+        earlyDepartureMins: entry.earlyDepartureMins || 0,
       });
     }
+
+    if (!empMeta && empDoc) {
+      const empType = resolveEmployeeType(empDoc, settings);
+      const shift = settings.shifts[empType] || settings.shifts.executive;
+      empMeta = {
+        employeeName: extractName(empDoc),
+        department: extractDepartment(empDoc),
+        designation: extractDesignation(empDoc),
+        employeeType: empType,
+        identityId: extractIdentity(empDoc),
+        biometricId: bid,
+        shiftStart: shift.start,
+        shiftEnd: shift.end,
+        isGhost: false,
+      };
+    }
+
+    const leaveApplications = allLeaveApps.map((lv) => ({
+      _id: lv._id,
+      leaveType: lv.leaveType,
+      status: lv.status,
+      fromDate: lv.fromDate,
+      toDate: lv.toDate,
+      totalDays: lv.totalDays,
+      reason: lv.reason,
+      applicationDate: lv.applicationDate,
+      isHalfDay: lv.isHalfDay || false,
+      halfDaySlot: lv.halfDaySlot || null,
+      rejectionReason: lv.rejectionReason || null,
+      hrRemarks: lv.hrRemarks || null,
+      managerDecisions: lv.managerDecisions || [],
+    }));
+
     res.json({
       success: true,
       from,
@@ -2765,10 +2980,502 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
       employee: empMeta,
       rows,
       stats,
+      leaveApplications,
       displayLabels: settings.displayLabels || {},
     });
   } catch (err) {
-    console.error("[EMPLOYEE-DETAIL]", err.message);
+    console.error("[EMPLOYEE-DETAIL]", err.message, err.stack);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. PUT /day-override
+// ─────────────────────────────────────────────────────────────────────────────
+router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const {
+      dateStr,
+      biometricId,
+      hrFinalStatus,
+      hrRemarks,
+      inTime,
+      finalOut,
+      lunchOut,
+      lunchIn,
+      teaOut,
+      teaIn,
+    } = req.body;
+
+    if (!dateStr || !biometricId)
+      return res
+        .status(400)
+        .json({ success: false, message: "dateStr and biometricId required" });
+
+    const validStatuses = [
+      "P",
+      "P*",
+      "P~",
+      "HD",
+      "AB",
+      "WO",
+      "PH",
+      "FH",
+      "NH",
+      "OH",
+      "RH",
+      "L-CL",
+      "L-SL",
+      "L-EL",
+      "LWP",
+      "MP",
+      "WFH",
+      "CO",
+      null,
+      "",
+    ];
+    if (hrFinalStatus !== undefined && !validStatuses.includes(hrFinalStatus))
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Allowed: ${validStatuses.filter(Boolean).join(", ")}`,
+      });
+
+    const bid = biometricId.toUpperCase();
+
+    // ── PRE-JOINING guard ─────────────────────────────────────────────────
+    const dojViolation = await checkPreJoining(bid, dateStr);
+    if (dojViolation) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot override attendance before date of joining (${dojViolation})`,
+      });
+    }
+
+    let dayDoc = await DailyAttendance.findOne({
+      dateStr,
+      "employees.biometricId": bid,
+    });
+
+    if (!dayDoc) {
+      const existingDay = await DailyAttendance.findOne({ dateStr });
+      const empRecord = await Employee.findOne({
+        $or: [
+          { biometricId: bid },
+          { "basicInfo.biometricId": bid },
+          { "workInfo.biometricId": bid },
+        ],
+      }).lean();
+      const settings2 = await AttendanceSettings.getConfig();
+      const empType2 = resolveEmployeeType(empRecord, settings2);
+      const shift2 = settings2.shifts?.[empType2] ||
+        settings2.shifts?.executive || { start: "09:30", end: "18:30" };
+      const newEntry = {
+        biometricId: bid,
+        employeeDbId: empRecord?._id || null,
+        identityId: extractIdentity(empRecord) || "",
+        employeeName: extractName(empRecord, bid),
+        department: extractDepartment(empRecord),
+        designation: extractDesignation(empRecord),
+        employeeType: empType2,
+        shiftStart: shift2.start || "09:30",
+        shiftEnd: shift2.end || "18:30",
+        systemPrediction: "AB",
+        hrFinalStatus: null,
+        rawPunches: [],
+        punchCount: 0,
+        netWorkMins: 0,
+        totalBreakMins: 0,
+        totalSpanMins: 0,
+        otMins: 0,
+        lateMins: 0,
+        lateDisplay: "",
+        isLate: false,
+        isEarlyDeparture: false,
+        hasOT: false,
+        hasMissPunch: false,
+        attendanceValue: 0,
+      };
+      if (existingDay) {
+        existingDay.employees.push(newEntry);
+        await existingDay.save();
+        dayDoc = await DailyAttendance.findOne({
+          dateStr,
+          "employees.biometricId": bid,
+        });
+      } else {
+        const [y2, m2, d2] = dateStr.split("-").map(Number);
+        await DailyAttendance.create({
+          dateStr,
+          date: new Date(Date.UTC(y2, m2 - 1, d2)),
+          yearMonth: dateStr.slice(0, 7),
+          employees: [newEntry],
+        });
+        dayDoc = await DailyAttendance.findOne({
+          dateStr,
+          "employees.biometricId": bid,
+        });
+      }
+    }
+
+    const empIdx = dayDoc.employees.findIndex((e) => e.biometricId === bid);
+    if (empIdx === -1)
+      return res.status(500).json({
+        success: false,
+        message: "Failed to locate employee entry after upsert",
+      });
+
+    const emp = dayDoc.employees[empIdx];
+    const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
+
+    if (hrFinalStatus !== undefined) emp.hrFinalStatus = hrFinalStatus || null;
+    if (hrRemarks !== undefined) emp.hrRemarks = hrRemarks || null;
+    emp.hrReviewedAt = new Date();
+
+    const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
+    const punchChanges = [];
+    let anyTimeUpdated = false;
+    for (const [field, value] of Object.entries(punchFields)) {
+      if (value === undefined) continue;
+      anyTimeUpdated = true;
+      const oldVal = emp[field] ? fmtTimeIST12(emp[field]) : "—";
+      const newDate = value ? parseTimeOnDateIST(value, dateStr) : null;
+      emp[field] = newDate;
+      punchChanges.push({
+        punchType: field,
+        action:
+          !emp[field] && value
+            ? "add"
+            : emp[field] && !value
+              ? "remove"
+              : "modify",
+        oldTime: oldVal,
+        newTime: newDate ? fmtTimeIST12(newDate) : "—",
+      });
+    }
+
+    if (anyTimeUpdated) {
+      const hasIn = !!emp.inTime,
+        hasOut = !!emp.finalOut;
+      const netWorkMins =
+        hasIn && hasOut
+          ? Math.max(
+              0,
+              Math.round(
+                (new Date(emp.finalOut) - new Date(emp.inTime)) / 60000 -
+                  (emp.totalBreakMins || 0),
+              ),
+            )
+          : 0;
+      emp.netWorkMins = netWorkMins;
+      const shift = await AttendanceSettings.getConfig().then(
+        (s) => s.shifts?.[emp.employeeType] || s.shifts?.executive,
+      );
+      const lateMins = emp.inTime
+        ? Math.max(
+            0,
+            Math.round(
+              (new Date(emp.inTime) -
+                parseTimeOnDateIST(shift.start || "09:30", dateStr)) /
+                60000,
+            ) - (shift.lateGraceMins ?? 10),
+          )
+        : 0;
+      emp.lateMins = Math.max(0, lateMins);
+      emp.isLate = emp.lateMins > 0;
+      const earlyDepartureMins = emp.finalOut
+        ? Math.max(
+            0,
+            Math.round(
+              (parseTimeOnDateIST(shift.end || "18:30", dateStr) -
+                new Date(emp.finalOut)) /
+                60000,
+            ) - 15,
+          )
+        : 0;
+      emp.isEarlyDeparture = earlyDepartureMins > 0;
+      emp.earlyDepartureMins = Math.max(0, earlyDepartureMins);
+
+      if (!emp.hrFinalStatus) {
+        if (!emp.inTime) emp.systemPrediction = "AB";
+        else if (!emp.finalOut) emp.systemPrediction = "MP";
+        else if (netWorkMins < (shift.halfDayThresholdMins || 240))
+          emp.systemPrediction = "HD";
+        else if (emp.lateMins > 0) emp.systemPrediction = "P*";
+        else if (emp.isEarlyDeparture) emp.systemPrediction = "P~";
+        else emp.systemPrediction = "P";
+      }
+    }
+
+    emp.attendanceValue = getAttendanceValue(
+      emp.hrFinalStatus || emp.systemPrediction,
+    );
+    dayDoc.markModified("employees");
+    await dayDoc.save();
+
+    // Log HR action
+    try {
+      await logHRAction({
+        actionType: "hr_override",
+        performedBy: req.user?.id,
+        employeeId: emp.employeeDbId,
+        biometricId: bid,
+        dateStr,
+        oldStatus,
+        newStatus: emp.hrFinalStatus || emp.systemPrediction,
+        remarks: hrRemarks,
+        punchChanges,
+      });
+    } catch (logErr) {
+      console.error("[DAY-OVERRIDE] Log error:", logErr.message);
+    }
+
+    // Sync leaves
+    try {
+      const newEffective = emp.hrFinalStatus || emp.systemPrediction;
+      const LEAVE_STATUS_TO_TYPE = {
+        "L-CL": "CL",
+        "L-SL": "SL",
+        "L-EL": "PL",
+      };
+      const oldLeaveType = LEAVE_STATUS_TO_TYPE[oldStatus];
+      const newLeaveType = LEAVE_STATUS_TO_TYPE[newEffective];
+      if (oldLeaveType !== newLeaveType) {
+        const empRef = emp.employeeDbId || null;
+        const year = parseInt(dateStr.split("-")[0], 10);
+        if (empRef) {
+          if (oldLeaveType) {
+            await getLeaveBalance().updateOne(
+              { employeeId: empRef, year },
+              { $inc: { [`consumed.${oldLeaveType}`]: -1 } },
+            );
+          }
+          if (newLeaveType) {
+            await getLeaveBalance().updateOne(
+              { employeeId: empRef, year },
+              { $inc: { [`consumed.${newLeaveType}`]: 1 } },
+            );
+          }
+        }
+      }
+    } catch (leaveErr) {
+      console.error("[DAY-OVERRIDE] Leave sync error:", leaveErr.message);
+    }
+
+    res.json({
+      success: true,
+      message: "Override saved",
+      data: dayDoc.employees[empIdx],
+    });
+  } catch (err) {
+    console.error("[OVERRIDE]", err.message, err.stack);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. POST /punch-correction
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { dateStr, biometricId, punchType, action, punchTime, hrRemarks } =
+      req.body;
+
+    if (!dateStr || !biometricId || !punchType || !action)
+      return res.status(400).json({
+        success: false,
+        message: "dateStr, biometricId, punchType and action are required",
+      });
+
+    const VALID_PUNCH_TYPES = [
+      "in",
+      "lunch_out",
+      "lunch_in",
+      "tea_out",
+      "tea_in",
+      "out",
+    ];
+    const VALID_ACTIONS = ["add", "remove", "modify"];
+
+    if (!VALID_PUNCH_TYPES.includes(punchType))
+      return res.status(400).json({
+        success: false,
+        message: `punchType must be one of: ${VALID_PUNCH_TYPES.join(", ")}`,
+      });
+    if (!VALID_ACTIONS.includes(action))
+      return res.status(400).json({
+        success: false,
+        message: `action must be one of: ${VALID_ACTIONS.join(", ")}`,
+      });
+    if ((action === "add" || action === "modify") && !punchTime)
+      return res.status(400).json({
+        success: false,
+        message: "punchTime (HH:MM) is required for add/modify",
+      });
+
+    const bid = biometricId.toUpperCase();
+
+    // ── PRE-JOINING guard ─────────────────────────────────────────────────
+    const dojViolation = await checkPreJoining(bid, dateStr);
+    if (dojViolation) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot edit punches before date of joining (${dojViolation})`,
+      });
+    }
+
+    const dayDoc = await DailyAttendance.findOne({
+      dateStr,
+      "employees.biometricId": bid,
+    });
+    if (!dayDoc)
+      return res.status(404).json({
+        success: false,
+        message: `No record for ${biometricId} on ${dateStr}`,
+      });
+
+    const empIdx = dayDoc.employees.findIndex((e) => e.biometricId === bid);
+    if (empIdx === -1)
+      return res.status(404).json({
+        success: false,
+        message: `Employee ${biometricId} not in day doc`,
+      });
+
+    const emp = dayDoc.employees[empIdx];
+    const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
+
+    const punchFieldMap = {
+      in: "inTime",
+      lunch_out: "lunchOut",
+      lunch_in: "lunchIn",
+      tea_out: "teaOut",
+      tea_in: "teaIn",
+      out: "finalOut",
+    };
+    const fieldName = punchFieldMap[punchType];
+    const oldTime = emp[fieldName] ? fmtTimeIST12(emp[fieldName]) : "—";
+
+    if (action === "remove") {
+      emp[fieldName] = null;
+      // Remove from rawPunches
+      emp.rawPunches = (emp.rawPunches || []).filter(
+        (p) => p.punchType !== punchType,
+      );
+    } else {
+      const newDate = parseTimeOnDateIST(punchTime, dateStr);
+      emp[fieldName] = newDate;
+      const existingIdx = (emp.rawPunches || []).findIndex(
+        (p) => p.punchType === punchType,
+      );
+      const punchEntry = {
+        seq:
+          existingIdx >= 0
+            ? emp.rawPunches[existingIdx].seq
+            : (emp.rawPunches?.length || 0) + 1,
+        time: newDate,
+        punchType,
+        source: "manual",
+        mcid: null,
+      };
+      if (existingIdx >= 0) emp.rawPunches[existingIdx] = punchEntry;
+      else emp.rawPunches = [...(emp.rawPunches || []), punchEntry];
+    }
+
+    emp.punchCount = (emp.rawPunches || []).length;
+
+    const hasIn = !!emp.inTime,
+      hasOut = !!emp.finalOut;
+    const netWorkMins =
+      hasIn && hasOut
+        ? Math.max(
+            0,
+            Math.round(
+              (new Date(emp.finalOut) - new Date(emp.inTime)) / 60000 -
+                (emp.totalBreakMins || 0),
+            ),
+          )
+        : 0;
+    emp.netWorkMins = netWorkMins;
+
+    const settingsCfg = await AttendanceSettings.getConfig();
+    const shift = settingsCfg.shifts?.[emp.employeeType] ||
+      settingsCfg.shifts?.executive || {
+        start: "09:30",
+        end: "18:30",
+        lateGraceMins: 15,
+        halfDayThresholdMins: 240,
+      };
+
+    const lateMins = emp.inTime
+      ? Math.max(
+          0,
+          Math.round(
+            (new Date(emp.inTime) -
+              parseTimeOnDateIST(shift.start || "09:30", dateStr)) /
+              60000,
+          ) - (shift.lateGraceMins ?? 10),
+        )
+      : 0;
+    emp.lateMins = Math.max(0, lateMins);
+    emp.isLate = emp.lateMins > 0;
+
+    const earlyDepartureMins = emp.finalOut
+      ? Math.max(
+          0,
+          Math.round(
+            (parseTimeOnDateIST(shift.end || "18:30", dateStr) -
+              new Date(emp.finalOut)) /
+              60000,
+          ) - 15,
+        )
+      : 0;
+    emp.isEarlyDeparture = earlyDepartureMins > 0;
+    emp.earlyDepartureMins = Math.max(0, earlyDepartureMins);
+
+    if (!emp.hrFinalStatus) {
+      if (!emp.inTime) emp.systemPrediction = "AB";
+      else if (!emp.finalOut) emp.systemPrediction = "MP";
+      else if (netWorkMins < (shift.halfDayThresholdMins || 240))
+        emp.systemPrediction = "HD";
+      else if (lateMins > 0) emp.systemPrediction = "P*";
+      else if (earlyDepartureMins > 0) emp.systemPrediction = "P~";
+      else emp.systemPrediction = "P";
+    }
+
+    emp.attendanceValue = getAttendanceValue(
+      emp.hrFinalStatus || emp.systemPrediction,
+    );
+    if (hrRemarks) emp.hrRemarks = hrRemarks;
+    emp.hrReviewedAt = new Date();
+
+    dayDoc.markModified("employees");
+    await dayDoc.save();
+
+    // Log HR action
+    try {
+      await logHRAction({
+        actionType: "punch_correction",
+        performedBy: req.user?.id,
+        employeeId: emp.employeeDbId,
+        biometricId: bid,
+        dateStr,
+        oldStatus,
+        newStatus: emp.hrFinalStatus || emp.systemPrediction,
+        remarks: hrRemarks,
+        punchChanges: [
+          { punchType, action, oldTime, newTime: punchTime || "—" },
+        ],
+      });
+    } catch (logErr) {
+      console.error("[PUNCH-CORRECTION] Log error:", logErr.message);
+    }
+
+    res.json({
+      success: true,
+      message: `Punch ${action} applied for ${punchType}`,
+      data: dayDoc.employees[empIdx],
+    });
+  } catch (err) {
+    console.error("[PUNCH-CORRECTION]", err.message, err.stack);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -3334,20 +4041,21 @@ router.delete(
   },
 );
 
-router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
+router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { yearMonth, department } = req.query;
-    if (!yearMonth || !/^\d{4}-\d{2}$/.test(yearMonth))
+    if (!yearMonth)
       return res
         .status(400)
-        .json({ success: false, message: "yearMonth (YYYY-MM) required" });
+        .json({ success: false, message: "yearMonth required" });
     const [yr, mo] = yearMonth.split("-").map(Number);
-    const from = `${yearMonth}-01`,
-      lastDay = new Date(yr, mo, 0).getDate(),
+    const lastDay = new Date(yr, mo, 0).getDate(),
+      from = `${yearMonth}-01`,
       to = `${yearMonth}-${String(lastDay).padStart(2, "0")}`;
+    const monthLabel = new Date(from + "T00:00:00")
+      .toLocaleDateString("en-IN", { month: "long", year: "numeric" })
+      .toUpperCase();
     const settings = await AttendanceSettings.getConfig();
-    const thresholds = settings.lateHalfDayPolicy
-      ?.cumulativeLateMinsThreshold || { operator: 30, executive: 40 };
     const holidayMap = await loadHolidayMap(from, to);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -3362,16 +4070,44 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       allDays.push({
         day: d,
         dateStr,
-        dayName: dt.toLocaleDateString("en-IN", { weekday: "short" }),
+        dayAbbr: dt
+          .toLocaleDateString("en-IN", { weekday: "short" })
+          .substring(0, 3)
+          .toUpperCase(),
         isSunday: dow === 0,
         isFuture: dt > today,
         isDeclaredHoliday,
         isWorkingSunday,
         holiday: isDeclaredHoliday ? hol : null,
         holidayStatus: isDeclaredHoliday ? holidayTypeToStatus(hol.type) : null,
-        restStatus: resolveRestDayStatus(dateStr, dow, holidayMap),
+        holidayName: isDeclaredHoliday ? hol.name : null,
       });
     }
+
+    function toSheetCode(status) {
+      const map = {
+        P: "P",
+        "P*": "P",
+        "P~": "P",
+        MP: "P",
+        WFH: "P",
+        AB: "A",
+        LWP: "A",
+        HD: "HD",
+        WO: "WO",
+        OH: "WO",
+        RH: "WO",
+        CO: "CO",
+        "L-CL": "CL",
+        "L-SL": "SL",
+        "L-EL": "PL",
+        FH: "FH",
+        NH: "NH",
+        PH: "FH",
+      };
+      return map[status] || "";
+    }
+
     const allActive = await Employee.find({
       $or: [
         { status: "active" },
@@ -3379,289 +4115,602 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         { isActive: true },
       ],
     }).lean();
+
     const filteredActive =
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
         : allActive;
+
     const dayDocs = await DailyAttendance.find({ yearMonth })
       .sort({ dateStr: 1 })
       .lean();
     const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
-    const employees = [],
-      running = new Map();
-    const PAID_CODES = [
-      "P",
-      "P*",
-      "P~",
-      "HD",
-      "MP",
-      "WO",
-      "FH",
-      "NH",
-      "OH",
-      "RH",
-      "PH",
-      "L-CL",
-      "L-SL",
-      "L-EL",
-      "WFH",
-      "CO",
-    ];
-    for (const emp of filteredActive) {
-      const bid = extractBiometricId(emp);
-      if (!bid) continue;
-      const key = String(bid).toUpperCase(),
-        empType = resolveEmployeeType(emp, settings);
+
+    // ── Helper: parse DOJ to YYYY-MM-DD string safely ─────────────────────
+    function getDojStr(rawDoj) {
+      if (!rawDoj) return null;
+      const d = new Date(rawDoj);
+      if (isNaN(d.getTime())) return null;
+      return d.toISOString().split("T")[0];
+    }
+
+    const employees = [];
+
+    // ── UPDATED buildEmpRow — now accepts dojStr ───────────────────────────
+    function buildEmpRow(key, empName, empDept, empDesig, empType, dojStr) {
       const row = {
         biometricId: key,
-        employeeDbId: emp._id,
-        employeeName: extractName(emp),
-        department: extractDepartment(emp),
-        designation: extractDesignation(emp),
+        employeeName: empName,
+        department: empDept,
+        designation: empDesig,
         employeeType: empType,
-        isGhost: false,
-        days: {},
+        dayCodes: {},
+        hrOverrides: new Set(),
         totals: {
           P: 0,
-          "P*": 0,
-          "P~": 0,
+          A: 0,
           HD: 0,
-          AB: 0,
-          MP: 0,
           WO: 0,
-          PH: 0,
-          FH: 0,
-          NH: 0,
-          OH: 0,
-          RH: 0,
-          leaves: 0,
-          effectivePresent: 0,
-          totalLateMins: 0,
-          totalOtMins: 0,
-          totalNetWorkMins: 0,
-          autoPromotedHDs: 0,
-          sundayWorked: 0,
-          holidayWorked: 0,
-          totalAttendance: 0,
+          CO: 0,
+          CL: 0,
+          SL: 0,
+          PL: 0,
+          NHFH: 0,
+          Total: 0,
         },
+        dojStr, // store for use by Excel writer
       };
-      running.set(key, 0);
+
       for (const cal of allDays) {
         if (cal.isFuture) {
-          row.days[cal.dateStr] = {
-            status: "—",
-            isSunday: cal.isSunday,
-            isFuture: true,
-          };
+          row.dayCodes[cal.dateStr] = "";
           continue;
         }
+
+        // ── PRE-JOINING: date is before employee's DOJ ────────────────────
+        if (dojStr && cal.dateStr < dojStr) {
+          row.dayCodes[cal.dateStr] = "."; // "." = not yet employed
+          // do NOT count as A, WO, holiday, or anything
+          continue;
+        }
+
         const dayDoc = byDate.get(cal.dateStr),
           entry = dayDoc
             ? (dayDoc.employees || []).find((e) => e.biometricId === key)
             : null;
+
+        let sheetCode = "";
+
         if (cal.isDeclaredHoliday) {
           const hs = cal.holidayStatus,
             didPunch = !!entry && (entry.punchCount || 0) > 0;
-          row.days[cal.dateStr] = {
-            status: hs,
-            holiday: cal.holiday,
-            punchedOnHoliday: didPunch,
-            netWorkMins: entry?.netWorkMins || 0,
-            otMins: entry?.otMins || 0,
-            punchCount: entry?.punchCount || 0,
-            hrOverride: !!entry?.hrFinalStatus,
-          };
-          row.totals[hs] = (row.totals[hs] || 0) + 1;
-          row.totals.totalAttendance++;
-          if (didPunch) {
-            row.totals.holidayWorked++;
-            row.totals.totalOtMins += entry.otMins || 0;
-            row.totals.totalNetWorkMins += entry.netWorkMins || 0;
-          }
-          continue;
-        }
-        if (cal.isSunday && !cal.isWorkingSunday) {
+          sheetCode = didPunch ? "P" : toSheetCode(hs);
+          if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch)
+            row.totals.NHFH++;
+          else if (didPunch) row.totals.P++;
+          if (
+            didPunch &&
+            (entry?.hrFinalStatus ||
+              (entry?.rawPunches || []).some((p) => p.source === "manual"))
+          )
+            row.hrOverrides.add(cal.dateStr);
+        } else if (cal.isSunday && !cal.isWorkingSunday) {
           const didPunch = !!entry && (entry.punchCount || 0) > 0;
           if (didPunch) {
-            let status = entry.systemPrediction;
-            const finalStatus = entry.hrFinalStatus || status;
-            row.days[cal.dateStr] = {
-              status: finalStatus,
-              netWorkMins: entry.netWorkMins || 0,
-              lateMins: entry.lateMins || 0,
-              otMins: entry.otMins || 0,
-              punchCount: entry.punchCount || 0,
-              isSunday: true,
-              isSundayWorked: true,
-              hrOverride: !!entry.hrFinalStatus,
-            };
-            if (row.totals[finalStatus] !== undefined)
-              row.totals[finalStatus]++;
-            row.totals.sundayWorked++;
-            row.totals.totalAttendance++;
-            row.totals.totalLateMins += entry.lateMins || 0;
-            row.totals.totalOtMins += entry.otMins || 0;
-            row.totals.totalNetWorkMins += entry.netWorkMins || 0;
+            const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
+            sheetCode = toSheetCode(finalStatus) || "P";
+            row.totals.P++;
+            if (
+              entry.hrFinalStatus ||
+              (entry.rawPunches || []).some(
+                (p) => p.source === "manual" || p.source === "miss_punch",
+              )
+            )
+              row.hrOverrides.add(cal.dateStr);
           } else {
-            row.days[cal.dateStr] = { status: "WO", isSunday: true };
+            sheetCode = "WO";
             row.totals.WO++;
-            row.totals.totalAttendance++;
           }
-          continue;
+        } else if (!dayDoc || !entry) {
+          sheetCode = dayDoc ? "A" : "";
+          if (dayDoc) row.totals.A++;
+        } else {
+          const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
+          sheetCode = toSheetCode(finalStatus);
+          const hasManualPunch = (entry.rawPunches || []).some(
+            (p) => p.source === "manual" || p.source === "miss_punch",
+          );
+          if (entry.hrFinalStatus || hasManualPunch)
+            row.hrOverrides.add(cal.dateStr);
+          if (["P", "P*", "P~", "MP", "WFH"].includes(finalStatus))
+            row.totals.P++;
+          else if (finalStatus === "AB" || finalStatus === "LWP")
+            row.totals.A++;
+          else if (finalStatus === "HD") row.totals.HD++;
+          else if (finalStatus === "WO") row.totals.WO++;
+          else if (finalStatus === "CO") row.totals.CO++;
+          else if (finalStatus === "L-CL") row.totals.CL++;
+          else if (finalStatus === "L-SL") row.totals.SL++;
+          else if (finalStatus === "L-EL") row.totals.PL++;
+          else if (["FH", "NH", "OH", "RH", "PH"].includes(finalStatus))
+            row.totals.NHFH++;
         }
-        if (!dayDoc) {
-          row.days[cal.dateStr] = {
-            status: "—",
-            isSunday: cal.isSunday,
-            unsynced: true,
-          };
-          continue;
-        }
-        if (!entry) {
-          row.days[cal.dateStr] = { status: "AB", isSunday: cal.isSunday };
-          row.totals.AB++;
-          continue;
-        }
-        let cum = running.get(key) || 0,
-          status = entry.systemPrediction,
-          promoted = false;
-        if (
-          settings.lateHalfDayPolicy?.enabled &&
-          entry.isLate &&
-          (entry.lateMins || 0) > 0
-        ) {
-          cum += entry.lateMins;
-          const thr =
-            thresholds[entry.employeeType] ?? thresholds.operator ?? 30;
-          if (cum >= thr) {
-            status = "HD";
-            promoted = true;
-            cum = 0;
-          }
-        }
-        running.set(key, cum);
-        const finalStatus = entry.hrFinalStatus || status;
-        row.days[cal.dateStr] = {
-          status: finalStatus,
-          displayLabel: getDisplayLabel(finalStatus, settings),
-          inTime: entry.inTime,
-          outTime: entry.finalOut,
-          netWorkMins: entry.netWorkMins || 0,
-          lateMins: entry.lateMins || 0,
-          otMins: entry.otMins || 0,
-          punchCount: entry.punchCount || 0,
-          isSunday: cal.isSunday,
-          hrOverride: !!entry.hrFinalStatus,
-          wasPromoted: promoted,
-          hasPunches: (entry.punchCount || 0) > 0,
-        };
-        if (row.totals[finalStatus] !== undefined) row.totals[finalStatus]++;
-        if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(finalStatus))
-          row.totals.leaves++;
-        if (PAID_CODES.includes(finalStatus)) row.totals.totalAttendance++;
-        if (
-          ["P", "P*", "P~"].includes(finalStatus) ||
-          (entry.inTime && entry.finalOut)
-        )
-          row.totals.effectivePresent++;
-        row.totals.totalLateMins += entry.lateMins || 0;
-        row.totals.totalOtMins += entry.otMins || 0;
-        row.totals.totalNetWorkMins += entry.netWorkMins || 0;
-        if (promoted) row.totals.autoPromotedHDs++;
+        row.dayCodes[cal.dateStr] = sheetCode;
       }
-      employees.push(row);
+
+      // ── Total Days: active days (DOJ→month-end) minus absent ─────────────
+      // If DOJ is mid-month, we only count from DOJ onward
+      const activeDays = allDays.filter(
+        (d) => !d.isFuture && (!dojStr || d.dateStr >= dojStr),
+      ).length;
+      row.totals.Total = Math.max(0, activeDays - row.totals.A);
+
+      return row;
     }
+
+    const processedBids = new Set();
+
+    for (const emp of filteredActive) {
+      const bid = extractBiometricId(emp);
+      if (!bid) continue;
+      const key = String(bid).toUpperCase();
+      if (processedBids.has(key)) continue;
+
+      const dojStr = getDojStr(emp.dateOfJoining);
+
+      // ── Skip employees who joined AFTER this month entirely ───────────────
+      if (dojStr && dojStr > to) continue;
+
+      processedBids.add(key);
+      const empType = resolveEmployeeType(emp, settings);
+      employees.push(
+        buildEmpRow(
+          key,
+          extractName(emp),
+          extractDepartment(emp),
+          extractDesignation(emp),
+          empType,
+          dojStr,
+        ),
+      );
+    }
+
+    // Also scan DailyAttendance for ghost employees
+    for (const dayDoc of dayDocs) {
+      for (const entry of dayDoc.employees || []) {
+        const key = String(entry.biometricId || "").toUpperCase();
+        if (!key || processedBids.has(key)) continue;
+        if (
+          department &&
+          department !== "all" &&
+          entry.department !== department
+        )
+          continue;
+        processedBids.add(key);
+        // Ghost employees have no DOJ — show all days
+        employees.push(
+          buildEmpRow(
+            key,
+            entry.employeeName || key,
+            entry.department || "—",
+            entry.designation || "—",
+            entry.employeeType || "operator",
+            null, // no DOJ for ghost
+          ),
+        );
+      }
+    }
+
     employees.sort((a, b) => {
       if (a.department !== b.department)
         return (a.department || "").localeCompare(b.department || "");
       return (a.employeeName || "").localeCompare(b.employeeName || "");
     });
-    const dayTotals = {};
-    for (const cal of allDays) {
-      const t = {
-        P: 0,
-        "P*": 0,
-        "P~": 0,
-        HD: 0,
-        AB: 0,
-        MP: 0,
-        WO: 0,
-        PH: 0,
-        FH: 0,
-        NH: 0,
-        OH: 0,
-        RH: 0,
-        leaves: 0,
-        total: 0,
-      };
-      for (const emp of employees) {
-        const d = emp.days[cal.dateStr];
-        if (!d || !d.status || d.status === "—") continue;
-        if (t[d.status] !== undefined) t[d.status]++;
-        if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(d.status))
-          t.leaves++;
-        t.total++;
-      }
-      dayTotals[cal.dateStr] = t;
-    }
-    const grand = {
-      totalEmployees: employees.length,
-      workingDays: allDays.filter(
-        (d) => !d.isSunday && !d.isFuture && !d.isDeclaredHoliday,
-      ).length,
-      sundays: allDays.filter((d) => d.isSunday && !d.isWorkingSunday).length,
-      holidayCount: allDays.filter((d) => d.isDeclaredHoliday).length,
-      syncedDays: dayDocs.length,
-      totalPresent: employees.reduce((a, e) => a + e.totals.P, 0),
-      totalAbsent: employees.reduce((a, e) => a + e.totals.AB, 0),
-      totalLate: employees.reduce((a, e) => a + e.totals["P*"], 0),
-      totalHD: employees.reduce((a, e) => a + e.totals.HD, 0),
-      totalMP: employees.reduce((a, e) => a + e.totals.MP, 0),
-      totalWO: employees.reduce((a, e) => a + e.totals.WO, 0),
-      totalLeaves: employees.reduce((a, e) => a + e.totals.leaves, 0),
-      totalHolidays: employees.reduce(
-        (a, e) => a + e.totals.FH + e.totals.NH + e.totals.OH + e.totals.RH,
-        0,
-      ),
-      totalSundayWorked: employees.reduce(
-        (a, e) => a + e.totals.sundayWorked,
-        0,
-      ),
-      totalHolidayWorked: employees.reduce(
-        (a, e) => a + e.totals.holidayWorked,
-        0,
-      ),
-      totalAttendance: employees.reduce(
-        (a, e) => a + e.totals.totalAttendance,
-        0,
-      ),
-      totalLateMins: employees.reduce((a, e) => a + e.totals.totalLateMins, 0),
-      totalOtMins: employees.reduce((a, e) => a + e.totals.totalOtMins, 0),
-      totalNetWorkMins: employees.reduce(
-        (a, e) => a + e.totals.totalNetWorkMins,
-        0,
-      ),
-    };
-    res.json({
-      success: true,
-      yearMonth,
-      from,
-      to,
-      monthLabel: new Date(from + "T00:00:00").toLocaleDateString("en-IN", {
-        month: "long",
-        year: "numeric",
-      }),
-      days: allDays,
-      holidays: [...holidayMap.values()].filter(
-        (h) => h.type !== "working_sunday",
-      ),
-      employees,
-      dayTotals,
-      grand,
-      displayLabels: settings.displayLabels,
+
+    // ── Build Excel ──────────────────────────────────────────────────────────
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "Grav Clothing HRMS";
+    wb.created = new Date();
+    const ws = wb.addWorksheet("Attendance", {
+      views: [{ state: "frozen", xSplit: 4, ySplit: 4, showGridLines: true }],
+      pageSetup: {
+        paperSize: 9,
+        orientation: "landscape",
+        fitToPage: true,
+        fitToWidth: 1,
+      },
     });
+
+    ws.getColumn(1).width = 6;
+    ws.getColumn(2).width = 24;
+    ws.getColumn(3).width = 14;
+    ws.getColumn(4).width = 20;
+    for (let d = 1; d <= lastDay; d++) ws.getColumn(4 + d).width = 4;
+    const sumStart = 4 + lastDay + 1;
+    const sumCols = [
+      "P",
+      "A",
+      "HD",
+      "WO",
+      "CO",
+      "CL",
+      "SL",
+      "PL",
+      "NH/FH",
+      "Total Days",
+    ];
+    sumCols.forEach((_, i) => {
+      ws.getColumn(sumStart + i).width = 7;
+    });
+    const totalCols = 4 + lastDay + sumCols.length;
+
+    // Row 1: Title
+    ws.mergeCells(1, 1, 1, totalCols);
+    const titleCell = ws.getCell("A1");
+    titleCell.value = `MONTHLY ATTENDANCE SHEET \u2014 ${monthLabel}`;
+    titleCell.font = { name: "Arial", size: 14, bold: true };
+    titleCell.alignment = { horizontal: "center", vertical: "middle" };
+    titleCell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FFD9E1F2" },
+    };
+    titleCell.border = {
+      top: { style: "medium" },
+      left: { style: "medium" },
+      right: { style: "medium" },
+      bottom: { style: "thin" },
+    };
+    ws.getRow(1).height = 22;
+
+    // Row 2: Legend
+    ws.mergeCells(2, 1, 2, Math.min(totalCols - 3, 30));
+    const legendCell = ws.getCell(2, 1);
+    legendCell.value =
+      "P = Present\t\tA= Absent\t\tHD = Half Day\t\tWO = Week Off\t\tCL = Casual Leave\t\tSL = Sick Leave\t\tPL = Privilege Leave\t\t. = Before joining\t\t[ Purple border = HR Override ]";
+    legendCell.font = { name: "Arial", size: 8 };
+    legendCell.alignment = { vertical: "middle" };
+    ws.getRow(2).height = 14;
+
+    // Row 3: Header labels
+    ws.getRow(3).height = 16;
+    const hdr = ws.getRow(3);
+    hdr.getCell(1).value = "Sr.  No.";
+    hdr.getCell(2).value = "Employee Name";
+    hdr.getCell(3).value = "Department";
+    hdr.getCell(4).value = "Designation";
+    for (let d = 1; d <= lastDay; d++) hdr.getCell(4 + d).value = d;
+    sumCols.forEach((h, i) => {
+      hdr.getCell(sumStart + i).value = h;
+    });
+    hdr.eachCell((cell, col) => {
+      const isSumCol = col >= sumStart,
+        isTitleCol = col <= 4;
+      cell.font = { name: "Arial", size: 9, bold: true };
+      cell.alignment = {
+        horizontal: "center",
+        vertical: "middle",
+        wrapText: true,
+      };
+      if (isTitleCol)
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FF8EA9C1" },
+        };
+      else if (isSumCol)
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFF4B942" },
+        };
+      else {
+        const dayIdx = col - 5,
+          cal = allDays[dayIdx];
+        if (cal?.isSunday)
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFFFC7CE" },
+          };
+        else if (cal?.isDeclaredHoliday)
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFB4C6E7" },
+          };
+        else
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FF8EA9C1" },
+          };
+      }
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        right: { style: "thin" },
+        bottom: { style: "thin" },
+      };
+    });
+
+    // Row 4: Day-of-week abbreviations
+    ws.getRow(4).height = 14;
+    const dowRow = ws.getRow(4);
+    for (let d = 1; d <= lastDay; d++) {
+      const cal = allDays[d - 1];
+      const cell = dowRow.getCell(4 + d);
+      cell.value = cal.dayAbbr;
+      cell.font = { name: "Arial", size: 7 };
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+      if (cal.isSunday)
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFFFC7CE" },
+        };
+      else if (cal.isDeclaredHoliday)
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFB4C6E7" },
+        };
+      cell.border = {
+        top: { style: "thin" },
+        left: { style: "thin" },
+        right: { style: "thin" },
+        bottom: { style: "thin" },
+      };
+    }
+
+    // ── STATUS styles — "." is new ─────────────────────────────────────────
+    const STATUS_STYLE = {
+      P: { font: "FF000000", fill: null },
+      A: { font: "FF9C0006", fill: "FFFFC7CE" },
+      HD: { font: "FF7D4701", fill: "FFFFEB9C" },
+      WO: { font: "FF375623", fill: "FFC6EFCE" },
+      CO: { font: "FF0D4A8C", fill: "FFBDD7EE" },
+      CL: { font: "FF5C2B9C", fill: "FFEDDBFF" },
+      SL: { font: "FF5C2B9C", fill: "FFEDDBFF" },
+      PL: { font: "FF5C2B9C", fill: "FFEDDBFF" },
+      FH: { font: "FF1F4E79", fill: "FFDCE6F1" },
+      NH: { font: "FF7B1E46", fill: "FFFCE4EC" },
+      ".": { font: "FFBDBDBD", fill: "FFF5F5F5" }, // pre-joining
+      "": { font: "FFAAAAAA", fill: null },
+    };
+
+    const colTotals = new Array(totalCols + 1).fill(0);
+
+    employees.forEach((emp, i) => {
+      const rowNum = 5 + i,
+        r = ws.getRow(rowNum);
+      r.height = 15;
+
+      // Fixed columns
+      r.getCell(1).value = i + 1;
+      r.getCell(2).value = emp.employeeName;
+      r.getCell(3).value = emp.department;
+      r.getCell(4).value = emp.designation;
+      [1, 2, 3, 4].forEach((col) => {
+        const cell = r.getCell(col);
+        const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: altBg },
+        };
+        cell.font = { name: "Arial", size: 9 };
+        cell.border = {
+          top: { style: "thin" },
+          left: { style: "thin" },
+          right: { style: "thin" },
+          bottom: { style: "thin" },
+        };
+        cell.alignment =
+          col === 1
+            ? { horizontal: "center", vertical: "middle" }
+            : { horizontal: "left", vertical: "middle" };
+      });
+
+      // Day cells
+      allDays.forEach((cal, di) => {
+        const cell = r.getCell(5 + di);
+        const code = emp.dayCodes[cal.dateStr] ?? "";
+        const isHrOverride = emp.hrOverrides.has(cal.dateStr);
+        const isPreJoining = code === ".";
+
+        cell.value = code;
+        const st = STATUS_STYLE[code] || STATUS_STYLE[""];
+        cell.font = {
+          name: "Arial",
+          size: 8,
+          bold: !!code && code !== ".",
+          color: { argb: st.font },
+        };
+        cell.alignment = { horizontal: "center", vertical: "middle" };
+
+        if (isPreJoining) {
+          // Pre-joining: grey background, no border highlight
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFF5F5F5" },
+          };
+          cell.border = {
+            top: { style: "thin", color: { argb: "FFE0E0E0" } },
+            left: { style: "thin", color: { argb: "FFE0E0E0" } },
+            right: { style: "thin", color: { argb: "FFE0E0E0" } },
+            bottom: { style: "thin", color: { argb: "FFE0E0E0" } },
+          };
+        } else if (st.fill) {
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: st.fill },
+          };
+          cell.border = isHrOverride
+            ? {
+                top: { style: "medium", color: { argb: "FF7C3AED" } },
+                left: { style: "medium", color: { argb: "FF7C3AED" } },
+                right: { style: "medium", color: { argb: "FF7C3AED" } },
+                bottom: { style: "medium", color: { argb: "FF7C3AED" } },
+              }
+            : {
+                top: { style: "thin" },
+                left: { style: "thin" },
+                right: { style: "thin" },
+                bottom: { style: "thin" },
+              };
+        } else {
+          const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: cal.isSunday ? "FFFFF0F0" : altBg },
+          };
+          cell.border = isHrOverride
+            ? {
+                top: { style: "medium", color: { argb: "FF7C3AED" } },
+                left: { style: "medium", color: { argb: "FF7C3AED" } },
+                right: { style: "medium", color: { argb: "FF7C3AED" } },
+                bottom: { style: "medium", color: { argb: "FF7C3AED" } },
+              }
+            : {
+                top: { style: "thin" },
+                left: { style: "thin" },
+                right: { style: "thin" },
+                bottom: { style: "thin" },
+              };
+        }
+
+        if (isHrOverride && !isPreJoining) {
+          cell.note = {
+            texts: [
+              {
+                font: { bold: true, size: 9, color: { argb: "FF7C3AED" } },
+                text: "HR Override",
+              },
+            ],
+          };
+        }
+      });
+
+      // Summary totals
+      const vals = [
+        emp.totals.P,
+        emp.totals.A,
+        emp.totals.HD,
+        emp.totals.WO,
+        emp.totals.CO,
+        emp.totals.CL,
+        emp.totals.SL,
+        emp.totals.PL,
+        emp.totals.NHFH,
+        emp.totals.Total,
+      ];
+      vals.forEach((v, si) => {
+        const cell = r.getCell(sumStart + si);
+        cell.value = v;
+        cell.font = { name: "Arial", size: 9, bold: si === sumCols.length - 1 };
+        cell.alignment = { horizontal: "center", vertical: "middle" };
+        const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: si === sumCols.length - 1 ? "FFF4B942" : altBg },
+        };
+        cell.border = {
+          top: { style: "thin" },
+          left: { style: "thin" },
+          right: { style: "thin" },
+          bottom: { style: "thin" },
+        };
+        colTotals[sumStart + si] = (colTotals[sumStart + si] || 0) + v;
+      });
+    });
+
+    // Totals row
+    const totRow = ws.getRow(5 + employees.length);
+    totRow.height = 16;
+    ws.mergeCells(5 + employees.length, 1, 5 + employees.length, 4);
+    const totLabel = totRow.getCell(1);
+    totLabel.value = "TOTALS";
+    totLabel.font = { name: "Arial", size: 10, bold: true };
+    totLabel.alignment = { horizontal: "center", vertical: "middle" };
+    totLabel.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF8EA9C1" },
+    };
+    totLabel.border = {
+      top: { style: "medium" },
+      left: { style: "medium" },
+      right: { style: "thin" },
+      bottom: { style: "medium" },
+    };
+
+    allDays.forEach((cal, di) => {
+      const cell = totRow.getCell(5 + di);
+      if (!cal.isFuture) {
+        // Count P codes only (not "." pre-joining)
+        const cnt = employees.filter(
+          (e) => e.dayCodes[cal.dateStr] === "P",
+        ).length;
+        cell.value = cnt || 0;
+      } else {
+        cell.value = 0;
+      }
+      cell.font = { name: "Arial", size: 9, bold: true };
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: {
+          argb: cal.isSunday
+            ? "FFFFC7CE"
+            : cal.isDeclaredHoliday
+              ? "FFB4C6E7"
+              : "FF8EA9C1",
+        },
+      };
+      cell.border = {
+        top: { style: "medium" },
+        left: { style: "thin" },
+        right: { style: "thin" },
+        bottom: { style: "medium" },
+      };
+    });
+
+    sumCols.forEach((_, si) => {
+      const cell = totRow.getCell(sumStart + si);
+      cell.value = colTotals[sumStart + si] || 0;
+      cell.font = { name: "Arial", size: 10, bold: true };
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FFF4B942" },
+      };
+      cell.border = {
+        top: { style: "medium" },
+        left: { style: "thin" },
+        right:
+          si === sumCols.length - 1 ? { style: "medium" } : { style: "thin" },
+        bottom: { style: "medium" },
+      };
+    });
+
+    const buffer = await wb.xlsx.writeBuffer();
+    const filename = `attendance_${yearMonth}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.send(buffer);
   } catch (err) {
-    console.error("[MUSTER]", err.message, err.stack);
+    console.error("[EXPORT-MUSTER]", err.message, err.stack);
     res.status(500).json({ success: false, message: err.message });
   }
 });

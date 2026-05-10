@@ -10,16 +10,31 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const router = express.Router();
-const { TallyVoucher } = require("../../models/Accountant_model/TallyVoucherModels");
-const { TallyLedger } = require("../../models/Accountant_model/TallyMasterModels");
+const {
+  TallyVoucher,
+} = require("../../models/Accountant_model/TallyVoucherModels");
+const {
+  TallyLedger,
+} = require("../../models/Accountant_model/TallyMasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
 const auth = accountantAuth;
 
 const VOUCHER_TYPES = [
-  "sales", "purchase", "receipt", "payment", "contra", "journal",
-  "credit_note", "debit_note", "stock_journal", "delivery_note",
-  "receipt_note", "rejection_in", "rejection_out", "memo"
+  "sales",
+  "purchase",
+  "receipt",
+  "payment",
+  "contra",
+  "journal",
+  "credit_note",
+  "debit_note",
+  "stock_journal",
+  "delivery_note",
+  "receipt_note",
+  "rejection_in",
+  "rejection_out",
+  "memo",
 ];
 
 /* ------------------------------------------------------------------ */
@@ -46,19 +61,19 @@ async function applyLedgerBalances(voucher, direction = 1, session = null) {
     const delta = (entry.signedAmount || 0) * direction;
     ops.push({
       updateOne: {
-        filter: { _id: entry.ledger },
-        update: { $inc: { currentBalance: delta } }
-      }
+        filter: { _id: entry.ledgerId },
+        update: { $inc: { currentBalance: delta } },
+      },
     });
   }
   if (ops.length) {
     await TallyLedger.bulkWrite(ops, { session });
   }
-  // Refresh balanceType per ledger touched
+  // Refresh currentBalanceType per ledger touched
   for (const entry of voucher.ledgerEntries) {
-    const led = await TallyLedger.findById(entry.ledger).session(session);
+    const led = await TallyLedger.findById(entry.ledgerId).session(session);
     if (led) {
-      led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+      led.currentBalanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
       await led.save({ session });
     }
   }
@@ -71,17 +86,25 @@ async function applyLedgerBalances(voucher, direction = 1, session = null) {
 router.get("/", auth, async (req, res) => {
   try {
     const {
-      companyId, voucherType, party, status,
-      dateFrom, dateTo, q,
-      page = 1, limit = 50, sort = "-voucherDate"
+      companyId,
+      voucherType,
+      party,
+      status,
+      dateFrom,
+      dateTo,
+      q,
+      page = 1,
+      limit = 50,
+      sort = "-voucherDate",
     } = req.query;
 
-    if (!companyId) return res.status(400).json({ error: "companyId required" });
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
 
     const filter = { companyId };
     if (voucherType) filter.voucherType = voucherType;
     if (status) filter.status = status;
-    if (party) filter.partyLedger = party;
+    if (party) filter.partyLedgerId = party;
     if (dateFrom || dateTo) {
       filter.voucherDate = {};
       if (dateFrom) filter.voucherDate.$gte = new Date(dateFrom);
@@ -91,21 +114,27 @@ router.get("/", auth, async (req, res) => {
       filter.$or = [
         { voucherNumber: new RegExp(q, "i") },
         { narration: new RegExp(q, "i") },
-        { partyLedgerName: new RegExp(q, "i") }
+        { partyLedgerName: new RegExp(q, "i") },
       ];
     }
 
     const skip = (Number(page) - 1) * Number(limit);
     const [items, total] = await Promise.all([
       TallyVoucher.find(filter)
-        .populate("partyLedger", "name groupName")
-        .sort(sort).skip(skip).limit(Number(limit)).lean(),
-      TallyVoucher.countDocuments(filter)
+        .populate("partyLedgerId", "name groupName")
+        .sort(sort)
+        .skip(skip)
+        .limit(Number(limit))
+        .lean(),
+      TallyVoucher.countDocuments(filter),
     ]);
 
     res.json({
-      items, total, page: Number(page), limit: Number(limit),
-      totalPages: Math.ceil(total / Number(limit))
+      items,
+      total,
+      page: Number(page),
+      limit: Number(limit),
+      totalPages: Math.ceil(total / Number(limit)),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -119,9 +148,9 @@ router.get("/", auth, async (req, res) => {
 router.get("/:id", auth, async (req, res) => {
   try {
     const voucher = await TallyVoucher.findById(req.params.id)
-      .populate("partyLedger", "name groupName gstin")
-      .populate("ledgerEntries.ledger", "name groupName")
-      .populate("inventoryEntries.stockItem", "name unit hsnCode")
+      .populate("partyLedgerId", "name groupName gstin")
+      .populate("ledgerEntries.ledgerId", "name groupName")
+      .populate("inventoryEntries.stockItemId", "name unit hsnCode")
       .lean();
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
     res.json(voucher);
@@ -138,7 +167,11 @@ router.get("/next-number/:companyId/:voucherType", auth, async (req, res) => {
   try {
     const { companyId, voucherType } = req.params;
     const { prefix } = req.query;
-    const number = await TallyVoucher.nextVoucherNumber(companyId, voucherType, prefix);
+    const number = await TallyVoucher.nextVoucherNumber(
+      companyId,
+      voucherType,
+      prefix,
+    );
     res.json({ voucherNumber: number });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -152,17 +185,23 @@ router.get("/next-number/:companyId/:voucherType", auth, async (req, res) => {
 router.post("/", auth, async (req, res) => {
   try {
     const body = req.body || {};
-    if (!body.companyId) return res.status(400).json({ error: "companyId required" });
+    if (!body.companyId)
+      return res.status(400).json({ error: "companyId required" });
     if (!body.voucherType || !VOUCHER_TYPES.includes(body.voucherType))
       return res.status(400).json({ error: "Valid voucherType required" });
-    if (!body.voucherDate) return res.status(400).json({ error: "voucherDate required" });
+    if (!body.voucherDate)
+      return res.status(400).json({ error: "voucherDate required" });
     if (!Array.isArray(body.ledgerEntries) || body.ledgerEntries.length === 0)
-      return res.status(400).json({ error: "At least one ledger entry required" });
+      return res
+        .status(400)
+        .json({ error: "At least one ledger entry required" });
 
     // Auto-number if not provided
     if (!body.voucherNumber) {
       body.voucherNumber = await TallyVoucher.nextVoucherNumber(
-        body.companyId, body.voucherType, body.numberingPrefix
+        body.companyId,
+        body.voucherType,
+        body.prefix,
       );
     }
 
@@ -170,15 +209,15 @@ router.post("/", auth, async (req, res) => {
     body.createdBy = req.user?.id;
 
     // Resolve partyLedgerName if missing
-    if (body.partyLedger && !body.partyLedgerName) {
-      const led = await TallyLedger.findById(body.partyLedger).select("name");
+    if (body.partyLedgerId && !body.partyLedgerName) {
+      const led = await TallyLedger.findById(body.partyLedgerId).select("name");
       if (led) body.partyLedgerName = led.name;
     }
 
     // Resolve ledger names
     for (const entry of body.ledgerEntries) {
-      if (entry.ledger && !entry.ledgerName) {
-        const led = await TallyLedger.findById(entry.ledger).select("name");
+      if (entry.ledgerId && !entry.ledgerName) {
+        const led = await TallyLedger.findById(entry.ledgerId).select("name");
         if (led) entry.ledgerName = led.name;
       }
     }
@@ -208,7 +247,9 @@ router.put("/:id", auth, async (req, res) => {
     const existing = await TallyVoucher.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: "Voucher not found" });
     if (existing.status !== "draft")
-      return res.status(400).json({ error: `Cannot edit voucher in '${existing.status}' status. Cancel and create new.` });
+      return res.status(400).json({
+        error: `Cannot edit voucher in '${existing.status}' status. Cancel and create new.`,
+      });
 
     const body = req.body || {};
     body.updatedBy = req.user?.id;
@@ -232,8 +273,10 @@ router.post("/:id/post", auth, async (req, res) => {
     session.startTransaction();
     const voucher = await TallyVoucher.findById(req.params.id).session(session);
     if (!voucher) throw new Error("Voucher not found");
-    if (voucher.status !== "draft") throw new Error(`Voucher already ${voucher.status}`);
-    if (!voucher.isBalanced) throw new Error("Voucher Dr/Cr totals do not balance — cannot post");
+    if (voucher.status !== "draft")
+      throw new Error(`Voucher already ${voucher.status}`);
+    if (!voucher.isBalanced)
+      throw new Error("Voucher Dr/Cr totals do not balance — cannot post");
 
     voucher.status = "posted";
     voucher.updatedBy = req.user?.id;
@@ -301,7 +344,10 @@ router.delete("/:id", auth, async (req, res) => {
     const voucher = await TallyVoucher.findById(req.params.id);
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
     if (voucher.status !== "draft")
-      return res.status(400).json({ error: "Only draft vouchers can be deleted. Use cancel/void for posted." });
+      return res.status(400).json({
+        error:
+          "Only draft vouchers can be deleted. Use cancel/void for posted.",
+      });
     await voucher.deleteOne();
     res.json({ ok: true });
   } catch (e) {
@@ -316,11 +362,12 @@ router.delete("/:id", auth, async (req, res) => {
 router.get("/summary/by-type", auth, async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo } = req.query;
-    if (!companyId) return res.status(400).json({ error: "companyId required" });
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
 
     const match = {
       companyId: new mongoose.Types.ObjectId(companyId),
-      status: "posted"
+      status: "posted",
     };
     if (dateFrom || dateTo) {
       match.voucherDate = {};
@@ -335,10 +382,10 @@ router.get("/summary/by-type", auth, async (req, res) => {
           _id: "$voucherType",
           count: { $sum: 1 },
           totalDebit: { $sum: "$totalDebit" },
-          totalCredit: { $sum: "$totalCredit" }
-        }
+          totalCredit: { $sum: "$totalCredit" },
+        },
       },
-      { $sort: { _id: 1 } }
+      { $sort: { _id: 1 } },
     ]);
 
     res.json({ summary });

@@ -15,11 +15,21 @@
 //                                          entries, bill-wise outstanding,
 //                                          previous-period comparison)
 //   POST   /ledgers/:id/transactions    — Quick add 2-line journal voucher
+//   POST   /ledgers/:id/transfer-balance — Move (full or partial) balance from
+//                                          one ledger to another via journal
+//   GET    /gstin-lookup/:gstin         — Validate GSTIN format + checksum,
+//                                          extract state + PAN; optional API
+//                                          fetch (env-configured) for name/addr
 //   GET    /payroll/runs                — List payroll runs + posting status
 //   GET    /payroll/runs/:id/preview    — Preview salary journal voucher
 //   POST   /payroll/runs/:id/post       — Post a single payroll run as voucher
 //   POST   /payroll/runs/post-all       — Post every unposted run
-//   POST   /payroll/runs/:id/unpost     — Cancel the auto-created voucher
+//   POST   /payroll/runs/:id/unpost     — Cancel the auto-created vouchers
+//                                          (handles paid runs with two vouchers)
+//   POST   /seed-manufacturing          — Seed manufacturing-industry chart
+//   GET    /parties/preview             — Preview party-ledger sync (dry-run)
+//   POST   /parties/sync                — Create Sundry Debtor / Creditor
+//                                          ledgers from CMS Customer + Vendor
 // =============================================================================
 
 const express = require("express");
@@ -38,6 +48,27 @@ const {
 // have the HR module installed yet.
 
 router.use(accountantAuth);
+
+// ── GET /version — quick check that the latest backend code is loaded.
+//   Hit this in the browser:  /api/accountant/chart-of-accounts/version
+//   If you see the version string, the new code is deployed. If 404, the
+//   server is still running an older revision and needs a restart.
+router.get("/version", (req, res) => {
+  res.json({
+    success: true,
+    version: "2026-05-07-payroll-bridge-v3",
+    features: [
+      "paid-aware payroll bridge (journal + payment vouchers)",
+      "voucher-number prefix-string lookup (race-safe)",
+      "duplicate-key retry loop (5 attempts)",
+      "hard-delete unpost (frees voucher numbers)",
+      "/payroll/cleanup emergency reset endpoint",
+      "parties bridge (customer→sundry-debtor, vendor→sundry-creditor)",
+      "manufacturing chart seeder",
+    ],
+    serverTime: new Date().toISOString(),
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper — sum currentBalance for a list of leaf ledgers (signed)
@@ -899,49 +930,62 @@ router.post("/ledgers/:id/transactions", async (req, res) => {
         ? vchType
         : "journal";
 
-    const number = await TallyVoucher.nextVoucherNumber(
-      thisLedger.companyId,
-      resolvedType,
-    );
     const date = voucherDate ? new Date(voucherDate) : new Date();
-
     const contraType = type === "Dr" ? "Cr" : "Dr";
 
-    const voucher = new TallyVoucher({
-      companyId: thisLedger.companyId,
-      voucherType: resolvedType,
-      voucherTypeName: {
-        journal: "Journal",
-        receipt: "Receipt",
-        payment: "Payment",
-        contra: "Contra",
-      }[resolvedType],
-      voucherNumber: number,
-      voucherDate: date,
-      referenceNumber: referenceNumber || "",
-      narration: narration || "",
-      ledgerEntries: [
-        {
-          ledgerId: thisLedger._id,
-          ledgerName: thisLedger.name,
-          groupName: thisLedger.groupName,
-          type,
-          amount: amt,
-        },
-        {
-          ledgerId: contraLedger._id,
-          ledgerName: contraLedger.name,
-          groupName: contraLedger.groupName,
-          type: contraType,
-          amount: amt,
-        },
-      ],
-      grandTotal: amt,
-      status: "posted",
-      createdBy: req.user?.id,
-    });
-
-    await voucher.save(); // pre-save hook fills signedAmount + totals + financialYear
+    // Retry on duplicate-key collisions (cancelled vouchers in same FY can
+    // confuse the default nextVoucherNumber implementation; allocate from MAX).
+    let voucher = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const number = await getNextVoucherNumberSafe(
+        thisLedger.companyId,
+        resolvedType,
+      );
+      try {
+        voucher = new TallyVoucher({
+          companyId: thisLedger.companyId,
+          voucherType: resolvedType,
+          voucherTypeName: {
+            journal: "Journal",
+            receipt: "Receipt",
+            payment: "Payment",
+            contra: "Contra",
+          }[resolvedType],
+          voucherNumber: number,
+          voucherDate: date,
+          referenceNumber: referenceNumber || "",
+          narration: narration || "",
+          ledgerEntries: [
+            {
+              ledgerId: thisLedger._id,
+              ledgerName: thisLedger.name,
+              groupName: thisLedger.groupName,
+              type,
+              amount: amt,
+            },
+            {
+              ledgerId: contraLedger._id,
+              ledgerName: contraLedger.name,
+              groupName: contraLedger.groupName,
+              type: contraType,
+              amount: amt,
+            },
+          ],
+          grandTotal: amt,
+          status: "posted",
+          createdBy: req.user?.id,
+        });
+        await voucher.save();
+        break;
+      } catch (e) {
+        const isDup =
+          e &&
+          (e.code === 11000 || /E11000|duplicate key/i.test(e.message || ""));
+        if (!isDup || attempt === 4) throw e;
+        voucher = null;
+        await new Promise((r) => setTimeout(r, 25 + Math.random() * 50));
+      }
+    }
 
     // ─── Update ledger balances ─────────────────────────────────────────
     // Use the schema's `ledgerId` field (signedAmount = +amount for Dr, -amount for Cr)
@@ -1367,40 +1411,70 @@ router.get("/payroll/runs", async (req, res) => {
       .sort({ year: -1, month: -1 })
       .lean();
 
-    // For each run, check whether a voucher already exists
+    // Pull every active voucher for these runs, then bucket by runId + kind
     const runIds = runs.map((r) => r._id);
     const existingVouchers = await TallyVoucher.find({
       companyId,
       sourceSystem: "auto_from_payroll",
       sourceId: { $in: runIds },
+      status: { $ne: "cancelled" },
     })
-      .select("_id voucherNumber sourceId voucherDate grandTotal status")
+      .select(
+        "_id voucherNumber sourceId sourceReference voucherDate grandTotal status voucherType",
+      )
       .lean();
 
-    const voucherByRunId = new Map(
-      existingVouchers.map((v) => [String(v.sourceId), v]),
-    );
+    // runId → { processing: voucher, payment: voucher }
+    const voucherMap = new Map();
+    for (const v of existingVouchers) {
+      const kind = (v.sourceReference || "").split("/").pop() || "processing";
+      const key = String(v.sourceId);
+      if (!voucherMap.has(key)) voucherMap.set(key, {});
+      voucherMap.get(key)[kind] = v;
+    }
 
     res.json({
       success: true,
       hrAvailable: true,
-      runs: runs.map((r) => ({
-        _id: r._id,
-        year: r.year,
-        month: r.month,
-        payPeriod: r.payPeriod,
-        status: r.status,
-        totalEmployees: r.totalEmployees,
-        totalGross: r.totalGross || 0,
-        totalDeductions: r.totalDeductions || 0,
-        totalNetPay: r.totalNetPay || 0,
-        totalPF: r.totalPF || 0,
-        totalESIC: r.totalESIC || 0,
-        createdAt: r.createdAt,
-        // Posting status:
-        postedToLedgers: voucherByRunId.has(String(r._id)),
-        voucher: voucherByRunId.get(String(r._id)) || null,
-      })),
+      runs: runs.map((r) => {
+        const vs = voucherMap.get(String(r._id)) || {};
+        const hasProcessing = !!vs.processing;
+        const hasPayment = !!vs.payment;
+        const isPaidRun = r.status === "paid";
+
+        // Posting status semantics:
+        //   "complete"     — everything that should be posted IS posted
+        //   "partial"      — processing posted, but a payment voucher is also
+        //                    expected (paid run) and missing
+        //   "not_posted"   — no vouchers exist at all
+        let postingStatus = "not_posted";
+        if (hasProcessing && (!isPaidRun || hasPayment))
+          postingStatus = "complete";
+        else if (hasProcessing && isPaidRun && !hasPayment)
+          postingStatus = "partial";
+
+        return {
+          _id: r._id,
+          year: r.year,
+          month: r.month,
+          payPeriod: r.payPeriod,
+          status: r.status,
+          paidAt: r.paidAt || null,
+          totalEmployees: r.totalEmployees,
+          totalGross: r.totalGross || 0,
+          totalDeductions: r.totalDeductions || 0,
+          totalNetPay: r.totalNetPay || 0,
+          totalPF: r.totalPF || 0,
+          totalESIC: r.totalESIC || 0,
+          createdAt: r.createdAt,
+          postingStatus,
+          // Backwards-compat for existing callers — reflects "has any voucher"
+          postedToLedgers: hasProcessing,
+          processingVoucher: vs.processing || null,
+          paymentVoucher: vs.payment || null,
+          voucher: vs.processing || vs.payment || null,
+        };
+      }),
     });
   } catch (err) {
     console.error("List payroll runs:", err);
@@ -1409,24 +1483,75 @@ router.get("/payroll/runs", async (req, res) => {
 });
 
 // ── Helper: build the journal voucher payload from a payroll run ──────────
-async function buildPayrollVoucher(companyId, run, items) {
+// ── Helper: pick a bank ledger to use as the contra for paid payroll runs.
+// Strategy: any ledger under the "Bank Accounts" group. If multiple, prefer
+// one whose name contains "primary"/"main"/"current"; otherwise the first.
+// If the accountant only has the placeholder "Bank Account" (from seed), use
+// that. If they have an explicitly-passed `bankLedgerId`, honour it.
+async function resolveBankLedgerForPayroll(companyId, explicitBankLedgerId) {
+  if (explicitBankLedgerId) {
+    const bl = await TallyLedger.findById(explicitBankLedgerId).lean();
+    if (bl && String(bl.companyId) === String(companyId)) return bl;
+  }
+  // Find the "Bank Accounts" group
+  const bankGroup = await TallyGroup.findOne({
+    companyId,
+    isActive: true,
+    name: { $regex: /^bank accounts$/i },
+  }).lean();
+  if (!bankGroup) {
+    throw new Error(
+      "Cannot find a Bank Accounts group. Seed the chart first or create a bank ledger manually before posting paid payroll runs.",
+    );
+  }
+  const banks = await TallyLedger.find({
+    companyId,
+    isActive: true,
+    groupId: bankGroup._id,
+  }).lean();
+  if (banks.length === 0) {
+    throw new Error(
+      "No bank ledger found under Bank Accounts. Create at least one bank ledger (e.g. HDFC Current A/c) before posting paid payroll runs.",
+    );
+  }
+  // Prefer something that looks like a primary account
+  const primary = banks.find((b) =>
+    /primary|main|current|operating/i.test(b.name),
+  );
+  return primary || banks[0];
+}
+
+async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   // Resolve every ledger we'll need
   const salariesLedger = await findOrCreateLedger(
     companyId,
-    ["Salaries", "Salaries A/c", "Salary", "Wages & Salaries"],
-    ["indirect expense", "salaries", "wages", "employee", "expenses"],
+    [
+      "Salaries (Office Staff)",
+      "Salaries",
+      "Salaries A/c",
+      "Salary",
+      "Wages & Salaries",
+    ],
+    [
+      "administrative expenses",
+      "indirect expense",
+      "salaries",
+      "wages",
+      "employee",
+      "expenses",
+    ],
     "expense",
   );
   const pfPayable = await findOrCreateLedger(
     companyId,
-    ["Provident Fund Payable", "PF Payable", "EPF Payable"],
-    ["statutory", "current liab", "duties & taxes"],
+    ["PF Payable", "Provident Fund Payable", "EPF Payable"],
+    ["duties & taxes", "statutory", "current liab"],
     "liability",
   );
   const esiPayable = await findOrCreateLedger(
     companyId,
     ["ESI Payable", "ESIC Payable", "Employees State Insurance Payable"],
-    ["statutory", "current liab", "duties & taxes"],
+    ["duties & taxes", "statutory", "current liab"],
     "liability",
   );
   const otherDeductionsPayable = await findOrCreateLedger(
@@ -1438,7 +1563,7 @@ async function buildPayrollVoucher(companyId, run, items) {
   const salaryPayable = await findOrCreateLedger(
     companyId,
     ["Salary Payable", "Salaries Payable", "Wages Payable"],
-    ["current liab", "salary"],
+    ["provisions", "current liab", "salary"],
     "liability",
   );
 
@@ -1462,18 +1587,20 @@ async function buildPayrollVoucher(companyId, run, items) {
     { gross: 0, pf: 0, esi: 0, tdsOther: 0, net: 0, count: 0 },
   );
 
-  // Sanity-check: gross = net + total deductions (within rounding)
+  // Sanity-check
   const computedNet = totals.gross - totals.pf - totals.esi - totals.tdsOther;
-  const diff = Math.abs(computedNet - totals.net);
-  if (diff > 1) {
-    // 1 rupee tolerance for cumulative rounding. If larger, something is off.
+  if (Math.abs(computedNet - totals.net) > 1) {
     throw new Error(
-      `Payroll math doesn't reconcile: gross ${totals.gross.toFixed(2)} − deductions = ${computedNet.toFixed(2)}, but net pay is ${totals.net.toFixed(2)} (diff ${diff.toFixed(2)}). Re-process the payroll run before posting.`,
+      `Payroll math doesn't reconcile: gross ${totals.gross.toFixed(2)} − deductions = ${computedNet.toFixed(2)}, but net pay is ${totals.net.toFixed(2)} (diff ${Math.abs(computedNet - totals.net).toFixed(2)}). Re-process the payroll run before posting.`,
     );
   }
 
-  // Build entries
-  const entries = [
+  // ── Voucher 1: PROCESSING (always created) ────────────────────────────
+  // Dr Salaries A/c (gross) / Cr PF + ESI + Other Deductions + Salary Payable
+  // This is the journal entry recognising the salary expense and accruing
+  // the liability. Always created regardless of payment status.
+  const processingDate = new Date(run.year, run.month, 0); // last day of the pay-period month
+  const processingEntries = [
     {
       ledgerId: salariesLedger._id,
       ledgerName: salariesLedger.name,
@@ -1483,7 +1610,7 @@ async function buildPayrollVoucher(companyId, run, items) {
     },
   ];
   if (totals.pf > 0)
-    entries.push({
+    processingEntries.push({
       ledgerId: pfPayable._id,
       ledgerName: pfPayable.name,
       groupName: pfPayable.groupName,
@@ -1491,7 +1618,7 @@ async function buildPayrollVoucher(companyId, run, items) {
       amount: totals.pf,
     });
   if (totals.esi > 0)
-    entries.push({
+    processingEntries.push({
       ledgerId: esiPayable._id,
       ledgerName: esiPayable.name,
       groupName: esiPayable.groupName,
@@ -1499,7 +1626,7 @@ async function buildPayrollVoucher(companyId, run, items) {
       amount: totals.esi,
     });
   if (totals.tdsOther > 0)
-    entries.push({
+    processingEntries.push({
       ledgerId: otherDeductionsPayable._id,
       ledgerName: otherDeductionsPayable.name,
       groupName: otherDeductionsPayable.groupName,
@@ -1507,7 +1634,7 @@ async function buildPayrollVoucher(companyId, run, items) {
       amount: totals.tdsOther,
     });
   if (totals.net > 0)
-    entries.push({
+    processingEntries.push({
       ledgerId: salaryPayable._id,
       ledgerName: salaryPayable.name,
       groupName: salaryPayable.groupName,
@@ -1515,13 +1642,58 @@ async function buildPayrollVoucher(companyId, run, items) {
       amount: totals.net,
     });
 
-  // Voucher date — last day of the payroll's pay period
-  const voucherDate = new Date(run.year, run.month, 0); // month is 1-12; this gives last day of that month
+  const vouchers = [
+    {
+      kind: "processing",
+      voucherType: "journal",
+      voucherTypeName: "Journal",
+      voucherDate: processingDate,
+      entries: processingEntries,
+      grandTotal: totals.gross,
+      narration: `Salary processed for ${run.payPeriod || `${run.year}-${run.month}`} — ${items.length} employees`,
+    },
+  ];
+
+  // ── Voucher 2: PAYMENT (only if run.status === "paid") ────────────────
+  // Dr Salary Payable (net) / Cr Bank A/c
+  // This clears the liability accrued in Voucher 1 and records the bank
+  // outflow. After both vouchers, Salary Payable nets to zero for this run.
+  if (run.status === "paid" && totals.net > 0) {
+    const bankLedger = await resolveBankLedgerForPayroll(
+      companyId,
+      opts.bankLedgerId,
+    );
+    const paymentDate = run.paidAt ? new Date(run.paidAt) : processingDate;
+    vouchers.push({
+      kind: "payment",
+      voucherType: "payment",
+      voucherTypeName: "Payment",
+      voucherDate: paymentDate,
+      entries: [
+        {
+          ledgerId: salaryPayable._id,
+          ledgerName: salaryPayable.name,
+          groupName: salaryPayable.groupName,
+          type: "Dr",
+          amount: totals.net,
+        },
+        {
+          ledgerId: bankLedger._id,
+          ledgerName: bankLedger.name,
+          groupName: bankLedger.groupName,
+          type: "Cr",
+          amount: totals.net,
+        },
+      ],
+      grandTotal: totals.net,
+      narration: `Salary paid for ${run.payPeriod || `${run.year}-${run.month}`} via ${bankLedger.name}`,
+      bankLedger: { _id: bankLedger._id, name: bankLedger.name },
+    });
+  }
 
   return {
-    entries,
+    vouchers,
     totals,
-    voucherDate,
     ledgerIds: {
       salariesLedger,
       pfPayable,
@@ -1532,10 +1704,24 @@ async function buildPayrollVoucher(companyId, run, items) {
   };
 }
 
+// Backwards-compatible: old code imports buildPayrollVoucher (singular) — keep it
+// returning the FIRST voucher only, so anything that hasn't been migrated still
+// produces a sensible journal even if it doesn't know about payments.
+async function buildPayrollVoucher(companyId, run, items, opts = {}) {
+  const built = await buildPayrollVouchers(companyId, run, items, opts);
+  const first = built.vouchers[0];
+  return {
+    entries: first.entries,
+    totals: built.totals,
+    voucherDate: first.voucherDate,
+    ledgerIds: built.ledgerIds,
+  };
+}
+
 // ── GET /payroll/runs/:runId/preview ──────────────────────────────────────
 router.get("/payroll/runs/:runId/preview", async (req, res) => {
   try {
-    const { companyId } = req.query;
+    const { companyId, bankLedgerId } = req.query;
     if (!companyId)
       return res
         .status(400)
@@ -1560,7 +1746,29 @@ router.get("/payroll/runs/:runId/preview", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Payroll run has no items to post." });
 
-    const built = await buildPayrollVoucher(companyId, run, items);
+    let built;
+    try {
+      built = await buildPayrollVouchers(companyId, run, items, {
+        bankLedgerId,
+      });
+    } catch (e) {
+      // Bank-ledger missing for paid runs is the most common cause — return a
+      // clear hint so the UI can prompt the accountant to create one.
+      return res.json({
+        success: false,
+        message: e.message,
+        run: {
+          _id: run._id,
+          payPeriod: run.payPeriod,
+          year: run.year,
+          month: run.month,
+          status: run.status,
+          totalEmployees: items.length,
+        },
+        bankSetupNeeded: /bank/i.test(e.message),
+      });
+    }
+
     res.json({
       success: true,
       run: {
@@ -1571,13 +1779,16 @@ router.get("/payroll/runs/:runId/preview", async (req, res) => {
         status: run.status,
         totalEmployees: items.length,
       },
-      preview: {
-        voucherType: "journal",
-        voucherDate: built.voucherDate,
-        narration: `Salary for ${run.payPeriod || `${run.year}-${run.month}`} — ${items.length} employees`,
-        entries: built.entries,
-        totals: built.totals,
-      },
+      vouchers: built.vouchers.map((v) => ({
+        kind: v.kind,
+        voucherType: v.voucherType,
+        voucherDate: v.voucherDate,
+        narration: v.narration,
+        entries: v.entries,
+        grandTotal: v.grandTotal,
+        bankLedger: v.bankLedger || null,
+      })),
+      totals: built.totals,
     });
   } catch (err) {
     console.error("Payroll preview:", err);
@@ -1585,10 +1796,175 @@ router.get("/payroll/runs/:runId/preview", async (req, res) => {
   }
 });
 
+// ── Helper: post (or re-post) the missing vouchers for a payroll run.
+// Returns { created: [...], skipped: [...] }
+//
+// Why a helper: a run can flip from "processed" to "paid" later. The first
+// time we post we may only create the journal; later when the user marks the
+// run paid, we want to add the payment voucher without duplicating the journal.
+// We use sourceReference to discriminate: "Payroll/<period>/processing" vs
+// "Payroll/<period>/payment".
+//
+// Voucher-number safety: TallyVoucher.nextVoucherNumber sorts by createdAt to
+// find the latest, but two vouchers created in the same millisecond can return
+// the same "next" number, which then collides on the unique index. We work
+// around this by computing the next number from the actual MAX numeric suffix
+// across ALL vouchers (active + cancelled), and retrying on duplicate-key
+// errors with a fresh number.
+async function getNextVoucherNumberSafe(companyId, voucherType) {
+  const today = new Date();
+  const fy =
+    today.getMonth() >= 3 ? today.getFullYear() : today.getFullYear() - 1;
+  const fyShort = `${fy.toString().slice(2)}${(fy + 1).toString().slice(2)}`;
+  const prefixMap = {
+    sales: "SL",
+    purchase: "PU",
+    receipt: "RC",
+    payment: "PY",
+    contra: "CN",
+    journal: "JV",
+    credit_note: "CR",
+    debit_note: "DR",
+    stock_journal: "SJ",
+  };
+  const prefix = prefixMap[voucherType] || "VC";
+
+  // Look up by the actual voucherNumber STRING prefix (`JV/2627/`), NOT by
+  // the stored `financialYear` field. The two can disagree: the prefix uses
+  // today's FY but the stored financialYear is derived from voucherDate.
+  // What we need to avoid is colliding with the unique index, which only
+  // sees the voucher number string.
+  //
+  // Match `<prefix>/<fyShort>/<digits>` exactly so a custom-numbered voucher
+  // with a different format doesn't poison the lookup.
+  const numberRegex = new RegExp(`^${prefix}/${fyShort}/\\d+$`);
+  const rows = await TallyVoucher.find({
+    companyId,
+    voucherType,
+    voucherNumber: { $regex: numberRegex },
+  })
+    .select("voucherNumber")
+    .lean();
+
+  let maxSeq = 0;
+  for (const r of rows) {
+    const m = (r.voucherNumber || "").match(/(\d+)$/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > maxSeq) maxSeq = n;
+    }
+  }
+
+  // Belt-and-suspenders: even after computing maxSeq, double-check the chosen
+  // number doesn't already exist (defensive against very rare race or stale
+  // index reads). Walk forward until we find a free slot.
+  let seq = maxSeq + 1;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const candidate = `${prefix}/${fyShort}/${seq.toString().padStart(5, "0")}`;
+    const existing = await TallyVoucher.exists({
+      companyId,
+      voucherType,
+      voucherNumber: candidate,
+    });
+    if (!existing) return candidate;
+    seq++;
+  }
+  // Fall back to a timestamp-based suffix if we somehow can't find a free slot
+  return `${prefix}/${fyShort}/T${Date.now().toString().slice(-7)}`;
+}
+
+async function createVoucherWithRetry(
+  payload,
+  voucherType,
+  companyId,
+  attempts = 5,
+) {
+  for (let i = 0; i < attempts; i++) {
+    const voucherNumber = await getNextVoucherNumberSafe(
+      companyId,
+      voucherType,
+    );
+    try {
+      const voucher = await TallyVoucher.create({ ...payload, voucherNumber });
+      return voucher;
+    } catch (e) {
+      const isDup =
+        e &&
+        (e.code === 11000 || /E11000|duplicate key/i.test(e.message || ""));
+      if (!isDup || i === attempts - 1) throw e;
+      // small jitter sleep so concurrent callers diverge
+      await new Promise((r) => setTimeout(r, 25 + Math.random() * 50));
+    }
+  }
+  throw new Error(
+    "Could not allocate a unique voucher number after multiple attempts.",
+  );
+}
+
+async function postPayrollRun(companyId, run, items, opts = {}) {
+  // Look at existing vouchers for this run
+  const existingVouchers = await TallyVoucher.find({
+    companyId,
+    sourceSystem: "auto_from_payroll",
+    sourceId: run._id,
+    status: { $ne: "cancelled" }, // ignore cancelled — they don't block re-post
+  }).lean();
+  const existingKinds = new Set(
+    existingVouchers
+      .map((v) => (v.sourceReference || "").split("/").pop())
+      .filter(Boolean),
+  );
+
+  const built = await buildPayrollVouchers(companyId, run, items, opts);
+
+  const created = [];
+  const skipped = [];
+
+  for (const v of built.vouchers) {
+    if (existingKinds.has(v.kind)) {
+      skipped.push({ kind: v.kind, reason: "already posted" });
+      continue;
+    }
+    const voucher = await createVoucherWithRetry(
+      {
+        companyId,
+        voucherType: v.voucherType,
+        voucherTypeName: v.voucherTypeName,
+        voucherDate: v.voucherDate,
+        ledgerEntries: v.entries,
+        grandTotal: v.grandTotal,
+        narration: v.narration,
+        status: "posted",
+        sourceSystem: "auto_from_payroll",
+        sourceId: run._id,
+        sourceReference: `Payroll/${run.payPeriod || `${run.year}-${run.month}`}/${v.kind}`,
+        postedAt: new Date(),
+      },
+      v.voucherType,
+      companyId,
+    );
+
+    // Apply ledger balance changes
+    for (const entry of v.entries) {
+      const signed = entry.type === "Dr" ? entry.amount : -entry.amount;
+      await TallyLedger.findByIdAndUpdate(entry.ledgerId, {
+        $inc: { currentBalance: signed },
+      });
+    }
+    created.push({
+      kind: v.kind,
+      voucherNumber: voucher.voucherNumber,
+      voucherId: voucher._id,
+    });
+  }
+
+  return { created, skipped, totals: built.totals };
+}
+
 // ── POST /payroll/runs/:runId/post ────────────────────────────────────────
 router.post("/payroll/runs/:runId/post", async (req, res) => {
   try {
-    const { companyId } = req.body;
+    const { companyId, bankLedgerId } = req.body;
     if (!companyId)
       return res
         .status(400)
@@ -1599,20 +1975,6 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "HR/Payroll module not available." });
-
-    // Idempotency check
-    const existing = await TallyVoucher.findOne({
-      companyId,
-      sourceSystem: "auto_from_payroll",
-      sourceId: req.params.runId,
-    }).lean();
-    if (existing) {
-      return res.json({
-        success: true,
-        alreadyPosted: true,
-        voucher: existing,
-      });
-    }
 
     const run = await HR.Payroll.findById(req.params.runId).lean();
     if (!run)
@@ -1628,43 +1990,33 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Payroll run has no items to post." });
 
-    const built = await buildPayrollVoucher(companyId, run, items);
-
-    // Get next voucher number for type "journal"
-    const voucherNumber = await TallyVoucher.nextVoucherNumber(
-      companyId,
-      "journal",
-    );
-
-    const voucher = await TallyVoucher.create({
-      companyId,
-      voucherType: "journal",
-      voucherTypeName: "Journal",
-      voucherNumber,
-      voucherDate: built.voucherDate,
-      ledgerEntries: built.entries,
-      grandTotal: built.totals.gross,
-      narration: `Salary for ${run.payPeriod || `${run.year}-${run.month}`} — ${items.length} employees`,
-      status: "posted",
-      sourceSystem: "auto_from_payroll",
-      sourceId: req.params.runId,
-      sourceReference: `Payroll/${run.payPeriod || `${run.year}-${run.month}`}`,
-      postedAt: new Date(),
-    });
-
-    // Update ledger currentBalance for each affected ledger
-    for (const entry of built.entries) {
-      const signed = entry.type === "Dr" ? entry.amount : -entry.amount;
-      await TallyLedger.findByIdAndUpdate(entry.ledgerId, {
-        $inc: { currentBalance: signed },
-      });
+    let result;
+    try {
+      result = await postPayrollRun(companyId, run, items, { bankLedgerId });
+    } catch (e) {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: e.message,
+          bankSetupNeeded: /bank/i.test(e.message),
+        });
     }
 
+    if (result.created.length === 0) {
+      return res.json({
+        success: true,
+        alreadyPosted: true,
+        skipped: result.skipped,
+        message: "No new vouchers needed — already up to date.",
+      });
+    }
     res.json({
       success: true,
-      voucher,
       alreadyPosted: false,
-      message: `Posted voucher ${voucherNumber}`,
+      created: result.created,
+      skipped: result.skipped,
+      message: `Posted ${result.created.length} voucher(s): ${result.created.map((c) => `${c.kind} (${c.voucherNumber})`).join(", ")}`,
     });
   } catch (err) {
     console.error("Post payroll:", err);
@@ -1693,29 +2045,8 @@ router.post("/payroll/runs/post-all", async (req, res) => {
       .sort({ year: 1, month: 1 })
       .lean();
 
-    const runIds = runs.map((r) => r._id);
-    const alreadyPostedIds = new Set(
-      (
-        await TallyVoucher.find({
-          companyId,
-          sourceSystem: "auto_from_payroll",
-          sourceId: { $in: runIds },
-        })
-          .select("sourceId")
-          .lean()
-      ).map((v) => String(v.sourceId)),
-    );
-
     const results = [];
     for (const run of runs) {
-      if (alreadyPostedIds.has(String(run._id))) {
-        results.push({
-          runId: run._id,
-          payPeriod: run.payPeriod,
-          status: "already_posted",
-        });
-        continue;
-      }
       try {
         const items = await HR.PayrollItem.find({ payrollId: run._id }).lean();
         if (items.length === 0) {
@@ -1726,38 +2057,22 @@ router.post("/payroll/runs/post-all", async (req, res) => {
           });
           continue;
         }
-        const built = await buildPayrollVoucher(companyId, run, items);
-        const voucherNumber = await TallyVoucher.nextVoucherNumber(
-          companyId,
-          "journal",
-        );
-        const voucher = await TallyVoucher.create({
-          companyId,
-          voucherType: "journal",
-          voucherTypeName: "Journal",
-          voucherNumber,
-          voucherDate: built.voucherDate,
-          ledgerEntries: built.entries,
-          grandTotal: built.totals.gross,
-          narration: `Salary for ${run.payPeriod || `${run.year}-${run.month}`} — ${items.length} employees`,
-          status: "posted",
-          sourceSystem: "auto_from_payroll",
-          sourceId: run._id,
-          sourceReference: `Payroll/${run.payPeriod || `${run.year}-${run.month}`}`,
-          postedAt: new Date(),
-        });
-        for (const entry of built.entries) {
-          const signed = entry.type === "Dr" ? entry.amount : -entry.amount;
-          await TallyLedger.findByIdAndUpdate(entry.ledgerId, {
-            $inc: { currentBalance: signed },
+        const r = await postPayrollRun(companyId, run, items, {});
+        if (r.created.length === 0) {
+          results.push({
+            runId: run._id,
+            payPeriod: run.payPeriod,
+            status: "already_posted",
+          });
+        } else {
+          results.push({
+            runId: run._id,
+            payPeriod: run.payPeriod,
+            status: "posted",
+            createdKinds: r.created.map((c) => c.kind),
+            voucherNumbers: r.created.map((c) => c.voucherNumber),
           });
         }
-        results.push({
-          runId: run._id,
-          payPeriod: run.payPeriod,
-          status: "posted",
-          voucherNumber,
-        });
       } catch (e) {
         results.push({
           runId: run._id,
@@ -1786,7 +2101,69 @@ router.post("/payroll/runs/post-all", async (req, res) => {
   }
 });
 
-// ── POST /payroll/runs/:runId/unpost — void the auto-created voucher ──────
+// ── POST /payroll/cleanup — emergency reset
+// Removes ALL auto_from_payroll vouchers for a company (both active and
+// cancelled), reverses ledger balances of any still-active ones, and frees
+// up the voucher numbers. Use this when previous post/unpost attempts have
+// left the database in an inconsistent state (typically: duplicate-key
+// errors after multiple failed unposts).
+router.post("/payroll/cleanup", async (req, res) => {
+  try {
+    const { companyId, confirm } = req.body;
+    if (!companyId)
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+    if (confirm !== "RESET_PAYROLL_VOUCHERS") {
+      return res.status(400).json({
+        success: false,
+        message:
+          "This is destructive. Pass confirm: 'RESET_PAYROLL_VOUCHERS' to proceed.",
+      });
+    }
+
+    const vouchers = await TallyVoucher.find({
+      companyId,
+      sourceSystem: "auto_from_payroll",
+    });
+
+    let reversedCount = 0;
+    for (const v of vouchers) {
+      if (v.status !== "cancelled") {
+        for (const entry of v.ledgerEntries) {
+          const signed = entry.type === "Dr" ? -entry.amount : entry.amount;
+          await TallyLedger.findByIdAndUpdate(entry.ledgerId, {
+            $inc: { currentBalance: signed },
+          });
+        }
+        reversedCount++;
+      }
+      await TallyVoucher.deleteOne({ _id: v._id });
+    }
+
+    res.json({
+      success: true,
+      message: `Cleaned up ${vouchers.length} payroll voucher(s) (${reversedCount} balances reversed). Now click "Post all" to re-post fresh.`,
+      removed: vouchers.length,
+      balancesReversed: reversedCount,
+    });
+  } catch (err) {
+    console.error("Payroll cleanup:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── POST /payroll/runs/:runId/unpost — cancel ALL auto-created vouchers
+// (a paid run can have BOTH a journal and a payment voucher; we reverse both).
+//
+// We HARD DELETE these vouchers (rather than soft-cancel) because:
+//   • They were never human-entered — the payroll run is the source of truth
+//   • A soft-cancelled voucher still occupies its (companyId, voucherType,
+//     voucherNumber) slot in the unique index, which causes "duplicate key"
+//     errors on the next post attempt because the model's nextVoucherNumber
+//     looks at most-recently-created (not max-numeric), and finding a
+//     cancelled voucher with number N can mislead it into returning N+1
+//     when N+1 is also already taken (cancelled).
 router.post("/payroll/runs/:runId/unpost", async (req, res) => {
   try {
     const { companyId } = req.body;
@@ -1795,40 +2172,1104 @@ router.post("/payroll/runs/:runId/unpost", async (req, res) => {
         .status(400)
         .json({ success: false, message: "companyId required" });
 
-    const voucher = await TallyVoucher.findOne({
+    // Match BOTH active and cancelled vouchers — we want to clean up whatever's
+    // there. Reverse balances only for vouchers that are currently posted.
+    const vouchers = await TallyVoucher.find({
       companyId,
       sourceSystem: "auto_from_payroll",
       sourceId: req.params.runId,
     });
-    if (!voucher)
+    if (vouchers.length === 0)
       return res
         .status(404)
-        .json({
-          success: false,
-          message: "No posted voucher found for this run.",
+        .json({ success: false, message: "No vouchers found for this run." });
+
+    const reversed = [];
+    const deleted = [];
+    for (const voucher of vouchers) {
+      // If still active (posted), reverse its ledger balance impact first.
+      if (voucher.status !== "cancelled") {
+        for (const entry of voucher.ledgerEntries) {
+          const signed = entry.type === "Dr" ? -entry.amount : entry.amount;
+          await TallyLedger.findByIdAndUpdate(entry.ledgerId, {
+            $inc: { currentBalance: signed },
+          });
+        }
+        reversed.push(voucher.voucherNumber);
+      }
+      // Hard delete so the voucher number is freed for re-post
+      await TallyVoucher.deleteOne({ _id: voucher._id });
+      deleted.push({
+        voucherNumber: voucher.voucherNumber,
+        kind: (voucher.sourceReference || "").split("/").pop(),
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Removed ${deleted.length} voucher(s): ${deleted.map((d) => `${d.kind} (${d.voucherNumber})`).join(", ")}`,
+      deleted,
+      reversed,
+    });
+  } catch (err) {
+    console.error("Unpost payroll:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MANUFACTURING CHART SEEDER
+//
+// POST /seed-manufacturing
+//   Body: { companyId, dryRun? }
+//
+// Populates the chart with the standard manufacturing-industry set of
+// sub-groups + ledgers, layered on top of the 28 default Tally primary groups
+// that are auto-seeded when a company is created.
+//
+// Idempotent — running twice does not duplicate. For each item:
+//   1. Look up the group/ledger by (companyId, exact name)
+//   2. If it already exists, skip
+//   3. Otherwise create it under the resolved parent
+//
+// Returns counts of what was created and what was skipped.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The chart, as a flat list of (parent → children) instructions.
+// `kind` is "group" or "ledger".  `parent` is the NAME of an existing group
+// (created earlier in the array, or one of the 28 default Tally groups).
+const MANUFACTURING_CHART = [
+  // ── ASSETS ────────────────────────────────────────────────────────────────
+  { kind: "ledger", parent: "Cash-in-Hand", name: "Cash in Hand" },
+  {
+    kind: "ledger",
+    parent: "Bank Accounts",
+    name: "Bank Account",
+    note: "Add specific bank ledgers (e.g. HDFC Current A/c) here",
+  },
+
+  // Inventory under Stock-in-Hand
+  { kind: "group", parent: "Stock-in-Hand", name: "Inventory" },
+  { kind: "ledger", parent: "Inventory", name: "Raw Materials" },
+  { kind: "ledger", parent: "Inventory", name: "Work-in-Progress" },
+  { kind: "ledger", parent: "Inventory", name: "Finished Goods" },
+  { kind: "ledger", parent: "Inventory", name: "Stores & Spares" },
+  { kind: "ledger", parent: "Inventory", name: "Packing Materials" },
+
+  // Loans & Advances + GST Input
+  {
+    kind: "ledger",
+    parent: "Loans & Advances (Asset)",
+    name: "Advances to Suppliers",
+  },
+  {
+    kind: "ledger",
+    parent: "Loans & Advances (Asset)",
+    name: "Employee Advances",
+  },
+  { kind: "group", parent: "Loans & Advances (Asset)", name: "GST Input" },
+  {
+    kind: "ledger",
+    parent: "GST Input",
+    name: "CGST Input",
+    gstApplicable: true,
+  },
+  {
+    kind: "ledger",
+    parent: "GST Input",
+    name: "SGST Input",
+    gstApplicable: true,
+  },
+  {
+    kind: "ledger",
+    parent: "GST Input",
+    name: "IGST Input",
+    gstApplicable: true,
+  },
+
+  // Bills Receivable + Other Current Assets
+  { kind: "group", parent: "Current Assets", name: "Other Current Assets" },
+  { kind: "ledger", parent: "Other Current Assets", name: "Prepaid Expenses" },
+  { kind: "ledger", parent: "Other Current Assets", name: "Accrued Income" },
+  { kind: "ledger", parent: "Other Current Assets", name: "Bills Receivable" },
+
+  // Fixed Assets
+  { kind: "ledger", parent: "Fixed Assets", name: "Land" },
+  { kind: "ledger", parent: "Fixed Assets", name: "Building" },
+  { kind: "ledger", parent: "Fixed Assets", name: "Plant & Machinery" },
+  { kind: "ledger", parent: "Fixed Assets", name: "Furniture & Fixtures" },
+  { kind: "ledger", parent: "Fixed Assets", name: "Vehicles" },
+  { kind: "ledger", parent: "Fixed Assets", name: "Office Equipment" },
+  { kind: "ledger", parent: "Fixed Assets", name: "Capital Work-in-Progress" },
+
+  { kind: "group", parent: "Fixed Assets", name: "Intangible Assets" },
+  { kind: "ledger", parent: "Intangible Assets", name: "Software" },
+  { kind: "ledger", parent: "Intangible Assets", name: "Patents" },
+
+  // Investments
+  { kind: "ledger", parent: "Investments", name: "Long-term Investments" },
+
+  // ── LIABILITIES ──────────────────────────────────────────────────────────
+  // Duties & Taxes
+  { kind: "group", parent: "Duties & Taxes", name: "GST Payable" },
+  {
+    kind: "ledger",
+    parent: "GST Payable",
+    name: "CGST Payable",
+    gstApplicable: true,
+  },
+  {
+    kind: "ledger",
+    parent: "GST Payable",
+    name: "SGST Payable",
+    gstApplicable: true,
+  },
+  {
+    kind: "ledger",
+    parent: "GST Payable",
+    name: "IGST Payable",
+    gstApplicable: true,
+  },
+  { kind: "ledger", parent: "Duties & Taxes", name: "Income Tax Payable" },
+  { kind: "ledger", parent: "Duties & Taxes", name: "TDS Payable" },
+  { kind: "ledger", parent: "Duties & Taxes", name: "PF Payable" },
+  { kind: "ledger", parent: "Duties & Taxes", name: "ESI Payable" },
+
+  // Provisions
+  { kind: "ledger", parent: "Provisions", name: "Salary Payable" },
+  { kind: "ledger", parent: "Provisions", name: "Expenses Payable" },
+  { kind: "ledger", parent: "Provisions", name: "Gratuity Provision" },
+  { kind: "ledger", parent: "Provisions", name: "Deferred Tax Liability" },
+
+  // Other current liabilities
+  {
+    kind: "group",
+    parent: "Current Liabilities",
+    name: "Other Current Liabilities",
+  },
+  {
+    kind: "ledger",
+    parent: "Other Current Liabilities",
+    name: "Advances from Customers",
+  },
+
+  // Long-term borrowings (use existing Secured Loans default group)
+  { kind: "ledger", parent: "Secured Loans", name: "Term Loan – Bank" },
+
+  // Equity / Capital
+  { kind: "ledger", parent: "Capital Account", name: "Share Capital" },
+  { kind: "ledger", parent: "Reserves & Surplus", name: "Retained Earnings" },
+  { kind: "ledger", parent: "Reserves & Surplus", name: "General Reserve" },
+
+  // ── REVENUE ──────────────────────────────────────────────────────────────
+  {
+    kind: "ledger",
+    parent: "Sales Accounts",
+    name: "Domestic Sales",
+    gstApplicable: true,
+  },
+  {
+    kind: "ledger",
+    parent: "Sales Accounts",
+    name: "Export Sales",
+    gstApplicable: true,
+  },
+  { kind: "ledger", parent: "Direct Incomes", name: "Scrap Sales" },
+  { kind: "ledger", parent: "Direct Incomes", name: "Job Work Income" },
+  { kind: "ledger", parent: "Indirect Incomes", name: "Interest Income" },
+  { kind: "ledger", parent: "Indirect Incomes", name: "Miscellaneous Income" },
+
+  // ── EXPENSES ─────────────────────────────────────────────────────────────
+  // Direct Expenses → Factory Overheads, Production Expenses
+  { kind: "group", parent: "Direct Expenses", name: "Factory Overheads" },
+  { kind: "ledger", parent: "Factory Overheads", name: "Indirect Wages" },
+  {
+    kind: "ledger",
+    parent: "Factory Overheads",
+    name: "Repairs & Maintenance (Plant)",
+  },
+  { kind: "ledger", parent: "Factory Overheads", name: "Consumables" },
+  { kind: "ledger", parent: "Factory Overheads", name: "Factory Insurance" },
+
+  { kind: "group", parent: "Direct Expenses", name: "Production Expenses" },
+  {
+    kind: "ledger",
+    parent: "Production Expenses",
+    name: "Quality Control Expenses",
+  },
+  {
+    kind: "ledger",
+    parent: "Production Expenses",
+    name: "Production Supplies",
+  },
+
+  // Indirect Expenses → Admin / Selling / Depreciation / Finance
+  {
+    kind: "group",
+    parent: "Indirect Expenses",
+    name: "Administrative Expenses",
+  },
+  {
+    kind: "ledger",
+    parent: "Administrative Expenses",
+    name: "Salaries (Office Staff)",
+  },
+  { kind: "ledger", parent: "Administrative Expenses", name: "Office Rent" },
+  {
+    kind: "ledger",
+    parent: "Administrative Expenses",
+    name: "Printing & Stationery",
+  },
+  { kind: "ledger", parent: "Administrative Expenses", name: "Audit Fees" },
+  { kind: "ledger", parent: "Administrative Expenses", name: "Legal Charges" },
+
+  {
+    kind: "group",
+    parent: "Indirect Expenses",
+    name: "Selling & Distribution Expenses",
+  },
+  {
+    kind: "ledger",
+    parent: "Selling & Distribution Expenses",
+    name: "Sales Commission",
+  },
+  {
+    kind: "ledger",
+    parent: "Selling & Distribution Expenses",
+    name: "Freight & Transportation",
+  },
+  {
+    kind: "ledger",
+    parent: "Selling & Distribution Expenses",
+    name: "Advertisement & Marketing",
+  },
+  {
+    kind: "ledger",
+    parent: "Selling & Distribution Expenses",
+    name: "Packing & Forwarding",
+  },
+
+  { kind: "group", parent: "Indirect Expenses", name: "Depreciation" },
+  {
+    kind: "ledger",
+    parent: "Depreciation",
+    name: "Depreciation – Plant & Machinery",
+  },
+  { kind: "ledger", parent: "Depreciation", name: "Depreciation – Building" },
+  { kind: "ledger", parent: "Depreciation", name: "Depreciation – Vehicles" },
+
+  { kind: "group", parent: "Indirect Expenses", name: "Finance Costs" },
+  { kind: "ledger", parent: "Finance Costs", name: "Interest on Loans" },
+  { kind: "ledger", parent: "Finance Costs", name: "Bank Charges" },
+];
+
+router.post("/seed-manufacturing", async (req, res) => {
+  try {
+    const { companyId, dryRun } = req.body;
+    if (!companyId)
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+
+    // Confirm the 28 default groups are present — otherwise this seeder
+    // can't anchor anything (it presumes parents like "Current Assets" exist).
+    const existingGroups = await TallyGroup.find({
+      companyId,
+      isActive: true,
+    }).lean();
+    if (existingGroups.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Default Tally groups missing. They get auto-seeded when a company is created. Re-create the company or seed the defaults first.",
+      });
+    }
+
+    // Build a lookup by name (case-insensitive). We update this as we create new groups.
+    const groupByName = new Map(
+      existingGroups.map((g) => [g.name.toLowerCase(), g]),
+    );
+
+    // Existing ledgers — needed for idempotency
+    const existingLedgers = await TallyLedger.find({
+      companyId,
+      isActive: true,
+    })
+      .select("name")
+      .lean();
+    const ledgerNameSet = new Set(
+      existingLedgers.map((l) => l.name.toLowerCase()),
+    );
+
+    const results = {
+      groupsCreated: [],
+      groupsSkipped: [],
+      ledgersCreated: [],
+      ledgersSkipped: [],
+      errors: [],
+    };
+
+    for (const item of MANUFACTURING_CHART) {
+      try {
+        const parent = groupByName.get(item.parent.toLowerCase());
+        if (!parent) {
+          results.errors.push({
+            item: item.name,
+            reason: `Parent group "${item.parent}" not found`,
+          });
+          continue;
+        }
+
+        if (item.kind === "group") {
+          if (groupByName.has(item.name.toLowerCase())) {
+            results.groupsSkipped.push(item.name);
+            continue;
+          }
+          if (dryRun) {
+            results.groupsCreated.push(item.name);
+            continue;
+          }
+
+          const doc = await TallyGroup.create({
+            companyId,
+            name: item.name,
+            parent: parent._id,
+            parentName: parent.name,
+            isPrimary: false,
+            isReserved: false,
+            nature: parent.nature,
+            level: (parent.level || 1) + 1,
+            fullPath: `${parent.fullPath || parent.name} > ${item.name}`,
+            description: item.note || `Auto-seeded — Manufacturing chart`,
+          });
+          groupByName.set(item.name.toLowerCase(), doc.toObject());
+          results.groupsCreated.push(item.name);
+        } else if (item.kind === "ledger") {
+          if (ledgerNameSet.has(item.name.toLowerCase())) {
+            results.ledgersSkipped.push(item.name);
+            continue;
+          }
+          if (dryRun) {
+            results.ledgersCreated.push(item.name);
+            continue;
+          }
+
+          await TallyLedger.create({
+            companyId,
+            name: item.name,
+            groupId: parent._id,
+            groupName: parent.name,
+            nature: parent.nature,
+            openingBalance: 0,
+            openingBalanceType:
+              parent.nature === "asset" || parent.nature === "expense"
+                ? "Dr"
+                : "Cr",
+            currentBalance: 0,
+            currentBalanceType:
+              parent.nature === "asset" || parent.nature === "expense"
+                ? "Dr"
+                : "Cr",
+            gstApplicable: !!item.gstApplicable,
+            isActive: true,
+            notes: item.note || "Auto-seeded — Manufacturing chart",
+          });
+          ledgerNameSet.add(item.name.toLowerCase());
+          results.ledgersCreated.push(item.name);
+        }
+      } catch (e) {
+        results.errors.push({ item: item.name, reason: e.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      dryRun: !!dryRun,
+      summary: {
+        groupsCreated: results.groupsCreated.length,
+        groupsSkipped: results.groupsSkipped.length,
+        ledgersCreated: results.ledgersCreated.length,
+        ledgersSkipped: results.ledgersSkipped.length,
+        errors: results.errors.length,
+      },
+      details: results,
+    });
+  } catch (err) {
+    console.error("Seed manufacturing:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARTIES → LEDGERS sync
+//
+//   GET  /parties/preview        — what would be created (dry-run)
+//   POST /parties/sync           — actually create the missing ledgers
+//
+// Mirrors the payroll bridge philosophy: the CMS has its own Customer and
+// Vendor collections; the chart of accounts has TallyLedger. Without a bridge
+// the Sundry Debtors group is empty even though you have customers.
+//
+// What this does:
+//   • Pulls every Customer  → ensures a ledger under "Sundry Debtors"  exists
+//   • Pulls every Vendor    → ensures a ledger under "Sundry Creditors" exists
+//
+// Idempotency: link by `linkedCustomerId` / `linkedVendorId` first, then by
+// exact name match. Existing ledgers are updated (in sync mode) with the
+// latest contact info; never duplicated.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function loadCustomerModel() {
+  try {
+    return require("../../models/Customer_Models/Customer");
+  } catch {
+    return null;
+  }
+}
+function loadVendorModel() {
+  try {
+    return require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
+  } catch {
+    return null;
+  }
+}
+
+// Choose the best display-name for a party. Customer model uses `name`;
+// Vendor uses `companyName`. Fall back to email/phone if neither is set.
+function partyDisplayName(p, kind) {
+  if (kind === "customer")
+    return p.name || p.email || p.phone || "Unnamed Customer";
+  return p.companyName || p.contactPerson || p.email || "Unnamed Vendor";
+}
+
+// Build the ledger payload from a customer/vendor record
+function buildPartyLedger(p, kind, parentGroup, companyId) {
+  const name = partyDisplayName(p, kind);
+  const isCustomer = kind === "customer";
+  return {
+    companyId,
+    name,
+    groupId: parentGroup._id,
+    groupName: parentGroup.name,
+    nature: parentGroup.nature, // asset for debtors, liability for creditors
+    openingBalance: 0,
+    openingBalanceType: isCustomer ? "Dr" : "Cr",
+    currentBalance: 0,
+    currentBalanceType: isCustomer ? "Dr" : "Cr",
+    billWiseEnabled: true, // party ledgers always bill-wise
+    gstApplicable: !!(p.gstNumber || p.gstin),
+    gstin: p.gstNumber || p.gstin || "",
+    panNumber: p.panNumber || p.pan || "",
+    contactDetails: {
+      contactPerson: p.contactPerson || "",
+      phone: p.phone || "",
+      email: p.email || "",
+      address:
+        typeof p.address === "string"
+          ? p.address
+          : (p.address &&
+              (p.address.line1 ||
+                p.address.street ||
+                JSON.stringify(p.address))) ||
+            "",
+    },
+    [isCustomer ? "linkedCustomerId" : "linkedVendorId"]: p._id,
+    isActive: true,
+    notes: `Auto-synced from CMS ${isCustomer ? "Customer" : "Vendor"} record on ${new Date().toISOString().slice(0, 10)}`,
+  };
+}
+
+// Decide the action for one party: create / update / skip
+async function reconcilePartyLedger(
+  party,
+  kind,
+  parentGroup,
+  companyId,
+  existingLedgers,
+  dryRun,
+) {
+  const linkField = kind === "customer" ? "linkedCustomerId" : "linkedVendorId";
+  const partyId = String(party._id);
+  const displayName = partyDisplayName(party, kind);
+
+  // 1) Try to find by linkage
+  let existing = existingLedgers.find(
+    (l) => String(l[linkField] || "") === partyId,
+  );
+  // 2) Fall back to exact name match (case-insensitive). If we find one, link it.
+  if (!existing) {
+    existing = existingLedgers.find(
+      (l) =>
+        l.groupId &&
+        String(l.groupId) === String(parentGroup._id) &&
+        l.name.toLowerCase() === displayName.toLowerCase(),
+    );
+  }
+
+  if (existing) {
+    // Already linked — nothing to do beyond optionally refreshing contact info
+    return {
+      kind: "exists",
+      name: existing.name,
+      ledgerId: existing._id,
+      partyId,
+    };
+  }
+
+  if (dryRun) {
+    return { kind: "to_create", name: displayName, partyId };
+  }
+
+  const payload = buildPartyLedger(party, kind, parentGroup, companyId);
+  const ledger = await TallyLedger.create(payload);
+  existingLedgers.push(ledger.toObject()); // grow cache so duplicate-name parties don't double-create
+  return { kind: "created", name: ledger.name, ledgerId: ledger._id, partyId };
+}
+
+// ── GET /parties/preview ─────────────────────────────────────────────────
+router.get("/parties/preview", async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+    return doPartiesSync(req, res, companyId, true);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── POST /parties/sync ───────────────────────────────────────────────────
+router.post("/parties/sync", async (req, res) => {
+  try {
+    const { companyId } = req.body;
+    if (!companyId)
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+    return doPartiesSync(req, res, companyId, false);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+async function doPartiesSync(req, res, companyId, dryRun) {
+  const Customer = loadCustomerModel();
+  const Vendor = loadVendorModel();
+
+  // Resolve target groups (must exist; they're system-reserved and seeded with the company)
+  const allGroups = await TallyGroup.find({ companyId, isActive: true }).lean();
+  const debtorsGroup = allGroups.find((g) => /^sundry debtors$/i.test(g.name));
+  const creditorsGroup = allGroups.find((g) =>
+    /^sundry creditors$/i.test(g.name),
+  );
+  if (!debtorsGroup || !creditorsGroup) {
+    return res.status(400).json({
+      success: false,
+      message:
+        "Sundry Debtors / Sundry Creditors groups missing. These should auto-seed when a company is created.",
+    });
+  }
+
+  // Pull existing party ledgers (we only care about the two groups)
+  const existingLedgers = await TallyLedger.find({
+    companyId,
+    isActive: true,
+    groupId: { $in: [debtorsGroup._id, creditorsGroup._id] },
+  }).lean();
+
+  const result = {
+    debtors: { created: [], existing: [], errors: [] },
+    creditors: { created: [], existing: [], errors: [] },
+    customerCount: 0,
+    vendorCount: 0,
+  };
+
+  // Customers
+  if (Customer) {
+    const customers = await Customer.find({}).lean();
+    result.customerCount = customers.length;
+    for (const c of customers) {
+      try {
+        const r = await reconcilePartyLedger(
+          c,
+          "customer",
+          debtorsGroup,
+          companyId,
+          existingLedgers,
+          dryRun,
+        );
+        if (r.kind === "created" || r.kind === "to_create")
+          result.debtors.created.push(r);
+        else if (r.kind === "exists") result.debtors.existing.push(r);
+      } catch (e) {
+        result.debtors.errors.push({
+          name: partyDisplayName(c, "customer"),
+          reason: e.message,
+        });
+      }
+    }
+  } else {
+    result.debtors.errors.push({
+      name: "Customer model",
+      reason: "Customer model not available in this environment.",
+    });
+  }
+
+  // Vendors
+  if (Vendor) {
+    const vendors = await Vendor.find({}).lean();
+    result.vendorCount = vendors.length;
+    for (const v of vendors) {
+      try {
+        const r = await reconcilePartyLedger(
+          v,
+          "vendor",
+          creditorsGroup,
+          companyId,
+          existingLedgers,
+          dryRun,
+        );
+        if (r.kind === "created" || r.kind === "to_create")
+          result.creditors.created.push(r);
+        else if (r.kind === "exists") result.creditors.existing.push(r);
+      } catch (e) {
+        result.creditors.errors.push({
+          name: partyDisplayName(v, "vendor"),
+          reason: e.message,
+        });
+      }
+    }
+  } else {
+    result.creditors.errors.push({
+      name: "Vendor model",
+      reason: "Vendor model not available in this environment.",
+    });
+  }
+
+  res.json({
+    success: true,
+    dryRun,
+    summary: {
+      customersFound: result.customerCount,
+      vendorsFound: result.vendorCount,
+      debtorLedgersToCreate: result.debtors.created.length,
+      debtorLedgersExisting: result.debtors.existing.length,
+      creditorLedgersToCreate: result.creditors.created.length,
+      creditorLedgersExisting: result.creditors.existing.length,
+      errors: result.debtors.errors.length + result.creditors.errors.length,
+    },
+    details: result,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GSTIN LOOKUP & VALIDATION
+//
+// GET /gstin-lookup/:gstin
+//
+// Two-tier strategy:
+//
+//   TIER 1 — Offline parsing (free, always available)
+//     Every GSTIN encodes structured data:
+//       positions 1-2  = state code      → we know all 36 states/UTs
+//       positions 3-12 = embedded PAN
+//       position 13    = entity number for this PAN at this state
+//       position 14    = "Z" by default
+//       position 15    = check digit (mod-36 algorithm)
+//     We validate format + checksum and decode state + PAN. This catches
+//     virtually all typos. No external call.
+//
+//   TIER 2 — External provider (optional, only if env-configured)
+//     If GSTIN_LOOKUP_API_URL and GSTIN_LOOKUP_API_KEY are set in your .env,
+//     the endpoint also fetches business name / trade name / address /
+//     registration status from the configured provider. The official GSTN
+//     Public API requires a GSP licence (months of paperwork); paid resellers
+//     like KnowYourGST, ClearTax, Masters India, GSTSearchonline, and Surepass
+//     work out of the box for a few rupees per lookup.
+//
+//     Provider call shape (overridable by env):
+//       GSTIN_LOOKUP_METHOD       = "GET" | "POST"  (default GET)
+//       GSTIN_LOOKUP_API_URL      = full URL with {GSTIN} placeholder
+//                                   e.g. "https://api.example.com/gstin/{GSTIN}"
+//       GSTIN_LOOKUP_API_KEY      = API key
+//       GSTIN_LOOKUP_API_KEY_HDR  = header name (default "X-API-Key")
+//
+//     The endpoint expects JSON back. It tries common field names — adjust
+//     the field-mapping section if your provider uses different keys.
+//
+// If neither tier succeeds (invalid GSTIN format), we return a helpful error.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GST_STATE_CODES = {
+  "01": "Jammu & Kashmir",
+  "02": "Himachal Pradesh",
+  "03": "Punjab",
+  "04": "Chandigarh",
+  "05": "Uttarakhand",
+  "06": "Haryana",
+  "07": "Delhi",
+  "08": "Rajasthan",
+  "09": "Uttar Pradesh",
+  10: "Bihar",
+  11: "Sikkim",
+  12: "Arunachal Pradesh",
+  13: "Nagaland",
+  14: "Manipur",
+  15: "Mizoram",
+  16: "Tripura",
+  17: "Meghalaya",
+  18: "Assam",
+  19: "West Bengal",
+  20: "Jharkhand",
+  21: "Odisha",
+  22: "Chhattisgarh",
+  23: "Madhya Pradesh",
+  24: "Gujarat",
+  25: "Daman & Diu",
+  26: "Dadra & Nagar Haveli",
+  27: "Maharashtra",
+  28: "Andhra Pradesh (Old)",
+  29: "Karnataka",
+  30: "Goa",
+  31: "Lakshadweep",
+  32: "Kerala",
+  33: "Tamil Nadu",
+  34: "Puducherry",
+  35: "Andaman & Nicobar",
+  36: "Telangana",
+  37: "Andhra Pradesh",
+  38: "Ladakh",
+  97: "Other Territory",
+  99: "Centre Jurisdiction",
+};
+
+function gstinChecksumValid(gstin) {
+  // Official GSTN algorithm: base-36 over the first 14 chars, weighted alternating
+  // 1, 2, 1, 2, ... Final digit is the mod-36 check digit.
+  if (!/^[0-9A-Z]{15}$/.test(gstin)) return false;
+  const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let sum = 0;
+  for (let i = 0; i < 14; i++) {
+    let v = charset.indexOf(gstin[i]);
+    if (v < 0) return false;
+    v = v * (i % 2 === 0 ? 1 : 2);
+    v = Math.floor(v / 36) + (v % 36);
+    sum += v;
+  }
+  const expected = charset[(36 - (sum % 36)) % 36];
+  return expected === gstin[14];
+}
+
+function parseGstinOffline(gstin) {
+  if (!gstin || typeof gstin !== "string") {
+    return { valid: false, reason: "Empty or invalid input" };
+  }
+  const g = gstin.trim().toUpperCase();
+  if (!/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$/.test(g)) {
+    return {
+      valid: false,
+      reason:
+        "Invalid GSTIN format. Should be 15 chars: 2 digits (state) + 5 letters + 4 digits + 1 letter + 1 alphanum + 'Z' + 1 alphanum.",
+      gstin: g,
+    };
+  }
+  if (!gstinChecksumValid(g)) {
+    return {
+      valid: false,
+      reason:
+        "GSTIN checksum mismatch — last digit doesn't match the algorithm. Likely a typo.",
+      gstin: g,
+    };
+  }
+  const stateCode = g.slice(0, 2);
+  const stateName = GST_STATE_CODES[stateCode] || "Unknown";
+  const embeddedPAN = g.slice(2, 12);
+  const entityNumber = g[12]; // 1..9, A..Z — counts registrations under same PAN in this state
+  return {
+    valid: true,
+    gstin: g,
+    stateCode,
+    stateName,
+    embeddedPAN,
+    entityNumber,
+    panMatchesEmbedded: true, // caller can compare against any user-entered PAN
+  };
+}
+
+router.get("/gstin-lookup/:gstin", async (req, res) => {
+  try {
+    const offline = parseGstinOffline(req.params.gstin);
+    if (!offline.valid) {
+      return res.json({ success: false, source: "offline", ...offline });
+    }
+
+    const result = {
+      success: true,
+      source: "offline",
+      gstin: offline.gstin,
+      valid: true,
+      stateCode: offline.stateCode,
+      stateName: offline.stateName,
+      embeddedPAN: offline.embeddedPAN,
+      entityNumber: offline.entityNumber,
+      // Filled below if external API succeeds:
+      legalName: null,
+      tradeName: null,
+      address: null,
+      registrationStatus: null,
+      registrationDate: null,
+      taxpayerType: null,
+    };
+
+    // Tier 2 — external API (optional)
+    const apiUrl = process.env.GSTIN_LOOKUP_API_URL;
+    const apiKey = process.env.GSTIN_LOOKUP_API_KEY;
+    if (apiUrl && apiKey) {
+      try {
+        const url = apiUrl.replace(
+          "{GSTIN}",
+          encodeURIComponent(offline.gstin),
+        );
+        const method = (process.env.GSTIN_LOOKUP_METHOD || "GET").toUpperCase();
+        const keyHeader = process.env.GSTIN_LOOKUP_API_KEY_HDR || "X-API-Key";
+
+        // Use built-in fetch (Node 18+). If your runtime is older, install node-fetch.
+        const fetchFn =
+          typeof fetch !== "undefined" ? fetch : require("node-fetch");
+        const response = await fetchFn(url, {
+          method,
+          headers: {
+            [keyHeader]: apiKey,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body:
+            method === "POST"
+              ? JSON.stringify({ gstin: offline.gstin })
+              : undefined,
         });
 
-    // Reverse the ledger balances
-    for (const entry of voucher.ledgerEntries) {
-      const signed = entry.type === "Dr" ? -entry.amount : entry.amount;
+        if (response.ok) {
+          const data = await response.json();
+          // Most providers return either at the top level or nested under .data
+          const d = data.data || data.result || data.response || data;
+
+          // Try multiple common field names in priority order
+          result.legalName =
+            d.lgnm ||
+            d.legalName ||
+            d.legal_name ||
+            d.name ||
+            d.company_name ||
+            null;
+          result.tradeName =
+            d.tradeNam || d.tradeName || d.trade_name || d.tradingName || null;
+          result.registrationStatus =
+            d.sts || d.status || d.registrationStatus || null;
+          result.registrationDate =
+            d.rgdt || d.registrationDate || d.registration_date || null;
+          result.taxpayerType =
+            d.dty || d.taxpayerType || d.taxpayer_type || d.entityType || null;
+
+          // Address can come in many shapes — concatenate whatever's available
+          const addr =
+            d.pradr || d.principalAddress || d.address || d.addr || null;
+          if (addr) {
+            if (typeof addr === "string") {
+              result.address = addr;
+            } else {
+              const a = addr.adr || addr;
+              const parts = [
+                a.bnm,
+                a.bno,
+                a.flno,
+                a.st,
+                a.loc,
+                a.city,
+                a.dst,
+                a.stcd,
+                a.pncd,
+              ].filter(Boolean);
+              result.address = parts.join(", ") || JSON.stringify(addr);
+            }
+          }
+
+          if (result.legalName || result.tradeName)
+            result.source = "offline+api";
+        } else {
+          result.apiError = `Lookup provider returned ${response.status}`;
+        }
+      } catch (e) {
+        result.apiError = `Lookup provider call failed: ${e.message}`;
+      }
+    } else {
+      result.apiHint =
+        "Set GSTIN_LOOKUP_API_URL + GSTIN_LOOKUP_API_KEY in your .env to enable name/address auto-fill from a provider like KnowYourGST, ClearTax, Masters India, or Surepass.";
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error("GSTIN lookup:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/accountant/chart-of-accounts/ledgers/:id/transfer-balance
+//   Body: { destinationLedgerId, amount?, narration?, voucherDate? }
+//
+// Move balance (or part of it) from this ledger to another. Common use case:
+// accountant created the wrong ledger and posted entries against it; later
+// realises a different ledger should have received them. Rather than editing
+// every voucher, post a single "transfer" journal voucher that moves the net
+// balance to the correct ledger.
+//
+// What this does:
+//   • If amount is omitted, transfers the FULL current balance
+//   • Creates a journal voucher with two entries that net out the source's
+//     current balance and apply it to the destination
+//   • For an asset/expense source (Dr balance):  Dr destination / Cr source
+//   • For a liability/revenue source (Cr balance): Dr source / Cr destination
+//   • Updates currentBalance on both ledgers
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/ledgers/:id/transfer-balance", async (req, res) => {
+  try {
+    const {
+      destinationLedgerId,
+      amount: explicitAmount,
+      narration,
+      voucherDate,
+    } = req.body;
+    if (!destinationLedgerId)
+      return res
+        .status(400)
+        .json({ success: false, message: "destinationLedgerId required" });
+
+    const source = await TallyLedger.findById(req.params.id);
+    if (!source || !source.isActive)
+      return res
+        .status(404)
+        .json({ success: false, message: "Source ledger not found" });
+
+    const dest = await TallyLedger.findById(destinationLedgerId);
+    if (!dest || !dest.isActive)
+      return res
+        .status(404)
+        .json({ success: false, message: "Destination ledger not found" });
+    if (String(source.companyId) !== String(dest.companyId))
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "Source and destination must belong to the same company.",
+        });
+    if (String(source._id) === String(dest._id))
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "Source and destination cannot be the same ledger.",
+        });
+
+    // Resolve transfer amount.
+    // currentBalance is signed: +ve = Dr, -ve = Cr.
+    // We always transfer the absolute value.
+    const sourceBal = source.currentBalance || 0;
+    const fullAbs = Math.abs(sourceBal);
+    const amt =
+      explicitAmount != null ? Math.abs(parseFloat(explicitAmount)) : fullAbs;
+    if (!amt || amt <= 0)
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message:
+            "Source ledger has no balance to transfer (or invalid amount).",
+        });
+    if (amt > fullAbs + 0.01)
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: `Cannot transfer ${amt.toFixed(2)} — source balance is only ${fullAbs.toFixed(2)} ${sourceBal >= 0 ? "Dr" : "Cr"}.`,
+        });
+
+    // Determine entry types so the source moves toward zero.
+    // If source has Dr balance (+ve): we credit source to reduce → and debit destination
+    // If source has Cr balance (-ve): we debit source to reduce → and credit destination
+    const srcIsDr = sourceBal >= 0;
+    const sourceEntryType = srcIsDr ? "Cr" : "Dr"; // opposite to clear
+    const destEntryType = srcIsDr ? "Dr" : "Cr"; // mirror
+
+    const entries = [
+      {
+        ledgerId: source._id,
+        ledgerName: source.name,
+        groupName: source.groupName,
+        type: sourceEntryType,
+        amount: amt,
+      },
+      {
+        ledgerId: dest._id,
+        ledgerName: dest.name,
+        groupName: dest.groupName,
+        type: destEntryType,
+        amount: amt,
+      },
+    ];
+
+    const date = voucherDate ? new Date(voucherDate) : new Date();
+
+    const voucher = await createVoucherWithRetry(
+      {
+        companyId: source.companyId,
+        voucherType: "journal",
+        voucherTypeName: "Journal",
+        voucherDate: date,
+        ledgerEntries: entries,
+        grandTotal: amt,
+        narration:
+          narration || `Balance transfer: ${source.name} → ${dest.name}`,
+        status: "posted",
+        sourceSystem: "manual",
+        sourceReference: `Balance Transfer/${source.name}/${dest.name}`,
+        postedAt: new Date(),
+        createdBy: req.user?.id,
+      },
+      "journal",
+      source.companyId,
+    );
+
+    // Apply ledger balance changes
+    for (const entry of entries) {
+      const signed = entry.type === "Dr" ? entry.amount : -entry.amount;
       await TallyLedger.findByIdAndUpdate(entry.ledgerId, {
         $inc: { currentBalance: signed },
       });
     }
-
-    voucher.status = "cancelled";
-    voucher.cancelledAt = new Date();
-    voucher.cancellationReason =
-      req.body.reason || "Unposted via payroll → ledger UI";
-    await voucher.save();
+    // Refresh balanceType on both ledgers
+    for (const id of [source._id, dest._id]) {
+      const led = await TallyLedger.findById(id);
+      if (led) {
+        led.currentBalanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+        await led.save();
+      }
+    }
 
     res.json({
       success: true,
-      message: `Voucher ${voucher.voucherNumber} cancelled`,
-      voucher,
+      message: `Transferred ₹${amt.toFixed(2)} from "${source.name}" to "${dest.name}" via voucher ${voucher.voucherNumber}.`,
+      voucher: {
+        _id: voucher._id,
+        voucherNumber: voucher.voucherNumber,
+        voucherType: voucher.voucherType,
+        voucherDate: voucher.voucherDate,
+      },
     });
   } catch (err) {
-    console.error("Unpost payroll:", err);
+    console.error("Transfer balance:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
