@@ -7,6 +7,44 @@ const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Customer code — derived from MongoDB ObjectId, no schema change required.
+//
+// Why derive instead of store? Adding a new field to the Customer schema would
+// leave existing records with null codes and require a backfill migration.
+// Deriving is deterministic: every customer (existing or new) gets a stable,
+// unique, searchable code computed at read time.
+//
+// Algorithm: take the last 3 bytes (6 hex chars) of the ObjectId — that's the
+// counter portion, which is sequential — convert to base36, uppercase, pad to
+// 5 chars. Result: "C-12K6B" (~16M unique codes per company, plenty).
+//
+// Searchability: the user can search by full code "C-12K6B" or just "12K6B" —
+// the search handler matches either form against the computed codes of all
+// customers.
+// ─────────────────────────────────────────────────────────────────────────────
+function customerCodeForId(objectId) {
+  const hex = String(objectId).slice(-6);
+  const num = parseInt(hex, 16);
+  if (Number.isNaN(num)) return "C-00000";
+  return "C-" + num.toString(36).toUpperCase().padStart(5, "0");
+}
+
+// Reverse the function for search: given a code, what does the trailing hex
+// look like? Used to filter at the DB level for performance (rather than
+// iterating every customer and computing each code).
+function idSuffixFromCode(code) {
+  // Strip prefix and any whitespace
+  const stripped = String(code || "")
+    .replace(/^C[\s-]*/i, "")
+    .trim()
+    .toUpperCase();
+  if (!stripped) return null;
+  const num = parseInt(stripped, 36);
+  if (Number.isNaN(num) || num < 0 || num > 0xffffff) return null;
+  return num.toString(16).padStart(6, "0");
+}
+
 // Import the accountant authentication middleware
 // Alternatively, you can use the inline middleware below
 // const AccountantAuthMiddleware = require('../../Middleware/AccountantAuthMiddleware');
@@ -71,34 +109,228 @@ const verifyAccountantToken = async (req, res, next) => {
   }
 };
 
-// GET all customers with basic info
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/accountant/customers
+//
+// List customers with financial summary per row + page-level KPIs.
+//
+// Query params:
+//   page    — 1-indexed page number (default 1)
+//   limit   — page size (default 20, max 100)
+//   search  — matches customer code (full or partial), name, email, phone
+//   sort    — name | revenue | outstanding | recent (default recent)
+//   filter  — all | with_outstanding | new (default all)
+//
+// Response shape:
+//   {
+//     summary:    { totalCustomers, totalRevenue, totalPaid, totalOutstanding,
+//                   customersWithOutstanding, newThisMonth },
+//     customers:  [ { _id, customerCode, name, email, phone, gstin, ...
+//                     totalRevenue, totalPaid, totalOutstanding, orderCount,
+//                     lastOrderDate, createdAt } ],
+//     pagination: { page, limit, total, totalPages }
+//   }
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/", verifyAccountantToken, async (req, res) => {
   try {
-    const customers = await Customer.find()
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(
+      100,
+      Math.max(1, parseInt(req.query.limit, 10) || 20),
+    );
+    const search = String(req.query.search || "").trim();
+    const sort = String(req.query.sort || "recent");
+    const filter = String(req.query.filter || "all");
+
+    // Build the customer query.
+    // Search matches: customer code (derived), name, email, phone.
+    let baseQuery = {};
+    if (search) {
+      const codeSuffix = idSuffixFromCode(search);
+      const orConditions = [
+        { name: { $regex: search, $options: "i" } },
+        { companyName: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } },
+        { phone: { $regex: search, $options: "i" } },
+      ];
+      // If search parses as a valid customer code, also match by ObjectId suffix.
+      // We use a regex on the string form of _id since Mongo can't filter on
+      // raw byte suffix without aggregation.
+      if (codeSuffix) {
+        orConditions.push({
+          $expr: {
+            $regexMatch: {
+              input: { $toString: "$_id" },
+              regex: `${codeSuffix}$`,
+              options: "i",
+            },
+          },
+        });
+      }
+      baseQuery = { $or: orConditions };
+    }
+
+    // Date filter for "new this month" KPI and the "new" filter
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    if (filter === "new") {
+      baseQuery.createdAt = { $gte: monthStart };
+    }
+
+    // Total count (before pagination, after filtering)
+    const total = await Customer.countDocuments(baseQuery);
+
+    // Sort spec
+    const sortSpec = {
+      name: { name: 1 },
+      recent: { createdAt: -1 },
+      // revenue & outstanding are derived; we sort post-fetch for those
+    }[sort] || { createdAt: -1 };
+
+    // Fetch the page of customers
+    let customers = await Customer.find(baseQuery)
       .select(
-        "name email phone profile createdAt lastLogin isPhoneVerified isEmailVerified",
+        "name companyName email phone profile gstin createdAt lastLogin isPhoneVerified isEmailVerified",
       )
-      .sort({ createdAt: -1 })
+      .sort(sortSpec)
+      .skip((page - 1) * limit)
+      .limit(limit)
       .lean();
 
-    // Get request counts for each customer
-    const customersWithStats = await Promise.all(
-      customers.map(async (customer) => {
-        const requestCount = await CustomerRequest.countDocuments({
-          customerId: customer._id,
-        });
+    // Aggregate per-customer financials in a single pass using $facet-style
+    // aggregation per customer. For pagination correctness we only aggregate
+    // for the page, so this is fast.
+    const customerIds = customers.map((c) => c._id);
+    const requestAgg = await CustomerRequest.aggregate([
+      { $match: { customerId: { $in: customerIds } } },
+      {
+        $project: {
+          customerId: 1,
+          status: 1,
+          totalPaidAmount: 1,
+          finalOrderPrice: 1,
+          createdAt: 1,
+          firstQuotation: { $arrayElemAt: ["$quotations", 0] },
+        },
+      },
+      {
+        $group: {
+          _id: "$customerId",
+          totalRevenue: {
+            $sum: { $ifNull: ["$firstQuotation.grandTotal", 0] },
+          },
+          totalPaid: { $sum: { $ifNull: ["$totalPaidAmount", 0] } },
+          orderCount: { $sum: 1 },
+          completedCount: {
+            $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+          },
+          lastOrderDate: { $max: "$createdAt" },
+        },
+      },
+    ]);
+    const aggMap = new Map(requestAgg.map((a) => [String(a._id), a]));
 
-        return {
-          ...customer,
-          totalRequests: requestCount,
-        };
-      }),
-    );
+    customers = customers.map((c) => {
+      const a = aggMap.get(String(c._id)) || {};
+      const totalRevenue = a.totalRevenue || 0;
+      const totalPaid = a.totalPaid || 0;
+      return {
+        ...c,
+        customerCode: customerCodeForId(c._id),
+        totalRevenue,
+        totalPaid,
+        totalOutstanding: Math.max(0, totalRevenue - totalPaid),
+        orderCount: a.orderCount || 0,
+        completedCount: a.completedCount || 0,
+        lastOrderDate: a.lastOrderDate || null,
+      };
+    });
+
+    // Apply derived filters AFTER computing financials
+    if (filter === "with_outstanding") {
+      customers = customers.filter((c) => c.totalOutstanding > 0);
+    }
+
+    // Sort by derived fields if needed
+    if (sort === "revenue") {
+      customers.sort((a, b) => b.totalRevenue - a.totalRevenue);
+    } else if (sort === "outstanding") {
+      customers.sort((a, b) => b.totalOutstanding - a.totalOutstanding);
+    }
+
+    // ── Page-level summary KPIs ──────────────────────────────────────────
+    // These cover ALL customers (not just the current page), so we compute
+    // separately. Cheap because the aggregation only runs over CustomerRequest.
+    const [
+      allRequestStats,
+      totalCustomers,
+      newThisMonthCount,
+      customersWithReqIds,
+    ] = await Promise.all([
+      CustomerRequest.aggregate([
+        {
+          $project: {
+            customerId: 1,
+            totalPaidAmount: 1,
+            firstQuotation: { $arrayElemAt: ["$quotations", 0] },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalRevenue: {
+              $sum: { $ifNull: ["$firstQuotation.grandTotal", 0] },
+            },
+            totalPaid: { $sum: { $ifNull: ["$totalPaidAmount", 0] } },
+          },
+        },
+      ]),
+      Customer.countDocuments({}),
+      Customer.countDocuments({ createdAt: { $gte: monthStart } }),
+      // For "customers with outstanding", we need per-customer outstanding > 0
+      CustomerRequest.aggregate([
+        {
+          $project: {
+            customerId: 1,
+            outstanding: {
+              $subtract: [
+                {
+                  $ifNull: [{ $arrayElemAt: ["$quotations.grandTotal", 0] }, 0],
+                },
+                { $ifNull: ["$totalPaidAmount", 0] },
+              ],
+            },
+          },
+        },
+        { $group: { _id: "$customerId", total: { $sum: "$outstanding" } } },
+        { $match: { total: { $gt: 0 } } },
+        { $count: "withOutstanding" },
+      ]),
+    ]);
+
+    const summary = {
+      totalCustomers,
+      totalRevenue: allRequestStats[0]?.totalRevenue || 0,
+      totalPaid: allRequestStats[0]?.totalPaid || 0,
+      totalOutstanding: Math.max(
+        0,
+        (allRequestStats[0]?.totalRevenue || 0) -
+          (allRequestStats[0]?.totalPaid || 0),
+      ),
+      customersWithOutstanding: customersWithReqIds[0]?.withOutstanding || 0,
+      newThisMonth: newThisMonthCount,
+    };
 
     res.status(200).json({
       success: true,
-      customers: customersWithStats,
-      count: customersWithStats.length,
+      summary,
+      customers,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit) || 1,
+      },
     });
   } catch (error) {
     console.error("Error fetching customers:", error);
@@ -124,6 +356,9 @@ router.get("/:customerId", verifyAccountantToken, async (req, res) => {
         message: "Customer not found",
       });
     }
+
+    // Attach the derived customer code so the detail view can show it
+    customer.customerCode = customerCodeForId(customer._id);
 
     res.status(200).json({
       success: true,
