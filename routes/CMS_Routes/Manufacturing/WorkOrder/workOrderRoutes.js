@@ -264,23 +264,26 @@ router.get("/machine-status", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /:id  — single work order
-// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     if (!mongoose.Types.ObjectId.isValid(id))
       return res.status(400).json({ success: false, message: "Invalid work order ID" });
-
+ 
     const workOrder = await WorkOrder.findById(id)
-      .select("workOrderNumber status priority quantity stockItemName stockItemReference stockItemId variantAttributes specialInstructions createdAt estimatedCost rawMaterials operations planningNotes")
-      .populate("plannedBy", "name").lean();
+      .select(
+        "workOrderNumber status priority quantity stockItemName stockItemReference stockItemId " +
+        "variantAttributes specialInstructions createdAt estimatedCost rawMaterials operations " +
+        "planningNotes assignedDeadline assignedDeadlineMeta timeline"
+      )
+      .populate("plannedBy", "name")
+      .populate("assignedDeadlineMeta.assignedBy", "name email")
+      .lean();
     if (!workOrder)
       return res.status(404).json({ success: false, message: "Work order not found" });
-
+ 
     const stockItemDetails = await getStockItemDetails(workOrder.stockItemId);
-
+ 
     const optimizedRawMaterials = (workOrder.rawMaterials || []).map(rm => ({
       name: rm.name, sku: rm.sku, unit: rm.unit, unitCost: rm.unitCost, totalCost: rm.totalCost,
       quantityRequired: rm.quantityRequired, quantityAllocated: rm.quantityAllocated || 0,
@@ -290,8 +293,7 @@ router.get("/:id", async (req, res) => {
       variantName: rm.rawItemVariantCombination?.join(" • ") ||
         (rm.rawItemVariantId ? `Variant #${rm.rawItemVariantId.toString().slice(-6)}` : "Default"),
     }));
-
-    // Only return name + code + timing — no machine fields
+ 
     const optimizedOperations = (workOrder.operations || []).map(op => ({
       _id:               op._id,
       operationType:     op.operationType,
@@ -300,9 +302,11 @@ router.get("/:id", async (req, res) => {
       status:            op.status || "pending",
       notes:             op.notes || "",
     }));
-
-    const totalPlannedSeconds = optimizedOperations.reduce((s, op) => s + (op.plannedTimeSeconds || 0), 0);
-
+ 
+    const totalPlannedSeconds = optimizedOperations.reduce(
+      (s, op) => s + (op.plannedTimeSeconds || 0), 0
+    );
+ 
     res.json({
       success: true,
       workOrder: {
@@ -314,6 +318,12 @@ router.get("/:id", async (req, res) => {
         specialInstructions: workOrder.specialInstructions || [],
         estimatedCost: workOrder.estimatedCost || 0, createdAt: workOrder.createdAt,
         plannedBy: workOrder.plannedBy?.name || null,
+ 
+        // ← NEW FIELDS for the View MO page
+        assignedDeadline:     workOrder.assignedDeadline || null,
+        assignedDeadlineMeta: workOrder.assignedDeadlineMeta || null,
+        timeline:             workOrder.timeline || {},
+ 
         panelCount:    stockItemDetails.panelCount,
         genderCategory: stockItemDetails.genderCategory,
         totalBarcodes: stockItemDetails.panelCount > 0

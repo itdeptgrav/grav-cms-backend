@@ -109,33 +109,146 @@ router.post("/change-email", verifyCoworkToken, verifyCeoToken, async (req, res)
   }
 });
 
-// ── Employee ──────────────────────────────────────────────
-/**
- * UPDATED: Now accepts optional `role` field ("employee" | "tl").
- * Defaults to "employee" if not provided.
- * If role === "tl", the created user gets TL custom claims and is stored as TL.
- */
+// ── Biometric IDs from MongoDB — shows used/unused for ID picker ──────────────
+// GET /cowork/employee/biometric-ids
+router.get("/employee/biometric-ids", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+  try {
+    const Employee = require("../../models/Employee");
+
+    // 1. All biometricIds from MongoDB HR employees
+    const hrEmployees = await Employee.find(
+      { biometricId: { $exists: true, $ne: null, $ne: "" } },
+      { biometricId: 1, firstName: 1, middleName: 1, lastName: 1, status: 1 }
+    ).lean();
+
+    // 2. Which IDs are already assigned to a CoWork employee (employeeId in Firestore)
+    const coworkSnap = await db.collection("cowork_employees").get();
+    const usedIds = new Set();
+    const coworkByBiometric = {};
+    coworkSnap.forEach(doc => {
+      const d = doc.data();
+      if (d.employeeId) {
+        usedIds.add(d.employeeId);
+        coworkByBiometric[d.employeeId] = d.name;
+      }
+    });
+
+    // 3. Split into available vs used
+    const available = [];
+    const used = [];
+    hrEmployees.forEach(emp => {
+      const id = emp.biometricId;
+      const hrName = [emp.firstName, emp.middleName, emp.lastName].filter(Boolean).join(" ").trim();
+      if (usedIds.has(id)) {
+        used.push({ biometricId: id, hrName, coworkName: coworkByBiometric[id] || hrName });
+      } else {
+        available.push({ biometricId: id, hrName });
+      }
+    });
+
+    available.sort((a, b) => a.biometricId.localeCompare(b.biometricId));
+    used.sort((a, b) => a.biometricId.localeCompare(b.biometricId));
+
+    res.json({ success: true, available, used });
+  } catch (e) {
+    console.error("[biometric-ids]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── MY MANAGERS — fetch from HR MongoDB using existing Employee schema ────────
+// GET /cowork/employee/my-managers/:employeeId
+// Finds employee by biometricId, then uses the same populate logic as /:id/details
+router.get("/employee/my-managers/:employeeId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const Employee = require("../../models/Employee");
+    const { employeeId } = req.params;
+
+    // Find employee by biometricId (same as CoWork employeeId)
+    const employee = await Employee.findOne({ biometricId: employeeId })
+      .populate("primaryManager.managerId", "firstName middleName lastName biometricId department designation jobTitle phone email profilePhoto")
+      .populate("secondaryManager.managerId", "firstName middleName lastName biometricId department designation jobTitle phone email profilePhoto")
+      .lean();
+
+    if (!employee) {
+      return res.json({ success: true, primaryManager: null, secondaryManager: null, message: "Employee not found in HR system" });
+    }
+
+    // Build primary manager — same pattern as Employee-Section.js /:id/details
+    const primaryManager = employee.primaryManager?.managerId
+      ? {
+        name: [
+          employee.primaryManager.managerId.firstName,
+          employee.primaryManager.managerId.middleName,
+          employee.primaryManager.managerId.lastName,
+        ].filter(Boolean).join(" ").trim()
+          || employee.primaryManager.managerName || "",
+        biometricId: employee.primaryManager.managerId.biometricId || "",
+        department: employee.primaryManager.managerId.department || "",
+        designation: employee.primaryManager.managerId.designation || employee.primaryManager.managerId.jobTitle || "",
+        phone: employee.primaryManager.managerId.phone || "",
+        email: employee.primaryManager.managerId.email || "",
+        profilePhotoUrl: employee.primaryManager.managerId.profilePhoto?.url || null,
+      }
+      : employee.primaryManager?.managerName
+        ? { name: employee.primaryManager.managerName, biometricId: "", department: "", designation: "", phone: "", email: "", profilePhotoUrl: null }
+        : null;
+
+    // Build secondary manager
+    const secondaryManager = employee.secondaryManager?.managerId
+      ? {
+        name: [
+          employee.secondaryManager.managerId.firstName,
+          employee.secondaryManager.managerId.middleName,
+          employee.secondaryManager.managerId.lastName,
+        ].filter(Boolean).join(" ").trim()
+          || employee.secondaryManager.managerName || "",
+        biometricId: employee.secondaryManager.managerId.biometricId || "",
+        department: employee.secondaryManager.managerId.department || "",
+        designation: employee.secondaryManager.managerId.designation || employee.secondaryManager.managerId.jobTitle || "",
+        phone: employee.secondaryManager.managerId.phone || "",
+        email: employee.secondaryManager.managerId.email || "",
+        profilePhotoUrl: employee.secondaryManager.managerId.profilePhoto?.url || null,
+      }
+      : employee.secondaryManager?.managerName
+        ? { name: employee.secondaryManager.managerName, biometricId: "", department: "", designation: "", phone: "", email: "", profilePhotoUrl: null }
+        : null;
+
+    res.json({ success: true, primaryManager, secondaryManager });
+  } catch (e) {
+    console.error("[my-managers]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
-    const { name, email, mobile, city, department, role: empRole } = req.body;
+    const { name, email, mobile, city, department, role: empRole, employeeId: chosenId } = req.body;
     if (!name || !email || !mobile || !city || !department) {
       return res.status(400).json({ error: "All fields required." });
+    }
+
+    // ── VALIDATE chosen biometricId is not already taken in CoWork ────────────
+    if (chosenId) {
+      const existing = await db.collection("cowork_employees").doc(chosenId).get();
+      if (existing.exists) {
+        return res.status(400).json({ error: `ID ${chosenId} is already assigned to another CoWork employee.` });
+      }
     }
 
     // ── CHECK: email must not already exist in Firebase Auth ────────────────
     try {
       await auth.getUserByEmail(email.trim().toLowerCase());
-      // If we reach here → user exists → reject
       return res.status(400).json({
         error: "This email address is already in use. Please use a different email.",
       });
     } catch (authErr) {
-      // auth/user-not-found = email is free → continue
       if (authErr.code !== "auth/user-not-found") throw authErr;
     }
 
     const resolvedRole = empRole === "tl" ? "tl" : "employee";
-    const result = await svc.createCoworkEmployee({ name, email, mobile, city, department, role: resolvedRole });
+    const result = await svc.createCoworkEmployee({ name, email, mobile, city, department, role: resolvedRole, employeeId: chosenId || null });
 
     // Send welcome email (non-blocking)
     sendWelcomeEmail(
@@ -546,6 +659,59 @@ router.patch("/notifications/read-all", verifyCoworkToken, verifyEmployeeToken, 
   } catch (e) {
     console.error('Error in /notifications/read-all endpoint:', e);
     res.status(200).json({ success: false, error: e.message });
+  }
+});
+
+// ── UPDATE EMPLOYEE ID (CEO only) ─────────────────────────────────────────────
+// PATCH /cowork/employee/:id/update-id
+// Changes employeeId value (biometricId from HR MongoDB) for an existing CoWork employee.
+// Steps: create new Firestore doc with new ID → copy all data → delete old doc
+// Field name "employeeId" stays the same — only the value changes (e.g. E022 → GR022)
+router.patch("/employee/:id/update-id", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+  try {
+    const { id: oldId } = req.params;
+    const { newEmployeeId } = req.body;
+
+    if (!newEmployeeId) return res.status(400).json({ error: "newEmployeeId is required." });
+    if (oldId === newEmployeeId) return res.status(400).json({ error: "New ID is same as current ID." });
+
+    // Cannot change CEO's ID
+    if (oldId === "E000") return res.status(400).json({ error: "Cannot change CEO's ID." });
+
+    // Check new ID not already taken in Firestore
+    const newDoc = await db.collection("cowork_employees").doc(newEmployeeId).get();
+    if (newDoc.exists) {
+      return res.status(400).json({ error: `ID ${newEmployeeId} is already assigned to ${newDoc.data().name}.` });
+    }
+
+    // Fetch existing employee
+    const oldDoc = await db.collection("cowork_employees").doc(oldId).get();
+    if (!oldDoc.exists) return res.status(404).json({ error: "Employee not found." });
+
+    const empData = oldDoc.data();
+
+    // Create new doc with new ID, copy all data, update employeeId field value
+    await db.collection("cowork_employees").doc(newEmployeeId).set({
+      ...empData,
+      employeeId: newEmployeeId,   // field name unchanged, value updated
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Delete old doc
+    await db.collection("cowork_employees").doc(oldId).delete();
+
+    console.log(`[UpdateEmployeeId] ${oldId} → ${newEmployeeId} by ${req.coworkUser.employeeId}`);
+
+    // Notify employee via push
+    try {
+      const { sendPushToEmployees } = require("../../services/fcmPush.service");
+      await sendPushToEmployees([newEmployeeId], "🆔 Employee ID Updated", `Your CoWork ID is now ${newEmployeeId}. Please log in again.`, { type: "id_updated" });
+    } catch (e) { console.error("[update-id push]", e.message); }
+
+    res.json({ success: true, oldId, newEmployeeId, message: `Employee ID updated from ${oldId} to ${newEmployeeId}.` });
+  } catch (e) {
+    console.error("[update-id]", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 

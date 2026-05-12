@@ -391,6 +391,10 @@ router.get("/requests/:requestId/work-orders", async (req, res) => {
   try {
     const { requestId } = req.params;
     const workOrders = await WorkOrder.find({ customerRequestId: requestId })
+      .populate({
+        path: "stockItemId",
+        select: "name reference genderCategory category",
+      })
       .sort({ createdAt: 1 })
       .lean();
     return res.json({ success: true, workOrders });

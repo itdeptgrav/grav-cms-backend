@@ -239,7 +239,37 @@ const employeeSchema = new mongoose.Schema({
   emailSentAt: { type: Date },
   emailError: { type: String },
 
-  pushToken: { type: String, default: null },
+  // ─── SOP COMPLIANCE ──────────────────────────────────────────────────────────
+  // Yearly point deduction records — one entry per year
+  sopPoints: [
+    {
+      year: { type: Number, required: true },   // e.g. 2026
+      totalDeducted: { type: Number, default: 0 },       // sum of all bleaches in that year
+      bleaches: [
+        {
+          sopId: { type: mongoose.Schema.Types.ObjectId, ref: "Sop" },
+          sopName: { type: String, required: true },
+          folderName: { type: String, default: "Uncategorized" },
+          points: { type: Number, required: true },
+          description: { type: String },
+          date: { type: String, required: true }, // "YYYY-MM-DD"
+          cutBy: { type: String, required: true },
+          cutByName: { type: String, required: true },
+          cutByRole: { type: String, enum: ["ceo", "tl", "hr"], required: true },
+          // ── Recheck ────────────────────────────────────────────────────────
+          recheck: {
+            status: { type: String, enum: ["none", "pending", "confirmed", "rejected"], default: "none" },
+            requestedAt: { type: Date, default: null },
+            requestNote: { type: String, default: "" },
+            reviewedBy: { type: String, default: null },
+            reviewedByName: { type: String, default: null },
+            reviewedAt: { type: Date, default: null },
+            reviewNote: { type: String, default: "" },
+          },
+        },
+      ],
+    },
+  ],
 
   // ─── SYSTEM ──────────────────────────────────────────────────────────────────
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
