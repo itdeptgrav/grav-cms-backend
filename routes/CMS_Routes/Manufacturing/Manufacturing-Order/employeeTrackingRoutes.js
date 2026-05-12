@@ -1,6 +1,8 @@
 // routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js
-// UPDATED: product records now include progressDocId, isDispatched, dispatchedAt
-// so the frontend EmployeeTrackingTab can use them for dispatch selection.
+// FIXED: Product name mismatch — was reading wo.stockItemName (canonical from
+//        StockItem) instead of the per-employee MPC product name (the
+//        customer's display name, e.g., "Gardener Shirt" vs canonical "Shirt").
+//        Now consults EmployeeMpc for the correct per-employee product name.
 
 const express  = require("express");
 const router   = express.Router();
@@ -8,24 +10,48 @@ const mongoose = require("mongoose");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+// ── NOTE: adjust this path to match your EmployeeMpc model location ──────────
+const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 
 router.use(EmployeeAuthMiddleware);
 
-// ── Helper: build per-employee records with dispatch info ─────────────────────
+// ── Helper: build per-employee records with correct product names ────────────
 async function buildEmployeeRecords(docs) {
   if (!docs.length) return [];
 
+  // ── 1. Fetch WOs (now selecting stockItemId for MPC lookup) ────────────
   const woIds = [...new Set(docs.map((d) => d.workOrderId.toString()))];
-  const wos   = await WorkOrder.find({ _id: { $in: woIds } })
-    .select("_id workOrderNumber stockItemName stockItemReference variantAttributes")
+  const wos = await WorkOrder.find({ _id: { $in: woIds } })
+    .select("_id workOrderNumber stockItemId stockItemName stockItemReference variantAttributes")
     .lean();
   const woMap = new Map(wos.map((wo) => [wo._id.toString(), wo]));
 
+  // ── 2. Batch-fetch MPC records for these employees ─────────────────────
+  // EmployeeMpc.products[] may contain a custom productName that overrides
+  // the canonical StockItem.name for THIS employee. We need that override.
+  const employeeIds = [...new Set(docs.map((d) => d.employeeId.toString()))];
+  const mpcRecords = await EmployeeMpc.find({ _id: { $in: employeeIds } })
+    .select("_id products.productId products.productName")
+    .lean();
+
+  // Build (employeeId | stockItemId) → productName map
+  const mpcProductMap = new Map();
+  for (const mpc of mpcRecords) {
+    const empId = mpc._id.toString();
+    for (const p of mpc.products || []) {
+      const pid = (p.productId?._id || p.productId)?.toString();
+      if (pid && p.productName?.trim()) {
+        mpcProductMap.set(`${empId}|${pid}`, p.productName.trim());
+      }
+    }
+  }
+
+  // ── 3. Iterate progress docs and build per-employee records ────────────
   const empMap = new Map();
 
   for (const doc of docs) {
     const empKey = doc.employeeId.toString();
-    const wo     = woMap.get(doc.workOrderId.toString());
+    const wo = woMap.get(doc.workOrderId.toString());
 
     if (!empMap.has(empKey)) {
       empMap.set(empKey, {
@@ -43,23 +69,37 @@ async function buildEmployeeRecords(docs) {
 
     const rec = empMap.get(empKey);
 
+    // ── Resolve correct product name using fallback chain ───────────────
+    // 1. doc.productName  (if EmployeeProductionProgress snapshots it at WO creation)
+    // 2. MPC custom name  (per-employee override)
+    // 3. wo.stockItemName (canonical)
+    // 4. "—"
+    const stockItemId = wo?.stockItemId?.toString();
+    const mpcKey = stockItemId ? `${empKey}|${stockItemId}` : null;
+    const productName =
+      doc.productName?.trim() ||
+      (mpcKey && mpcProductMap.get(mpcKey)) ||
+      wo?.stockItemName ||
+      "—";
+
     // Derive variant display name from WO variantAttributes
     const variantName = wo?.variantAttributes?.length
       ? wo.variantAttributes.map((v) => v.value).join(" / ")
       : "Default";
 
     rec.products.push({
-      // ── ADDED: dispatch-required fields ──────────────────────────────────
-      progressDocId:        doc._id,           // used as the select key in EmployeeTrackingTab
-      isDispatched:         doc.isDispatched || false,
-      dispatchedAt:         doc.dispatchedAt   || null,
-      dispatchedBy:         doc.dispatchedBy   || null,
-      // ── existing fields ───────────────────────────────────────────────────
+      // dispatch-required fields
+      progressDocId: doc._id,
+      isDispatched:  doc.isDispatched || false,
+      dispatchedAt:  doc.dispatchedAt || null,
+      dispatchedBy:  doc.dispatchedBy || null,
+      // identity fields
       workOrderId:          doc.workOrderId,
       workOrderNumber:      wo?.workOrderNumber    || "—",
-      productName:          wo?.stockItemName      || "—",
+      productName,
       productRef:           wo?.stockItemReference || "",
       variantName,
+      // unit tracking
       unitStart:            doc.unitStart,
       unitEnd:              doc.unitEnd,
       totalUnits:           doc.totalUnits,
@@ -85,7 +125,7 @@ async function buildEmployeeRecords(docs) {
   return [...empMap.values()];
 }
 
-// ── GET /manufacturing-order/:moId/employees ──────────────────────────────────
+// ── GET /manufacturing-order/:moId/employees ────────────────────────────────
 router.get("/manufacturing-order/:moId/employees", async (req, res) => {
   try {
     const { moId } = req.params;
@@ -140,7 +180,7 @@ router.get("/manufacturing-order/:moId/employees", async (req, res) => {
   }
 });
 
-// ── GET /search ───────────────────────────────────────────────────────────────
+// ── GET /search ─────────────────────────────────────────────────────────────
 router.get("/search", async (req, res) => {
   try {
     const { query, manufacturingOrderId } = req.query;
