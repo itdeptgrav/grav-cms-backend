@@ -32,6 +32,87 @@ const verifyCustomerToken = async (req, res, next) => {
 };
 
 
+
+
+router.get('/available-items', verifyCustomerToken, async (req, res) => {
+  try {
+    const { search = '', category = '' } = req.query;
+    const query = {};
+ 
+    if (search && search.trim()) {
+      const q = search.trim();
+      query.$or = [
+        { name: { $regex: q, $options: 'i' } },
+        { reference: { $regex: q, $options: 'i' } },
+        { category: { $regex: q, $options: 'i' } },
+        { genderCategory: { $regex: q, $options: 'i' } },
+      ];
+    }
+    if (category) query.category = category;
+ 
+    const stockItems = await StockItem.find(query)
+      .select(
+        '_id name reference category genderCategory baseSalesPrice images attributes variants'
+      )
+      .limit(50)
+      .lean();
+ 
+    const processedItems = stockItems.map(item => {
+      const attributeData =
+        item.attributes?.map(attr => ({
+          name: attr.name,
+          values: attr.values || [],
+        })) || [];
+ 
+      const variants =
+        item.variants?.map(v => ({
+          _id: v._id,
+          sku: v.sku,
+          attributes: v.attributes || [],
+          salesPrice: v.salesPrice,
+          images: v.images || [],
+        })) || [];
+ 
+      const firstVariantPrice = variants[0]?.salesPrice;
+      const displayPrice =
+        firstVariantPrice != null && firstVariantPrice > 0
+          ? firstVariantPrice
+          : item.baseSalesPrice || 0;
+ 
+      return {
+        _id: item._id,
+        id: item._id,
+        name: item.name,
+        reference: item.reference,
+        category: item.category,
+        genderCategory: item.genderCategory || '',
+        baseSalesPrice: item.baseSalesPrice || 0,
+        displayPrice,
+        images: item.images || [],
+        attributes: attributeData,
+        variants,
+        hasVariants: variants.length > 0,
+      };
+    });
+ 
+    const uniqueCategories = [
+      ...new Set(processedItems.map(i => i.category).filter(Boolean)),
+    ];
+ 
+    return res.status(200).json({
+      success: true,
+      items: processedItems,
+      categories: uniqueCategories,
+    });
+  } catch (error) {
+    console.error('Error fetching available items:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error while fetching available items',
+    });
+  }
+});
+
 router.post('/:requestId/delivery-confirmation', verifyCustomerToken, async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -133,14 +214,6 @@ router.post('/', verifyCustomerToken, async (req, res) => {
         return res.status(400).json({
           success: false,
           message: `Item ${item.stockItemName || item.stockItemId} not found`
-        });
-      }
-
-      // Check if item is available
-      if (stockItem.quantityOnHand === 0) {
-        return res.status(400).json({
-          success: false,
-          message: `Item ${stockItem.name} is out of stock`
         });
       }
 
