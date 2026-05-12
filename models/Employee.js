@@ -249,9 +249,19 @@ const employeeSchema = new mongoose.Schema({
           points: { type: Number, required: true },
           description: { type: String },
           date: { type: String, required: true }, // "YYYY-MM-DD"
-          cutBy: { type: String, required: true }, // employeeId or hrId
+          cutBy: { type: String, required: true },
           cutByName: { type: String, required: true },
           cutByRole: { type: String, enum: ["ceo", "tl", "hr"], required: true },
+          // ── Recheck ────────────────────────────────────────────────────────
+          recheck: {
+            status: { type: String, enum: ["none", "pending", "confirmed", "rejected"], default: "none" },
+            requestedAt: { type: Date, default: null },
+            requestNote: { type: String, default: "" },
+            reviewedBy: { type: String, default: null },
+            reviewedByName: { type: String, default: null },
+            reviewedAt: { type: Date, default: null },
+            reviewNote: { type: String, default: "" },
+          },
         },
       ],
     },
