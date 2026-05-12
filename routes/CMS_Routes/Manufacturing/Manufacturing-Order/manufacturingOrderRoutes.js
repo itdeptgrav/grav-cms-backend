@@ -16,7 +16,7 @@ router.get("/", async (req, res) => {
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
     const skip = (pageNum - 1) * limitNum;
- 
+
     // Base filter — always restrict to sales-approved (this is what an MO IS)
     const matchQuery = { status: "quotation_sales_approved" };
     if (search) {
@@ -27,10 +27,10 @@ router.get("/", async (req, res) => {
         { "customerInfo.email": re },
       ];
     }
- 
+
     const pipeline = [
       { $match: matchQuery },
- 
+
       // Compute totalQuantity in-DB from items[].totalQuantity (no need to ship items)
       {
         $addFields: {
@@ -45,7 +45,7 @@ router.get("/", async (req, res) => {
           }
         }
       },
- 
+
       // Join WO stats per MO in ONE query (replaces the per-MO countDocuments + aggregate)
       {
         $lookup: {
@@ -84,7 +84,7 @@ router.get("/", async (req, res) => {
         }
       },
       { $addFields: { _stats: { $arrayElemAt: ["$_woStats", 0] } } },
- 
+
       // Flatten + compute completion % at the MO level
       {
         $addFields: {
@@ -111,7 +111,7 @@ router.get("/", async (req, res) => {
           }
         }
       },
- 
+
       // Derive the MO status from WO progress
       {
         $addFields: {
@@ -145,10 +145,10 @@ router.get("/", async (req, res) => {
           }
         }
       },
- 
+
       // Apply derived status filter if requested
       ...(status ? [{ $match: { derivedStatus: status } }] : []),
- 
+
       // Paginate + count in one go
       {
         $facet: {
@@ -178,11 +178,11 @@ router.get("/", async (req, res) => {
         }
       }
     ];
- 
+
     const [result] = await CustomerRequest.aggregate(pipeline);
     const rows = result?.paginated || [];
     const total = result?.totalCount?.[0]?.count || 0;
- 
+
     const manufacturingOrders = rows.map((r) => ({
       _id: r._id,
       moNumber: `MO-${r.requestId}`,
@@ -201,7 +201,7 @@ router.get("/", async (req, res) => {
       requestType: r.requestType || "customer_request",
       measurementName: r.measurementName || null,
     }));
- 
+
     res.json({
       success: true,
       manufacturingOrders,
@@ -530,17 +530,17 @@ router.get("/:id/detailed", async (req, res) => {
         efficiency:
           productionCompletion.efficiencyMetrics?.length > 0
             ? {
-                avgEfficiency:
-                  productionCompletion.efficiencyMetrics.reduce(
-                    (sum, m) => sum + m.efficiencyPercentage,
-                    0,
-                  ) / productionCompletion.efficiencyMetrics.length,
-                totalScans:
-                  productionCompletion.operatorDetails?.reduce(
-                    (sum, op) => sum + op.totalScans,
-                    0,
-                  ) || 0,
-              }
+              avgEfficiency:
+                productionCompletion.efficiencyMetrics.reduce(
+                  (sum, m) => sum + m.efficiencyPercentage,
+                  0,
+                ) / productionCompletion.efficiencyMetrics.length,
+              totalScans:
+                productionCompletion.operatorDetails?.reduce(
+                  (sum, op) => sum + op.totalScans,
+                  0,
+                ) || 0,
+            }
             : null,
 
         // Invalid scans if any
@@ -704,14 +704,14 @@ router.get("/:id/work-orders", async (req, res) => {
 router.get("/emplloyeeTracking/:id", async (req, res) => {
   try {
     const { id } = req.params;
- 
+
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
         message: "Invalid manufacturing order ID format",
       });
     }
- 
+
     // ── CR: select only what the frontend uses ─────────────────────────────
     const customerRequest = await CustomerRequest.findById(id)
       .select(
@@ -722,46 +722,47 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       )
       .populate("salesPersonAssigned", "name email phone")
       .lean();
- 
+
     if (!customerRequest) {
       return res.status(404).json({
         success: false,
         message: "Manufacturing order not found",
       });
     }
- 
+
     // ── WOs: trimmed selection + add genderCategory ─────────────────────────
     const workOrders = await WorkOrder.find({
       customerRequestId: customerRequest._id,
     })
       .select(
         "workOrderNumber status quantity stockItemId stockItemName stockItemReference " +
-        "operations forwardedToVendor productionCompletion variantAttributes rawMaterials"
+        "operations forwardedToVendor productionCompletion variantAttributes rawMaterials " +
+        "assignedDeadline"                                              // ← ADDED
       )
-      .populate("stockItemId", "name reference genderCategory") // ← genderCategory added
+      .populate("stockItemId", "name reference genderCategory images variants.images")
       .populate("forwardedToVendor", "name vendorCode")
       .sort({ createdAt: 1 })
       .lean();
- 
+
     // ── Stats ───────────────────────────────────────────────────────────────
     const totalWorkOrders = workOrders.length;
     const totalQuantity = workOrders.reduce((s, wo) => s + (wo.quantity || 0), 0);
     let plannedWorkOrders = 0, scheduledWorkOrders = 0,
-        inProgressWorkOrders = 0, completedWorkOrders = 0;
+      inProgressWorkOrders = 0, completedWorkOrders = 0;
     for (const wo of workOrders) {
-      if (wo.status === "planned")       plannedWorkOrders++;
-      if (wo.status === "scheduled")     scheduledWorkOrders++;
-      if (wo.status === "in_progress")   inProgressWorkOrders++;
-      if (wo.status === "completed")     completedWorkOrders++;
+      if (wo.status === "planned") plannedWorkOrders++;
+      if (wo.status === "scheduled") scheduledWorkOrders++;
+      if (wo.status === "in_progress") inProgressWorkOrders++;
+      if (wo.status === "completed") completedWorkOrders++;
     }
- 
+
     // ── Aggregate raw materials across WOs ──────────────────────────────────
     const rawMaterialMap = new Map();
     for (const wo of workOrders) {
       for (const rm of wo.rawMaterials || []) {
         const variantKey = rm.rawItemVariantCombination?.join("-") || "default";
         const key = `${rm.rawItemId}_${variantKey}`;
- 
+
         if (rawMaterialMap.has(key)) {
           const existing = rawMaterialMap.get(key);
           existing.quantityRequired += rm.quantityRequired;
@@ -785,7 +786,7 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
         }
       }
     }
- 
+
     // ── BATCH raw item lookups: N queries → 1 ──────────────────────────────
     const rawItemIds = [
       ...new Set(
@@ -794,7 +795,7 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
           .filter((id) => id && mongoose.Types.ObjectId.isValid(id))
       ),
     ];
- 
+
     let rawItemMap = new Map();
     if (rawItemIds.length > 0) {
       const rawItems = await RawItem.find({ _id: { $in: rawItemIds } })
@@ -802,17 +803,17 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
         .lean();
       rawItemMap = new Map(rawItems.map((r) => [r._id.toString(), r]));
     }
- 
+
     // ── Compute variant stock + status for each requirement ────────────────
     const allRawMaterialRequirements = [];
     for (const material of rawMaterialMap.values()) {
       const rawItem = material.rawItemId
         ? rawItemMap.get(material.rawItemId.toString())
         : null;
- 
+
       let variantStock = 0;
       const totalStock = rawItem?.quantity || 0;
- 
+
       // Find specific variant if rawItemVariantId exists
       if (material.rawItemVariantId && rawItem?.variants) {
         const variant = rawItem.variants.find(
@@ -831,13 +832,13 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
         });
         if (variant) variantStock = variant.quantity || 0;
       }
- 
+
       let status = "unavailable";
       if (variantStock >= material.quantityRequired) status = "available";
       else if (variantStock > 0) status = "partial";
- 
+
       const deficitQuantity = Math.max(0, material.quantityRequired - variantStock);
- 
+
       allRawMaterialRequirements.push({
         ...material,
         variantStock,
@@ -852,13 +853,13 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
         variantId: material.rawItemVariantId?.toString(),
       });
     }
- 
+
     // ── Build response ──────────────────────────────────────────────────────
     const isMeasurementConversion = !!(
       customerRequest.requestType === "measurement_conversion" ||
       customerRequest.measurementId
     );
- 
+
     const manufacturingOrder = {
       _id: customerRequest._id,
       moNumber: `MO-${customerRequest.requestId}`,
@@ -876,13 +877,13 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
       deliveryDeadline: customerRequest.customerInfo?.deliveryDeadline,
       createdAt: customerRequest.createdAt,
       updatedAt: customerRequest.updatedAt,
- 
+
       requestType: isMeasurementConversion ? "measurement_conversion" : "customer_request",
       requestTypeBadge: isMeasurementConversion ? "MEASUREMENT" : "CUSTOMER",
       measurementId: customerRequest.measurementId || null,
       measurementName: customerRequest.measurementName || null,
       isMeasurementConversion,
- 
+
       workOrders,
       workOrderStats: {
         total: totalWorkOrders,
@@ -892,13 +893,13 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
         completed: completedWorkOrders,
         totalQuantity,
       },
- 
+
       rawMaterialRequirements: allRawMaterialRequirements,
       totalRawMaterialCost: allRawMaterialRequirements.reduce(
         (sum, rm) => sum + (rm.totalCost || 0),
         0
       ),
- 
+
       timeline: {
         requestCreated: customerRequest.createdAt,
         salesApproved: customerRequest.quotations?.[0]?.salesApproval?.approvedAt,
@@ -906,7 +907,7 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
         actualCompletion: customerRequest.actualCompletion,
       },
     };
- 
+
     res.json({ success: true, manufacturingOrder });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
@@ -952,14 +953,14 @@ router.get("/employeeTracking/:id/work-orders", async (req, res) => {
 router.get("/vendors/active", async (req, res) => {
   try {
     const Vendor = require("../../../../models/Vendor_Models/vendor");
-    
-    const vendors = await Vendor.find({ 
+
+    const vendors = await Vendor.find({
       status: "active",
-      isDeleted: false 
+      isDeleted: false
     })
-    .select("name contactPerson email phone vendorCode category city state")
-    .sort({ name: 1 })
-    .lean();
+      .select("name contactPerson email phone vendorCode category city state")
+      .sort({ name: 1 })
+      .lean();
 
     res.json({
       success: true,
@@ -990,10 +991,10 @@ router.post("/share-to-vendor", async (req, res) => {
 
     // Validate vendor exists
     const Vendor = require("../../../../models/Vendor_Models/vendor");
-    const vendor = await Vendor.findOne({ 
-      _id: vendorId, 
+    const vendor = await Vendor.findOne({
+      _id: vendorId,
       status: "active",
-      isDeleted: false 
+      isDeleted: false
     });
 
     if (!vendor) {
@@ -1013,7 +1014,7 @@ router.post("/share-to-vendor", async (req, res) => {
     };
 
     const result = await WorkOrder.updateMany(
-      { 
+      {
         _id: { $in: workOrderIds },
         status: { $nin: ["completed", "cancelled", "forwarded"] }
       },
@@ -1031,9 +1032,9 @@ router.post("/share-to-vendor", async (req, res) => {
     const updatedWorkOrders = await WorkOrder.find({
       _id: { $in: workOrderIds }
     })
-    .select("workOrderNumber status forwardedToVendor forwardedAt")
-    .populate("forwardedToVendor", "name vendorCode")
-    .lean();
+      .select("workOrderNumber status forwardedToVendor forwardedAt")
+      .populate("forwardedToVendor", "name vendorCode")
+      .lean();
 
     res.json({
       success: true,
