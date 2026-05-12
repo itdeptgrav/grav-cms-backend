@@ -717,6 +717,16 @@ const customerRequestSchema = new mongoose.Schema(
       type: Date,
     },
 
+    processingStartedAt: {
+      type: Date,
+      default: null,
+    },
+    processingStartedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SalesDepartment",
+      default: null,
+    },
+
     // Quotation Management - ONLY ONE QUOTATION ALLOWED
     quotations: [quotationSchema],
     // REMOVED: currentQuotation field (not needed with single quotation)
