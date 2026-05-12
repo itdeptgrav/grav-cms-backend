@@ -42,20 +42,26 @@ async function syncToRTDBWithExpiry(collection, docId, data, ttlHours = 24) {
 
 // ── EMPLOYEE ─────────────────────────────────────────────
 // ── REPLACE this function in services/cowork.service.js ──────────────────────
-async function createCoworkEmployee({ name, email, mobile, city, department, role = "employee" }) {
+async function createCoworkEmployee({ name, email, mobile, city, department, role = "employee", employeeId: chosenId = null }) {
   const { auth, db, admin } = require("../config/firebaseAdmin");
 
   // Validate role
   const resolvedRole = role === "tl" ? "tl" : "employee";
 
-  // Generate employee ID
-  const counterRef = db.collection("cowork_meta").doc("counters");
-  const empId = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(counterRef);
-    const seq = (snap.data()?.employeeSeq || 0) + 1;
-    tx.update(counterRef, { employeeSeq: seq });
-    return `E${String(seq).padStart(3, "0")}`;
-  });
+  // Use chosen biometricId from HR MongoDB if provided, else fall back to E001 auto-gen
+  let empId;
+  if (chosenId) {
+    empId = chosenId;
+  } else {
+    // Legacy fallback — auto-generate E001 style
+    const counterRef = db.collection("cowork_meta").doc("counters");
+    empId = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(counterRef);
+      const seq = (snap.data()?.employeeSeq || 0) + 1;
+      tx.update(counterRef, { employeeSeq: seq });
+      return `E${String(seq).padStart(3, "0")}`;
+    });
+  }
 
   // Generate temp password
   const tempPassword = Math.random().toString(36).slice(-8) + Math.random().toString(36).slice(-4).toUpperCase();

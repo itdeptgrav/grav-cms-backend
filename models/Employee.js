@@ -235,6 +235,28 @@ const employeeSchema = new mongoose.Schema({
   emailSentAt: { type: Date },
   emailError: { type: String },
 
+  // ─── SOP COMPLIANCE ──────────────────────────────────────────────────────────
+  // Yearly point deduction records — one entry per year
+  sopPoints: [
+    {
+      year: { type: Number, required: true },   // e.g. 2026
+      totalDeducted: { type: Number, default: 0 },       // sum of all bleaches in that year
+      bleaches: [
+        {
+          sopId: { type: mongoose.Schema.Types.ObjectId, ref: "Sop" },
+          sopName: { type: String, required: true },
+          folderName: { type: String, default: "Uncategorized" },
+          points: { type: Number, required: true },
+          description: { type: String },
+          date: { type: String, required: true }, // "YYYY-MM-DD"
+          cutBy: { type: String, required: true }, // employeeId or hrId
+          cutByName: { type: String, required: true },
+          cutByRole: { type: String, enum: ["ceo", "tl", "hr"], required: true },
+        },
+      ],
+    },
+  ],
+
   // ─── SYSTEM ──────────────────────────────────────────────────────────────────
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
   createdAt: { type: Date, default: Date.now },
