@@ -2034,6 +2034,32 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         const filteredActive = (department && department !== "all") ? allActive.filter((e) => extractDepartment(e) === department) : allActive;
         const dayDocs = await DailyAttendance.find({ yearMonth }).sort({ dateStr: 1 }).lean();
         const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
+
+        // ── Build promotion map: replay applyLateCountPromotion across the ──
+        // full month in date order so LHD/LAB/EAB show up in the export just
+        // like they do in the /daily and /summary API routes.
+        // Structure: Map<biometricId(upper), Map<dateStr, "LHD"|"LAB"|"EAB">>
+        const promotionMap = new Map();
+        const _exportPolicy = settings.lateHalfDayPolicy;
+        if (_exportPolicy?.enabled) {
+            const _nowIST = new Date(Date.now() + 330 * 60 * 1000);
+            const _todayStr = `${_nowIST.getUTCFullYear()}-${String(_nowIST.getUTCMonth() + 1).padStart(2, "0")}-${String(_nowIST.getUTCDate()).padStart(2, "0")}`;
+            const _running = new Map(); // biometricId → { lateCount, earlyCount }
+            for (const doc of dayDocs) { // already sorted by dateStr asc
+                for (const e of (doc.employees || [])) {
+                    const _bid = String(e.biometricId || "").toUpperCase();
+                    if (!_bid) continue;
+                    if (!_running.has(_bid)) _running.set(_bid, { lateCount: 0, earlyCount: 0 });
+                    const _state = _running.get(_bid);
+                    const { promotedStatus, promoted } = applyLateCountPromotion(e, _state, _exportPolicy, doc.dateStr, _todayStr);
+                    if (promoted && promotedStatus) {
+                        if (!promotionMap.has(_bid)) promotionMap.set(_bid, new Map());
+                        promotionMap.get(_bid).set(doc.dateStr, promotedStatus);
+                    }
+                }
+            }
+        }
+
         const employees = [];
         function buildEmpRow(key, empName, empDept, empDesig, empType) {
             const row = { biometricId: key, employeeName: empName, department: empDept, designation: empDesig, employeeType: empType, dayCodes: {}, hrOverrides: new Set(), totals: { P: 0, A: 0, HD: 0, WO: 0, CO: 0, CL: 0, SL: 0, PL: 0, NHFH: 0, Total: 0 } };
@@ -2053,12 +2079,15 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
                     else { sheetCode = "WO"; row.totals.WO++; }
                 } else if (!dayDoc || !entry) { sheetCode = dayDoc ? "A" : ""; if (dayDoc) row.totals.A++; }
                 else {
-                    const finalStatus = entry.hrFinalStatus || entry.systemPrediction; sheetCode = toSheetCode(finalStatus);
+                    // Resolve promoted status (LHD/LAB/EAB) computed above; \
+                    // falls back to raw systemPrediction if no promotion this day.
+                    const _promoStatus = promotionMap.get(String(key).toUpperCase())?.get(cal.dateStr);
+                    const finalStatus = entry.hrFinalStatus || _promoStatus || entry.systemPrediction; sheetCode = toSheetCode(finalStatus);
                     const hasManualPunch = (entry.rawPunches || []).some(p => p.source === "manual" || p.source === "miss_punch");
                     if (entry.hrFinalStatus || hasManualPunch) row.hrOverrides.add(cal.dateStr);
                     if (["P", "P*", "P~", "MP", "WFH"].includes(finalStatus)) row.totals.P++;
-                    else if (finalStatus === "AB" || finalStatus === "LWP") row.totals.A++;
-                    else if (finalStatus === "HD") row.totals.HD++;
+                    else if (finalStatus === "AB" || finalStatus === "LWP" || finalStatus === "LAB" || finalStatus === "EAB") row.totals.A++;
+                    else if (finalStatus === "HD" || finalStatus === "LHD") row.totals.HD++;
                     else if (finalStatus === "WO") row.totals.WO++;
                     else if (finalStatus === "CO") row.totals.CO++;
                     else if (finalStatus === "L-CL") row.totals.CL++;
@@ -2096,7 +2125,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         hdr.eachCell((cell, col) => { const isSumCol = col >= sumStart, isTitleCol = col <= 4; cell.font = { name: "Arial", size: 9, bold: true }; cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true }; if (isTitleCol) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } }; else if (isSumCol) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF4B942" } }; else { const dayIdx = col - 5, cal = allDays[dayIdx]; if (cal?.isSunday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } }; else if (cal?.isDeclaredHoliday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFB4C6E7" } }; else cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF8EA9C1" } }; } cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } }; });
         ws.getRow(4).height = 14; const dowRow = ws.getRow(4);
         for (let d = 1; d <= lastDay; d++) { const cal = allDays[d - 1]; const cell = dowRow.getCell(4 + d); cell.value = cal.dayAbbr; cell.font = { name: "Arial", size: 7 }; cell.alignment = { horizontal: "center", vertical: "middle" }; if (cal.isSunday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFC7CE" } }; else if (cal.isDeclaredHoliday) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFB4C6E7" } }; cell.border = { top: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" }, bottom: { style: "thin" } }; }
-        const STATUS_STYLE = { "P": { font: "FF000000", fill: null }, "A": { font: "FF9C0006", fill: "FFFFC7CE" }, "HD": { font: "FF7D4701", fill: "FFFFEB9C" }, "WO": { font: "FF375623", fill: "FFC6EFCE" }, "CO": { font: "FF0D4A8C", fill: "FFBDD7EE" }, "CL": { font: "FF5C2B9C", fill: "FFEDDBFF" }, "SL": { font: "FF5C2B9C", fill: "FFEDDBFF" }, "PL": { font: "FF5C2B9C", fill: "FFEDDBFF" }, "FH": { font: "FF1F4E79", fill: "FFDCE6F1" }, "NH": { font: "FF7B1E46", fill: "FFFCE4EC" }, "": { font: "FFAAAAAA", fill: null } };
+        const STATUS_STYLE = { "P": { font: "FF000000", fill: null }, "A": { font: "FF9C0006", fill: "FFFFC7CE" }, "HD": { font: "FF7D4701", fill: "FFFFEB9C" }, "LHD": { font: "FF7D4701", fill: "FFFFEB9C" }, "LAB": { font: "FF9C0006", fill: "FFFFC7CE" }, "EAB": { font: "FF9C0006", fill: "FFFFC7CE" }, "WO": { font: "FF375623", fill: "FFC6EFCE" }, "CO": { font: "FF0D4A8C", fill: "FFBDD7EE" }, "CL": { font: "FF5C2B9C", fill: "FFEDDBFF" }, "SL": { font: "FF5C2B9C", fill: "FFEDDBFF" }, "PL": { font: "FF5C2B9C", fill: "FFEDDBFF" }, "FH": { font: "FF1F4E79", fill: "FFDCE6F1" }, "NH": { font: "FF7B1E46", fill: "FFFCE4EC" }, "": { font: "FFAAAAAA", fill: null } };
         const colTotals = new Array(totalCols + 1).fill(0);
         employees.forEach((emp, i) => {
             const rowNum = 5 + i, r = ws.getRow(rowNum); r.height = 15;
