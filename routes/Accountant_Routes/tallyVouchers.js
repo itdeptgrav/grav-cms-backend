@@ -17,8 +17,15 @@ const {
   TallyLedger,
 } = require("../../models/Accountant_model/TallyMasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+const {
+  orgAuth,
+  requirePermission,
+} = require("../../Middlewear/AccountantOrgAuthMiddleware");
+const { createApprovalRequest } = require("./approvalRoutes");
 
-const auth = accountantAuth;
+// Use orgAuth — it gracefully handles legacy tokens too (sees them as
+// owner-equivalent with isLegacy=true and skips role enforcement).
+const auth = orgAuth;
 
 const VOUCHER_TYPES = [
   "sales",
@@ -142,6 +149,134 @@ router.get("/", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Cash & bank ledgers for a company (used by the Contra voucher form)  */
+/* ------------------------------------------------------------------ */
+// Returns ledgers belonging to Cash-in-Hand, Bank Accounts, or Bank OD A/c
+// — i.e. the only valid endpoints for a contra voucher.
+//
+// Resolution strategy (robust to sub-grouping):
+//   1. Find the three reserved groups by name for this company.
+//   2. Walk their descendant tree (sub-groups, sub-sub-groups, …) so that
+//      user-created groups like "Petty Cash" (under Cash-in-Hand) or
+//      "HDFC Current" (under Bank Accounts) are picked up too.
+//   3. Pull all ledgers whose groupId is in that descendant set.
+//   4. As a backup, also include any ledger whose denormalised groupName
+//      exactly matches one of the three names — covers edge cases where
+//      a ledger was imported with a groupName that doesn't resolve via
+//      the group hierarchy (rare but happens with Tally XML imports).
+
+const {
+  TallyGroup,
+} = require("../../models/Accountant_model/TallyMasterModels");
+
+router.get("/cash-bank-ledgers", auth, async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+
+    const ROOT_NAMES = ["Cash-in-Hand", "Bank Accounts", "Bank OD A/c"];
+
+    // 1. Find the root groups for this company
+    const roots = await TallyGroup.find({
+      companyId,
+      name: { $in: ROOT_NAMES },
+    })
+      .select("_id name")
+      .lean();
+
+    // 2. Walk down the tree to collect all descendant group IDs
+    const allGroupIds = new Set(roots.map((g) => String(g._id)));
+    let frontier = roots.map((g) => g._id);
+    let safety = 10; // hierarchy guard against accidental cycles
+    while (frontier.length > 0 && safety-- > 0) {
+      const children = await TallyGroup.find({
+        companyId,
+        parent: { $in: frontier },
+      })
+        .select("_id")
+        .lean();
+      if (children.length === 0) break;
+      frontier = [];
+      for (const c of children) {
+        const id = String(c._id);
+        if (!allGroupIds.has(id)) {
+          allGroupIds.add(id);
+          frontier.push(c._id);
+        }
+      }
+    }
+
+    // 3. Find ledgers under any of those groups OR with the exact groupName
+    //    (the OR-fallback covers imported ledgers whose groupName denormalised
+    //    string matches even if the groupId resolution path is broken)
+    const groupIdArr = Array.from(allGroupIds).map(
+      (id) => new mongoose.Types.ObjectId(id),
+    );
+
+    const ledgers = await TallyLedger.find({
+      companyId,
+      isActive: true,
+      $or: [
+        { groupId: { $in: groupIdArr } },
+        { groupName: { $in: ROOT_NAMES } },
+      ],
+    })
+      .select(
+        "name groupName groupId currentBalance currentBalanceType openingBalance nature",
+      )
+      .sort({ groupName: 1, name: 1 })
+      .lean();
+
+    // Diagnostic in server logs when nothing's found — helps trace setup issues
+    if (ledgers.length === 0) {
+      console.warn(
+        `[contra/cash-bank-ledgers] No ledgers for company ${companyId}. ` +
+          `Roots found: ${roots.length} (${roots.map((r) => r.name).join(", ") || "none"}). ` +
+          `Descendant groups: ${allGroupIds.size}. ` +
+          `Likely cause: ledgers exist but their groupName/groupId doesn't point to a cash/bank group.`,
+      );
+    }
+
+    res.json({
+      success: true,
+      ledgers,
+      // Diagnostic block — frontend can show this when empty for easier debugging
+      _diagnostic: {
+        companyId,
+        rootGroupsFound: roots.map((r) => ({ id: r._id, name: r.name })),
+        descendantGroupCount: allGroupIds.size,
+        ledgerCount: ledgers.length,
+      },
+    });
+  } catch (e) {
+    console.error("Error in /cash-bank-ledgers:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Get next voucher number (used by frontend on form open)             */
+/* ------------------------------------------------------------------ */
+// IMPORTANT: declared BEFORE `/:id` so the path "next-number/..." isn't
+// captured by the id-route's CastError.
+
+router.get("/next-number/:companyId/:voucherType", auth, async (req, res) => {
+  try {
+    const { companyId, voucherType } = req.params;
+    const { prefix } = req.query;
+    const number = await TallyVoucher.nextVoucherNumber(
+      companyId,
+      voucherType,
+      prefix,
+    );
+    res.json({ voucherNumber: number });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* Get one                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -160,30 +295,33 @@ router.get("/:id", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Get next voucher number (used by frontend on form open)             */
+/* (moved above /:id — see comment there)                              */
 /* ------------------------------------------------------------------ */
-
-router.get("/next-number/:companyId/:voucherType", auth, async (req, res) => {
-  try {
-    const { companyId, voucherType } = req.params;
-    const { prefix } = req.query;
-    const number = await TallyVoucher.nextVoucherNumber(
-      companyId,
-      voucherType,
-      prefix,
-    );
-    res.json({ voucherNumber: number });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 /* ------------------------------------------------------------------ */
 /* Create                                                              */
 /* ------------------------------------------------------------------ */
+// Approval routing:
+//   - Owner / Approver / legacy / dev users:
+//     If autoPost=true and balanced → post directly (existing behaviour).
+//     Else → save as draft.
+//   - Editor users (org.settings.requireApprovalForVouchers=true):
+//     If autoPost=true:
+//       → save voucher as `pending_approval`
+//       → create ApprovalRequest (kind="voucher", action="post")
+//       → return the voucher + the approval request so the UI can show
+//         "awaiting approval" instead of "posted".
+//     If autoPost=false → save as draft (same as everyone else).
+//   - Viewer users: 403 (cannot create at all).
 
 router.post("/", auth, async (req, res) => {
   try {
+    if (req.user?.permissions && !req.user.permissions.canEdit) {
+      return res
+        .status(403)
+        .json({ error: "Your role does not allow creating vouchers" });
+    }
+
     const body = req.body || {};
     if (!body.companyId)
       return res.status(400).json({ error: "companyId required" });
@@ -222,21 +360,74 @@ router.post("/", auth, async (req, res) => {
       }
     }
 
-    const voucher = new TallyVoucher(body);
+    // Decide the path: direct-post / pending-approval / draft
+    const wantsPost = !!body.autoPost;
+    const needsApproval =
+      wantsPost &&
+      req.user?.permissions &&
+      !req.user.permissions.canPostDirectly &&
+      req.organization?.settings?.requireApprovalForVouchers !== false;
+
+    // Save the voucher (status depends on path)
+    const voucher = new TallyVoucher({
+      ...body,
+      status: needsApproval ? "pending_approval" : "draft",
+    });
     await voucher.save();
 
-    // Auto-post if requested and balanced
-    if (body.autoPost && voucher.isBalanced) {
+    // Path A — direct post
+    if (wantsPost && !needsApproval && voucher.isBalanced) {
       voucher.status = "posted";
       await voucher.save();
       await applyLedgerBalances(voucher, +1);
+      return res.status(201).json(voucher);
     }
 
+    // Path B — needs approval (Editor + autoPost)
+    if (needsApproval) {
+      let approvalRequest = null;
+      try {
+        approvalRequest = await createApprovalRequest({
+          req,
+          kind: "voucher",
+          action: "post",
+          title: `Post ${body.voucherType} voucher ${voucher.voucherNumber} · ${formatGrand(voucher)}`,
+          target: { collection: "TallyVoucher", id: voucher._id },
+          payload: null,
+          companyId: voucher.companyId,
+        });
+      } catch (e) {
+        // If approval-request creation fails (e.g. legacy session), fall
+        // back to leaving the voucher as a draft so nothing is lost.
+        console.warn("[vouchers] couldn't create approval request:", e.message);
+        voucher.status = "draft";
+        await voucher.save();
+      }
+      return res.status(201).json({
+        ...voucher.toObject(),
+        approvalRequestId: approvalRequest?._id,
+        _meta: { needsApproval: true, message: "Submitted for approval" },
+      });
+    }
+
+    // Path C — plain draft
     res.status(201).json(voucher);
   } catch (e) {
+    console.error("[vouchers] create error:", e);
     res.status(400).json({ error: e.message });
   }
 });
+
+// Helper for the approval title — robust to missing fields
+function formatGrand(voucher) {
+  const v = Number(voucher.grandTotal || voucher.totalDebit || 0);
+  if (!v) return "(unbalanced)";
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 2,
+  }).format(v);
+}
 
 /* ------------------------------------------------------------------ */
 /* Update (only if draft)                                              */
@@ -268,6 +459,47 @@ router.put("/:id", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 
 router.post("/:id/post", auth, async (req, res) => {
+  // Editor without canPostDirectly → submit for approval, don't post
+  if (
+    req.user?.permissions &&
+    !req.user.permissions.canPostDirectly &&
+    req.organization?.settings?.requireApprovalForVouchers !== false
+  ) {
+    try {
+      const voucher = await TallyVoucher.findById(req.params.id);
+      if (!voucher) return res.status(404).json({ error: "Voucher not found" });
+      if (voucher.status !== "draft") {
+        return res.status(400).json({
+          error: `Voucher is ${voucher.status} — cannot submit for approval`,
+        });
+      }
+      if (!voucher.isBalanced) {
+        return res.status(400).json({
+          error: "Dr/Cr totals don't balance — fix before submitting",
+        });
+      }
+      voucher.status = "pending_approval";
+      voucher.updatedBy = req.user.id;
+      await voucher.save();
+      const ar = await createApprovalRequest({
+        req,
+        kind: "voucher",
+        action: "post",
+        title: `Post ${voucher.voucherType} voucher ${voucher.voucherNumber} · ${formatGrand(voucher)}`,
+        target: { collection: "TallyVoucher", id: voucher._id },
+        companyId: voucher.companyId,
+      });
+      return res.json({
+        ...voucher.toObject(),
+        approvalRequestId: ar._id,
+        _meta: { needsApproval: true, message: "Submitted for approval" },
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
+
+  // Owner / Approver / legacy → direct post
   const session = await mongoose.startSession();
   try {
     session.startTransaction();

@@ -619,7 +619,36 @@ router.get("/gst-summary", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* CASH FLOW (simplified: movements on cash & bank ledgers)            */
+/* CASH FLOW — AS-3 / IAS-7 classified statement                       */
+/*                                                                      */
+/* Indian accounting standard for cash flow statements requires three   */
+/* sections:                                                            */
+/*   A. OPERATING activities — receipts from customers, payments to     */
+/*      suppliers/staff, taxes, working-capital movements.              */
+/*   B. INVESTING activities — fixed-asset purchases/sales, investments,*/
+/*      loans given.                                                    */
+/*   C. FINANCING activities — loans taken/repaid, capital injected,    */
+/*      dividends paid.                                                 */
+/*                                                                      */
+/* For each non-internal cash voucher, we look at the "other side" of   */
+/* the entry (the non-cash ledgers) and classify by their GROUP NATURE  */
+/* / GROUP NAME. The activity money flow is: when cash goes Dr (in),    */
+/* the other side is Cr (something gave us cash); reverse for outflows. */
+/*                                                                      */
+/* Returns:                                                             */
+/*   {                                                                  */
+/*     dateRange:    { from, to },                                      */
+/*     openingCash:  N,                                                 */
+/*     closingCash:  N,                                                 */
+/*     activities: {                                                    */
+/*       operating: { lines: [{label, inflow, outflow, net}], net },    */
+/*       investing: { lines: [...], net },                              */
+/*       financing: { lines: [...], net }                               */
+/*     },                                                               */
+/*     internalTransfers: { inflow, outflow },  // contras, info-only   */
+/*     totals: { inflow, outflow, net },        // legacy compat        */
+/*     breakdown: [...]                          // legacy compat        */
+/*   }                                                                  */
 /* ------------------------------------------------------------------ */
 router.get("/cash-flow", auth, async (req, res) => {
   try {
@@ -629,7 +658,8 @@ router.get("/cash-flow", auth, async (req, res) => {
     const { from, to } = parseDateRange(req);
 
     const cId = new mongoose.Types.ObjectId(companyId);
-    // Find cash & bank ledgers — Tally groups: "Cash-in-Hand", "Bank Accounts"
+
+    // 1) Identify cash & bank ledgers (these are what we follow)
     const cashGroups = await TallyGroup.find({
       companyId: cId,
       name: { $in: ["Cash-in-Hand", "Bank Accounts", "Bank OD A/c"] },
@@ -642,7 +672,55 @@ router.get("/cash-flow", auth, async (req, res) => {
       groupId: { $in: cashGroupIds },
     }).lean();
     const cashLedgerIds = cashLedgers.map((l) => l._id);
+    const cashLedgerIdSet = new Set(cashLedgerIds.map(String));
 
+    // 2) Pull all groups + ledgers so we can classify any "other side" ledger
+    const allGroups = await TallyGroup.find({ companyId: cId }).lean();
+    const allLedgers = await TallyLedger.find({ companyId: cId }).lean();
+    const groupById = new Map(allGroups.map((g) => [String(g._id), g]));
+    const ledgerById = new Map(allLedgers.map((l) => [String(l._id), l]));
+
+    // Classifier — input is a non-cash ledger; output is one of:
+    //   "operating" | "investing" | "financing" | "internal" | "unknown"
+    function classify(ledger) {
+      if (!ledger) return "unknown";
+      if (cashLedgerIdSet.has(String(ledger._id))) return "internal";
+      const grp = groupById.get(String(ledger.groupId));
+      if (!grp) return "unknown";
+
+      const gname = (grp.name || "").toLowerCase();
+      // Walk up the parent chain to also consider parent group name
+      const parentName = grp.parentId
+        ? (groupById.get(String(grp.parentId))?.name || "").toLowerCase()
+        : "";
+
+      // Investing: fixed assets, intangibles, investments, capital WIP, deposits
+      if (/(fixed asset|intangible|investment|capital work)/.test(gname))
+        return "investing";
+      if (/(fixed asset|intangible|investment|capital work)/.test(parentName))
+        return "investing";
+
+      // Financing: loans (both directions), capital, reserves
+      if (
+        /(secured loan|unsecured loan|bank od|capital account|reserves|share capital|partner|drawings)/.test(
+          gname,
+        )
+      )
+        return "financing";
+      if (
+        /(secured loan|unsecured loan|capital account|reserves)/.test(
+          parentName,
+        )
+      )
+        return "financing";
+
+      // Operating: everything else that affects revenue/expense/working capital
+      // — debtors, creditors, taxes, expense ledgers, revenue ledgers, provisions,
+      // current assets/liabilities not classified above
+      return "operating";
+    }
+
+    // 3) Pull cash vouchers in the period — fully (we need the "other side")
     const match = {
       companyId: cId,
       status: "posted",
@@ -653,7 +731,157 @@ router.get("/cash-flow", auth, async (req, res) => {
       if (from) match.voucherDate.$gte = from;
       if (to) match.voucherDate.$lte = to;
     }
+    const vouchers = await TallyVoucher.find(match).lean();
 
+    // 4) Walk each voucher: for each cash leg (Dr or Cr), distribute its amount
+    // to the other-side ledgers proportionally based on their amounts and signs.
+    //
+    // For a typical voucher (e.g. cash sale): Cash Dr 1000 / Sales Cr 1000.
+    // The cash inflow of 1000 is attributed to "Sales" and classified as
+    // operating-inflow.
+    //
+    // For a more complex voucher (Cash Dr 1000 / Sales Cr 800 / GST Cr 200),
+    // we distribute the 1000 inflow proportionally: 800 to Sales (operating-in),
+    // 200 to GST (operating-in).
+    const activityBuckets = {
+      operating: new Map(), // key = ledgerId, value = { ledgerName, label, inflow, outflow }
+      investing: new Map(),
+      financing: new Map(),
+    };
+    let internalIn = 0,
+      internalOut = 0;
+
+    for (const v of vouchers) {
+      const entries = v.ledgerEntries || [];
+      // Sum cash-side Dr (inflow into business) and Cr (outflow from business)
+      let cashDr = 0,
+        cashCr = 0;
+      const otherEntries = []; // {ledgerId, type, amount}
+      for (const e of entries) {
+        if (cashLedgerIdSet.has(String(e.ledgerId))) {
+          if (e.type === "Dr") cashDr += e.amount;
+          else cashCr += e.amount;
+        } else {
+          otherEntries.push(e);
+        }
+      }
+      const cashNet = cashDr - cashCr; // +ve = net inflow, -ve = net outflow
+      if (Math.abs(cashNet) < 0.005) continue; // pure contra inside cash group
+
+      // If there are no non-cash entries, this is a pure cash↔cash transfer
+      // (contra). Track separately as internal.
+      if (otherEntries.length === 0) {
+        if (cashNet > 0) internalIn += cashNet;
+        else internalOut += -cashNet;
+        continue;
+      }
+
+      // Sum of other-side absolute amounts — used as denominator for prorate
+      const otherDr = otherEntries
+        .filter((e) => e.type === "Dr")
+        .reduce((s, e) => s + e.amount, 0);
+      const otherCr = otherEntries
+        .filter((e) => e.type === "Cr")
+        .reduce((s, e) => s + e.amount, 0);
+
+      // For an inflow voucher (cashNet > 0), the OPPOSITE side (Cr legs of
+      // non-cash entries) tells us where cash came FROM. For an outflow,
+      // the Dr legs of non-cash entries tell us where cash WENT TO.
+      const isInflow = cashNet > 0;
+      const sourceSide = isInflow ? "Cr" : "Dr";
+      const sideTotal = isInflow ? otherCr : otherDr;
+
+      // Walk source-side ledgers and bucket them into activity categories.
+      // The amount distributed to each ledger = (its amount / sideTotal) * |cashNet|.
+      // If sideTotal is 0 (asymmetric voucher — rare), we fall back to
+      // distributing across whatever non-cash entries exist.
+      const denom = sideTotal > 0 ? sideTotal : otherDr + otherCr;
+      const targets =
+        sideTotal > 0
+          ? otherEntries.filter((e) => e.type === sourceSide)
+          : otherEntries;
+
+      for (const e of targets) {
+        const share = denom > 0 ? (e.amount / denom) * Math.abs(cashNet) : 0;
+        if (share < 0.005) continue;
+        const led = ledgerById.get(String(e.ledgerId));
+        const cat = classify(led);
+        if (cat === "internal" || cat === "unknown") {
+          // Treat unknown as operating to be safe; internal already filtered above
+          if (cat === "internal") {
+            if (isInflow) internalIn += share;
+            else internalOut += share;
+            continue;
+          }
+        }
+        const bucketKey = cat === "unknown" ? "operating" : cat;
+        const map = activityBuckets[bucketKey];
+        const k = String(e.ledgerId);
+        if (!map.has(k)) {
+          map.set(k, {
+            ledgerId: e.ledgerId,
+            ledgerName: e.ledgerName || led?.name || "Unknown",
+            groupName: led
+              ? groupById.get(String(led.groupId))?.name || ""
+              : "",
+            inflow: 0,
+            outflow: 0,
+          });
+        }
+        const row = map.get(k);
+        if (isInflow) row.inflow += share;
+        else row.outflow += share;
+      }
+    }
+
+    function buildSection(map) {
+      const lines = Array.from(map.values())
+        .map((r) => ({ ...r, net: r.inflow - r.outflow }))
+        .sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+      const inflow = lines.reduce((s, l) => s + l.inflow, 0);
+      const outflow = lines.reduce((s, l) => s + l.outflow, 0);
+      return { lines, inflow, outflow, net: inflow - outflow };
+    }
+    const operating = buildSection(activityBuckets.operating);
+    const investing = buildSection(activityBuckets.investing);
+    const financing = buildSection(activityBuckets.financing);
+
+    // 5) Compute opening & closing cash balances (sum of cash-ledger balances
+    // including all activity up to `from-1` for opening, and up to `to` for
+    // closing).
+    async function cashBalanceUpTo(date) {
+      // Opening = sum of cash ledgers' openingBalance + all signed entries up to date
+      const baseOpening = cashLedgers.reduce(
+        (s, l) => s + (l.openingBalance || 0),
+        0,
+      );
+      if (!date) return baseOpening;
+      const agg = await TallyVoucher.aggregate([
+        {
+          $match: {
+            companyId: cId,
+            status: "posted",
+            voucherDate: { $lt: date },
+          },
+        },
+        { $unwind: "$ledgerEntries" },
+        { $match: { "ledgerEntries.ledgerId": { $in: cashLedgerIds } } },
+        {
+          $group: {
+            _id: null,
+            signed: { $sum: "$ledgerEntries.signedAmount" },
+          },
+        },
+      ]);
+      return baseOpening + (agg[0]?.signed || 0);
+    }
+    const openingCash = await cashBalanceUpTo(from);
+    // For closing: sum opening + period movements (all 3 activities + internal nets out to 0)
+    const periodNet = operating.net + investing.net + financing.net;
+    const closingCash = openingCash + periodNet;
+
+    // 6) Legacy-compat breakdown — keep returning the old shape so any page
+    // still using it doesn't break. The new frontend uses `activities`.
     const flows = await TallyVoucher.aggregate([
       { $match: match },
       { $unwind: "$ledgerEntries" },
@@ -682,12 +910,10 @@ router.get("/cash-flow", auth, async (req, res) => {
         },
       },
     ]);
-
     const ledMap = {};
     cashLedgers.forEach((l) => {
       ledMap[l._id.toString()] = l;
     });
-
     const breakdown = flows.map((f) => ({
       ledgerId: f._id.ledger,
       ledgerName: ledMap[f._id.ledger.toString()]?.name || "Unknown",
@@ -697,17 +923,23 @@ router.get("/cash-flow", auth, async (req, res) => {
       net: f.inflow - f.outflow,
     }));
 
-    const totals = breakdown.reduce(
-      (a, b) => {
-        a.inflow += b.inflow;
-        a.outflow += b.outflow;
-        a.net += b.net;
-        return a;
-      },
-      { inflow: 0, outflow: 0, net: 0 },
-    );
+    const totals = {
+      inflow: operating.inflow + investing.inflow + financing.inflow,
+      outflow: operating.outflow + investing.outflow + financing.outflow,
+      net: periodNet,
+    };
 
-    res.json({ companyId, dateRange: { from, to }, breakdown, totals });
+    res.json({
+      companyId,
+      dateRange: { from, to },
+      openingCash,
+      closingCash,
+      activities: { operating, investing, financing },
+      internalTransfers: { inflow: internalIn, outflow: internalOut },
+      // Legacy compat
+      totals,
+      breakdown,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

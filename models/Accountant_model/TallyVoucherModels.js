@@ -19,24 +19,28 @@ const mongoose = require("mongoose");
 // ─────────────────────────────────────────────────────────────────────────────
 const ledgerEntrySchema = new mongoose.Schema(
   {
-    ledgerId:   { type: mongoose.Schema.Types.ObjectId, ref: "TallyLedger" },
+    ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyLedger" },
     ledgerName: { type: String, required: true, trim: true }, // denormalised — survives ledger renames
-    groupName:  { type: String, trim: true },
+    groupName: { type: String, trim: true },
 
     // Tally records every line as either a debit or a credit, with an
     // unsigned amount. We keep both `type` + `amount` (industry-standard
     // representation) AND a signed `signedAmount` for fast balance maths.
-    type:        { type: String, enum: ["Dr", "Cr"], required: true },
-    amount:      { type: Number, required: true, min: 0 },
-    signedAmount:{ type: Number }, // +ve for Dr, -ve for Cr — auto-set in pre-save
+    type: { type: String, enum: ["Dr", "Cr"], required: true },
+    amount: { type: Number, required: true, min: 0 },
+    signedAmount: { type: Number }, // +ve for Dr, -ve for Cr — auto-set in pre-save
 
     // Bill-wise allocations (Tally's "Bill-wise Details" pop-up)
     billAllocations: [
       {
-        billName:   { type: String, trim: true },           // bill no / reference
-        billType:   { type: String, enum: ["new_ref", "agst_ref", "advance", "on_account"], default: "new_ref" },
-        amount:     { type: Number, default: 0 },
-        dueDate:    { type: Date },
+        billName: { type: String, trim: true }, // bill no / reference
+        billType: {
+          type: String,
+          enum: ["new_ref", "agst_ref", "advance", "on_account"],
+          default: "new_ref",
+        },
+        amount: { type: Number, default: 0 },
+        dueDate: { type: Date },
         creditDays: { type: Number, default: 0 },
       },
     ],
@@ -44,20 +48,23 @@ const ledgerEntrySchema = new mongoose.Schema(
     // Cost-centre allocation
     costCentreAllocations: [
       {
-        costCentreId:   { type: mongoose.Schema.Types.ObjectId, ref: "TallyCostCentre" },
+        costCentreId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "TallyCostCentre",
+        },
         costCentreName: { type: String, trim: true },
-        amount:         { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
       },
     ],
 
     // GST classification at the line level
     gstClassification: { type: String, trim: true }, // "Taxable", "Exempt", "Nil-Rated", "Non-GST"
-    isPartyLedger:     { type: Boolean, default: false },
-    isDeemedPositive:  { type: Boolean, default: true },
+    isPartyLedger: { type: Boolean, default: false },
+    isDeemedPositive: { type: Boolean, default: true },
 
     narration: { type: String, trim: true },
   },
-  { _id: true }
+  { _id: true },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,31 +72,37 @@ const ledgerEntrySchema = new mongoose.Schema(
 // ─────────────────────────────────────────────────────────────────────────────
 const inventoryEntrySchema = new mongoose.Schema(
   {
-    stockItemId:   { type: mongoose.Schema.Types.ObjectId, ref: "TallyStockItem" },
+    stockItemId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyStockItem",
+    },
     stockItemName: { type: String, required: true, trim: true },
 
     quantity: { type: Number, required: true },
-    unit:     { type: String, trim: true },
-    rate:     { type: Number, default: 0 },
+    unit: { type: String, trim: true },
+    rate: { type: Number, default: 0 },
     discount: { type: Number, default: 0 },
 
     amount: { type: Number, required: true }, // qty × rate − discount
 
-    hsnCode:   { type: String, trim: true },
-    godownId:  { type: mongoose.Schema.Types.ObjectId, ref: "TallyGodown" },
-    godownName:{ type: String, trim: true },
+    hsnCode: { type: String, trim: true },
+    godownId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyGodown" },
+    godownName: { type: String, trim: true },
     batchName: { type: String, trim: true },
 
     // Per-line tax (some accountants prefer line-level, others voucher-level)
-    taxRate:    { type: Number, default: 0 },
-    taxAmount:  { type: Number, default: 0 },
+    taxRate: { type: Number, default: 0 },
+    taxAmount: { type: Number, default: 0 },
 
     // Sales/purchase ledger this line posts against (optional — voucher-level
     // sales ledger is the more common pattern)
-    accountingLedgerId:   { type: mongoose.Schema.Types.ObjectId, ref: "TallyLedger" },
+    accountingLedgerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyLedger",
+    },
     accountingLedgerName: { type: String, trim: true },
   },
-  { _id: true }
+  { _id: true },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,13 +110,13 @@ const inventoryEntrySchema = new mongoose.Schema(
 // ─────────────────────────────────────────────────────────────────────────────
 const gstBreakupSchema = new mongoose.Schema(
   {
-    cgst:  { type: Number, default: 0 },
-    sgst:  { type: Number, default: 0 },
-    igst:  { type: Number, default: 0 },
-    cess:  { type: Number, default: 0 },
+    cgst: { type: Number, default: 0 },
+    sgst: { type: Number, default: 0 },
+    igst: { type: Number, default: 0 },
+    cess: { type: Number, default: 0 },
     total: { type: Number, default: 0 },
   },
-  { _id: false }
+  { _id: false },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,11 +142,11 @@ const tallyVoucherSchema = new mongoose.Schema(
         "purchase",
         "receipt",
         "payment",
-        "contra",          // bank ↔ bank or cash ↔ bank
-        "journal",         // adjustments
-        "credit_note",     // sales return / customer credit
-        "debit_note",      // purchase return / vendor debit
-        "stock_journal",   // inventory transfer
+        "contra", // bank ↔ bank or cash ↔ bank
+        "journal", // adjustments
+        "credit_note", // sales return / customer credit
+        "debit_note", // purchase return / vendor debit
+        "stock_journal", // inventory transfer
         "delivery_note",
         "receipt_note",
         "rejection_in",
@@ -147,42 +160,46 @@ const tallyVoucherSchema = new mongoose.Schema(
 
     voucherNumber: { type: String, required: true, trim: true, index: true },
     referenceNumber: { type: String, trim: true }, // e.g. supplier invoice no
-    referenceDate:   { type: Date },
+    referenceDate: { type: Date },
 
     voucherDate: { type: Date, required: true, index: true },
 
     // ─── Party (optional — sales/purchase/receipt/payment/CN/DN have one) ───
-    partyLedgerId:   { type: mongoose.Schema.Types.ObjectId, ref: "TallyLedger" },
+    partyLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyLedger" },
     partyLedgerName: { type: String, trim: true },
-    partyGstin:      { type: String, trim: true },
-    placeOfSupply:   { type: String, trim: true },
+    partyGstin: { type: String, trim: true },
+    placeOfSupply: { type: String, trim: true },
     placeOfSupplyCode: { type: String, trim: true }, // GST state code
 
     // ─── Lines ──────────────────────────────────────────────────────────────
-    ledgerEntries:    { type: [ledgerEntrySchema],    default: [] },
+    ledgerEntries: { type: [ledgerEntrySchema], default: [] },
     inventoryEntries: { type: [inventoryEntrySchema], default: [] },
 
     // ─── Totals ─────────────────────────────────────────────────────────────
-    subtotal:      { type: Number, default: 0 },
+    subtotal: { type: Number, default: 0 },
     discountTotal: { type: Number, default: 0 },
-    gstBreakup:    { type: gstBreakupSchema, default: () => ({}) },
-    totalTax:      { type: Number, default: 0 },
-    roundOff:      { type: Number, default: 0 },
-    grandTotal:    { type: Number, required: true },
+    gstBreakup: { type: gstBreakupSchema, default: () => ({}) },
+    totalTax: { type: Number, default: 0 },
+    roundOff: { type: Number, default: 0 },
+    grandTotal: { type: Number, required: true },
     amountInWords: { type: String, trim: true },
 
     // ─── Validation: total Dr must equal total Cr ─────────────────────────────
-    totalDebit:  { type: Number, default: 0 },
+    totalDebit: { type: Number, default: 0 },
     totalCredit: { type: Number, default: 0 },
-    isBalanced:  { type: Boolean, default: false },
+    isBalanced: { type: Boolean, default: false },
 
     // ─── Narration (header-level note) ──────────────────────────────────────
     narration: { type: String, trim: true },
 
     // ─── Status ─────────────────────────────────────────────────────────────
+    // pending_approval is the state used when an Editor creates a voucher
+    // but the org requires owner/approver review before it posts. It maps
+    // to an ApprovalRequest row; approve flips it to "posted", reject to
+    // "cancelled".
     status: {
       type: String,
-      enum: ["draft", "posted", "cancelled", "void"],
+      enum: ["draft", "pending_approval", "posted", "cancelled", "void"],
       default: "draft",
       index: true,
     },
@@ -193,54 +210,72 @@ const tallyVoucherSchema = new mongoose.Schema(
 
     // ─── e-Invoice / e-Way Bill (sales) ─────────────────────────────────────
     eInvoiceDetails: {
-      irn:                   { type: String, trim: true },
-      ackNumber:             { type: String, trim: true },
-      ackDate:               { type: Date },
-      qrCode:                { type: String, trim: true },
-      signedInvoiceFile:     { type: String, trim: true },
+      irn: { type: String, trim: true },
+      ackNumber: { type: String, trim: true },
+      ackDate: { type: Date },
+      qrCode: { type: String, trim: true },
+      signedInvoiceFile: { type: String, trim: true },
     },
     eWayBillDetails: {
-      ewbNumber:    { type: String, trim: true },
-      ewbDate:      { type: Date },
-      validUpto:    { type: Date },
-      transporter:  { type: String, trim: true },
-      vehicleNo:    { type: String, trim: true },
-      distance:     { type: Number, default: 0 },
+      ewbNumber: { type: String, trim: true },
+      ewbDate: { type: Date },
+      validUpto: { type: Date },
+      transporter: { type: String, trim: true },
+      vehicleNo: { type: String, trim: true },
+      distance: { type: Number, default: 0 },
     },
 
     // ─── CMS bridge ─────────────────────────────────────────────────────────
     sourceSystem: {
       type: String,
-      enum: ["manual", "auto_from_quotation", "auto_from_po", "auto_from_payroll", "tally_import"],
+      enum: [
+        "manual",
+        "auto_from_quotation",
+        "auto_from_po",
+        "auto_from_payroll",
+        "tally_import",
+      ],
       default: "manual",
     },
-    sourceId:        { type: mongoose.Schema.Types.ObjectId },
+    sourceId: { type: mongoose.Schema.Types.ObjectId },
     sourceReference: { type: String, trim: true },
 
     // ─── Tally provenance ───────────────────────────────────────────────────
-    tallyGuid:    { type: String },
-    importedAt:   { type: Date },
-    importSession:{ type: mongoose.Schema.Types.ObjectId, ref: "TallyImportSession" },
+    tallyGuid: { type: String },
+    importedAt: { type: Date },
+    importSession: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyImportSession",
+    },
 
     // ─── Audit ──────────────────────────────────────────────────────────────
     financialYear: { type: String, index: true },
     attachments: [
       {
-        fileName:   String,
-        fileUrl:    String,
-        fileType:   String,
+        fileName: String,
+        fileUrl: String,
+        fileType: String,
         uploadedAt: { type: Date, default: Date.now },
       },
     ],
 
-    enteredBy:  { type: mongoose.Schema.Types.ObjectId, ref: "AccountantDepartment" },
-    postedBy:   { type: mongoose.Schema.Types.ObjectId, ref: "AccountantDepartment" },
-    postedAt:   { type: Date },
-    cancelledBy:{ type: mongoose.Schema.Types.ObjectId, ref: "AccountantDepartment" },
-    cancelledAt:{ type: Date },
+    enteredBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AccountantDepartment",
+    },
+    postedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AccountantDepartment",
+    },
+    postedAt: { type: Date },
+    cancelledBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AccountantDepartment",
+    },
+    cancelledAt: { type: Date },
     cancellationReason: { type: String, trim: true },
   },
-  { timestamps: true, collection: "tally_vouchers" }
+  { timestamps: true, collection: "tally_vouchers" },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -253,9 +288,15 @@ tallyVoucherSchema.pre("save", function (next) {
   });
 
   // Dr / Cr totals
-  this.totalDebit  = this.ledgerEntries.reduce((s, l) => s + (l.type === "Dr" ? l.amount : 0), 0);
-  this.totalCredit = this.ledgerEntries.reduce((s, l) => s + (l.type === "Cr" ? l.amount : 0), 0);
-  this.isBalanced  = Math.abs(this.totalDebit - this.totalCredit) < 0.01;
+  this.totalDebit = this.ledgerEntries.reduce(
+    (s, l) => s + (l.type === "Dr" ? l.amount : 0),
+    0,
+  );
+  this.totalCredit = this.ledgerEntries.reduce(
+    (s, l) => s + (l.type === "Cr" ? l.amount : 0),
+    0,
+  );
+  this.isBalanced = Math.abs(this.totalDebit - this.totalCredit) < 0.01;
 
   // GST aggregate
   if (this.gstBreakup) {
@@ -281,7 +322,10 @@ tallyVoucherSchema.pre("save", function (next) {
 // INDEXES
 // ─────────────────────────────────────────────────────────────────────────────
 tallyVoucherSchema.index({ companyId: 1, voucherDate: -1 });
-tallyVoucherSchema.index({ companyId: 1, voucherType: 1, voucherNumber: 1 }, { unique: true });
+tallyVoucherSchema.index(
+  { companyId: 1, voucherType: 1, voucherNumber: 1 },
+  { unique: true },
+);
 tallyVoucherSchema.index({ companyId: 1, partyLedgerId: 1 });
 tallyVoucherSchema.index({ companyId: 1, financialYear: 1 });
 tallyVoucherSchema.index({ "ledgerEntries.ledgerId": 1, voucherDate: -1 });
@@ -289,24 +333,36 @@ tallyVoucherSchema.index({ "ledgerEntries.ledgerId": 1, voucherDate: -1 });
 // ─────────────────────────────────────────────────────────────────────────────
 // STATIC: get the next voucher number for a given company + type
 // ─────────────────────────────────────────────────────────────────────────────
-tallyVoucherSchema.statics.nextVoucherNumber = async function (companyId, voucherType, prefix) {
-  const fmtPrefix = prefix || ({
-    sales: "SL",
-    purchase: "PU",
-    receipt: "RC",
-    payment: "PY",
-    contra: "CN",
-    journal: "JV",
-    credit_note: "CR",
-    debit_note: "DR",
-    stock_journal: "SJ",
-  }[voucherType] || "VC");
+tallyVoucherSchema.statics.nextVoucherNumber = async function (
+  companyId,
+  voucherType,
+  prefix,
+) {
+  const fmtPrefix =
+    prefix ||
+    {
+      sales: "SL",
+      purchase: "PU",
+      receipt: "RC",
+      payment: "PY",
+      contra: "CN",
+      journal: "JV",
+      credit_note: "CR",
+      debit_note: "DR",
+      stock_journal: "SJ",
+    }[voucherType] ||
+    "VC";
 
   const today = new Date();
-  const fy = today.getMonth() >= 3 ? today.getFullYear() : today.getFullYear() - 1;
+  const fy =
+    today.getMonth() >= 3 ? today.getFullYear() : today.getFullYear() - 1;
   const fyShort = `${fy.toString().slice(2)}${(fy + 1).toString().slice(2)}`;
 
-  const last = await this.findOne({ companyId, voucherType, financialYear: `${fy}-${(fy + 1).toString().slice(2)}` })
+  const last = await this.findOne({
+    companyId,
+    voucherType,
+    financialYear: `${fy}-${(fy + 1).toString().slice(2)}`,
+  })
     .sort({ createdAt: -1 })
     .select("voucherNumber")
     .lean();
@@ -324,15 +380,24 @@ tallyVoucherSchema.statics.nextVoucherNumber = async function (companyId, vouche
 // ─────────────────────────────────────────────────────────────────────────────
 const tallyGodownSchema = new mongoose.Schema(
   {
-    companyId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyCompany", required: true, index: true },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyCompany",
+      required: true,
+      index: true,
+    },
     name: { type: String, required: true, trim: true },
-    parent: { type: mongoose.Schema.Types.ObjectId, ref: "TallyGodown", default: null },
+    parent: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyGodown",
+      default: null,
+    },
     parentName: { type: String, trim: true },
     address: { type: String, trim: true },
     isActive: { type: Boolean, default: true },
     tallyGuid: { type: String },
   },
-  { timestamps: true, collection: "tally_godowns" }
+  { timestamps: true, collection: "tally_godowns" },
 );
 
 tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
@@ -341,7 +406,7 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
 // EXPORTS
 // ─────────────────────────────────────────────────────────────────────────────
 const TallyVoucher = mongoose.model("TallyVoucher", tallyVoucherSchema);
-const TallyGodown  = mongoose.model("TallyGodown",  tallyGodownSchema);
+const TallyGodown = mongoose.model("TallyGodown", tallyGodownSchema);
 
 module.exports = {
   TallyVoucher,
