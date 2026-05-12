@@ -13,7 +13,7 @@ const webpush = require("web-push");
 // Get these from Firebase Console → Project Settings → Cloud Messaging → Web Push certificates
 const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
-const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:admin@grav.in";
+const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:rakesh.biswal@grav.in";
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
     webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
@@ -113,10 +113,8 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
         console.log(`[FCM] Sending to ${fcmTokens.length} FCM token(s) total`);
 
         const message = {
-            // Top-level notification (Android background, some web)
-            notification: { title, body },
-
-            // Data payload (always included — sw.js reads this)
+            // Data-only payload — service worker (onBackgroundMessage) controls display
+            // This prevents Chrome from auto-showing AND onBackgroundMessage double-firing
             data: dataPayload,
 
             // ── Web Push (Chrome, Firefox, Edge, desktop) ──
@@ -125,8 +123,8 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                 notification: {
                     title,
                     body,
-                    icon: "/icons/icon-192x192.png",
-                    badge: "/icons/badge-72x72.png",
+                    icon: "/icon-192.png",
+                    badge: "/icon-192.png",
                     requireInteraction: false,
                     vibrate: [200, 100, 200],
                     tag: `cowork-${data.type || "notif"}-${Date.now()}`,

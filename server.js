@@ -312,11 +312,11 @@ io.on("connection", (socket) => {
 
 // 1. At the top with your other requires:
 const transcriptModule = require("./routes/task_routes/transcript.routes");
-
+const sopRoutes = require("./routes/soproutes/soproute"); //sop routes
 
 // 2. With your other app.use() route registrations:
 app.use("/cowork", transcriptModule.router);
-
+app.use("/cowork/sop", sopRoutes);  // sop
 
 // ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
