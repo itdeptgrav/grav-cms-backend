@@ -42,7 +42,7 @@ function countLeaveDays(startStr, endStr) {
   const from = new Date(sy, sm - 1, sd),
     to = new Date(ey, em - 1, ed);
   if (from > to) return 0;
-  if (from.getTime() === to.getTime() && from.getDay() === 6) return 0;
+  // ✅ FIX 1: Removed Saturday blocking — Saturday is a valid leave day
   return Math.round((to - from) / (24 * 60 * 60 * 1000)) + 1;
 }
 
@@ -340,7 +340,8 @@ router.post(
         return res
           .status(400)
           .json({ success: false, message: "All fields required" });
-      if (!["CL", "SL", "PL"].includes(leaveType))
+      // ✅ FIX 2: Added LOP as valid leave type
+      if (!["CL", "SL", "PL", "LOP"].includes(leaveType))
         return res
           .status(400)
           .json({ success: false, message: "Invalid leave type" });
@@ -393,22 +394,33 @@ router.post(
           code: "OVERLAP",
         });
 
-      // ── LWP split: allow even if balance insufficient ──
-      const bal = await ensureBalance(employeeId, year, te.biometricId, config);
-      if (leaveType === "PL" && !bal.plEligible) {
-        bal.plEligible = true;
-        bal.plGrantedDate = new Date();
-        bal.entitlement.PL = config.plPerYear;
-        await bal.save();
+      // ✅ FIX 3: LOP — all days are LWP, no balance deduction
+      let paidDays, lwpDays;
+      if (leaveType === "LOP") {
+        paidDays = 0;
+        lwpDays = totalDays;
+      } else {
+        const bal = await ensureBalance(
+          employeeId,
+          year,
+          te.biometricId,
+          config,
+        );
+        if (leaveType === "PL" && !bal.plEligible) {
+          bal.plEligible = true;
+          bal.plGrantedDate = new Date();
+          bal.entitlement.PL = config.plPerYear;
+          await bal.save();
+        }
+        const le = {
+          CL: config.clPerYear,
+          SL: config.slPerYear,
+          PL: bal.plEligible ? config.plPerYear : 0,
+        };
+        const av = Math.max(0, le[leaveType] - bal.consumed[leaveType]);
+        paidDays = Math.min(totalDays, av);
+        lwpDays = Math.max(0, totalDays - paidDays);
       }
-      const le = {
-        CL: config.clPerYear,
-        SL: config.slPerYear,
-        PL: bal.plEligible ? config.plPerYear : 0,
-      };
-      const av = Math.max(0, le[leaveType] - bal.consumed[leaveType]);
-      const paidDays = Math.min(totalDays, av);
-      const lwpDays = Math.max(0, totalDays - paidDays);
 
       const rd = leaveType === "SL" && totalDays > config.slDocumentThreshold;
       const mn = [];
@@ -530,8 +542,10 @@ router.get("/:id", AllEmployeeAppMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  APPLY FOR LEAVE — with LWP breakdown (paid vs unpaid split)
-//  No longer blocks on insufficient balance — excess becomes LWP
+//  APPLY FOR LEAVE
+//  ✅ FIX 4: Removed Saturday block entirely
+//  ✅ FIX 5: Added SL as proper leave type (separate flow, no split needed)
+//  ✅ FIX 6: Added LOP — all days are Loss of Pay, no balance deduction
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
   try {
@@ -543,15 +557,20 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       reason,
       isHalfDay,
       halfDaySlot,
+      paidDays: clientPaidDays, // for LOP: client sends paidDays:0
     } = req.body;
+
     if (!leaveType || !applicationDate || !fromDate || !toDate || !reason)
       return res
         .status(400)
         .json({ success: false, message: "All fields required" });
-    if (!["CL", "SL", "PL"].includes(leaveType))
+
+    // ✅ FIX 5+6: Accept CL, SL, PL, LOP
+    if (!["CL", "SL", "PL", "LOP"].includes(leaveType))
       return res
         .status(400)
         .json({ success: false, message: "Invalid leave type" });
+
     if (new Date(toDate) < new Date(fromDate))
       return res
         .status(400)
@@ -566,6 +585,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+
     const config = await LeaveConfig.getConfig();
     const year = new Date(fromDate).getFullYear();
 
@@ -584,19 +604,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         code: "PL_NOT_ELIGIBLE",
       });
 
-    // Calculate days
-    const [fsy, fsm, fsd] = fromDate.split("-").map(Number);
-    const [tsy, tsm, tsd] = toDate.split("-").map(Number);
-    if (
-      new Date(fsy, fsm - 1, fsd).getTime() ===
-        new Date(tsy, tsm - 1, tsd).getTime() &&
-      new Date(fsy, fsm - 1, fsd).getDay() === 6
-    )
-      return res.status(400).json({
-        success: false,
-        message: "Saturday is not a valid leave day.",
-        code: "SATURDAY_BLOCKED",
-      });
+    // ✅ FIX 4: No Saturday block — just calculate days normally
     const totalDays = isHalfDay ? 0.5 : countLeaveDays(fromDate, toDate);
     if (totalDays <= 0)
       return res
@@ -618,7 +626,140 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       });
 
     // ══════════════════════════════════════════════════════════════════
-    //  CALCULATE PAID vs LWP BREAKDOWN — no longer blocks
+    //  LOP — no balance calculation, all days are unpaid
+    // ══════════════════════════════════════════════════════════════════
+    if (leaveType === "LOP") {
+      const mn = [];
+      if (emp.primaryManager?.managerId)
+        mn.push({
+          managerId: emp.primaryManager.managerId,
+          managerName: emp.primaryManager.managerName || "",
+          type: "primary",
+        });
+      if (emp.secondaryManager?.managerId)
+        mn.push({
+          managerId: emp.secondaryManager.managerId,
+          managerName: emp.secondaryManager.managerName || "",
+          type: "secondary",
+        });
+
+      const app = await LeaveApplication.create({
+        employeeId: req.user.id,
+        biometricId: emp.biometricId,
+        employeeName: `${emp.firstName} ${emp.lastName}`.trim(),
+        designation: emp.designation,
+        department: emp.department,
+        leaveType: "LOP",
+        applicationDate,
+        fromDate,
+        toDate,
+        totalDays,
+        paidDays: 0,
+        lwpDays: totalDays,
+        reason,
+        isHalfDay: !!isHalfDay,
+        halfDaySlot: isHalfDay ? halfDaySlot || "first_half" : null,
+        requiresDocument: false,
+        managersNotified: mn,
+        status: "pending",
+      });
+
+      notifyManagerOnLeaveApply(emp, app).catch((e) =>
+        console.warn("[PUSH]", e.message),
+      );
+
+      return res.status(201).json({
+        success: true,
+        data: app,
+        message: `LOP application submitted: ${totalDays} day${totalDays !== 1 ? "s" : ""} (all unpaid).`,
+        breakdown: {
+          totalDays,
+          paidDays: 0,
+          lwpDays: totalDays,
+          leaveType: "LOP",
+          availableBalance: 0,
+          effectiveAvailable: 0,
+        },
+      });
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  SL — direct submission, uses SL balance, excess becomes LWP
+    // ══════════════════════════════════════════════════════════════════
+    if (leaveType === "SL") {
+      const bal = await ensureBalance(
+        req.user.id,
+        year,
+        emp.biometricId,
+        config,
+      );
+      const availableSL = Math.max(0, config.slPerYear - bal.consumed.SL);
+      const paidDays = Math.min(totalDays, availableSL);
+      const lwpDays = Math.max(0, totalDays - paidDays);
+      const rd = totalDays > config.slDocumentThreshold;
+
+      const mn = [];
+      if (emp.primaryManager?.managerId)
+        mn.push({
+          managerId: emp.primaryManager.managerId,
+          managerName: emp.primaryManager.managerName || "",
+          type: "primary",
+        });
+      if (emp.secondaryManager?.managerId)
+        mn.push({
+          managerId: emp.secondaryManager.managerId,
+          managerName: emp.secondaryManager.managerName || "",
+          type: "secondary",
+        });
+
+      const app = await LeaveApplication.create({
+        employeeId: req.user.id,
+        biometricId: emp.biometricId,
+        employeeName: `${emp.firstName} ${emp.lastName}`.trim(),
+        designation: emp.designation,
+        department: emp.department,
+        leaveType: "SL",
+        applicationDate,
+        fromDate,
+        toDate,
+        totalDays,
+        paidDays,
+        lwpDays,
+        reason,
+        isHalfDay: !!isHalfDay,
+        halfDaySlot: isHalfDay ? halfDaySlot || "first_half" : null,
+        requiresDocument: rd,
+        managersNotified: mn,
+        status: "pending",
+      });
+
+      notifyManagerOnLeaveApply(emp, app).catch((e) =>
+        console.warn("[PUSH]", e.message),
+      );
+
+      let msg = "Sick Leave application submitted.";
+      if (lwpDays > 0)
+        msg = `SL submitted: ${paidDays} day${paidDays !== 1 ? "s" : ""} paid + ${lwpDays} day${lwpDays !== 1 ? "s" : ""} LWP.`;
+      if (rd) msg += " Please submit a medical certificate.";
+
+      return res.status(201).json({
+        success: true,
+        data: app,
+        message: msg,
+        requiresDocument: rd,
+        breakdown: {
+          totalDays,
+          paidDays,
+          lwpDays,
+          leaveType: "SL",
+          availableBalance: availableSL,
+          effectiveAvailable: availableSL,
+        },
+      });
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CL / PL — with LWP breakdown (paid vs unpaid split)
     // ══════════════════════════════════════════════════════════════════
     const bal = await ensureBalance(req.user.id, year, emp.biometricId, config);
     if (leaveType === "PL" && !bal.plEligible) {
@@ -637,7 +778,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       le[leaveType] - bal.consumed[leaveType],
     );
 
-    // CL monthly limit check — cap paid CL at maxCLPerMonth
+    // CL monthly limit check
     let effectiveAvailable = availableBalance;
     if (leaveType === "CL") {
       const maxCLMonth = config.maxCLPerMonth || 3;
@@ -671,20 +812,18 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       null,
     );
     const monthlyRemaining = Math.max(0, monthlyCap - totalMonthUsed);
-    // Effective paid can't exceed monthly remaining
     effectiveAvailable = Math.min(effectiveAvailable, monthlyRemaining);
     console.log(
       `[LEAVE-LWP] Monthly: used=${totalMonthUsed}, cap=${monthlyCap}, remaining=${monthlyRemaining}, effectiveAvail=${effectiveAvailable}`,
     );
 
-    // Final breakdown
     const paidDays = Math.min(totalDays, effectiveAvailable);
     const lwpDays = Math.max(0, totalDays - paidDays);
     console.log(
       `[LEAVE-LWP] BREAKDOWN: total=${totalDays}, paid=${paidDays} (${leaveType}), lwp=${lwpDays}, employee=${emp.firstName} ${emp.lastName}`,
     );
 
-    const rd = leaveType === "SL" && totalDays > config.slDocumentThreshold;
+    const rd = false; // CL/PL don't require documents
     const mn = [];
     if (emp.primaryManager?.managerId)
       mn.push({
@@ -739,6 +878,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
           applicationId: app._id.toString(),
         }).catch((e) => console.warn("[EMAIL]", e.message));
     } catch (_) {}
+
     try {
       const io = req.app.get("io");
       if (io && mn.length > 0) {
@@ -763,17 +903,14 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       console.warn("[PUSH]", e.message),
     );
 
-    // Build response message
     let msg = "Leave application submitted successfully";
     if (lwpDays > 0)
       msg = `Leave submitted: ${paidDays} day${paidDays !== 1 ? "s" : ""} ${leaveType} (paid) + ${lwpDays} day${lwpDays !== 1 ? "s" : ""} LWP (unpaid)`;
-    if (rd) msg += ". Please submit supporting documents.";
 
     res.status(201).json({
       success: true,
       data: app,
       message: msg,
-      requiresDocument: rd,
       breakdown: {
         totalDays,
         paidDays,
@@ -826,16 +963,7 @@ router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
     const { fromDate, toDate, reason, isHalfDay, halfDaySlot } = req.body;
     const nF = fromDate || a.fromDate,
       nT = isHalfDay ? nF : toDate || a.toDate;
-    const [fy, fm, fd] = nF.split("-").map(Number);
-    const [ty, tm, td] = nT.split("-").map(Number);
-    if (
-      new Date(fy, fm - 1, fd).getTime() ===
-        new Date(ty, tm - 1, td).getTime() &&
-      new Date(fy, fm - 1, fd).getDay() === 6
-    )
-      return res
-        .status(400)
-        .json({ success: false, message: "Saturday invalid" });
+    // ✅ FIX 4: Removed Saturday block from employee self-edit too
     const nt = (isHalfDay !== undefined ? isHalfDay : a.isHalfDay)
       ? 0.5
       : countLeaveDays(nF, nT);
@@ -938,7 +1066,7 @@ router.post(
 );
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MANAGER EDIT — HOD can adjust dates, leave type, reason before approving
+//  MANAGER EDIT
 // ═══════════════════════════════════════════════════════════════════════════════
 router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
   try {
@@ -962,7 +1090,9 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
         ? nF
         : toDate || a.toDate;
     const nType = leaveType || a.leaveType;
-    if (!["CL", "SL", "PL"].includes(nType))
+
+    // ✅ FIX 6: Accept LOP as valid type in manager edit too
+    if (!["CL", "SL", "PL", "LOP"].includes(nType))
       return res
         .status(400)
         .json({ success: false, message: "Invalid leave type" });
@@ -973,7 +1103,6 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
     if (totalDays <= 0)
       return res.status(400).json({ success: false, message: "No valid days" });
 
-    // Overlap check (exclude self)
     const oc = await LeaveApplication.findOne({
       _id: { $ne: req.params.id },
       employeeId: a.employeeId,
@@ -988,67 +1117,77 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
         code: "OVERLAP",
       });
 
-    // Recalculate paid vs LWP for new type/dates
-    const config = await LeaveConfig.getConfig();
-    const year = new Date(nF).getFullYear();
-    const bal = await ensureBalance(a.employeeId, year, a.biometricId, config);
-    const le = {
-      CL: config.clPerYear,
-      SL: config.slPerYear,
-      PL: bal.plEligible ? config.plPerYear : 0,
-    };
-    let effectiveAvailable = Math.max(0, le[nType] - bal.consumed[nType]);
+    let paidDays, lwpDays;
 
-    if (nType === "CL") {
-      const maxCLMonth = config.maxCLPerMonth || 3;
-      const { used: clUsed } = await countMonthlyUsage(
+    if (nType === "LOP") {
+      paidDays = 0;
+      lwpDays = totalDays;
+    } else {
+      const config = await LeaveConfig.getConfig();
+      const year = new Date(nF).getFullYear();
+      const bal = await ensureBalance(
+        a.employeeId,
+        year,
+        a.biometricId,
+        config,
+      );
+      const le = {
+        CL: config.clPerYear,
+        SL: config.slPerYear,
+        PL: bal.plEligible ? config.plPerYear : 0,
+      };
+      let effectiveAvailable = Math.max(0, le[nType] - bal.consumed[nType]);
+
+      if (nType === "CL") {
+        const maxCLMonth = config.maxCLPerMonth || 3;
+        const { used: clUsed } = await countMonthlyUsage(
+          a.employeeId,
+          nF,
+          "CL",
+          a._id,
+        );
+        effectiveAvailable = Math.min(
+          effectiveAvailable,
+          Math.max(0, maxCLMonth - clUsed),
+        );
+      }
+
+      const emp = await Employee.findById(a.employeeId)
+        .select("address")
+        .lean();
+      const empState = (
+        emp?.address?.current?.state ||
+        emp?.address?.permanent?.state ||
+        ""
+      )
+        .toLowerCase()
+        .trim();
+      const isOdisha = ["odisha", "orissa"].includes(empState);
+      const monthlyCap = isOdisha
+        ? config.maxLeaveDaysPerMonthOdisha || 7
+        : config.maxLeaveDaysPerMonth || 10;
+      const { used: totalMonthUsed } = await countMonthlyUsage(
         a.employeeId,
         nF,
-        "CL",
+        null,
         a._id,
       );
       effectiveAvailable = Math.min(
         effectiveAvailable,
-        Math.max(0, maxCLMonth - clUsed),
+        Math.max(0, monthlyCap - totalMonthUsed),
       );
+
+      if (req.body.paidDays !== undefined && req.body.paidDays !== null) {
+        paidDays = Math.max(
+          0,
+          Math.min(Number(req.body.paidDays), effectiveAvailable, totalDays),
+        );
+      } else {
+        paidDays = Math.min(totalDays, effectiveAvailable);
+      }
+      lwpDays = Math.max(0, totalDays - paidDays);
     }
 
-    const emp = await Employee.findById(a.employeeId).select("address").lean();
-    const empState = (
-      emp?.address?.current?.state ||
-      emp?.address?.permanent?.state ||
-      ""
-    )
-      .toLowerCase()
-      .trim();
-    const isOdisha = ["odisha", "orissa"].includes(empState);
-    const monthlyCap = isOdisha
-      ? config.maxLeaveDaysPerMonthOdisha || 7
-      : config.maxLeaveDaysPerMonth || 10;
-    const { used: totalMonthUsed } = await countMonthlyUsage(
-      a.employeeId,
-      nF,
-      null,
-      a._id,
-    );
-    effectiveAvailable = Math.min(
-      effectiveAvailable,
-      Math.max(0, monthlyCap - totalMonthUsed),
-    );
-
-    // If manager specified paidDays (from cart UI), use it — but cap at effectiveAvailable
-    let paidDays;
-    if (req.body.paidDays !== undefined && req.body.paidDays !== null) {
-      paidDays = Math.max(
-        0,
-        Math.min(Number(req.body.paidDays), effectiveAvailable, totalDays),
-      );
-    } else {
-      paidDays = Math.min(totalDays, effectiveAvailable);
-    }
-    const lwpDays = Math.max(0, totalDays - paidDays);
-
-    // Update
     a.fromDate = nF;
     a.toDate = nT;
     a.leaveType = nType;
@@ -1061,7 +1200,8 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       a.halfDaySlot = isHalfDay ? halfDaySlot || "first_half" : null;
     }
     a.requiresDocument =
-      nType === "SL" && totalDays > config.slDocumentThreshold;
+      nType === "SL" &&
+      totalDays > (await LeaveConfig.getConfig()).slDocumentThreshold;
 
     const mgr = await Employee.findById(myId)
       .select("firstName lastName")
@@ -1086,7 +1226,8 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MANAGER APPROVAL/REJECT — only deducts paidDays from balance (not LWP)
+//  MANAGER APPROVAL/REJECT
+//  ✅ FIX 7: LOP approvals don't deduct any balance (paidDays is 0)
 // ═══════════════════════════════════════════════════════════════════════════════
 router.patch(
   "/manager/:id/approve",
@@ -1153,7 +1294,8 @@ router.patch(
           message: "Primary approved. Awaiting secondary.",
         });
       }
-      // Final approval — deduct only paidDays
+
+      // Final approval
       const {
         LeaveConfig: LC,
         LeaveBalance: LB,
@@ -1165,8 +1307,10 @@ router.patch(
       a.hrApprovedAt = new Date();
       a.hrRemarks = remarks || `Approved by ${mt} manager`;
       await a.save();
-      const deductDays = a.paidDays != null ? a.paidDays : a.totalDays; // backward compat: old apps without paidDays
-      if (deductDays > 0) {
+
+      // ✅ FIX 7: Only deduct if paidDays > 0 (LOP will have paidDays=0)
+      const deductDays = a.paidDays != null ? a.paidDays : a.totalDays;
+      if (deductDays > 0 && a.leaveType !== "LOP") {
         const fy = new Date(a.fromDate).getFullYear();
         const fc = await LC.getConfig();
         await LB.findOneAndUpdate(
@@ -1189,7 +1333,12 @@ router.patch(
         console.log(
           `[APPROVE] Deducted ${deductDays} ${a.leaveType} for ${a.employeeName} (${a.lwpDays || 0} LWP not deducted)`,
         );
+      } else if (a.leaveType === "LOP") {
+        console.log(
+          `[APPROVE] LOP approved for ${a.employeeName}: ${a.totalDays} days all unpaid — no balance deducted`,
+        );
       }
+
       let ar = { applied: 0 };
       try {
         if (applyLeaveToAttendance) ar = await applyLeaveToAttendance(a);
@@ -1220,7 +1369,10 @@ router.patch(
       res.json({
         success: true,
         data: a,
-        message: `Approved. ${deductDays} ${a.leaveType} deducted${a.lwpDays ? `, ${a.lwpDays} LWP` : ""}. Attendance: ${ar.applied} day(s).`,
+        message:
+          a.leaveType === "LOP"
+            ? `LOP approved: ${a.totalDays} day(s) — all unpaid. Attendance: ${ar.applied} day(s).`
+            : `Approved. ${deductDays} ${a.leaveType} deducted${a.lwpDays ? `, ${a.lwpDays} LWP` : ""}. Attendance: ${ar.applied} day(s).`,
         attendanceSync: ar,
       });
     } catch (e) {
