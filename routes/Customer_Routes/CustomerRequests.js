@@ -31,6 +31,76 @@ const verifyCustomerToken = async (req, res, next) => {
   }
 };
 
+
+router.post('/:requestId/delivery-confirmation', verifyCustomerToken, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const customerId = req.customerId;
+    const {
+      address,
+      city,
+      postalCode,
+      phone,
+      preferredDate,
+      timeSlot,
+      specialInstructions,
+      paymentStepNumber,
+    } = req.body;
+ 
+    // Basic validation
+    if (!address || !city || !postalCode || !phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'Address, city, postal code and phone are required',
+      });
+    }
+ 
+    const request = await Request.findOne({ _id: requestId, customerId });
+    if (!request) {
+      return res.status(404).json({
+        success: false,
+        message: 'Request not found',
+      });
+    }
+ 
+    request.deliveryConfirmation = {
+      address: address.trim(),
+      city: city.trim(),
+      postalCode: postalCode.trim(),
+      phone: phone.trim(),
+      preferredDate: preferredDate ? new Date(preferredDate) : null,
+      timeSlot: timeSlot || 'anytime',
+      specialInstructions: (specialInstructions || '').trim(),
+      submittedAt: new Date(),
+      submittedAfterPaymentStep: paymentStepNumber || null,
+    };
+ 
+    request.notes.push({
+      text: `Customer submitted delivery confirmation after payment${
+        paymentStepNumber ? ` (step ${paymentStepNumber})` : ''
+      }`,
+      addedBy: customerId,
+      addedByModel: 'Customer',
+      createdAt: new Date(),
+    });
+ 
+    request.updatedAt = new Date();
+    await request.save();
+ 
+    return res.json({
+      success: true,
+      message: 'Delivery details saved successfully',
+      deliveryConfirmation: request.deliveryConfirmation,
+    });
+  } catch (err) {
+    console.error('Delivery confirmation error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error while saving delivery details',
+    });
+  }
+});
+
 // Create new request with variations
 router.post('/', verifyCustomerToken, async (req, res) => {
   try {

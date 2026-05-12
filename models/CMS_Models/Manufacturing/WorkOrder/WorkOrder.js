@@ -255,6 +255,26 @@ const workOrderSchema = new mongoose.Schema(
       },
     },
 
+    storeDepartmentVerified: {
+      type: Boolean,
+      default: false,
+      index: true,   // useful for "show me unverified WOs" queries
+    },
+    storeDepartmentVerifiedAt: {
+      type: Date,
+      default: null,
+    },
+    storeDepartmentVerifiedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "StoreDepartment",
+      default: null,
+    },
+    storeDepartmentNotes: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
     productionCompletion: productionCompletionSchema,
 
     specialInstructions: [{ type: String, trim: true }],
