@@ -12,103 +12,196 @@ router.use(EmployeeAuthMiddleware);
 
 router.get("/", async (req, res) => {
   try {
-    const { page = 1, limit = 10, search = "", status = "" } = req.query;
-
+    const { page = 1, limit = 12, search = "", status = "" } = req.query;
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
     const skip = (pageNum - 1) * limitNum;
-
-    let query = {
-      status: "quotation_sales_approved",
-    };
-
+ 
+    // Base filter — always restrict to sales-approved (this is what an MO IS)
+    const matchQuery = { status: "quotation_sales_approved" };
     if (search) {
-      const searchRegex = new RegExp(search, "i");
-      query.$or = [
-        { "customerInfo.name": searchRegex },
-        { requestId: searchRegex },
-        { "customerInfo.email": searchRegex },
+      const re = new RegExp(search, "i");
+      matchQuery.$or = [
+        { "customerInfo.name": re },
+        { requestId: re },
+        { "customerInfo.email": re },
       ];
     }
-
-    if (status) {
-      query.status = status;
-    }
-
-    const total = await CustomerRequest.countDocuments(query);
-
-    // OPTIMIZED: Only select needed fields, minimal population
-    const customerRequests = await CustomerRequest.find(query)
-      .select(
-        "requestId customerInfo status finalOrderPrice items priority createdAt requestType measurementName",
-      )
-      .sort({ updatedAt: -1 })
-      .skip(skip)
-      .limit(limitNum)
-      .lean();
-
-    const manufacturingOrders = await Promise.all(
-      customerRequests.map(async (request) => {
-        // OPTIMIZED: Only get count of work orders, not full documents
-        const workOrdersCount = await WorkOrder.countDocuments({
-          customerRequestId: request._id,
-        });
-
-        const totalQuantity = request.items.reduce(
-          (sum, item) => sum + (item.totalQuantity || 0),
-          0,
-        );
-
-        // OPTIMIZED: Get status from work orders aggregation
-        const statusAggregation = await WorkOrder.aggregate([
-          { $match: { customerRequestId: request._id } },
-          {
-            $group: {
-              _id: "$status",
-              count: { $sum: 1 },
-            },
-          },
-        ]);
-
-        const statusCounts = {};
-        statusAggregation.forEach((item) => {
-          statusCounts[item._id] = item.count;
-        });
-
-        // Determine overall status (simplified logic)
-        let overallStatus = "pending";
-        const totalWorkOrders = workOrdersCount;
-
-        if (statusCounts["cancelled"] === totalWorkOrders) {
-          overallStatus = "cancelled";
-        } else if (statusCounts["completed"] === totalWorkOrders) {
-          overallStatus = "completed";
-        } else if (statusCounts["in_progress"] > 0) {
-          overallStatus = "in_production";
-        } else if (statusCounts["planned"] > 0) {
-          overallStatus = "planning";
+ 
+    const pipeline = [
+      { $match: matchQuery },
+ 
+      // Compute totalQuantity in-DB from items[].totalQuantity (no need to ship items)
+      {
+        $addFields: {
+          totalQuantity: {
+            $sum: {
+              $map: {
+                input: { $ifNull: ["$items", []] },
+                as: "it",
+                in: { $ifNull: ["$$it.totalQuantity", 0] }
+              }
+            }
+          }
         }
-
-        // OPTIMIZED: Minimal response data
-        return {
-          _id: request._id,
-          moNumber: `MO-${request.requestId}`,
-          customerInfo: {
-            name: request.customerInfo?.name || "N/A",
-            email: request.customerInfo?.email || "N/A",
-          },
-          finalOrderPrice: request.finalOrderPrice || 0,
-          totalQuantity: totalQuantity,
-          workOrdersCount: workOrdersCount,
-          status: overallStatus,
-          priority: request.priority,
-          createdAt: request.createdAt,
-          requestType: request.requestType || "customer_request",
-          measurementName: request.measurementName || null,
-        };
-      }),
-    );
-
+      },
+ 
+      // Join WO stats per MO in ONE query (replaces the per-MO countDocuments + aggregate)
+      {
+        $lookup: {
+          from: "workorders",
+          let: { reqId: "$_id" },
+          pipeline: [
+            { $match: { $expr: { $eq: ["$customerRequestId", "$$reqId"] } } },
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+                totalWoQty: { $sum: { $ifNull: ["$quantity", 0] } },
+                totalCompleted: {
+                  $sum: { $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }
+                },
+                cancelledCount: {
+                  $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] }
+                },
+                anyInProgress: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: ["$status", "in_progress"] },
+                          { $gt: [{ $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }, 0] }
+                        ]
+                      },
+                      1, 0
+                    ]
+                  }
+                }
+              }
+            }
+          ],
+          as: "_woStats"
+        }
+      },
+      { $addFields: { _stats: { $arrayElemAt: ["$_woStats", 0] } } },
+ 
+      // Flatten + compute completion % at the MO level
+      {
+        $addFields: {
+          workOrdersCount: { $ifNull: ["$_stats.count", 0] },
+          _totalWoQty: { $ifNull: ["$_stats.totalWoQty", 0] },
+          _totalCompleted: { $ifNull: ["$_stats.totalCompleted", 0] },
+          _cancelledCount: { $ifNull: ["$_stats.cancelledCount", 0] },
+          _anyInProgress: { $ifNull: ["$_stats.anyInProgress", 0] }
+        }
+      },
+      {
+        $addFields: {
+          completionPercentage: {
+            $cond: [
+              { $gt: ["$_totalWoQty", 0] },
+              {
+                $round: [
+                  { $multiply: [{ $divide: ["$_totalCompleted", "$_totalWoQty"] }, 100] },
+                  0
+                ]
+              },
+              0
+            ]
+          }
+        }
+      },
+ 
+      // Derive the MO status from WO progress
+      {
+        $addFields: {
+          derivedStatus: {
+            $switch: {
+              branches: [
+                { case: { $eq: ["$workOrdersCount", 0] }, then: "pending" },
+                {
+                  case: {
+                    $and: [
+                      { $gt: ["$workOrdersCount", 0] },
+                      { $eq: ["$_cancelledCount", "$workOrdersCount"] }
+                    ]
+                  },
+                  then: "cancelled"
+                },
+                { case: { $gte: ["$completionPercentage", 100] }, then: "completed" },
+                { case: { $gte: ["$completionPercentage", 70] }, then: "about_to_finish" },
+                {
+                  case: {
+                    $or: [
+                      { $gt: ["$completionPercentage", 0] },
+                      { $gt: ["$_anyInProgress", 0] }
+                    ]
+                  },
+                  then: "in_progress"
+                }
+              ],
+              default: "pending"
+            }
+          }
+        }
+      },
+ 
+      // Apply derived status filter if requested
+      ...(status ? [{ $match: { derivedStatus: status } }] : []),
+ 
+      // Paginate + count in one go
+      {
+        $facet: {
+          paginated: [
+            { $sort: { updatedAt: -1 } },
+            { $skip: skip },
+            { $limit: limitNum },
+            {
+              $project: {
+                _id: 1,
+                requestId: 1,
+                customerInfo: { name: 1, email: 1 },
+                finalOrderPrice: 1,
+                totalQuantity: 1,
+                priority: 1,
+                createdAt: 1,
+                requestType: 1,
+                measurementName: 1,
+                workOrdersCount: 1,
+                completionPercentage: 1,
+                completedQuantity: "$_totalCompleted",
+                status: "$derivedStatus"
+              }
+            }
+          ],
+          totalCount: [{ $count: "count" }]
+        }
+      }
+    ];
+ 
+    const [result] = await CustomerRequest.aggregate(pipeline);
+    const rows = result?.paginated || [];
+    const total = result?.totalCount?.[0]?.count || 0;
+ 
+    const manufacturingOrders = rows.map((r) => ({
+      _id: r._id,
+      moNumber: `MO-${r.requestId}`,
+      customerInfo: {
+        name: r.customerInfo?.name || "N/A",
+        email: r.customerInfo?.email || "N/A",
+      },
+      finalOrderPrice: r.finalOrderPrice || 0,
+      totalQuantity: r.totalQuantity || 0,
+      workOrdersCount: r.workOrdersCount || 0,
+      completedQuantity: r.completedQuantity || 0,
+      completionPercentage: r.completionPercentage || 0,
+      status: r.status,
+      priority: r.priority,
+      createdAt: r.createdAt,
+      requestType: r.requestType || "customer_request",
+      measurementName: r.measurementName || null,
+    }));
+ 
     res.json({
       success: true,
       manufacturingOrders,
@@ -611,62 +704,64 @@ router.get("/:id/work-orders", async (req, res) => {
 router.get("/emplloyeeTracking/:id", async (req, res) => {
   try {
     const { id } = req.params;
-
-    // Check if id is a valid ObjectId
+ 
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
         message: "Invalid manufacturing order ID format",
       });
     }
-
+ 
+    // ── CR: select only what the frontend uses ─────────────────────────────
     const customerRequest = await CustomerRequest.findById(id)
-      .populate("customerId", "name email phone address")
+      .select(
+        "requestId customerInfo finalOrderPrice totalPaidAmount totalDueAmount " +
+        "priority status measurementId measurementName requestType " +
+        "salesPersonAssigned quotations actualCompletion " +
+        "estimatedCompletion createdAt updatedAt"
+      )
       .populate("salesPersonAssigned", "name email phone")
-      .populate("quotations.preparedBy", "name email")
       .lean();
-
+ 
     if (!customerRequest) {
       return res.status(404).json({
         success: false,
         message: "Manufacturing order not found",
       });
     }
-
+ 
+    // ── WOs: trimmed selection + add genderCategory ─────────────────────────
     const workOrders = await WorkOrder.find({
       customerRequestId: customerRequest._id,
     })
-      .populate("stockItemId", "name reference images")
-      .populate("createdBy", "name email")
-      .populate("plannedBy", "name email")
+      .select(
+        "workOrderNumber status quantity stockItemId stockItemName stockItemReference " +
+        "operations forwardedToVendor productionCompletion variantAttributes rawMaterials"
+      )
+      .populate("stockItemId", "name reference genderCategory") // ← genderCategory added
+      .populate("forwardedToVendor", "name vendorCode")
       .sort({ createdAt: 1 })
       .lean();
-
+ 
+    // ── Stats ───────────────────────────────────────────────────────────────
     const totalWorkOrders = workOrders.length;
-    const totalQuantity = workOrders.reduce((sum, wo) => sum + wo.quantity, 0);
-
-    const plannedWorkOrders = workOrders.filter(
-      (wo) => wo.status === "planned",
-    ).length;
-    const scheduledWorkOrders = workOrders.filter(
-      (wo) => wo.status === "scheduled",
-    ).length;
-    const inProgressWorkOrders = workOrders.filter(
-      (wo) => wo.status === "in_progress",
-    ).length;
-    const completedWorkOrders = workOrders.filter(
-      (wo) => wo.status === "completed",
-    ).length;
-
-    // Get aggregated raw material requirements with variant-wise stock
-    const rawMaterialMap = new Map();
-
+    const totalQuantity = workOrders.reduce((s, wo) => s + (wo.quantity || 0), 0);
+    let plannedWorkOrders = 0, scheduledWorkOrders = 0,
+        inProgressWorkOrders = 0, completedWorkOrders = 0;
     for (const wo of workOrders) {
-      for (const rm of wo.rawMaterials) {
-        // Create a unique key: rawItemId + variant combination
+      if (wo.status === "planned")       plannedWorkOrders++;
+      if (wo.status === "scheduled")     scheduledWorkOrders++;
+      if (wo.status === "in_progress")   inProgressWorkOrders++;
+      if (wo.status === "completed")     completedWorkOrders++;
+    }
+ 
+    // ── Aggregate raw materials across WOs ──────────────────────────────────
+    const rawMaterialMap = new Map();
+    for (const wo of workOrders) {
+      for (const rm of wo.rawMaterials || []) {
         const variantKey = rm.rawItemVariantCombination?.join("-") || "default";
         const key = `${rm.rawItemId}_${variantKey}`;
-
+ 
         if (rawMaterialMap.has(key)) {
           const existing = rawMaterialMap.get(key);
           existing.quantityRequired += rm.quantityRequired;
@@ -677,167 +772,142 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
             rawItemId: rm.rawItemId,
             name: rm.name,
             sku: rm.sku,
-            // VARIANT-SPECIFIC FIELDS
             rawItemVariantId: rm.rawItemVariantId,
             rawItemVariantCombination: rm.rawItemVariantCombination || [],
             variantName: rm.rawItemVariantCombination?.join(" • ") || "Default",
-            // QUANTITY AND COST
             quantityRequired: rm.quantityRequired,
             unit: rm.unit,
             unitCost: rm.unitCost,
             totalCost: rm.totalCost,
-            // SOURCE INFO
             sourceWorkOrders: [wo.workOrderNumber],
             sourceWorkOrderId: wo._id,
           });
         }
       }
     }
-
-    // Fetch current stock for each raw material - WITH VARIANT SUPPORT
-    const allRawMaterialRequirements = [];
-
-    for (const [key, material] of rawMaterialMap) {
-      if (
-        material.rawItemId &&
-        mongoose.Types.ObjectId.isValid(material.rawItemId)
-      ) {
-        const rawItem = await RawItem.findById(material.rawItemId).lean();
-
-        let variantStock = 0;
-        const totalStock = rawItem?.quantity || 0;
-
-        // Find specific variant if rawItemVariantId exists
-        if (material.rawItemVariantId && rawItem?.variants) {
-          const variant = rawItem.variants.find(
-            (v) => v._id.toString() === material.rawItemVariantId.toString(),
-          );
-          if (variant) {
-            variantStock = variant.quantity || 0;
-          }
-        }
-        // Or find variant by combination
-        else if (
-          material.rawItemVariantCombination?.length > 0 &&
-          rawItem?.variants
-        ) {
-          const variant = rawItem.variants.find((v) => {
-            // Compare variant combinations
-            const vCombination = v.combination || [];
-            const mCombination = material.rawItemVariantCombination;
-
-            if (vCombination.length !== mCombination.length) return false;
-
-            return vCombination.every((val, idx) => val === mCombination[idx]);
-          });
-
-          if (variant) {
-            variantStock = variant.quantity || 0;
-          }
-        }
-
-        // Calculate status based on VARIANT stock, not total stock
-        let status = "unavailable";
-        if (variantStock >= material.quantityRequired) {
-          status = "available";
-        } else if (variantStock > 0) {
-          status = "partial";
-        }
-
-        const deficitQuantity = Math.max(
-          0,
-          material.quantityRequired - variantStock,
-        );
-
-        allRawMaterialRequirements.push({
-          ...material,
-          // STOCK INFORMATION
-          variantStock: variantStock, // Specific variant quantity
-          totalStock: totalStock, // Total raw item quantity
-          availableQuantity: variantStock, // For backward compatibility
-          deficitQuantity: deficitQuantity,
-          status: status,
-          rawItemStatus: rawItem?.status,
-
-          // ADDITIONAL INFO FOR UI
-          requiresVariant:
-            material.rawItemVariantCombination?.length > 0 ||
-            !!material.rawItemVariantId,
-          variantId: material.rawItemVariantId?.toString(),
-        });
-      }
+ 
+    // ── BATCH raw item lookups: N queries → 1 ──────────────────────────────
+    const rawItemIds = [
+      ...new Set(
+        [...rawMaterialMap.values()]
+          .map((m) => m.rawItemId?.toString())
+          .filter((id) => id && mongoose.Types.ObjectId.isValid(id))
+      ),
+    ];
+ 
+    let rawItemMap = new Map();
+    if (rawItemIds.length > 0) {
+      const rawItems = await RawItem.find({ _id: { $in: rawItemIds } })
+        .select("variants quantity status")
+        .lean();
+      rawItemMap = new Map(rawItems.map((r) => [r._id.toString(), r]));
     }
-
-    // CRITICAL FIX: Properly determine requestType from the database
-    // Check multiple fields to ensure accuracy
+ 
+    // ── Compute variant stock + status for each requirement ────────────────
+    const allRawMaterialRequirements = [];
+    for (const material of rawMaterialMap.values()) {
+      const rawItem = material.rawItemId
+        ? rawItemMap.get(material.rawItemId.toString())
+        : null;
+ 
+      let variantStock = 0;
+      const totalStock = rawItem?.quantity || 0;
+ 
+      // Find specific variant if rawItemVariantId exists
+      if (material.rawItemVariantId && rawItem?.variants) {
+        const variant = rawItem.variants.find(
+          (v) => v._id.toString() === material.rawItemVariantId.toString()
+        );
+        if (variant) variantStock = variant.quantity || 0;
+      } else if (
+        material.rawItemVariantCombination?.length > 0 &&
+        rawItem?.variants
+      ) {
+        const variant = rawItem.variants.find((v) => {
+          const vc = v.combination || [];
+          const mc = material.rawItemVariantCombination;
+          if (vc.length !== mc.length) return false;
+          return vc.every((val, idx) => val === mc[idx]);
+        });
+        if (variant) variantStock = variant.quantity || 0;
+      }
+ 
+      let status = "unavailable";
+      if (variantStock >= material.quantityRequired) status = "available";
+      else if (variantStock > 0) status = "partial";
+ 
+      const deficitQuantity = Math.max(0, material.quantityRequired - variantStock);
+ 
+      allRawMaterialRequirements.push({
+        ...material,
+        variantStock,
+        totalStock,
+        availableQuantity: variantStock,
+        deficitQuantity,
+        status,
+        rawItemStatus: rawItem?.status,
+        requiresVariant:
+          material.rawItemVariantCombination?.length > 0 ||
+          !!material.rawItemVariantId,
+        variantId: material.rawItemVariantId?.toString(),
+      });
+    }
+ 
+    // ── Build response ──────────────────────────────────────────────────────
     const isMeasurementConversion = !!(
       customerRequest.requestType === "measurement_conversion" ||
       customerRequest.measurementId
     );
-
-    const requestType = isMeasurementConversion
-      ? "measurement_conversion"
-      : "customer_request";
-
-    const requestTypeBadge = isMeasurementConversion
-      ? "MEASUREMENT"
-      : "CUSTOMER";
-
+ 
     const manufacturingOrder = {
       _id: customerRequest._id,
       moNumber: `MO-${customerRequest.requestId}`,
       requestId: customerRequest.requestId,
       customerInfo: customerRequest.customerInfo,
-      customer: customerRequest.customerId,
-      items: customerRequest.items,
       finalOrderPrice: customerRequest.finalOrderPrice || 0,
       totalPaidAmount: customerRequest.totalPaidAmount || 0,
       totalDueAmount: customerRequest.totalDueAmount || 0,
       priority: customerRequest.priority,
       status: customerRequest.status,
       salesPerson: customerRequest.salesPersonAssigned,
-      quotation: customerRequest.quotations[0],
+      quotation: customerRequest.quotations?.[0] || null,
       estimatedCompletion: customerRequest.estimatedCompletion,
       specialInstructions: customerRequest.customerInfo?.description,
       deliveryDeadline: customerRequest.customerInfo?.deliveryDeadline,
       createdAt: customerRequest.createdAt,
       updatedAt: customerRequest.updatedAt,
-
-      // CRITICAL: These fields MUST be set correctly
-      requestType: requestType,
-      requestTypeBadge: requestTypeBadge,
+ 
+      requestType: isMeasurementConversion ? "measurement_conversion" : "customer_request",
+      requestTypeBadge: isMeasurementConversion ? "MEASUREMENT" : "CUSTOMER",
       measurementId: customerRequest.measurementId || null,
       measurementName: customerRequest.measurementName || null,
-      isMeasurementConversion: isMeasurementConversion,
-
-      workOrders: workOrders,
+      isMeasurementConversion,
+ 
+      workOrders,
       workOrderStats: {
         total: totalWorkOrders,
         planned: plannedWorkOrders,
         scheduled: scheduledWorkOrders,
         inProgress: inProgressWorkOrders,
         completed: completedWorkOrders,
-        totalQuantity: totalQuantity,
+        totalQuantity,
       },
-
+ 
       rawMaterialRequirements: allRawMaterialRequirements,
       totalRawMaterialCost: allRawMaterialRequirements.reduce(
-        (sum, rm) => sum + rm.totalCost,
-        0,
+        (sum, rm) => sum + (rm.totalCost || 0),
+        0
       ),
-
+ 
       timeline: {
         requestCreated: customerRequest.createdAt,
-        salesApproved: customerRequest.quotations[0]?.salesApproval?.approvedAt,
+        salesApproved: customerRequest.quotations?.[0]?.salesApproval?.approvedAt,
         estimatedCompletion: customerRequest.estimatedCompletion,
         actualCompletion: customerRequest.actualCompletion,
       },
     };
-
-    res.json({
-      success: true,
-      manufacturingOrder,
-    });
+ 
+    res.json({ success: true, manufacturingOrder });
   } catch (error) {
     console.error("Error fetching manufacturing order details:", error);
     res.status(500).json({
@@ -847,6 +917,7 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
     });
   }
 });
+
 
 // GET work orders for a manufacturing order
 router.get("/employeeTracking/:id/work-orders", async (req, res) => {
