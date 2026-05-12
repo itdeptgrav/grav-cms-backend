@@ -768,7 +768,6 @@ app.use("/api/employees", employeeRoutes);
 const pushTokenRoutes = require("./routes/Employee_Routes/pushToken");
 app.use("/api/employee", pushTokenRoutes);
 
-
 const barcodeRoutes = require("./routes/CMS_Routes/Inventory/Operations/barcodes");
 app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 
@@ -836,7 +835,10 @@ const stockAdjRoutes = require("./routes/CMS_Routes/Inventory/Products/stockAdju
 app.use("/api/cms/inventory/stock-adjustments", stockAdjRoutes);
 
 const rawItemBarcodeRoutes = require("./routes/CMS_Routes/Manufacturing/CuttingMaster/rawItemBarcodeRoutes");
-app.use("/api/cms/manufacturing/cutting-master/raw-item-barcode", rawItemBarcodeRoutes);
+app.use(
+  "/api/cms/manufacturing/cutting-master/raw-item-barcode",
+  rawItemBarcodeRoutes,
+);
 
 const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems");
 app.use("/api/cms/stock-items", stockItemsRoutes);
@@ -977,10 +979,17 @@ const empAttendance = require("./routes/Employee_Routes/employeeAttendance");
 app.use("/api/employee/attendance", empAttendance);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ACCOUNTANT DEPARTMENT ROUTES — ALL 17 ENDPOINTS
+// ACCOUNTANT DEPARTMENT ROUTES — ALL 20 ENDPOINTS (17 legacy + 3 sub-account)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Path conventions:
+//   /api/accountant/auth/...            → accountantAuthRoutes.js (login,
+//                                          logout, me, accept-invite,
+//                                          bootstrap, change-password)
+//   /api/accountant/team/...            → teamRoutes.js (sub-account
+//                                          management; owner-only mutations)
+//   /api/accountant/approvals/...       → approvalRoutes.js (pending
+//                                          change queue for editors)
 //   /api/accountant/tally/reports/...   → tallyReports.js (books reports:
 //                                          trial-balance, day-book, P&L,
 //                                          balance-sheet, cash-flow)
@@ -989,6 +998,39 @@ app.use("/api/employee/attendance", empAttendance);
 //                                          payables-aging)
 
 console.log("[accountant] mounting routes…");
+
+// ── Authentication, team, approvals (NEW — sub-account system) ────────
+// These three must be mounted FIRST in the accountant block because:
+//   • /auth has public endpoints (login, accept-invite, bootstrap) that
+//     must work without prior auth
+//   • /team and /approvals self-protect with orgAuth internally
+app.use(
+  "/api/accountant/auth",
+  require("./routes/Accountant_Routes/accountantAuthRoutes"),
+);
+app.use(
+  "/api/accountant/team",
+  require("./routes/Accountant_Routes/teamRoutes"),
+);
+app.use(
+  "/api/accountant/approvals",
+  require("./routes/Accountant_Routes/approvalRoutes"),
+);
+
+app.use(
+  "/api/accountant/pins",
+  require("./routes/Accountant_Routes/pinsRoutes"),
+);
+
+app.use(
+  "/api/accountant/priorities",
+  require("./routes/Accountant_Routes/prioritiesRoutes"),
+);
+
+app.use(
+  "/api/accountant/cashflow-adjustments",
+  require("./routes/Accountant_Routes/cashflowAdjustmentsRoutes"),
+);
 
 // ── Operational routes ────────────────────────────────────────────────
 app.use(
@@ -1031,6 +1073,12 @@ app.use(
   "/api/accountant/bank-transactions",
   require("./routes/Accountant_Routes/bankTransactions"),
 );
+
+app.use(
+  "/api/accountant/setu-aa",
+  require("./routes/Accountant_Routes/setuAA"),
+);
+
 app.use(
   "/api/accountant/budgets",
   require("./routes/Accountant_Routes/budgets"),
@@ -1069,10 +1117,16 @@ app.get("/api/accountant/_health", (req, res) => {
     ok: true,
     timestamp: new Date().toISOString(),
     message: "Accountant module is mounted ✓",
+    routes: {
+      auth: "/api/accountant/auth/{login,logout,me,accept-invite,bootstrap,change-password}",
+      team: "/api/accountant/team/{,invites,:userId,:userId/deactivate,:userId/activate}",
+      approvals:
+        "/api/accountant/approvals/{,:id,:id/approve,:id/reject,:id/cancel}",
+    },
   });
 });
 
-console.log("[accountant] ✓ all 17 routes mounted");
+console.log("[accountant] ✓ all 20 routes mounted (incl. auth/team/approvals)");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // END ACCOUNTANT ROUTES
@@ -1983,7 +2037,11 @@ server.listen(PORT, () => {
         const updates = {};
 
         // Has visibleTo but no approverId → set approverId from visibleTo[0]
-        if (!d.approverId && Array.isArray(d.visibleTo) && d.visibleTo.length > 0) {
+        if (
+          !d.approverId &&
+          Array.isArray(d.visibleTo) &&
+          d.visibleTo.length > 0
+        ) {
           updates.approverId = d.visibleTo[0];
         }
         // Has approverId but isSelfAssigned not set → set it
@@ -1993,15 +2051,23 @@ server.listen(PORT, () => {
           updates.selfAssignApproved = d.selfAssignApproved ?? false;
         }
         // Has isSelfAssigned=true but no visibleTo → set visibleTo from approverId
-        if (d.isSelfAssigned && resolvedApproverId && (!Array.isArray(d.visibleTo) || !d.visibleTo.includes(resolvedApproverId))) {
-          updates.visibleTo = admin.firestore.FieldValue.arrayUnion(resolvedApproverId);
+        if (
+          d.isSelfAssigned &&
+          resolvedApproverId &&
+          (!Array.isArray(d.visibleTo) ||
+            !d.visibleTo.includes(resolvedApproverId))
+        ) {
+          updates.visibleTo =
+            admin.firestore.FieldValue.arrayUnion(resolvedApproverId);
         }
 
         if (Object.keys(updates).length > 0) {
           updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
           await doc.ref.update(updates);
           fixed++;
-          console.log(`  ↳ Repaired task ${d.taskId || doc.id}: approverId=${resolvedApproverId}`);
+          console.log(
+            `  ↳ Repaired task ${d.taskId || doc.id}: approverId=${resolvedApproverId}`,
+          );
         }
       }
       if (fixed > 0) console.log(`✅ Self-assign repair: fixed ${fixed} tasks`);
