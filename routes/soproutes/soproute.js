@@ -353,4 +353,198 @@ router.get("/bleach/:employeeId", verifyCoworkToken, verifyEmployeeToken, async 
     }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /cowork/sop/recheck/pending-list
+// Returns employees with pending recheck requests
+router.get("/recheck/pending-list", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+    try {
+        const { role, employeeId } = req.coworkUser;
+        let filter = {};
+        if (role === "tl") {
+            const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
+            if (me) filter.department = me.department;
+        }
+        const employees = await Employee.find(filter, { biometricId: 1, firstName: 1, lastName: 1, department: 1, sopPoints: 1 }).lean();
+        const result = [];
+        employees.forEach(emp => {
+            const pending = [];
+            (emp.sopPoints || []).forEach(yp => {
+                (yp.bleaches || []).forEach(b => {
+                    if (b.recheck?.status === "pending") {
+                        pending.push({ bleachId: b._id, sopName: b.sopName, points: b.points, date: b.date, requestNote: b.recheck.requestNote });
+                    }
+                });
+            });
+            if (pending.length > 0) {
+                result.push({
+                    employeeId: emp.biometricId,
+                    name: `${emp.firstName} ${emp.lastName}`.trim(),
+                    department: emp.department,
+                    pendingCount: pending.length,
+                    bleaches: pending,
+                });
+            }
+        });
+        res.json({ success: true, list: result });
+    } catch (e) {
+        console.error("[recheck/pending-list]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// GET /cowork/sop/recheck/pending-count
+// Returns count of pending recheck requests for TL (own dept) or CEO (all)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/recheck/pending-count", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+    try {
+        const { role, employeeId } = req.coworkUser;
+        let filter = {};
+
+        if (role === "tl") {
+            const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
+            if (me) filter.department = me.department;
+        }
+
+        const employees = await Employee.find(filter, { sopPoints: 1 }).lean();
+        let count = 0;
+        employees.forEach(emp => {
+            (emp.sopPoints || []).forEach(yp => {
+                (yp.bleaches || []).forEach(b => {
+                    if (b.recheck?.status === "pending") count++;
+                });
+            });
+        });
+
+        res.json({ success: true, count });
+    } catch (e) {
+        console.error("[recheck/pending-count]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /cowork/sop/bleach/:employeeId/:bleachId/recheck
+// Employee requests a recheck on a bleach entry
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+    try {
+        const { employeeId: requesterId, role } = req.coworkUser;
+        const { employeeId, bleachId } = req.params;
+        const { requestNote } = req.body;
+
+        // Only the employee themselves can request a recheck
+        if (role === "employee" && requesterId !== employeeId) {
+            return res.status(403).json({ error: "You can only recheck your own bleaches." });
+        }
+
+        const employee = await Employee.findOne({ biometricId: employeeId });
+        if (!employee) return res.status(404).json({ error: "Employee not found." });
+
+        // Find the bleach entry across all year records
+        let found = false;
+        for (const yearRecord of employee.sopPoints) {
+            const bleach = yearRecord.bleaches.id(bleachId);
+            if (bleach) {
+                // Can't recheck if already confirmed (deduction removed)
+                if (bleach.recheck?.status === "confirmed") {
+                    return res.status(400).json({ error: "This bleach was already confirmed — deduction has been removed." });
+                }
+                bleach.recheck = {
+                    status: "pending",
+                    requestedAt: new Date(),
+                    requestNote: requestNote?.trim() || "",
+                    reviewedBy: null,
+                    reviewedByName: null,
+                    reviewedAt: null,
+                    reviewNote: "",
+                };
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) return res.status(404).json({ error: "Bleach entry not found." });
+
+        await employee.save();
+        res.json({ success: true, message: "Recheck request submitted. Awaiting TL/CEO review." });
+    } catch (e) {
+        console.error("[sop/recheck/POST]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /cowork/sop/bleach/:employeeId/:bleachId/recheck
+// TL/CEO reviews the recheck — confirm (points reversed) or reject (points stay)
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+    try {
+        const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
+        const { employeeId, bleachId } = req.params;
+        const { action, reviewNote } = req.body; // action: "confirm" | "reject"
+
+        if (!["confirm", "reject"].includes(action)) {
+            return res.status(400).json({ error: "action must be 'confirm' or 'reject'." });
+        }
+
+        const employee = await Employee.findOne({ biometricId: employeeId });
+        if (!employee) return res.status(404).json({ error: "Employee not found." });
+
+        // TL scope check
+        if (role === "tl") {
+            const me = await Employee.findOne({ biometricId: reviewerId }, { department: 1 }).lean();
+            if (!me || me.department !== employee.department) {
+                return res.status(403).json({ error: "TL can only review rechecks of their own department." });
+            }
+        }
+
+        let found = false;
+        let bleachPoints = 0;
+        let yearIndex = -1;
+
+        for (let i = 0; i < employee.sopPoints.length; i++) {
+            const bleach = employee.sopPoints[i].bleaches.id(bleachId);
+            if (bleach) {
+                if (bleach.recheck?.status !== "pending") {
+                    return res.status(400).json({ error: "No pending recheck for this bleach." });
+                }
+
+                bleachPoints = bleach.points;
+                yearIndex = i;
+
+                bleach.recheck.status = action === "confirm" ? "confirmed" : "rejected";
+                bleach.recheck.reviewedBy = reviewerId;
+                bleach.recheck.reviewedByName = reviewerName;
+                bleach.recheck.reviewedAt = new Date();
+                bleach.recheck.reviewNote = reviewNote?.trim() || "";
+
+                // confirm = employee was right = reverse the deduction
+                if (action === "confirm") {
+                    employee.sopPoints[i].totalDeducted = +(
+                        employee.sopPoints[i].totalDeducted - bleachPoints
+                    ).toFixed(2);
+                    // floor at 0
+                    if (employee.sopPoints[i].totalDeducted < 0) employee.sopPoints[i].totalDeducted = 0;
+                }
+
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) return res.status(404).json({ error: "Bleach entry not found." });
+
+        await employee.save();
+
+        const msg = action === "confirm"
+            ? `Recheck confirmed — ${bleachPoints} pts reversed back to employee.`
+            : `Recheck rejected — deduction of ${bleachPoints} pts stands.`;
+
+        res.json({ success: true, message: msg });
+    } catch (e) {
+        console.error("[sop/recheck/PATCH]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 module.exports = router;
