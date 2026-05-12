@@ -11,6 +11,7 @@ const Measurement = require("../../../models/Customer_Models/Measurement");
 const EmployeeProductionProgress = require("../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const mongoose = require("mongoose");
 const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
+const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -33,6 +34,371 @@ const calculateItemTotals = (quantity, unitPrice, gstPercentage) => {
     priceIncludingGST: parseFloat(priceIncludingGST.toFixed(2))
   };
 };
+
+
+
+router.post("/requests/:requestId/start-processing", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) {
+      return res.status(404).json({ success: false, message: "Customer request not found" });
+    }
+ 
+    // Idempotent — if already started, just return current state
+    if (request.processingStartedAt) {
+      return res.json({
+        success: true,
+        message: "Processing already started",
+        request,
+      });
+    }
+ 
+    request.processingStartedAt = new Date();
+    if (req.user?.id) request.processingStartedBy = req.user.id;
+    await request.save();
+ 
+    return res.json({
+      success: true,
+      message: "Processing started",
+      request,
+    });
+  } catch (err) {
+    console.error("Start processing error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+router.patch("/work-orders/:id/assigned-deadline", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { deadline } = req.body;
+ 
+    const wo = await WorkOrder.findById(id);
+    if (!wo) {
+      return res.status(404).json({ success: false, message: "Work order not found" });
+    }
+ 
+    if (deadline === null || deadline === "") {
+      wo.assignedDeadline = null;
+      wo.assignedDeadlineMeta = { assignedAt: null, assignedBy: null };
+    } else {
+      const parsed = new Date(deadline);
+      if (isNaN(parsed.getTime())) {
+        return res.status(400).json({ success: false, message: "Invalid deadline date" });
+      }
+      wo.assignedDeadline = parsed;
+      wo.assignedDeadlineMeta = {
+        assignedAt: new Date(),
+        assignedBy: req.user?.id || null,
+      };
+    }
+ 
+    await wo.save();
+    return res.json({
+      success: true,
+      message: deadline ? "Deadline assigned" : "Deadline cleared",
+      workOrder: wo,
+    });
+  } catch (err) {
+    console.error("Assign deadline error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+ 
+    const request = await CustomerRequest.findById(requestId).lean();
+    if (!request) {
+      return res.status(404).json({ success: false, message: "Customer request not found" });
+    }
+ 
+    if (!Array.isArray(request.items) || request.items.length === 0) {
+      return res.json({
+        success: true,
+        perProduct: [],
+        totals: [],
+        grand: { totalLineItems: 0, totalRequired: 0, totalAvailable: 0, shortfallCount: 0 },
+      });
+    }
+ 
+    // ── Fetch all StockItems referenced by the request in one go ───────────
+    const stockItemIds = [
+      ...new Set(
+        request.items
+          .map((it) => it.stockItemId)
+          .filter(Boolean)
+          .map((id) => (typeof id === "object" ? id.toString() : id.toString()))
+      ),
+    ];
+    const stockItems = await StockItem.find({
+      _id: { $in: stockItemIds.map((id) => new mongoose.Types.ObjectId(id)) },
+    }).lean();
+    const stockItemMap = new Map(stockItems.map((s) => [s._id.toString(), s]));
+ 
+    // ── Helper: find a matching StockItem variant for a request variant ────
+    const findStockVariant = (stockItem, reqVariant) => {
+      if (!stockItem.variants || stockItem.variants.length === 0) return null;
+ 
+      // 1) Try matching by attribute set
+      const reqAttrs = reqVariant.attributes || [];
+      if (reqAttrs.length > 0) {
+        const norm = (s) => String(s || "").trim().toLowerCase();
+        for (const v of stockItem.variants) {
+          const vAttrs = v.attributes || [];
+          if (vAttrs.length !== reqAttrs.length) continue;
+          const allMatch = reqAttrs.every((ra) =>
+            vAttrs.some((va) => norm(va.name) === norm(ra.name) && norm(va.value) === norm(ra.value))
+          );
+          if (allMatch) return v;
+        }
+      }
+ 
+      // 2) Fall back to first variant
+      return stockItem.variants[0];
+    };
+ 
+    // ── Per-product list + aggregated totals ──────────────────────────────
+    const perProduct = [];
+    const totalsMap = new Map(); // key: `${rawItemId}|${variantId||""}`
+ 
+    for (const item of request.items) {
+      const sid = item.stockItemId?.toString();
+      const stockItem = sid ? stockItemMap.get(sid) : null;
+      if (!stockItem) {
+        perProduct.push({
+          productName: item.stockItemName || "Unknown",
+          stockItemReference: item.stockItemReference || "",
+          totalQuantity: item.totalQuantity || 0,
+          rawItems: [],
+          note: "Stock item not found in inventory",
+        });
+        continue;
+      }
+ 
+      const productRawItems = []; // accumulated for this product
+ 
+      for (const reqVariant of item.variants || []) {
+        const qtyOrdered = reqVariant.quantity || 0;
+        if (qtyOrdered <= 0) continue;
+ 
+        const matchedVariant = findStockVariant(stockItem, reqVariant);
+        if (!matchedVariant || !Array.isArray(matchedVariant.rawItems)) continue;
+ 
+        for (const ri of matchedVariant.rawItems) {
+          const required = (ri.quantity || 0) * qtyOrdered;
+          if (required <= 0) continue;
+ 
+          const rawItemIdStr = ri.rawItemId?.toString() || "";
+          const variantIdStr = ri.variantId?.toString() || "";
+          const key = `${rawItemIdStr}|${variantIdStr}`;
+ 
+          // Accumulate for this product
+          const existingForProduct = productRawItems.find(
+            (p) => `${p.rawItemId}|${p.variantId || ""}` === key
+          );
+          if (existingForProduct) {
+            existingForProduct.quantityRequired += required;
+            existingForProduct.totalCost += (ri.totalCost || 0) * (qtyOrdered / 1); // already qty-multiplied above; safer to just sum unitCost*req
+          } else {
+            productRawItems.push({
+              rawItemId: rawItemIdStr,
+              variantId: variantIdStr,
+              rawItemName: ri.rawItemName,
+              rawItemSku: ri.rawItemSku || "",
+              variantCombination: ri.variantCombination || [],
+              unit: ri.unit,
+              baseUnit: ri.baseUnit || ri.unit,
+              quantityRequired: required,
+              unitCost: ri.unitCost || 0,
+              totalCost: (ri.unitCost || 0) * required,
+            });
+          }
+ 
+          // Accumulate global totals
+          if (!totalsMap.has(key)) {
+            totalsMap.set(key, {
+              rawItemId: rawItemIdStr,
+              variantId: variantIdStr,
+              rawItemName: ri.rawItemName,
+              rawItemSku: ri.rawItemSku || "",
+              variantCombination: ri.variantCombination || [],
+              unit: ri.unit,
+              baseUnit: ri.baseUnit || ri.unit,
+              quantityRequired: 0,
+              unitCost: ri.unitCost || 0,
+              totalCost: 0,
+            });
+          }
+          const totalEntry = totalsMap.get(key);
+          totalEntry.quantityRequired += required;
+          totalEntry.totalCost += (ri.unitCost || 0) * required;
+        }
+      }
+ 
+      perProduct.push({
+        productName: item.mpcDisplayName || item.stockItemName,
+        stockItemReference: item.stockItemReference || "",
+        totalQuantity: item.totalQuantity || 0,
+        rawItems: productRawItems,
+      });
+    }
+ 
+    // ── Fetch current stock for all unique raw-item ids ───────────────────
+    const uniqueRawItemIds = [
+      ...new Set([...totalsMap.values()].map((t) => t.rawItemId).filter(Boolean)),
+    ];
+ 
+    const rawItemDocs = uniqueRawItemIds.length
+      ? await RawItem.find({
+          _id: { $in: uniqueRawItemIds.map((id) => new mongoose.Types.ObjectId(id)) },
+        }).lean()
+      : [];
+    const rawItemMap = new Map(rawItemDocs.map((r) => [r._id.toString(), r]));
+ 
+    // ── Build totals[] with availability comparison ───────────────────────
+    const totals = [];
+    let totalRequired = 0;
+    let totalAvailable = 0;
+    let shortfallCount = 0;
+ 
+    for (const t of totalsMap.values()) {
+      const doc = rawItemMap.get(t.rawItemId);
+      let available = null;
+      let minStock = 0;
+ 
+      if (doc) {
+        if (t.variantId && Array.isArray(doc.variants)) {
+          const v = doc.variants.find((vv) => vv._id?.toString() === t.variantId);
+          if (v) {
+            available = v.quantity || 0;
+            minStock = v.minStock ?? doc.minStock ?? 0;
+          }
+        }
+        if (available === null) {
+          // Fall back to item-level qty
+          available = doc.quantity || 0;
+          minStock = doc.minStock || 0;
+        }
+      }
+ 
+      const shortfall = available !== null ? Math.max(0, t.quantityRequired - available) : null;
+ 
+      let status = "unknown";
+      if (available !== null) {
+        if (available <= 0) status = "out_of_stock";
+        else if (shortfall > 0) status = "shortage";
+        else if (available - t.quantityRequired <= minStock) status = "low";
+        else status = "ok";
+      }
+ 
+      totalRequired += t.quantityRequired;
+      if (available !== null) totalAvailable += available;
+      if (shortfall && shortfall > 0) shortfallCount++;
+ 
+      totals.push({
+        ...t,
+        available,
+        shortfall,
+        minStock,
+        status,
+      });
+    }
+ 
+    // Sort totals: shortages first, then low, then ok
+    const statusRank = { out_of_stock: 0, shortage: 1, low: 2, ok: 3, unknown: 4 };
+    totals.sort((a, b) => {
+      const r = (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9);
+      if (r !== 0) return r;
+      return (a.rawItemName || "").localeCompare(b.rawItemName || "");
+    });
+ 
+    return res.json({
+      success: true,
+      perProduct,
+      totals,
+      grand: {
+        totalLineItems: totals.length,
+        totalRequired,
+        totalAvailable,
+        shortfallCount,
+      },
+    });
+  } catch (err) {
+    console.error("Raw-item requirement error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+ 
+ 
+// ═══════════════════════════════════════════════════════════════════════════
+// 3) ASSIGN DEADLINE — bulk
+//    Frontend: POST /api/cms/sales/work-orders/assign-deadlines-batch
+//    Body: { workOrderIds: [...], deadline: "2026-06-15" | null }
+// ═══════════════════════════════════════════════════════════════════════════
+router.post("/work-orders/assign-deadlines-batch", async (req, res) => {
+  try {
+    const { workOrderIds, deadline } = req.body;
+    if (!Array.isArray(workOrderIds) || workOrderIds.length === 0) {
+      return res.status(400).json({ success: false, message: "workOrderIds array is required" });
+    }
+ 
+    const isClearing = deadline === null || deadline === "";
+    let parsed = null;
+    if (!isClearing) {
+      parsed = new Date(deadline);
+      if (isNaN(parsed.getTime())) {
+        return res.status(400).json({ success: false, message: "Invalid deadline date" });
+      }
+    }
+ 
+    const update = isClearing
+      ? {
+          $set: {
+            assignedDeadline: null,
+            "assignedDeadlineMeta.assignedAt": null,
+            "assignedDeadlineMeta.assignedBy": null,
+          },
+        }
+      : {
+          $set: {
+            assignedDeadline: parsed,
+            "assignedDeadlineMeta.assignedAt": new Date(),
+            "assignedDeadlineMeta.assignedBy": req.user?.id || null,
+          },
+        };
+ 
+    const result = await WorkOrder.updateMany({ _id: { $in: workOrderIds } }, update);
+ 
+    return res.json({
+      success: true,
+      message: `${result.modifiedCount} work order${result.modifiedCount !== 1 ? "s" : ""} updated`,
+      modifiedCount: result.modifiedCount,
+      workOrderIds,
+      deadline: isClearing ? null : parsed,
+    });
+  } catch (err) {
+    console.error("Batch assign deadline error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.get("/requests/:requestId/work-orders", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const workOrders = await WorkOrder.find({ customerRequestId: requestId })
+      .sort({ createdAt: 1 })
+      .lean();
+    return res.json({ success: true, workOrders });
+  } catch (err) {
+    console.error("Fetch work orders error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // CREATE quotation for a request
 router.post("/requests/:requestId/quotation", async (req, res) => {

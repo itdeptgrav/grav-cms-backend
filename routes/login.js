@@ -11,8 +11,9 @@ const CuttingMasterDepartment = require("../models/CuttingMasterDepartment");
 const AccountantDepartment = require("../models/Accountant_model/AccountantDepartment");
 const PackagingDispatchDepartment = require("../models/PackagingDispatchDepartment");
 const ProductionSupervisorDepartment = require("../models/ProductionSupervisorDepartment");
-const QCDepartment = require("../models/QCDepartment"); // ✅ NEW
+const QCDepartment = require("../models/QCDepartment");
 const CEODepartment = require("../models/CEODepartment");
+const StoreDepartment = require("../models/StoreDepartment"); // ✅ NEW
 
 router.post("/login", async (req, res) => {
   try {
@@ -51,9 +52,13 @@ router.post("/login", async (req, res) => {
                     user = await QCDepartment.findOne({ email: email.toLowerCase() });
                     if (user) userModel = "qc";
                     else {
-                      // ✅ NEW: CEO
                       user = await CEODepartment.findOne({ email: email.toLowerCase() });
                       if (user) userModel = "ceo";
+                      else {
+                        // ✅ NEW: Store
+                        user = await StoreDepartment.findOne({ email: email.toLowerCase() });
+                        if (user) userModel = "store";
+                      }
                     }
                   }
                 }
@@ -89,7 +94,7 @@ router.post("/login", async (req, res) => {
 
     let redirectPath = "/";
     if (user.role === "hr_manager") redirectPath = "/hr/dashboard";
-    if (user.role === "ceo") redirectPath = "/ceo/dashboard"; // ✅ NEW
+    if (user.role === "ceo") redirectPath = "/ceo/dashboard";
     if (user.role === "project_manager") redirectPath = "/project-manager/dashboard";
     if (user.role === "sales") redirectPath = "/sales/dashboard";
     if (user.role === "mpc-measurement") redirectPath = "/mpc-measurement/dashboard";
@@ -97,7 +102,8 @@ router.post("/login", async (req, res) => {
     if (user.role === "accountant") redirectPath = "/accountant/";
     if (user.role === "packaging_dispatch") redirectPath = "/packaging-dispatch/dashboard";
     if (user.role === "production_supervisor") redirectPath = "/production-supervisor/dashboard";
-    if (user.role === "quality_control") redirectPath = "/qc/dashboard"; // ✅ NEW
+    if (user.role === "quality_control") redirectPath = "/qc/dashboard";
+    if (user.role === "store_manager") redirectPath = "/store/dashboard/overview"; // ✅ NEW
 
     res.status(200).json({
       success: true,
@@ -132,7 +138,8 @@ router.post("/verify", async (req, res) => {
       case "accountant": user = await AccountantDepartment.findById(decoded.id).select("-password"); break;
       case "packaging-dispatch": user = await PackagingDispatchDepartment.findById(decoded.id).select("-password"); break;
       case "production-supervisor": user = await ProductionSupervisorDepartment.findById(decoded.id).select("-password"); break;
-      case "qc": user = await QCDepartment.findById(decoded.id).select("-password"); break; // ✅ NEW
+      case "qc": user = await QCDepartment.findById(decoded.id).select("-password"); break;
+      case "store": user = await StoreDepartment.findById(decoded.id).select("-password"); break; // ✅ NEW
       default: user = await HRDepartment.findById(decoded.id).select("-password"); break;
     }
 
