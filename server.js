@@ -1151,6 +1151,11 @@ app.use("/cowork", askAITest);
 const crossOrgRoutes = require("./routes/Customer_Routes/cross-org-assign.js");
 app.use("/api/customer/employees/cross-org", crossOrgRoutes);
 
+
+
+const storeOrderRoutes= require("./routes/CMS_Routes/Store/storeRoutes.js");
+app.use("/api/cms/store", storeOrderRoutes);
+
 /* =====================================================================
    INLINE: Barcode Scanner Tracking Routes
    Base URL: /api/cms/production/tracking
