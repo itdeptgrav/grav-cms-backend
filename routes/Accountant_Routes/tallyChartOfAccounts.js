@@ -120,6 +120,25 @@ router.get("/tree", async (req, res) => {
       if (parent) parent.ledgers.push(l);
     });
 
+    // Sort ledgers within each group by groupOrder (when present), then
+    // alphabetical. Wrapped defensively so a bad comparator never kills
+    // the response — fall back to the unsorted array.
+    try {
+      groupMap.forEach((g) => {
+        if (!Array.isArray(g.ledgers) || g.ledgers.length < 2) return;
+        g.ledgers.sort((a, b) => {
+          const ao = a.groupOrder,
+            bo = b.groupOrder;
+          if (ao != null && bo == null) return -1;
+          if (ao == null && bo != null) return 1;
+          if (ao != null && bo != null && ao !== bo) return ao - bo;
+          return (a.name || "").localeCompare(b.name || "");
+        });
+      });
+    } catch (sortErr) {
+      console.warn("[CoA tree] ledger sort skipped:", sortErr.message);
+    }
+
     const roots = [];
     groupMap.forEach((g) => {
       if (g.parent) {
@@ -134,12 +153,39 @@ router.get("/tree", async (req, res) => {
     // Roll up balances bottom-up
     roots.forEach(rollupGroupTotals);
 
+    // Sort child groups by displayOrder (when set), then name. Wrap so
+    // a bad comparator never kills the response.
+    function sortChildrenRecursive(node) {
+      if (!Array.isArray(node.children) || node.children.length === 0) return;
+      node.children.sort((a, b) => {
+        const ao = a.displayOrder,
+          bo = b.displayOrder;
+        if (ao != null && bo == null) return -1;
+        if (ao == null && bo != null) return 1;
+        if (ao != null && bo != null && ao !== bo) return ao - bo;
+        return (a.name || "").localeCompare(b.name || "");
+      });
+      for (const c of node.children) sortChildrenRecursive(c);
+    }
+    try {
+      for (const r of roots) sortChildrenRecursive(r);
+    } catch (sortErr) {
+      console.warn("[CoA tree] child sort skipped:", sortErr.message);
+    }
+
     const order = ["asset", "liability", "equity", "revenue", "expense"];
     roots.sort((a, b) => {
+      // First by nature (Assets → Liabilities → Equity → Revenue → Expenses)
       const oa = order.indexOf(a.nature);
       const ob = order.indexOf(b.nature);
       if (oa !== ob) return oa - ob;
-      return a.name.localeCompare(b.name);
+      // Within a nature: by user displayOrder if set, else alphabetical
+      const ao = a.displayOrder,
+        bo = b.displayOrder;
+      if (ao != null && bo == null) return -1;
+      if (ao == null && bo != null) return 1;
+      if (ao != null && bo != null && ao !== bo) return ao - bo;
+      return (a.name || "").localeCompare(b.name || "");
     });
 
     // Top-level totals by nature (handy for the page header strip)
@@ -185,12 +231,10 @@ router.post("/groups", async (req, res) => {
   try {
     const { companyId, name, parent, nature, description } = req.body;
     if (!companyId || !name || !nature) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "companyId, name, nature are required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "companyId, name, nature are required",
+      });
     }
     let parentDoc = null;
     if (parent) {
@@ -226,12 +270,10 @@ router.put("/groups/:id", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Group not found" });
     if (grp.isReserved && req.body.name && req.body.name !== grp.name) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Cannot rename a reserved Tally group",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Cannot rename a reserved Tally group",
+      });
     }
     Object.assign(grp, req.body);
     await grp.save();
@@ -276,6 +318,124 @@ router.delete("/groups/:id", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PATCH /groups/:id/order — manually re-order a group among its siblings
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure display-order operation: doesn't touch any balances, doesn't change
+// the group's parent, doesn't change its nature, doesn't affect any ledger.
+// Only the user-visible sort within the Chart of Accounts page changes.
+//
+// Body shape:
+//   {
+//     companyId,             // required, sanity-check the group is in scope
+//     destGroupId,           // the sibling we're being dropped BEFORE
+//     siblingIds             // optional: the user's current view-order of
+//                            // siblings. If provided, we re-rank all of
+//                            // them in one go to clean up sparse gaps.
+//   }
+//
+// Constraints:
+//   • src and dest must share the same parent (or both be top-level under
+//     the same nature). Cross-parent moves are NOT supported via this
+//     endpoint — that would cascade nature changes, which is risky.
+//   • Both groups must belong to the requested company.
+//   • Either group being reserved is fine — we only change display order.
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/groups/:id/order", async (req, res) => {
+  try {
+    const { companyId, destGroupId, siblingIds } = req.body || {};
+    if (!companyId)
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+    if (!destGroupId)
+      return res
+        .status(400)
+        .json({ success: false, message: "destGroupId required" });
+
+    const [src, dest] = await Promise.all([
+      TallyGroup.findById(req.params.id),
+      TallyGroup.findById(destGroupId),
+    ]);
+    if (!src || !dest)
+      return res
+        .status(404)
+        .json({ success: false, message: "Group(s) not found" });
+    if (
+      String(src.companyId) !== String(companyId) ||
+      String(dest.companyId) !== String(companyId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Both groups must belong to the same company",
+      });
+    }
+
+    // Same-parent constraint. Both null parents (top-level) count as
+    // "same parent" only if their natures match — otherwise you'd be
+    // moving between different nature buckets, which we refuse here.
+    const sameParent =
+      (src.parent &&
+        dest.parent &&
+        String(src.parent) === String(dest.parent)) ||
+      (!src.parent && !dest.parent && src.nature === dest.nature);
+    if (!sameParent) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Groups can only be reordered within the same parent group (or within the same top-level nature).",
+        code: "CROSS_PARENT_NOT_SUPPORTED",
+      });
+    }
+    if (String(src._id) === String(dest._id)) {
+      return res.json({ success: true, noop: true });
+    }
+
+    // Case A: client gave us the new ordered list — write ranks for all
+    // of them in one go. This is the preferred path because it leaves
+    // clean, evenly-spaced display order values.
+    const GAP = 100;
+    if (Array.isArray(siblingIds) && siblingIds.length > 0) {
+      // Re-order: pull src out, insert it just before dest in the array
+      const without = siblingIds
+        .map(String)
+        .filter((x) => x !== String(src._id));
+      const destIdx = without.findIndex((x) => x === String(dest._id));
+      if (destIdx < 0) {
+        return res.status(400).json({
+          success: false,
+          message: "destGroupId not found in siblingIds",
+        });
+      }
+      const newOrder = [
+        ...without.slice(0, destIdx),
+        String(src._id),
+        ...without.slice(destIdx),
+      ];
+      const ops = newOrder.map((gid, i) => ({
+        updateOne: {
+          filter: { _id: gid, companyId },
+          update: { $set: { displayOrder: i * GAP } },
+        },
+      }));
+      await TallyGroup.bulkWrite(ops);
+      return res.json({ success: true, reordered: newOrder.length });
+    }
+
+    // Case B: no sibling list given — just put src at dest's order - 1
+    // (or 0 if dest has no order set). Simpler but can create gaps.
+    const destOrder = Number.isFinite(dest.displayOrder)
+      ? dest.displayOrder
+      : 0;
+    src.displayOrder = destOrder - 1;
+    await src.save();
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[group/order]", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // LEDGERS — CRUD
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/ledgers", async (req, res) => {
@@ -283,6 +443,8 @@ router.get("/ledgers", async (req, res) => {
     const {
       companyId,
       groupId,
+      groupName,
+      group,
       nature,
       search,
       page = 1,
@@ -291,6 +453,54 @@ router.get("/ledgers", async (req, res) => {
     const filter = { isActive: true };
     if (companyId) filter.companyId = companyId;
     if (groupId) filter.groupId = groupId;
+
+    // Allow filtering by group NAME (e.g. "Sundry Debtors"). Resolves
+    // the name → groupId on the fly. Accept either `group` or
+    // `groupName` query param. Case-insensitive. Includes descendants
+    // of the named group too — if a user nested "Wholesale Customers"
+    // under "Sundry Debtors", those ledgers come back too.
+    const gname = groupName || group;
+    if (gname && !groupId && companyId) {
+      const rx = new RegExp(
+        "^" + gname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
+        "i",
+      );
+      const root = await TallyGroup.findOne({
+        companyId,
+        isActive: true,
+        name: rx,
+      });
+      if (!root) {
+        return res.json({
+          success: true,
+          ledgers: [],
+          total: 0,
+          page: parseInt(page),
+          pages: 0,
+        });
+      }
+      // Walk descendants
+      const groupIds = new Set([String(root._id)]);
+      let frontier = [root._id];
+      let safety = 0;
+      while (frontier.length > 0 && safety++ < 20) {
+        const kids = await TallyGroup.find({
+          companyId,
+          isActive: true,
+          parent: { $in: frontier },
+        }).select("_id");
+        const next = [];
+        for (const k of kids) {
+          if (!groupIds.has(String(k._id))) {
+            groupIds.add(String(k._id));
+            next.push(k._id);
+          }
+        }
+        frontier = next;
+      }
+      filter.groupId = { $in: Array.from(groupIds) };
+    }
+
     if (nature) filter.nature = nature;
     if (search) {
       filter.$or = [
@@ -895,12 +1105,10 @@ router.post("/ledgers/:id/transactions", async (req, res) => {
         .status(400)
         .json({ success: false, message: "amount must be a positive number" });
     if (String(ledgerId) === String(contraLedgerId)) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "contra ledger cannot be the same as this ledger",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "contra ledger cannot be the same as this ledger",
+      });
     }
 
     const [thisLedger, contraLedger] = await Promise.all([
@@ -916,12 +1124,10 @@ router.post("/ledgers/:id/transactions", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Contra ledger not found" });
     if (String(thisLedger.companyId) !== String(contraLedger.companyId)) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Both ledgers must belong to the same company",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Both ledgers must belong to the same company",
+      });
     }
 
     // ─── Build the voucher ──────────────────────────────────────────────
@@ -1115,7 +1321,7 @@ router.get("/trial-balance", async (req, res) => {
       const priorTxn = openingMap.get(String(l._id)) || 0;
       const opening = (l.openingBalance || 0) + priorTxn;
       const closing = opening + period.debit - period.credit;
-      return {
+      const row = {
         ledgerId: l._id,
         name: l.name,
         groupName: l.groupName,
@@ -1132,7 +1338,37 @@ router.get("/trial-balance", async (req, res) => {
         drColumn: closing >= 0 ? closing : 0,
         crColumn: closing < 0 ? Math.abs(closing) : 0,
       };
+      // Optional drag-and-drop fields (added Apr 2026). Wrapped so legacy
+      // ledgers without these fields never crash the route. The frontend
+      // uses groupId for drop targeting; groupOrder for stable manual
+      // sorting set elsewhere (BS/P&L drag-reorder writes this).
+      try {
+        row.groupId = l.groupId || null;
+        row.groupOrder = l.groupOrder === undefined ? null : l.groupOrder;
+      } catch (_) {
+        /* defensive */
+      }
+      return row;
     });
+
+    // Sort rows by groupOrder (when present), then name. Wrapped so a
+    // bad comparator never kills the response.
+    try {
+      rows.sort((a, b) => {
+        // Primary: keep current groupName grouping so the front-end's
+        // by-nature → by-group nesting stays coherent.
+        if (a.groupName !== b.groupName)
+          return (a.groupName || "").localeCompare(b.groupName || "");
+        const ao = a.groupOrder,
+          bo = b.groupOrder;
+        if (ao != null && bo == null) return -1;
+        if (ao == null && bo != null) return 1;
+        if (ao != null && bo != null && ao !== bo) return ao - bo;
+        return (a.name || "").localeCompare(b.name || "");
+      });
+    } catch (sortErr) {
+      console.warn("[trial-balance] sort skipped:", sortErr.message);
+    }
 
     // Filter out completely-zero ledgers? Keep them — auditors want to see "not used yet" too.
     // Group totals
@@ -1142,6 +1378,7 @@ router.get("/trial-balance", async (req, res) => {
         byGroup.set(r.groupName, {
           groupName: r.groupName,
           nature: r.nature,
+          groupId: r.groupId || null, // ← for drop-target wiring
           debit: 0,
           credit: 0,
           drColumn: 0,
@@ -1994,13 +2231,11 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
     try {
       result = await postPayrollRun(companyId, run, items, { bankLedgerId });
     } catch (e) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: e.message,
-          bankSetupNeeded: /bank/i.test(e.message),
-        });
+      return res.status(400).json({
+        success: false,
+        message: e.message,
+        bankSetupNeeded: /bank/i.test(e.message),
+      });
     }
 
     if (result.created.length === 0) {
@@ -3159,19 +3394,15 @@ router.post("/ledgers/:id/transfer-balance", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Destination ledger not found" });
     if (String(source.companyId) !== String(dest.companyId))
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Source and destination must belong to the same company.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Source and destination must belong to the same company.",
+      });
     if (String(source._id) === String(dest._id))
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Source and destination cannot be the same ledger.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Source and destination cannot be the same ledger.",
+      });
 
     // Resolve transfer amount.
     // currentBalance is signed: +ve = Dr, -ve = Cr.
@@ -3181,20 +3412,16 @@ router.post("/ledgers/:id/transfer-balance", async (req, res) => {
     const amt =
       explicitAmount != null ? Math.abs(parseFloat(explicitAmount)) : fullAbs;
     if (!amt || amt <= 0)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message:
-            "Source ledger has no balance to transfer (or invalid amount).",
-        });
+      return res.status(400).json({
+        success: false,
+        message:
+          "Source ledger has no balance to transfer (or invalid amount).",
+      });
     if (amt > fullAbs + 0.01)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `Cannot transfer ${amt.toFixed(2)} — source balance is only ${fullAbs.toFixed(2)} ${sourceBal >= 0 ? "Dr" : "Cr"}.`,
-        });
+      return res.status(400).json({
+        success: false,
+        message: `Cannot transfer ${amt.toFixed(2)} — source balance is only ${fullAbs.toFixed(2)} ${sourceBal >= 0 ? "Dr" : "Cr"}.`,
+      });
 
     // Determine entry types so the source moves toward zero.
     // If source has Dr balance (+ve): we credit source to reduce → and debit destination

@@ -89,7 +89,7 @@ router.get("/trial-balance", auth, async (req, res) => {
           debitTotal: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.type", "Dr"] },
+                { $eq: ["$ledgerEntries.entryType", "Dr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -98,7 +98,7 @@ router.get("/trial-balance", auth, async (req, res) => {
           creditTotal: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.type", "Cr"] },
+                { $eq: ["$ledgerEntries.entryType", "Cr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -110,11 +110,11 @@ router.get("/trial-balance", auth, async (req, res) => {
 
     const movementMap = {};
     movements.forEach((m) => {
-      movementMap[m._id.toString()] = m;
+      if (m && m._id) movementMap[m._id.toString()] = m;
     });
 
     // For opening balance: if `from` is given, opening = current - movements_within_range
-    // Simpler: opening = ledger.openingBalanceSigned (as configured at start of books)
+    // Simpler: opening = ledger.openingBalance (as configured at start of books)
     //          plus all movement BEFORE `from` if `from` is set.
     let priorMovements = [];
     if (from) {
@@ -137,7 +137,7 @@ router.get("/trial-balance", auth, async (req, res) => {
     }
     const priorMap = {};
     priorMovements.forEach((p) => {
-      priorMap[p._id.toString()] = p.net;
+      if (p && p._id) priorMap[p._id.toString()] = p.net;
     });
 
     // Build ledger rows
@@ -228,16 +228,42 @@ router.get("/day-book", auth, async (req, res) => {
       companyId,
       voucherType,
       status = "posted",
+      date,
       page = 1,
       limit = 100,
     } = req.query;
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
+
+    // Two ways to scope the date: single `date=YYYY-MM-DD` (day-book
+    // semantics — one day's vouchers), or `dateFrom/dateTo` (range
+    // semantics — kept for callers that want a window).
     const { from, to } = parseDateRange(req);
 
     const filter = { companyId, status };
     if (voucherType) filter.voucherType = voucherType;
-    if (from || to) {
+    if (date) {
+      const d = new Date(date);
+      const dayStart = new Date(
+        d.getFullYear(),
+        d.getMonth(),
+        d.getDate(),
+        0,
+        0,
+        0,
+        0,
+      );
+      const dayEnd = new Date(
+        d.getFullYear(),
+        d.getMonth(),
+        d.getDate(),
+        23,
+        59,
+        59,
+        999,
+      );
+      filter.voucherDate = { $gte: dayStart, $lte: dayEnd };
+    } else if (from || to) {
       filter.voucherDate = {};
       if (from) filter.voucherDate.$gte = from;
       if (to) filter.voucherDate.$lte = to;
@@ -246,6 +272,10 @@ router.get("/day-book", auth, async (req, res) => {
     const skip = (Number(page) - 1) * Number(limit);
     const [vouchers, total] = await Promise.all([
       TallyVoucher.find(filter)
+        // Schema field is `partyLedgerId`, not `partyLedger`. The voucher
+        // already has `partyLedgerName` denormalised so we don't strictly
+        // need the populate — but keeping it for callers who want the
+        // full ledger doc, with the corrected field name.
         .populate("partyLedgerId", "name")
         .sort({ voucherDate: 1, createdAt: 1 })
         .skip(skip)
@@ -271,6 +301,9 @@ router.get("/day-book", auth, async (req, res) => {
     ]);
 
     res.json({
+      // Day Book page expects `vouchers`; CoA / other callers also use
+      // `items`. Return both for compatibility.
+      vouchers,
       items: vouchers,
       total,
       page: Number(page),
@@ -279,7 +312,8 @@ router.get("/day-book", auth, async (req, res) => {
       totals: totals[0] || { debit: 0, credit: 0 },
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("[day-book] FAILED:", e);
+    res.status(500).json({ error: e.message, stack: e.stack });
   }
 });
 
@@ -331,7 +365,7 @@ router.get("/profit-loss", auth, async (req, res) => {
     ]);
     const moveMap = {};
     movements.forEach((m) => {
-      moveMap[m._id.toString()] = m.net;
+      if (m && m._id) moveMap[m._id.toString()] = m.net;
     });
 
     const revenueLines = [];
@@ -343,22 +377,46 @@ router.get("/profit-loss", auth, async (req, res) => {
       const net = moveMap[led._id.toString()] || 0;
       // Revenue: credit balance is income → -net (since signed is Dr-positive)
       // Expense: debit balance is expense → +net
+      const line = {
+        ledgerId: led._id,
+        ledgerName: led.name,
+        groupName: led.groupName,
+      };
+      // Optional drag-and-drop fields (added Apr 2026). Wrapped so legacy
+      // ledgers without them never crash the route.
+      try {
+        line.groupId = led.groupId || null;
+        line.groupOrder = led.groupOrder === undefined ? null : led.groupOrder;
+      } catch (_) {
+        /* defensive */
+      }
+
       if (grp.nature === "revenue") {
-        revenueLines.push({
-          ledgerId: led._id,
-          ledgerName: led.name,
-          groupName: led.groupName,
-          amount: -net, // credit-side gives income
-        });
+        revenueLines.push({ ...line, amount: -net }); // credit-side gives income
       } else if (grp.nature === "expense") {
-        expenseLines.push({
-          ledgerId: led._id,
-          ledgerName: led.name,
-          groupName: led.groupName,
-          amount: net, // debit-side gives expense
-        });
+        expenseLines.push({ ...line, amount: net }); // debit-side gives expense
       }
     });
+
+    // Sort each side by user-set groupOrder, then alphabetically. Same
+    // pattern as Balance Sheet. Wrapped so a bad comparator can't kill
+    // the response.
+    try {
+      function sortByOrder(arr) {
+        arr.sort((a, b) => {
+          const ao = a.groupOrder,
+            bo = b.groupOrder;
+          if (ao != null && bo == null) return -1;
+          if (ao == null && bo != null) return 1;
+          if (ao != null && bo != null && ao !== bo) return ao - bo;
+          return (a.ledgerName || "").localeCompare(b.ledgerName || "");
+        });
+      }
+      sortByOrder(revenueLines);
+      sortByOrder(expenseLines);
+    } catch (sortErr) {
+      console.warn("[profit-loss] sort skipped:", sortErr.message);
+    }
 
     const totalRevenue = revenueLines.reduce((s, l) => s + l.amount, 0);
     const totalExpense = expenseLines.reduce((s, l) => s + l.amount, 0);
@@ -392,7 +450,8 @@ router.get("/profit-loss", auth, async (req, res) => {
       netProfit,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("[profit-loss] FAILED:", e);
+    res.status(500).json({ error: e.message, stack: e.stack });
   }
 });
 
@@ -401,7 +460,7 @@ router.get("/profit-loss", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /*
  * As-of date snapshot: for each ledger compute closing balance =
- * openingBalanceSigned + sum of signedAmount across all postings up to date.
+ * openingBalance + sum of signedAmount across all postings up to date.
  * Group by nature: assets / liabilities / equity.
  */
 router.get("/balance-sheet", auth, async (req, res) => {
@@ -444,7 +503,7 @@ router.get("/balance-sheet", auth, async (req, res) => {
     ]);
     const moveMap = {};
     movements.forEach((m) => {
-      moveMap[m._id.toString()] = m.net;
+      if (m && m._id) moveMap[m._id.toString()] = m.net;
     });
 
     // Compute net profit (revenue - expense) up to asOf and add to equity
@@ -457,6 +516,8 @@ router.get("/balance-sheet", auth, async (req, res) => {
       if (!grp) return;
       const closing =
         (led.openingBalance || 0) + (moveMap[led._id.toString()] || 0);
+      // Build line defensively — new fields (groupId, groupOrder) are guarded
+      // so legacy ledgers without these fields don't crash anything.
       const line = {
         ledgerId: led._id,
         ledgerName: led.name,
@@ -464,6 +525,15 @@ router.get("/balance-sheet", auth, async (req, res) => {
         amount: Math.abs(closing),
         signedAmount: closing,
       };
+      // Optional new fields — added Apr 2026 for drag-and-drop. Wrapped
+      // in a try so any unexpected field-access error degrades gracefully.
+      try {
+        line.groupId = led.groupId || null;
+        line.groupOrder = led.groupOrder === undefined ? null : led.groupOrder;
+      } catch (fieldErr) {
+        // Shouldn't happen, but defensive — old clients still work
+        console.warn("[balance-sheet] new fields skipped:", fieldErr.message);
+      }
       if (grp.nature === "asset") buckets.asset.push(line);
       else if (grp.nature === "liability")
         buckets.liability.push({ ...line, amount: -closing });
@@ -472,6 +542,26 @@ router.get("/balance-sheet", auth, async (req, res) => {
       else if (grp.nature === "revenue") revenueNet += -closing;
       else if (grp.nature === "expense") expenseNet += closing;
     });
+
+    // Sort each bucket by user-set groupOrder, then alphabetically. Wrapped
+    // in try so any sort comparator error doesn't kill the whole response.
+    try {
+      function bucketSort(arr) {
+        arr.sort((a, b) => {
+          const ao = a.groupOrder,
+            bo = b.groupOrder;
+          if (ao != null && bo == null) return -1;
+          if (ao == null && bo != null) return 1;
+          if (ao != null && bo != null && ao !== bo) return ao - bo;
+          return (a.ledgerName || "").localeCompare(b.ledgerName || "");
+        });
+      }
+      bucketSort(buckets.asset);
+      bucketSort(buckets.liability);
+      bucketSort(buckets.equity);
+    } catch (sortErr) {
+      console.warn("[balance-sheet] sort skipped:", sortErr.message);
+    }
 
     const netProfit = revenueNet - expenseNet;
     if (netProfit !== 0) {
@@ -504,7 +594,10 @@ router.get("/balance-sheet", auth, async (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    // Log full stack trace so the actual cause shows in your terminal —
+    // previously this was a bare `e.message` which hid the real error.
+    console.error("[balance-sheet] FAILED:", e);
+    res.status(500).json({ error: e.message, stack: e.stack });
   }
 });
 
@@ -619,36 +712,7 @@ router.get("/gst-summary", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* CASH FLOW — AS-3 / IAS-7 classified statement                       */
-/*                                                                      */
-/* Indian accounting standard for cash flow statements requires three   */
-/* sections:                                                            */
-/*   A. OPERATING activities — receipts from customers, payments to     */
-/*      suppliers/staff, taxes, working-capital movements.              */
-/*   B. INVESTING activities — fixed-asset purchases/sales, investments,*/
-/*      loans given.                                                    */
-/*   C. FINANCING activities — loans taken/repaid, capital injected,    */
-/*      dividends paid.                                                 */
-/*                                                                      */
-/* For each non-internal cash voucher, we look at the "other side" of   */
-/* the entry (the non-cash ledgers) and classify by their GROUP NATURE  */
-/* / GROUP NAME. The activity money flow is: when cash goes Dr (in),    */
-/* the other side is Cr (something gave us cash); reverse for outflows. */
-/*                                                                      */
-/* Returns:                                                             */
-/*   {                                                                  */
-/*     dateRange:    { from, to },                                      */
-/*     openingCash:  N,                                                 */
-/*     closingCash:  N,                                                 */
-/*     activities: {                                                    */
-/*       operating: { lines: [{label, inflow, outflow, net}], net },    */
-/*       investing: { lines: [...], net },                              */
-/*       financing: { lines: [...], net }                               */
-/*     },                                                               */
-/*     internalTransfers: { inflow, outflow },  // contras, info-only   */
-/*     totals: { inflow, outflow, net },        // legacy compat        */
-/*     breakdown: [...]                          // legacy compat        */
-/*   }                                                                  */
+/* CASH FLOW (simplified: movements on cash & bank ledgers)            */
 /* ------------------------------------------------------------------ */
 router.get("/cash-flow", auth, async (req, res) => {
   try {
@@ -658,8 +722,7 @@ router.get("/cash-flow", auth, async (req, res) => {
     const { from, to } = parseDateRange(req);
 
     const cId = new mongoose.Types.ObjectId(companyId);
-
-    // 1) Identify cash & bank ledgers (these are what we follow)
+    // Find cash & bank ledgers — Tally groups: "Cash-in-Hand", "Bank Accounts"
     const cashGroups = await TallyGroup.find({
       companyId: cId,
       name: { $in: ["Cash-in-Hand", "Bank Accounts", "Bank OD A/c"] },
@@ -672,55 +735,7 @@ router.get("/cash-flow", auth, async (req, res) => {
       groupId: { $in: cashGroupIds },
     }).lean();
     const cashLedgerIds = cashLedgers.map((l) => l._id);
-    const cashLedgerIdSet = new Set(cashLedgerIds.map(String));
 
-    // 2) Pull all groups + ledgers so we can classify any "other side" ledger
-    const allGroups = await TallyGroup.find({ companyId: cId }).lean();
-    const allLedgers = await TallyLedger.find({ companyId: cId }).lean();
-    const groupById = new Map(allGroups.map((g) => [String(g._id), g]));
-    const ledgerById = new Map(allLedgers.map((l) => [String(l._id), l]));
-
-    // Classifier — input is a non-cash ledger; output is one of:
-    //   "operating" | "investing" | "financing" | "internal" | "unknown"
-    function classify(ledger) {
-      if (!ledger) return "unknown";
-      if (cashLedgerIdSet.has(String(ledger._id))) return "internal";
-      const grp = groupById.get(String(ledger.groupId));
-      if (!grp) return "unknown";
-
-      const gname = (grp.name || "").toLowerCase();
-      // Walk up the parent chain to also consider parent group name
-      const parentName = grp.parentId
-        ? (groupById.get(String(grp.parentId))?.name || "").toLowerCase()
-        : "";
-
-      // Investing: fixed assets, intangibles, investments, capital WIP, deposits
-      if (/(fixed asset|intangible|investment|capital work)/.test(gname))
-        return "investing";
-      if (/(fixed asset|intangible|investment|capital work)/.test(parentName))
-        return "investing";
-
-      // Financing: loans (both directions), capital, reserves
-      if (
-        /(secured loan|unsecured loan|bank od|capital account|reserves|share capital|partner|drawings)/.test(
-          gname,
-        )
-      )
-        return "financing";
-      if (
-        /(secured loan|unsecured loan|capital account|reserves)/.test(
-          parentName,
-        )
-      )
-        return "financing";
-
-      // Operating: everything else that affects revenue/expense/working capital
-      // — debtors, creditors, taxes, expense ledgers, revenue ledgers, provisions,
-      // current assets/liabilities not classified above
-      return "operating";
-    }
-
-    // 3) Pull cash vouchers in the period — fully (we need the "other side")
     const match = {
       companyId: cId,
       status: "posted",
@@ -731,157 +746,7 @@ router.get("/cash-flow", auth, async (req, res) => {
       if (from) match.voucherDate.$gte = from;
       if (to) match.voucherDate.$lte = to;
     }
-    const vouchers = await TallyVoucher.find(match).lean();
 
-    // 4) Walk each voucher: for each cash leg (Dr or Cr), distribute its amount
-    // to the other-side ledgers proportionally based on their amounts and signs.
-    //
-    // For a typical voucher (e.g. cash sale): Cash Dr 1000 / Sales Cr 1000.
-    // The cash inflow of 1000 is attributed to "Sales" and classified as
-    // operating-inflow.
-    //
-    // For a more complex voucher (Cash Dr 1000 / Sales Cr 800 / GST Cr 200),
-    // we distribute the 1000 inflow proportionally: 800 to Sales (operating-in),
-    // 200 to GST (operating-in).
-    const activityBuckets = {
-      operating: new Map(), // key = ledgerId, value = { ledgerName, label, inflow, outflow }
-      investing: new Map(),
-      financing: new Map(),
-    };
-    let internalIn = 0,
-      internalOut = 0;
-
-    for (const v of vouchers) {
-      const entries = v.ledgerEntries || [];
-      // Sum cash-side Dr (inflow into business) and Cr (outflow from business)
-      let cashDr = 0,
-        cashCr = 0;
-      const otherEntries = []; // {ledgerId, type, amount}
-      for (const e of entries) {
-        if (cashLedgerIdSet.has(String(e.ledgerId))) {
-          if (e.type === "Dr") cashDr += e.amount;
-          else cashCr += e.amount;
-        } else {
-          otherEntries.push(e);
-        }
-      }
-      const cashNet = cashDr - cashCr; // +ve = net inflow, -ve = net outflow
-      if (Math.abs(cashNet) < 0.005) continue; // pure contra inside cash group
-
-      // If there are no non-cash entries, this is a pure cash↔cash transfer
-      // (contra). Track separately as internal.
-      if (otherEntries.length === 0) {
-        if (cashNet > 0) internalIn += cashNet;
-        else internalOut += -cashNet;
-        continue;
-      }
-
-      // Sum of other-side absolute amounts — used as denominator for prorate
-      const otherDr = otherEntries
-        .filter((e) => e.type === "Dr")
-        .reduce((s, e) => s + e.amount, 0);
-      const otherCr = otherEntries
-        .filter((e) => e.type === "Cr")
-        .reduce((s, e) => s + e.amount, 0);
-
-      // For an inflow voucher (cashNet > 0), the OPPOSITE side (Cr legs of
-      // non-cash entries) tells us where cash came FROM. For an outflow,
-      // the Dr legs of non-cash entries tell us where cash WENT TO.
-      const isInflow = cashNet > 0;
-      const sourceSide = isInflow ? "Cr" : "Dr";
-      const sideTotal = isInflow ? otherCr : otherDr;
-
-      // Walk source-side ledgers and bucket them into activity categories.
-      // The amount distributed to each ledger = (its amount / sideTotal) * |cashNet|.
-      // If sideTotal is 0 (asymmetric voucher — rare), we fall back to
-      // distributing across whatever non-cash entries exist.
-      const denom = sideTotal > 0 ? sideTotal : otherDr + otherCr;
-      const targets =
-        sideTotal > 0
-          ? otherEntries.filter((e) => e.type === sourceSide)
-          : otherEntries;
-
-      for (const e of targets) {
-        const share = denom > 0 ? (e.amount / denom) * Math.abs(cashNet) : 0;
-        if (share < 0.005) continue;
-        const led = ledgerById.get(String(e.ledgerId));
-        const cat = classify(led);
-        if (cat === "internal" || cat === "unknown") {
-          // Treat unknown as operating to be safe; internal already filtered above
-          if (cat === "internal") {
-            if (isInflow) internalIn += share;
-            else internalOut += share;
-            continue;
-          }
-        }
-        const bucketKey = cat === "unknown" ? "operating" : cat;
-        const map = activityBuckets[bucketKey];
-        const k = String(e.ledgerId);
-        if (!map.has(k)) {
-          map.set(k, {
-            ledgerId: e.ledgerId,
-            ledgerName: e.ledgerName || led?.name || "Unknown",
-            groupName: led
-              ? groupById.get(String(led.groupId))?.name || ""
-              : "",
-            inflow: 0,
-            outflow: 0,
-          });
-        }
-        const row = map.get(k);
-        if (isInflow) row.inflow += share;
-        else row.outflow += share;
-      }
-    }
-
-    function buildSection(map) {
-      const lines = Array.from(map.values())
-        .map((r) => ({ ...r, net: r.inflow - r.outflow }))
-        .sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
-      const inflow = lines.reduce((s, l) => s + l.inflow, 0);
-      const outflow = lines.reduce((s, l) => s + l.outflow, 0);
-      return { lines, inflow, outflow, net: inflow - outflow };
-    }
-    const operating = buildSection(activityBuckets.operating);
-    const investing = buildSection(activityBuckets.investing);
-    const financing = buildSection(activityBuckets.financing);
-
-    // 5) Compute opening & closing cash balances (sum of cash-ledger balances
-    // including all activity up to `from-1` for opening, and up to `to` for
-    // closing).
-    async function cashBalanceUpTo(date) {
-      // Opening = sum of cash ledgers' openingBalance + all signed entries up to date
-      const baseOpening = cashLedgers.reduce(
-        (s, l) => s + (l.openingBalance || 0),
-        0,
-      );
-      if (!date) return baseOpening;
-      const agg = await TallyVoucher.aggregate([
-        {
-          $match: {
-            companyId: cId,
-            status: "posted",
-            voucherDate: { $lt: date },
-          },
-        },
-        { $unwind: "$ledgerEntries" },
-        { $match: { "ledgerEntries.ledgerId": { $in: cashLedgerIds } } },
-        {
-          $group: {
-            _id: null,
-            signed: { $sum: "$ledgerEntries.signedAmount" },
-          },
-        },
-      ]);
-      return baseOpening + (agg[0]?.signed || 0);
-    }
-    const openingCash = await cashBalanceUpTo(from);
-    // For closing: sum opening + period movements (all 3 activities + internal nets out to 0)
-    const periodNet = operating.net + investing.net + financing.net;
-    const closingCash = openingCash + periodNet;
-
-    // 6) Legacy-compat breakdown — keep returning the old shape so any page
-    // still using it doesn't break. The new frontend uses `activities`.
     const flows = await TallyVoucher.aggregate([
       { $match: match },
       { $unwind: "$ledgerEntries" },
@@ -892,7 +757,7 @@ router.get("/cash-flow", auth, async (req, res) => {
           inflow: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.type", "Dr"] },
+                { $eq: ["$ledgerEntries.entryType", "Dr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -901,7 +766,7 @@ router.get("/cash-flow", auth, async (req, res) => {
           outflow: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.type", "Cr"] },
+                { $eq: ["$ledgerEntries.entryType", "Cr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -910,10 +775,12 @@ router.get("/cash-flow", auth, async (req, res) => {
         },
       },
     ]);
+
     const ledMap = {};
     cashLedgers.forEach((l) => {
       ledMap[l._id.toString()] = l;
     });
+
     const breakdown = flows.map((f) => ({
       ledgerId: f._id.ledger,
       ledgerName: ledMap[f._id.ledger.toString()]?.name || "Unknown",
@@ -923,23 +790,17 @@ router.get("/cash-flow", auth, async (req, res) => {
       net: f.inflow - f.outflow,
     }));
 
-    const totals = {
-      inflow: operating.inflow + investing.inflow + financing.inflow,
-      outflow: operating.outflow + investing.outflow + financing.outflow,
-      net: periodNet,
-    };
+    const totals = breakdown.reduce(
+      (a, b) => {
+        a.inflow += b.inflow;
+        a.outflow += b.outflow;
+        a.net += b.net;
+        return a;
+      },
+      { inflow: 0, outflow: 0, net: 0 },
+    );
 
-    res.json({
-      companyId,
-      dateRange: { from, to },
-      openingCash,
-      closingCash,
-      activities: { operating, investing, financing },
-      internalTransfers: { inflow: internalIn, outflow: internalOut },
-      // Legacy compat
-      totals,
-      breakdown,
-    });
+    res.json({ companyId, dateRange: { from, to }, breakdown, totals });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
