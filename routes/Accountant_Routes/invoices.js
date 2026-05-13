@@ -1,418 +1,435 @@
 // routes/Accountant_Routes/invoices.js
-// Complete Invoice Management Routes
+//
+// INVOICES — AR-side view of posted sales vouchers.
+//
+// This module does NOT have its own collection. Instead it reads from
+// the unified TallyVoucher collection (voucherType: "sales") and
+// enriches each invoice with:
+//
+//   • paymentStatus   — derived from receipt allocations + credit notes
+//                       against this invoice ("paid" / "partial" /
+//                       "unpaid" / "overdue")
+//   • receivedAmount  — sum of receipts allocated against this invoice
+//   • creditedAmount  — sum of CNs linked to this invoice
+//   • outstanding     — grandTotal − received − credited
+//   • ageInDays       — days since voucherDate (or dueDate when set)
+//   • isOverdue       — true if dueDate is past AND outstanding > 0
+//
+// The Sales Vouchers page = accountant's transaction-entry view of
+// these same documents. The Invoices page = AR officer's collection
+// view of those documents with payment lifecycle focus.
+//
+// LEGACY NOTE: The previous version of this file imported a non-existent
+// "AccountantModels" module and crashed at module-load. This new version
+// is a clean rewrite using TallyVoucher.
 
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
-const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
-const { Invoice, AccountantSettings, ActivityLog } = require("../../models/Accountant_model/AccountantModels");
-const Customer = require("../../models/Customer_Models/Customer");
-const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+const {
+  TallyVoucher,
+} = require("../../models/Accountant_model/TallyVoucherModels");
+const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
-router.use(AccountantAuthMiddleware.accountantAuth);
+router.use(accountantAuth);
 
-// Helper: number to words for Indian currency
-const numberToWords = (num) => {
-  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
-    "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
-  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+/* ------------------------------------------------------------------ */
+/* Helper: enrich a batch of invoices with payment lifecycle data      */
+/* ------------------------------------------------------------------ */
+async function enrichInvoices(invoices, companyId) {
+  if (invoices.length === 0) return [];
 
-  if (num === 0) return "Zero Rupees Only";
+  const invoiceIds = invoices.map((i) => i._id);
+  const invoiceNumbers = invoices.map((i) => i.voucherNumber);
 
-  const convert = (n) => {
-    if (n < 20) return ones[n];
-    if (n < 100) return tens[Math.floor(n / 10)] + (n % 10 ? " " + ones[n % 10] : "");
-    if (n < 1000) return ones[Math.floor(n / 100)] + " Hundred" + (n % 100 ? " and " + convert(n % 100) : "");
-    if (n < 100000) return convert(Math.floor(n / 1000)) + " Thousand" + (n % 1000 ? " " + convert(n % 1000) : "");
-    if (n < 10000000) return convert(Math.floor(n / 100000)) + " Lakh" + (n % 100000 ? " " + convert(n % 100000) : "");
-    return convert(Math.floor(n / 10000000)) + " Crore" + (n % 10000000 ? " " + convert(n % 10000000) : "");
-  };
+  // ── Tally credit notes linked to each invoice ──
+  const cnAgg = await TallyVoucher.aggregate([
+    {
+      $match: {
+        companyId: new mongoose.Types.ObjectId(companyId),
+        voucherType: "credit_note",
+        status: "posted",
+        "originalInvoice.voucherId": { $in: invoiceIds },
+      },
+    },
+    {
+      $group: {
+        _id: "$originalInvoice.voucherId",
+        totalCredited: { $sum: "$grandTotal" },
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+  const creditedMap = new Map(
+    cnAgg.map((c) => [
+      String(c._id),
+      {
+        amount: c.totalCredited,
+        count: c.count,
+      },
+    ]),
+  );
 
-  const rupees = Math.floor(num);
-  const paise = Math.round((num - rupees) * 100);
-  let words = convert(rupees) + " Rupees";
-  if (paise > 0) words += " and " + convert(paise) + " Paise";
-  return words + " Only";
-};
+  // ── Tally receipt allocations against each invoice (by voucherNumber
+  //    in billAllocations.agst_ref) ──
+  const receipts = await TallyVoucher.find({
+    companyId,
+    voucherType: "receipt",
+    status: "posted",
+    "ledgerEntries.billAllocations.billName": { $in: invoiceNumbers },
+  })
+    .select("ledgerEntries")
+    .lean();
 
-// Helper: generate invoice number
-const generateInvoiceNumber = async () => {
-  const settings = await AccountantSettings.getSingleton();
-  const prefix = settings.invoicePrefix || "INV";
-  const nextNum = (settings.currentInvoiceNumber || 0) + 1;
-  const fy = settings.currentFinancialYear || new Date().getFullYear().toString();
-  settings.currentInvoiceNumber = nextNum;
-  await settings.save();
-  return `${prefix}/${fy}/${nextNum.toString().padStart(4, "0")}`;
-};
+  const receivedMap = new Map();
+  for (const rcpt of receipts) {
+    for (const entry of rcpt.ledgerEntries || []) {
+      for (const alloc of entry.billAllocations || []) {
+        if (alloc.billType === "agst_ref" && alloc.billName) {
+          const inv = invoices.find((i) => i.voucherNumber === alloc.billName);
+          if (inv) {
+            const k = String(inv._id);
+            const prev = receivedMap.get(k) || { amount: 0, count: 0 };
+            receivedMap.set(k, {
+              amount: prev.amount + (alloc.amount || 0),
+              count: prev.count + 1,
+            });
+          }
+        }
+      }
+    }
+  }
 
-// ── GET all invoices ──
+  // ── Compute per-invoice status ──
+  const today = new Date();
+  return invoices.map((inv) => {
+    const k = String(inv._id);
+    const credited = creditedMap.get(k) || { amount: 0, count: 0 };
+    const received = receivedMap.get(k) || { amount: 0, count: 0 };
+    const outstanding = Math.max(
+      0,
+      (inv.grandTotal || 0) - credited.amount - received.amount,
+    );
+    const ageRef = inv.dueDate
+      ? new Date(inv.dueDate)
+      : new Date(inv.voucherDate);
+    const ageInDays = Math.floor((today - ageRef) / 86400000);
+    const isOverdue =
+      inv.dueDate && outstanding > 0.01 && today > new Date(inv.dueDate);
+
+    let paymentStatus;
+    if (outstanding < 0.01) paymentStatus = "paid";
+    else if (received.amount > 0.01 || credited.amount > 0.01)
+      paymentStatus = "partial";
+    else if (isOverdue) paymentStatus = "overdue";
+    else paymentStatus = "unpaid";
+
+    return {
+      ...inv,
+      paymentStatus,
+      receivedAmount: received.amount,
+      receiptCount: received.count,
+      creditedAmount: credited.amount,
+      creditNoteCount: credited.count,
+      outstanding,
+      ageInDays,
+      isOverdue,
+    };
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* GET / — list invoices with computed payment status                  */
+/* ------------------------------------------------------------------ */
+/* Query params:
+ *   companyId       — required
+ *   paymentStatus   — filter: paid / partial / unpaid / overdue
+ *   customerId      — partyLedgerId filter
+ *   dateFrom        — ISO date
+ *   dateTo          — ISO date
+ *   search          — voucherNumber / partyLedgerName / narration
+ *   ageBucket       — "0-30" / "31-60" / "61-90" / "90+" (only overdue)
+ *   page, limit
+ *   sort            — default "-voucherDate"
+ */
 router.get("/", async (req, res) => {
   try {
     const {
-      page = 1, limit = 20, status, paymentStatus,
-      startDate, endDate, search, customerId, sortBy = "createdAt", sortOrder = "desc",
+      companyId,
+      paymentStatus,
+      customerId,
+      dateFrom,
+      dateTo,
+      search,
+      ageBucket,
+      page = 1,
+      limit = 50,
+      sort = "-voucherDate",
     } = req.query;
 
-    let filter = {};
-    if (status) filter.status = status;
-    if (paymentStatus) filter.paymentStatus = paymentStatus;
-    if (customerId) filter.customerId = customerId;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
 
-    if (startDate || endDate) {
-      filter.invoiceDate = {};
-      if (startDate) filter.invoiceDate.$gte = new Date(startDate);
-      if (endDate) filter.invoiceDate.$lte = new Date(endDate);
+    // Build base filter — always sales + posted (drafts don't show in AR)
+    const filter = {
+      companyId,
+      voucherType: "sales",
+      status: "posted",
+    };
+    if (customerId) filter.partyLedgerId = customerId;
+    if (dateFrom || dateTo) {
+      filter.voucherDate = {};
+      if (dateFrom) filter.voucherDate.$gte = new Date(dateFrom);
+      if (dateTo) filter.voucherDate.$lte = new Date(dateTo);
     }
-
     if (search) {
+      const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
       filter.$or = [
-        { invoiceNumber: { $regex: search, $options: "i" } },
-        { customerName: { $regex: search, $options: "i" } },
-        { requestId: { $regex: search, $options: "i" } },
+        { voucherNumber: rx },
+        { partyLedgerName: rx },
+        { narration: rx },
+        { referenceNumber: rx },
       ];
     }
 
+    // We compute paymentStatus/aging AFTER the DB query, since they
+    // depend on data from other voucher types. Apply paymentStatus and
+    // ageBucket filters post-enrich.
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const [invoices, total] = await Promise.all([
-      Invoice.find(filter)
-        .sort({ [sortBy]: sortOrder === "asc" ? 1 : -1 })
-        .skip(skip)
-        .limit(parseInt(limit))
-        .lean(),
-      Invoice.countDocuments(filter),
-    ]);
+    // Read more than needed and trim after enrich+filter, to keep the
+    // post-filtered pagination reasonable. Cap at limit*5 or 500 max.
+    const overFetchLimit = Math.min(500, parseInt(limit) * 5);
 
-    // Summary
-    const allInvoices = await Invoice.find(filter).select("grandTotal paymentStatus paidAmount balanceDue").lean();
-    const summary = {
-      totalInvoiced: allInvoices.reduce((s, i) => s + (i.grandTotal || 0), 0),
-      totalCollected: allInvoices.reduce((s, i) => s + (i.paidAmount || 0), 0),
-      totalOutstanding: allInvoices.reduce((s, i) => s + (i.balanceDue || 0), 0),
-      overdue: allInvoices.filter((i) => i.paymentStatus === "overdue").length,
-      count: total,
-    };
+    const sortObj = {};
+    const sortKey = sort.replace(/^-/, "");
+    sortObj[sortKey] = sort.startsWith("-") ? -1 : 1;
 
-    res.json({
-      success: true,
-      invoices,
-      pagination: { page: parseInt(page), limit: parseInt(limit), total, totalPages: Math.ceil(total / parseInt(limit)) },
-      summary,
-    });
-  } catch (error) {
-    console.error("Error fetching invoices:", error);
-    res.status(500).json({ success: false, message: "Error fetching invoices" });
-  }
-});
-
-// ── GET single invoice ──
-router.get("/:id", async (req, res) => {
-  try {
-    const invoice = await Invoice.findById(req.params.id)
-      .populate("customerId", "name email phone profile")
-      .populate("createdBy", "name email")
+    const raw = await TallyVoucher.find(filter)
+      .sort(sortObj)
+      .skip(skip)
+      .limit(overFetchLimit)
       .lean();
 
-    if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
+    const enriched = await enrichInvoices(raw, companyId);
 
-    res.json({ success: true, invoice });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Error fetching invoice" });
-  }
-});
+    // Apply payment-status filter
+    let filtered = enriched;
+    if (paymentStatus) {
+      filtered = filtered.filter((i) => i.paymentStatus === paymentStatus);
+    }
 
-// ── CREATE invoice ──
-router.post("/", async (req, res) => {
-  try {
-    const data = req.body;
-    data.invoiceNumber = await generateInvoiceNumber();
-    data.createdBy = req.user.id;
-
-    // Calculate totals
-    let subtotal = 0;
-    let totalTax = 0;
-    let totalDiscount = 0;
-
-    if (data.items && data.items.length > 0) {
-      data.items.forEach((item) => {
-        let itemTotal = item.quantity * item.unitPrice;
-        let discount = 0;
-
-        if (item.discount) {
-          discount = item.discountType === "percentage"
-            ? (itemTotal * item.discount) / 100
-            : item.discount;
-        }
-
-        itemTotal -= discount;
-        const tax = (itemTotal * (item.taxRate || 0)) / 100;
-
-        item.taxAmount = parseFloat(tax.toFixed(2));
-        item.totalPrice = parseFloat((itemTotal + tax).toFixed(2));
-
-        subtotal += itemTotal;
-        totalTax += tax;
-        totalDiscount += discount;
+    // Apply age-bucket filter (only meaningful for overdue / unpaid)
+    if (ageBucket) {
+      filtered = filtered.filter((i) => {
+        if (!i.isOverdue && i.paymentStatus !== "unpaid") return false;
+        const d = i.ageInDays;
+        if (ageBucket === "0-30") return d >= 0 && d <= 30;
+        if (ageBucket === "31-60") return d > 30 && d <= 60;
+        if (ageBucket === "61-90") return d > 60 && d <= 90;
+        if (ageBucket === "90+") return d > 90;
+        return true;
       });
     }
 
-    data.subtotal = parseFloat(subtotal.toFixed(2));
-    data.discountTotal = parseFloat(totalDiscount.toFixed(2));
-    data.taxBreakdown = {
-      cgst: parseFloat((totalTax / 2).toFixed(2)),
-      sgst: parseFloat((totalTax / 2).toFixed(2)),
-      igst: 0,
-      totalTax: parseFloat(totalTax.toFixed(2)),
-    };
+    // Total count for pagination — accurate when no post-filter,
+    // approximate otherwise (we tell the client this).
+    const totalNoPostFilter = await TallyVoucher.countDocuments(filter);
+    const filteredAndTrimmed = filtered.slice(0, parseInt(limit));
 
-    const grandTotal = subtotal + totalTax;
-    data.grandTotal = parseFloat(grandTotal.toFixed(2));
-    data.roundOff = parseFloat((Math.round(grandTotal) - grandTotal).toFixed(2));
-    data.balanceDue = data.grandTotal;
-    data.amountInWords = numberToWords(Math.round(grandTotal));
-
-    // Set financial year
-    const invDate = new Date(data.invoiceDate || Date.now());
-    const fy = invDate.getMonth() >= 3 ? invDate.getFullYear() : invDate.getFullYear() - 1;
-    data.financialYear = `${fy}-${(fy + 1).toString().slice(2)}`;
-
-    // Company details
-    const settings = await AccountantSettings.getSingleton();
-    data.companyDetails = {
-      name: settings.companyName,
-      gstin: settings.companyGSTIN,
-      pan: settings.companyPAN,
-      address: settings.companyAddress,
-      phone: settings.companyPhone,
-      email: settings.companyEmail,
-    };
-
-    if (settings.bankAccounts?.length > 0) {
-      const defaultBank = settings.bankAccounts.find((b) => b.isDefault) || settings.bankAccounts[0];
-      data.companyDetails.bankName = defaultBank.bankName;
-      data.companyDetails.accountNumber = defaultBank.accountNumber;
-      data.companyDetails.ifscCode = defaultBank.ifscCode;
-      data.companyDetails.upiId = defaultBank.upiId;
-    }
-
-    data.termsAndConditions = data.termsAndConditions || settings.invoiceTerms || "";
-
-    const invoice = await Invoice.create(data);
-
-    await ActivityLog.create({
-      accountantId: req.user.id,
-      action: "Created invoice",
-      module: "invoice",
-      entityType: "Invoice",
-      entityId: invoice._id,
-      details: `Created invoice ${invoice.invoiceNumber} for ₹${invoice.grandTotal}`,
+    res.json({
+      invoices: filteredAndTrimmed,
+      total: totalNoPostFilter,
+      filteredCount: filtered.length,
+      page: parseInt(page),
+      pages: Math.ceil(totalNoPostFilter / parseInt(limit)),
+      hasPostFilter: !!(paymentStatus || ageBucket),
     });
-
-    res.status(201).json({ success: true, message: "Invoice created", invoice });
-  } catch (error) {
-    console.error("Error creating invoice:", error);
-    res.status(500).json({ success: false, message: "Error creating invoice" });
+  } catch (e) {
+    console.error("[invoices]", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ── UPDATE invoice ──
-router.put("/:id", async (req, res) => {
+/* ------------------------------------------------------------------ */
+/* GET /summary — receivables KPIs + aging breakdown                   */
+/* ------------------------------------------------------------------ */
+router.get("/summary", async (req, res) => {
   try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
-    if (invoice.status === "paid") {
-      return res.status(400).json({ success: false, message: "Cannot edit paid invoice" });
-    }
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
 
-    const data = req.body;
-    data.updatedBy = req.user.id;
-
-    const updated = await Invoice.findByIdAndUpdate(req.params.id, data, { new: true });
-    res.json({ success: true, message: "Invoice updated", invoice: updated });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Error updating invoice" });
-  }
-});
-
-// ── RECORD payment against invoice ──
-router.post("/:id/payment", async (req, res) => {
-  try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
-
-    const { amount, paymentMethod, referenceNumber, paymentDate, notes } = req.body;
-
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ success: false, message: "Valid amount required" });
-    }
-
-    if (amount > invoice.balanceDue) {
-      return res.status(400).json({ success: false, message: `Amount exceeds balance due (₹${invoice.balanceDue})` });
-    }
-
-    invoice.payments.push({
-      amount,
-      paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
-      paymentMethod,
-      referenceNumber,
-      notes,
-      recordedBy: req.user.id,
-    });
-
-    invoice.paidAmount += amount;
-    invoice.balanceDue = invoice.grandTotal - invoice.paidAmount;
-
-    if (invoice.balanceDue <= 0) {
-      invoice.paymentStatus = "paid";
-      invoice.status = "paid";
-    } else {
-      invoice.paymentStatus = "partially_paid";
-    }
-
-    await invoice.save();
-
-    await ActivityLog.create({
-      accountantId: req.user.id,
-      action: "Recorded payment",
-      module: "invoice",
-      entityType: "Invoice",
-      entityId: invoice._id,
-      details: `Recorded ₹${amount} payment for invoice ${invoice.invoiceNumber}`,
-    });
-
-    res.json({ success: true, message: `Payment of ₹${amount} recorded`, invoice });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Error recording payment" });
-  }
-});
-
-// ── GENERATE invoice from customer request ──
-router.post("/generate-from-request/:requestId", async (req, res) => {
-  try {
-    const request = await CustomerRequest.findById(req.params.requestId)
-      .populate("customerId", "name email phone profile")
+    // Fetch ALL posted sales for this company. We need them all to
+    // compute aggregates correctly. For very large datasets (10k+
+    // invoices) this becomes slow; would need to move computation into
+    // aggregation pipelines. For our scale this is fine.
+    const raw = await TallyVoucher.find({
+      companyId,
+      voucherType: "sales",
+      status: "posted",
+    })
+      .select(
+        "voucherNumber voucherDate dueDate grandTotal partyLedgerId partyLedgerName",
+      )
+      .limit(2000)
       .lean();
 
-    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    const enriched = await enrichInvoices(raw, companyId);
 
-    const quotation = request.quotations?.[0];
-    if (!quotation) return res.status(400).json({ success: false, message: "No quotation found for request" });
-
-    // Build invoice items from quotation
-    const items = (quotation.items || []).map((item) => ({
-      itemName: item.itemName || item.itemCode || "Item",
-      description: item.description || "",
-      hsnCode: item.hsnCode || "",
-      quantity: item.quantity || 1,
-      unitPrice: item.unitPrice || 0,
-      discount: item.discount || 0,
-      discountType: item.discountType || "flat",
-      taxRate: item.taxRate || 0,
-      taxAmount: item.taxAmount || 0,
-      totalPrice: item.totalPrice || 0,
-    }));
-
-    const customer = request.customerId;
-    const invoiceData = {
-      invoiceDate: new Date(),
-      dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
-      customerId: customer._id,
-      customerName: customer.name,
-      customerEmail: customer.email,
-      customerPhone: customer.phone,
-      customerRequestId: request._id,
-      requestId: request.requestId,
-      quotationId: quotation._id,
-      items,
+    const summary = {
+      totalInvoiced: 0,
+      totalReceived: 0,
+      totalCredited: 0,
+      totalOutstanding: 0,
+      counts: { paid: 0, partial: 0, unpaid: 0, overdue: 0 },
+      aging: { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 },
+      byCustomer: new Map(),
     };
 
-    // Use the create invoice logic (simulate req/res)
-    req.body = invoiceData;
+    for (const inv of enriched) {
+      summary.totalInvoiced += inv.grandTotal || 0;
+      summary.totalReceived += inv.receivedAmount || 0;
+      summary.totalCredited += inv.creditedAmount || 0;
+      summary.totalOutstanding += inv.outstanding || 0;
+      summary.counts[inv.paymentStatus] =
+        (summary.counts[inv.paymentStatus] || 0) + 1;
 
-    // Inline create
-    invoiceData.invoiceNumber = await generateInvoiceNumber();
-    invoiceData.createdBy = req.user.id;
+      if (inv.outstanding > 0.01) {
+        const d = inv.ageInDays;
+        if (d <= 30) summary.aging["0-30"] += inv.outstanding;
+        else if (d <= 60) summary.aging["31-60"] += inv.outstanding;
+        else if (d <= 90) summary.aging["61-90"] += inv.outstanding;
+        else summary.aging["90+"] += inv.outstanding;
 
-    let subtotal = 0, totalTax = 0;
-    items.forEach((item) => {
-      const itemTotal = item.quantity * item.unitPrice - (item.discount || 0);
-      const tax = (itemTotal * (item.taxRate || 0)) / 100;
-      item.taxAmount = parseFloat(tax.toFixed(2));
-      item.totalPrice = parseFloat((itemTotal + tax).toFixed(2));
-      subtotal += itemTotal;
-      totalTax += tax;
+        const k = inv.partyLedgerName || "—";
+        const prev = summary.byCustomer.get(k) || {
+          outstanding: 0,
+          count: 0,
+          customerId: inv.partyLedgerId,
+        };
+        summary.byCustomer.set(k, {
+          outstanding: prev.outstanding + inv.outstanding,
+          count: prev.count + 1,
+          customerId: prev.customerId,
+        });
+      }
+    }
+
+    const topCustomers = [...summary.byCustomer.entries()]
+      .map(([name, v]) => ({ name, ...v }))
+      .sort((a, b) => b.outstanding - a.outstanding)
+      .slice(0, 10);
+
+    res.json({
+      ...summary,
+      byCustomer: undefined, // strip Map from response
+      topCustomers,
     });
-
-    invoiceData.subtotal = parseFloat(subtotal.toFixed(2));
-    invoiceData.taxBreakdown = {
-      cgst: parseFloat((totalTax / 2).toFixed(2)),
-      sgst: parseFloat((totalTax / 2).toFixed(2)),
-      igst: 0,
-      totalTax: parseFloat(totalTax.toFixed(2)),
-    };
-    invoiceData.grandTotal = parseFloat((subtotal + totalTax).toFixed(2));
-    invoiceData.balanceDue = invoiceData.grandTotal;
-    invoiceData.amountInWords = numberToWords(Math.round(invoiceData.grandTotal));
-
-    const invDate = new Date();
-    const fy = invDate.getMonth() >= 3 ? invDate.getFullYear() : invDate.getFullYear() - 1;
-    invoiceData.financialYear = `${fy}-${(fy + 1).toString().slice(2)}`;
-
-    const invoice = await Invoice.create(invoiceData);
-
-    res.status(201).json({ success: true, message: "Invoice generated from request", invoice });
-  } catch (error) {
-    console.error("Error generating invoice:", error);
-    res.status(500).json({ success: false, message: "Error generating invoice" });
+  } catch (e) {
+    console.error("[invoices/summary]", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ── SEND invoice (mark as sent) ──
-router.post("/:id/send", async (req, res) => {
+/* ------------------------------------------------------------------ */
+/* GET /:id — single invoice with full bill trail                      */
+/* ------------------------------------------------------------------ */
+router.get("/:id", async (req, res) => {
   try {
-    const invoice = await Invoice.findByIdAndUpdate(
-      req.params.id,
-      { status: "sent" },
-      { new: true }
-    );
-    if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
-    res.json({ success: true, message: "Invoice marked as sent", invoice });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Error sending invoice" });
+    const inv = await TallyVoucher.findOne({
+      _id: req.params.id,
+      voucherType: "sales",
+    }).lean();
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
+
+    const [enriched] = await enrichInvoices([inv], inv.companyId);
+
+    // Also fetch the linked CNs and receipts for the trail
+    const [linkedCNs, linkedReceipts] = await Promise.all([
+      TallyVoucher.find({
+        companyId: inv.companyId,
+        voucherType: "credit_note",
+        status: "posted",
+        "originalInvoice.voucherId": inv._id,
+      })
+        .select("voucherNumber voucherDate grandTotal creditNoteReason")
+        .lean(),
+
+      TallyVoucher.find({
+        companyId: inv.companyId,
+        voucherType: "receipt",
+        status: "posted",
+        "ledgerEntries.billAllocations.billName": inv.voucherNumber,
+      })
+        .select(
+          "voucherNumber voucherDate grandTotal paymentMode ledgerEntries",
+        )
+        .lean()
+        .then((receipts) =>
+          receipts.map((r) => {
+            // Calculate the amount actually allocated to THIS invoice
+            let allocated = 0;
+            for (const entry of r.ledgerEntries || []) {
+              for (const alloc of entry.billAllocations || []) {
+                if (
+                  alloc.billName === inv.voucherNumber &&
+                  alloc.billType === "agst_ref"
+                ) {
+                  allocated += alloc.amount || 0;
+                }
+              }
+            }
+            // Strip the heavy ledgerEntries from response
+            const { ledgerEntries, ...rest } = r;
+            return { ...rest, allocatedToThisInvoice: allocated };
+          }),
+        ),
+    ]);
+
+    res.json({
+      invoice: enriched,
+      linkedCreditNotes: linkedCNs,
+      linkedReceipts,
+    });
+  } catch (e) {
+    console.error("[invoices/:id]", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ── CANCEL invoice ──
-router.post("/:id/cancel", async (req, res) => {
+/* ------------------------------------------------------------------ */
+/* POST /:id/reminder — log a payment reminder                         */
+/* ------------------------------------------------------------------ */
+/* Records that a reminder was issued. Does NOT actually send anything
+ * (that's a future integration with email/WhatsApp). Just an audit
+ * trail accountants use during AR follow-up.
+ *
+ * Body: { channel, note }
+ */
+router.post("/:id/reminder", async (req, res) => {
   try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
-    if (invoice.paymentStatus === "paid") {
-      return res.status(400).json({ success: false, message: "Cannot cancel paid invoice" });
-    }
+    const { channel = "other", note = "" } = req.body || {};
+    const inv = await TallyVoucher.findOne({
+      _id: req.params.id,
+      voucherType: "sales",
+    });
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
 
-    invoice.status = "cancelled";
-    invoice.paymentStatus = "cancelled";
-    await invoice.save();
+    inv.reminderLog = inv.reminderLog || [];
+    inv.reminderLog.push({
+      sentAt: new Date(),
+      sentBy: req.user?.id,
+      sentByName: req.user?.name || req.user?.email || "Unknown",
+      channel,
+      note,
+    });
+    await inv.save();
 
-    res.json({ success: true, message: "Invoice cancelled" });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Error cancelling invoice" });
-  }
-});
-
-// ── DELETE invoice ──
-router.delete("/:id", async (req, res) => {
-  try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
-    if (invoice.status !== "draft") {
-      return res.status(400).json({ success: false, message: "Can only delete draft invoices" });
-    }
-    await invoice.deleteOne();
-    res.json({ success: true, message: "Invoice deleted" });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Error deleting invoice" });
+    res.json({ success: true, reminderCount: inv.reminderLog.length });
+  } catch (e) {
+    console.error("[invoices/reminder]", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
