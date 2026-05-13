@@ -27,24 +27,36 @@ const Unit            = require("../../models/CMS_Models/Inventory/Configuration
 router.use(EmployeeAuthMiddleware);
 
 // Common select() spec including all candidate completion fields
-const WO_SELECT = "workOrderNumber stockItemId stockItemName stockItemReference variantId variantAttributes quantity customerName customerRequestId status priority cuttingProgress stitchingProgress finishingProgress packagingProgress completedQuantity completed";
+const WO_SELECT = "workOrderNumber stockItemId stockItemName stockItemReference variantId variantAttributes quantity customerName customerRequestId status priority productionCompletion";
 
 
 // ─── WO Completion Reader ────────────────────────────────────────────────
 //
-// Reads the WO's tracked completion value. Falls back through likely fields
-// in order from most-representative (final stage) to most-basic.
-// If your schema uses a different field, just put it at the top.
+// Uses the EXACT same field that the Manufacturing Orders dashboard uses:
+//   wo.productionCompletion.overallCompletedQuantity
+//
+// This is the system's authoritative "completed quantity" for a WO,
+// synced from operation completion. Don't change this — it matches the
+// MO listing page's progress calculation.
 function getWOCompleted(wo) {
   if (!wo) return 0;
-  if (wo.packagingProgress?.completed != null)  return wo.packagingProgress.completed;
-  if (wo.finishingProgress?.completed != null)  return wo.finishingProgress.completed;
-  if (wo.stitchingProgress?.completed != null)  return wo.stitchingProgress.completed;
-  if (typeof wo.completedQuantity === "number") return wo.completedQuantity;
-  if (typeof wo.completed === "number")         return wo.completed;
-  if (wo.cuttingProgress?.completed != null)    return wo.cuttingProgress.completed;
-  if (wo.status === "completed")                return wo.quantity || 0;
+  if (typeof wo.productionCompletion?.overallCompletedQuantity === "number") {
+    return wo.productionCompletion.overallCompletedQuantity;
+  }
+  if (wo.status === "completed") return wo.quantity || 0;
   return 0;
+}
+
+// Optional: use the WO's pre-computed completion % if present (more accurate
+// than recomputing from completed/quantity when partial units are tracked).
+function getWOCompletionPct(wo) {
+  if (!wo) return 0;
+  if (typeof wo.productionCompletion?.overallCompletionPercentage === "number") {
+    return Math.min(100, wo.productionCompletion.overallCompletionPercentage);
+  }
+  const completed = getWOCompleted(wo);
+  const total = wo.quantity || 0;
+  return total > 0 ? Math.min(100, (completed / total) * 100) : 0;
 }
 
 
@@ -441,8 +453,7 @@ router.get("/day-wise", async (req, res) => {
           ? customerRequestById.get(wo.customerRequestId.toString()) : null;
 
         const completedQty = getWOCompleted(wo);
-        const completionPct = wo?.quantity > 0
-          ? Math.min(100, (completedQty / wo.quantity) * 100) : 0;
+        const completionPct = getWOCompletionPct(wo);
 
         byWorkOrderMap.set(c.woShortId, {
           woShortId: c.woShortId,
@@ -683,8 +694,7 @@ router.get("/order-wise/:orderId", async (req, res) => {
       const bom = woBOMs.get(wo._id.toString());
       const shortId = wo._id.toString().slice(-8);
       const woCompletedQty = getWOCompleted(wo);
-      const woCompletionPct = wo.quantity > 0
-        ? Math.min(100, (woCompletedQty / wo.quantity) * 100) : 0;
+      const woCompletionPct = getWOCompletionPct(wo);
 
       for (const line of (bom?.bomLines || [])) {
         const variantKey = line.variantId?.toString() ||
@@ -879,7 +889,7 @@ router.get("/order-wise/:orderId", async (req, res) => {
     const workOrdersOut = wos.map(wo => {
       const bom = woBOMs.get(wo._id.toString());
       const completed = getWOCompleted(wo);
-      const pct = wo.quantity > 0 ? Math.min(100, (completed / wo.quantity) * 100) : 0;
+      const pct = getWOCompletionPct(wo);
       return {
         _id: wo._id,
         workOrderNumber: wo.workOrderNumber,
