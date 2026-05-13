@@ -40,7 +40,7 @@ const employeeSchema = new mongoose.Schema({
   extension: { type: String }, // office extension number
 
   dateOfBirth: { type: Date },
-  gender: { type: String, enum: ["Male", "Female", "Other", ""], default: "" },
+  gender: { type: String, enum: ["Male", "Female", "Other", "male","female"], default: "" },
   bloodGroup: { type: String },
   maritalStatus: {
     type: String,
