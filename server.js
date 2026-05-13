@@ -719,6 +719,10 @@ app.use("/api/ceo/merchandiser", merchandiserRoutes);
 const ceoOverviewRoutes = require("./routes/CEO_Routes/overview");
 app.use("/api/ceo/overview", ceoOverviewRoutes);
 
+// server.js
+const rawItemWastageRoutes = require("./routes/CEO_Routes/rawItemWastageRoutes");
+app.use("/api/ceo/raw-item-wastage", rawItemWastageRoutes);
+
 /* =====================
     Normal Employees ROUTES
   ===================== */
