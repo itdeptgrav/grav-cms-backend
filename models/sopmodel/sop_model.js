@@ -10,7 +10,7 @@ const sopSchema = new mongoose.Schema(
         department: { type: String, trim: true },
 
         // Who created
-        createdBy: { type: String, required: true }, // employeeId e.g. GR001
+        createdBy: { type: String }, // employeeId e.g. GR001
         createdByName: { type: String },
         createdByRole: { type: String },
 
