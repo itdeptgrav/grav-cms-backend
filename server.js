@@ -411,11 +411,9 @@ io.on("connection", (socket) => {
 
 // 1. At the top with your other requires:
 const transcriptModule = require("./routes/task_routes/transcript.routes");
-const sopRoutes = require("./routes/soproutes/soproute"); //sop routes
 
 // 2. With your other app.use() route registrations:
 app.use("/cowork", transcriptModule.router);
-app.use("/cowork/sop", sopRoutes);  // sop
 
 // ─── Database Connection ──────────────────────────────────────────────────────
 const connectDB = async () => {
@@ -441,7 +439,6 @@ connectDB().then(async () => {
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
-const StoreDepartment = require("./models/StoreDepartment");
 const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
 
 const PackagingDispatchDepartment = require("./models/PackagingDispatchDepartment");
@@ -480,34 +477,6 @@ const createDefaultCuttingMaster = async () => {
     console.log("✅ Default Cutting Master created successfully");
   } catch (error) {
     console.error("❌ Cutting Master creation failed:", error.message);
-  }
-};
-
-
-const createDefaultStore = async () => {
-  try {
-    const existing = await StoreDepartment.findOne({
-      role: "store_manager",
-      department: "Store",
-    });
-    if (existing) {
-      console.log("✅ Store user already exists, skipping creation");
-      return;
-    }
-    const defaultStore = new StoreDepartment({
-      name: "Store Admin",
-      email: "store@grav.in",
-      password: "Store@12345", // will be hashed by pre-save hook
-      employeeId: "STR001",
-      phone: "9999999999",
-      department: "Store",
-      role: "store_manager",
-      isActive: true,
-    });
-    await defaultStore.save();
-    console.log("✅ Default Store user created: store@grav.in / Store@12345 (STR001)");
-  } catch (err) {
-    console.error("❌ Store creation failed:", err.message);
   }
 };
 
@@ -661,7 +630,6 @@ connectDB().then(async () => {
   await createDefaultAccountant(); // ✅ ADD THIS
   await createDefaultPackagingDispatch();
   await createDefaultProductionSupervisor();
-  await createDefaultStore();
 });
 //changes
 
@@ -1038,6 +1006,11 @@ app.use(
   require("./routes/Accountant_Routes/cashflowAdjustmentsRoutes"),
 );
 
+app.use(
+  "/api/accountant/ledger-reclass",
+  require("./routes/Accountant_Routes/ledgerreclassRoutes.js"),
+);
+
 // ── Operational routes ────────────────────────────────────────────────
 app.use(
   "/api/accountant/dashboard",
@@ -1210,11 +1183,6 @@ app.use("/cowork", askAITest);
 
 const crossOrgRoutes = require("./routes/Customer_Routes/cross-org-assign.js");
 app.use("/api/customer/employees/cross-org", crossOrgRoutes);
-
-
-
-const storeOrderRoutes= require("./routes/CMS_Routes/Store/storeRoutes.js");
-app.use("/api/cms/store", storeOrderRoutes);
 
 /* =====================================================================
    INLINE: Barcode Scanner Tracking Routes

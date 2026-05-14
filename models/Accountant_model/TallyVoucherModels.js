@@ -164,6 +164,37 @@ const tallyVoucherSchema = new mongoose.Schema(
 
     voucherDate: { type: Date, required: true, index: true },
 
+    // Due date for AR/AP tracking. Optional. When set, the Invoices
+    // page uses this to compute "overdue" status; otherwise it falls
+    // back to voucherDate + credit-period heuristic.
+    dueDate: { type: Date, index: true },
+
+    // Free-text payment terms displayed on the invoice (e.g. "Net 30",
+    // "Due on receipt", "2/10 Net 30"). The form lets the user type
+    // anything; if they pick a common pattern we may parse dueDate from
+    // it but typically dueDate is set directly.
+    paymentTerms: { type: String, trim: true },
+
+    // Reminder log — when the user clicks "Send reminder" on the
+    // Invoices page, we append a row here. Not the same as sending an
+    // email — just an audit trail of when reminders were issued.
+    reminderLog: [
+      {
+        sentAt: { type: Date, default: Date.now },
+        sentBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "AccountantDepartment",
+        },
+        sentByName: { type: String, trim: true },
+        channel: {
+          type: String,
+          enum: ["email", "sms", "whatsapp", "phone", "in_person", "other"],
+          default: "other",
+        },
+        note: { type: String, trim: true },
+      },
+    ],
+
     // ─── Party (optional — sales/purchase/receipt/payment/CN/DN have one) ───
     partyLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyLedger" },
     partyLedgerName: { type: String, trim: true },
@@ -191,6 +222,96 @@ const tallyVoucherSchema = new mongoose.Schema(
 
     // ─── Narration (header-level note) ──────────────────────────────────────
     narration: { type: String, trim: true },
+
+    // ─── Credit / Debit Note specifics ─────────────────────────────────────
+    // GSTR-1 9B/9C compliance. These fields are only meaningful when
+    // voucherType is "credit_note" or "debit_note"; they remain null on
+    // every other voucher type and don't affect their validation.
+    //
+    // originalInvoice links the CN back to the sales invoice it's reversing.
+    // Required for GSTR-1 Table 9B mapping when the customer is registered.
+    // For standalone CNs (e.g. goodwill discount with no specific invoice),
+    // this stays empty.
+    originalInvoice: {
+      voucherId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyVoucher" },
+      voucherNumber: { type: String, trim: true },
+      voucherDate: { type: Date },
+    },
+
+    // originalBill is the AP mirror of originalInvoice — links a debit
+    // note back to the purchase voucher it's reversing (or supplements).
+    // Captures both our internal voucher # and the supplier's invoice #
+    // so GSTR-2B reconciliation can match either way.
+    originalBill: {
+      voucherId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyVoucher" },
+      voucherNumber: { type: String, trim: true }, // our voucher #
+      supplierInvoiceNumber: { type: String, trim: true }, // their bill #
+      voucherDate: { type: Date },
+    },
+
+    // The GST reason code as required on the e-invoice / GSTR-1 9B export.
+    // The six codes below are the canonical Indian GST reasons for issuing
+    // a CN — every accounting software in India uses this same list.
+    creditNoteReason: {
+      type: String,
+      enum: [
+        "sales_return", // goods returned by customer
+        "post_sale_discount", // discount given after invoicing
+        "deficiency_service", // service was deficient
+        "correction_invoice", // wrong amount on original invoice
+        "change_pos", // change in place of supply
+        "others",
+        null,
+      ],
+      default: null,
+    },
+
+    // GST reason code for debit notes — AP-side mirror. Reported on
+    // GSTR-1 Table 9B (supplier's side) or GSTR-2 as appropriate. Same
+    // canonical reason list flipped to the buyer's perspective.
+    debitNoteReason: {
+      type: String,
+      enum: [
+        "purchase_return", // goods returned to vendor
+        "price_correction", // vendor overcharged us
+        "deficiency_service", // service was deficient
+        "shortage_quantity", // less than billed received
+        "rate_difference", // post-bill price renegotiation
+        "others",
+        null,
+      ],
+      default: null,
+    },
+
+    // Whether stock physically came back with this credit note. When true,
+    // inventoryEntries holds the item-wise return details. Captured but a
+    // separate stock journal is NOT auto-posted here — most accountants
+    // prefer to handle inventory movements manually after a return.
+    affectsInventory: { type: Boolean, default: false },
+
+    // ─── Payment instrument details ────────────────────────────────────────
+    // Used by Receipt and Payment vouchers to record HOW the money moved.
+    // Cash receipts don't need an instrument number; cheques and bank
+    // transfers do. Optional everywhere — won't affect other voucher types.
+    paymentMode: {
+      type: String,
+      enum: [
+        "cash",
+        "cheque",
+        "neft",
+        "rtgs",
+        "imps",
+        "upi",
+        "card",
+        "online",
+        "other",
+        null,
+      ],
+      default: null,
+    },
+    instrumentNumber: { type: String, trim: true }, // cheque number / UTR / UPI ref
+    instrumentDate: { type: Date }, // cheque date (may differ from voucher date)
+    bankName: { type: String, trim: true }, // for cheque clearing context
 
     // ─── Status ─────────────────────────────────────────────────────────────
     // pending_approval is the state used when an Editor creates a voucher
@@ -233,6 +354,7 @@ const tallyVoucherSchema = new mongoose.Schema(
         "auto_from_quotation",
         "auto_from_po",
         "auto_from_payroll",
+        "expense_module",
         "tally_import",
       ],
       default: "manual",

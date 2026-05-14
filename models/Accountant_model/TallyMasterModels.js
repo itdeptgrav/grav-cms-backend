@@ -65,9 +65,12 @@ const tallyCompanySchema = new mongoose.Schema(
     isPrimary: { type: Boolean, default: false }, // set on the GRAV Clothing record itself
     isActive: { type: Boolean, default: true },
 
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "AccountantDepartment" },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AccountantDepartment",
+    },
   },
-  { timestamps: true, collection: "tally_companies" }
+  { timestamps: true, collection: "tally_companies" },
 );
 
 tallyCompanySchema.index({ gstin: 1 });
@@ -87,40 +90,195 @@ tallyCompanySchema.index({ isPrimary: 1 });
 //   Indirect Incomes, …
 const TALLY_DEFAULT_GROUPS = [
   // Liabilities
-  { name: "Capital Account",      nature: "liability", isReserved: true, parent: null, isPrimary: true },
-  { name: "Reserves & Surplus",   nature: "liability", isReserved: true, parent: "Capital Account" },
-  { name: "Loans (Liability)",    nature: "liability", isReserved: true, parent: null, isPrimary: true },
-  { name: "Bank OD A/c",          nature: "liability", isReserved: true, parent: "Loans (Liability)" },
-  { name: "Secured Loans",        nature: "liability", isReserved: true, parent: "Loans (Liability)" },
-  { name: "Unsecured Loans",      nature: "liability", isReserved: true, parent: "Loans (Liability)" },
-  { name: "Current Liabilities",  nature: "liability", isReserved: true, parent: null, isPrimary: true },
-  { name: "Duties & Taxes",       nature: "liability", isReserved: true, parent: "Current Liabilities" },
-  { name: "Provisions",           nature: "liability", isReserved: true, parent: "Current Liabilities" },
-  { name: "Sundry Creditors",     nature: "liability", isReserved: true, parent: "Current Liabilities" },
-  { name: "Suspense A/c",         nature: "liability", isReserved: true, parent: null, isPrimary: true },
+  {
+    name: "Capital Account",
+    nature: "liability",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Reserves & Surplus",
+    nature: "liability",
+    isReserved: true,
+    parent: "Capital Account",
+  },
+  {
+    name: "Loans (Liability)",
+    nature: "liability",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Bank OD A/c",
+    nature: "liability",
+    isReserved: true,
+    parent: "Loans (Liability)",
+  },
+  {
+    name: "Secured Loans",
+    nature: "liability",
+    isReserved: true,
+    parent: "Loans (Liability)",
+  },
+  {
+    name: "Unsecured Loans",
+    nature: "liability",
+    isReserved: true,
+    parent: "Loans (Liability)",
+  },
+  {
+    name: "Current Liabilities",
+    nature: "liability",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Duties & Taxes",
+    nature: "liability",
+    isReserved: true,
+    parent: "Current Liabilities",
+  },
+  {
+    name: "Provisions",
+    nature: "liability",
+    isReserved: true,
+    parent: "Current Liabilities",
+  },
+  {
+    name: "Sundry Creditors",
+    nature: "liability",
+    isReserved: true,
+    parent: "Current Liabilities",
+  },
+  {
+    name: "Suspense A/c",
+    nature: "liability",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
 
   // Assets
-  { name: "Fixed Assets",         nature: "asset", isReserved: true, parent: null, isPrimary: true },
-  { name: "Investments",          nature: "asset", isReserved: true, parent: null, isPrimary: true },
-  { name: "Current Assets",       nature: "asset", isReserved: true, parent: null, isPrimary: true },
-  { name: "Bank Accounts",        nature: "asset", isReserved: true, parent: "Current Assets" },
-  { name: "Cash-in-Hand",         nature: "asset", isReserved: true, parent: "Current Assets" },
-  { name: "Deposits (Asset)",     nature: "asset", isReserved: true, parent: "Current Assets" },
-  { name: "Loans & Advances (Asset)", nature: "asset", isReserved: true, parent: "Current Assets" },
-  { name: "Stock-in-Hand",        nature: "asset", isReserved: true, parent: "Current Assets" },
-  { name: "Sundry Debtors",       nature: "asset", isReserved: true, parent: "Current Assets" },
-  { name: "Misc. Expenses (Asset)", nature: "asset", isReserved: true, parent: null, isPrimary: true },
-  { name: "Branch / Divisions",   nature: "asset", isReserved: true, parent: null, isPrimary: true },
+  {
+    name: "Fixed Assets",
+    nature: "asset",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Investments",
+    nature: "asset",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Current Assets",
+    nature: "asset",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Bank Accounts",
+    nature: "asset",
+    isReserved: true,
+    parent: "Current Assets",
+  },
+  {
+    name: "Cash-in-Hand",
+    nature: "asset",
+    isReserved: true,
+    parent: "Current Assets",
+  },
+  {
+    name: "Deposits (Asset)",
+    nature: "asset",
+    isReserved: true,
+    parent: "Current Assets",
+  },
+  {
+    name: "Loans & Advances (Asset)",
+    nature: "asset",
+    isReserved: true,
+    parent: "Current Assets",
+  },
+  {
+    name: "Stock-in-Hand",
+    nature: "asset",
+    isReserved: true,
+    parent: "Current Assets",
+  },
+  {
+    name: "Sundry Debtors",
+    nature: "asset",
+    isReserved: true,
+    parent: "Current Assets",
+  },
+  {
+    name: "Misc. Expenses (Asset)",
+    nature: "asset",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Branch / Divisions",
+    nature: "asset",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
 
   // Income
-  { name: "Sales Accounts",       nature: "revenue", isReserved: true, parent: null, isPrimary: true },
-  { name: "Direct Incomes",       nature: "revenue", isReserved: true, parent: null, isPrimary: true },
-  { name: "Indirect Incomes",     nature: "revenue", isReserved: true, parent: null, isPrimary: true },
+  {
+    name: "Sales Accounts",
+    nature: "revenue",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Direct Incomes",
+    nature: "revenue",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Indirect Incomes",
+    nature: "revenue",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
 
   // Expense
-  { name: "Purchase Accounts",    nature: "expense", isReserved: true, parent: null, isPrimary: true },
-  { name: "Direct Expenses",      nature: "expense", isReserved: true, parent: null, isPrimary: true },
-  { name: "Indirect Expenses",    nature: "expense", isReserved: true, parent: null, isPrimary: true },
+  {
+    name: "Purchase Accounts",
+    nature: "expense",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Direct Expenses",
+    nature: "expense",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
+  {
+    name: "Indirect Expenses",
+    nature: "expense",
+    isReserved: true,
+    parent: null,
+    isPrimary: true,
+  },
 ];
 
 const tallyGroupSchema = new mongoose.Schema(
@@ -134,7 +292,11 @@ const tallyGroupSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true },
 
     // Either parent (sub-group) or null (one of the 28 primaries)
-    parent: { type: mongoose.Schema.Types.ObjectId, ref: "TallyGroup", default: null },
+    parent: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyGroup",
+      default: null,
+    },
     parentName: { type: String, trim: true }, // denormalised — saves a populate
     isPrimary: { type: Boolean, default: false },
 
@@ -155,6 +317,13 @@ const tallyGroupSchema = new mongoose.Schema(
     level: { type: Number, default: 1 },
     fullPath: { type: String }, // e.g. "Current Assets > Sundry Debtors"
 
+    // Manual sort order among siblings (groups sharing the same parent
+    // and same companyId). Sparse integer ranking; null = falls back to
+    // alphabetical sort at render time. Same idea as TallyLedger.groupOrder.
+    // Pure display-order: doesn't affect balances, reports, or any
+    // calculated values. Editor+ can change it, no approval required.
+    displayOrder: { type: Number, default: null, index: true },
+
     description: { type: String, trim: true },
     isActive: { type: Boolean, default: true },
 
@@ -162,9 +331,12 @@ const tallyGroupSchema = new mongoose.Schema(
     tallyGuid: { type: String }, // GUID from Tally, if imported
     importedAt: { type: Date },
 
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "AccountantDepartment" },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AccountantDepartment",
+    },
   },
-  { timestamps: true, collection: "tally_groups" }
+  { timestamps: true, collection: "tally_groups" },
 );
 
 tallyGroupSchema.index({ companyId: 1, name: 1 }, { unique: true });
@@ -188,8 +360,31 @@ const tallyLedgerSchema = new mongoose.Schema(
     aliases: [{ type: String, trim: true }], // alternate names — Tally supports these natively
 
     // Group reference
-    groupId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyGroup", required: true },
+    groupId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyGroup",
+      required: true,
+    },
     groupName: { type: String, required: true, trim: true }, // denormalised
+
+    // Manual sort order WITHIN the group — org-wide, persisted across users.
+    // Sparse integer ranking (gaps of 100): inserting a ledger between two
+    // existing ones usually needs only one update. Ledgers without a value
+    // fall back to alphabetical at render time. See ledgerReclassRoutes.js
+    // for the reorder logic.
+    groupOrder: { type: Number, default: null, index: true },
+
+    // Reclassification audit — set when a ledger's groupId changes. Used
+    // by the activity log and to surface "this ledger was recently moved"
+    // hints to users who might be confused.
+    reclassifiedAt: { type: Date, default: null },
+    reclassifiedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AccountantUser",
+      default: null,
+    },
+    reclassifiedByName: { type: String, default: "" },
+    reclassificationCount: { type: Number, default: 0 },
 
     // Inherited from group, but can be overridden per-ledger in Tally
     nature: {
@@ -230,7 +425,10 @@ const tallyLedgerSchema = new mongoose.Schema(
       branchName: { type: String, trim: true },
       accountNumber: { type: String, trim: true },
       ifscCode: { type: String, trim: true },
-      accountType: { type: String, enum: ["current", "savings", "od", "cc", "fd"] },
+      accountType: {
+        type: String,
+        enum: ["current", "savings", "od", "cc", "fd"],
+      },
       upiId: { type: String, trim: true },
     },
 
@@ -254,7 +452,10 @@ const tallyLedgerSchema = new mongoose.Schema(
 
     // Cost centre allocation
     costCentreApplicable: { type: Boolean, default: false },
-    defaultCostCentreId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyCostCentre" },
+    defaultCostCentreId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyCostCentre",
+    },
 
     // CMS bridge — link this ledger to the rest of GRAV
     linkedCustomerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer" },
@@ -267,11 +468,18 @@ const tallyLedgerSchema = new mongoose.Schema(
     // Tally provenance
     tallyGuid: { type: String },
     importedAt: { type: Date },
-    importSource: { type: String, enum: ["manual", "tally_excel", "tally_xml", "tally_csv", "auto"], default: "manual" },
+    importSource: {
+      type: String,
+      enum: ["manual", "tally_excel", "tally_xml", "tally_csv", "auto"],
+      default: "manual",
+    },
 
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "AccountantDepartment" },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AccountantDepartment",
+    },
   },
-  { timestamps: true, collection: "tally_ledgers" }
+  { timestamps: true, collection: "tally_ledgers" },
 );
 
 tallyLedgerSchema.index({ companyId: 1, name: 1 }, { unique: true });
@@ -287,16 +495,25 @@ tallyLedgerSchema.index({ aliases: 1 });
 // Cost Centres let you slice expense/income by department, project, branch.
 const tallyCostCentreSchema = new mongoose.Schema(
   {
-    companyId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyCompany", required: true, index: true },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyCompany",
+      required: true,
+      index: true,
+    },
     name: { type: String, required: true, trim: true },
-    parent: { type: mongoose.Schema.Types.ObjectId, ref: "TallyCostCentre", default: null },
+    parent: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyCostCentre",
+      default: null,
+    },
     parentName: { type: String, trim: true },
     category: { type: String, trim: true }, // e.g. "Departments", "Branches", "Projects"
     isActive: { type: Boolean, default: true },
     tallyGuid: { type: String },
     notes: { type: String, trim: true },
   },
-  { timestamps: true, collection: "tally_cost_centres" }
+  { timestamps: true, collection: "tally_cost_centres" },
 );
 
 tallyCostCentreSchema.index({ companyId: 1, name: 1 }, { unique: true });
@@ -306,7 +523,12 @@ tallyCostCentreSchema.index({ companyId: 1, name: 1 }, { unique: true });
 // ─────────────────────────────────────────────────────────────────────────────
 const tallyUnitSchema = new mongoose.Schema(
   {
-    companyId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyCompany", required: true, index: true },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyCompany",
+      required: true,
+      index: true,
+    },
     symbol: { type: String, required: true, trim: true }, // "Pcs", "Mtr", "Kg"
     formalName: { type: String, trim: true }, // "Pieces"
     decimalPlaces: { type: Number, default: 0 },
@@ -317,7 +539,7 @@ const tallyUnitSchema = new mongoose.Schema(
     isActive: { type: Boolean, default: true },
     tallyGuid: { type: String },
   },
-  { timestamps: true, collection: "tally_units" }
+  { timestamps: true, collection: "tally_units" },
 );
 
 tallyUnitSchema.index({ companyId: 1, symbol: 1 }, { unique: true });
@@ -327,15 +549,24 @@ tallyUnitSchema.index({ companyId: 1, symbol: 1 }, { unique: true });
 // ─────────────────────────────────────────────────────────────────────────────
 const tallyStockGroupSchema = new mongoose.Schema(
   {
-    companyId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyCompany", required: true, index: true },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyCompany",
+      required: true,
+      index: true,
+    },
     name: { type: String, required: true, trim: true },
-    parent: { type: mongoose.Schema.Types.ObjectId, ref: "TallyStockGroup", default: null },
+    parent: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyStockGroup",
+      default: null,
+    },
     parentName: { type: String, trim: true },
     shouldQuantitiesAdd: { type: Boolean, default: true },
     isActive: { type: Boolean, default: true },
     tallyGuid: { type: String },
   },
-  { timestamps: true, collection: "tally_stock_groups" }
+  { timestamps: true, collection: "tally_stock_groups" },
 );
 
 tallyStockGroupSchema.index({ companyId: 1, name: 1 }, { unique: true });
@@ -345,11 +576,19 @@ tallyStockGroupSchema.index({ companyId: 1, name: 1 }, { unique: true });
 // ─────────────────────────────────────────────────────────────────────────────
 const tallyStockItemSchema = new mongoose.Schema(
   {
-    companyId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyCompany", required: true, index: true },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyCompany",
+      required: true,
+      index: true,
+    },
     name: { type: String, required: true, trim: true },
     aliases: [{ type: String, trim: true }],
 
-    stockGroupId: { type: mongoose.Schema.Types.ObjectId, ref: "TallyStockGroup" },
+    stockGroupId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TallyStockGroup",
+    },
     stockGroupName: { type: String, trim: true },
 
     baseUnit: { type: String, trim: true }, // symbol — "Pcs", "Mtr"
@@ -375,7 +614,10 @@ const tallyStockItemSchema = new mongoose.Schema(
     standardSellingPrice: { type: Number, default: 0 },
 
     // CMS bridge
-    linkedStockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem" },
+    linkedStockItemId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "StockItem",
+    },
     linkedRawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem" },
 
     isActive: { type: Boolean, default: true },
@@ -384,7 +626,7 @@ const tallyStockItemSchema = new mongoose.Schema(
 
     notes: { type: String, trim: true },
   },
-  { timestamps: true, collection: "tally_stock_items" }
+  { timestamps: true, collection: "tally_stock_items" },
 );
 
 tallyStockItemSchema.index({ companyId: 1, name: 1 }, { unique: true });
@@ -394,13 +636,19 @@ tallyStockItemSchema.index({ aliases: 1 });
 // ─────────────────────────────────────────────────────────────────────────────
 // MODEL EXPORTS
 // ─────────────────────────────────────────────────────────────────────────────
-const TallyCompany    = mongoose.model("TallyCompany",    tallyCompanySchema);
-const TallyGroup      = mongoose.model("TallyGroup",      tallyGroupSchema);
-const TallyLedger     = mongoose.model("TallyLedger",     tallyLedgerSchema);
-const TallyCostCentre = mongoose.model("TallyCostCentre", tallyCostCentreSchema);
-const TallyUnit       = mongoose.model("TallyUnit",       tallyUnitSchema);
-const TallyStockGroup = mongoose.model("TallyStockGroup", tallyStockGroupSchema);
-const TallyStockItem  = mongoose.model("TallyStockItem",  tallyStockItemSchema);
+const TallyCompany = mongoose.model("TallyCompany", tallyCompanySchema);
+const TallyGroup = mongoose.model("TallyGroup", tallyGroupSchema);
+const TallyLedger = mongoose.model("TallyLedger", tallyLedgerSchema);
+const TallyCostCentre = mongoose.model(
+  "TallyCostCentre",
+  tallyCostCentreSchema,
+);
+const TallyUnit = mongoose.model("TallyUnit", tallyUnitSchema);
+const TallyStockGroup = mongoose.model(
+  "TallyStockGroup",
+  tallyStockGroupSchema,
+);
+const TallyStockItem = mongoose.model("TallyStockItem", tallyStockItemSchema);
 
 module.exports = {
   TallyCompany,
