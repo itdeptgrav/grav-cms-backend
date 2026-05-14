@@ -16,6 +16,15 @@ const {
   getEmployeeGmailToken,
   disconnectEmployeeGmail,
   getEmployeeInbox,
+  markRead,
+  toggleStar,
+  trashMessage,
+  archiveMessage,
+  sendEmail,
+  replyToEmail,
+  getAttachment,
+  getLabels,
+  getThread,
 } = require("./services/googleEmployeeGmailService");
 
 // Chat service - load safely in case not set up yet
@@ -263,26 +272,21 @@ router.get("/gmail/all-inbox", async (req, res) => {
 // ── PER-EMPLOYEE GMAIL ────────────────────────────────────────────────────────
 
 // GET /api/google/employee-gmail/auth-url?employeeId=E001
-// Returns OAuth URL for this employee to connect their personal Gmail
 router.get("/employee-gmail/auth-url", (req, res) => {
   try {
     const { employeeId } = req.query;
     if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
     const url = getEmployeeAuthUrl(employeeId);
     res.json({ success: true, url });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
 // GET /api/google/employee-gmail/callback?code=xxx&state=E001
-// Called by Google after employee authorizes — saves token to Firestore
 router.get("/employee-gmail/callback", async (req, res) => {
   try {
     const { code, state: employeeId } = req.query;
     if (!code || !employeeId) return res.status(400).json({ success: false, message: "Missing code or employeeId" });
     const { connectedEmail } = await saveEmployeeGmailToken(employeeId, code);
-    // Redirect back to CoWork settings with success param
     const frontendUrl = process.env.COWORK_FRONTEND_URL || "http://localhost:3000";
     res.redirect(`${frontendUrl}/coworking/settings?gmail=connected&email=${encodeURIComponent(connectedEmail)}`);
   } catch (err) {
@@ -292,13 +296,32 @@ router.get("/employee-gmail/callback", async (req, res) => {
   }
 });
 
-// GET /api/google/employee-gmail/inbox?employeeId=E001&max=30
-// Returns this employee's own Gmail inbox
+// GET /api/google/employee-gmail/status?employeeId=E001
+router.get("/employee-gmail/status", async (req, res) => {
+  try {
+    const { employeeId } = req.query;
+    if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
+    const token = await getEmployeeGmailToken(employeeId);
+    res.json({ success: true, connected: !!token, connectedEmail: token?.connectedEmail || null, connectedAt: token?.connectedAt || null });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// DELETE /api/google/employee-gmail/disconnect
+router.delete("/employee-gmail/disconnect", async (req, res) => {
+  try {
+    const { employeeId } = req.query;
+    if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
+    await disconnectEmployeeGmail(employeeId);
+    res.json({ success: true, message: "Gmail disconnected" });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// GET /api/google/employee-gmail/inbox?employeeId=E001&max=40&pageToken=xxx&labelId=INBOX&q=
 router.get("/employee-gmail/inbox", async (req, res) => {
   try {
-    const { employeeId, max } = req.query;
+    const { employeeId, max, pageToken, labelId, q } = req.query;
     if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
-    const result = await getEmployeeInbox(employeeId, parseInt(max) || 30);
+    const result = await getEmployeeInbox(employeeId, parseInt(max) || 40, pageToken || null, labelId || "INBOX", q || "");
     res.json({ success: true, ...result });
   } catch (err) {
     console.error("[employee-gmail/inbox]", err.message);
@@ -306,35 +329,143 @@ router.get("/employee-gmail/inbox", async (req, res) => {
   }
 });
 
-// GET /api/google/employee-gmail/status?employeeId=E001
-// Check if this employee has Gmail connected
-router.get("/employee-gmail/status", async (req, res) => {
+// PATCH /api/google/employee-gmail/mark-read
+router.patch("/employee-gmail/mark-read", async (req, res) => {
+  try {
+    const { employeeId, messageId, read } = req.body;
+    if (!employeeId || !messageId) return res.status(400).json({ success: false, message: "employeeId and messageId required" });
+    await markRead(employeeId, messageId, read !== false);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// PATCH /api/google/employee-gmail/star
+router.patch("/employee-gmail/star", async (req, res) => {
+  try {
+    const { employeeId, messageId, star } = req.body;
+    if (!employeeId || !messageId) return res.status(400).json({ success: false, message: "employeeId and messageId required" });
+    await toggleStar(employeeId, messageId, star !== false);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// DELETE /api/google/employee-gmail/trash  — body: { employeeId, messageId }
+router.delete("/employee-gmail/trash", async (req, res) => {
+  try {
+    const { employeeId, messageId } = req.body;
+    if (!employeeId || !messageId) return res.status(400).json({ success: false, message: "employeeId and messageId required" });
+    await trashMessage(employeeId, messageId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// PATCH /api/google/employee-gmail/archive
+router.patch("/employee-gmail/archive", async (req, res) => {
+  try {
+    const { employeeId, messageId } = req.body;
+    if (!employeeId || !messageId) return res.status(400).json({ success: false, message: "employeeId and messageId required" });
+    await archiveMessage(employeeId, messageId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// POST /api/google/employee-gmail/send
+router.post("/employee-gmail/send", async (req, res) => {
+  try {
+    const { employeeId, to, cc, bcc, subject, body, isHtml, attachments } = req.body;
+    if (!employeeId || !to || !subject) return res.status(400).json({ success: false, message: "employeeId, to, subject required" });
+    await sendEmail(employeeId, { to, cc, bcc, subject, body, isHtml, attachments: attachments || [] });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// POST /api/google/employee-gmail/reply
+router.post("/employee-gmail/reply", async (req, res) => {
+  try {
+    const { employeeId, messageId, to, cc, subject, body, isHtml, attachments } = req.body;
+    if (!employeeId || !messageId || !to) return res.status(400).json({ success: false, message: "employeeId, messageId, to required" });
+    await replyToEmail(employeeId, messageId, { to, cc, subject, body, isHtml, attachments: attachments || [] });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// GET /api/google/employee-gmail/attachment
+router.get("/employee-gmail/attachment", async (req, res) => {
+  try {
+    const { employeeId, messageId, attachmentId } = req.query;
+    if (!employeeId || !messageId || !attachmentId) return res.status(400).json({ success: false, message: "employeeId, messageId, attachmentId required" });
+    const data = await getAttachment(employeeId, messageId, attachmentId);
+    res.json({ success: true, data });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// GET /api/google/employee-gmail/labels
+router.get("/employee-gmail/labels", async (req, res) => {
   try {
     const { employeeId } = req.query;
     if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
-    const token = await getEmployeeGmailToken(employeeId);
-    res.json({
-      success: true,
-      connected: !!token,
-      connectedEmail: token?.connectedEmail || null,
-      connectedAt: token?.connectedAt || null,
-    });
+    const labels = await getLabels(employeeId);
+    res.json({ success: true, labels });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// GET /api/google/employee-gmail/thread?employeeId=E001&threadId=xxx
+router.get("/employee-gmail/thread", async (req, res) => {
+  try {
+    const { employeeId, threadId } = req.query;
+    if (!employeeId || !threadId) return res.status(400).json({ success: false, message: "employeeId and threadId required" });
+    const data = await getThread(employeeId, threadId);
+    res.json({ success: true, ...data });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// POST /api/google/employee-gmail/backfill-display-names
+// One-shot admin route: patches displayName into every connected employee's gmailToken
+// Call once from browser/Postman — safe to call multiple times (idempotent)
+router.post("/employee-gmail/backfill-display-names", async (req, res) => {
+  try {
+    const { db, admin } = require("../config/firebaseAdmin");
+    const { google } = require("googleapis");
+
+    const snap = await db.collection("cowork_employees").get();
+    const results = { patched: [], skipped: [], failed: [] };
+
+    await Promise.allSettled(snap.docs.map(async (doc) => {
+      const data = doc.data();
+      const token = data.gmailToken;
+      // Skip if no gmail connected or displayName already exists
+      if (!token || !token.refresh_token) { results.skipped.push(doc.id + " (no token)"); return; }
+      if (token.displayName) { results.skipped.push(doc.id + " (already has: " + token.displayName + ")"); return; }
+
+      try {
+        const client = new google.auth.OAuth2(
+          process.env.GOOGLE_CLIENT_ID,
+          process.env.GOOGLE_CLIENT_SECRET,
+          process.env.GOOGLE_REDIRECT_URI_EMPLOYEE || process.env.GOOGLE_REDIRECT_URI
+        );
+        client.setCredentials({ refresh_token: token.refresh_token });
+        const oauth2 = google.oauth2({ version: "v2", auth: client });
+        const userInfo = await oauth2.userinfo.get();
+        const displayName = userInfo.data.name || "";
+        if (displayName) {
+          await doc.ref.update({ "gmailToken.displayName": displayName });
+          results.patched.push(doc.id + " → " + displayName);
+        } else {
+          results.skipped.push(doc.id + " (no name in Google profile)");
+        }
+      } catch (e) {
+        results.failed.push(doc.id + ": " + e.message);
+      }
+    }));
+
+    console.log("[backfill-display-names]", results);
+    res.json({ success: true, ...results });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// DELETE /api/google/employee-gmail/disconnect?employeeId=E001
-router.delete("/employee-gmail/disconnect", async (req, res) => {
-  try {
-    const { employeeId } = req.query;
-    if (!employeeId) return res.status(400).json({ success: false, message: "employeeId required" });
-    await disconnectEmployeeGmail(employeeId);
-    res.json({ success: true, message: "Gmail disconnected" });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
+module.exports = router;
 
 // ── GOOGLE CHAT SPACES ────────────────────────────────────────────────────────
 
