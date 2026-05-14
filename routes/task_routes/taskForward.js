@@ -1352,6 +1352,7 @@ router.post("/task/:taskId/goal-activity/:activityId/submit-report", verifyCowor
     const now = new Date().toISOString();
     activities[idx] = {
       ...activities[idx],
+      status: "pending_approval",
       report: {
         text: text || "",
         files: files || [],
