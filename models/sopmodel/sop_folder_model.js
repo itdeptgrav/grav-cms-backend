@@ -4,11 +4,11 @@ const mongoose = require("mongoose");
 
 const sopFolderSchema = new mongoose.Schema(
     {
-        name: { type: String, required: true, trim: true },
-        department: { type: String, required: true, trim: true },
-        createdBy: { type: String, required: true }, // employeeId
-        createdByName: { type: String, required: true },
-        createdByRole: { type: String, enum: ["ceo", "tl"], required: true },
+        name: { type: String, trim: true },
+        department: { type: String, trim: true },
+        createdBy: { type: String }, // employeeId
+        createdByName: { type: String },
+        createdByRole: { type: String },
     },
     { timestamps: true }
 );
