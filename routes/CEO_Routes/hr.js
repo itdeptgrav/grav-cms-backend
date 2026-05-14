@@ -97,6 +97,39 @@ router.get("/employees", ceoAuth, async (req, res) => {
     }
 });
 
+
+router.get("/employees/:id/sop-points", ceoAuth, async (req, res) => {
+    try {
+        const emp = await Employee.findById(req.params.id)
+            .select("firstName lastName biometricId department sopPoints")
+            .lean();
+        if (!emp) return res.status(404).json({ success: false, message: "Employee not found" });
+ 
+        // Normalize: negative points = old credit format
+        const sopPoints = (emp.sopPoints || []).map(yp => ({
+            ...yp,
+            bleaches: (yp.bleaches || []).map(b =>
+                Number(b.points) < 0
+                    ? { ...b, points: Math.abs(b.points), isCredit: true }
+                    : b
+            ),
+        })).sort((a, b) => b.year - a.year);
+ 
+        // Calculate net
+        const totalDeducted = sopPoints.reduce((s, yp) =>
+            s + (yp.bleaches || []).filter(b => !b.isCredit && b.recheck?.status !== "confirmed")
+                .reduce((bs, b) => bs + Number(b.points), 0), 0);
+        const totalCredited = sopPoints.reduce((s, yp) =>
+            s + (yp.bleaches || []).filter(b => b.isCredit)
+                .reduce((bs, b) => bs + Number(b.points), 0), 0);
+        const netPoints = +(totalDeducted - totalCredited).toFixed(2);
+ 
+        res.json({ success: true, sopPoints, totalDeducted: +totalDeducted.toFixed(2), totalCredited: +totalCredited.toFixed(2), netPoints });
+    } catch (e) {
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+
 // GET /api/ceo/hr/employees/:id
 router.get("/employees/:id", ceoAuth, async (req, res) => {
     try {
