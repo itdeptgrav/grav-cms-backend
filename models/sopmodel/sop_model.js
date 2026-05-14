@@ -4,15 +4,15 @@ const mongoose = require("mongoose");
 
 const sopSchema = new mongoose.Schema(
     {
-        name: { type: String, required: true, trim: true },
-        points: { type: Number, required: true, min: 0.5 },
-        description: { type: String, required: true, trim: true },
-        department: { type: String, required: true, trim: true },
+        name: { type: String, trim: true },
+        points: { type: Number, min: 0.5 },
+        description: { type: String, trim: true },
+        department: { type: String, trim: true },
 
         // Who created
         createdBy: { type: String, required: true }, // employeeId e.g. GR001
-        createdByName: { type: String, required: true },
-        createdByRole: { type: String, enum: ["ceo", "tl"], required: true },
+        createdByName: { type: String },
+        createdByRole: { type: String },
 
         // Folder grouping
         folderId: { type: mongoose.Schema.Types.ObjectId, ref: "SopFolder", default: null },
