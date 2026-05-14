@@ -264,15 +264,23 @@ router.patch("/:id/reject", verifyCoworkToken, verifyCeoToken, async (req, res) 
 router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId: appliedById, name: appliedByName } = req.coworkUser;
-        const { targetEmployeeId, sopId, description } = req.body;
+        const { targetEmployeeId, sopId, description, manualPoints, manualSopName } = req.body;
 
-        if (!targetEmployeeId || !sopId) {
-            return res.status(400).json({ error: "targetEmployeeId and sopId are required." });
+        if (!targetEmployeeId) {
+            return res.status(400).json({ error: "targetEmployeeId is required." });
+        }
+        if (!sopId && !manualPoints) {
+            return res.status(400).json({ error: "Either sopId or manualPoints is required." });
         }
 
-        const sop = await Sop.findById(sopId).lean();
-        if (!sop) return res.status(404).json({ error: "SOP not found." });
-        if (sop.status !== "approved") return res.status(400).json({ error: "Only approved SOPs can be applied." });
+        const sop = sopId ? await Sop.findById(sopId).lean() : null;
+        if (sopId && !sop) return res.status(404).json({ error: "SOP not found." });
+        if (sopId && sop.status !== "approved") return res.status(400).json({ error: "Only approved SOPs can be applied." });
+
+        // Support manual bleach (task suggestion without SOP)
+        const finalPoints = sop ? sop.points : Number(manualPoints);
+        const finalSopName = sop ? sop.name : (manualSopName || "Manual Deduction");
+        const finalFolderName = sop ? (sop.folderName || "Uncategorized") : "Task Event";
 
         const employee = await Employee.findOne({ biometricId: targetEmployeeId });
         if (!employee) return res.status(404).json({ error: "Employee not found." });
@@ -288,27 +296,44 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
         const year = new Date().getFullYear();
 
         const bleachEntry = {
-            sopId: sop._id, sopName: sop.name,
-            folderName: sop.folderName || "Uncategorized",
-            points: sop.points,
-            description: description?.trim() || sop.description,
+            sopId: sop?._id || null,
+            sopName: finalSopName,
+            folderName: finalFolderName,
+            points: finalPoints,
+            description: description?.trim() || sop?.description || "",
             date: today,
             cutBy: appliedById, cutByName: appliedByName,
             cutByRole: role === "ceo" ? "ceo" : "tl",
+            recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
         };
 
         const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);
         if (yearIndex >= 0) {
             employee.sopPoints[yearIndex].bleaches.push(bleachEntry);
             employee.sopPoints[yearIndex].totalDeducted = +(
-                employee.sopPoints[yearIndex].totalDeducted + sop.points
+                employee.sopPoints[yearIndex].totalDeducted + finalPoints
             ).toFixed(2);
         } else {
-            employee.sopPoints.push({ year, totalDeducted: sop.points, bleaches: [bleachEntry] });
+            employee.sopPoints.push({ year, totalDeducted: finalPoints, bleaches: [bleachEntry] });
         }
 
         await employee.save();
-        res.status(201).json({ success: true, message: `${sop.points} pts deducted from ${employee.firstName} for "${sop.name}".` });
+
+        // Mark this task+event as applied in Firestore to prevent re-showing
+        if (req.body.taskId && req.body.eventKey) {
+            try {
+                const { db } = require("../../config/firebaseAdmin");
+                await db.collection("cowork_sop_applied").add({
+                    taskId: req.body.taskId,
+                    eventKey: req.body.eventKey,
+                    employeeId: targetEmployeeId,
+                    appliedBy: appliedById,
+                    appliedAt: new Date().toISOString(),
+                });
+            } catch (e) { console.error("[sop_applied]", e.message); }
+        }
+
+        res.status(201).json({ success: true, message: `${finalPoints} pts deducted from ${employee.firstName} for "${finalSopName}".` });
     } catch (e) {
         console.error("[sop/bleach]", e.message);
         res.status(500).json({ error: e.message });
@@ -339,7 +364,16 @@ router.get("/bleach/:employeeId", verifyCoworkToken, verifyEmployeeToken, async 
             }
         }
 
-        const sopPoints = (employee.sopPoints || []).sort((a, b) => b.year - a.year);
+        const sopPoints = (employee.sopPoints || []).sort((a, b) => b.year - a.year).map(yp => ({
+            ...yp,
+            bleaches: (yp.bleaches || []).map(b => {
+                // Normalize old entries: negative points = credit (old format before isCredit flag)
+                if (Number(b.points) < 0) {
+                    return { ...b, points: Math.abs(b.points), isCredit: true };
+                }
+                return b;
+            }),
+        }));
         res.json({
             success: true,
             employeeId: employee.biometricId,
@@ -543,6 +577,267 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
         res.json({ success: true, message: msg });
     } catch (e) {
         console.error("[sop/recheck/PATCH]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /cowork/sop/task-suggestions/dismiss
+// Called when TL/CEO rejects a suggestion — saves to applied collection so it won't reappear
+router.post("/task-suggestions/dismiss", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+    try {
+        const { employeeId: appliedById } = req.coworkUser;
+        const { taskId, eventKey, assigneeId } = req.body;
+        if (!taskId || !eventKey) return res.status(400).json({ error: "taskId and eventKey required." });
+
+        const { db } = require("../../config/firebaseAdmin");
+        await db.collection("cowork_sop_applied").add({
+            taskId, eventKey,
+            employeeId: assigneeId || "",
+            appliedBy: appliedById,
+            action: "rejected",
+            appliedAt: new Date().toISOString(),
+        });
+
+        res.json({ success: true });
+    } catch (e) {
+        console.error("[task-suggestions/dismiss]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// GET /cowork/sop/task-suggestions
+// Fetches tasks from Firestore that match enabled SOP events
+// Returns list of tasks with suggested bleach info for TL/CEO to review
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+    try {
+        const { role, employeeId } = req.coworkUser;
+        const { admin, db } = require("../../config/firebaseAdmin");
+
+        // 1. Load SOP event config from Firestore
+        const configSnap = await db.collection("cowork_sop_settings").doc("task_events").get();
+        if (!configSnap.exists) return res.json({ success: true, suggestions: [] });
+
+        const config = configSnap.data().events || {};
+        const now = new Date();
+
+        // 2. Get TL's department for scoping
+        let myDept = null;
+        if (role === "tl") {
+            const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
+            myDept = me?.department || null;
+        }
+
+        // 3. Fetch all relevant tasks from Firestore
+        let tasksSnap;
+        if (role === "ceo") {
+            tasksSnap = await db.collection("cowork_tasks").get();
+        } else {
+            // TL: tasks they assigned OR tasks assigned to their dept employees
+            const [s1, s2] = await Promise.all([
+                db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get(),
+                db.collection("cowork_tasks").where("department", "==", myDept).get(),
+            ]);
+            const taskMap = {};
+            s1.forEach(d => { taskMap[d.id] = { id: d.id, ...d.data() }; });
+            s2.forEach(d => { taskMap[d.id] = { id: d.id, ...d.data() }; });
+            tasksSnap = { docs: Object.values(taskMap).map(t => ({ id: t.id, data: () => t })) };
+        }
+
+        // Load already-applied task+event pairs to exclude them
+        const appliedSnap = await db.collection("cowork_sop_applied").get();
+        const appliedSet = new Set();
+        appliedSnap.forEach(d => {
+            const data = d.data();
+            appliedSet.add(`${data.taskId}_${data.eventKey}`);
+        });
+
+        const suggestions = [];
+
+        tasksSnap.docs.forEach(docSnap => {
+            const task = { id: docSnap.id, ...docSnap.data() };
+            if (task.isFolder) return; // skip folders
+
+            const assigneeId = (task.assigneeIds || [])[0];
+            const assigneeName = task.assigneeNameMap?.[assigneeId] || assigneeId || "Unknown";
+            const taskDept = task.department || myDept || "";
+
+            // Helper to push suggestion
+            const push = (eventKey, reason) => {
+                const ev = config[eventKey];
+                if (!ev?.enabled || !ev.points) return;
+                if (appliedSet.has(`${task.id}_${eventKey}`)) return; // already applied
+
+                // Role-aware points: CEO applying uses ceo-specific event if available
+                // task_rejected_tl → if ceo is applying, use task_rejected_ceo points instead
+                let finalPoints = ev.points;
+                if (role === "ceo" && eventKey === "task_rejected_tl" && config.task_rejected_ceo?.enabled) {
+                    finalPoints = config.task_rejected_ceo.points;
+                }
+                if (role === "tl" && eventKey === "task_rejected_ceo" && config.task_rejected_tl?.enabled) {
+                    finalPoints = config.task_rejected_tl.points;
+                }
+
+                suggestions.push({
+                    taskId: task.id,
+                    taskTitle: task.title || "Untitled Task",
+                    taskType: task.isRepeat ? "repeat" : task.isGoal ? "goal" : task.isThirdParty ? "third_party" : task.isSelfAssigned ? "self_assigned" : "regular",
+                    eventKey,
+                    eventLabel: reason,
+                    assigneeId,
+                    assigneeName,
+                    department: taskDept,
+                    suggestedPoints: finalPoints,
+                    description: ev.description || reason,
+                    assignedBy: task.assignedBy,
+                    dueDate: task.dueDate || task.fixedDeadline || task.goalDeadline || null,
+                });
+            };
+
+            // ── Check each event ──────────────────────────────────────────────────
+
+            // 1. Task overdue (regular, has timer or fixedDeadline)
+            if (config.task_overdue?.enabled) {
+                const due = task.dueDate || task.fixedDeadline;
+                if (due && new Date(due) < now && !["done", "tl_approved", "ceo_approved"].includes(task.status) && !task.isRepeat && !task.isGoal && !task.isThirdParty) {
+                    push("task_overdue", "Task Overdue");
+                }
+            }
+
+            // 2. Task rejected by TL
+            if (config.task_rejected_tl?.enabled && task.completionStatus === "tl_rejected") {
+                push("task_rejected_tl", "Rejected by Team Lead");
+            }
+
+            // 3. Task rejected by CEO
+            if (config.task_rejected_ceo?.enabled && task.completionStatus === "ceo_rejected") {
+                push("task_rejected_ceo", "Rejected by CEO");
+            }
+
+            // 4. Repeat task missed
+            if (config.repeat_missed?.enabled && task.isRepeat) {
+                const deadlines = task.repeatConfig?.deadlineTimes || (task.deadlineTime ? [task.deadlineTime] : []);
+                const today = now.toISOString().split("T")[0];
+                const currentHHMM = now.getHours().toString().padStart(2, "0") + ":" + now.getMinutes().toString().padStart(2, "0");
+                const submissions = task.repeatSubmissions || {};
+                deadlines.forEach(dl => {
+                    if (currentHHMM > dl && !submissions[`${today}_${dl}`]) {
+                        push("repeat_missed", `Repeat Task Missed (${dl})`);
+                    }
+                });
+            }
+
+            // 5. Repeat task submitted late
+            if (config.repeat_late?.enabled && task.isRepeat) {
+                const subs = task.repeatSubmissions || {};
+                Object.entries(subs).forEach(([key, sub]) => {
+                    if (sub.isLate) push("repeat_late", `Repeat Submitted Late (${key})`);
+                });
+            }
+
+            // 6. Third party overdue
+            if (config.third_party_overdue?.enabled && task.isThirdParty) {
+                const due = task.fixedDeadline || task.dueDate;
+                if (due && new Date(due) < now && task.status !== "done") {
+                    push("third_party_overdue", "Third Party Task Overdue");
+                }
+            }
+
+            // 7. Third party rejected
+            if (config.third_party_rejected?.enabled && task.isThirdParty && task.completionStatus === "tl_rejected") {
+                push("third_party_rejected", "Third Party Task Rejected");
+            }
+
+            // 8. Goal overdue
+            if (config.goal_overdue?.enabled && task.isGoal) {
+                const due = task.goalDeadline || task.dueDate;
+                if (due && new Date(due) < now && task.status !== "done") {
+                    push("goal_overdue", "Goal Task Overdue");
+                }
+            }
+
+            // 9. Self assigned overdue
+            if (config.self_assigned_overdue?.enabled && task.isSelfAssigned) {
+                const due = task.dueDate || task.fixedDeadline;
+                if (due && new Date(due) < now && task.status !== "done") {
+                    push("self_assigned_overdue", "Self-Assigned Task Overdue");
+                }
+            }
+
+            // 10. Extension rejected
+            if (config.extension_rejected?.enabled && task.deadlineExtension?.status === "rejected") {
+                push("extension_rejected", "Deadline Extension Rejected");
+            }
+
+            // 11. Task not started (open too long)
+            if (config.task_not_started?.enabled) {
+                const days = config.task_not_started.daysThreshold || 2;
+                const created = task.createdAt?._seconds ? new Date(task.createdAt._seconds * 1000) : task.createdAt ? new Date(task.createdAt) : null;
+                if (created && task.status === "open") {
+                    const diffDays = (now - created) / (1000 * 60 * 60 * 24);
+                    if (diffDays >= days) push("task_not_started", `Task Not Started (${Math.floor(diffDays)} days)`);
+                }
+            }
+        });
+
+        res.json({ success: true, suggestions });
+    } catch (e) {
+        console.error("[task-suggestions]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /cowork/sop/goal-credit
+// Awards positive points to employee when goal component is completed
+// Acts as reverse of bleach — adds credit to sopPoints
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+    try {
+        const { role, employeeId: awardedById, name: awardedByName } = req.coworkUser;
+        const { targetEmployeeId, points, componentName, taskTitle, taskId, componentId } = req.body;
+
+        if (!targetEmployeeId) return res.status(400).json({ error: "targetEmployeeId is required." });
+        if (!points || points <= 0) return res.status(400).json({ error: "points must be > 0." });
+
+        const employee = await Employee.findOne({ biometricId: targetEmployeeId });
+        if (!employee) return res.status(404).json({ error: "Employee not found." });
+
+        const year = new Date().getFullYear();
+        const today = new Date().toISOString().split("T")[0];
+
+        const creditEntry = {
+            sopId: null,
+            sopName: componentName || "Goal Component",
+            folderName: taskTitle || "Goal Task",
+            points: Math.abs(points), // store as positive
+            description: `Goal component completed: ${componentName || ""}`,
+            date: today,
+            cutBy: awardedById,
+            cutByName: awardedByName,
+            cutByRole: role === "ceo" ? "ceo" : "tl",
+            isCredit: true,
+            taskId,
+            componentId,
+            recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+        };
+
+        const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);
+        if (yearIndex >= 0) {
+            employee.sopPoints[yearIndex].bleaches.push(creditEntry);
+            // Credit reduces totalDeducted (floor at 0 or allow negative for net positive)
+            employee.sopPoints[yearIndex].totalDeducted = +(
+                employee.sopPoints[yearIndex].totalDeducted - Math.abs(points)
+            ).toFixed(2);
+        } else {
+            employee.sopPoints.push({ year, totalDeducted: -Math.abs(points), bleaches: [creditEntry] });
+        }
+
+        await employee.save();
+        res.json({ success: true, message: `+${points} pts credited to ${employee.firstName} for "${componentName}".` });
+    } catch (e) {
+        console.error("[goal-credit]", e.message);
         res.status(500).json({ error: e.message });
     }
 });

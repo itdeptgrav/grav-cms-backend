@@ -741,6 +741,14 @@ app.use("/api/employee", pushTokenRoutes);
 const barcodeRoutes = require("./routes/CMS_Routes/Inventory/Operations/barcodes");
 app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 
+
+
+const hrSopRoutes  = require("./routes/HrRoutes/hrSopRoutes");
+const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
+
+app.use("/api/hr/sop",  hrSopRoutes);
+app.use("/api/ceo/sop", ceoSopRoutes);
+
 /* =====================
     Customer ROUTES
   ===================== */
