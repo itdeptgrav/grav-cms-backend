@@ -39,6 +39,7 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 const {
   TallyGroup,
   TallyLedger,
+  TALLY_DEFAULT_GROUPS,
 } = require("../../models/Accountant_model/TallyMasterModels");
 const {
   TallyVoucher,
@@ -48,6 +49,118 @@ const {
 // have the HR module installed yet.
 
 router.use(accountantAuth);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Helper — ensure the 28 default Tally groups exist for a company.
+//
+// Some companies in the wild were created before the auto-seed-on-create
+// behaviour existed, OR seeding silently failed (race condition during
+// company creation). Result: their chart is empty and every downstream
+// feature (seed-manufacturing, parties sync, group create) fails with
+// "Default Tally groups missing".
+//
+// This helper is idempotent: it skips groups whose name already exists,
+// so calling it on a partially-seeded company tops it up without
+// duplicating anything. We keep this LOCAL to this file rather than
+// importing from tallyCompanies.js to avoid a circular dependency.
+//
+// Returns the count of groups CREATED (not total).
+// ─────────────────────────────────────────────────────────────────────────
+async function ensureDefaultGroups(companyId, createdBy) {
+  if (
+    !Array.isArray(TALLY_DEFAULT_GROUPS) ||
+    TALLY_DEFAULT_GROUPS.length === 0
+  ) {
+    return 0;
+  }
+
+  // Index existing groups by lowercased name so we can skip-or-create
+  const existing = await TallyGroup.find({ companyId }).lean();
+  const byName = new Map(existing.map((g) => [g.name.toLowerCase(), g]));
+  let created = 0;
+
+  // Pass 1: primaries
+  for (const g of TALLY_DEFAULT_GROUPS.filter((x) => !x.parent)) {
+    if (byName.has(g.name.toLowerCase())) continue;
+    const doc = await TallyGroup.create({
+      companyId,
+      name: g.name,
+      parent: null,
+      parentName: null,
+      isPrimary: true,
+      isReserved: g.isReserved || false,
+      nature: g.nature,
+      level: 1,
+      fullPath: g.name,
+      createdBy,
+      isActive: true,
+    });
+    byName.set(g.name.toLowerCase(), doc);
+    created++;
+  }
+
+  // Pass 2: children — need the parent ObjectId resolved
+  for (const g of TALLY_DEFAULT_GROUPS.filter((x) => x.parent)) {
+    if (byName.has(g.name.toLowerCase())) continue;
+    const parent = byName.get(g.parent.toLowerCase());
+    if (!parent) continue; // parent missing (shouldn't happen but defensive)
+    const doc = await TallyGroup.create({
+      companyId,
+      name: g.name,
+      parent: parent._id,
+      parentName: parent.name,
+      isPrimary: false,
+      isReserved: g.isReserved || false,
+      nature: g.nature,
+      level: 2,
+      fullPath: `${parent.name} > ${g.name}`,
+      createdBy,
+      isActive: true,
+    });
+    byName.set(g.name.toLowerCase(), doc);
+    created++;
+  }
+
+  return created;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/accountant/chart-of-accounts/ensure-defaults
+// ─────────────────────────────────────────────────────────────────────────
+// Self-heal endpoint — top up any missing default Tally groups for a
+// company. Safe to call any time; idempotent. The CoA page surfaces a
+// button calling this when the chart looks empty.
+// ─────────────────────────────────────────────────────────────────────────
+router.post("/ensure-defaults", async (req, res) => {
+  try {
+    const { companyId } = req.body || {};
+    if (!companyId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+    }
+    const created = await ensureDefaultGroups(companyId, req.user?.id);
+    const total = await TallyGroup.countDocuments({
+      companyId,
+      isActive: true,
+    });
+    res.json({
+      success: true,
+      created,
+      total,
+      message:
+        created === 0
+          ? `All ${total} default groups were already present.`
+          : `Created ${created} missing default groups (now ${total} total).`,
+    });
+  } catch (err) {
+    console.error("ensure-defaults:", err);
+    res.status(500).json({
+      success: false,
+      message: err.message || "Failed to seed defaults",
+    });
+  }
+});
 
 // ── GET /version — quick check that the latest backend code is loaded.
 //   Hit this in the browser:  /api/accountant/chart-of-accounts/version
@@ -625,6 +738,105 @@ router.delete("/ledgers/:id", async (req, res) => {
       });
     }
     ledger.isActive = false;
+    await ledger.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRIMARY INVOICE BANK — the bank ledger flagged as the default to print
+// on tax invoices for a given company. At most one per company.
+//
+// Used by the invoice PDF generator: backend's /invoices/:id endpoint
+// returns this ledger alongside the company doc, and the PDF places its
+// bankDetails into the "Company's Bank Details" footer block.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /primary-invoice-bank?companyId=...
+// Returns the currently-flagged primary bank for a company (or null).
+// Used by the Settings page when it loads.
+router.get("/primary-invoice-bank", async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "companyId required" });
+    }
+    const ledger = await TallyLedger.findOne({
+      companyId,
+      isPrimaryInvoiceBank: true,
+      isActive: { $ne: false },
+    })
+      .select("name groupName bankDetails")
+      .lean();
+    res.json({ success: true, ledger });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /ledgers/:id/set-primary-bank
+// Marks this ledger as the primary invoice bank for its company. Atomic:
+// clears the flag on any other bank ledger in the same company first,
+// then sets it on the target ledger. Returns the updated ledger.
+//
+// The target ledger must (a) belong to a "Bank Accounts" group — soft
+// check, since group names are user-editable; we just refuse if the
+// resolved group has a nature other than "asset" — and (b) have at least
+// a bankName populated, otherwise printing it on an invoice is
+// meaningless.
+router.post("/ledgers/:id/set-primary-bank", async (req, res) => {
+  try {
+    const ledger = await TallyLedger.findById(req.params.id);
+    if (!ledger) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Ledger not found" });
+    }
+    if (!ledger.bankDetails?.bankName) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Set the ledger's bank name (and other bank details) before marking it as the primary invoice bank.",
+      });
+    }
+
+    // Clear the flag on every other bank ledger in this company so the
+    // invariant "at most one primary per company" holds.
+    await TallyLedger.updateMany(
+      {
+        companyId: ledger.companyId,
+        _id: { $ne: ledger._id },
+        isPrimaryInvoiceBank: true,
+      },
+      { $set: { isPrimaryInvoiceBank: false } },
+    );
+
+    ledger.isPrimaryInvoiceBank = true;
+    await ledger.save();
+
+    res.json({ success: true, ledger: ledger.toObject() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /ledgers/:id/clear-primary-bank
+// Removes the primary-bank flag from this ledger. Useful when an
+// accountant wants no bank printed on invoices, or before switching to
+// a fresh one without an in-between state.
+router.post("/ledgers/:id/clear-primary-bank", async (req, res) => {
+  try {
+    const ledger = await TallyLedger.findById(req.params.id);
+    if (!ledger) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Ledger not found" });
+    }
+    ledger.isPrimaryInvoiceBank = false;
     await ledger.save();
     res.json({ success: true });
   } catch (err) {
@@ -2706,17 +2918,28 @@ router.post("/seed-manufacturing", async (req, res) => {
         .status(400)
         .json({ success: false, message: "companyId required" });
 
-    // Confirm the 28 default groups are present — otherwise this seeder
-    // can't anchor anything (it presumes parents like "Current Assets" exist).
-    const existingGroups = await TallyGroup.find({
+    // Self-heal: if the 28 default groups are missing, seed them now rather
+    // than asking the user to "re-create the company". This used to be a
+    // hard failure on companies created before the auto-seed-on-create flow,
+    // or where that step silently failed. The seed function is idempotent
+    // so this is safe to call every time.
+    let existingGroups = await TallyGroup.find({
       companyId,
       isActive: true,
     }).lean();
+    let autoSeededCount = 0;
+    if (existingGroups.length === 0) {
+      autoSeededCount = await ensureDefaultGroups(companyId, req.user?.id);
+      existingGroups = await TallyGroup.find({
+        companyId,
+        isActive: true,
+      }).lean();
+    }
     if (existingGroups.length === 0) {
       return res.status(400).json({
         success: false,
         message:
-          "Default Tally groups missing. They get auto-seeded when a company is created. Re-create the company or seed the defaults first.",
+          "Couldn't seed default groups. Check that TALLY_DEFAULT_GROUPS is exported from TallyMasterModels.",
       });
     }
 
@@ -2820,6 +3043,7 @@ router.post("/seed-manufacturing", async (req, res) => {
     res.json({
       success: true,
       dryRun: !!dryRun,
+      autoSeededDefaults: autoSeededCount,
       summary: {
         groupsCreated: results.groupsCreated.length,
         groupsSkipped: results.groupsSkipped.length,
@@ -2993,8 +3217,14 @@ async function doPartiesSync(req, res, companyId, dryRun) {
   const Customer = loadCustomerModel();
   const Vendor = loadVendorModel();
 
-  // Resolve target groups (must exist; they're system-reserved and seeded with the company)
-  const allGroups = await TallyGroup.find({ companyId, isActive: true }).lean();
+  // Resolve target groups (must exist; they're system-reserved and seeded with the company).
+  // Self-heal: if the chart is empty, top up the 28 defaults first so this
+  // call succeeds rather than 400'ing.
+  let allGroups = await TallyGroup.find({ companyId, isActive: true }).lean();
+  if (allGroups.length === 0) {
+    await ensureDefaultGroups(companyId, req.user?.id);
+    allGroups = await TallyGroup.find({ companyId, isActive: true }).lean();
+  }
   const debtorsGroup = allGroups.find((g) => /^sundry debtors$/i.test(g.name));
   const creditorsGroup = allGroups.find((g) =>
     /^sundry creditors$/i.test(g.name),
@@ -3003,7 +3233,7 @@ async function doPartiesSync(req, res, companyId, dryRun) {
     return res.status(400).json({
       success: false,
       message:
-        "Sundry Debtors / Sundry Creditors groups missing. These should auto-seed when a company is created.",
+        "Sundry Debtors / Sundry Creditors groups missing. Try running 'Seed Default Groups' first.",
     });
   }
 

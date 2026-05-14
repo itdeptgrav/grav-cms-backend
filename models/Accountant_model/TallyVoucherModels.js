@@ -202,6 +202,23 @@ const tallyVoucherSchema = new mongoose.Schema(
     placeOfSupply: { type: String, trim: true },
     placeOfSupplyCode: { type: String, trim: true }, // GST state code
 
+    // ─── Shipping address (Consignee / Ship-to) ─────────────────────────────
+    // Snapshot at voucher creation. Independent of the party ledger so a
+    // later edit to the customer's saved address doesn't retroactively
+    // rewrite invoices that already shipped. Mirrors the buyer fields
+    // we already keep on `partyLedger*` + place-of-supply. Set on sales
+    // invoices; ignored for receipts/payments/etc.
+    shippingAddress: {
+      name: { type: String, trim: true },
+      addressLines: [{ type: String, trim: true }],
+      city: { type: String, trim: true },
+      state: { type: String, trim: true },
+      stateCode: { type: String, trim: true },
+      pincode: { type: String, trim: true },
+      country: { type: String, default: "India", trim: true },
+      gstin: { type: String, trim: true },
+    },
+
     // ─── Lines ──────────────────────────────────────────────────────────────
     ledgerEntries: { type: [ledgerEntrySchema], default: [] },
     inventoryEntries: { type: [inventoryEntrySchema], default: [] },

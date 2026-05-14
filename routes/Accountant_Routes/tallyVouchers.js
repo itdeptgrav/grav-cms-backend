@@ -16,6 +16,7 @@ const {
 const {
   TallyLedger,
   TallyGroup,
+  TallyStockItem,
 } = require("../../models/Accountant_model/TallyMasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
@@ -107,6 +108,141 @@ async function applyLedgerBalances(voucher, direction = 1, session = null) {
  *     }
  *   }
  */
+// ─────────────────────────────────────────────────────────────────────────
+// GET /stock-items — list stock items for the form pickers
+// ─────────────────────────────────────────────────────────────────────────
+// Pulls from TWO collections and merges:
+//
+//   1. CMS `StockItem` (models/CMS_Models/Inventory/Products/StockItem.js)
+//      — the real product catalog the user manages in their inventory UI.
+//      Not scoped by companyId (CMS catalog is org-wide).
+//
+//   2. Accounting `TallyStockItem` — items created via Tally import or
+//      the accountant module itself. Scoped by companyId.
+//
+// Merge convention: CMS items take priority when names collide. The
+// "source" field on the response tells the form where the row came from
+// (useful for the picker's tertiary text).
+//
+// Field mapping for CMS StockItem → picker shape:
+//   name → name
+//   hsnCode → hsnCode
+//   unit (default unit string) → baseUnit
+//   baseSalesPrice → standardSellingPrice
+//   baseCost → standardCost
+//   salesTax (string like "18%" or "GST 18") → taxRate (parsed)
+//   additionalNames → aliases (used for fuzzy search)
+//   totalQuantityOnHand → closingQuantity
+//
+// Query params:
+//   companyId — required (only filters TallyStockItem; CMS items returned anyway)
+//   q         — optional substring search on name / aliases / HSN
+//   limit     — default 500 per source
+// ─────────────────────────────────────────────────────────────────────────
+
+// Parse "salesTax" strings ("18%", "GST 18%", "18", "0") into a number.
+// Returns 0 if unparseable — the form's GST-rate dropdown will let the
+// user fix it. This keeps the picker resilient to whatever the CMS
+// inventory UI puts in that field.
+function parseTaxRate(raw) {
+  if (raw === null || raw === undefined || raw === "") return 0;
+  if (typeof raw === "number") return raw;
+  const m = String(raw).match(/(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+}
+
+// Lazy-require the CMS StockItem model. Doing this inside the handler
+// keeps tallyVouchers.js loadable even on deployments that don't have
+// the CMS inventory module installed yet. If require fails, we just
+// skip the CMS source and fall back to TallyStockItem only.
+function loadCMSStockItem() {
+  try {
+    return require("../../models/CMS_Models/Inventory/Products/StockItem");
+  } catch (e) {
+    return null;
+  }
+}
+
+router.get("/stock-items", auth, async (req, res) => {
+  try {
+    const { companyId, q, limit = 500 } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+
+    const lim = parseInt(limit);
+    const rx = q
+      ? new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
+      : null;
+
+    // ── Source 1: CMS StockItem catalog ────────────────────────────
+    const CMSStockItem = loadCMSStockItem();
+    let cmsItems = [];
+    if (CMSStockItem) {
+      const cmsFilter = {};
+      if (rx) {
+        cmsFilter.$or = [
+          { name: rx },
+          { additionalNames: rx },
+          { hsnCode: rx },
+          { reference: rx },
+          { barcode: rx },
+        ];
+      }
+      const cmsRaw = await CMSStockItem.find(cmsFilter)
+        .sort({ name: 1 })
+        .limit(lim)
+        .select(
+          "name additionalNames hsnCode unit baseSalesPrice baseCost salesTax totalQuantityOnHand reference category genderCategory",
+        )
+        .lean();
+
+      cmsItems = cmsRaw.map((s) => ({
+        _id: s._id,
+        name: s.name,
+        aliases: s.additionalNames || [],
+        hsnCode: s.hsnCode || "",
+        baseUnit: s.unit || "Nos",
+        taxRate: parseTaxRate(s.salesTax),
+        standardSellingPrice: s.baseSalesPrice || 0,
+        standardCost: s.baseCost || 0,
+        closingQuantity: s.totalQuantityOnHand || 0,
+        gstApplicable: !!s.salesTax,
+        source: "cms",
+        // Extras the picker UI can show as tertiary text
+        reference: s.reference,
+        category: s.category,
+      }));
+    }
+
+    // ── Source 2: TallyStockItem (accountant-side, company-scoped) ──
+    const tallyFilter = { companyId, isActive: true };
+    if (rx) {
+      tallyFilter.$or = [{ name: rx }, { aliases: rx }, { hsnCode: rx }];
+    }
+    const tallyRaw = await TallyStockItem.find(tallyFilter)
+      .sort({ name: 1 })
+      .limit(lim)
+      .select(
+        "name aliases hsnCode taxRate baseUnit altUnit standardSellingPrice standardCost closingQuantity gstApplicable",
+      )
+      .lean();
+
+    const tallyItems = tallyRaw.map((t) => ({ ...t, source: "tally" }));
+
+    // ── Merge — CMS items win when names collide (case-insensitive) ──
+    const seen = new Set(cmsItems.map((i) => (i.name || "").toLowerCase()));
+    const merged = [
+      ...cmsItems,
+      ...tallyItems.filter((t) => !seen.has((t.name || "").toLowerCase())),
+    ];
+
+    res.json({ items: merged, count: merged.length });
+  } catch (e) {
+    console.error("[stock-items]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get("/cash-bank-ledgers", auth, async (req, res) => {
   try {
     const { companyId } = req.query;
@@ -1003,6 +1139,151 @@ router.get("/unpaid-invoices", auth, async (req, res) => {
     res.json({ invoices: filtered });
   } catch (e) {
     console.error("[unpaid-invoices]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /unpaid-bills — AP mirror of /unpaid-invoices                    */
+/* ------------------------------------------------------------------ */
+/* Returns pending purchase bills for a vendor with the outstanding
+ * amount per bill. Used by the Payment form's bill-wise allocation
+ * picker so the accountant can apply outgoing money to specific bills.
+ *
+ * "Outstanding" = grandTotal MINUS (sum of payments already applied to
+ *                 this bill via billAllocations.agst_ref) MINUS (sum
+ *                 of DNs linked to this bill via originalBill.voucherId).
+ *
+ * Match nuance: payments may have been allocated using EITHER our
+ * internal voucher # OR the supplier's invoice # as the billName, since
+ * accountants type whichever they have in hand. We search by both.
+ *
+ * Query params:
+ *   companyId      — required
+ *   partyLedgerId  — required (vendor)
+ *   dateFrom       — optional, defaults to one year ago
+ *   dateTo         — optional, defaults to today
+ *   includeCleared — "1" to include fully-settled bills (default off)
+ */
+router.get("/unpaid-bills", auth, async (req, res) => {
+  try {
+    const { companyId, partyLedgerId, dateFrom, dateTo, includeCleared } =
+      req.query;
+    if (!companyId || !partyLedgerId) {
+      return res
+        .status(400)
+        .json({ error: "companyId and partyLedgerId required" });
+    }
+
+    const from = dateFrom
+      ? new Date(dateFrom)
+      : new Date(Date.now() - 365 * 86400000);
+    const to = dateTo ? new Date(dateTo) : new Date();
+
+    const bills = await TallyVoucher.find({
+      companyId,
+      voucherType: "purchase",
+      status: "posted",
+      partyLedgerId,
+      voucherDate: { $gte: from, $lte: to },
+    })
+      .sort({ voucherDate: 1 })
+      .select(
+        "voucherNumber voucherDate referenceNumber referenceDate dueDate grandTotal",
+      )
+      .limit(200)
+      .lean();
+
+    if (bills.length === 0) {
+      return res.json({ bills: [] });
+    }
+
+    // ── Prior DN amounts against each bill ──
+    const billIds = bills.map((b) => b._id);
+    const priorDNs = await TallyVoucher.aggregate([
+      {
+        $match: {
+          companyId: new mongoose.Types.ObjectId(companyId),
+          voucherType: "debit_note",
+          status: { $in: ["posted", "pending_approval"] },
+          "originalBill.voucherId": { $in: billIds },
+        },
+      },
+      {
+        $group: {
+          _id: "$originalBill.voucherId",
+          totalDebited: { $sum: "$grandTotal" },
+        },
+      },
+    ]);
+    const debitedMap = new Map(
+      priorDNs.map((d) => [String(d._id), d.totalDebited]),
+    );
+
+    // ── Prior payment allocations against each bill ──
+    // Match by either our voucher # OR supplier ref, since the
+    // allocating accountant types whichever they have on the bill.
+    const billNumbers = bills.map((b) => b.voucherNumber).filter(Boolean);
+    const supplierNumbers = bills.map((b) => b.referenceNumber).filter(Boolean);
+    const lookupNames = [...new Set([...billNumbers, ...supplierNumbers])];
+
+    const priorPayments = await TallyVoucher.find({
+      companyId,
+      voucherType: "payment",
+      status: "posted",
+      partyLedgerId,
+      "ledgerEntries.billAllocations.billName": { $in: lookupNames },
+    })
+      .select("ledgerEntries")
+      .lean();
+
+    const paidMap = new Map();
+    for (const pay of priorPayments) {
+      for (const entry of pay.ledgerEntries || []) {
+        for (const alloc of entry.billAllocations || []) {
+          if (alloc.billType === "agst_ref" && alloc.billName) {
+            // Match against either voucher # or supplier ref
+            const bill = bills.find(
+              (b) =>
+                b.voucherNumber === alloc.billName ||
+                b.referenceNumber === alloc.billName,
+            );
+            if (bill) {
+              const k = String(bill._id);
+              paidMap.set(k, (paidMap.get(k) || 0) + (alloc.amount || 0));
+            }
+          }
+        }
+      }
+    }
+
+    const today = new Date();
+    const enriched = bills.map((b) => {
+      const debited = debitedMap.get(String(b._id)) || 0;
+      const paid = paidMap.get(String(b._id)) || 0;
+      const outstanding = Math.max(0, (b.grandTotal || 0) - debited - paid);
+      const ageRef = b.dueDate ? new Date(b.dueDate) : new Date(b.voucherDate);
+      const ageInDays = Math.floor((today - ageRef) / 86400000);
+      const isOverdue =
+        b.dueDate && outstanding > 0.01 && today > new Date(b.dueDate);
+      return {
+        ...b,
+        alreadyDebited: debited,
+        alreadyPaid: paid,
+        outstanding,
+        ageInDays,
+        isOverdue,
+      };
+    });
+
+    const filtered =
+      includeCleared === "1"
+        ? enriched
+        : enriched.filter((b) => b.outstanding > 0.01);
+
+    res.json({ bills: filtered });
+  } catch (e) {
+    console.error("[unpaid-bills]", e);
     res.status(500).json({ error: e.message });
   }
 });

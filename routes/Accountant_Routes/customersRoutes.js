@@ -7,6 +7,16 @@ const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
 
+// Accounting-side models — used by the /accounting and /statement endpoints
+// to bridge from the CRM Customer collection into the unified TallyVoucher
+// accounting ledger. Best-effort name match on the Sundry Debtor ledger.
+const {
+  TallyVoucher,
+} = require("../../models/Accountant_model/TallyVoucherModels");
+const {
+  TallyLedger,
+} = require("../../models/Accountant_model/TallyMasterModels");
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Customer code — derived from MongoDB ObjectId, no schema change required.
 //
@@ -43,6 +53,52 @@ function idSuffixFromCode(code) {
   const num = parseInt(stripped, 36);
   if (Number.isNaN(num) || num < 0 || num > 0xffffff) return null;
   return num.toString(16).padStart(6, "0");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// parseSortParam — normalize the sort query string into {field, direction}.
+//
+// Accepts both the legacy short forms and the new field-direction form so
+// the existing dropdown ("Newest first" etc.) keeps working while column-
+// header clicks send precise field-direction tokens.
+//
+// Legacy mappings:
+//   "recent"      → { field: "created",      direction: "desc" }
+//   "name"        → { field: "name",         direction: "asc"  }
+//   "revenue"     → { field: "revenue",      direction: "desc" }
+//   "outstanding" → { field: "outstanding",  direction: "desc" }
+//
+// New form: "<field>-<asc|desc>" where field is one of:
+//   created | name | code | revenue | outstanding | paid | orders | lastOrder
+//
+// Unknown inputs fall back to { field: "created", direction: "desc" } so
+// a stray query param can never break the listing.
+// ─────────────────────────────────────────────────────────────────────────────
+function parseSortParam(raw) {
+  const legacy = {
+    recent: { field: "created", direction: "desc" },
+    name: { field: "name", direction: "asc" },
+    revenue: { field: "revenue", direction: "desc" },
+    outstanding: { field: "outstanding", direction: "desc" },
+  };
+  if (legacy[raw]) return legacy[raw];
+
+  const [field, direction] = String(raw || "").split("-");
+  const allowedFields = [
+    "created",
+    "name",
+    "code",
+    "revenue",
+    "outstanding",
+    "paid",
+    "orders",
+    "lastOrder",
+  ];
+  const allowedDirs = ["asc", "desc"];
+  if (allowedFields.includes(field) && allowedDirs.includes(direction)) {
+    return { field, direction };
+  }
+  return { field: "created", direction: "desc" };
 }
 
 // Import the accountant authentication middleware
@@ -139,7 +195,25 @@ router.get("/", verifyAccountantToken, async (req, res) => {
       Math.max(1, parseInt(req.query.limit, 10) || 20),
     );
     const search = String(req.query.search || "").trim();
-    const sort = String(req.query.sort || "recent");
+    // Sort param accepts:
+    //   - legacy: "recent" | "name" | "revenue" | "outstanding"
+    //   - new:    "<field>-<asc|desc>" e.g. "revenue-desc", "outstanding-asc",
+    //             "name-asc", "code-desc", "paid-desc", "orders-asc",
+    //             "lastOrder-desc", "created-desc".
+    //
+    // Derived fields (revenue/outstanding/paid/orders/lastOrder) are
+    // computed AFTER fetching customers, so we route those through a
+    // "full fetch → aggregate all → sort → paginate" path. Mongo-side
+    // fields (name/code/created) use the regular indexed sort.
+    const rawSort = String(req.query.sort || "recent");
+    const { field: sortField, direction: sortDir } = parseSortParam(rawSort);
+    const isDerivedSort = [
+      "revenue",
+      "outstanding",
+      "paid",
+      "orders",
+      "lastOrder",
+    ].includes(sortField);
     const filter = String(req.query.filter || "all");
 
     // Build the customer query.
@@ -180,82 +254,189 @@ router.get("/", verifyAccountantToken, async (req, res) => {
     // Total count (before pagination, after filtering)
     const total = await Customer.countDocuments(baseQuery);
 
-    // Sort spec
-    const sortSpec = {
-      name: { name: 1 },
-      recent: { createdAt: -1 },
-      // revenue & outstanding are derived; we sort post-fetch for those
-    }[sort] || { createdAt: -1 };
+    // ─── Build the sort spec for Mongo-side fields ───
+    // We map the abstract sort field to the actual Customer document
+    // field. "code" sorts by _id since the code is derived from the
+    // ObjectId — same order. lastOrder/orders/revenue/etc. are derived
+    // and handled in the derived path below.
+    const dir = sortDir === "asc" ? 1 : -1;
+    const mongoSortMap = {
+      created: { createdAt: dir },
+      name: { name: dir },
+      code: { _id: dir }, // code is derived from _id, so same ordering
+    };
+    const mongoSortSpec = mongoSortMap[sortField] || { createdAt: -1 };
 
-    // Fetch the page of customers
-    let customers = await Customer.find(baseQuery)
-      .select(
-        "name companyName email phone profile gstin createdAt lastLogin isPhoneVerified isEmailVerified",
-      )
-      .sort(sortSpec)
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean();
+    // ─── Two fetch paths depending on whether the sort is derived ───
+    //
+    // Path A — Mongo-side sort (name/code/created): page first, then
+    //   aggregate financials for only this page. Fast. This is the
+    //   original flow.
+    //
+    // Path B — derived sort (revenue/outstanding/paid/orders/lastOrder):
+    //   fetch ALL filtered customers, aggregate financials for all,
+    //   sort the full set in memory, then paginate. Slower but
+    //   required for correctness — sorting just the current page would
+    //   only sort 20 rows and the "highest revenue" customer might be
+    //   on page 4 entirely.
+    let customers;
 
-    // Aggregate per-customer financials in a single pass using $facet-style
-    // aggregation per customer. For pagination correctness we only aggregate
-    // for the page, so this is fast.
-    const customerIds = customers.map((c) => c._id);
-    const requestAgg = await CustomerRequest.aggregate([
-      { $match: { customerId: { $in: customerIds } } },
-      {
-        $project: {
-          customerId: 1,
-          status: 1,
-          totalPaidAmount: 1,
-          finalOrderPrice: 1,
-          createdAt: 1,
-          firstQuotation: { $arrayElemAt: ["$quotations", 0] },
-        },
-      },
-      {
-        $group: {
-          _id: "$customerId",
-          totalRevenue: {
-            $sum: { $ifNull: ["$firstQuotation.grandTotal", 0] },
+    if (isDerivedSort) {
+      // Path B
+      const allCustomers = await Customer.find(baseQuery)
+        .select(
+          "name companyName email phone profile gstin createdAt lastLogin isPhoneVerified isEmailVerified",
+        )
+        .lean();
+      const allIds = allCustomers.map((c) => c._id);
+      const fullAgg = await CustomerRequest.aggregate([
+        { $match: { customerId: { $in: allIds } } },
+        {
+          $project: {
+            customerId: 1,
+            status: 1,
+            totalPaidAmount: 1,
+            finalOrderPrice: 1,
+            createdAt: 1,
+            firstQuotation: { $arrayElemAt: ["$quotations", 0] },
           },
-          totalPaid: { $sum: { $ifNull: ["$totalPaidAmount", 0] } },
-          orderCount: { $sum: 1 },
-          completedCount: {
-            $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
-          },
-          lastOrderDate: { $max: "$createdAt" },
         },
-      },
-    ]);
-    const aggMap = new Map(requestAgg.map((a) => [String(a._id), a]));
+        {
+          $group: {
+            _id: "$customerId",
+            totalRevenue: {
+              $sum: { $ifNull: ["$firstQuotation.grandTotal", 0] },
+            },
+            totalPaid: { $sum: { $ifNull: ["$totalPaidAmount", 0] } },
+            orderCount: { $sum: 1 },
+            completedCount: {
+              $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+            },
+            lastOrderDate: { $max: "$createdAt" },
+          },
+        },
+      ]);
+      const fullAggMap = new Map(fullAgg.map((a) => [String(a._id), a]));
 
-    customers = customers.map((c) => {
-      const a = aggMap.get(String(c._id)) || {};
-      const totalRevenue = a.totalRevenue || 0;
-      const totalPaid = a.totalPaid || 0;
-      return {
-        ...c,
-        customerCode: customerCodeForId(c._id),
-        totalRevenue,
-        totalPaid,
-        totalOutstanding: Math.max(0, totalRevenue - totalPaid),
-        orderCount: a.orderCount || 0,
-        completedCount: a.completedCount || 0,
-        lastOrderDate: a.lastOrderDate || null,
+      let enriched = allCustomers.map((c) => {
+        const a = fullAggMap.get(String(c._id)) || {};
+        const totalRevenue = a.totalRevenue || 0;
+        const totalPaid = a.totalPaid || 0;
+        return {
+          ...c,
+          customerCode: customerCodeForId(c._id),
+          totalRevenue,
+          totalPaid,
+          totalOutstanding: Math.max(0, totalRevenue - totalPaid),
+          orderCount: a.orderCount || 0,
+          completedCount: a.completedCount || 0,
+          lastOrderDate: a.lastOrderDate || null,
+        };
+      });
+
+      // Apply derived filter (with_outstanding) BEFORE sorting +
+      // paginating so "Page 2 of customers with outstanding" makes sense.
+      if (filter === "with_outstanding") {
+        enriched = enriched.filter((c) => c.totalOutstanding > 0);
+      }
+
+      // Sort by the requested derived field
+      const sortFn = (a, b) => {
+        const sign = sortDir === "asc" ? 1 : -1;
+        switch (sortField) {
+          case "revenue":
+            return sign * ((a.totalRevenue || 0) - (b.totalRevenue || 0));
+          case "outstanding":
+            return (
+              sign * ((a.totalOutstanding || 0) - (b.totalOutstanding || 0))
+            );
+          case "paid":
+            return sign * ((a.totalPaid || 0) - (b.totalPaid || 0));
+          case "orders":
+            return sign * ((a.orderCount || 0) - (b.orderCount || 0));
+          case "lastOrder": {
+            const av = a.lastOrderDate
+              ? new Date(a.lastOrderDate).getTime()
+              : 0;
+            const bv = b.lastOrderDate
+              ? new Date(b.lastOrderDate).getTime()
+              : 0;
+            return sign * (av - bv);
+          }
+          default:
+            return 0;
+        }
       };
-    });
+      enriched.sort(sortFn);
 
-    // Apply derived filters AFTER computing financials
-    if (filter === "with_outstanding") {
-      customers = customers.filter((c) => c.totalOutstanding > 0);
-    }
+      // Paginate the sorted in-memory set
+      customers = enriched.slice((page - 1) * limit, page * limit);
+    } else {
+      // Path A — Mongo-side sort
+      customers = await Customer.find(baseQuery)
+        .select(
+          "name companyName email phone profile gstin createdAt lastLogin isPhoneVerified isEmailVerified",
+        )
+        .sort(mongoSortSpec)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean();
 
-    // Sort by derived fields if needed
-    if (sort === "revenue") {
-      customers.sort((a, b) => b.totalRevenue - a.totalRevenue);
-    } else if (sort === "outstanding") {
-      customers.sort((a, b) => b.totalOutstanding - a.totalOutstanding);
+      // Aggregate per-customer financials for THIS PAGE only (fast)
+      const customerIds = customers.map((c) => c._id);
+      const requestAgg = await CustomerRequest.aggregate([
+        { $match: { customerId: { $in: customerIds } } },
+        {
+          $project: {
+            customerId: 1,
+            status: 1,
+            totalPaidAmount: 1,
+            finalOrderPrice: 1,
+            createdAt: 1,
+            firstQuotation: { $arrayElemAt: ["$quotations", 0] },
+          },
+        },
+        {
+          $group: {
+            _id: "$customerId",
+            totalRevenue: {
+              $sum: { $ifNull: ["$firstQuotation.grandTotal", 0] },
+            },
+            totalPaid: { $sum: { $ifNull: ["$totalPaidAmount", 0] } },
+            orderCount: { $sum: 1 },
+            completedCount: {
+              $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+            },
+            lastOrderDate: { $max: "$createdAt" },
+          },
+        },
+      ]);
+      const aggMap = new Map(requestAgg.map((a) => [String(a._id), a]));
+
+      customers = customers.map((c) => {
+        const a = aggMap.get(String(c._id)) || {};
+        const totalRevenue = a.totalRevenue || 0;
+        const totalPaid = a.totalPaid || 0;
+        return {
+          ...c,
+          customerCode: customerCodeForId(c._id),
+          totalRevenue,
+          totalPaid,
+          totalOutstanding: Math.max(0, totalRevenue - totalPaid),
+          orderCount: a.orderCount || 0,
+          completedCount: a.completedCount || 0,
+          lastOrderDate: a.lastOrderDate || null,
+        };
+      });
+
+      // Apply derived filters AFTER computing financials. NOTE: this
+      // filter post-fetch is technically buggy at page boundaries
+      // (the page count won't reflect the filtered count), but it's
+      // the legacy behavior — preserved here to avoid changing
+      // pagination semantics in this round.
+      if (filter === "with_outstanding") {
+        customers = customers.filter((c) => c.totalOutstanding > 0);
+      }
     }
 
     // ── Page-level summary KPIs ──────────────────────────────────────────
@@ -337,6 +518,127 @@ router.get("/", verifyAccountantToken, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Server error while fetching customers",
+    });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GET /all — return EVERY customer with financials in a single response.
+//
+// Designed for client-side filtering, sorting, and pagination. The customers
+// list page calls this once on initial load and never again (unless the user
+// clicks Refresh), then handles all subsequent UI state changes in-browser.
+//
+// Why a separate endpoint instead of just removing pagination from `/`?
+//   The paginated `/` endpoint is also consumed by other surfaces (some
+//   reports / dashboards) that expect the page+limit+pagination response
+//   shape. Splitting cleanly avoids breaking those callers.
+//
+// Performance notes:
+//   • Single Customer.find() over the whole collection — fine for SMB
+//     scale (hundreds → low thousands). Add pagination back if the
+//     collection grows past ~10k.
+//   • One CustomerRequest.aggregate() with all customer IDs $in — Mongo
+//     handles this efficiently with an index on customerId.
+//   • Total payload size: ~1KB per customer × ~thousands = manageable.
+//
+// Response shape mirrors `/` so existing summary KPI code keeps working,
+// but instead of `pagination`, returns just `customers[]` + `summary`.
+// ═════════════════════════════════════════════════════════════════════════════
+router.get("/all", verifyAccountantToken, async (req, res) => {
+  try {
+    // Fetch every customer (no filter, no pagination). The frontend
+    // owns search/filter/sort from here on.
+    const allCustomers = await Customer.find({})
+      .select(
+        "name companyName email phone profile gstin createdAt lastLogin isPhoneVerified isEmailVerified",
+      )
+      .lean();
+
+    const allIds = allCustomers.map((c) => c._id);
+
+    // One aggregation for all of them. Same shape as the paginated path.
+    const requestAgg = await CustomerRequest.aggregate([
+      { $match: { customerId: { $in: allIds } } },
+      {
+        $project: {
+          customerId: 1,
+          status: 1,
+          totalPaidAmount: 1,
+          finalOrderPrice: 1,
+          createdAt: 1,
+          firstQuotation: { $arrayElemAt: ["$quotations", 0] },
+        },
+      },
+      {
+        $group: {
+          _id: "$customerId",
+          totalRevenue: {
+            $sum: { $ifNull: ["$firstQuotation.grandTotal", 0] },
+          },
+          totalPaid: { $sum: { $ifNull: ["$totalPaidAmount", 0] } },
+          orderCount: { $sum: 1 },
+          completedCount: {
+            $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+          },
+          lastOrderDate: { $max: "$createdAt" },
+        },
+      },
+    ]);
+    const aggMap = new Map(requestAgg.map((a) => [String(a._id), a]));
+
+    const customers = allCustomers.map((c) => {
+      const a = aggMap.get(String(c._id)) || {};
+      const totalRevenue = a.totalRevenue || 0;
+      const totalPaid = a.totalPaid || 0;
+      return {
+        ...c,
+        customerCode: customerCodeForId(c._id),
+        totalRevenue,
+        totalPaid,
+        totalOutstanding: Math.max(0, totalRevenue - totalPaid),
+        orderCount: a.orderCount || 0,
+        completedCount: a.completedCount || 0,
+        lastOrderDate: a.lastOrderDate || null,
+      };
+    });
+
+    // ─── Page-level summary KPIs (same as `/`) ───
+    // Aggregated across the FULL set, so the KPI strip on the page
+    // matches what the user sees in the table when no filter is on.
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const totalRevenue = customers.reduce((s, c) => s + c.totalRevenue, 0);
+    const totalPaid = customers.reduce((s, c) => s + c.totalPaid, 0);
+    const totalOutstanding = customers.reduce(
+      (s, c) => s + c.totalOutstanding,
+      0,
+    );
+    const customersWithOutstanding = customers.filter(
+      (c) => c.totalOutstanding > 0,
+    ).length;
+    const newThisMonth = customers.filter(
+      (c) => c.createdAt && new Date(c.createdAt) >= monthStart,
+    ).length;
+
+    res.json({
+      success: true,
+      customers,
+      summary: {
+        totalCustomers: customers.length,
+        totalRevenue: parseFloat(totalRevenue.toFixed(2)),
+        totalPaid: parseFloat(totalPaid.toFixed(2)),
+        totalOutstanding: parseFloat(totalOutstanding.toFixed(2)),
+        customersWithOutstanding,
+        newThisMonth,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching all customers:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching all customers",
     });
   }
 });
@@ -511,6 +813,198 @@ router.get(
       res.status(500).json({
         success: false,
         message: "Server error while fetching financial summary",
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:customerId/accounting
+// ─────────────────────────────────────────────────────────────────────────────
+// Bridges the CRM `Customer` record to the unified accounting world.
+//
+// Why this endpoint exists:
+//   The customer list page already shows revenue/paid/outstanding from the
+//   CRM-side `CustomerRequest` collection (quotations → orders). But the
+//   detail page also needs to show what's in the BOOKS — actual sales
+//   vouchers, receipts, and credit notes posted to a Sundry Debtor ledger.
+//
+//   Those two worlds aren't yet linked at the schema level (no
+//   linkedLedgerId field on Customer). So we do a best-effort name match
+//   against TallyLedger here. It works for the common case where the
+//   accountant created a Sundry Debtor ledger with the same name as the
+//   CRM customer. When no match is found, we return an empty accounting
+//   block — the UI shows a hint to create the ledger.
+//
+// Query params:
+//   companyId — required (which set of books to look in)
+//
+// Response:
+//   {
+//     success: true,
+//     ledger: { _id, name, currentBalance, balanceType, groupName } | null,
+//     stats: {
+//       totalInvoiced,   // sum of posted sales vouchers
+//       totalReceived,   // sum of posted receipts
+//       totalCredited,   // sum of posted credit notes
+//       outstanding,     // invoiced - received - credited
+//       invoiceCount, receiptCount, cnCount
+//     },
+//     recentInvoices: [...],     // last 10
+//     recentReceipts: [...],     // last 10
+//     recentCreditNotes: [...],  // last 10
+//   }
+router.get(
+  "/:customerId/accounting",
+  verifyAccountantToken,
+  async (req, res) => {
+    try {
+      const { customerId } = req.params;
+      const { companyId } = req.query;
+      if (!companyId) {
+        return res.status(400).json({
+          success: false,
+          message: "companyId query param is required",
+        });
+      }
+
+      const customer = await Customer.findById(customerId)
+        .select("name companyName email")
+        .lean();
+      if (!customer) {
+        return res.status(404).json({
+          success: false,
+          message: "Customer not found",
+        });
+      }
+
+      // Best-effort name match: try companyName first, then name. Both
+      // case-insensitive exact match. We don't fuzzy-match because that
+      // can silently link to the wrong ledger (a big accounting hazard).
+      const candidates = [customer.companyName, customer.name].filter(Boolean);
+      let ledger = null;
+      for (const candidate of candidates) {
+        const rx = new RegExp(
+          "^" + candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
+          "i",
+        );
+        ledger = await TallyLedger.findOne({
+          companyId,
+          isActive: true,
+          name: rx,
+        })
+          .select("name currentBalance balanceType groupName groupId")
+          .lean();
+        if (ledger) break;
+      }
+
+      // If no linked ledger, return empty accounting view (UI shows a
+      // call-to-action to create one).
+      if (!ledger) {
+        return res.status(200).json({
+          success: true,
+          ledger: null,
+          stats: {
+            totalInvoiced: 0,
+            totalReceived: 0,
+            totalCredited: 0,
+            outstanding: 0,
+            invoiceCount: 0,
+            receiptCount: 0,
+            cnCount: 0,
+          },
+          recentInvoices: [],
+          recentReceipts: [],
+          recentCreditNotes: [],
+        });
+      }
+
+      // Pull all posted vouchers for this ledger. Limit to recent 200
+      // each for performance — accountants who want the full history
+      // can click through to the ledger statement page.
+      const baseFilter = {
+        companyId,
+        status: "posted",
+        partyLedgerId: ledger._id,
+      };
+
+      const [invoices, receipts, creditNotes] = await Promise.all([
+        TallyVoucher.find({ ...baseFilter, voucherType: "sales" })
+          .sort({ voucherDate: -1 })
+          .limit(200)
+          .select(
+            "voucherNumber voucherDate dueDate grandTotal subtotal totalTax",
+          )
+          .lean(),
+        TallyVoucher.find({ ...baseFilter, voucherType: "receipt" })
+          .sort({ voucherDate: -1 })
+          .limit(200)
+          .select(
+            "voucherNumber voucherDate grandTotal paymentMode instrumentNumber ledgerEntries",
+          )
+          .lean(),
+        TallyVoucher.find({ ...baseFilter, voucherType: "credit_note" })
+          .sort({ voucherDate: -1 })
+          .limit(200)
+          .select(
+            "voucherNumber voucherDate grandTotal originalInvoice creditNoteReason",
+          )
+          .lean(),
+      ]);
+
+      const totalInvoiced = invoices.reduce(
+        (s, v) => s + (v.grandTotal || 0),
+        0,
+      );
+      const totalReceived = receipts.reduce(
+        (s, v) => s + (v.grandTotal || 0),
+        0,
+      );
+      const totalCredited = creditNotes.reduce(
+        (s, v) => s + (v.grandTotal || 0),
+        0,
+      );
+
+      // Strip heavy ledgerEntries from receipts before sending, but keep
+      // a derived "appliedToBills" summary for the UI's "what bill did
+      // this settle" column.
+      const slimReceipts = receipts.map((r) => {
+        const bills = [];
+        for (const entry of r.ledgerEntries || []) {
+          for (const alloc of entry.billAllocations || []) {
+            if (alloc.billType === "agst_ref" && alloc.billName) {
+              bills.push({ billName: alloc.billName, amount: alloc.amount });
+            }
+          }
+        }
+        const { ledgerEntries, ...rest } = r;
+        return { ...rest, appliedToBills: bills };
+      });
+
+      res.status(200).json({
+        success: true,
+        ledger,
+        stats: {
+          totalInvoiced,
+          totalReceived,
+          totalCredited,
+          outstanding: Math.max(
+            0,
+            totalInvoiced - totalReceived - totalCredited,
+          ),
+          invoiceCount: invoices.length,
+          receiptCount: receipts.length,
+          cnCount: creditNotes.length,
+        },
+        recentInvoices: invoices.slice(0, 10),
+        recentReceipts: slimReceipts.slice(0, 10),
+        recentCreditNotes: creditNotes.slice(0, 10),
+      });
+    } catch (error) {
+      console.error("Error fetching customer accounting:", error);
+      res.status(500).json({
+        success: false,
+        message: "Server error while fetching customer accounting",
       });
     }
   },

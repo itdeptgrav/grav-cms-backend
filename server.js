@@ -719,10 +719,6 @@ app.use("/api/ceo/merchandiser", merchandiserRoutes);
 const ceoOverviewRoutes = require("./routes/CEO_Routes/overview");
 app.use("/api/ceo/overview", ceoOverviewRoutes);
 
-// server.js
-const rawItemWastageRoutes = require("./routes/CEO_Routes/rawItemWastageRoutes");
-app.use("/api/ceo/raw-item-wastage", rawItemWastageRoutes);
-
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -1023,6 +1019,10 @@ app.use(
 app.use(
   "/api/accountant/invoices",
   require("./routes/Accountant_Routes/invoices"),
+);
+app.use(
+  "/api/accountant/proforma-invoices",
+  require("./routes/Accountant_Routes/proformaInvoices"),
 );
 app.use(
   "/api/accountant/vendors",

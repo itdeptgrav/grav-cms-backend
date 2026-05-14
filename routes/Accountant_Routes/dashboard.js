@@ -20,6 +20,9 @@ const {
   ActivityLog,
   AccountantSettings,
 } = require("../../models/Accountant_model/AccountantModels");
+const {
+  ApprovalRequest,
+} = require("../../models/Accountant_model/AccountantOrgModels");
 
 router.use(AccountantAuthMiddleware.accountantAuth);
 
@@ -72,7 +75,8 @@ router.get("/", async (req, res) => {
 
     purchaseOrders.forEach((po) => {
       totalPayables += po.totalAmount || 0;
-      const poPaid = po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
+      const poPaid =
+        po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
       totalVendorPaid += poPaid;
     });
 
@@ -86,7 +90,10 @@ router.get("/", async (req, res) => {
       .select("totalAmount category createdAt paymentStatus")
       .lean();
 
-    const totalExpenses = expenses.reduce((sum, e) => sum + (e.totalAmount || 0), 0);
+    const totalExpenses = expenses.reduce(
+      (sum, e) => sum + (e.totalAmount || 0),
+      0,
+    );
     const monthlyExpenses = expenses
       .filter((e) => new Date(e.createdAt) >= startOfMonth)
       .reduce((sum, e) => sum + (e.totalAmount || 0), 0);
@@ -99,7 +106,9 @@ router.get("/", async (req, res) => {
     });
 
     // ── Payroll summary ──
-    const latestPayroll = await Payroll.findOne().sort({ year: -1, month: -1 }).lean();
+    const latestPayroll = await Payroll.findOne()
+      .sort({ year: -1, month: -1 })
+      .lean();
     let payrollSummary = { totalNetPay: 0, totalEmployees: 0, totalGross: 0 };
     if (latestPayroll) {
       payrollSummary = {
@@ -120,7 +129,9 @@ router.get("/", async (req, res) => {
       total: invoices.length,
       totalAmount: invoices.reduce((sum, i) => sum + (i.grandTotal || 0), 0),
       paid: invoices.filter((i) => i.paymentStatus === "paid").length,
-      unpaid: invoices.filter((i) => ["unpaid", "overdue"].includes(i.paymentStatus)).length,
+      unpaid: invoices.filter((i) =>
+        ["unpaid", "overdue"].includes(i.paymentStatus),
+      ).length,
       overdue: invoices.filter((i) => i.paymentStatus === "overdue").length,
     };
 
@@ -142,8 +153,15 @@ router.get("/", async (req, res) => {
     const revenueTrend = [];
     for (let i = 5; i >= 0; i--) {
       const monthStart = new Date(today.getFullYear(), today.getMonth() - i, 1);
-      const monthEnd = new Date(today.getFullYear(), today.getMonth() - i + 1, 0);
-      const monthLabel = monthStart.toLocaleString("en-IN", { month: "short", year: "numeric" });
+      const monthEnd = new Date(
+        today.getFullYear(),
+        today.getMonth() - i + 1,
+        0,
+      );
+      const monthLabel = monthStart.toLocaleString("en-IN", {
+        month: "short",
+        year: "numeric",
+      });
 
       const monthRevenue = customerRequests
         .filter((r) => {
@@ -173,12 +191,17 @@ router.get("/", async (req, res) => {
     // ── Cash flow ──
     const cashFlow = {
       inflow: totalRevenue,
-      outflow: totalExpenses + totalVendorPaid + (payrollSummary.totalNetPay || 0),
-      net: totalRevenue - (totalExpenses + totalVendorPaid + (payrollSummary.totalNetPay || 0)),
+      outflow:
+        totalExpenses + totalVendorPaid + (payrollSummary.totalNetPay || 0),
+      net:
+        totalRevenue -
+        (totalExpenses + totalVendorPaid + (payrollSummary.totalNetPay || 0)),
     };
 
     // ── Budget status ──
-    const activeBudget = await Budget.findOne({ status: "active" }).sort({ createdAt: -1 }).lean();
+    const activeBudget = await Budget.findOne({ status: "active" })
+      .sort({ createdAt: -1 })
+      .lean();
 
     // ── Recent activity ──
     const recentActivity = await ActivityLog.find()
@@ -192,6 +215,118 @@ router.get("/", async (req, res) => {
     const totalVendors = await Vendor.countDocuments({ status: "Active" });
     const totalEmployees = await Employee.countDocuments({ isActive: true });
 
+    // ── Work queue: approvals + activity feed ──
+    //
+    // We always include the data on the response. The frontend decides
+    // which sections to show based on role. The reason for sending it
+    // even to viewers is that gating it server-side here would require
+    // role-aware behavior in this legacy endpoint, which currently uses
+    // the older AccountantDepartment auth (not the org-role auth).
+    //
+    // Scope: org-scoped if the request comes from a sub-account user
+    // (orgAuth attaches req.user.organizationId); otherwise unscoped
+    // for the legacy single-tenant accountant token.
+    const orgScope = req.user?.organizationId
+      ? { organizationId: req.user.organizationId }
+      : {};
+
+    // Pending approvals — for the "Needs your attention" card on the
+    // dashboard. Show the 8 most-recent pending across the whole org.
+    // Owners/approvers see this; editors don't (UI gates it).
+    const pendingApprovalsRaw = await ApprovalRequest.find({
+      ...orgScope,
+      status: "pending",
+    })
+      .sort({ createdAt: -1 })
+      .limit(8)
+      .lean();
+
+    const pendingApprovals = pendingApprovalsRaw.map((a) => ({
+      _id: a._id,
+      kind: a.kind, // e.g. "voucher.create"
+      action: a.action, // create | update | delete
+      title: a.title, // pre-built human summary
+      requestedBy: a.requestedBy,
+      requestedByName: a.requestedByName || "Someone",
+      createdAt: a.createdAt,
+      companyId: a.companyId,
+      // Don't ship the full payload over the wire — the detail page
+      // fetches it on demand. Lighter for the list view.
+    }));
+
+    const pendingApprovalsCount = await ApprovalRequest.countDocuments({
+      ...orgScope,
+      status: "pending",
+    });
+
+    // My submissions — for editors. Their own requests across statuses,
+    // newest 8. Helps them see "did the boss approve my CN yet?"
+    let mySubmissions = [];
+    if (req.user?.id) {
+      mySubmissions = await ApprovalRequest.find({
+        ...orgScope,
+        requestedBy: req.user.id,
+      })
+        .sort({ createdAt: -1 })
+        .limit(8)
+        .lean()
+        .then((rows) =>
+          rows.map((a) => ({
+            _id: a._id,
+            kind: a.kind,
+            title: a.title,
+            status: a.status,
+            createdAt: a.createdAt,
+            reviewedAt: a.reviewedAt,
+            reviewedByName: a.reviewedByName,
+            reviewNote: a.reviewNote,
+          })),
+        );
+    }
+
+    // Unified activity feed — merges:
+    //   • ActivityLog entries (already loaded above as recentActivity)
+    //   • Approval transitions (pending → approved/rejected) so the
+    //     feed shows "Bob approved CN/2627/00012" as well as the raw
+    //     create/edit events.
+    // Cap at 15 items, sorted by timestamp descending.
+    const recentApprovalEvents = await ApprovalRequest.find({
+      ...orgScope,
+      status: { $in: ["approved", "rejected", "cancelled"] },
+    })
+      .sort({ reviewedAt: -1 })
+      .limit(15)
+      .lean();
+
+    const activityFeed = [
+      // Activity log → unified shape
+      ...recentActivity.map((a) => ({
+        kind: "log",
+        action: a.action,
+        module: a.module,
+        actorName: a.accountantId?.name || "Someone",
+        text: a.details || `${a.action} in ${a.module}`,
+        at: a.createdAt,
+      })),
+      // Approval transitions → unified shape
+      ...recentApprovalEvents.map((a) => ({
+        kind: "approval",
+        action: a.status, // approved | rejected | cancelled
+        module: a.kind?.split(".")[0] || "approval",
+        actorName: a.reviewedByName || a.requestedByName || "Someone",
+        text:
+          a.status === "approved"
+            ? `Approved: ${a.title}`
+            : a.status === "rejected"
+              ? `Rejected: ${a.title}${a.reviewNote ? ` — ${a.reviewNote}` : ""}`
+              : `Cancelled: ${a.title}`,
+        at: a.reviewedAt || a.updatedAt,
+        approvalId: a._id,
+      })),
+    ]
+      .sort((x, y) => new Date(y.at) - new Date(x.at))
+      .slice(0, 15);
+
     res.json({
       success: true,
       dashboard: {
@@ -202,7 +337,9 @@ router.get("/", async (req, res) => {
           outstandingPayables: parseFloat(outstandingPayables.toFixed(2)),
           totalExpenses: parseFloat(totalExpenses.toFixed(2)),
           monthlyExpenses: parseFloat(monthlyExpenses.toFixed(2)),
-          netProfit: parseFloat((totalRevenue - totalExpenses - totalVendorPaid).toFixed(2)),
+          netProfit: parseFloat(
+            (totalRevenue - totalExpenses - totalVendorPaid).toFixed(2),
+          ),
           cashFlow,
         },
         expenseByCategory,
@@ -218,17 +355,38 @@ router.get("/", async (req, res) => {
               totalSpent: activeBudget.totalSpent,
               utilization:
                 activeBudget.totalAllocated > 0
-                  ? parseFloat(((activeBudget.totalSpent / activeBudget.totalAllocated) * 100).toFixed(1))
+                  ? parseFloat(
+                      (
+                        (activeBudget.totalSpent /
+                          activeBudget.totalAllocated) *
+                        100
+                      ).toFixed(1),
+                    )
                   : 0,
             }
           : null,
         counts: { totalCustomers, totalVendors, totalEmployees },
         recentActivity,
+
+        // Work queue (new)
+        // - pendingApprovals: items waiting for approver action.
+        //   Frontend shows this only to owners/approvers.
+        // - pendingApprovalsCount: total in the queue (for KPI badge).
+        // - mySubmissions: current user's own approval requests (any
+        //   status). Frontend shows this only to editors.
+        // - activity: unified feed of recent events (logs + approval
+        //   transitions). Shown to everyone with a role.
+        pendingApprovals,
+        pendingApprovalsCount,
+        mySubmissions,
+        activity: activityFeed,
       },
     });
   } catch (error) {
     console.error("Dashboard error:", error);
-    res.status(500).json({ success: false, message: "Error loading dashboard" });
+    res
+      .status(500)
+      .json({ success: false, message: "Error loading dashboard" });
   }
 });
 
@@ -294,7 +452,10 @@ router.get("/profit-loss", async (req, res) => {
       .select("earnings.grossEarnings deductions.totalDeductions netPay")
       .lean();
 
-    const totalPayrollCost = payrollItems.reduce((sum, p) => sum + (p.earnings?.grossEarnings || 0), 0);
+    const totalPayrollCost = payrollItems.reduce(
+      (sum, p) => sum + (p.earnings?.grossEarnings || 0),
+      0,
+    );
 
     const grossProfit = salesRevenue - cogs;
     const netProfit = grossProfit - totalOperatingExpenses - totalPayrollCost;
@@ -305,12 +466,18 @@ router.get("/profit-loss", async (req, res) => {
         revenue: { salesRevenue: parseFloat(salesRevenue.toFixed(2)) },
         costOfGoodsSold: parseFloat(cogs.toFixed(2)),
         grossProfit: parseFloat(grossProfit.toFixed(2)),
-        grossProfitMargin: salesRevenue > 0 ? parseFloat(((grossProfit / salesRevenue) * 100).toFixed(1)) : 0,
+        grossProfitMargin:
+          salesRevenue > 0
+            ? parseFloat(((grossProfit / salesRevenue) * 100).toFixed(1))
+            : 0,
         operatingExpenses,
         totalOperatingExpenses: parseFloat(totalOperatingExpenses.toFixed(2)),
         payrollCost: parseFloat(totalPayrollCost.toFixed(2)),
         netProfit: parseFloat(netProfit.toFixed(2)),
-        netProfitMargin: salesRevenue > 0 ? parseFloat(((netProfit / salesRevenue) * 100).toFixed(1)) : 0,
+        netProfitMargin:
+          salesRevenue > 0
+            ? parseFloat(((netProfit / salesRevenue) * 100).toFixed(1))
+            : 0,
       },
     });
   } catch (error) {
@@ -333,12 +500,14 @@ router.get("/balance-sheet", async (req, res) => {
     requests.forEach((r) => {
       const q = r.quotations?.[0];
       if (q?.grandTotal) {
-        totalReceivables += (q.grandTotal - (r.totalPaidAmount || 0));
+        totalReceivables += q.grandTotal - (r.totalPaidAmount || 0);
       }
     });
 
     // Bank balances
-    const bankTxns = await BankTransaction.find().sort({ transactionDate: -1 }).lean();
+    const bankTxns = await BankTransaction.find()
+      .sort({ transactionDate: -1 })
+      .lean();
     const bankBalances = {};
     bankTxns.forEach((txn) => {
       if (!bankBalances[txn.bankAccount] && txn.runningBalance !== undefined) {
@@ -366,13 +535,21 @@ router.get("/balance-sheet", async (req, res) => {
     const pendingPayroll = await PayrollItem.find({ status: "pending" })
       .select("netPay")
       .lean();
-    const salaryPayable = pendingPayroll.reduce((s, p) => s + (p.netPay || 0), 0);
+    const salaryPayable = pendingPayroll.reduce(
+      (s, p) => s + (p.netPay || 0),
+      0,
+    );
 
     // Tax payable
-    const pendingTaxes = await TaxFiling.find({ status: { $in: ["pending", "upcoming"] } })
+    const pendingTaxes = await TaxFiling.find({
+      status: { $in: ["pending", "upcoming"] },
+    })
       .select("totalPayable amountPaid")
       .lean();
-    const taxPayable = pendingTaxes.reduce((s, t) => s + ((t.totalPayable || 0) - (t.amountPaid || 0)), 0);
+    const taxPayable = pendingTaxes.reduce(
+      (s, t) => s + ((t.totalPayable || 0) - (t.amountPaid || 0)),
+      0,
+    );
 
     res.json({
       success: true,
@@ -394,7 +571,9 @@ router.get("/balance-sheet", async (req, res) => {
     });
   } catch (error) {
     console.error("Balance sheet error:", error);
-    res.status(500).json({ success: false, message: "Error generating balance sheet" });
+    res
+      .status(500)
+      .json({ success: false, message: "Error generating balance sheet" });
   }
 });
 
@@ -409,8 +588,15 @@ router.get("/cash-flow", async (req, res) => {
 
     for (let i = parseInt(months) - 1; i >= 0; i--) {
       const monthStart = new Date(today.getFullYear(), today.getMonth() - i, 1);
-      const monthEnd = new Date(today.getFullYear(), today.getMonth() - i + 1, 0);
-      const label = monthStart.toLocaleString("en-IN", { month: "short", year: "numeric" });
+      const monthEnd = new Date(
+        today.getFullYear(),
+        today.getMonth() - i + 1,
+        0,
+      );
+      const label = monthStart.toLocaleString("en-IN", {
+        month: "short",
+        year: "numeric",
+      });
 
       // Inflows
       const monthRequests = await CustomerRequest.find({
@@ -419,7 +605,10 @@ router.get("/cash-flow", async (req, res) => {
         .select("totalPaidAmount")
         .lean();
 
-      const inflow = monthRequests.reduce((s, r) => s + (r.totalPaidAmount || 0), 0);
+      const inflow = monthRequests.reduce(
+        (s, r) => s + (r.totalPaidAmount || 0),
+        0,
+      );
 
       // Outflows
       const monthExpenses = await Expense.find({
@@ -429,7 +618,10 @@ router.get("/cash-flow", async (req, res) => {
         .select("totalAmount")
         .lean();
 
-      const expenseOutflow = monthExpenses.reduce((s, e) => s + (e.totalAmount || 0), 0);
+      const expenseOutflow = monthExpenses.reduce(
+        (s, e) => s + (e.totalAmount || 0),
+        0,
+      );
 
       const monthPayroll = await PayrollItem.find({
         createdAt: { $gte: monthStart, $lte: monthEnd },
@@ -438,7 +630,10 @@ router.get("/cash-flow", async (req, res) => {
         .select("netPay")
         .lean();
 
-      const payrollOutflow = monthPayroll.reduce((s, p) => s + (p.netPay || 0), 0);
+      const payrollOutflow = monthPayroll.reduce(
+        (s, p) => s + (p.netPay || 0),
+        0,
+      );
 
       cashFlowData.push({
         month: label,
@@ -451,7 +646,9 @@ router.get("/cash-flow", async (req, res) => {
     res.json({ success: true, cashFlow: cashFlowData });
   } catch (error) {
     console.error("Cash flow error:", error);
-    res.status(500).json({ success: false, message: "Error generating cash flow" });
+    res
+      .status(500)
+      .json({ success: false, message: "Error generating cash flow" });
   }
 });
 
