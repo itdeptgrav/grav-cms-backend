@@ -6,20 +6,19 @@ const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewe
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
 const Customer = require("../../../models/Customer_Models/Customer");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem")
+const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 
 const Measurement = require('../../../models/Customer_Models/Measurement');
 const EmployeeMpc = require('../../../models/Customer_Models/Employee_Mpc');
 
 const CustomerEmailService = require('../../../services/CustomerEmailService');
 
-// Apply auth middleware
 router.use(EmployeeAuthMiddleware);
 
-// ========================
+// ════════════════════════════════════════════════════════════════════════════
 // DASHBOARD ROUTES
-// ========================
+// ════════════════════════════════════════════════════════════════════════════
 
-// GET dashboard statistics
 router.get("/dashboard", async (req, res) => {
     try {
         const now = new Date();
@@ -75,7 +74,6 @@ router.get("/dashboard", async (req, res) => {
     }
 });
 
-// GET recent requests for dashboard
 router.get("/dashboard/recent-requests", async (req, res) => {
     try {
         const recentRequests = await CustomerRequest.find()
@@ -90,7 +88,6 @@ router.get("/dashboard/recent-requests", async (req, res) => {
     }
 });
 
-// GET top customers
 router.get("/dashboard/top-customers", async (req, res) => {
     try {
         const topCustomers = await CustomerRequest.aggregate([
@@ -109,11 +106,10 @@ router.get("/dashboard/top-customers", async (req, res) => {
     }
 });
 
-// ========================
+// ════════════════════════════════════════════════════════════════════════════
 // CUSTOMER REQUESTS ROUTES
-// ========================
+// ════════════════════════════════════════════════════════════════════════════
 
-// Export requests to CSV
 router.get("/requests/export", async (req, res) => {
     try {
         const { startDate, endDate, status } = req.query;
@@ -144,7 +140,7 @@ router.get("/requests/export", async (req, res) => {
     }
 });
 
-// GET all customer requests with filters
+// GET all customer requests — NOW with WO completion enrichment + deadline risk
 router.get("/requests", async (req, res) => {
     try {
         const { search = "", status, dateRange, priority, page = 1, limit = 20 } = req.query;
@@ -185,7 +181,94 @@ router.get("/requests", async (req, res) => {
         const skip = (page - 1) * limit;
         const requests = await CustomerRequest.find(filter)
             .sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit))
-            .populate('salesPersonAssigned', 'name email').select('-__v');
+            .populate('salesPersonAssigned', 'name email')
+            .select('-__v')
+            .lean();
+
+        // ── WO completion aggregation: one query for all returned requests ──
+        const requestIds = requests.map(r => r._id);
+        let woMap = new Map();
+        if (requestIds.length > 0) {
+            const woAgg = await WorkOrder.aggregate([
+                { $match: { customerRequestId: { $in: requestIds } } },
+                {
+                    $group: {
+                        _id: "$customerRequestId",
+                        count: { $sum: 1 },
+                        totalQty: { $sum: { $ifNull: ["$quantity", 0] } },
+                        totalCompleted: {
+                            $sum: { $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }
+                        },
+                        anyStarted: {
+                            $sum: {
+                                $cond: [
+                                    { $gt: [{ $ifNull: ["$productionCompletion.overallCompletedQuantity", 0] }, 0] },
+                                    1, 0
+                                ]
+                            }
+                        }
+                    }
+                }
+            ]);
+            woMap = new Map(woAgg.map(w => [w._id.toString(), w]));
+        }
+
+        // ── Enrich each request with derived status + completion + deadline risk ──
+        const enriched = requests.map(r => {
+            const woStats = woMap.get(r._id.toString());
+            const woCount = woStats?.count || 0;
+
+            const totalUnitsOrdered = woCount > 0
+                ? (woStats.totalQty || 0)
+                : (r.items || []).reduce((s, i) => s + (i.totalQuantity || 0), 0);
+            const totalUnitsCompleted = woStats?.totalCompleted || 0;
+            const completionPercentage = totalUnitsOrdered > 0
+                ? Math.round((totalUnitsCompleted / totalUnitsOrdered) * 100)
+                : 0;
+
+            // Derive status — override quotation_sales_approved based on WO progress
+            let derivedStatus = r.status;
+            if (r.status === "quotation_sales_approved" && woCount > 0) {
+                if (totalUnitsOrdered > 0 && totalUnitsCompleted >= totalUnitsOrdered) {
+                    derivedStatus = "production_complete";
+                } else if (totalUnitsCompleted > 0) {
+                    derivedStatus = "in_production";
+                } else {
+                    derivedStatus = "ready_for_production";
+                }
+            }
+
+            // Deadline risk
+            let deadlineRisk = null;
+            let daysUntilDeadline = null;
+            const deadline = r.customerInfo?.deliveryDeadline;
+            const isAllComplete = totalUnitsOrdered > 0 && totalUnitsCompleted >= totalUnitsOrdered;
+            const isTerminal = r.status === "cancelled" || r.status === "completed" || derivedStatus === "production_complete";
+            if (deadline && !isAllComplete && !isTerminal) {
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                const dl = new Date(deadline);
+                dl.setHours(0, 0, 0, 0);
+                daysUntilDeadline = Math.round((dl - today) / (1000 * 60 * 60 * 24));
+                if (daysUntilDeadline < 0) deadlineRisk = "missed";
+                else if (daysUntilDeadline === 0) deadlineRisk = "due_today";
+                else if (daysUntilDeadline <= 3 && completionPercentage < 70) deadlineRisk = "due_soon";
+                else if (daysUntilDeadline <= 7 && completionPercentage < 50) deadlineRisk = "at_risk";
+                else deadlineRisk = "on_track";
+            }
+
+            return {
+                ...r,
+                totalUnitsOrdered,
+                totalUnitsCompleted,
+                completionPercentage,
+                workOrdersCount: woCount,
+                derivedStatus,
+                deadlineRisk,
+                daysUntilDeadline,
+            };
+        });
+
         const total = await CustomerRequest.countDocuments(filter);
         const stats = {
             total: await CustomerRequest.countDocuments(),
@@ -195,14 +278,21 @@ router.get("/requests", async (req, res) => {
             cancelled: await CustomerRequest.countDocuments({ status: 'cancelled' })
         };
 
-        res.json({ success: true, requests, stats, pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / limit) } });
+        res.json({
+            success: true,
+            requests: enriched,
+            stats,
+            pagination: {
+                page: parseInt(page), limit: parseInt(limit), total,
+                pages: Math.ceil(total / limit)
+            }
+        });
     } catch (error) {
         console.error("Error fetching customer requests:", error);
         res.status(500).json({ success: false, message: "Server error while fetching customer requests" });
     }
 });
 
-// GET single customer request by ID
 router.get("/requests/:requestId", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId)
@@ -214,9 +304,6 @@ router.get("/requests/:requestId", async (req, res) => {
             return res.status(404).json({ success: false, message: "Request not found" });
         }
 
-        // ── For measurement_conversion POs, enrich each item with the MPC
-        //    display name so the PDF can show the alias the employee recognises.
-        //    This is READ-ONLY — nothing stored in the DB changes.
         if (
             request.measurementId &&
             request.requestType === 'measurement_conversion'
@@ -227,21 +314,16 @@ router.get("/requests/:requestId", async (req, res) => {
                     .lean();
 
                 if (measurement) {
-                    // Collect employee IDs present in the measurement
                     const employeeIds = measurement.employeeMeasurements
                         .map(e => e.employeeId)
                         .filter(Boolean);
 
-                    // Batch-fetch MPC records (only products field needed)
                     const mpcEmployees = await EmployeeMpc.find({
                         _id: { $in: employeeIds },
                     })
                         .select('_id products')
                         .lean();
 
-                    // Build: stockItemId (string) → first non-empty MPC productName
-                    // "first found" is fine because every employee that has the same
-                    // productId was assigned via the same name.
                     const mpcNameMap = new Map();
                     for (const emp of mpcEmployees) {
                         for (const prod of (emp.products || [])) {
@@ -256,20 +338,14 @@ router.get("/requests/:requestId", async (req, res) => {
                         }
                     }
 
-                    // Attach mpcDisplayName to each item (plain object, not stored)
                     const enrichedRequest = request.toObject();
                     enrichedRequest.items = enrichedRequest.items.map(item => {
                         const stockId = (
                             item.stockItemId?._id || item.stockItemId
                         )?.toString();
-
-                        // Only override when the MPC name actually differs from the
-                        // canonical StockItem name to avoid unnecessary changes.
                         const mpcName = stockId ? mpcNameMap.get(stockId) : null;
-
                         return {
                             ...item,
-                            // null when no MPC alias exists → frontend falls back to stockItemName
                             mpcDisplayName: mpcName || null,
                         };
                     });
@@ -277,12 +353,10 @@ router.get("/requests/:requestId", async (req, res) => {
                     return res.json({ success: true, request: enrichedRequest });
                 }
             } catch (enrichError) {
-                // Non-fatal: log and fall through to return without enrichment
                 console.error('[salesRoutes] MPC name enrichment failed:', enrichError.message);
             }
         }
 
-        // Default path (non-measurement requests, or enrichment failed)
         res.json({ success: true, request });
     } catch (error) {
         console.error("Error fetching customer request:", error);
@@ -293,7 +367,6 @@ router.get("/requests/:requestId", async (req, res) => {
     }
 });
 
-// UPDATE request status
 router.patch("/requests/:requestId/status", async (req, res) => {
     try {
         const { status, notes } = req.body;
@@ -314,7 +387,6 @@ router.patch("/requests/:requestId/status", async (req, res) => {
     }
 });
 
-// ASSIGN request to sales person
 router.patch("/requests/:requestId/assign", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId);
@@ -329,7 +401,6 @@ router.patch("/requests/:requestId/assign", async (req, res) => {
     }
 });
 
-// UPDATE request priority
 router.patch("/requests/:requestId/priority", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId);
@@ -344,7 +415,6 @@ router.patch("/requests/:requestId/priority", async (req, res) => {
     }
 });
 
-// ADD note to request
 router.post("/requests/:requestId/notes", async (req, res) => {
     try {
         const { text } = req.body;
@@ -361,7 +431,6 @@ router.post("/requests/:requestId/notes", async (req, res) => {
     }
 });
 
-// GET request notes
 router.get("/requests/:requestId/notes", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId).select('notes');
@@ -373,11 +442,10 @@ router.get("/requests/:requestId/notes", async (req, res) => {
     }
 });
 
-// ========================
-// EDIT REQUEST ROUTES
-// ========================
+// ════════════════════════════════════════════════════════════════════════════
+// EDIT REQUEST ROUTES (unchanged)
+// ════════════════════════════════════════════════════════════════════════════
 
-// CREATE edit request
 router.post("/:requestId/edit-request", async (req, res) => {
     try {
         const { requestId } = req.params;
@@ -447,7 +515,6 @@ router.post("/:requestId/edit-request", async (req, res) => {
     }
 });
 
-// GET edit requests for a request
 router.get("/:requestId/edit-requests", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId)
@@ -462,7 +529,6 @@ router.get("/:requestId/edit-requests", async (req, res) => {
     }
 });
 
-// APPROVE edit request (sales side)
 router.post("/:requestId/approve-edit", async (req, res) => {
     try {
         const { requestId } = req.params;
@@ -511,7 +577,6 @@ router.post("/:requestId/approve-edit", async (req, res) => {
     }
 });
 
-// REJECT edit request (sales side)
 router.post("/:requestId/reject-edit", async (req, res) => {
     try {
         const { reason } = req.body;
