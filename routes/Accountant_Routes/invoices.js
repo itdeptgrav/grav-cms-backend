@@ -29,6 +29,12 @@ const router = express.Router();
 const {
   TallyVoucher,
 } = require("../../models/Accountant_model/TallyVoucherModels");
+const {
+  TallyCompany,
+} = require("../../models/Accountant_model/TallyMasterModels");
+const {
+  AccountantSettings,
+} = require("../../models/Accountant_model/AccountantModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
 router.use(accountantAuth);
@@ -333,6 +339,104 @@ router.get("/summary", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* GET /all — return ALL posted invoices + summary in one call.        */
+/*                                                                     */
+/* Designed for client-side filtering, sorting, and pagination. The    */
+/* invoices page calls this once on initial load and never again       */
+/* (unless the user clicks Refresh or logs a reminder). After that,    */
+/* every state change (filter pills, status pills, period preset,      */
+/* search, column-header sort, Next/Prev) is handled in-browser.       */
+/*                                                                     */
+/* Returns:                                                            */
+/*   invoices  — every posted sales invoice for this company,          */
+/*               enriched with paymentStatus, outstanding, ageInDays,  */
+/*               receivedAmount, creditedAmount, etc.                  */
+/*   summary   — the same KPI block the old /summary endpoint returns: */
+/*               totalInvoiced / Received / Credited / Outstanding,    */
+/*               counts by status, aging buckets, top customers.       */
+/*                                                                     */
+/* Same scale caveat as /summary: caps the fetch at 2000 invoices.     */
+/* If you have more than that, the older Mongo-paginated / endpoint    */
+/* is still available.                                                 */
+/* ------------------------------------------------------------------ */
+router.get("/all", async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+
+    // Fetch every posted sales voucher for this company. No filter, no
+    // pagination — the frontend owns everything after this. Sort the
+    // raw list by voucherDate desc so client-side default ordering
+    // matches what /summary would have shown.
+    const raw = await TallyVoucher.find({
+      companyId,
+      voucherType: "sales",
+      status: "posted",
+    })
+      .sort({ voucherDate: -1 })
+      .limit(2000)
+      .lean();
+
+    const enriched = await enrichInvoices(raw, companyId);
+
+    // Compute summary KPIs from the enriched set — mirrors the logic
+    // in /summary so the frontend shape doesn't change.
+    const summary = {
+      totalInvoiced: 0,
+      totalReceived: 0,
+      totalCredited: 0,
+      totalOutstanding: 0,
+      counts: { paid: 0, partial: 0, unpaid: 0, overdue: 0 },
+      aging: { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 },
+    };
+    const byCustomer = new Map();
+
+    for (const inv of enriched) {
+      summary.totalInvoiced += inv.grandTotal || 0;
+      summary.totalReceived += inv.receivedAmount || 0;
+      summary.totalCredited += inv.creditedAmount || 0;
+      summary.totalOutstanding += inv.outstanding || 0;
+      summary.counts[inv.paymentStatus] =
+        (summary.counts[inv.paymentStatus] || 0) + 1;
+
+      if (inv.outstanding > 0.01) {
+        const d = inv.ageInDays;
+        if (d <= 30) summary.aging["0-30"] += inv.outstanding;
+        else if (d <= 60) summary.aging["31-60"] += inv.outstanding;
+        else if (d <= 90) summary.aging["61-90"] += inv.outstanding;
+        else summary.aging["90+"] += inv.outstanding;
+
+        const k = inv.partyLedgerName || "—";
+        const prev = byCustomer.get(k) || {
+          outstanding: 0,
+          count: 0,
+          customerId: inv.partyLedgerId,
+        };
+        byCustomer.set(k, {
+          outstanding: prev.outstanding + inv.outstanding,
+          count: prev.count + 1,
+          customerId: prev.customerId,
+        });
+      }
+    }
+
+    const topCustomers = [...byCustomer.entries()]
+      .map(([name, v]) => ({ name, ...v }))
+      .sort((a, b) => b.outstanding - a.outstanding)
+      .slice(0, 10);
+
+    res.json({
+      invoices: enriched,
+      summary: { ...summary, topCustomers },
+    });
+  } catch (e) {
+    console.error("[invoices/all]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* GET /:id — single invoice with full bill trail                      */
 /* ------------------------------------------------------------------ */
 router.get("/:id", async (req, res) => {
@@ -344,6 +448,35 @@ router.get("/:id", async (req, res) => {
     if (!inv) return res.status(404).json({ error: "Invoice not found" });
 
     const [enriched] = await enrichInvoices([inv], inv.companyId);
+
+    // Fetch (in parallel):
+    //   • The seller TallyCompany doc — used as fallback for the seller
+    //     block when AccountantSettings doesn't have a value.
+    //   • The AccountantSettings singleton — this is where the visible
+    //     Settings page (Organization / Address / Tax / Bank Accounts)
+    //     persists its data. The PDF reads from settings FIRST (it's the
+    //     accountant-controlled invoice identity), then falls back to
+    //     the TallyCompany doc for anything not set there.
+    const [company, settings] = await Promise.all([
+      TallyCompany.findById(inv.companyId)
+        .select("companyName address contact gstin pan cin tan")
+        .lean(),
+      AccountantSettings.findOne()
+        .select(
+          "companyName companyGSTIN companyPAN companyAddress companyPhone companyEmail bankAccounts invoiceTerms",
+        )
+        .lean(),
+    ]);
+
+    // The default bank account that prints on the invoice is whichever
+    // entry in settings.bankAccounts[] has isDefault: true. If none has
+    // the flag (shouldn't normally happen since the Settings UI marks
+    // the first one default), we fall back to the first entry so the
+    // PDF isn't empty when there's clearly a bank configured.
+    const defaultBank =
+      (settings?.bankAccounts || []).find((b) => b.isDefault) ||
+      (settings?.bankAccounts || [])[0] ||
+      null;
 
     // Also fetch the linked CNs and receipts for the trail
     const [linkedCNs, linkedReceipts] = await Promise.all([
@@ -389,6 +522,9 @@ router.get("/:id", async (req, res) => {
 
     res.json({
       invoice: enriched,
+      company,
+      settings, // full AccountantSettings doc (singleton)
+      defaultBank, // bankAccounts entry with isDefault:true (or first)
       linkedCreditNotes: linkedCNs,
       linkedReceipts,
     });

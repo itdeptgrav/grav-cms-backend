@@ -54,20 +54,29 @@ function orgFilter(req) {
 
 // Re-implements the voucher balance application from tallyVouchers.js so we
 // don't depend on its internals. direction = +1 for posting, -1 for unposting.
+//
+// Note: we read entry.ledgerId OR entry.ledger because older drafts (saved
+// before the schema rename) still carry `ledger` instead of `ledgerId`.
+// Without this fallback, approving an older draft silently fails to apply
+// the balance update — voucher posts but ledger balances don't move.
 async function applyLedgerBalances(voucher, direction, session) {
   const ops = [];
   for (const entry of voucher.ledgerEntries) {
+    const lid = entry.ledgerId || entry.ledger;
+    if (!lid) continue;
     const delta = (entry.signedAmount || 0) * direction;
     ops.push({
       updateOne: {
-        filter: { _id: entry.ledgerId },
+        filter: { _id: lid },
         update: { $inc: { currentBalance: delta } },
       },
     });
   }
   if (ops.length) await TallyLedger.bulkWrite(ops, { session });
   for (const entry of voucher.ledgerEntries) {
-    const led = await TallyLedger.findById(entry.ledgerId).session(session);
+    const lid = entry.ledgerId || entry.ledger;
+    if (!lid) continue;
+    const led = await TallyLedger.findById(lid).session(session);
     if (led) {
       led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
       await led.save({ session });
@@ -166,7 +175,16 @@ async function applyApprovedAction(reqDoc, approver) {
     }
   }
 
-  // Add more kinds here as you migrate modules to the approval flow:
+  // Add more kinds here as you migrate modules to the approval flow.
+  //
+  // NOTE: cashflow-adjustments and ledger-reclass have their own
+  // approve/reject endpoints under /cashflow-adjustments/:id/approve
+  // and /ledger-reclass/:id/approve respectively. They are NOT queued
+  // through this unified ApprovalRequest collection — they live in
+  // their own collections and use orgAuth + role checks directly.
+  // If you want a single unified queue UI later, the simplest path is
+  // to write a thin "show me everything pending" endpoint that fans
+  // out reads to all three collections; the writes stay specialised.
   //
   //   if (kind === "ledger" && action === "update") {
   //     await TallyLedger.findByIdAndUpdate(target.id, payload);

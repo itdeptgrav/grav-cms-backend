@@ -37,6 +37,10 @@ router.get("/_health", (req, res) => {
       "GET  /tally/import/sessions?companyId=...",
       "GET  /tally/reports/trial-balance?companyId=...",
       "GET  /reports/gst",
+      "GET  /pins?entityType=...",
+      "GET  /priorities?entityType=...",
+      "GET  /cashflow-adjustments?periodStart=...",
+      "GET  /ledger-reclass/pending",
     ],
   });
 });
@@ -73,6 +77,22 @@ const mounts = [
   ["/tally/import", "./Accountant_Routes/tallyImport"],
   ["/tally/reports", "./Accountant_Routes/tallyReports"],
   ["/vouchers", "./Accountant_Routes/tallyVouchers"],
+
+  // === Generic UI persistence (every list page uses these) ===
+  // pins   → "pin this row to top" (star button)
+  // priorities → "drag-reorder these rows" (grip button)
+  // Without these mounted, pin/reorder state silently fails to persist
+  // across page reloads — backs the usePins / usePriorities hooks.
+  ["/pins", "./Accountant_Routes/pinsRoutes"],
+  ["/priorities", "./Accountant_Routes/prioritiesRoutes"],
+
+  // === Approval workflows outside /approvals ===
+  // cashflow-adjustments backs the manual "Particulars" rows on the
+  // Cash Flow report — has its own approve/reject endpoints.
+  // ledger-reclass backs the group-reorder / ledger-move proposals
+  // raised from CoA, BS, P&L, TB, and Day Book pages.
+  ["/cashflow-adjustments", "./Accountant_Routes/cashflowAdjustmentsRoutes"],
+  ["/ledger-reclass", "./Accountant_Routes/ledgerreclassRoutes"],
 ];
 
 let mounted = 0;
