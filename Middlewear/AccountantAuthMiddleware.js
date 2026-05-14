@@ -1,45 +1,38 @@
 // Middlewear/AccountantAuthMiddleware.js
 //
-// Accountant auth middleware. Handles JWT extraction from cookies (with or
-// without cookie-parser middleware) and Bearer headers. Has a DEV BYPASS
-// flag for local debugging when login isn't yet wired up.
+// LEGACY accountant auth middleware. Handles JWT extraction from cookies
+// (with or without cookie-parser) and Bearer headers. Has a DEV BYPASS
+// flag for local debugging.
 //
 // HISTORY:
-//   This file is the LEGACY entry-point. The new sub-account system
+//   This file is the LEGACY entry-point. The newer sub-account system
 //   (organization + roles: owner/approver/editor/viewer) lives in
-//   AccountantOrgAuthMiddleware.js. Both must coexist for two reasons:
+//   AccountantOrgAuthMiddleware.js. Both must coexist:
 //
 //     1. Existing accountant routes import { accountantAuth } from here
 //        and we don't want to rewrite every route.
 //     2. The main GRAV CMS login also issues JWTs that we need to keep
 //        accepting (for backwards-compat).
 //
-//   So this file was rewritten to accept BOTH token formats:
+//   So this file accepts BOTH token formats:
 //     - new tokens (with organizationId + role in {owner, approver,
-//       editor, viewer}) → read from `accountant_token` cookie, with
-//       priority over the legacy cookie names
+//       editor, viewer}) → read from `accountant_token` cookie
 //     - legacy tokens (role in {accountant, admin, accountant_viewer})
 //       → read from auth_token / token / jwt cookies
 //
 //   When a new-system token is used, req.user is populated with the
 //   new user's id/role/email PLUS a `permissions` object so old routes
-//   can opt-in to fine-grained gating if they want.
+//   can opt-in to fine-grained gating.
 //
-// Exports (unchanged from before):
-//   - accountantAuth         → require role: accountant or admin OR any
-//                              new-system role (so editors/viewers can
-//                              also access legacy routes; routes that
-//                              need to restrict by permission should
-//                              check req.user.permissions themselves)
-//   - accountantReadOnlyAuth → as above plus accountant_viewer
-//   - adminOnlyAuth          → require role: admin or owner
-//   - withCompanyScope       → injects req.companyId
-//   - verifyToken            → raw JWT verifier (throws on failure)
-//   - makeAuth               → factory for custom role lists
+// MODEL REFERENCES:
+//   This file references the Activity-Log model. AFTER the Acc_ rename,
+//   the model name is `Acc_ActivityLog` (formerly `AccountantActivityLog`
+//   / `ActivityLog`). We probe both for backward-compat in case any old
+//   code still registers the legacy name on boot, but the canonical
+//   name is `Acc_ActivityLog`.
 //
-// DEV BYPASS — set ACCOUNTANT_AUTH_BYPASS=true in .env to skip auth checks
-// during local development. This injects a fake admin user. NEVER use in
-// production.
+// DEV BYPASS — set ACCOUNTANT_AUTH_BYPASS=true in .env to skip auth
+// during local development. Injects a fake admin user. NEVER use in prod.
 
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
@@ -76,20 +69,17 @@ function extractToken(req) {
   //   3. token / jwt        — older variants
   //   4. Authorization: Bearer
 
-  // 1. Try cookie-parser-populated req.cookies
   if (req.cookies?.accountant_token) return req.cookies.accountant_token;
   if (req.cookies?.auth_token) return req.cookies.auth_token;
   if (req.cookies?.token) return req.cookies.token;
   if (req.cookies?.jwt) return req.cookies.jwt;
 
-  // 2. Fallback: parse the raw cookie header ourselves
   const raw = parseCookieHeader(req.headers?.cookie || "");
   if (raw.accountant_token) return raw.accountant_token;
   if (raw.auth_token) return raw.auth_token;
   if (raw.token) return raw.token;
   if (raw.jwt) return raw.jwt;
 
-  // 3. Authorization: Bearer …
   const authHeader = req.headers?.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
     return authHeader.slice(7);
@@ -134,10 +124,6 @@ function verifyToken(req) {
 /* ------------------------------------------------------------------ */
 /* Role compatibility map                                              */
 /* ------------------------------------------------------------------ */
-// New roles → are they accepted by routes that ask for legacy roles?
-// The answer: yes for ALL of them. Old routes don't care about edit vs
-// view; routes that want to block viewers should check
-// req.user.permissions.canEdit themselves.
 
 const NEW_ROLES = ["owner", "approver", "editor", "viewer"];
 
@@ -145,7 +131,6 @@ function isNewRole(role) {
   return NEW_ROLES.includes(role);
 }
 
-// Compute the permissions object for a new-system role.
 function newRolePermissions(role) {
   const p = {
     canView: true,
@@ -170,8 +155,6 @@ function newRolePermissions(role) {
   return p;
 }
 
-// Compute permissions for legacy roles. Legacy `accountant` had full
-// rights; `accountant_viewer` was read-only; `admin` had everything.
 function legacyRolePermissions(role) {
   const p = {
     canView: true,
@@ -195,15 +178,9 @@ function legacyRolePermissions(role) {
 /* ------------------------------------------------------------------ */
 /* Role-checking factory                                              */
 /* ------------------------------------------------------------------ */
-//
-// `allowedRoles` is the original list of legacy roles a route asks for.
-// We extend it so that ANY new-system role is also implicitly accepted
-// — letting editors/viewers reach old read-paths. Routes that want to
-// gate writes should inspect req.user.permissions.canEdit themselves.
 
 function makeAuth(allowedRoles = []) {
   return (req, res, next) => {
-    // DEV BYPASS — inject fake admin
     if (DEV_BYPASS) {
       req.user = {
         id: "000000000000000000000001",
@@ -221,11 +198,6 @@ function makeAuth(allowedRoles = []) {
       const decoded = verifyToken(req);
       const role = decoded.role;
 
-      // Decide acceptance:
-      //   - if role is a new-system role → accept (we'll set permissions
-      //     so routes can self-gate)
-      //   - if role is in the legacy allow-list → accept
-      //   - else → 403
       const isNew = isNewRole(role);
       const allowedExplicit =
         allowedRoles.length === 0 || allowedRoles.includes(role);
@@ -297,13 +269,20 @@ function withCompanyScope(req, res, next) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Activity log helper (no-op if model missing)                       */
+/* Activity log helper                                                */
 /* ------------------------------------------------------------------ */
+//
+// After the Acc_ rename, the canonical model name is `Acc_ActivityLog`.
+// We also probe `ActivityLog` for backwards compat with any old code
+// that might still register that name. If neither model is registered,
+// this is a silent no-op — activity logging is best-effort.
 
 function logAccountantActivity(action) {
   return async (req, res, next) => {
     try {
-      const ActivityLog = mongoose.models.ActivityLog;
+      const ActivityLog =
+        mongoose.models.Acc_ActivityLog || mongoose.models.ActivityLog || null;
+
       if (ActivityLog && req.user) {
         ActivityLog.create({
           userId: req.user.id,
