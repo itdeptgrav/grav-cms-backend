@@ -748,7 +748,7 @@ app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 
 
 const hrSopRoutes  = require("./routes/HrRoutes/hrSopRoutes");
-const ceoSopRoutes = require("./routes/CEO_routes/ceoSopRoutes");
+const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 
 app.use("/api/hr/sop",  hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
