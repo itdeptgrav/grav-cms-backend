@@ -7,6 +7,7 @@ const {
   notifyManagerOnLeaveApply,
   notifySecondaryOnPrimaryApproval,
   notifyEmployeeOnLeaveAction,
+  notifyManagerOnWithdrawRequest,
 } = require("../../services/leaveNotification.service");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 
@@ -250,7 +251,10 @@ router.get("/calendar", AllEmployeeAppMiddleware, async (req, res) => {
         ? hh || { date: ds, name: "Sunday", type: "company" }
         : hh;
       const lv = ml.find(
-        (a) => a.fromDate <= ds && a.toDate >= ds && a.status === "hr_approved",
+        (a) =>
+          a.fromDate <= ds &&
+          a.toDate >= ds &&
+          ["hr_approved", "withdraw_pending"].includes(a.status),
       );
       cal.push({
         date: ds,
@@ -316,6 +320,191 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
         .sort({ createdAt: -1 })
         .lean(),
     });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANAGER WITHDRAW APPROVE/REJECT
+//  When employee requests withdrawal of an hr_approved leave
+// ═══════════════════════════════════════════════════════════════════════════════
+router.patch(
+  "/manager/:id/approve-withdraw",
+  AllEmployeeAppMiddleware,
+  async (req, res) => {
+    try {
+      const myId = req.user.id;
+      const a = await LeaveApplication.findOne({
+        _id: req.params.id,
+        status: "withdraw_pending",
+        "managersNotified.managerId": myId,
+      });
+      if (!a)
+        return res.status(404).json({
+          success: false,
+          message: "Not found or not a withdrawal request",
+        });
+
+      // Refund the paidDays back to balance
+      if (a.leaveType !== "LOP") {
+        const refundDays = a.paidDays != null ? a.paidDays : a.totalDays;
+        if (refundDays > 0) {
+          const year = new Date(a.fromDate).getFullYear();
+          const config = await LeaveConfig.getConfig();
+          await LeaveBalance.findOneAndUpdate(
+            { employeeId: a.employeeId, year },
+            {
+              $setOnInsert: {
+                employeeId: a.employeeId,
+                biometricId: a.biometricId || "",
+                year,
+                entitlement: {
+                  CL: config.clPerYear,
+                  SL: config.slPerYear,
+                  PL: 0,
+                },
+                consumed: { CL: 0, SL: 0, PL: 0 },
+              },
+            },
+            { upsert: true },
+          );
+          const bal = await LeaveBalance.findOne({
+            employeeId: a.employeeId,
+            year,
+          });
+          if (bal) {
+            bal.consumed[a.leaveType] = Math.max(
+              0,
+              (bal.consumed[a.leaveType] || 0) - refundDays,
+            );
+            await bal.save();
+            console.log(
+              `[WITHDRAW-APPROVE] Refunded ${refundDays} ${a.leaveType} for ${a.employeeName}`,
+            );
+          }
+        }
+      }
+
+      a.status = "cancelled";
+      a.cancelledBy = myId;
+      a.cancelledAt = new Date();
+      a.hrRemarks = `Withdrawal approved by manager`;
+      await a.save();
+      notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
+        a,
+        "withdrawn",
+        "Manager approved your withdrawal; balance restored.",
+      ).catch((e) => console.warn("[PUSH-WITHDRAW-APPROVE]", e.message));
+
+      // Notify employee
+      try {
+        const io = req.app.get("io");
+        if (io)
+          io.to(String(a.employeeId)).emit("leave_notification", {
+            type: "withdraw_approved",
+            leaveId: a._id.toString(),
+            leaveType: a.leaveType,
+            message: `Your ${a.leaveType} withdrawal (${a.fromDate}–${a.toDate}) has been approved. Balance restored.`,
+            timestamp: new Date().toISOString(),
+          });
+      } catch (_) {}
+
+      res.json({
+        success: true,
+        data: a,
+        message: "Withdrawal approved. Leave balance restored.",
+      });
+    } catch (e) {
+      res.status(500).json({ success: false, message: e.message });
+    }
+  },
+);
+
+router.patch(
+  "/manager/:id/reject-withdraw",
+  AllEmployeeAppMiddleware,
+  async (req, res) => {
+    try {
+      const myId = req.user.id;
+      const a = await LeaveApplication.findOne({
+        _id: req.params.id,
+        status: "withdraw_pending",
+        "managersNotified.managerId": myId,
+      });
+      if (!a)
+        return res.status(404).json({ success: false, message: "Not found" });
+
+      // Revert to hr_approved
+      a.status = "hr_approved";
+      a.hrRemarks = `Withdrawal rejected by manager: ${req.body.remarks || ""}`;
+      await a.save();
+
+      notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
+        a,
+        "rejected",
+        req.body.remarks ||
+          "Manager rejected withdrawal — leave remains active",
+      ).catch((e) => console.warn("[PUSH-WITHDRAW-REJECT]", e.message));
+
+      try {
+        const io = req.app.get("io");
+        if (io)
+          io.to(String(a.employeeId)).emit("leave_notification", {
+            type: "withdraw_rejected",
+            leaveId: a._id.toString(),
+            leaveType: a.leaveType,
+            message: `Your ${a.leaveType} withdrawal request was not approved.`,
+            timestamp: new Date().toISOString(),
+          });
+      } catch (_) {}
+
+      res.json({
+        success: true,
+        data: a,
+        message: "Withdrawal request rejected. Leave remains active.",
+      });
+    } catch (e) {
+      res.status(500).json({ success: false, message: e.message });
+    }
+  },
+);
+
+router.get(
+  "/manager/withdraw-pending",
+  AllEmployeeAppMiddleware,
+  async (req, res) => {
+    try {
+      const res2 = await LeaveApplication.find({
+        status: "withdraw_pending",
+        "managersNotified.managerId": req.user.id,
+      })
+        .sort({ updatedAt: -1 })
+        .lean();
+      res.json({ success: true, data: res2 });
+    } catch (e) {
+      res.status(500).json({ success: false, message: e.message });
+    }
+  },
+);
+
+router.get("/manager/history", AllEmployeeAppMiddleware, async (req, res) => {
+  try {
+    const myId = req.user.id;
+
+    // Query directly via managersNotified — avoids ObjectId/string type mismatch
+    // on Employee.primaryManager.managerId vs req.user.id
+    const history = await LeaveApplication.find({
+      "managersNotified.managerId": myId,
+      status: { $in: ["hr_approved", "manager_approved"] },
+    })
+      .sort({ updatedAt: -1, fromDate: -1 })
+      .limit(100)
+      .lean();
+
+    res.json({ success: true, data: history });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -934,14 +1123,64 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
     });
     if (!a)
       return res.status(404).json({ success: false, message: "Not found" });
-    if (!["pending", "manager_approved"].includes(a.status))
-      return res.status(400).json({ success: false, message: "Cannot cancel" });
+
+    // Block only truly terminal statuses
+    if (["hr_rejected", "manager_rejected", "cancelled"].includes(a.status))
+      return res.status(400).json({
+        success: false,
+        message: `Cannot withdraw — leave is already ${a.status}`,
+      });
+
+    const wasApproved = a.status === "hr_approved";
+
+    if (wasApproved) {
+      // ✅ For approved leaves: set to withdraw_pending — requires manager approval
+      a.status = "withdraw_pending";
+      a.cancelReason = req.body.cancelReason || "Employee withdrawal request";
+      await a.save();
+      notifyManagerOnWithdrawRequest(a).catch((e) =>
+        console.warn("[PUSH-WITHDRAW-REQ]", e.message),
+      );
+
+      // Notify both managers via socket + push
+      try {
+        const io = req.app.get("io");
+        if (io && a.managersNotified?.length > 0) {
+          for (const mgr of a.managersNotified) {
+            if (mgr?.managerId)
+              io.to(String(mgr.managerId)).emit("leave_notification", {
+                type: "leave_withdraw_requested",
+                leaveId: a._id.toString(),
+                employeeName: a.employeeName,
+                leaveType: a.leaveType,
+                fromDate: a.fromDate,
+                toDate: a.toDate,
+                message: `${a.employeeName} requested withdrawal of ${a.leaveType} (${a.fromDate}–${a.toDate}). Please review.`,
+                timestamp: new Date().toISOString(),
+              });
+          }
+        }
+      } catch (_) {}
+
+      return res.json({
+        success: true,
+        data: a,
+        message: "Withdrawal request sent to your manager for approval.",
+      });
+    }
+
+    // For pending/manager_approved: direct cancel, no manager needed
     a.status = "cancelled";
     a.cancelledBy = req.user.id;
     a.cancelledAt = new Date();
-    a.cancelReason = req.body.cancelReason || "";
+    a.cancelReason = req.body.cancelReason || "Employee withdrawal request";
     await a.save();
-    res.json({ success: true, data: a, message: "Cancelled" });
+
+    res.json({
+      success: true,
+      data: a,
+      message: "Leave application withdrawn.",
+    });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -1210,6 +1449,14 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
     a.hrRemarks = `Edited by ${mgrName}: ${paidDays} ${nType} paid, ${lwpDays} LOP`;
 
     await a.save();
+
+    notifyEmployeeOnLeaveAction(
+      String(a.employeeId),
+      a,
+      "edited",
+      mgrName,
+    ).catch((e) => console.warn("[PUSH-EDIT]", e.message));
+
     console.log(
       `[MGR-EDIT] ${mgrName} edited leave ${a._id}: ${nType} ${nF}→${nT}, paid=${paidDays}, lwp=${lwpDays}`,
     );
@@ -1362,10 +1609,11 @@ router.patch(
           });
       } catch (_) {}
       notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
         a,
         "approved",
-        mgr?.managerName || "Manager",
-      ).catch(() => {});
+        `Approved by ${mgr?.managerName || "Manager"}`,
+      ).catch((e) => console.warn("[PUSH-APPROVE]", e.message));
       res.json({
         success: true,
         data: a,
@@ -1424,10 +1672,12 @@ router.patch(
           });
       } catch (_) {}
       notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
         a,
         "rejected",
-        mgr?.managerName || "Manager",
-      ).catch(() => {});
+        remarks || `Rejected by ${mgr?.managerName || "Manager"}`,
+      ).catch((e) => console.warn("[PUSH-REJECT]", e.message));
+
       res.json({ success: true, data: a, message: "Rejected" });
     } catch (e) {
       res.status(500).json({ success: false, message: e.message });
