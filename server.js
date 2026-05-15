@@ -19,6 +19,7 @@ const allowedOrigins = [
   "http://localhost:8081",
   "http://localhost:3001",
   "https://grav-cms.vercel.app",
+  "http://10.119.220.161:3000",
   "https://cms.grav.in",
   "https://cowork.grav.in",
   "https://customer.grav.in",
@@ -741,12 +742,10 @@ app.use("/api/employee", pushTokenRoutes);
 const barcodeRoutes = require("./routes/CMS_Routes/Inventory/Operations/barcodes");
 app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 
-
-
-const hrSopRoutes  = require("./routes/HrRoutes/hrSopRoutes");
+const hrSopRoutes = require("./routes/HrRoutes/hrSopRoutes");
 const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 
-app.use("/api/hr/sop",  hrSopRoutes);
+app.use("/api/hr/sop", hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
 
 /* =====================
@@ -982,23 +981,14 @@ console.log("[accountant] mounting routes…");
 //   • /auth has public endpoints (login, accept-invite, bootstrap) that
 //     must work without prior auth
 //   • /team and /approvals self-protect with orgAuth internally
-app.use(
-  "/api/accountant/auth",
-  require("./routes/Accountant_Routes/Acc_auth"),
-);
-app.use(
-  "/api/accountant/team",
-  require("./routes/Accountant_Routes/Acc_team"),
-);
+app.use("/api/accountant/auth", require("./routes/Accountant_Routes/Acc_auth"));
+app.use("/api/accountant/team", require("./routes/Accountant_Routes/Acc_team"));
 app.use(
   "/api/accountant/approvals",
   require("./routes/Accountant_Routes/Acc_approvals"),
 );
 
-app.use(
-  "/api/accountant/pins",
-  require("./routes/Accountant_Routes/Acc_pins"),
-);
+app.use("/api/accountant/pins", require("./routes/Accountant_Routes/Acc_pins"));
 
 app.use(
   "/api/accountant/priorities",
