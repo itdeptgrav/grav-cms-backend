@@ -761,6 +761,10 @@ app.use("/api/customer/requests", customerRequestsRoutes);
 const customerProfileRoutes = require("./routes/Customer_Routes/Profile.js");
 app.use("/api/customer/profile", customerProfileRoutes);
 
+
+const sopRoutes = require("./routes/soproutes/soproute");
+app.use("/cowork/sop", sopRoutes);
+
 // Add this to your server.js in the CMS ROUTES section
 const customerStockItemsRoutes = require("./routes/Customer_Routes/StockItems");
 app.use("/api/customer/stock-items", customerStockItemsRoutes);
@@ -820,6 +824,9 @@ app.use(
 
 const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems");
 app.use("/api/cms/stock-items", stockItemsRoutes);
+
+const StoreRoutes = require("./routes/CMS_Routes/Store/storeRoutes.js");
+app.use("/api/cms/store", StoreRoutes);
 
 // Operations Category
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
