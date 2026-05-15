@@ -19,6 +19,7 @@ const allowedOrigins = [
   "http://localhost:8081",
   "http://localhost:3001",
   "https://grav-cms.vercel.app",
+  "http://10.119.220.161:3000",
   "https://cms.grav.in",
   "https://cowork.grav.in",
   "https://customer.grav.in",
@@ -439,7 +440,7 @@ connectDB().then(async () => {
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
 const HRDepartment = require("./models/HRDepartment");
-const AccountantDepartment = require("./models/Accountant_model/AccountantDepartment.js");
+const AccountantDepartment = require("./models/Accountant_model/Acc_Department.js");
 
 const PackagingDispatchDepartment = require("./models/PackagingDispatchDepartment");
 
@@ -741,12 +742,10 @@ app.use("/api/employee", pushTokenRoutes);
 const barcodeRoutes = require("./routes/CMS_Routes/Inventory/Operations/barcodes");
 app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 
-
-
-const hrSopRoutes  = require("./routes/HrRoutes/hrSopRoutes");
+const hrSopRoutes = require("./routes/HrRoutes/hrSopRoutes");
 const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 
-app.use("/api/hr/sop",  hrSopRoutes);
+app.use("/api/hr/sop", hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
 
 /* =====================
@@ -989,119 +988,110 @@ console.log("[accountant] mounting routes…");
 //   • /auth has public endpoints (login, accept-invite, bootstrap) that
 //     must work without prior auth
 //   • /team and /approvals self-protect with orgAuth internally
-app.use(
-  "/api/accountant/auth",
-  require("./routes/Accountant_Routes/accountantAuthRoutes"),
-);
-app.use(
-  "/api/accountant/team",
-  require("./routes/Accountant_Routes/teamRoutes"),
-);
+app.use("/api/accountant/auth", require("./routes/Accountant_Routes/Acc_auth"));
+app.use("/api/accountant/team", require("./routes/Accountant_Routes/Acc_team"));
 app.use(
   "/api/accountant/approvals",
-  require("./routes/Accountant_Routes/approvalRoutes"),
+  require("./routes/Accountant_Routes/Acc_approvals"),
 );
 
-app.use(
-  "/api/accountant/pins",
-  require("./routes/Accountant_Routes/pinsRoutes"),
-);
+app.use("/api/accountant/pins", require("./routes/Accountant_Routes/Acc_pins"));
 
 app.use(
   "/api/accountant/priorities",
-  require("./routes/Accountant_Routes/prioritiesRoutes"),
+  require("./routes/Accountant_Routes/Acc_priorities"),
 );
 
 app.use(
   "/api/accountant/cashflow-adjustments",
-  require("./routes/Accountant_Routes/cashflowAdjustmentsRoutes"),
+  require("./routes/Accountant_Routes/Acc_cashflowAdjustments"),
 );
 
 app.use(
   "/api/accountant/ledger-reclass",
-  require("./routes/Accountant_Routes/ledgerreclassRoutes.js"),
+  require("./routes/Accountant_Routes/Acc_ledgerReclass"),
 );
 
 // ── Operational routes ────────────────────────────────────────────────
 app.use(
   "/api/accountant/dashboard",
-  require("./routes/Accountant_Routes/dashboard"),
+  require("./routes/Accountant_Routes/Acc_dashboard"),
 );
 app.use(
   "/api/accountant/expenses",
-  require("./routes/Accountant_Routes/expenses"),
+  require("./routes/Accountant_Routes/Acc_expenses"),
 );
 app.use(
   "/api/accountant/invoices",
-  require("./routes/Accountant_Routes/invoices"),
+  require("./routes/Accountant_Routes/Acc_invoices"),
 );
 app.use(
   "/api/accountant/proforma-invoices",
-  require("./routes/Accountant_Routes/proformaInvoices"),
+  require("./routes/Accountant_Routes/Acc_proformaInvoices"),
 );
 app.use(
   "/api/accountant/vendors",
-  require("./routes/Accountant_Routes/vendors"),
+  require("./routes/Accountant_Routes/Acc_vendors"),
 );
 app.use(
   "/api/accountant/customers",
-  require("./routes/Accountant_Routes/customersRoutes"),
+  require("./routes/Accountant_Routes/Acc_customers"),
 );
 app.use(
   "/api/accountant/journal-entries",
-  require("./routes/Accountant_Routes/journalEntries"),
+  require("./routes/Accountant_Routes/Acc_journalEntries"),
 );
 app.use(
   "/api/accountant/payroll",
-  require("./routes/Accountant_Routes/payroll"),
+  require("./routes/Accountant_Routes/Acc_payroll"),
 );
 app.use(
   "/api/accountant/settings",
-  require("./routes/Accountant_Routes/settings"),
+  require("./routes/Accountant_Routes/Acc_settings"),
 );
 app.use(
   "/api/accountant/tax-filings",
-  require("./routes/Accountant_Routes/taxFilings"),
+  require("./routes/Accountant_Routes/Acc_taxFilings"),
 );
 app.use(
   "/api/accountant/bank-transactions",
-  require("./routes/Accountant_Routes/bankTransactions"),
+  require("./routes/Accountant_Routes/Acc_bankTransactions"),
 );
 
 app.use(
   "/api/accountant/setu-aa",
-  require("./routes/Accountant_Routes/setuAA"),
+  require("./routes/Accountant_Routes/Acc_setuAA"),
 );
 
 app.use(
   "/api/accountant/budgets",
-  require("./routes/Accountant_Routes/budgets"),
+  require("./routes/Accountant_Routes/Acc_budgets"),
 );
 app.use(
   "/api/accountant/reports",
-  require("./routes/Accountant_Routes/reports"),
+  require("./routes/Accountant_Routes/Acc_reports"),
 );
 
 // ── Books / Vouchers / Import ─────────────────────────────────────────
 app.use(
   "/api/accountant/chart-of-accounts",
-  require("./routes/Accountant_Routes/tallyChartOfAccounts"),
+  require("./routes/Accountant_Routes/Acc_chartOfAccounts"),
 );
 app.use(
   "/api/accountant/tally/companies",
-  require("./routes/Accountant_Routes/tallyCompanies"),
+  require("./routes/Accountant_Routes/Acc_companies"),
 );
 app.use(
   "/api/accountant/tally/import",
-  require("./routes/Accountant_Routes/tallyImport"),
+  require("./routes/Accountant_Routes/Acc_import"),
 );
 app.use(
   "/api/accountant/tally/reports",
-  require("./routes/Accountant_Routes/tallyReports"),
+  require("./routes/Accountant_Routes/Acc_books"),
 );
 app.use(
   "/api/accountant/vouchers",
-  require("./routes/Accountant_Routes/tallyVouchers"),
+  require("./routes/Accountant_Routes/Acc_vouchers"),
 );
 
 // ── Health probe (open in browser to verify mounting) ────────────────

@@ -1,172 +1,193 @@
-// services/leaveNotification.service.js
-const { Expo } = require("expo-server-sdk");
+/**
+ * services/leaveNotification.service.js
+ * Push notification handlers for leave events.
+ * Sends FCM web push (background/foreground) to employees and managers.
+ */
+
 const Employee = require("../models/Employee");
+const { sendWebPush, sendWebPushToMany } = require("../utils/sendWebPush");
 
-const expo = new Expo();
+/**
+ * Notify manager(s) when an employee applies for leave.
+ */
+async function notifyManagerOnLeaveApply(employee, application) {
+  try {
+    const managersNotified = application.managersNotified || [];
+    if (!managersNotified.length) return;
 
-const LEAVE_TYPE_LABELS = {
-    CL: "Casual Leave", SL: "Sick Leave",
-    PL: "Privilege Leave", EL: "Earned Leave",
-};
+    const managerIds = managersNotified.map((m) => m.managerId).filter(Boolean);
+    if (!managerIds.length) return;
 
-// ══════════════════════════════════════════════════════════════════════════
-// 1. Employee applies → Notify their PRIMARY manager
-// ══════════════════════════════════════════════════════════════════════════
-async function notifyManagerOnLeaveApply(employee, leaveApp) {
-    try {
-        const managerId = employee.primaryManager?.managerId;
-        if (!managerId) {
-            console.log("[LEAVE-PUSH] No primary manager for", employee.firstName);
-            return { sent: false, reason: "no_manager" };
-        }
+    const empName = `${employee.firstName} ${employee.lastName || ""}`.trim();
+    const fromDate = application.fromDate
+      ? new Date(application.fromDate).toLocaleDateString("en-IN", {
+          day: "2-digit",
+          month: "short",
+        })
+      : "—";
+    const toDate = application.toDate
+      ? new Date(application.toDate).toLocaleDateString("en-IN", {
+          day: "2-digit",
+          month: "short",
+        })
+      : "—";
 
-        const manager = await Employee.findById(managerId)
-            .select("firstName lastName pushToken").lean();
-        if (!manager?.pushToken || !Expo.isExpoPushToken(manager.pushToken)) {
-            console.log(`[LEAVE-PUSH] Manager ${manager?.firstName || managerId} has no valid push token`);
-            return { sent: false, reason: "no_token" };
-        }
-
-        const empName = [employee.firstName, employee.lastName].filter(Boolean).join(" ");
-        const leaveLabel = LEAVE_TYPE_LABELS[leaveApp.leaveType] || leaveApp.leaveType;
-        const days = leaveApp.totalDays || 1;
-
-        const receipts = await expo.sendPushNotificationsAsync([{
-            to: manager.pushToken,
-            sound: "default",
-            title: "Leave Request",
-            body: `${empName} has applied for ${leaveLabel} (${days} day${days > 1 ? "s" : ""}) from ${leaveApp.fromDate} to ${leaveApp.toDate || leaveApp.fromDate}.`,
-            data: {
-                type: "leave_request",
-                leaveId: String(leaveApp._id),
-                employeeId: String(employee._id),
-                employeeName: empName,
-                leaveType: leaveApp.leaveType,
-                fromDate: leaveApp.fromDate,
-                toDate: leaveApp.toDate,
-                totalDays: days,
-                screen: "Leave",
-            },
-            categoryId: "leave_action",
-            channelId: "general",
-            priority: "high",
-            badge: 1,
-        }]);
-
-        const ok = receipts[0]?.status === "ok";
-        console.log(`[LEAVE-PUSH] Manager ${manager.firstName}: ${ok ? "sent" : "failed"}`);
-        if (!ok && receipts[0]?.details?.error === "DeviceNotRegistered") {
-            await Employee.findByIdAndUpdate(managerId, { pushToken: null }).catch(() => { });
-        }
-        return { sent: ok };
-    } catch (err) {
-        console.error("[LEAVE-PUSH] notifyManager error:", err.message);
-        return { sent: false, error: err.message };
-    }
+    await sendWebPushToMany({
+      employeeIds: managerIds,
+      title: "🏖️ Leave Application",
+      body: `${empName} has applied for ${application.leaveType || "leave"} from ${fromDate} to ${toDate}.`,
+      type: "leave_applied",
+      url: "/leave",
+      extra: {
+        leaveId: String(application._id || ""),
+        applicantId: String(employee._id || ""),
+      },
+    });
+  } catch (e) {
+    console.error("[LEAVE-NOTIF] notifyManagerOnLeaveApply error:", e.message);
+  }
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// 2. Primary approved → Notify SECONDARY manager (needs their approval)
-// ══════════════════════════════════════════════════════════════════════════
-async function notifySecondaryOnPrimaryApproval(leaveApp) {
-    try {
-        const secEntry = (leaveApp.managersNotified || []).find(m => m.type === "secondary");
-        if (!secEntry?.managerId) return { sent: false, reason: "no_secondary" };
+/**
+ * Notify secondary approver when primary approves (multi-level approval).
+ */
+async function notifySecondaryOnPrimaryApproval(employee, application) {
+  try {
+    const managersNotified = application.managersNotified || [];
+    // Find managers who haven't approved yet
+    const pendingManagers = managersNotified
+      .filter((m) => m.status === "pending")
+      .map((m) => m.managerId)
+      .filter(Boolean);
 
-        const secMgr = await Employee.findById(secEntry.managerId)
-            .select("firstName lastName pushToken").lean();
-        if (!secMgr?.pushToken || !Expo.isExpoPushToken(secMgr.pushToken)) {
-            console.log(`[LEAVE-PUSH] Secondary ${secMgr?.firstName || secEntry.managerId} has no valid token`);
-            return { sent: false, reason: "no_token" };
-        }
+    if (!pendingManagers.length) return;
 
-        const receipts = await expo.sendPushNotificationsAsync([{
-            to: secMgr.pushToken,
-            sound: "default",
-            title: "Leave Pending Your Approval",
-            body: `${leaveApp.employeeName}'s ${LEAVE_TYPE_LABELS[leaveApp.leaveType] || leaveApp.leaveType} (${leaveApp.fromDate} to ${leaveApp.toDate}) needs your approval.`,
-            data: {
-                type: "leave_request",
-                leaveId: String(leaveApp._id),
-                employeeName: leaveApp.employeeName,
-                leaveType: leaveApp.leaveType,
-                fromDate: leaveApp.fromDate,
-                toDate: leaveApp.toDate,
-                totalDays: leaveApp.totalDays,
-                screen: "Leave",
-            },
-            categoryId: "leave_action",
-            channelId: "general",
-            priority: "high",
-            badge: 1,
-        }]);
-
-        const ok = receipts[0]?.status === "ok";
-        console.log(`[LEAVE-PUSH] Secondary ${secMgr.firstName}: ${ok ? "sent" : "failed"}`);
-        if (!ok && receipts[0]?.details?.error === "DeviceNotRegistered") {
-            await Employee.findByIdAndUpdate(secEntry.managerId, { pushToken: null }).catch(() => { });
-        }
-        return { sent: ok };
-    } catch (err) {
-        console.error("[LEAVE-PUSH] notifySecondary error:", err.message);
-        return { sent: false, error: err.message };
-    }
+    const empName = `${employee.firstName} ${employee.lastName || ""}`.trim();
+    await sendWebPushToMany({
+      employeeIds: pendingManagers,
+      title: "🏖️ Leave Pending Your Approval",
+      body: `${empName}'s leave application is awaiting your approval.`,
+      type: "leave_applied",
+      url: "/leave",
+    });
+  } catch (e) {
+    console.error(
+      "[LEAVE-NOTIF] notifySecondaryOnPrimaryApproval error:",
+      e.message,
+    );
+  }
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// 3. Manager approves/rejects → Notify the employee
-// ══════════════════════════════════════════════════════════════════════════
-async function notifyEmployeeOnLeaveAction(leaveApp, action, managerName) {
-    try {
-        const empId = leaveApp.employeeId?._id || leaveApp.employeeId;
-        if (!empId) return { sent: false, reason: "no_employee_id" };
-
-        const employee = await Employee.findById(empId)
-            .select("firstName lastName pushToken").lean();
-        if (!employee?.pushToken || !Expo.isExpoPushToken(employee.pushToken)) {
-            console.log(`[LEAVE-PUSH] Employee ${employee?.firstName || empId} has no valid token`);
-            return { sent: false, reason: "no_token" };
-        }
-
-        const leaveLabel = LEAVE_TYPE_LABELS[leaveApp.leaveType] || leaveApp.leaveType;
-        const isApproved = ["approve", "approved", "manager_approved", "hr_approved"].includes(action);
-
-        const title = isApproved ? "Leave Approved" : "Leave Rejected";
-        const body = isApproved
-            ? `Your ${leaveLabel} (${leaveApp.fromDate} to ${leaveApp.toDate}) has been approved${managerName ? ` by ${managerName}` : ""}. Tap to view.`
-            : `Your ${leaveLabel} (${leaveApp.fromDate} to ${leaveApp.toDate}) has been rejected${managerName ? ` by ${managerName}` : ""}. Tap to view.`;
-
-        const receipts = await expo.sendPushNotificationsAsync([{
-            to: employee.pushToken,
-            sound: "default",
-            title,
-            body,
-            data: {
-                type: "leave_action",
-                leaveId: String(leaveApp._id),
-                action: isApproved ? "approved" : "rejected",
-                screen: "Leave",
-            },
-            categoryId: "general",
-            channelId: "general",
-            priority: "high",
-            badge: 1,
-        }]);
-
-        const ok = receipts[0]?.status === "ok";
-        console.log(`[LEAVE-PUSH] Employee ${employee.firstName}: ${title} — ${ok ? "sent" : "failed"}`);
-        if (!ok && receipts[0]?.details?.error === "DeviceNotRegistered") {
-            await Employee.findByIdAndUpdate(empId, { pushToken: null }).catch(() => { });
-        }
-        return { sent: ok };
-    } catch (err) {
-        console.error("[LEAVE-PUSH] notifyEmployee error:", err.message);
-        return { sent: false, error: err.message };
+/**
+ * Notify employee when their leave is approved or rejected.
+ * action: "approved" | "rejected" | "withdrawn" | "cancelled"
+ */
+async function notifyEmployeeOnLeaveAction(arg1, arg2, arg3, arg4) {
+  try {
+    // Support both signatures:
+    //   (employeeId, application, action, reason)  ← original
+    //   (application, action, managerName)         ← leaveRoutes.js style
+    let employeeId, application, action, reason;
+    if (typeof arg1 === "string" || (arg1 && arg1._bsontype)) {
+      // Called as (employeeId, application, action, reason)
+      employeeId = arg1;
+      application = arg2;
+      action = arg3;
+      reason = arg4;
+    } else {
+      // Called as (application, action, managerName)
+      application = arg1;
+      action = arg2;
+      reason = arg3; // managerName here is treated as reason
+      employeeId = application?.employeeId;
     }
+
+    if (!employeeId || !application) return;
+
+    const { sendWebPush } = require("../utils/sendWebPush");
+
+    const actionMap = {
+      approved: { emoji: "✅", verb: "approved", type: "leave_approved" },
+      rejected: { emoji: "❌", verb: "rejected", type: "leave_rejected" },
+      withdrawn: { emoji: "↩️", verb: "withdrawn", type: "leave_withdrawn" },
+      cancelled: { emoji: "🚫", verb: "cancelled", type: "leave_cancelled" },
+      edited: { emoji: "✏️", verb: "edited", type: "leave_applied" },
+    };
+    const { emoji, verb, type } = actionMap[action] || {
+      emoji: "📋",
+      verb: action,
+      type: "leave_applied",
+    };
+
+    const fromDate = application.fromDate
+      ? new Date(application.fromDate).toLocaleDateString("en-IN", {
+          day: "2-digit",
+          month: "short",
+        })
+      : "—";
+
+    let body = `Your ${application.leaveType || "leave"} from ${fromDate} has been ${verb}.`;
+    if (reason && action === "rejected") body += ` Reason: ${reason}`;
+    if (reason && action === "edited") body += ` By: ${reason}`;
+
+    await sendWebPush({
+      employeeId: String(employeeId),
+      title: `${emoji} Leave ${verb.charAt(0).toUpperCase() + verb.slice(1)}`,
+      body,
+      type,
+      url: "/leave",
+      extra: { leaveId: String(application._id || "") },
+    });
+  } catch (e) {
+    console.error(
+      "[LEAVE-NOTIF] notifyEmployeeOnLeaveAction error:",
+      e.message,
+    );
+  }
 }
 
+// Also export a new function for withdraw-request → managers:
+async function notifyManagerOnWithdrawRequest(application) {
+  try {
+    const { sendWebPushToMany } = require("../utils/sendWebPush");
+    const managerIds = (application.managersNotified || [])
+      .map((m) => m.managerId)
+      .filter(Boolean);
+    if (!managerIds.length) return;
+
+    const fromDate = application.fromDate
+      ? new Date(application.fromDate).toLocaleDateString("en-IN", {
+          day: "2-digit",
+          month: "short",
+        })
+      : "—";
+    const toDate = application.toDate
+      ? new Date(application.toDate).toLocaleDateString("en-IN", {
+          day: "2-digit",
+          month: "short",
+        })
+      : "—";
+
+    await sendWebPushToMany({
+      employeeIds: managerIds,
+      title: "↩️ Leave Withdrawal Request",
+      body: `${application.employeeName || "An employee"} requested withdrawal of ${application.leaveType || "leave"} (${fromDate} → ${toDate}). Please review.`,
+      type: "leave_withdrawn",
+      url: "/leave",
+      extra: { leaveId: String(application._id || "") },
+    });
+  } catch (e) {
+    console.error(
+      "[LEAVE-NOTIF] notifyManagerOnWithdrawRequest error:",
+      e.message,
+    );
+  }
+}
+
+// Update module.exports to include the new helper:
 module.exports = {
-    notifyManagerOnLeaveApply,
-    notifySecondaryOnPrimaryApproval,
-    notifyEmployeeOnLeaveAction,
+  notifyManagerOnLeaveApply,
+  notifySecondaryOnPrimaryApproval,
+  notifyEmployeeOnLeaveAction,
+  notifyManagerOnWithdrawRequest,
 };
