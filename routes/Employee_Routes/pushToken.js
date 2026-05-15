@@ -282,20 +282,9 @@ router.post("/test-web-push", EmployeeAuthMiddleware, async (req, res) => {
         // Top-level data — SW reads these via payload.data
         data: dataPayload,
 
-        // ── Web Push (Chrome, Firefox, Edge, Android Chrome) ──
+        // ── Web Push — NO notification object (data-only prevents Chrome auto-display) ──
         webpush: {
           headers: { Urgency: "high", TTL: "0" },
-          notification: {
-            title: finalTitle,
-            body: finalBody,
-            icon: "/icon.png",
-            badge: "/icon.png",
-            requireInteraction: false,
-            vibrate: [200, 100, 200],
-            tag: `grav-test-${Date.now()}`,
-            renotify: true,
-            data: dataPayload,
-          },
           fcmOptions: { link: finalUrl },
         },
 
