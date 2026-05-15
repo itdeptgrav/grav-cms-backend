@@ -7,6 +7,7 @@ const {
   notifyManagerOnLeaveApply,
   notifySecondaryOnPrimaryApproval,
   notifyEmployeeOnLeaveAction,
+  notifyManagerOnWithdrawRequest,
 } = require("../../services/leaveNotification.service");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 
@@ -390,6 +391,12 @@ router.patch(
       a.cancelledAt = new Date();
       a.hrRemarks = `Withdrawal approved by manager`;
       await a.save();
+      notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
+        a,
+        "withdrawn",
+        "Manager approved your withdrawal; balance restored.",
+      ).catch((e) => console.warn("[PUSH-WITHDRAW-APPROVE]", e.message));
 
       // Notify employee
       try {
@@ -433,6 +440,14 @@ router.patch(
       a.status = "hr_approved";
       a.hrRemarks = `Withdrawal rejected by manager: ${req.body.remarks || ""}`;
       await a.save();
+
+      notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
+        a,
+        "rejected",
+        req.body.remarks ||
+          "Manager rejected withdrawal — leave remains active",
+      ).catch((e) => console.warn("[PUSH-WITHDRAW-REJECT]", e.message));
 
       try {
         const io = req.app.get("io");
@@ -1123,6 +1138,9 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
       a.status = "withdraw_pending";
       a.cancelReason = req.body.cancelReason || "Employee withdrawal request";
       await a.save();
+      notifyManagerOnWithdrawRequest(a).catch((e) =>
+        console.warn("[PUSH-WITHDRAW-REQ]", e.message),
+      );
 
       // Notify both managers via socket + push
       try {
@@ -1431,6 +1449,14 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
     a.hrRemarks = `Edited by ${mgrName}: ${paidDays} ${nType} paid, ${lwpDays} LOP`;
 
     await a.save();
+
+    notifyEmployeeOnLeaveAction(
+      String(a.employeeId),
+      a,
+      "edited",
+      mgrName,
+    ).catch((e) => console.warn("[PUSH-EDIT]", e.message));
+
     console.log(
       `[MGR-EDIT] ${mgrName} edited leave ${a._id}: ${nType} ${nF}→${nT}, paid=${paidDays}, lwp=${lwpDays}`,
     );
@@ -1583,10 +1609,11 @@ router.patch(
           });
       } catch (_) {}
       notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
         a,
         "approved",
-        mgr?.managerName || "Manager",
-      ).catch(() => {});
+        `Approved by ${mgr?.managerName || "Manager"}`,
+      ).catch((e) => console.warn("[PUSH-APPROVE]", e.message));
       res.json({
         success: true,
         data: a,
@@ -1645,10 +1672,12 @@ router.patch(
           });
       } catch (_) {}
       notifyEmployeeOnLeaveAction(
+        String(a.employeeId),
         a,
         "rejected",
-        mgr?.managerName || "Manager",
-      ).catch(() => {});
+        remarks || `Rejected by ${mgr?.managerName || "Manager"}`,
+      ).catch((e) => console.warn("[PUSH-REJECT]", e.message));
+
       res.json({ success: true, data: a, message: "Rejected" });
     } catch (e) {
       res.status(500).json({ success: false, message: e.message });
