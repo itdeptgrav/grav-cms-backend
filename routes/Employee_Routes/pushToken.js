@@ -18,6 +18,7 @@ const express = require("express");
 const router = express.Router();
 const Employee = require("../../models/Employee");
 const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
+const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // POST /push-token  — register a device token (mobile or web)
@@ -224,6 +225,147 @@ router.get("/push-token/debug", AllEmployeeAppMiddleware, async (req, res) => {
   } catch (err) {
     console.error("[PUSH-TOKEN-DEBUG]", err.message);
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post("/test-web-push", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id || req.user._id;
+    const { title, body, url } = req.body;
+
+    const Employee = require("../../models/Employee");
+    const emp = await Employee.findById(userId)
+      .select("firstName lastName fcmToken")
+      .lean();
+
+    if (!emp)
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    if (!emp.fcmToken)
+      return res.status(400).json({
+        success: false,
+        message:
+          "No fcmToken registered. Log in on web first and allow notifications.",
+      });
+
+    let messaging;
+    try {
+      messaging = require("../../config/firebaseAdmin").messaging;
+    } catch (e) {
+      return res.status(500).json({
+        success: false,
+        message: "Firebase Admin not configured: " + e.message,
+      });
+    }
+
+    const finalTitle = title || "🔔 Test Push";
+    const finalBody = body || `Hello ${emp.firstName}, this is a test push.`;
+    const finalUrl = url || "/dashboard";
+
+    const dataPayload = {
+      title: finalTitle,
+      body: finalBody,
+      type: "test",
+      url: finalUrl,
+      timestamp: String(Date.now()),
+    };
+
+    console.log(
+      `[TEST-PUSH] Sending to ${emp.firstName} (${emp.fcmToken.substring(0, 30)}...)`,
+    );
+
+    try {
+      const result = await messaging.send({
+        token: emp.fcmToken,
+
+        // Top-level data — SW reads these via payload.data
+        data: dataPayload,
+
+        // ── Web Push (Chrome, Firefox, Edge, Android Chrome) ──
+        webpush: {
+          headers: { Urgency: "high", TTL: "0" },
+          notification: {
+            title: finalTitle,
+            body: finalBody,
+            icon: "/icon.png",
+            badge: "/icon.png",
+            requireInteraction: false,
+            vibrate: [200, 100, 200],
+            tag: `grav-test-${Date.now()}`,
+            renotify: true,
+            data: dataPayload,
+          },
+          fcmOptions: { link: finalUrl },
+        },
+
+        // ── APNs (iOS Safari 16.4+ PWA) ──
+        apns: {
+          headers: {
+            "apns-priority": "10",
+            "apns-push-type": "alert",
+            "apns-expiration": "0",
+          },
+          payload: {
+            aps: {
+              alert: { title: finalTitle, body: finalBody },
+              badge: 1,
+              sound: "default",
+              "mutable-content": 1,
+              "content-available": 1,
+            },
+            ...dataPayload,
+          },
+        },
+
+        // ── Android native (for future mobile-app use) ──
+        android: {
+          priority: "high",
+          ttl: 0,
+          notification: {
+            title: finalTitle,
+            body: finalBody,
+            icon: "ic_notification",
+            color: "#111827",
+            sound: "default",
+            channelId: "grav_default",
+            priority: "max",
+            defaultSound: true,
+            defaultVibrateTimings: true,
+          },
+        },
+      });
+
+      console.log(`[TEST-PUSH] ✓ Sent. FCM messageId:`, result);
+      res.json({
+        success: true,
+        message: `Push sent to ${emp.firstName} ${emp.lastName} (FCM messageId: ${result})`,
+        messageId: result,
+      });
+    } catch (err) {
+      const code = err.errorInfo?.code || err.code || "unknown";
+      console.error(`[TEST-PUSH] ✗ FCM error (${code}):`, err.message);
+
+      if (
+        code === "messaging/registration-token-not-registered" ||
+        code === "messaging/invalid-registration-token" ||
+        code === "messaging/third-party-auth-error"
+      ) {
+        await Employee.findByIdAndUpdate(userId, { $set: { fcmToken: null } });
+        return res.status(400).json({
+          success: false,
+          message: `Stale token cleared. Log out and back in on web to register a fresh one. (${code})`,
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: `FCM send failed: ${err.message} (${code})`,
+      });
+    }
+  } catch (e) {
+    console.error("[TEST-PUSH] Route error:", e.message);
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
