@@ -615,232 +615,276 @@ async function sendPayrollPushNotifications(
   type = "generated",
   employeeIdFilter = null,
 ) {
-  const result = { sent: 0, failed: 0, accepted: 0, details: [] };
+  const result = {
+    mobile: { sent: 0, failed: 0 },
+    web: { sent: 0, failed: 0 },
+    total: 0,
+    sent: 0,
+    failed: 0,
+    error: null,
+  };
 
   try {
-    const tokenQuery = {
-      pushToken: { $exists: true, $nin: [null, ""] },
-      $or: [{ status: "active" }, { isActive: true }],
+    const baseQuery = {
+      $and: [
+        { $or: [{ status: "active" }, { isActive: true }] },
+        {
+          $or: [
+            { pushToken: { $exists: true, $nin: [null, ""] } },
+            { fcmToken: { $exists: true, $nin: [null, ""] } },
+          ],
+        },
+      ],
     };
-
     if (employeeIdFilter && employeeIdFilter.length > 0) {
-      tokenQuery._id = { $in: employeeIdFilter };
+      baseQuery._id = { $in: employeeIdFilter };
     }
 
     console.log(
       `[PAYROLL-PUSH-${type.toUpperCase()}] ── Querying employees...`,
     );
 
-    const empWithTokens = await Employee.find(tokenQuery)
-      .select("pushToken firstName lastName profilePhoto")
+    const empWithTokens = await Employee.find(baseQuery)
+      .select("pushToken fcmToken firstName lastName profilePhoto")
       .lean();
 
     console.log(
-      `[PAYROLL-PUSH-${type.toUpperCase()}] Found ${empWithTokens.length} employee(s) with push tokens`,
+      `[PAYROLL-PUSH-${type.toUpperCase()}] Found ${empWithTokens.length} employee(s) with tokens`,
     );
 
     if (empWithTokens.length === 0) {
       console.warn(
-        `[PAYROLL-PUSH-${type.toUpperCase()}] ❌ No employees with valid push tokens found!`,
+        `[PAYROLL-PUSH-${type.toUpperCase()}] ❌ No employees with any push token`,
       );
       return result;
     }
 
-    const invalidTokenIds = [];
-    // Map ticket ID → { empId, token, name } so we can act on receipt errors later
-    const ticketMap = new Map();
+    const buildTitle = () =>
+      type === "paid" ? "Salary Credited" : "Payslip Generated";
+    const buildBody = (emp) =>
+      type === "paid"
+        ? `Hi ${emp.firstName}, your salary for ${MONTH_NAMES[month]} ${year} has been credited to your account. Tap to view your payslip.`
+        : `Hi ${emp.firstName}, your payslip for ${MONTH_NAMES[month]} ${year} has been processed. Open the app to view details.`;
 
-    // ── PHASE 1: SEND ────────────────────────────────────────────────────
-    // Send each message individually so one bad token can't poison the batch.
+    // ─── MOBILE (Expo) — unchanged ──────────────────────────────────────
+    const expoMessages = [];
+    const invalidMobileIds = [];
     for (const emp of empWithTokens) {
-      const token = emp.pushToken;
-      const name = `${emp.firstName} ${emp.lastName || ""}`.trim();
-
-      // Skip tokens that aren't valid Expo push tokens at all
-      if (!Expo.isExpoPushToken(token)) {
-        console.warn(
-          `[PAYROLL-PUSH-${type.toUpperCase()}] ⚠ Invalid (non-Expo) token for ${name}: "${token}" — cleaning up`,
-        );
-        invalidTokenIds.push(emp._id);
-        result.failed++;
+      if (!emp.pushToken) continue;
+      if (!Expo.isExpoPushToken(emp.pushToken)) {
+        invalidMobileIds.push(emp._id);
         continue;
       }
-
-      const title = type === "paid" ? "Salary Credited" : "Payslip Generated";
-      const body =
-        type === "paid"
-          ? `Hi ${emp.firstName}, your salary for ${MONTH_NAMES[month]} ${year} has been credited to your account. Tap to view your payslip.`
-          : `Hi ${emp.firstName}, your payslip for ${MONTH_NAMES[month]} ${year} has been processed. Open the app to view details.`;
-
-      const message = {
-        to: token,
+      expoMessages.push({
+        to: emp.pushToken,
         sound: "default",
-        title,
-        body,
+        title: buildTitle(),
+        body: buildBody(emp),
         data: {
           type: "payroll",
-          month,
-          year,
+          month: String(month),
+          year: String(year),
           screen: "Salary",
+          url: "/salary",
           profilePhoto: emp.profilePhoto?.url || null,
         },
         categoryId: "payroll",
         channelId: "payroll",
         priority: "high",
         badge: 1,
-      };
-
-      try {
-        const tickets = await expo.sendPushNotificationsAsync([message]);
-        const ticket = tickets[0];
-
-        if (ticket.status === "ok") {
-          result.accepted++;
-          console.log(
-            `[PAYROLL-PUSH-${type.toUpperCase()}] ✓ QUEUED → ${name} | ticket: ${ticket.id}`,
-          );
-          // Save the ticket so we can check its receipt in Phase 2
-          if (ticket.id) {
-            ticketMap.set(ticket.id, {
-              empId: emp._id,
-              token,
-              name,
-            });
-          }
-        } else {
-          result.failed++;
-          const errCode = ticket.details?.error;
-          console.warn(
-            `[PAYROLL-PUSH-${type.toUpperCase()}] ✗ REJECTED → ${name}: ${ticket.message || errCode}`,
-          );
-
-          if (errCode === "DeviceNotRegistered") {
-            invalidTokenIds.push(emp._id);
-          }
-        }
-      } catch (singleErr) {
-        result.failed++;
-        const msg = singleErr.message || "";
-        console.error(
-          `[PAYROLL-PUSH-${type.toUpperCase()}] ✗ ERROR → ${name}: ${msg}`,
-        );
-
-        if (
-          msg.includes("same project") ||
-          msg.includes("conflicting tokens")
-        ) {
-          invalidTokenIds.push(emp._id);
-          console.log(
-            `[PAYROLL-PUSH-${type.toUpperCase()}]   ↳ Wrong-project token — queued for cleanup`,
-          );
-        }
-      }
+      });
     }
 
-    console.log(
-      `[PAYROLL-PUSH-${type.toUpperCase()}] ── Phase 1 done: ${result.accepted} queued, ${result.failed} rejected`,
-    );
-
-    // ── PHASE 2: CHECK RECEIPTS (THE REAL DELIVERY STATUS) ───────────────
-    // Wait ~15 seconds for Expo to forward messages to FCM and get a response,
-    // then ask Expo what actually happened with each ticket.
-    if (ticketMap.size > 0) {
+    if (expoMessages.length > 0) {
       console.log(
-        `[PAYROLL-PUSH-${type.toUpperCase()}] ── Waiting 15s before checking delivery receipts...`,
+        `[PAYROLL-PUSH-${type.toUpperCase()}] Sending ${expoMessages.length} mobile push(es)...`,
       );
-      await new Promise((r) => setTimeout(r, 15000));
-
-      const ticketIds = Array.from(ticketMap.keys());
-      const receiptIdChunks = expo.chunkPushNotificationReceiptIds(ticketIds);
-
-      for (const chunk of receiptIdChunks) {
+      const chunks = expo.chunkPushNotifications(expoMessages);
+      const staleMobile = [];
+      for (const chunk of chunks) {
         try {
-          const receipts = await expo.getPushNotificationReceiptsAsync(chunk);
-          // receipts is an object: { ticketId: { status, details? } }
-
-          for (const [receiptId, receipt] of Object.entries(receipts)) {
-            const info = ticketMap.get(receiptId);
-            if (!info) continue;
-
-            if (receipt.status === "ok") {
-              result.sent++;
+          const receipts = await expo.sendPushNotificationsAsync(chunk);
+          for (let i = 0; i < receipts.length; i++) {
+            const r = receipts[i];
+            if (r.status === "ok") {
+              result.mobile.sent++;
               console.log(
-                `[PAYROLL-PUSH-${type.toUpperCase()}] ✅ DELIVERED → ${info.name}`,
+                `[PAYROLL-PUSH-${type.toUpperCase()}] ✓ Mobile OK → ${chunk[i].to.substring(0, 35)}...`,
               );
             } else {
-              result.failed++;
-              const errCode = receipt.details?.error;
-              const errMsg = receipt.message || "Unknown delivery error";
-              console.error(
-                `[PAYROLL-PUSH-${type.toUpperCase()}] ❌ DELIVERY FAILED → ${info.name}`,
+              result.mobile.failed++;
+              console.warn(
+                `[PAYROLL-PUSH-${type.toUpperCase()}] ✗ Mobile FAIL: ${r.message || JSON.stringify(r.details)}`,
               );
-              console.error(
-                `[PAYROLL-PUSH-${type.toUpperCase()}]    error: ${errCode}`,
-              );
-              console.error(
-                `[PAYROLL-PUSH-${type.toUpperCase()}]    message: ${errMsg}`,
-              );
-
-              // Auto-cleanup bad tokens based on the REAL error
-              if (
-                errCode === "DeviceNotRegistered" ||
-                errCode === "MismatchSenderId"
-              ) {
-                invalidTokenIds.push(info.empId);
-                console.log(
-                  `[PAYROLL-PUSH-${type.toUpperCase()}]    ↳ Token queued for cleanup`,
+              if (r.details?.error === "DeviceNotRegistered") {
+                const stale = empWithTokens.find(
+                  (e) => e.pushToken === chunk[i].to,
                 );
-              }
-
-              // This is the critical one — your Expo project has bad/no FCM credentials
-              if (errCode === "InvalidCredentials") {
-                console.error(
-                  `[PAYROLL-PUSH-${type.toUpperCase()}] ⚠⚠⚠ CRITICAL ⚠⚠⚠`,
-                );
-                console.error(
-                  `[PAYROLL-PUSH-${type.toUpperCase()}] Your Expo project's FCM credentials are invalid or missing.`,
-                );
-                console.error(
-                  `[PAYROLL-PUSH-${type.toUpperCase()}] Fix: upload your google-services.json FCM key to:`,
-                );
-                console.error(
-                  `[PAYROLL-PUSH-${type.toUpperCase()}] https://expo.dev/accounts/grav_2026/projects/grav-crm/credentials`,
-                );
+                if (stale) staleMobile.push(stale._id);
               }
             }
           }
-        } catch (recErr) {
+        } catch (chunkErr) {
           console.error(
-            `[PAYROLL-PUSH-${type.toUpperCase()}] Receipt fetch error:`,
-            recErr.message,
+            `[PAYROLL-PUSH-${type.toUpperCase()}] CHUNK ERROR:`,
+            chunkErr.message,
+          );
+          result.mobile.failed += chunk.length;
+        }
+      }
+      if (staleMobile.length > 0) {
+        await Employee.updateMany(
+          { _id: { $in: staleMobile } },
+          { $set: { pushToken: null } },
+        ).catch((e) =>
+          console.warn("[PAYROLL-PUSH] Mobile cleanup error:", e.message),
+        );
+      }
+    }
+    if (invalidMobileIds.length > 0) {
+      await Employee.updateMany(
+        { _id: { $in: invalidMobileIds } },
+        { $set: { pushToken: null } },
+      ).catch((e) =>
+        console.warn("[PAYROLL-PUSH] Invalid mobile cleanup error:", e.message),
+      );
+    }
+
+    // ─── WEB (FCM multicast) — canonical cross-platform payload ─────────
+    const webEmps = empWithTokens.filter((e) => e.fcmToken);
+    if (webEmps.length > 0) {
+      console.log(
+        `[PAYROLL-PUSH-${type.toUpperCase()}] Sending ${webEmps.length} web push(es)...`,
+      );
+
+      let messaging = null;
+      let admin = null;
+      try {
+        messaging = require("../../config/firebaseAdmin").messaging;
+        admin = require("firebase-admin");
+      } catch (e) {
+        console.warn("[PAYROLL-PUSH] firebaseAdmin not available:", e.message);
+      }
+
+      if (messaging) {
+        // Group employees by token so we can map errors back to employee IDs
+        const tokens = webEmps.map((e) => e.fcmToken);
+        const empByToken = Object.fromEntries(
+          webEmps.map((e) => [e.fcmToken, e]),
+        );
+
+        // Title/body need to be personalised per employee → send each individually.
+        // This is a few more requests but gives each user their name in the body.
+        const staleWeb = [];
+        for (const emp of webEmps) {
+          const dataPayload = {
+            title: buildTitle(),
+            body: buildBody(emp),
+            type: "payroll",
+            month: String(month),
+            year: String(year),
+            screen: "Salary",
+            url: "/salary",
+          };
+
+          try {
+            await messaging.send({
+              token: emp.fcmToken,
+              data: dataPayload,
+              webpush: {
+                headers: { Urgency: "high", TTL: "0" },
+                notification: {
+                  title: dataPayload.title,
+                  body: dataPayload.body,
+                  icon: emp.profilePhoto?.url || "/icon.png",
+                  badge: "/icon.png",
+                  requireInteraction: false,
+                  vibrate: [200, 100, 200],
+                  tag: `grav-payroll-${month}-${year}-${Date.now()}`,
+                  renotify: true,
+                  data: dataPayload,
+                },
+                fcmOptions: { link: "/salary" },
+              },
+              apns: {
+                headers: {
+                  "apns-priority": "10",
+                  "apns-push-type": "alert",
+                  "apns-expiration": "0",
+                },
+                payload: {
+                  aps: {
+                    alert: { title: dataPayload.title, body: dataPayload.body },
+                    badge: 1,
+                    sound: "default",
+                    "mutable-content": 1,
+                    "content-available": 1,
+                  },
+                  ...dataPayload,
+                },
+              },
+              android: {
+                priority: "high",
+                ttl: 0,
+                notification: {
+                  title: dataPayload.title,
+                  body: dataPayload.body,
+                  icon: "ic_notification",
+                  color: "#111827",
+                  sound: "default",
+                  channelId: "grav_payroll",
+                  priority: "max",
+                  defaultSound: true,
+                  defaultVibrateTimings: true,
+                },
+              },
+            });
+            result.web.sent++;
+            console.log(
+              `[PAYROLL-PUSH-${type.toUpperCase()}] ✓ Web OK → ${emp.firstName}`,
+            );
+          } catch (err) {
+            result.web.failed++;
+            const code = err.errorInfo?.code || err.code || "";
+            console.warn(
+              `[PAYROLL-PUSH-${type.toUpperCase()}] ✗ Web FAIL → ${emp.firstName}: ${code} ${err.message}`,
+            );
+            if (
+              code === "messaging/registration-token-not-registered" ||
+              code === "messaging/invalid-registration-token" ||
+              code === "messaging/invalid-argument" ||
+              code === "messaging/third-party-auth-error"
+            ) {
+              staleWeb.push(emp._id);
+            }
+          }
+        }
+        if (staleWeb.length > 0) {
+          await Employee.updateMany(
+            { _id: { $in: staleWeb } },
+            { $set: { fcmToken: null } },
+          ).catch((e) =>
+            console.warn("[PAYROLL-PUSH] Web cleanup error:", e.message),
+          );
+          console.log(
+            `[PAYROLL-PUSH-${type.toUpperCase()}] Cleaned ${staleWeb.length} stale web token(s)`,
           );
         }
       }
     }
 
-    // ── PHASE 3: CLEANUP BAD TOKENS ──────────────────────────────────────
-    const uniqueInvalid = [
-      ...new Set(invalidTokenIds.map((id) => id.toString())),
-    ];
-    if (uniqueInvalid.length > 0) {
-      await Employee.updateMany(
-        { _id: { $in: uniqueInvalid } },
-        { $set: { pushToken: null } },
-      ).catch((e) => console.warn("[PAYROLL-PUSH] Cleanup error:", e.message));
-      console.log(
-        `[PAYROLL-PUSH-${type.toUpperCase()}] Cleaned ${uniqueInvalid.length} bad token(s) from DB`,
-      );
-    }
+    result.total = result.mobile.sent + result.web.sent;
+    result.sent = result.total;
+    result.failed = result.mobile.failed + result.web.failed;
 
     console.log(
-      `[PAYROLL-PUSH-${type.toUpperCase()}] ══ FINAL: ${result.sent} delivered, ${result.failed} failed (of ${result.accepted} queued) ══`,
+      `[PAYROLL-PUSH-${type.toUpperCase()}] ══ DONE: ${result.mobile.sent} mobile, ${result.web.sent} web, ${result.failed} failed ══`,
     );
   } catch (pushErr) {
     console.error(
       `[PAYROLL-PUSH-${type.toUpperCase()}] ❌ CRITICAL ERROR:`,
       pushErr.message,
     );
-    console.error(`[PAYROLL-PUSH-${type.toUpperCase()}] Stack:`, pushErr.stack);
     result.error = pushErr.message;
   }
 
