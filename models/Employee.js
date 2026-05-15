@@ -40,7 +40,11 @@ const employeeSchema = new mongoose.Schema({
   extension: { type: String }, // office extension number
 
   dateOfBirth: { type: Date },
-  gender: { type: String, enum: ["Male", "Female", "Other", "male","female"], default: "" },
+  gender: {
+    type: String,
+    enum: ["Male", "Female", "Other", "male", "female"],
+    default: "",
+  },
   bloodGroup: { type: String },
   maritalStatus: {
     type: String,
@@ -242,19 +246,19 @@ const employeeSchema = new mongoose.Schema({
   // Yearly point deduction records — one entry per year
   sopPoints: [
     {
-      year: { type: Number },   // e.g. 2026
-      totalDeducted: { type: Number, default: 0 },       // sum of all bleaches in that year
+      year: { type: Number }, // e.g. 2026
+      totalDeducted: { type: Number, default: 0 }, // sum of all bleaches in that year
       bleaches: [
         {
           sopId: { type: mongoose.Schema.Types.ObjectId, ref: "Sop" },
           sopName: { type: String },
           folderName: { type: String, default: "Uncategorized" },
-          points: { type: Number},
+          points: { type: Number },
           description: { type: String },
-          date: { type: String}, // "YYYY-MM-DD"
-          cutBy: { type: String},
-          cutByName: { type: String},
-          cutByRole: { type: String},
+          date: { type: String }, // "YYYY-MM-DD"
+          cutBy: { type: String },
+          cutByName: { type: String },
+          cutByRole: { type: String },
           // ── Recheck ────────────────────────────────────────────────────────
           recheck: {
             status: { type: String, default: "none" },
@@ -269,6 +273,11 @@ const employeeSchema = new mongoose.Schema({
       ],
     },
   ],
+
+  // ─── PUSH NOTIFICATIONS ──────────────────────────────────────────────────────
+  // Expo push token for the native mobile app (Android/iOS)
+  pushToken: { type: String, default: null },
+  fcmToken: { type: String, default: null },
 
   // ─── SYSTEM ──────────────────────────────────────────────────────────────────
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
