@@ -55,20 +55,26 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             const fcmDoc = fcmDocs[i];
             if (fcmDoc.exists) {
                 const d = fcmDoc.data();
-                // Use device_* keys first (one per physical device, always fresh)
-                const deviceKeys = Object.keys(d).filter(k => k.startsWith("device_"));
-                if (deviceKeys.length > 0) {
-                    deviceKeys.forEach(k => { if (d[k]) tokens.add(d[k]); });
-                } else {
-                    // Fallback: latestToken only — skip tokens[] array (accumulates stale duplicates)
-                    if (d.latestToken) tokens.add(d.latestToken);
-                    else if (d.token) tokens.add(d.token);
-                }
+                // Old format: tokens array
+                (d.tokens || []).forEach(t => t && tokens.add(t));
+                if (d.token) tokens.add(d.token);
+                // Always use latestToken — most recent registration
+                if (d.latestToken) tokens.add(d.latestToken);
+                // New format: device_* keys — one per device, replaces stale tokens
+                Object.keys(d).filter(k => k.startsWith("device_")).forEach(k => {
+                    if (d[k]) tokens.add(d[k]);
+                });
             } else {
                 console.log(`[FCM]   ⚠️  ${id}: no doc in cowork_fcm_tokens`);
             }
 
-            // Skip cowork_employees.fcmTokens — legacy, causes duplicate notifications
+            const empDoc = empDocs[i];
+            if (empDoc.exists) {
+                const d = empDoc.data();
+                (d.fcmTokens || []).forEach(t => t && tokens.add(t));
+            } else {
+                console.log(`[FCM]   ⚠️  ${id}: employee doc not found`);
+            }
 
             tokenMap[id] = [...tokens].filter(Boolean);
             console.log(`[FCM]   ${id}: ${tokenMap[id].length} token(s) found`);
@@ -112,12 +118,19 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             data: dataPayload,
 
             // ── Web Push (Chrome, Firefox, Edge, desktop) ──
-            // NO webpush.notification here — Chrome would auto-show it AND
-            // onBackgroundMessage would also show it = duplicate notifications.
-            // onBackgroundMessage in firebase-messaging-sw.js is the single handler.
             webpush: {
                 headers: { Urgency: "high", TTL: "0" },
-                // data-only — no notification block — prevents Chrome auto-display
+                notification: {
+                    title,
+                    body,
+                    icon: "/icon-192.png",
+                    badge: "/icon-192.png",
+                    requireInteraction: false,
+                    vibrate: [200, 100, 200],
+                    tag: `cowork-${data.type || "notif"}-${Date.now()}`,
+                    renotify: true,
+                    data: dataPayload,
+                },
                 fcmOptions: { link: "/coworking" },
             },
 
