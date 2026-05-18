@@ -7,9 +7,7 @@
 //   4. UPDATED: PUT /:id matches incoming variants by _id first, then combination
 //      — preserves variant.image + variant.vendorNicknames if not in payload
 //   5. UPDATED: POST / accepts variant.image + variant.vendorNicknames
-//
-// Everything else (auth middleware, embedded stockTransactions, primaryVendor,
-// alternateVendors, suppliers history, purchase orders, etc.) is untouched.
+//   6. ADDED: unitConversion accepted on POST / and PUT /:id (product-level)
 
 const express = require("express");
 const router = express.Router();
@@ -80,6 +78,20 @@ const normaliseVariantNicknames = (incoming) => {
       nickname: vn.nickname.toString().trim(),
       notes: (vn.notes || "").toString().trim()
     }));
+};
+
+// Normalise unitConversion input → returns object or null
+const normaliseUnitConversion = (uc) => {
+  if (!uc || !uc.toUnit || uc.quantity === undefined || uc.quantity === null || uc.quantity === "") {
+    return null;
+  }
+  const qty = parseFloat(uc.quantity);
+  if (isNaN(qty) || qty < 0) return null;
+  return {
+    fromUnit: (uc.fromUnit || "").toString().trim(),
+    toUnit: (uc.toUnit || "").toString().trim(),
+    quantity: qty
+  };
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,6 +288,7 @@ router.post("/", async (req, res) => {
       discounts,
       attributes,
       variants,
+      unitConversion,
       description,
       notes
     } = req.body;
@@ -364,6 +377,7 @@ router.post("/", async (req, res) => {
               price: parseFloat(d.price)
             }))
         : [],
+      unitConversion: normaliseUnitConversion(unitConversion),
       attributes: attributes && Array.isArray(attributes)
         ? attributes
             .filter(attr => attr.name && attr.name.trim() && attr.values && attr.values.length > 0)
@@ -423,6 +437,7 @@ router.put("/:id", async (req, res) => {
       discounts,
       attributes,
       variants,
+      unitConversion,
       description,
       notes
     } = req.body;
@@ -466,6 +481,10 @@ router.put("/:id", async (req, res) => {
               price: parseFloat(d.price)
             }))
         : [];
+    }
+
+    if (unitConversion !== undefined) {
+      rawItem.unitConversion = normaliseUnitConversion(unitConversion);
     }
 
     if (attributes !== undefined) {
@@ -624,13 +643,13 @@ router.get("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
 // ADD nickname to a specific variant
 router.post("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
   try {
-    const { vendor, nickname, notes } = req.body;
+    const { vendor, nickname, notes, price, deliveryDays } = req.body;
 
     if (!vendor || !mongoose.Types.ObjectId.isValid(vendor)) {
       return res.status(400).json({ success: false, message: "Valid vendor is required" });
     }
     if (!nickname || !nickname.trim()) {
-      return res.status(400).json({ success: false, message: "Nickname is required" });
+      return res.status(400).json({ success: false, message: "Vendor code is required" });
     }
 
     const vendorDoc = await Vendor.findById(vendor).select("companyName");
@@ -648,20 +667,21 @@ router.post("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
       return res.status(404).json({ success: false, message: "Variant not found" });
     }
 
-    // Block duplicate vendor entry on same variant
     const existing = (variant.vendorNicknames || []).find(
       vn => vn.vendor?.toString() === vendor
     );
     if (existing) {
       return res.status(400).json({
         success: false,
-        message: `${vendorDoc.companyName} already has a nickname for this variant. Edit the existing entry instead.`
+        message: `${vendorDoc.companyName} already has an alias for this variant. Edit the existing entry instead.`
       });
     }
 
     variant.vendorNicknames.push({
       vendor,
       nickname: nickname.trim(),
+      price: price != null && !isNaN(price) ? parseFloat(price) : 0,
+      deliveryDays: deliveryDays != null && !isNaN(deliveryDays) ? parseInt(deliveryDays) : 0,
       notes: (notes || "").trim()
     });
 
@@ -679,11 +699,11 @@ router.post("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Vendor nickname added successfully",
+      message: "Vendor alias added successfully",
       vendorNicknames: updatedVariant?.vendorNicknames || []
     });
   } catch (error) {
-    console.error("Error adding variant vendor nickname:", error);
+    console.error("Error adding variant vendor alias:", error);
     res.status(500).json({ success: false, message: "Server error: " + error.message });
   }
 });
@@ -691,7 +711,7 @@ router.post("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
 // UPDATE a nickname on a specific variant
 router.put("/:id/variants/:variantId/vendor-nicknames/:nicknameId", async (req, res) => {
   try {
-    const { nickname, notes, vendor } = req.body;
+    const { nickname, notes, vendor, price, deliveryDays } = req.body;
 
     const rawItem = await RawItem.findById(req.params.id);
     if (!rawItem) {
@@ -705,23 +725,24 @@ router.put("/:id/variants/:variantId/vendor-nicknames/:nicknameId", async (req, 
 
     const entry = variant.vendorNicknames.id(req.params.nicknameId);
     if (!entry) {
-      return res.status(404).json({ success: false, message: "Vendor nickname entry not found" });
+      return res.status(404).json({ success: false, message: "Vendor alias entry not found" });
     }
 
     if (vendor && mongoose.Types.ObjectId.isValid(vendor)) {
-      // Make sure no other entry on this variant already uses this vendor
       const collision = variant.vendorNicknames.find(
         vn => vn._id.toString() !== req.params.nicknameId && vn.vendor?.toString() === vendor
       );
       if (collision) {
         return res.status(400).json({
           success: false,
-          message: "Another nickname already exists for that vendor on this variant"
+          message: "Another alias already exists for that vendor on this variant"
         });
       }
       entry.vendor = vendor;
     }
     if (nickname !== undefined && nickname.trim()) entry.nickname = nickname.trim();
+    if (price !== undefined) entry.price = !isNaN(price) ? parseFloat(price) : 0;
+    if (deliveryDays !== undefined) entry.deliveryDays = !isNaN(deliveryDays) ? parseInt(deliveryDays) : 0;
     if (notes !== undefined) entry.notes = (notes || "").trim();
 
     rawItem.updatedBy = req.user.id;
@@ -738,11 +759,11 @@ router.put("/:id/variants/:variantId/vendor-nicknames/:nicknameId", async (req, 
 
     res.json({
       success: true,
-      message: "Vendor nickname updated successfully",
+      message: "Vendor alias updated successfully",
       vendorNicknames: updatedVariant?.vendorNicknames || []
     });
   } catch (error) {
-    console.error("Error updating variant vendor nickname:", error);
+    console.error("Error updating variant vendor alias:", error);
     res.status(500).json({ success: false, message: "Server error: " + error.message });
   }
 });

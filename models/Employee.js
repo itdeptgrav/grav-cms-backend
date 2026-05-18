@@ -40,7 +40,11 @@ const employeeSchema = new mongoose.Schema({
   extension: { type: String }, // office extension number
 
   dateOfBirth: { type: Date },
-  gender: { type: String, enum: ["Male", "Female", "Other", "male","female"], default: "" },
+  gender: {
+    type: String,
+    enum: ["Male", "Female", "Other", "male", "female"],
+    default: "",
+  },
   bloodGroup: { type: String },
   maritalStatus: {
     type: String,
@@ -238,23 +242,54 @@ const employeeSchema = new mongoose.Schema({
   emailSentAt: { type: Date },
   emailError: { type: String },
 
+  // ── PATCH for models/Employee.js ─────────────────────────────────────────────
+  // Replace the sopPoints section in the employeeSchema with this:
+
   // ─── SOP COMPLIANCE ──────────────────────────────────────────────────────────
-  // Yearly point deduction records — one entry per year
+  // Yearly point records — one entry per year.
+  // totalDeducted is the NET score:
+  //   Positive value = violations are adding up (bad)
+  //   Negative value = rewards outweigh violations (excellent)
   sopPoints: [
     {
-      year: { type: Number },   // e.g. 2026
-      totalDeducted: { type: Number, default: 0 },       // sum of all bleaches in that year
+      year: { type: Number }, // e.g. 2026
+      totalDeducted: { type: Number, default: 0 },
       bleaches: [
         {
           sopId: { type: mongoose.Schema.Types.ObjectId, ref: "Sop" },
           sopName: { type: String },
           folderName: { type: String, default: "Uncategorized" },
-          points: { type: Number},
+          points: { type: Number },
           description: { type: String },
-          date: { type: String}, // "YYYY-MM-DD"
-          cutBy: { type: String},
-          cutByName: { type: String},
-          cutByRole: { type: String},
+          date: { type: String }, // "YYYY-MM-DD"
+          cutBy: { type: String },
+          cutByName: { type: String },
+          cutByRole: { type: String },
+
+          // ── bleachType ────────────────────────────────────────────────────
+          // "credit" = SOP violation charged to employee
+          //            → adds to totalDeducted (penalty goes UP)
+          //            → shown in RED in the history UI
+          //
+          // "debit"  = Goal task reward: employee submitted on-time
+          //            → subtracts from totalDeducted (penalty goes DOWN)
+          //            → shown in GREEN in the history UI
+          //
+          // Default is "credit" so all normal SOP bleaches are violations.
+          bleachType: {
+            type: String,
+            enum: ["credit", "debit"],
+            default: "credit",
+          },
+
+          // Legacy boolean kept for backward compat with old entries.
+          // isCredit:true is treated the same as bleachType:"debit" in the UI.
+          isCredit: { type: Boolean, default: false },
+
+          // Optional refs for goal-task debit credits
+          taskId: { type: String, default: null },
+          componentId: { type: String, default: null },
+
           // ── Recheck ────────────────────────────────────────────────────────
           recheck: {
             status: { type: String, default: "none" },
@@ -269,6 +304,11 @@ const employeeSchema = new mongoose.Schema({
       ],
     },
   ],
+
+  // ─── PUSH NOTIFICATIONS ──────────────────────────────────────────────────────
+  // Expo push token for the native mobile app (Android/iOS)
+  pushToken: { type: String, default: null },
+  fcmToken: { type: String, default: null },
 
   // ─── SYSTEM ──────────────────────────────────────────────────────────────────
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },

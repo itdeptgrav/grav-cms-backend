@@ -76,7 +76,12 @@ async function finaliseApproval(app, approverId, remarks = "") {
   // Now safely increment
   await LeaveBalance.findOneAndUpdate(
     { employeeId: app.employeeId, year },
-    { $inc: { [`consumed.${app.leaveType}`]: app.totalDays } },
+    {
+      $inc: {
+        [`consumed.${app.leaveType}`]:
+          app.paidDays != null ? app.paidDays : app.totalDays,
+      },
+    },
   );
   console.log(
     `[APPROVE] Deducted ${app.totalDays} ${app.leaveType} for ${app.employeeName}`,
@@ -1611,7 +1616,12 @@ router.patch("/:id/approve", EmployeeAuthMiddleware, async (req, res) => {
     // Now safely increment
     await LeaveBalance.findOneAndUpdate(
       { employeeId: app.employeeId, year },
-      { $inc: { [`consumed.${app.leaveType}`]: app.totalDays } },
+      {
+        $inc: {
+          [`consumed.${app.leaveType}`]:
+            app.paidDays != null ? app.paidDays : app.totalDays,
+        },
+      },
     );
     console.log(
       `[HR-APPROVE] Deducted ${app.totalDays} ${app.leaveType} for ${app.employeeName}`,
