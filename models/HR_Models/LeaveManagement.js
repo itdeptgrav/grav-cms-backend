@@ -96,7 +96,11 @@ const leaveApplicationSchema = new mongoose.Schema(
     designation: { type: String },
     department: { type: String },
 
-    leaveType: { type: String, enum: ["CL", "SL", "PL"], required: true },
+    leaveType: {
+      type: String,
+      enum: ["CL", "SL", "PL", "LOP"],
+      required: true,
+    },
     applicationDate: { type: String, required: true },
     fromDate: { type: String, required: true },
     toDate: { type: String, required: true },
@@ -129,6 +133,7 @@ const leaveApplicationSchema = new mongoose.Schema(
         "hr_approved",
         "hr_rejected",
         "cancelled",
+        "withdraw_pending",
       ],
       default: "pending",
       index: true,
@@ -270,6 +275,7 @@ const regularizationRequestSchema = new mongoose.Schema(
         "hr_approved",
         "hr_rejected",
         "cancelled",
+        "withdraw_pending",
       ],
       default: "pending",
       index: true,

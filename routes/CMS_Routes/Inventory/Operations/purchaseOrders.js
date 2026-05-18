@@ -18,6 +18,7 @@ const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Ven
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const VendorEmailService = require("../../../../services/VendorEmailService");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
+const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -153,6 +154,73 @@ router.get("/", async (req, res) => {
   } catch (error) {
     console.error("Error fetching purchase orders:", error);
     res.status(500).json({ success: false, message: "Server error while fetching purchase orders" });
+  }
+});
+
+
+//    vendor's price + deliveryDays + the alias _id (needed for price write-back).
+router.get("/data/vendor-items/:vendorId", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(vendorId)) {
+      return res.status(400).json({ success: false, message: "Invalid vendor id" });
+    }
+
+    const items = await RawItem.find({ "variants.vendorNicknames.vendor": vendorId })
+      .select(
+        "name sku category customCategory unit customUnit description quantity minStock maxStock status variants unitConversion"
+      )
+      .lean()
+      .sort({ name: 1 });
+
+    const formatted = items.map((item) => {
+      // Keep only variants that have an alias for THIS vendor
+      const matchingVariants = (item.variants || [])
+        .map((v) => {
+          const alias = (v.vendorNicknames || []).find(
+            (vn) => vn.vendor?.toString() === vendorId
+          );
+          if (!alias) return null;
+          return {
+            _id: v._id.toString(),
+            combination: v.combination || [],
+            sku: v.sku || "",
+            quantity: v.quantity || 0,
+            minStock: v.minStock || 0,
+            maxStock: v.maxStock || 0,
+            // vendor-specific alias data
+            aliasId: alias._id.toString(),
+            vendorCode: alias.nickname || "",
+            price: alias.price || 0,
+            deliveryDays: alias.deliveryDays || 0,
+          };
+        })
+        .filter(Boolean);
+
+      return {
+        id: item._id.toString(),
+        name: item.name,
+        sku: item.sku,
+        category: item.customCategory || item.category || "Uncategorized",
+        unit: item.customUnit || item.unit || "unit",
+        description: item.description || "",
+        currentStock: item.quantity || 0,
+        minStock: item.minStock || 0,
+        maxStock: item.maxStock || 0,
+        status: item.status || "In Stock",
+        unitConversion: item.unitConversion || null,
+        variants: matchingVariants,
+      };
+    });
+
+    res.json({ success: true, rawItems: formatted });
+  } catch (error) {
+    console.error("Error fetching vendor items:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching vendor items",
+    });
   }
 });
 

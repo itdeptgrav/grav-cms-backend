@@ -15,7 +15,7 @@
 //                     Rows" mapping mode).
 // =============================================================================
 
-const { TallyLedger, TallyGroup } = require("../models/Accountant_model/TallyMasterModels");
+const { Acc_Ledger, Acc_Group } = require("../models/Accountant_model/Acc_MasterModels");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Transforms — small DSL referenced by the mapping
@@ -223,7 +223,7 @@ async function resolveLedgers(names, companyId, opts = {}) {
   if (!unique.length) return new Map();
 
   // 1. Existing ledgers (case-insensitive on name OR aliases)
-  const existing = await TallyLedger.find({
+  const existing = await Acc_Ledger.find({
     companyId,
     $or: [
       { name: { $in: unique.map(n => new RegExp(`^${escapeRegex(n)}$`, "i")) } },
@@ -241,11 +241,11 @@ async function resolveLedgers(names, companyId, opts = {}) {
   const missing = unique.filter(n => !map.has(n.toLowerCase()));
   if (missing.length && opts.autoCreate) {
     const defaultGroupName = opts.defaultGroup || "Sundry Debtors";
-    const group = await TallyGroup.findOne({ companyId, name: defaultGroupName }).lean();
+    const group = await Acc_Group.findOne({ companyId, name: defaultGroupName }).lean();
     if (!group) {
       throw new Error(`Default group "${defaultGroupName}" not found — seed Tally groups first.`);
     }
-    const created = await TallyLedger.insertMany(missing.map(n => ({
+    const created = await Acc_Ledger.insertMany(missing.map(n => ({
       companyId,
       name: n,
       groupId: group._id,

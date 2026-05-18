@@ -37,6 +37,10 @@ router.get("/_health", (req, res) => {
       "GET  /tally/import/sessions?companyId=...",
       "GET  /tally/reports/trial-balance?companyId=...",
       "GET  /reports/gst",
+      "GET  /pins?entityType=...",
+      "GET  /priorities?entityType=...",
+      "GET  /cashflow-adjustments?periodStart=...",
+      "GET  /ledger-reclass/pending",
     ],
   });
 });
@@ -46,33 +50,50 @@ const mounts = [
   // /auth must be reachable without a prior login — its middleware is
   // self-contained (login/bootstrap/accept-invite are public, the others
   // gate themselves with orgAuth internally).
-  ["/auth", "./Accountant_Routes/accountantAuthRoutes"],
+  ["/auth", "./Accountant_Routes/Acc_auth"],
 
   // /team — sub-account management. Requires orgAuth (mounted internally).
-  ["/team", "./Accountant_Routes/teamRoutes"],
+  ["/team", "./Accountant_Routes/Acc_team"],
 
   // /approvals — pending change queue. Requires orgAuth (mounted internally).
-  ["/approvals", "./Accountant_Routes/approvalRoutes"],
+  ["/approvals", "./Accountant_Routes/Acc_approvals"],
 
-  ["/dashboard", "./Accountant_Routes/dashboard"],
-  ["/expenses", "./Accountant_Routes/expenses"],
-  ["/invoices", "./Accountant_Routes/invoices"],
-  ["/vendors", "./Accountant_Routes/vendors"],
-  ["/customers", "./Accountant_Routes/customersRoutes"],
-  ["/journal-entries", "./Accountant_Routes/journalEntries"],
-  ["/payroll", "./Accountant_Routes/payroll"],
-  ["/reports", "./Accountant_Routes/reports"],
-  ["/settings", "./Accountant_Routes/settings"],
-  ["/tax-filings", "./Accountant_Routes/taxFilings"],
-  ["/bank-transactions", "./Accountant_Routes/bankTransactions"],
-  ["/budgets", "./Accountant_Routes/budgets"],
+  ["/dashboard", "./Accountant_Routes/Acc_dashboard"],
+  ["/expenses", "./Accountant_Routes/Acc_expenses"],
+  ["/invoices", "./Accountant_Routes/Acc_invoices"],
+  ["/proforma-invoices", "./Accountant_Routes/Acc_proformaInvoices"],
+  ["/vendors", "./Accountant_Routes/Acc_vendors"],
+  ["/customers", "./Accountant_Routes/Acc_customers"],
+  ["/journal-entries", "./Accountant_Routes/Acc_journalEntries"],
+  ["/payroll", "./Accountant_Routes/Acc_payroll"],
+  ["/reports", "./Accountant_Routes/Acc_reports"],
+  ["/settings", "./Accountant_Routes/Acc_settings"],
+  ["/tax-filings", "./Accountant_Routes/Acc_taxFilings"],
+  ["/bank-transactions", "./Accountant_Routes/Acc_bankTransactions"],
+  ["/budgets", "./Accountant_Routes/Acc_budgets"],
 
   // === books / vouchers / import (new files) ===
-  ["/chart-of-accounts", "./Accountant_Routes/tallyChartOfAccounts"],
-  ["/tally/companies", "./Accountant_Routes/tallyCompanies"],
-  ["/tally/import", "./Accountant_Routes/tallyImport"],
-  ["/tally/reports", "./Accountant_Routes/tallyReports"],
-  ["/vouchers", "./Accountant_Routes/tallyVouchers"],
+  ["/chart-of-accounts", "./Accountant_Routes/Acc_chartOfAccounts"],
+  ["/tally/companies", "./Accountant_Routes/Acc_companies"],
+  ["/tally/import", "./Accountant_Routes/Acc_import"],
+  ["/tally/reports", "./Accountant_Routes/Acc_books"],
+  ["/vouchers", "./Accountant_Routes/Acc_vouchers"],
+
+  // === Generic UI persistence (every list page uses these) ===
+  // pins   → "pin this row to top" (star button)
+  // priorities → "drag-reorder these rows" (grip button)
+  // Without these mounted, pin/reorder state silently fails to persist
+  // across page reloads — backs the usePins / usePriorities hooks.
+  ["/pins", "./Accountant_Routes/Acc_pins"],
+  ["/priorities", "./Accountant_Routes/Acc_priorities"],
+
+  // === Approval workflows outside /approvals ===
+  // cashflow-adjustments backs the manual "Particulars" rows on the
+  // Cash Flow report — has its own approve/reject endpoints.
+  // ledger-reclass backs the group-reorder / ledger-move proposals
+  // raised from CoA, BS, P&L, TB, and Day Book pages.
+  ["/cashflow-adjustments", "./Accountant_Routes/Acc_cashflowAdjustments"],
+  ["/ledger-reclass", "./Accountant_Routes/Acc_ledgerReclass"],
 ];
 
 let mounted = 0;
@@ -93,7 +114,7 @@ for (const [path, modulePath] of mounts) {
 //   own UI calls). We mount the public one first so its /webhook route is
 //   reachable without the accountant auth middleware blocking Setu. ===
 try {
-  const setuMod = require("./Accountant_Routes/setuAA");
+  const setuMod = require("./Accountant_Routes/Acc_setuAA");
   // Public webhook lives at /setu-aa/webhook — mount the public router at /setu-aa
   router.use("/setu-aa", setuMod.publicRouter);
   // Then mount the auth-protected routes on top of the same path. Express
@@ -107,7 +128,7 @@ try {
 } catch (err) {
   failed.push({
     path: "/setu-aa",
-    modulePath: "./Accountant_Routes/setuAA",
+    modulePath: "./Accountant_Routes/Acc_setuAA",
     error: err.message,
   });
   console.error("❌ [accountant] failed to mount /setu-aa:", err.message);

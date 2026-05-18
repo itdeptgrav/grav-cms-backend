@@ -17,9 +17,9 @@
 
 const mongoose = require("mongoose");
 const {
-  TallyGroup,
-  TallyLedger,
-} = require("../models/Accountant_model/TallyMasterModels");
+  Acc_Group,
+  Acc_Ledger,
+} = require("../models/Accountant_model/Acc_MasterModels");
 
 // Lazy-load CMS models so a missing model doesn't crash boot
 function tryRequire(p) {
@@ -39,16 +39,16 @@ const HRDepartment = tryRequire("../models/HRDepartment");
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 async function findOrCreateGroup(companyId, groupName, fallback) {
-  let grp = await TallyGroup.findOne({ companyId, name: groupName });
+  let grp = await Acc_Group.findOne({ companyId, name: groupName });
   if (grp) return grp;
   // Caller can provide a fallback shape (e.g. for a new sub-group under a parent)
-  return TallyGroup.create({ companyId, name: groupName, ...fallback });
+  return Acc_Group.create({ companyId, name: groupName, ...fallback });
 }
 
 async function findOrCreateLedger(filter, doc) {
-  let led = await TallyLedger.findOne(filter);
+  let led = await Acc_Ledger.findOne(filter);
   if (led) return { ledger: led, created: false };
-  led = await TallyLedger.create(doc);
+  led = await Acc_Ledger.create(doc);
   return { ledger: led, created: true };
 }
 
@@ -58,7 +58,7 @@ async function findOrCreateLedger(filter, doc) {
 async function seedCashAndBank(companyId, createdBy) {
   const results = [];
 
-  const cashGroup = await TallyGroup.findOne({
+  const cashGroup = await Acc_Group.findOne({
     companyId,
     name: "Cash-in-Hand",
   });
@@ -81,7 +81,7 @@ async function seedCashAndBank(companyId, createdBy) {
     if (r.created) results.push(r.ledger.name);
   }
 
-  const bankGroup = await TallyGroup.findOne({
+  const bankGroup = await Acc_Group.findOne({
     companyId,
     name: "Bank Accounts",
   });
@@ -116,19 +116,19 @@ async function seedSalaryExpenseByDepartment(companyId, createdBy) {
   if (!HRDepartment) return [];
   const created = [];
 
-  const parent = await TallyGroup.findOne({
+  const parent = await Acc_Group.findOne({
     companyId,
     name: "Indirect Expenses",
   });
   if (!parent) return [];
 
   // Sub-group "Salaries" if it doesn't exist
-  let salaryGroup = await TallyGroup.findOne({
+  let salaryGroup = await Acc_Group.findOne({
     companyId,
     name: "Salaries & Wages",
   });
   if (!salaryGroup) {
-    salaryGroup = await TallyGroup.create({
+    salaryGroup = await Acc_Group.create({
       companyId,
       name: "Salaries & Wages",
       parent: parent._id,
@@ -195,19 +195,19 @@ async function seedEmployeeLedgers(companyId, createdBy) {
   if (!Employee) return [];
   const created = [];
 
-  const parent = await TallyGroup.findOne({
+  const parent = await Acc_Group.findOne({
     companyId,
     name: "Sundry Creditors",
   });
   if (!parent) return [];
 
   // Sub-group "Employee Payables"
-  let empGroup = await TallyGroup.findOne({
+  let empGroup = await Acc_Group.findOne({
     companyId,
     name: "Employee Payables",
   });
   if (!empGroup) {
-    empGroup = await TallyGroup.create({
+    empGroup = await Acc_Group.create({
       companyId,
       name: "Employee Payables",
       parent: parent._id,
@@ -272,7 +272,7 @@ async function seedCustomerLedgers(companyId, createdBy) {
   if (!Customer) return [];
   const created = [];
 
-  const parent = await TallyGroup.findOne({
+  const parent = await Acc_Group.findOne({
     companyId,
     name: "Sundry Debtors",
   });
@@ -329,7 +329,7 @@ async function seedVendorLedgers(companyId, createdBy) {
   if (!Vendor) return [];
   const created = [];
 
-  const parent = await TallyGroup.findOne({
+  const parent = await Acc_Group.findOne({
     companyId,
     name: "Sundry Creditors",
   });
