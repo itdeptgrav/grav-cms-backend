@@ -747,10 +747,10 @@ app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 
 
 
-const hrSopRoutes  = require("./routes/HrRoutes/hrSopRoutes");
+const hrSopRoutes = require("./routes/HrRoutes/hrSopRoutes");
 const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 
-app.use("/api/hr/sop",  hrSopRoutes);
+app.use("/api/hr/sop", hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
 
 /* =====================
@@ -1347,7 +1347,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
               workOrder = await WorkOrder.findById(
                 parsedBarcode.workOrderShortId,
               );
-            } catch {}
+            } catch { }
           }
           if (workOrder) {
             io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
@@ -1436,7 +1436,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
                 message: `${employeeName} signed out`,
                 timestamp: new Date(),
               });
-          } catch {}
+          } catch { }
           return res.json({
             success: true,
             message: `${employeeName} signed out`,
@@ -1456,7 +1456,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
         const existingSession = machineTracking.operators.find(
           (op) =>
             op.operatorIdentityId ===
-              machineTracking.currentOperatorIdentityId && !op.signOutTime,
+            machineTracking.currentOperatorIdentityId && !op.signOutTime,
         );
         if (existingSession) existingSession.signOutTime = scanTime;
       }
@@ -1480,7 +1480,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
             status: `${employeeName} signed in to ${machine.name}`,
             timestamp: new Date(),
           });
-      } catch {}
+      } catch { }
 
       return res.json({
         success: true,
@@ -1618,7 +1618,7 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
                   const existing = machineTracking.operators.find(
                     (op) =>
                       op.operatorIdentityId ===
-                        machineTracking.currentOperatorIdentityId &&
+                      machineTracking.currentOperatorIdentityId &&
                       !op.signOutTime,
                   );
                   if (existing) existing.signOutTime = scan.timeStamp;
@@ -1640,7 +1640,7 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
               const operatorSession = machineTracking.operators.find(
                 (op) =>
                   op.operatorIdentityId ===
-                    machineTracking.currentOperatorIdentityId &&
+                  machineTracking.currentOperatorIdentityId &&
                   !op.signOutTime,
               );
               if (!operatorSession)
@@ -1738,13 +1738,13 @@ app.get("/api/cms/production/tracking/status/today", async (req, res) => {
         }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? {
-              identityId: empDoc.identityId,
-              name: `${empDoc.firstName} ${empDoc.lastName}`,
-            }
+            identityId: empDoc.identityId,
+            name: `${empDoc.firstName} ${empDoc.lastName}`,
+          }
           : {
-              identityId: machine.currentOperatorIdentityId,
-              name: "Unknown Operator",
-            };
+            identityId: machine.currentOperatorIdentityId,
+            name: "Unknown Operator",
+          };
       }
 
       machinesStatus.push({
@@ -1832,13 +1832,13 @@ app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
         }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? {
-              identityId: empDoc.identityId,
-              name: `${empDoc.firstName} ${empDoc.lastName}`,
-            }
+            identityId: empDoc.identityId,
+            name: `${empDoc.firstName} ${empDoc.lastName}`,
+          }
           : {
-              identityId: machine.currentOperatorIdentityId,
-              name: "Unknown Operator",
-            };
+            identityId: machine.currentOperatorIdentityId,
+            name: "Unknown Operator",
+          };
       }
 
       machinesStatus.push({
