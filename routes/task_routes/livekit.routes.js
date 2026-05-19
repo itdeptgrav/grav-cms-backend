@@ -116,7 +116,7 @@ router.post(
                 roomName,
                 createdBy: employeeId,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours — matches token TTL
+                expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
                 active: true,
             });
 
