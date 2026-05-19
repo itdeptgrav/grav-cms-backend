@@ -127,7 +127,7 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                     badge: "/icon-192.png",
                     requireInteraction: false,
                     vibrate: [200, 100, 200],
-                    tag: `cowork-${data.type || "notif"}-${Date.now()}`,
+                    tag: `cowork-${data.type || "notif"}`,
                     renotify: true,
                     data: dataPayload,
                 },
