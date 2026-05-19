@@ -406,7 +406,7 @@ List the next steps decided in the meeting]
 
 
 VOICES ACTUALLY HEARD IN AUDIO FILES (these are the ONLY participants):
-${audioFileParticipants.map((name, i) => `  File ${i + 1}: ${name}`).join('\n')}
+${participantNames.map((name, i) => `  File ${i + 1}: ${name}`).join('\n')}
 
 IMPORTANT DISTINCTION:
 - "PARTICIPANTS" = ONLY the people whose VOICES are in the audio files above
