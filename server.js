@@ -834,6 +834,9 @@ app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
 const deliveryRoutes = require("./routes/CMS_Routes/Inventory/Operations/deliveries");
 app.use("/api/cms/inventory/operations/deliveries", deliveryRoutes);
 
+const returnRoutes = require("./routes/CMS_Routes/Inventory/Operations/returnRequests");
+app.use("/api/cms/inventory/operations/purchase-orders/:poId/returns", returnRoutes);
+
 // Overview Section
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
