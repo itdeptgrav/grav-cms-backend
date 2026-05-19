@@ -22,7 +22,8 @@ const purchaseOrderItemSchema = new mongoose.Schema({
     variantCombination:  [{ type: String, trim: true }],
     variantName:         { type: String, trim: true, default: "" },
     variantSku:          { type: String, trim: true, default: "" },
-    vendorNickname: { type: String, trim: true, default: "" }
+    vendorNickname: { type: String, trim: true, default: "" },
+    expectedDeliveryDate: { type: Date, default: null }
 }, { _id: true });
 
 const deliverySchema = new mongoose.Schema({
@@ -46,6 +47,38 @@ const deliverySchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: "ProjectManager"
     }
+}, { timestamps: true });
+
+
+// ── Return request receipt sub-doc ───────────────────────────────────────
+const returnReceiptSchema = new mongoose.Schema({
+    quantityReceived: { type: Number, required: true, min: 0 },
+    receivedDate:     { type: Date, default: Date.now },
+    notes:            { type: String, trim: true, default: "" },
+    receivedBy:       { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+}, { timestamps: true });
+
+// ── Return request sub-doc ───────────────────────────────────────────────
+const returnRequestSchema = new mongoose.Schema({
+    poItemId:           { type: mongoose.Schema.Types.ObjectId, required: true },
+    rawItem:            { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+    itemName:           { type: String, trim: true, required: true },
+    sku:                { type: String, trim: true, default: "" },
+    unit:               { type: String, trim: true, default: "unit" },
+    variantId:          { type: mongoose.Schema.Types.ObjectId, default: null },
+    variantCombination: [{ type: String, trim: true }],
+    damagedQuantity:    { type: Number, required: true, min: 0 },
+    returnedQuantity:   { type: Number, default: 0, min: 0 },
+    pendingReturnQty:   { type: Number, default: 0, min: 0 },
+    status: {
+        type: String,
+        enum: ["PENDING", "PARTIAL", "COMPLETED", "CANCELLED"],
+        default: "PENDING"
+    },
+    reason:     { type: String, trim: true, default: "" },
+    reportedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    reportedAt: { type: Date, default: Date.now },
+    receipts:   [returnReceiptSchema],
 }, { timestamps: true });
 
 const paymentSchema = new mongoose.Schema({
@@ -143,6 +176,9 @@ const purchaseOrderSchema = new mongoose.Schema({
 
     // Delivery Tracking
     deliveries: [deliverySchema],
+    
+    returnRequests: [returnRequestSchema],
+
     totalReceived: {
         type: Number,
         min: 0,
