@@ -880,6 +880,12 @@ app.use(
   workOrderProgressRoutes,
 );
 
+
+
+const mrfRoutes = require("./routes/CMS_Routes/Inventory/Operations/mrfRoutes")
+app.use("/api/cms/inventory/mrf", mrfRoutes)
+
+
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 
