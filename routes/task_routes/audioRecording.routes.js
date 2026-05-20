@@ -318,8 +318,7 @@ module.exports = function (io) {
                 // uploadAudioToDrive handles (1),(2)... suffix if file already exists
                 // Use sanitized full name — avoids collision between participants with same first name
                 const safeName = (firstName || name || "user").replace(/[^a-zA-Z0-9]/g, "").slice(0, 20) || employeeId;
-                const baseFileName = `${employeeId}_${safeName}_audio_${meetId}.${ext}`;
-
+                const baseFileName = `${safeName}_audio_${meetId}.${ext}`;
                 console.log(`[AudioFinalize] Merging ${merged.length} bytes for ${employeeId} → ${baseFileName}`);
 
                 // Upload to Google Drive — returns actual fileName (may have (1) suffix)

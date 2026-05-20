@@ -1,10 +1,17 @@
 /**
- * utils/sendWebPush.js
- * Shared FCM Web Push helper. Use this in any route/service to send
- * background push notifications to employees.
+ * utils/sendWebPush.js  (or wherever you place it in your backend)
+ * Shared FCM Web Push helper — DATA-ONLY payloads.
+ *
+ * Why data-only?
+ *   If you include a `notification` object, Chrome/FCM auto-displays it
+ *   BEFORE the service worker's onBackgroundMessage fires. This causes:
+ *     - "You have a new notification" generic text (Chrome's fallback)
+ *     - Duplicate notifications
+ *     - Notifications not coming from the PWA
+ *   Data-only means onBackgroundMessage is the SINGLE display controller.
  */
 
-const Employee = require("../models/Employee");
+const Employee = require("../models/Employee"); // adjust path as needed
 
 const URL_MAP = {
   salary_credited: "/salary",
@@ -25,8 +32,14 @@ function getUrl(type) {
   return URL_MAP[type] || "/dashboard";
 }
 
+/**
+ * Build a DATA-ONLY FCM payload.
+ * No `notification` object anywhere — SW controls display entirely.
+ */
 function buildPayload({ title, body, type, url, extra = {} }) {
   const finalUrl = url || getUrl(type);
+
+  // FCM requires all data values to be strings
   const data = {
     title,
     body,
@@ -37,23 +50,19 @@ function buildPayload({ title, body, type, url, extra = {} }) {
       Object.entries(extra).map(([k, v]) => [k, String(v ?? "")]),
     ),
   };
+
   return {
+    // ── Data-only: SW handles display ──────────────────────────────────
     data,
+
+    // ── Web push delivery options (no notification object!) ────────────
     webpush: {
       headers: { Urgency: "high", TTL: "0" },
-      notification: {
-        title,
-        body,
-        icon: "/icon.png",
-        badge: "/icon.png",
-        requireInteraction: false,
-        vibrate: [200, 100, 200],
-        tag: "grav-" + (type || "notif") + "-" + Date.now(),
-        renotify: true,
-        data,
-      },
+      // NO webpush.notification — that's what causes Chrome auto-display
       fcmOptions: { link: finalUrl },
     },
+
+    // ── APNs (iOS Safari 16.4+ PWA) ────────────────────────────────────
     apns: {
       headers: {
         "apns-priority": "10",
@@ -71,6 +80,8 @@ function buildPayload({ title, body, type, url, extra = {} }) {
         ...data,
       },
     },
+
+    // ── Android native (future) ────────────────────────────────────────
     android: {
       priority: "high",
       ttl: 0,
@@ -104,6 +115,14 @@ async function clearStaleToken(id) {
   );
 }
 
+function isStaleError(code = "") {
+  return (
+    code.includes("not-registered") ||
+    code.includes("invalid-registration") ||
+    code.includes("third-party-auth")
+  );
+}
+
 /**
  * Send push to a single employee by MongoDB _id.
  */
@@ -112,7 +131,10 @@ async function sendWebPush({ employeeId, title, body, type, url, extra }) {
     const emp = await Employee.findById(employeeId)
       .select("firstName fcmToken")
       .lean();
-    if (!emp?.fcmToken) return { sent: 0 };
+    if (!emp?.fcmToken) {
+      console.log(`[WEB-PUSH] No FCM token for ${employeeId}`);
+      return { sent: 0 };
+    }
 
     const messaging = getMessaging();
     if (!messaging) return { sent: 0 };
@@ -120,22 +142,18 @@ async function sendWebPush({ employeeId, title, body, type, url, extra }) {
     const payload = buildPayload({ title, body, type, url, extra });
     try {
       await messaging.send({ token: emp.fcmToken, ...payload });
-      console.log("[WEB-PUSH] Sent to", emp.firstName, "(" + type + ")");
+      console.log(
+        `[WEB-PUSH] ✅ Sent "${title}" to ${emp.firstName} (${type})`,
+      );
       return { sent: 1 };
     } catch (err) {
       const code = err.errorInfo?.code || err.code || "";
-      console.error("[WEB-PUSH] Failed for", emp.firstName, code);
-      if (
-        code.includes("not-registered") ||
-        code.includes("invalid-registration") ||
-        code.includes("third-party-auth")
-      ) {
-        await clearStaleToken(employeeId);
-      }
+      console.error(`[WEB-PUSH] ✗ ${emp.firstName}: ${code}`);
+      if (isStaleError(code)) await clearStaleToken(employeeId);
       return { sent: 0 };
     }
   } catch (e) {
-    console.error("[WEB-PUSH] Error:", e.message);
+    console.error("[WEB-PUSH] sendWebPush error:", e.message);
     return { sent: 0 };
   }
 }
@@ -160,7 +178,12 @@ async function sendWebPushToMany({
       .select("firstName fcmToken")
       .lean();
 
-    if (!emps.length) return { sent: 0, failed: 0 };
+    if (!emps.length) {
+      console.log(
+        `[WEB-PUSH] No FCM tokens for ${employeeIds.length} employee(s)`,
+      );
+      return { sent: 0, failed: 0 };
+    }
 
     const messaging = getMessaging();
     if (!messaging) return { sent: 0, failed: emps.length };
@@ -172,24 +195,19 @@ async function sendWebPushToMany({
     for (const emp of emps) {
       try {
         await messaging.send({ token: emp.fcmToken, ...payload });
-        console.log("[WEB-PUSH] Sent to", emp.firstName, "(" + type + ")");
+        console.log(`[WEB-PUSH] ✅ ${emp.firstName} (${type})`);
         sent++;
       } catch (err) {
         const code = err.errorInfo?.code || err.code || "";
+        console.error(`[WEB-PUSH] ✗ ${emp.firstName}: ${code}`);
         failed++;
-        if (
-          code.includes("not-registered") ||
-          code.includes("invalid-registration") ||
-          code.includes("third-party-auth")
-        ) {
-          await clearStaleToken(emp._id);
-        }
+        if (isStaleError(code)) await clearStaleToken(emp._id);
       }
     }
-    console.log("[WEB-PUSH]", type, "—", sent + "/" + emps.length, "sent");
+    console.log(`[WEB-PUSH] ${type} — ${sent}/${emps.length} sent`);
     return { sent, failed };
   } catch (e) {
-    console.error("[WEB-PUSH] Error:", e.message);
+    console.error("[WEB-PUSH] sendWebPushToMany error:", e.message);
     return { sent: 0, failed: 0 };
   }
 }
