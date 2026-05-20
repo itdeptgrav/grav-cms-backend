@@ -28,7 +28,6 @@ router.get("/folders", verifyCoworkToken, verifyEmployeeToken, async (req, res) 
             const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
             if (me) filter.department = me.department;
         }
-        // employee sees folders of their dept too (for awareness)
         if (role === "employee") {
             const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
             if (me) filter.department = me.department;
@@ -41,7 +40,7 @@ router.get("/folders", verifyCoworkToken, verifyEmployeeToken, async (req, res) 
     }
 });
 
-// POST /cowork/sop/folders — create folder (no approval needed)
+// POST /cowork/sop/folders — create folder
 router.post("/folders", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId, name: userName } = req.coworkUser;
@@ -49,7 +48,6 @@ router.post("/folders", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
 
         if (!name || !department) return res.status(400).json({ error: "name and department are required." });
 
-        // TL can only create folder for their own dept
         if (role === "tl") {
             const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
             if (!me || me.department !== department) {
@@ -70,7 +68,7 @@ router.post("/folders", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     }
 });
 
-// DELETE /cowork/sop/folders/:id — delete folder (CEO any, TL own)
+// DELETE /cowork/sop/folders/:id
 router.delete("/folders/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId } = req.coworkUser;
@@ -81,7 +79,6 @@ router.delete("/folders/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res)
             return res.status(403).json({ error: "TL can only delete their own folders." });
         }
 
-        // Move SOPs inside to Uncategorized
         await Sop.updateMany(
             { folderId: folder._id },
             { $set: { folderId: null, folderName: "Uncategorized" } }
@@ -142,7 +139,6 @@ router.post("/", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
             }
         }
 
-        // Resolve folder
         let folderName = "Uncategorized";
         let resolvedFolderId = null;
         if (folderId) {
@@ -184,7 +180,6 @@ router.patch("/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
         if (description) sop.description = description.trim();
         if (department && role === "ceo") sop.department = department.trim();
 
-        // Update folder if changed
         if (folderId !== undefined) {
             if (!folderId) {
                 sop.folderId = null; sop.folderName = "Uncategorized";
@@ -277,7 +272,6 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
         if (sopId && !sop) return res.status(404).json({ error: "SOP not found." });
         if (sopId && sop.status !== "approved") return res.status(400).json({ error: "Only approved SOPs can be applied." });
 
-        // Support manual bleach (task suggestion without SOP)
         const finalPoints = sop ? sop.points : Number(manualPoints);
         const finalSopName = sop ? sop.name : (manualSopName || "Manual Deduction");
         const finalFolderName = sop ? (sop.folderName || "Uncategorized") : "Task Event";
@@ -296,14 +290,17 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
         const year = new Date().getFullYear();
 
         const bleachEntry = {
-            sopId: sop?._id || null,
-            sopName: finalSopName,
-            folderName: finalFolderName,
-            points: finalPoints,
-            description: description?.trim() || sop?.description || "",
-            date: today,
-            cutBy: appliedById, cutByName: appliedByName,
-            cutByRole: role === "ceo" ? "ceo" : "tl",
+            sopId:        sop?._id || null,
+            sopName:      finalSopName,
+            folderName:   finalFolderName,
+            points:       finalPoints,
+            description:  description?.trim() || sop?.description || "",
+            date:         today,
+            cutBy:        appliedById,
+            cutByName:    appliedByName,
+            cutByRole:    role === "ceo" ? "ceo" : "tl",
+            bleachType:   "credit", // SOP violation — adds to penalty score
+            isCredit:     false,
             recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
         };
 
@@ -319,7 +316,6 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
 
         await employee.save();
 
-        // Mark this task+event as applied in Firestore to prevent re-showing
         if (req.body.taskId && req.body.eventKey) {
             try {
                 const { db } = require("../../config/firebaseAdmin");
@@ -367,7 +363,6 @@ router.get("/bleach/:employeeId", verifyCoworkToken, verifyEmployeeToken, async 
         const sopPoints = (employee.sopPoints || []).sort((a, b) => b.year - a.year).map(yp => ({
             ...yp,
             bleaches: (yp.bleaches || []).map(b => {
-                // Normalize old entries: negative points = credit (old format before isCredit flag)
                 if (Number(b.points) < 0) {
                     return { ...b, points: Math.abs(b.points), isCredit: true };
                 }
@@ -389,7 +384,6 @@ router.get("/bleach/:employeeId", verifyCoworkToken, verifyEmployeeToken, async 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /cowork/sop/recheck/pending-list
-// Returns employees with pending recheck requests
 router.get("/recheck/pending-list", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId } = req.coworkUser;
@@ -427,8 +421,6 @@ router.get("/recheck/pending-list", verifyCoworkToken, verifyCeoOrTL, async (req
 });
 
 // GET /cowork/sop/recheck/pending-count
-// Returns count of pending recheck requests for TL (own dept) or CEO (all)
-// ─────────────────────────────────────────────────────────────────────────────
 router.get("/recheck/pending-count", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId } = req.coworkUser;
@@ -456,17 +448,13 @@ router.get("/recheck/pending-count", verifyCoworkToken, verifyCeoOrTL, async (re
     }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /cowork/sop/bleach/:employeeId/:bleachId/recheck
-// Employee requests a recheck on a bleach entry
-// ─────────────────────────────────────────────────────────────────────────────
 router.post("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
         const { employeeId: requesterId, role } = req.coworkUser;
         const { employeeId, bleachId } = req.params;
         const { requestNote } = req.body;
 
-        // Only the employee themselves can request a recheck
         if (role === "employee" && requesterId !== employeeId) {
             return res.status(403).json({ error: "You can only recheck your own bleaches." });
         }
@@ -474,12 +462,10 @@ router.post("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEm
         const employee = await Employee.findOne({ biometricId: employeeId });
         if (!employee) return res.status(404).json({ error: "Employee not found." });
 
-        // Find the bleach entry across all year records
         let found = false;
         for (const yearRecord of employee.sopPoints) {
             const bleach = yearRecord.bleaches.id(bleachId);
             if (bleach) {
-                // Can't recheck if already confirmed (deduction removed)
                 if (bleach.recheck?.status === "confirmed") {
                     return res.status(400).json({ error: "This bleach was already confirmed — deduction has been removed." });
                 }
@@ -507,15 +493,12 @@ router.post("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEm
     }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 // PATCH /cowork/sop/bleach/:employeeId/:bleachId/recheck
-// TL/CEO reviews the recheck — confirm (points reversed) or reject (points stay)
-// ─────────────────────────────────────────────────────────────────────────────
 router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
         const { employeeId, bleachId } = req.params;
-        const { action, reviewNote } = req.body; // action: "confirm" | "reject"
+        const { action, reviewNote } = req.body;
 
         if (!["confirm", "reject"].includes(action)) {
             return res.status(400).json({ error: "action must be 'confirm' or 'reject'." });
@@ -524,7 +507,6 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
         const employee = await Employee.findOne({ biometricId: employeeId });
         if (!employee) return res.status(404).json({ error: "Employee not found." });
 
-        // TL scope check
         if (role === "tl") {
             const me = await Employee.findOne({ biometricId: reviewerId }, { department: 1 }).lean();
             if (!me || me.department !== employee.department) {
@@ -534,7 +516,6 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
 
         let found = false;
         let bleachPoints = 0;
-        let yearIndex = -1;
 
         for (let i = 0; i < employee.sopPoints.length; i++) {
             const bleach = employee.sopPoints[i].bleaches.id(bleachId);
@@ -544,7 +525,6 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
                 }
 
                 bleachPoints = bleach.points;
-                yearIndex = i;
 
                 bleach.recheck.status = action === "confirm" ? "confirmed" : "rejected";
                 bleach.recheck.reviewedBy = reviewerId;
@@ -552,12 +532,10 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
                 bleach.recheck.reviewedAt = new Date();
                 bleach.recheck.reviewNote = reviewNote?.trim() || "";
 
-                // confirm = employee was right = reverse the deduction
                 if (action === "confirm") {
                     employee.sopPoints[i].totalDeducted = +(
                         employee.sopPoints[i].totalDeducted - bleachPoints
                     ).toFixed(2);
-                    // floor at 0
                     if (employee.sopPoints[i].totalDeducted < 0) employee.sopPoints[i].totalDeducted = 0;
                 }
 
@@ -581,9 +559,7 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
     }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /cowork/sop/task-suggestions/dismiss
-// Called when TL/CEO rejects a suggestion — saves to applied collection so it won't reappear
 router.post("/task-suggestions/dismiss", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { employeeId: appliedById } = req.coworkUser;
@@ -607,34 +583,27 @@ router.post("/task-suggestions/dismiss", verifyCoworkToken, verifyCeoOrTL, async
 });
 
 // GET /cowork/sop/task-suggestions
-// Fetches tasks from Firestore that match enabled SOP events
-// Returns list of tasks with suggested bleach info for TL/CEO to review
-// ─────────────────────────────────────────────────────────────────────────────
 router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId } = req.coworkUser;
         const { admin, db } = require("../../config/firebaseAdmin");
 
-        // 1. Load SOP event config from Firestore
         const configSnap = await db.collection("cowork_sop_settings").doc("task_events").get();
         if (!configSnap.exists) return res.json({ success: true, suggestions: [] });
 
         const config = configSnap.data().events || {};
         const now = new Date();
 
-        // 2. Get TL's department for scoping
         let myDept = null;
         if (role === "tl") {
             const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
             myDept = me?.department || null;
         }
 
-        // 3. Fetch all relevant tasks from Firestore
         let tasksSnap;
         if (role === "ceo") {
             tasksSnap = await db.collection("cowork_tasks").get();
         } else {
-            // TL: tasks they assigned OR tasks assigned to their dept employees
             const [s1, s2] = await Promise.all([
                 db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get(),
                 db.collection("cowork_tasks").where("department", "==", myDept).get(),
@@ -645,7 +614,6 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
             tasksSnap = { docs: Object.values(taskMap).map(t => ({ id: t.id, data: () => t })) };
         }
 
-        // Load already-applied task+event pairs to exclude them
         const appliedSnap = await db.collection("cowork_sop_applied").get();
         const appliedSet = new Set();
         appliedSnap.forEach(d => {
@@ -657,20 +625,17 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
 
         tasksSnap.docs.forEach(docSnap => {
             const task = { id: docSnap.id, ...docSnap.data() };
-            if (task.isFolder) return; // skip folders
+            if (task.isFolder) return;
 
             const assigneeId = (task.assigneeIds || [])[0];
             const assigneeName = task.assigneeNameMap?.[assigneeId] || assigneeId || "Unknown";
             const taskDept = task.department || myDept || "";
 
-            // Helper to push suggestion
             const push = (eventKey, reason) => {
                 const ev = config[eventKey];
                 if (!ev?.enabled || !ev.points) return;
-                if (appliedSet.has(`${task.id}_${eventKey}`)) return; // already applied
+                if (appliedSet.has(`${task.id}_${eventKey}`)) return;
 
-                // Role-aware points: CEO applying uses ceo-specific event if available
-                // task_rejected_tl → if ceo is applying, use task_rejected_ceo points instead
                 let finalPoints = ev.points;
                 if (role === "ceo" && eventKey === "task_rejected_tl" && config.task_rejected_ceo?.enabled) {
                     finalPoints = config.task_rejected_ceo.points;
@@ -695,9 +660,6 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 });
             };
 
-            // ── Check each event ──────────────────────────────────────────────────
-
-            // 1. Task overdue (regular, has timer or fixedDeadline)
             if (config.task_overdue?.enabled) {
                 const due = task.dueDate || task.fixedDeadline;
                 if (due && new Date(due) < now && !["done", "tl_approved", "ceo_approved"].includes(task.status) && !task.isRepeat && !task.isGoal && !task.isThirdParty) {
@@ -705,17 +667,14 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 }
             }
 
-            // 2. Task rejected by TL
             if (config.task_rejected_tl?.enabled && task.completionStatus === "tl_rejected") {
                 push("task_rejected_tl", "Rejected by Team Lead");
             }
 
-            // 3. Task rejected by CEO
             if (config.task_rejected_ceo?.enabled && task.completionStatus === "ceo_rejected") {
                 push("task_rejected_ceo", "Rejected by CEO");
             }
 
-            // 4. Repeat task missed
             if (config.repeat_missed?.enabled && task.isRepeat) {
                 const deadlines = task.repeatConfig?.deadlineTimes || (task.deadlineTime ? [task.deadlineTime] : []);
                 const today = now.toISOString().split("T")[0];
@@ -728,7 +687,6 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 });
             }
 
-            // 5. Repeat task submitted late
             if (config.repeat_late?.enabled && task.isRepeat) {
                 const subs = task.repeatSubmissions || {};
                 Object.entries(subs).forEach(([key, sub]) => {
@@ -736,7 +694,6 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 });
             }
 
-            // 6. Third party overdue
             if (config.third_party_overdue?.enabled && task.isThirdParty) {
                 const due = task.fixedDeadline || task.dueDate;
                 if (due && new Date(due) < now && task.status !== "done") {
@@ -744,12 +701,10 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 }
             }
 
-            // 7. Third party rejected
             if (config.third_party_rejected?.enabled && task.isThirdParty && task.completionStatus === "tl_rejected") {
                 push("third_party_rejected", "Third Party Task Rejected");
             }
 
-            // 8. Goal overdue
             if (config.goal_overdue?.enabled && task.isGoal) {
                 const due = task.goalDeadline || task.dueDate;
                 if (due && new Date(due) < now && task.status !== "done") {
@@ -757,7 +712,6 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 }
             }
 
-            // 9. Self assigned overdue
             if (config.self_assigned_overdue?.enabled && task.isSelfAssigned) {
                 const due = task.dueDate || task.fixedDeadline;
                 if (due && new Date(due) < now && task.status !== "done") {
@@ -765,12 +719,10 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 }
             }
 
-            // 10. Extension rejected
             if (config.extension_rejected?.enabled && task.deadlineExtension?.status === "rejected") {
                 push("extension_rejected", "Deadline Extension Rejected");
             }
 
-            // 11. Task not started (open too long)
             if (config.task_not_started?.enabled) {
                 const days = config.task_not_started.daysThreshold || 2;
                 const created = task.createdAt?._seconds ? new Date(task.createdAt._seconds * 1000) : task.createdAt ? new Date(task.createdAt) : null;
@@ -790,52 +742,113 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /cowork/sop/goal-credit
-// Awards positive points to employee when goal component is completed
-// Acts as reverse of bleach — adds credit to sopPoints
+//
+// Deducts points from employee's sopPoints.totalDeducted when a goal node is
+// approved on-time (submitted BEFORE its deadline). Since lower totalDeducted
+// = better performance, subtracting points here is a REWARD.
+//
+// Flow:
+//   1. Sender (TL/CEO) clicks Approve on the submitted report
+//   2. Frontend calls /goal-credit with { submittedAt, deadline, points, ... }
+//   3. Backend checks: submittedAt <= deadline
+//      → YES  → deduct points from totalDeducted (reward employee)
+//      → NO   → return skipped:true, no change to employee record
+//
+// The credit entry is stored in bleaches with isCredit:true for history display.
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId: awardedById, name: awardedByName } = req.coworkUser;
-        const { targetEmployeeId, points, componentName, taskTitle, taskId, componentId } = req.body;
+        const {
+            targetEmployeeId,
+            points,
+            componentName,
+            taskTitle,
+            taskId,
+            componentId,
+            submittedAt,   // ISO string — when receiver submitted the report
+            deadline,      // ISO string — the node's deadline
+        } = req.body;
 
-        if (!targetEmployeeId) return res.status(400).json({ error: "targetEmployeeId is required." });
-        if (!points || points <= 0) return res.status(400).json({ error: "points must be > 0." });
+        if (!targetEmployeeId) {
+            return res.status(400).json({ error: "targetEmployeeId is required." });
+        }
+        if (!points || Number(points) <= 0) {
+            return res.status(400).json({ error: "points must be > 0." });
+        }
+
+        // ── On-time check ──────────────────────────────────────────────────────
+        // Only apply credit if submission was before (or exactly at) the deadline.
+        // If deadline is not set, credit unconditionally.
+        let isOnTime = true;
+        if (deadline && submittedAt) {
+            const deadlineDate  = new Date(deadline);
+            const submittedDate = new Date(submittedAt);
+            isOnTime = submittedDate <= deadlineDate;
+        }
+
+        if (!isOnTime) {
+            // Submission was late — no credit applied, just return info
+            return res.json({
+                success: false,
+                skipped: true,
+                message: `Submitted after deadline — no point credit for "${componentName}". Approval still recorded.`,
+            });
+        }
+        // ──────────────────────────────────────────────────────────────────────
 
         const employee = await Employee.findOne({ biometricId: targetEmployeeId });
         if (!employee) return res.status(404).json({ error: "Employee not found." });
 
-        const year = new Date().getFullYear();
-        const today = new Date().toISOString().split("T")[0];
+        const year       = new Date().getFullYear();
+        const today      = new Date().toISOString().split("T")[0];
+        const absPoints  = Math.abs(Number(points));
 
+        // Build the credit entry — bleachType:"debit" = reward (reduces penalty score)
         const creditEntry = {
-            sopId: null,
-            sopName: componentName || "Goal Component",
-            folderName: taskTitle || "Goal Task",
-            points: Math.abs(points), // store as positive
-            description: `Goal component completed: ${componentName || ""}`,
-            date: today,
-            cutBy: awardedById,
-            cutByName: awardedByName,
-            cutByRole: role === "ceo" ? "ceo" : "tl",
-            isCredit: true,
+            sopId:        null,
+            sopName:      componentName || "Goal Component",
+            folderName:   taskTitle     || "Goal Task",
+            points:       absPoints,
+            description:  `On-time goal node approved: ${componentName || ""}`,
+            date:         today,
+            cutBy:        awardedById,
+            cutByName:    awardedByName,
+            cutByRole:    role === "ceo" ? "ceo" : "tl",
+            bleachType:   "debit",  // REWARD — subtracts from penalty score, shown GREEN
+            isCredit:     true,     // legacy boolean kept for compat
             taskId,
             componentId,
-            recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+            recheck: {
+                status: "none", requestedAt: null, requestNote: "",
+                reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "",
+            },
         };
 
         const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);
         if (yearIndex >= 0) {
             employee.sopPoints[yearIndex].bleaches.push(creditEntry);
-            // Credit reduces totalDeducted (floor at 0 or allow negative for net positive)
+            // Subtract points — lower totalDeducted = better performance
             employee.sopPoints[yearIndex].totalDeducted = +(
-                employee.sopPoints[yearIndex].totalDeducted - Math.abs(points)
+                employee.sopPoints[yearIndex].totalDeducted - absPoints
             ).toFixed(2);
+            // Allow negative (net positive means excellent — no floor at 0)
         } else {
-            employee.sopPoints.push({ year, totalDeducted: -Math.abs(points), bleaches: [creditEntry] });
+            // First record for this year — start at negative (net reward)
+            employee.sopPoints.push({
+                year,
+                totalDeducted: -absPoints,
+                bleaches: [creditEntry],
+            });
         }
 
         await employee.save();
-        res.json({ success: true, message: `+${points} pts credited to ${employee.firstName} for "${componentName}".` });
+
+        res.json({
+            success:  true,
+            credited: true,
+            message:  `−${absPoints} pts applied to ${employee.firstName}'s record for on-time completion of "${componentName}".`,
+        });
     } catch (e) {
         console.error("[goal-credit]", e.message);
         res.status(500).json({ error: e.message });

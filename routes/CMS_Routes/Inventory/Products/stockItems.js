@@ -61,9 +61,7 @@ async function buildUnitConversionsMap() {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: process raw items for a variant
-// ─────────────────────────────────────────────────────────────────────────────
+// REPLACE the entire processVariantRawItems function with this:
 async function processVariantRawItems(rawItemsInput) {
   const processedRawItems = [];
   if (!rawItemsInput || !Array.isArray(rawItemsInput)) return processedRawItems;
@@ -73,7 +71,6 @@ async function processVariantRawItems(rawItemsInput) {
 
     const rawItemData = await RawItem.findById(rawItem.rawItemId)
       .select("name sku unit customUnit variants stockTransactions sellingPrice");
-
     if (!rawItemData) continue;
 
     let unitCost = 0;
@@ -85,7 +82,17 @@ async function processVariantRawItems(rawItemsInput) {
       if (rawItemVariant) {
         variantCombination = rawItemVariant.combination || [];
         variantId = rawItem.variantId;
-        if (rawItemData.stockTransactions?.length > 0) {
+
+        // ── 1. Try vendor alias prices on this variant ──────────────────
+        const aliasPrices = (rawItemVariant.vendorNicknames || [])
+          .map(vn => vn.price || 0)
+          .filter(p => p > 0);
+        if (aliasPrices.length > 0) {
+          unitCost = aliasPrices.reduce((s, p) => s + p, 0) / aliasPrices.length;
+        }
+
+        // ── 2. Fall back to variant stock transactions ───────────────────
+        if (unitCost === 0 && rawItemData.stockTransactions?.length > 0) {
           const variantTxs = rawItemData.stockTransactions
             .filter(tx =>
               tx.variantId?.toString() === rawItem.variantId &&
@@ -97,6 +104,7 @@ async function processVariantRawItems(rawItemsInput) {
       }
     }
 
+    // ── 3. Fall back to item-level stock transactions ──────────────────
     if (unitCost === 0 && rawItemData.stockTransactions?.length > 0) {
       const purchaseTxs = rawItemData.stockTransactions
         .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
@@ -104,6 +112,7 @@ async function processVariantRawItems(rawItemsInput) {
       if (purchaseTxs.length > 0) unitCost = purchaseTxs[0].unitPrice || 0;
     }
 
+    // ── 4. Last resort: selling price haircut ────────────────────────────
     if (unitCost === 0 && rawItemData.sellingPrice) unitCost = rawItemData.sellingPrice * 0.8;
 
     const registeredUnit = rawItemData.customUnit || rawItemData.unit || "Unit";
@@ -296,16 +305,39 @@ router.get("/data/raw-items", async (req, res) => {
       };
 
       if (item.variants && item.variants.length > 0) {
+        // Inside GET /data/raw-items, REPLACE the variant cost block inside the map:
         baseItem.variants = item.variants.map(variant => {
+          // ── 1. Vendor alias prices (average if multiple) ──────────────────
           let latestCost = 0;
-          if (item.stockTransactions && item.stockTransactions.length > 0) {
+          const aliasPrices = (variant.vendorNicknames || [])
+            .map(vn => vn.price || 0)
+            .filter(p => p > 0);
+          if (aliasPrices.length > 0) {
+            latestCost = aliasPrices.reduce((s, p) => s + p, 0) / aliasPrices.length;
+          }
+
+          // ── 2. Variant stock transactions ─────────────────────────────────
+          if (latestCost === 0 && item.stockTransactions?.length > 0) {
             const variantTransactions = item.stockTransactions
-              .filter(tx => tx.variantId && tx.variantId.toString() === variant._id.toString() && (tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD"))
+              .filter(tx => tx.variantId?.toString() === variant._id.toString()
+                && (tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD"))
               .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
             if (variantTransactions.length > 0) latestCost = variantTransactions[0].unitPrice || 0;
           }
+
+          // ── 3. Selling price haircut ──────────────────────────────────────
           if (latestCost === 0 && item.sellingPrice) latestCost = item.sellingPrice * 0.8;
-          return { id: variant._id, combination: variant.combination || [], combinationText: variant.combination?.join(" • ") || "Default", quantity: variant.quantity || 0, unit: baseUnitName, cost: latestCost, status: variant.status || "Out of Stock", sku: variant.sku || `${baseItem.sku}-var` };
+
+          return {
+            id: variant._id,
+            combination: variant.combination || [],
+            combinationText: variant.combination?.join(" • ") || "Default",
+            quantity: variant.quantity || 0,
+            unit: baseUnitName,
+            cost: latestCost,
+            status: variant.status || "Out of Stock",
+            sku: variant.sku || `${baseItem.sku}-var`
+          };
         });
       } else {
         let latestCost = 0;
@@ -399,14 +431,14 @@ router.get("/:id/tab/:tabName", async (req, res) => {
     let selectFields = "";
 
     switch (tabName) {
-      case "general":       selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images genderCategory"; break;
-      case "attributes":    selectFields = "attributes"; break;
-      case "variants":      selectFields = "variants attributes reference baseCost baseSalesPrice"; break;
-      case "raw-items":     selectFields = "variants.rawItems variants._id variants.attributes variants.sku"; break;
-      case "operations":    selectFields = "operations"; break;
-      case "measurements":  selectFields = "measurements numberOfPanels"; break;
-      case "costs":         selectFields = "miscellaneousCosts"; break;
-      default:              selectFields = "name category";
+      case "general": selectFields = "name additionalNames productType category unit hsnCode baseSalesPrice baseCost internalNotes numberOfPanels reference images genderCategory"; break;
+      case "attributes": selectFields = "attributes"; break;
+      case "variants": selectFields = "variants attributes reference baseCost baseSalesPrice"; break;
+      case "raw-items": selectFields = "variants.rawItems variants._id variants.attributes variants.sku"; break;
+      case "operations": selectFields = "operations"; break;
+      case "measurements": selectFields = "measurements numberOfPanels"; break;
+      case "costs": selectFields = "miscellaneousCosts"; break;
+      default: selectFields = "name category";
     }
 
     const stockItem = await StockItem.findById(id).select(selectFields);
@@ -419,7 +451,7 @@ router.get("/:id/tab/:tabName", async (req, res) => {
         Operation.find().sort({ name: 1 }),
         OperationGroup.find().populate("operations", "name operationCode totalSam durationSeconds machineType").sort({ name: 1 })
       ]);
-      response.registeredOperations = registeredOperations.map(op => ({ _id: op._id, name: op.name,operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType }));
+      response.registeredOperations = registeredOperations.map(op => ({ _id: op._id, name: op.name, operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType }));
       response.registeredGroups = registeredGroups.map(grp => ({ _id: grp._id, name: grp.name, operations: grp.operations }));
     }
 

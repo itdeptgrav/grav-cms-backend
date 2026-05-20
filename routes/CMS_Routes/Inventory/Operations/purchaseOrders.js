@@ -18,6 +18,7 @@ const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Ven
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const VendorEmailService = require("../../../../services/VendorEmailService");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
+const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -153,6 +154,117 @@ router.get("/", async (req, res) => {
   } catch (error) {
     console.error("Error fetching purchase orders:", error);
     res.status(500).json({ success: false, message: "Server error while fetching purchase orders" });
+  }
+});
+
+
+//    vendor's price + deliveryDays + the alias _id (needed for price write-back).
+router.get("/data/vendor-items/:vendorId", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(vendorId)) {
+      return res.status(400).json({ success: false, message: "Invalid vendor id" });
+    }
+
+    const items = await RawItem.find({ "variants.vendorNicknames.vendor": vendorId })
+      .select(
+        "name sku category customCategory unit customUnit description quantity minStock maxStock status variants unitConversion"
+      )
+      .lean()
+      .sort({ name: 1 });
+
+    const formatted = items.map((item) => {
+      // Keep only variants that have an alias for THIS vendor
+      const matchingVariants = (item.variants || [])
+        .map((v) => {
+          const alias = (v.vendorNicknames || []).find(
+            (vn) => vn.vendor?.toString() === vendorId
+          );
+          if (!alias) return null;
+          return {
+            _id: v._id.toString(),
+            combination: v.combination || [],
+            sku: v.sku || "",
+            quantity: v.quantity || 0,
+            minStock: v.minStock || 0,
+            maxStock: v.maxStock || 0,
+            // vendor-specific alias data
+            aliasId: alias._id.toString(),
+            vendorCode: alias.nickname || "",
+            price: alias.price || 0,
+            deliveryDays: alias.deliveryDays || 0,
+          };
+        })
+        .filter(Boolean);
+
+      return {
+        id: item._id.toString(),
+        name: item.name,
+        sku: item.sku,
+        category: item.customCategory || item.category || "Uncategorized",
+        unit: item.customUnit || item.unit || "unit",
+        description: item.description || "",
+        currentStock: item.quantity || 0,
+        minStock: item.minStock || 0,
+        maxStock: item.maxStock || 0,
+        status: item.status || "In Stock",
+        unitConversion: item.unitConversion || null,
+        variants: matchingVariants,
+      };
+    });
+
+    res.json({ success: true, rawItems: formatted });
+  } catch (error) {
+    console.error("Error fetching vendor items:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching vendor items",
+    });
+  }
+});
+
+
+router.get("/data/raw-items-with-variants", async (req, res) => {
+  try {
+    const rawItems = await RawItem.find({})
+      .select("name sku category customCategory unit customUnit description quantity minStock maxStock status variants")
+      .lean()
+      .sort({ name: 1 });
+
+    const formatted = rawItems.map((item) => ({
+      id: item._id.toString(),
+      name: item.name,
+      sku: item.sku,
+      category: item.customCategory || item.category || "Uncategorized",
+      unit: item.customUnit || item.unit || "unit",
+      description: item.description || "",
+      currentStock: item.quantity || 0,
+      minStock: item.minStock || 0,
+      maxStock: item.maxStock || 0,
+      status: item.status || "In Stock",
+      variants: (item.variants || []).map(v => ({
+        _id: v._id.toString(),
+        combination: v.combination || [],
+        sku: v.sku || "",
+        quantity: v.quantity || 0,
+        image: v.image || "",
+        // No aliasId / vendorCode / price / deliveryDays here — those are vendor-specific
+        // The frontend will mark hasExistingAlias = false for all variants in this pool
+        aliasId: "",
+        vendorCode: "",
+        price: 0,
+        deliveryDays: 0,
+      })),
+    }));
+
+    res.json({ success: true, rawItems: formatted });
+  } catch (error) {
+    console.error("Error fetching raw items with variants:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching raw items with variants",
+    });
   }
 });
 
@@ -343,8 +455,11 @@ router.post("/", async (req, res) => {
         variantId: item.variantId || null,
         variantCombination: item.variantCombination || [],
         variantName: item.variantCombination?.join(" • ") || "",
-        variantSku: item.variantSku || ""
+        variantSku: item.variantSku || "",
+        expectedDeliveryDate: item.expectedDeliveryDate ? new Date(item.expectedDeliveryDate) : null
       };
+
+
     }));
 
     const subtotal = itemsWithDetails.reduce((sum, i) => sum + (i.totalPrice || 0), 0);
@@ -496,8 +611,10 @@ router.put("/:id", async (req, res) => {
           variantId: item.variantId || null,
           variantCombination: item.variantCombination || [],
           variantName: (item.variantCombination || []).join(" • ") || "",
-          variantSku: item.variantSku || ""
+          variantSku: item.variantSku || "",
+          expectedDeliveryDate: item.expectedDeliveryDate ? new Date(item.expectedDeliveryDate) : null
         };
+
       }));
 
       purchaseOrder.items = itemsWithDetails;
@@ -714,18 +831,21 @@ router.post("/:id/receive", async (req, res) => {
 
     const updates = [];
     for (const ri of items) {
-      const poItem = purchaseOrder.items.find(it => it._id.toString() === ri.itemId);
+      const poItem = purchaseOrder.items.find(
+        it => it._id.toString() === ri.itemId?.toString()
+      );
       if (!poItem) {
+        console.error(`[receive] itemId ${ri.itemId} not matched in PO items:`, purchaseOrder.items.map(it => it._id.toString()));
         return res.status(400).json({ success: false, message: `Item not found in PO: ${ri.itemId}` });
       }
       const qty = parseFloat(ri.quantity) || 0;
       if (qty <= 0) continue;
 
-      const pending = poItem.quantity - poItem.receivedQuantity;
-      if (qty > pending + 0.0001) {
+      const pending = Math.max(0, +(poItem.quantity - poItem.receivedQuantity).toFixed(4));
+      if (qty > pending + 0.001) {
         return res.status(400).json({
           success: false,
-          message: `Cannot receive ${qty} of ${poItem.itemName}. Only ${pending} pending.`,
+          message: `Cannot receive ${qty} of ${poItem.itemName}. Only ${pending.toFixed(4)} pending.`,
         });
       }
 

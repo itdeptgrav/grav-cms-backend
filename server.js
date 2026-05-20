@@ -760,6 +760,10 @@ app.use("/api/customer/requests", customerRequestsRoutes);
 const customerProfileRoutes = require("./routes/Customer_Routes/Profile.js");
 app.use("/api/customer/profile", customerProfileRoutes);
 
+
+const sopRoutes = require("./routes/soproutes/soproute");
+app.use("/cowork/sop", sopRoutes);
+
 // Add this to your server.js in the CMS ROUTES section
 const customerStockItemsRoutes = require("./routes/Customer_Routes/StockItems");
 app.use("/api/customer/stock-items", customerStockItemsRoutes);
@@ -820,12 +824,18 @@ app.use(
 const stockItemsRoutes = require("./routes/CMS_Routes/Inventory/Products/stockItems");
 app.use("/api/cms/stock-items", stockItemsRoutes);
 
+const StoreRoutes = require("./routes/CMS_Routes/Store/storeRoutes.js");
+app.use("/api/cms/store", StoreRoutes);
+
 // Operations Category
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
 
 const deliveryRoutes = require("./routes/CMS_Routes/Inventory/Operations/deliveries");
 app.use("/api/cms/inventory/operations/deliveries", deliveryRoutes);
+
+const returnRoutes = require("./routes/CMS_Routes/Inventory/Operations/returnRequests");
+app.use("/api/cms/inventory/operations/purchase-orders/:poId/returns", returnRoutes);
 
 // Overview Section
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
@@ -1351,7 +1361,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
               workOrder = await WorkOrder.findById(
                 parsedBarcode.workOrderShortId,
               );
-            } catch {}
+            } catch { }
           }
           if (workOrder) {
             io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
@@ -1440,7 +1450,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
                 message: `${employeeName} signed out`,
                 timestamp: new Date(),
               });
-          } catch {}
+          } catch { }
           return res.json({
             success: true,
             message: `${employeeName} signed out`,
@@ -1460,7 +1470,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
         const existingSession = machineTracking.operators.find(
           (op) =>
             op.operatorIdentityId ===
-              machineTracking.currentOperatorIdentityId && !op.signOutTime,
+            machineTracking.currentOperatorIdentityId && !op.signOutTime,
         );
         if (existingSession) existingSession.signOutTime = scanTime;
       }
@@ -1484,7 +1494,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
             status: `${employeeName} signed in to ${machine.name}`,
             timestamp: new Date(),
           });
-      } catch {}
+      } catch { }
 
       return res.json({
         success: true,
@@ -1622,7 +1632,7 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
                   const existing = machineTracking.operators.find(
                     (op) =>
                       op.operatorIdentityId ===
-                        machineTracking.currentOperatorIdentityId &&
+                      machineTracking.currentOperatorIdentityId &&
                       !op.signOutTime,
                   );
                   if (existing) existing.signOutTime = scan.timeStamp;
@@ -1644,7 +1654,7 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
               const operatorSession = machineTracking.operators.find(
                 (op) =>
                   op.operatorIdentityId ===
-                    machineTracking.currentOperatorIdentityId &&
+                  machineTracking.currentOperatorIdentityId &&
                   !op.signOutTime,
               );
               if (!operatorSession)
@@ -1742,13 +1752,13 @@ app.get("/api/cms/production/tracking/status/today", async (req, res) => {
         }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? {
-              identityId: empDoc.identityId,
-              name: `${empDoc.firstName} ${empDoc.lastName}`,
-            }
+            identityId: empDoc.identityId,
+            name: `${empDoc.firstName} ${empDoc.lastName}`,
+          }
           : {
-              identityId: machine.currentOperatorIdentityId,
-              name: "Unknown Operator",
-            };
+            identityId: machine.currentOperatorIdentityId,
+            name: "Unknown Operator",
+          };
       }
 
       machinesStatus.push({
@@ -1836,13 +1846,13 @@ app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
         }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? {
-              identityId: empDoc.identityId,
-              name: `${empDoc.firstName} ${empDoc.lastName}`,
-            }
+            identityId: empDoc.identityId,
+            name: `${empDoc.firstName} ${empDoc.lastName}`,
+          }
           : {
-              identityId: machine.currentOperatorIdentityId,
-              name: "Unknown Operator",
-            };
+            identityId: machine.currentOperatorIdentityId,
+            name: "Unknown Operator",
+          };
       }
 
       machinesStatus.push({

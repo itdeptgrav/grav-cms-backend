@@ -239,7 +239,9 @@ router.get("/:id", async (req, res) => {
                 unitPrice: item.unitPrice,
                 totalPrice: item.totalPrice,
                 rawItem: item.rawItem,
-                status: item.status
+                status: item.status,
+                vendorNickname: item.vendorNickname || "",        // ← add
+                variantCombination: item.variantCombination || [] // ← add
             });
         });
 
