@@ -193,7 +193,7 @@ async function _buildPath(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
-async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null }) {
+async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0 }) {
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
   const path = await _buildPath(parentTaskId);
@@ -235,6 +235,11 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     goalUpdates: [],
     hasTimer: isRepeat || isThirdParty || isGoal ? null : (hasTimer !== false),
     fixedDeadline: (!isRepeat && !isThirdParty && !isGoal && !hasTimer) ? fixedDeadline || null : null,
+    // ── Sender-preset timer: CEO/TL can set a suggested duration at task creation
+    // When > 0, receiver sees "Time set: X hrs — Approve or suggest different" instead of
+    // being asked to propose their own time from scratch.
+    senderTimerWindowSecs: (!isRepeat && !isThirdParty && !isGoal && hasTimer !== false)
+      ? (Number(senderTimerWindowSecs) || 0) : 0,
     // Hierarchy
     parentTaskId: parentTaskId || null,
     isRoot: !parentTaskId,

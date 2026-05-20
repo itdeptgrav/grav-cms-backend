@@ -69,9 +69,10 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName } = req.body;
+    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
+    console.log("[task/create] senderTimerWindowSecs:", senderTimerWindowSecs);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     // isFolder can be boolean true OR string "true" from some clients
     const folderFlag = isFolder === true || isFolder === "true";
@@ -141,6 +142,7 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       // Mark whether this is a CEO-created root task (for visibility filtering)
       createdByCeo: requesterRole === "ceo" && !parentTaskId,
       createdByTl: requesterRole === "tl",
+      senderTimerWindowSecs: Number(senderTimerWindowSecs) || 0,
     });
 
     // If it's a subtask created by TL, post notification in parent task chat
@@ -972,6 +974,154 @@ router.post("/task/:taskId/propose-deadline", verifyCoworkToken, verifyEmployeeT
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── APPROVE SENDER'S PRESET TIMER (employee accepts without proposing their own) ──
+// Called when CEO/TL set a timer duration at creation and employee directly approves it.
+// Mirrors the fixed-deadline approve flow: sets deadlineWindowSecs = senderTimerWindowSecs
+// and moves task to deadline_approved so employee can Confirm & Start.
+router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const { sendPushToEmployees } = require("../../services/fcmPush.service");
+    const { taskId } = req.params;
+    const { employeeId, name: employeeName } = req.coworkUser;
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+
+    if (!task.assigneeIds?.includes(employeeId))
+      return res.status(403).json({ error: "Only assigned employees can approve" });
+    if (task.status !== "open")
+      return res.status(400).json({ error: "Task is not in open state" });
+    const approvedSecs = Number(task.senderTimerWindowSecs) || 0;
+    if (approvedSecs <= 0)
+      return res.status(400).json({ error: "No sender-set timer to approve" });
+
+    // Compute a placeholder dueDate (actual countdown starts when employee presses Start)
+    const dueDate = new Date(Date.now() + approvedSecs * 1000).toISOString();
+
+    await taskRef.update({
+      status: "deadline_approved",
+      deadlineWindowSecs: approvedSecs,
+      originalWindowSecs: approvedSecs,
+      dueDate,
+      senderTimerApprovedBy: employeeId,
+      senderTimerApprovedByName: employeeName,
+      senderTimerApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Post system message to draft chat
+    const _fmtSecs = (s) => {
+      s = Math.max(0, Math.round(Number(s) || 0));
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.round(s / 60)}m`;
+      if (s < 86400) { const h = Math.floor(s / 3600); const m = Math.round((s % 3600) / 60); return m > 0 ? `${h}h ${m}m` : `${h}h`; }
+      return `${Math.round(s / 86400)}d`;
+    };
+    try {
+      const msgRef = db.collection("cowork_tasks").doc(taskId).collection("draft_chat");
+      const msgId = `sys-${Date.now()}`;
+      await msgRef.doc(msgId).set({
+        messageId: msgId, taskId,
+        senderId: employeeId, senderName: employeeName,
+        text: `✅ ${employeeName} approved the time: ${_fmtSecs(approvedSecs)}. You can now Confirm & Start.`,
+        messageType: "system",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await taskRef.update({ lastChatAt: admin.firestore.FieldValue.serverTimestamp(), lastChatPreview: `${employeeName} approved the timer` });
+    } catch (chatErr) {
+      console.warn("[approve-sender-timer] chat post failed:", chatErr.message);
+    }
+
+    // Notify task creator
+    if (task.assignedBy) {
+      try {
+        await sendPushToEmployees(
+          [task.assignedBy],
+          `⏱ Timer Approved · ${task.title}`,
+          `${employeeName} approved the ${_fmtSecs(approvedSecs)} time. Task is ready to start.`,
+          { type: "sender_timer_approved", taskId }
+        );
+      } catch (_) { }
+    }
+
+    res.json({ success: true, deadlineWindowSecs: approvedSecs });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── REJECT SENDER'S PRESET TIMER — receiver finds the time insufficient ────────
+// Employee rejects the sender-set time. Task stays "open" so employee can then
+// propose their own duration (which goes through the normal pending_deadline_approval flow).
+router.post("/task/:taskId/reject-sender-timer", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { db, admin } = require("../../config/firebaseAdmin");
+    const { taskId } = req.params;
+    const { reason } = req.body;
+    const { employeeId, name: employeeName } = req.coworkUser;
+
+    if (!reason?.trim()) return res.status(400).json({ error: "Rejection reason is required" });
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+
+    if (!task.assigneeIds?.includes(employeeId))
+      return res.status(403).json({ error: "Only assigned employees can reject" });
+    if (task.status !== "open")
+      return res.status(400).json({ error: "Task is not in open state" });
+    if (!Number(task.senderTimerWindowSecs))
+      return res.status(400).json({ error: "No sender-set timer to reject" });
+
+    const _fmtSecs = (s) => {
+      s = Math.max(0, Math.round(Number(s) || 0));
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.round(s / 60)}m`;
+      if (s < 86400) { const h = Math.floor(s / 3600); const m = Math.round((s % 3600) / 60); return m > 0 ? `${h}h ${m}m` : `${h}h`; }
+      return `${Math.round(s / 86400)}d`;
+    };
+
+    await taskRef.update({
+      senderTimerRejected: true,
+      senderTimerRejectionReason: reason.trim(),
+      senderTimerRejectedBy: employeeId,
+      senderTimerRejectedByName: employeeName,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Post system message to draft chat
+    try {
+      const msgRef = db.collection("cowork_tasks").doc(taskId).collection("draft_chat");
+      const msgId = `sys-reject-timer-${Date.now()}`;
+      await msgRef.doc(msgId).set({
+        messageId: msgId, taskId,
+        senderId: employeeId, senderName: employeeName,
+        text: `❌ ${employeeName} rejected the allocated time (${_fmtSecs(task.senderTimerWindowSecs)}). Reason: ${reason.trim()}`,
+        messageType: "system",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await taskRef.update({ lastChatAt: admin.firestore.FieldValue.serverTimestamp() });
+    } catch (_) { }
+
+    // Notify task creator (sender)
+    if (task.assignedBy) {
+      try {
+        const { sendPushToEmployees } = require("../../services/fcmPush.service");
+        await sendPushToEmployees(
+          [task.assignedBy],
+          `⏱ Timer Rejected · ${task.title}`,
+          `${employeeName} rejected the ${_fmtSecs(task.senderTimerWindowSecs)} time. Reason: ${reason.trim()}`,
+          { type: "sender_timer_rejected", taskId }
+        );
+      } catch (_) { }
+    }
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── APPROVE / REJECT DEADLINE (task creator only) ─────────────────────────────
