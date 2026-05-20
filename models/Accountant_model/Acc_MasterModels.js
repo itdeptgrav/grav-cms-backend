@@ -402,6 +402,13 @@ const tallyLedgerSchema = new mongoose.Schema(
     currentBalance: { type: Number, default: 0 }, // signed
     currentBalanceType: { type: String, enum: ["Dr", "Cr"], default: "Dr" },
 
+    // When true, openingBalance/currentBalance hold the AUTHORITATIVE
+    // closing balance taken directly from the Tally Trial Balance
+    // export (which already did opening + all movements). The Balance
+    // Sheet then uses it AS-IS and does NOT re-add Day-Book movements
+    // (re-adding caused period-gap / sign / double-count errors).
+    balanceFromTrialBalance: { type: Boolean, default: false },
+
     // Tax & statutory
     gstApplicable: { type: Boolean, default: false },
     gstRegistrationType: {
@@ -639,15 +646,9 @@ tallyStockItemSchema.index({ aliases: 1 });
 const Acc_Company = mongoose.model("Acc_Company", tallyCompanySchema);
 const Acc_Group = mongoose.model("Acc_Group", tallyGroupSchema);
 const Acc_Ledger = mongoose.model("Acc_Ledger", tallyLedgerSchema);
-const Acc_CostCentre = mongoose.model(
-  "Acc_CostCentre",
-  tallyCostCentreSchema,
-);
+const Acc_CostCentre = mongoose.model("Acc_CostCentre", tallyCostCentreSchema);
 const Acc_Unit = mongoose.model("Acc_Unit", tallyUnitSchema);
-const Acc_StockGroup = mongoose.model(
-  "Acc_StockGroup",
-  tallyStockGroupSchema,
-);
+const Acc_StockGroup = mongoose.model("Acc_StockGroup", tallyStockGroupSchema);
 const Acc_StockItem = mongoose.model("Acc_StockItem", tallyStockItemSchema);
 
 module.exports = {

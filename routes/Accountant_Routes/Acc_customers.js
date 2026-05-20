@@ -18,6 +18,180 @@ const {
 } = require("../../models/Accountant_model/Acc_MasterModels");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IMPORTED PARTY BRIDGE
+// ─────────────────────────────────────────────────────────────────────────────
+// The Customers page reads the CRM `Customer` collection. Parties that came
+// in from a Tally import live as Acc_Ledger records under the "Sundry
+// Debtors" group and were therefore invisible here. This helper pulls those
+// imported ledgers, computes each one's revenue/paid/outstanding from its
+// POSTED vouchers, and returns them shaped exactly like a customer row so
+// they can be merged into the same list (no separate page, no data copy).
+//
+// A Sundry Debtor's natural balance is a DEBIT (they owe us):
+//   revenue  ≈ total Debit posted to the ledger (sales raised)
+//   paid     ≈ total Credit posted (receipts/settlements)
+//   outstanding = max(0, signed closing balance) (net still owed)
+async function importedPartyRows(companyId, { groupRx, kind }) {
+  const Acc_Group =
+    require("../../models/Accountant_model/Acc_MasterModels").Acc_Group;
+  const Acc_Company =
+    require("../../models/Accountant_model/Acc_MasterModels").Acc_Company;
+
+  // The Customers/Vendors pages don't pass companyId. Resolve it: use the
+  // passed value if any, else the primary company, else the only company.
+  let cId = null;
+  if (companyId) {
+    try {
+      cId = new mongoose.Types.ObjectId(companyId);
+    } catch {
+      cId = null;
+    }
+  }
+  if (!cId) {
+    let comp = await Acc_Company.findOne({ isPrimary: true })
+      .select("_id")
+      .lean();
+    if (!comp) {
+      const all = await Acc_Company.find({}).select("_id").limit(2).lean();
+      if (all.length === 1) comp = all[0];
+    }
+    if (comp) cId = comp._id;
+  }
+  if (!cId) return [];
+
+  const groups = await Acc_Group.find({ companyId: cId })
+    .select("_id name parent parentName")
+    .lean();
+  if (!groups.length) return [];
+
+  const ids = new Set(
+    groups.filter((g) => groupRx.test(g.name || "")).map((g) => String(g._id)),
+  );
+  let added = true;
+  let guard = 0;
+  while (added && guard < 20) {
+    added = false;
+    guard++;
+    for (const g of groups) {
+      if (ids.has(String(g._id))) continue;
+      const pName = g.parentName;
+      const pId = g.parent && String(g.parent);
+      const parentResolved =
+        (pId && ids.has(pId)) ||
+        (pName &&
+          groups.some((x) => x.name === pName && ids.has(String(x._id))));
+      if (parentResolved) {
+        ids.add(String(g._id));
+        added = true;
+      }
+    }
+  }
+  if (!ids.size) return [];
+  const gIds = [...ids].map((s) => new mongoose.Types.ObjectId(s));
+
+  const ledgers = await Acc_Ledger.find({
+    companyId: cId,
+    groupId: { $in: gIds },
+  })
+    .select(
+      "name gstin aliases groupName openingBalance openingBalanceType email phone",
+    )
+    .lean();
+  if (!ledgers.length) return [];
+
+  const ledgerIds = ledgers.map((l) => l._id);
+  const agg = await Acc_Voucher.aggregate([
+    { $match: { companyId: cId, status: "posted" } },
+    { $unwind: "$ledgerEntries" },
+    { $match: { "ledgerEntries.ledgerId": { $in: ledgerIds } } },
+    {
+      $group: {
+        _id: "$ledgerEntries.ledgerId",
+        dr: {
+          $sum: {
+            $cond: [
+              { $eq: ["$ledgerEntries.type", "Dr"] },
+              "$ledgerEntries.amount",
+              0,
+            ],
+          },
+        },
+        cr: {
+          $sum: {
+            $cond: [
+              { $eq: ["$ledgerEntries.type", "Cr"] },
+              "$ledgerEntries.amount",
+              0,
+            ],
+          },
+        },
+        orderCount: { $sum: 1 },
+        lastOrderDate: { $max: "$voucherDate" },
+      },
+    },
+  ]);
+  const m = new Map(agg.map((a) => [String(a._id), a]));
+
+  return ledgers.map((l) => {
+    const a = m.get(String(l._id)) || {};
+    const dr = a.dr || 0;
+    const cr = a.cr || 0;
+    const openSigned =
+      (l.openingBalanceType === "Cr" ? -1 : 1) *
+      Math.abs(l.openingBalance || 0);
+    // Use the NET-per-ledger basis so the page totals reconcile with the
+    // Balance Sheet's Sundry Debtors figures (which net each ledger first,
+    // then split Dr-balance vs Cr-balance ledgers). closingSigned = the
+    // ledger's net balance including any opening.
+    const closingSigned = openSigned + dr - cr;
+    // Present the NET only, on the same basis as the Balance Sheet
+    // (Sundry Debtors). For a customer:
+    //   net DEBIT  (closingSigned > 0) → they still owe us → outstanding
+    //   net CREDIT (closingSigned < 0) → advance from them  → no receivable
+    // We don't fabricate gross revenue/paid splits (they don't tie to
+    // Tally and were the source of the wrong figures).
+    const stillOwed = closingSigned > 0 ? closingSigned : 0;
+    const advanceFrom = closingSigned < 0 ? Math.abs(closingSigned) : 0;
+    const netMagnitude = Math.abs(closingSigned);
+    return {
+      _id: l._id,
+      isImported: true,
+      source: "tally_ledger",
+      customerCode: null,
+      vendorCode: null,
+      name: l.name,
+      email: l.email || null,
+      phone: l.phone || null,
+      gstin: l.gstin || null,
+      aliases: l.aliases || [],
+      groupName: l.groupName || null,
+      // Revenue = net business (closing magnitude); Paid = advance, if
+      // they're in credit; Outstanding = what they still owe (net Dr).
+      totalRevenue: netMagnitude,
+      totalPaid: advanceFrom,
+      totalOutstanding: stillOwed,
+      balance: netMagnitude,
+      balanceType: closingSigned < 0 ? "Cr" : "Dr",
+      outstandingType: closingSigned < 0 ? "Cr" : "Dr",
+      orderCount: a.orderCount || 0,
+      completedCount: 0,
+      lastOrderDate: a.lastOrderDate || null,
+      _normName: String(l.name || "")
+        .toLowerCase()
+        .replace(/\(.*?\)/g, " ")
+        .replace(
+          /\b(pvt|private|ltd|limited|llp|opc|inc|co|company|enterprises?|traders?|and|&)\b/g,
+          " ",
+        )
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim(),
+      _gstinKey: (l.gstin || "").toUpperCase().replace(/\s+/g, ""),
+    };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Customer code — derived from MongoDB ObjectId, no schema change required.
 //
 // Why derive instead of store? Adding a new field to the Customer schema would
@@ -502,6 +676,60 @@ router.get("/", verifyAccountantToken, async (req, res) => {
       newThisMonth: newThisMonthCount,
     };
 
+    // ── Merge in imported Tally parties (Sundry Debtors) ─────────────
+    // So everything that came from the import shows up here too, in the
+    // same list, with revenue/paid/outstanding from its posted vouchers.
+    try {
+      const imported = await importedPartyRows(req.query.companyId, {
+        groupRx: /sundry debtor/i,
+        kind: "customer",
+      });
+      if (imported.length) {
+        let merged = imported;
+        if (search) {
+          const sx = search.toLowerCase();
+          merged = merged.filter(
+            (c) =>
+              (c.name || "").toLowerCase().includes(sx) ||
+              (c.gstin || "").toLowerCase().includes(sx) ||
+              (c.aliases || []).some((al) => al.toLowerCase().includes(sx)),
+          );
+        }
+        if (filter === "with_outstanding") {
+          merged = merged.filter((c) => c.totalOutstanding > 0);
+        }
+        // Imported parties are appended after CRM customers. They don't
+        // paginate with the CRM set (different source) — show them all so
+        // none are hidden. The page-level summary below counts them.
+        customers = [...customers, ...merged];
+
+        const impRevenue = imported.reduce(
+          (s, c) => s + (c.totalRevenue || 0),
+          0,
+        );
+        const impPaid = imported.reduce((s, c) => s + (c.totalPaid || 0), 0);
+        const impOutstanding = imported.reduce(
+          (s, c) => s + (c.totalOutstanding || 0),
+          0,
+        );
+        summary.totalCustomers =
+          (summary.totalCustomers || 0) + imported.length;
+        summary.totalRevenue = (summary.totalRevenue || 0) + impRevenue;
+        summary.totalPaid = (summary.totalPaid || 0) + impPaid;
+        summary.totalOutstanding =
+          (summary.totalOutstanding || 0) + impOutstanding;
+        summary.customersWithOutstanding =
+          (summary.customersWithOutstanding || 0) +
+          imported.filter((c) => c.totalOutstanding > 0).length;
+        total += imported.length;
+      }
+    } catch (impErr) {
+      console.error(
+        "[customers] imported-party merge skipped:",
+        impErr.message,
+      );
+    }
+
     res.status(200).json({
       success: true,
       summary,
@@ -622,15 +850,90 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
       (c) => c.createdAt && new Date(c.createdAt) >= monthStart,
     ).length;
 
+    // ── Merge in imported Tally parties (Sundry Debtors) ─────────────
+    // /all is the endpoint the Customers page actually calls. Append the
+    // imported Sundry Debtor ledgers so they show in the same list with
+    // revenue/paid/outstanding from their posted vouchers.
+    let allRows = customers;
+    let impSummary = {
+      count: 0,
+      revenue: 0,
+      paid: 0,
+      outstanding: 0,
+      withOutstanding: 0,
+    };
+    try {
+      let imported = await importedPartyRows(req.query.companyId, {
+        groupRx: /sundry debtor/i,
+        kind: "customer",
+      });
+      if (imported.length) {
+        // GHOST DETECTION vs CRM customers (by GSTIN, else norm name).
+        const crmByGstin = new Map();
+        const crmByName = new Map();
+        for (const c of customers) {
+          const g = (c.gstin || "").toUpperCase().replace(/\s+/g, "");
+          if (g) crmByGstin.set(g, c);
+          const n = String(c.name || "")
+            .toLowerCase()
+            .replace(/\(.*?\)/g, " ")
+            .replace(
+              /\b(pvt|private|ltd|limited|llp|opc|inc|co|company|enterprises?|traders?|and|&)\b/g,
+              " ",
+            )
+            .replace(/[^a-z0-9]+/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (n) crmByName.set(n, c);
+        }
+        imported = imported.map((c) => {
+          let match = null;
+          if (c._gstinKey && crmByGstin.has(c._gstinKey))
+            match = crmByGstin.get(c._gstinKey);
+          else if (c._normName && crmByName.has(c._normName))
+            match = crmByName.get(c._normName);
+          const ghost = match
+            ? {
+                isGhost: true,
+                ghostOf: { id: match._id, name: match.name },
+              }
+            : {};
+          const { _normName, _gstinKey, ...rest } = c;
+          return { ...rest, ...ghost };
+        });
+        allRows = [...customers, ...imported];
+        impSummary.count = imported.length;
+        impSummary.revenue = imported.reduce(
+          (s, c) => s + (c.totalRevenue || 0),
+          0,
+        );
+        impSummary.paid = imported.reduce((s, c) => s + (c.totalPaid || 0), 0);
+        impSummary.outstanding = imported.reduce(
+          (s, c) => s + (c.totalOutstanding || 0),
+          0,
+        );
+        impSummary.withOutstanding = imported.filter(
+          (c) => c.totalOutstanding > 0,
+        ).length;
+      }
+    } catch (impErr) {
+      console.error("[customers/all] imported merge skipped:", impErr.message);
+    }
+
     res.json({
       success: true,
-      customers,
+      customers: allRows,
       summary: {
-        totalCustomers: customers.length,
-        totalRevenue: parseFloat(totalRevenue.toFixed(2)),
-        totalPaid: parseFloat(totalPaid.toFixed(2)),
-        totalOutstanding: parseFloat(totalOutstanding.toFixed(2)),
-        customersWithOutstanding,
+        totalCustomers: customers.length + impSummary.count,
+        totalRevenue: parseFloat(
+          (totalRevenue + impSummary.revenue).toFixed(2),
+        ),
+        totalPaid: parseFloat((totalPaid + impSummary.paid).toFixed(2)),
+        totalOutstanding: parseFloat(
+          (totalOutstanding + impSummary.outstanding).toFixed(2),
+        ),
+        customersWithOutstanding:
+          customersWithOutstanding + impSummary.withOutstanding,
         newThisMonth,
       },
     });
