@@ -1087,6 +1087,20 @@ app.use(
   require("./routes/Accountant_Routes/Acc_vouchers"),
 );
 
+app.use(
+  "/api/accountant/parties",
+  require("./routes/Accountant_Routes/Acc_parties"),
+);
+app.use(
+  "/api/accountant/merge",
+  require("./routes/Accountant_Routes/Acc_merge"),
+);
+
+app.use(
+  "/api/accountant/import-mapping",
+  require("./routes/Accountant_Routes/Acc_importMapping"),
+);
+
 // ── Health probe (open in browser to verify mounting) ────────────────
 // http://localhost:5000/api/accountant/_health
 app.get("/api/accountant/_health", (req, res) => {

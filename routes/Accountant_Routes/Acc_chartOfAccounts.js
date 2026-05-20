@@ -620,7 +620,7 @@ router.get("/ledgers", async (req, res) => {
       ];
     }
     const skip = (parseInt(page) - 1) * parseInt(limit);
-    const [ledgers, total] = await Promise.all([
+    const [ledgersRaw, total] = await Promise.all([
       Acc_Ledger.find(filter)
         .sort({ name: 1 })
         .skip(skip)
@@ -628,6 +628,80 @@ router.get("/ledgers", async (req, res) => {
         .lean(),
       Acc_Ledger.countDocuments(filter),
     ]);
+
+    // Auto-derive stateCode from GSTIN for any ledger that has GSTIN
+    // but is missing stateCode (common for Tally imports).
+    const GST_STATES = {
+      "01": "Jammu & Kashmir",
+      "02": "Himachal Pradesh",
+      "03": "Punjab",
+      "04": "Chandigarh",
+      "05": "Uttarakhand",
+      "06": "Haryana",
+      "07": "Delhi",
+      "08": "Rajasthan",
+      "09": "Uttar Pradesh",
+      10: "Bihar",
+      11: "Sikkim",
+      12: "Arunachal Pradesh",
+      13: "Nagaland",
+      14: "Manipur",
+      15: "Mizoram",
+      16: "Tripura",
+      17: "Meghalaya",
+      18: "Assam",
+      19: "West Bengal",
+      20: "Jharkhand",
+      21: "Odisha",
+      22: "Chhattisgarh",
+      23: "Madhya Pradesh",
+      24: "Gujarat",
+      25: "Daman & Diu",
+      26: "Dadra & Nagar Haveli and Daman & Diu",
+      27: "Maharashtra",
+      28: "Andhra Pradesh (Old)",
+      29: "Karnataka",
+      30: "Goa",
+      31: "Lakshadweep",
+      32: "Kerala",
+      33: "Tamil Nadu",
+      34: "Puducherry",
+      35: "Andaman & Nicobar Islands",
+      36: "Telangana",
+      37: "Andhra Pradesh",
+      38: "Ladakh",
+    };
+    const bulkFixOps = [];
+    const ledgers = ledgersRaw.map((l) => {
+      if (l.gstin && l.gstin.length >= 2) {
+        const code = l.gstin.slice(0, 2);
+        if (GST_STATES[code]) {
+          if (!l.contactDetails) l.contactDetails = {};
+          if (!l.contactDetails.stateCode) {
+            l.contactDetails.stateCode = code;
+            bulkFixOps.push({
+              updateOne: {
+                filter: { _id: l._id },
+                update: {
+                  $set: {
+                    "contactDetails.stateCode": code,
+                    "contactDetails.state": GST_STATES[code],
+                  },
+                },
+              },
+            });
+          }
+          if (!l.contactDetails.state)
+            l.contactDetails.state = GST_STATES[code];
+        }
+      }
+      return l;
+    });
+    // Fire-and-forget bulk fix so next request doesn't need it
+    if (bulkFixOps.length > 0) {
+      Acc_Ledger.bulkWrite(bulkFixOps).catch(() => {});
+    }
+
     res.json({
       success: true,
       ledgers,
@@ -676,12 +750,73 @@ router.post("/ledgers", async (req, res) => {
 
 router.get("/ledgers/:id", async (req, res) => {
   try {
-    const ledger = await Acc_Ledger.findById(req.params.id).lean();
+    const ledger = await Acc_Ledger.findById(req.params.id);
     if (!ledger)
       return res
         .status(404)
         .json({ success: false, message: "Ledger not found" });
-    res.json({ success: true, ledger });
+
+    // Auto-derive stateCode from GSTIN if missing (fixes "Vendor has
+    // GSTIN but no state code" warning on purchase vouchers). Also
+    // auto-fill state name. Persists to DB so it's a one-time fix.
+    if (ledger.gstin && ledger.gstin.length >= 2) {
+      const code = ledger.gstin.slice(0, 2);
+      const GST_STATES = {
+        "01": "Jammu & Kashmir",
+        "02": "Himachal Pradesh",
+        "03": "Punjab",
+        "04": "Chandigarh",
+        "05": "Uttarakhand",
+        "06": "Haryana",
+        "07": "Delhi",
+        "08": "Rajasthan",
+        "09": "Uttar Pradesh",
+        10: "Bihar",
+        11: "Sikkim",
+        12: "Arunachal Pradesh",
+        13: "Nagaland",
+        14: "Manipur",
+        15: "Mizoram",
+        16: "Tripura",
+        17: "Meghalaya",
+        18: "Assam",
+        19: "West Bengal",
+        20: "Jharkhand",
+        21: "Odisha",
+        22: "Chhattisgarh",
+        23: "Madhya Pradesh",
+        24: "Gujarat",
+        25: "Daman & Diu",
+        26: "Dadra & Nagar Haveli and Daman & Diu",
+        27: "Maharashtra",
+        28: "Andhra Pradesh (Old)",
+        29: "Karnataka",
+        30: "Goa",
+        31: "Lakshadweep",
+        32: "Kerala",
+        33: "Tamil Nadu",
+        34: "Puducherry",
+        35: "Andaman & Nicobar Islands",
+        36: "Telangana",
+        37: "Andhra Pradesh",
+        38: "Ladakh",
+      };
+      let dirty = false;
+      if (!ledger.contactDetails) ledger.contactDetails = {};
+      if (!ledger.contactDetails.stateCode && GST_STATES[code]) {
+        ledger.contactDetails.stateCode = code;
+        dirty = true;
+      }
+      if (!ledger.contactDetails.state && GST_STATES[code]) {
+        ledger.contactDetails.state = GST_STATES[code];
+        dirty = true;
+      }
+      if (dirty) {
+        await ledger.save();
+      }
+    }
+
+    res.json({ success: true, ledger: ledger.toObject() });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -716,6 +851,14 @@ router.put("/ledgers/:id", async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* DELETE /ledgers/:id — Soft-delete with dependency check             */
+/* ------------------------------------------------------------------ */
+/* If the ledger has transactions, returns a 409 with details about
+ * where it's used, plus asks for an alternativeLedgerId to reassign.
+ * If alternativeLedgerId is provided in query, reassigns all txns
+ * to the alternative ledger first, then deletes.
+ */
 router.delete("/ledgers/:id", async (req, res) => {
   try {
     const ledger = await Acc_Ledger.findById(req.params.id);
@@ -724,19 +867,90 @@ router.delete("/ledgers/:id", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Ledger not found" });
 
+    const alternativeId = req.query.alternativeLedgerId;
+
+    // Check dependencies
     const txnCount = await Acc_Voucher.countDocuments({
       "ledgerEntries.ledgerId": ledger._id,
       status: "posted",
     });
-    if (txnCount > 0) {
-      return res.status(400).json({
+
+    // Check if used as party ledger in vouchers
+    const partyCount = await Acc_Voucher.countDocuments({
+      partyLedgerId: ledger._id,
+    });
+
+    // Check linked vendor/customer
+    const linkedTo = [];
+    if (ledger.linkedVendorId) linkedTo.push("Vendor");
+    if (ledger.linkedCustomerId) linkedTo.push("Customer");
+    if (ledger.linkedEmployeeId) linkedTo.push("Employee");
+
+    const totalUsage = txnCount + partyCount;
+
+    if (totalUsage > 0 && !alternativeId) {
+      // Return dependency details — frontend shows a dialog
+      return res.status(409).json({
         success: false,
-        message: `Ledger has ${txnCount} posted transactions. Reverse or void them first.`,
+        message: `This ledger is used in ${totalUsage} place(s). Choose an alternative ledger to reassign transactions before deleting.`,
+        dependencies: {
+          voucherEntries: txnCount,
+          partyVouchers: partyCount,
+          linkedEntities: linkedTo,
+          totalUsage,
+        },
+        requiresAlternative: true,
       });
     }
+
+    // If alternative provided, reassign all references
+    if (alternativeId && totalUsage > 0) {
+      const alt = await Acc_Ledger.findById(alternativeId);
+      if (!alt)
+        return res.status(404).json({
+          success: false,
+          message: "Alternative ledger not found",
+        });
+
+      // Reassign voucher ledger entries
+      if (txnCount > 0) {
+        await Acc_Voucher.updateMany(
+          { "ledgerEntries.ledgerId": ledger._id },
+          {
+            $set: {
+              "ledgerEntries.$[elem].ledgerId": alt._id,
+              "ledgerEntries.$[elem].ledgerName": alt.name,
+            },
+          },
+          { arrayFilters: [{ "elem.ledgerId": ledger._id }] },
+        );
+      }
+
+      // Reassign party ledger references
+      if (partyCount > 0) {
+        await Acc_Voucher.updateMany(
+          { partyLedgerId: ledger._id },
+          {
+            $set: {
+              partyLedgerId: alt._id,
+              partyLedgerName: alt.name,
+            },
+          },
+        );
+      }
+    }
+
+    // Soft-delete
     ledger.isActive = false;
+    ledger.deletedAt = new Date();
     await ledger.save();
-    res.json({ success: true });
+
+    res.json({
+      success: true,
+      message: alternativeId
+        ? `Ledger deleted. ${totalUsage} reference(s) reassigned to "${(await Acc_Ledger.findById(alternativeId).select("name").lean())?.name || alternativeId}".`
+        : "Ledger deleted.",
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -992,23 +1206,104 @@ router.get("/ledgers/:id/statement", async (req, res) => {
       bucket.txCount += 1;
     }
 
-    // Walk months in chronological order, carrying balance forward
+    // Determine the FULL month range to display. The accountant wants
+    // EVERY month of the selected period shown — even months with no
+    // transactions — each carrying the previous month's closing forward
+    // (a zero-activity month still has a closing balance). Previously only
+    // months that had at least one transaction appeared, so a ledger that
+    // was active in Aug/Oct/Mar showed just those three rows.
+    //
+    // Range source priority:
+    //   1. explicit startDate/endDate query params, else
+    //   2. first → last transaction month, else
+    //   3. the single month of `opening`'s context (fallback: current).
+    function ymKey(y, mo) {
+      return `${y}-${String(mo).padStart(2, "0")}`;
+    }
+    let rangeStart = null;
+    let rangeEnd = null;
+    if (startDate) {
+      const s = new Date(startDate);
+      rangeStart = { y: s.getFullYear(), m: s.getMonth() + 1 };
+    }
+    if (endDate) {
+      const e = new Date(endDate);
+      rangeEnd = { y: e.getFullYear(), m: e.getMonth() + 1 };
+    }
+    if ((!rangeStart || !rangeEnd) && lines.length > 0) {
+      const first = new Date(lines[0].date);
+      const last = new Date(lines[lines.length - 1].date);
+      if (!rangeStart)
+        rangeStart = { y: first.getFullYear(), m: first.getMonth() + 1 };
+      if (!rangeEnd)
+        rangeEnd = { y: last.getFullYear(), m: last.getMonth() + 1 };
+    }
+    if (!rangeStart && !rangeEnd) {
+      const now = new Date();
+      rangeStart = { y: now.getFullYear(), m: now.getMonth() + 1 };
+      rangeEnd = { ...rangeStart };
+    } else if (!rangeStart) {
+      rangeStart = { ...rangeEnd };
+    } else if (!rangeEnd) {
+      rangeEnd = { ...rangeStart };
+    }
+
+    // Build the ordered list of every (year, month) in the range.
+    const allMonthKeys = [];
+    {
+      let y = rangeStart.y;
+      let mo = rangeStart.m;
+      // Guard against an inverted range.
+      const endSerial = rangeEnd.y * 12 + (rangeEnd.m - 1);
+      let serial = y * 12 + (mo - 1);
+      let safety = 0;
+      while (serial <= endSerial && safety < 600) {
+        allMonthKeys.push({ key: ymKey(y, mo), y, m: mo });
+        mo += 1;
+        if (mo > 12) {
+          mo = 1;
+          y += 1;
+        }
+        serial = y * 12 + (mo - 1);
+        safety += 1;
+      }
+      if (allMonthKeys.length === 0)
+        allMonthKeys.push({
+          key: ymKey(rangeStart.y, rangeStart.m),
+          y: rangeStart.y,
+          m: rangeStart.m,
+        });
+    }
+
+    // Walk every month in the range, carrying balance forward through
+    // empty months too.
     let monthRunning = opening;
-    const monthlySummary = Array.from(byMonth.values())
-      .sort((a, b) => a.monthKey.localeCompare(b.monthKey))
-      .map((m) => {
-        const monthOpening = monthRunning;
-        const monthClosing = monthOpening + m.debit - m.credit;
-        monthRunning = monthClosing;
-        return {
-          ...m,
-          opening: monthOpening,
-          openingType: monthOpening >= 0 ? "Dr" : "Cr",
-          closing: monthClosing,
-          closingType: monthClosing >= 0 ? "Dr" : "Cr",
-          netChange: m.debit - m.credit,
-        };
-      });
+    const monthlySummary = allMonthKeys.map(({ key, y, m }) => {
+      const existing = byMonth.get(key);
+      const dbg = existing ? existing.debit : 0;
+      const crg = existing ? existing.credit : 0;
+      const txCount = existing ? existing.txCount : 0;
+      const dt = new Date(y, m - 1, 1);
+      const monthOpening = monthRunning;
+      const monthClosing = monthOpening + dbg - crg;
+      monthRunning = monthClosing;
+      return {
+        monthKey: key,
+        year: y,
+        month: m,
+        monthName: dt.toLocaleString("en-IN", { month: "long" }),
+        monthShort: dt.toLocaleString("en-IN", { month: "short" }),
+        debit: dbg,
+        credit: crg,
+        txCount,
+        opening: monthOpening,
+        openingType: monthOpening >= 0 ? "Dr" : "Cr",
+        closing: monthClosing,
+        closingType: monthClosing >= 0 ? "Dr" : "Cr",
+        netChange: dbg - crg,
+        noActivity: txCount === 0,
+      };
+    });
 
     // ── Daily summary buckets ───────────────────────────────────────────
     const byDay = new Map();

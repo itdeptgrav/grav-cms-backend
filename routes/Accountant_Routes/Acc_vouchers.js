@@ -1289,6 +1289,202 @@ router.get("/unpaid-bills", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* GET /po-lookup — Search POs for purchase voucher auto-fill          */
+/* ------------------------------------------------------------------ */
+router.get("/po-lookup", auth, async (req, res) => {
+  try {
+    const { q, vendorId, limit = 20 } = req.query;
+    let PurchaseOrder;
+    try {
+      PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+    } catch {
+      return res.json({
+        purchaseOrders: [],
+        message: "PO module not available",
+      });
+    }
+    const filter = {};
+    if (!q) filter.status = { $nin: ["CANCELLED", "cancelled", "Cancelled"] };
+    if (vendorId) filter.vendor = vendorId;
+    if (q)
+      filter.poNumber = new RegExp(
+        String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i",
+      );
+
+    const pos = await PurchaseOrder.find(filter)
+      .populate("vendor", "companyName gstNumber email phone contactPerson")
+      .populate("items.rawItem", "name sku unit category hsnCode gstRate")
+      .select(
+        "poNumber orderDate expectedDeliveryDate totalAmount status items vendor gstDetails",
+      )
+      .sort({ orderDate: -1 })
+      .limit(parseInt(limit))
+      .lean();
+
+    const result = pos.map((po) => ({
+      _id: po._id,
+      poNumber: po.poNumber,
+      orderDate: po.orderDate,
+      expectedDeliveryDate: po.expectedDeliveryDate,
+      totalAmount: po.totalAmount,
+      status: po.status,
+      vendor: po.vendor
+        ? {
+            _id: po.vendor._id,
+            companyName: po.vendor.companyName,
+            gstNumber: po.vendor.gstNumber,
+            email: po.vendor.email,
+            phone: po.vendor.phone,
+          }
+        : null,
+      items: (po.items || []).map((item) => ({
+        _id: item._id,
+        itemName: item.itemName || item.rawItem?.name || "",
+        rawItemId: item.rawItem?._id || null,
+        sku: item.rawItem?.sku || "",
+        unit: item.rawItem?.unit || item.unit || "Nos",
+        hsnCode: item.rawItem?.hsnCode || item.hsnCode || "",
+        gstRate: item.rawItem?.gstRate || item.gstRate || 18,
+        quantity: item.quantity || 0,
+        unitPrice: item.unitPrice || 0,
+        totalPrice: item.totalPrice || 0,
+        receivedQuantity: item.receivedQuantity || 0,
+        pendingQuantity:
+          item.pendingQuantity || item.quantity - (item.receivedQuantity || 0),
+        category: item.rawItem?.category || "",
+      })),
+    }));
+    res.json({ purchaseOrders: result, count: result.length });
+  } catch (e) {
+    console.error("[po-lookup]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /raw-materials — Raw material items for purchase voucher        */
+/* ------------------------------------------------------------------ */
+router.get("/raw-materials", auth, async (req, res) => {
+  try {
+    const { companyId, q, limit = 500 } = req.query;
+    const lim = parseInt(limit);
+    const rx = q
+      ? new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
+      : null;
+    let rawItems = [];
+    try {
+      const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+      const filter = {};
+      if (rx) filter.$or = [{ name: rx }, { sku: rx }, { hsnCode: rx }];
+      const items = await RawItem.find(filter)
+        .sort({ name: 1 })
+        .limit(lim)
+        .select("name sku unit category hsnCode gstRate basePrice")
+        .lean();
+      rawItems = items.map((r) => ({
+        _id: r._id,
+        name: r.name,
+        sku: r.sku || "",
+        hsnCode: r.hsnCode || "",
+        baseUnit: r.unit || "Nos",
+        taxRate: r.gstRate || 0,
+        standardCost: r.basePrice || 0,
+        category: r.category || "",
+        source: "cms_raw",
+      }));
+    } catch {
+      try {
+        const Product = require("../../models/CMS_Models/Inventory/Products/Product");
+        const filter = {
+          type: { $in: ["raw_material", "rawMaterial", "raw"] },
+        };
+        if (rx) filter.$or = [{ name: rx }, { sku: rx }];
+        const items = await Product.find(filter)
+          .sort({ name: 1 })
+          .limit(lim)
+          .lean();
+        rawItems = items.map((r) => ({
+          _id: r._id,
+          name: r.name,
+          sku: r.sku || "",
+          hsnCode: r.hsnCode || "",
+          baseUnit: r.unit || "Nos",
+          taxRate: r.gstRate || 0,
+          standardCost: r.basePrice || r.costPrice || 0,
+          source: "cms_product",
+        }));
+      } catch {
+        /* no CMS product model */
+      }
+    }
+    if (companyId) {
+      const tallyFilter = { companyId, isActive: true };
+      if (rx)
+        tallyFilter.$or = [{ name: rx }, { aliases: rx }, { hsnCode: rx }];
+      const tallyRaw = await Acc_StockItem.find(tallyFilter)
+        .sort({ name: 1 })
+        .limit(lim)
+        .select("name aliases hsnCode taxRate baseUnit standardCost")
+        .lean();
+      const seen = new Set(rawItems.map((r) => r.name?.toLowerCase()));
+      for (const t of tallyRaw) {
+        if (!seen.has(t.name?.toLowerCase()))
+          rawItems.push({ ...t, source: "tally" });
+      }
+    }
+    res.json({ items: rawItems, count: rawItems.length });
+  } catch (e) {
+    console.error("[raw-materials]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /roundoff-ledger — auto-find or create the Round Off ledger     */
+/* ------------------------------------------------------------------ */
+router.get("/roundoff-ledger", auth, async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+    let led = await Acc_Ledger.findOne({
+      companyId,
+      isActive: true,
+      name: /^rounding\s*off$/i,
+    });
+    if (!led) {
+      led = await Acc_Ledger.findOne({
+        companyId,
+        isActive: true,
+        name: { $in: [/^round\s*off$/i, /^round\s*off\s*a\/c$/i] },
+      });
+    }
+    if (!led) {
+      let grp =
+        (await Acc_Group.findOne({ companyId, name: /indirect expense/i })) ||
+        (await Acc_Group.findOne({ companyId, nature: "expense" }));
+      if (grp) {
+        led = await Acc_Ledger.create({
+          companyId,
+          name: "Rounding Off",
+          groupId: grp._id,
+          groupName: grp.name,
+          nature: "expense",
+          openingBalance: 0,
+          isActive: true,
+          description: "Auto-created for rounding adjustments",
+        });
+      }
+    }
+    res.json({ ledger: led || null });
+  } catch (e) {
+    console.error("[roundoff-ledger]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* Get one                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -1385,6 +1581,45 @@ router.post("/", auth, async (req, res) => {
 
     // Resolve ledger names. Accept both legacy `ledger` and current
     // `ledgerId` from clients; canonicalise to `ledgerId`.
+    //
+    // If an entry has a NAME but no ID (e.g. the "Round Off" line the
+    // sales form now emits), resolve it — and auto-create it if it truly
+    // doesn't exist yet — so the voucher posts balanced instead of
+    // silently dropping the rounding paise. This mirrors the idempotent
+    // auto-create pattern already used for Sales/Purchase Returns ledgers.
+    async function resolveOrCreateByName(name, companyId) {
+      const clean = String(name || "").trim();
+      if (!clean) return null;
+      let led = await Acc_Ledger.findOne({
+        companyId,
+        name: new RegExp(
+          `^${clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+          "i",
+        ),
+      });
+      if (led) return led;
+      // Round Off is an indirect-expense-natured nominal ledger. Find a
+      // sensible parent group; fall back to any expense-nature group.
+      let grp =
+        (await Acc_Group.findOne({
+          companyId,
+          name: /indirect expense/i,
+        })) ||
+        (await Acc_Group.findOne({ companyId, nature: "expense" })) ||
+        (await Acc_Group.findOne({ companyId }));
+      if (!grp) return null;
+      led = await Acc_Ledger.create({
+        companyId,
+        name: clean,
+        groupId: grp._id,
+        groupName: grp.name,
+        openingBalance: 0,
+        openingBalanceType: "Dr",
+        sourceSystem: "auto_from_voucher",
+      });
+      return led;
+    }
+
     for (const entry of body.ledgerEntries) {
       const ledId = entry.ledgerId || entry.ledger;
       if (ledId) {
@@ -1393,8 +1628,18 @@ router.post("/", auth, async (req, res) => {
           const led = await Acc_Ledger.findById(ledId).select("name");
           if (led) entry.ledgerName = led.name;
         }
+      } else if (entry.ledgerName) {
+        const led = await resolveOrCreateByName(
+          entry.ledgerName,
+          body.companyId,
+        );
+        if (led) {
+          entry.ledgerId = led._id;
+          entry.ledgerName = led.name;
+        }
       }
       delete entry.ledger;
+      delete entry.autoLedger;
     }
 
     const voucher = new Acc_Voucher(body);

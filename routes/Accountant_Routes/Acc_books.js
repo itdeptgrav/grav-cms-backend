@@ -13,6 +13,7 @@ const {
 const {
   Acc_Ledger,
   Acc_Group,
+  Acc_Company,
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
@@ -89,7 +90,10 @@ router.get("/trial-balance", auth, async (req, res) => {
           debitTotal: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.entryType", "Dr"] },
+                // Schema field is `type` (Dr/Cr). `entryType` never
+                // existed, so imported-voucher movements summed to zero
+                // here too. Use the correct field.
+                { $eq: ["$ledgerEntries.type", "Dr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -98,7 +102,7 @@ router.get("/trial-balance", auth, async (req, res) => {
           creditTotal: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.entryType", "Cr"] },
+                { $eq: ["$ledgerEntries.type", "Cr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -144,8 +148,18 @@ router.get("/trial-balance", auth, async (req, res) => {
     const ledgerRows = ledgers.map((led) => {
       const lid = led._id.toString();
       const mv = movementMap[lid] || { debitTotal: 0, creditTotal: 0 };
-      const opening = (led.openingBalance || 0) + (priorMap[lid] || 0);
-      const closing = opening + (mv.debitTotal - mv.creditTotal);
+      const netMove = mv.debitTotal - mv.creditTotal;
+
+      let opening, closing;
+      if (led.balanceFromTrialBalance === true && !from) {
+        // TB-sourced closing. Back-derive the opening.
+        closing = led.openingBalance || 0;
+        opening = closing - netMove;
+      } else {
+        opening = (led.openingBalance || 0) + (priorMap[lid] || 0);
+        closing = opening + netMove;
+      }
+
       return {
         ledgerId: led._id,
         ledgerName: led.name,
@@ -465,10 +479,17 @@ router.get("/profit-loss", auth, async (req, res) => {
  */
 router.get("/balance-sheet", auth, async (req, res) => {
   try {
-    const { companyId, asOf } = req.query;
+    const { companyId, asOf, from } = req.query;
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
     const asOfDate = asOf ? new Date(asOf) : new Date();
+    // Optional period start. A Balance Sheet is fundamentally an
+    // "as at <date>" snapshot, but the accountant asked to also bound
+    // the start so they can view a specific period's closing position
+    // (movements from `from` … `asOf`, opening balances still included
+    // as the brought-forward position). When `from` is omitted it's the
+    // classic cumulative-to-date balance sheet.
+    const fromDate = from ? new Date(from) : null;
 
     const cId = new mongoose.Types.ObjectId(companyId);
     const groups = await Acc_Group.find({
@@ -485,14 +506,58 @@ router.get("/balance-sheet", auth, async (req, res) => {
       groupMap[g._id.toString()] = g;
     });
 
+    // ── Tally primary group resolution ──────────────────────────────
+    // Walk each group's parent chain to find the top-level Tally group
+    // (e.g. "Current Liabilities" instead of "Sundry Creditors").
+    const groupNameMap = {};
+    groups.forEach((g) => {
+      if (g.name) groupNameMap[g.name.toLowerCase()] = g;
+    });
+    function findPrimary(grp) {
+      if (!grp) return null;
+      const visited = new Set();
+      let cur = grp;
+      while (cur) {
+        const cid = cur._id?.toString();
+        if (visited.has(cid)) break;
+        visited.add(cid);
+        if (!cur.parent && !cur.parentName) return cur;
+        const parent = cur.parent ? groupMap[cur.parent.toString()] : null;
+        if (parent) {
+          cur = parent;
+          continue;
+        }
+        const byName = cur.parentName
+          ? groupNameMap[cur.parentName.toLowerCase()]
+          : null;
+        if (byName) {
+          cur = byName;
+          continue;
+        }
+        return cur;
+      }
+      return cur || grp;
+    }
+    const _primaryCache = {};
+    function getPrimaryGroupName(grp) {
+      if (!grp) return "";
+      const gid = grp._id?.toString();
+      if (_primaryCache[gid] !== undefined) return _primaryCache[gid];
+      const prim = findPrimary(grp);
+      const name = prim?.name || grp.name || "";
+      _primaryCache[gid] = name;
+      return name;
+    }
+
+    const voucherMatch = {
+      companyId: cId,
+      status: "posted",
+      voucherDate: { $lte: asOfDate },
+    };
+    if (fromDate) voucherMatch.voucherDate.$gte = fromDate;
+
     const movements = await Acc_Voucher.aggregate([
-      {
-        $match: {
-          companyId: cId,
-          status: "posted",
-          voucherDate: { $lte: asOfDate },
-        },
-      },
+      { $match: voucherMatch },
       { $unwind: "$ledgerEntries" },
       {
         $group: {
@@ -511,36 +576,92 @@ router.get("/balance-sheet", auth, async (req, res) => {
       expenseNet = 0;
     const buckets = { asset: [], liability: [], equity: [] };
 
+    // ── Tally reserved group → nature override ──────────────────────
+    // If a group was manually created or imported with the wrong nature
+    // (e.g. Capital Account → "liability"), this corrects it at query
+    // time so the BS groups correctly without requiring a re-import.
+    const TALLY_NATURE = {
+      "capital account": "equity",
+      "reserves & surplus": "equity",
+      "current liabilities": "liability",
+      "loans (liability)": "liability",
+      "secured loans": "liability",
+      "unsecured loans": "liability",
+      "bank od a/c": "liability",
+      provisions: "liability",
+      "current assets": "asset",
+      "fixed assets": "asset",
+      investments: "asset",
+      "misc. expenses (asset)": "asset",
+      "branch / divisions": "asset",
+      "suspense a/c": "liability",
+      "stock-in-hand": "asset",
+      "sundry creditors": "liability",
+      "sundry debtors": "asset",
+      "bank accounts": "asset",
+      "cash-in-hand": "asset",
+      "deposits (asset)": "asset",
+      "loans & advances (asset)": "asset",
+      "duties & taxes": "liability",
+      "sales accounts": "revenue",
+      "purchase accounts": "expense",
+      "direct expenses": "expense",
+      "indirect expenses": "expense",
+      "direct incomes": "revenue",
+      "indirect incomes": "revenue",
+    };
+
     ledgers.forEach((led) => {
       const grp = groupMap[led.groupId?.toString()];
       if (!grp) return;
+
+      // Resolve nature: DB value, then Tally override
+      const grpNameLower = String(grp.name || "")
+        .trim()
+        .toLowerCase();
+      const nature = TALLY_NATURE[grpNameLower] || grp.nature;
+
+      const lname = String(led.name || "")
+        .trim()
+        .toLowerCase();
+      if (
+        led.isReserved === true ||
+        lname === "profit & loss a/c" ||
+        lname === "profit and loss a/c"
+      ) {
+        return;
+      }
+
+      // BALANCE: TB-flagged → stored closing. Otherwise → opening + moves.
       const closing =
-        (led.openingBalance || 0) + (moveMap[led._id.toString()] || 0);
-      // Build line defensively — new fields (groupId, groupOrder) are guarded
-      // so legacy ledgers without these fields don't crash anything.
+        led.balanceFromTrialBalance === true
+          ? led.openingBalance || 0
+          : (led.openingBalance || 0) + (moveMap[led._id.toString()] || 0);
+
+      const primaryName = getPrimaryGroupName(grp);
       const line = {
         ledgerId: led._id,
         ledgerName: led.name,
-        groupName: led.groupName,
-        amount: Math.abs(closing),
+        // Set groupName to Tally PRIMARY group so the frontend groups
+        // like Tally does (e.g. all Sundry Creditors, Duties & Taxes
+        // etc. collapse under "Current Liabilities" with one total).
+        groupName: primaryName || led.groupName,
+        subGroupName: led.groupName,
+        amount: closing,
+        displayAmount: Math.abs(closing),
         signedAmount: closing,
       };
-      // Optional new fields — added Apr 2026 for drag-and-drop. Wrapped
-      // in a try so any unexpected field-access error degrades gracefully.
       try {
         line.groupId = led.groupId || null;
         line.groupOrder = led.groupOrder === undefined ? null : led.groupOrder;
       } catch (fieldErr) {
-        // Shouldn't happen, but defensive — old clients still work
         console.warn("[balance-sheet] new fields skipped:", fieldErr.message);
       }
-      if (grp.nature === "asset") buckets.asset.push(line);
-      else if (grp.nature === "liability")
-        buckets.liability.push({ ...line, amount: -closing });
-      else if (grp.nature === "equity")
-        buckets.equity.push({ ...line, amount: -closing });
-      else if (grp.nature === "revenue") revenueNet += -closing;
-      else if (grp.nature === "expense") expenseNet += closing;
+      if (nature === "asset") buckets.asset.push(line);
+      else if (nature === "liability") buckets.liability.push(line);
+      else if (nature === "equity") buckets.equity.push(line);
+      else if (nature === "revenue") revenueNet += -closing;
+      else if (nature === "expense") expenseNet += closing;
     });
 
     // Sort each bucket by user-set groupOrder, then alphabetically. Wrapped
@@ -563,34 +684,159 @@ router.get("/balance-sheet", auth, async (req, res) => {
       console.warn("[balance-sheet] sort skipped:", sortErr.message);
     }
 
-    const netProfit = revenueNet - expenseNet;
-    if (netProfit !== 0) {
+    // ── Correct Balance-Sheet assembly ──────────────────────────────
+    // Every `line.amount` is Tally-signed: Debit +, Credit −.
+    //   • Assets are naturally Debit  → presented as  +Σ(signed)
+    //   • Liabilities/Equity are Cr   → presented as  −Σ(signed)  (so a
+    //     normal credit balance shows as a positive figure)
+    //   • Current-year P&L: a LOSS is shown on the ASSETS side (exactly
+    //     like Tally), a PROFIT on the equity side. This placement is the
+    //     piece that was missing/!wrong before and caused the false
+    //     "OUT OF BALANCE".
+    const netProfit = revenueNet - expenseNet; // <0 = loss, >0 = profit
+
+    const rawAssets = buckets.asset.reduce((s, x) => s + x.amount, 0); // Dr+
+    const rawLiab = buckets.liability.reduce((s, x) => s + x.amount, 0); // signed
+    const rawEquity = buckets.equity.reduce((s, x) => s + x.amount, 0); // signed
+
+    // Present liabilities & equity as positive credit figures.
+    const liabilitiesTotal = -rawLiab;
+    let equityTotal = -rawEquity;
+
+    // Assets side carries any current-period LOSS (Tally convention).
+    let assetsTotal = rawAssets;
+    if (netProfit < 0) {
+      assetsTotal += Math.abs(netProfit);
+      buckets.asset.push({
+        ledgerName: "Profit & Loss A/c (Current Period Loss)",
+        groupName: "Profit & Loss A/c",
+        amount: Math.abs(netProfit), // Dr on assets side
+        displayAmount: Math.abs(netProfit),
+        signedAmount: Math.abs(netProfit),
+        synthetic: true,
+      });
+    } else if (netProfit > 0) {
+      equityTotal += netProfit;
       buckets.equity.push({
         ledgerName: "Net Profit (Current Period)",
         groupName: "Profit & Loss",
-        amount: netProfit,
+        amount: -netProfit, // Cr in equity
+        displayAmount: netProfit,
         signedAmount: -netProfit,
         synthetic: true,
       });
     }
 
-    const sumOf = (arr) => arr.reduce((s, x) => s + x.amount, 0);
+    const liabEquityTotal = liabilitiesTotal + equityTotal;
+
+    // ── Tally-style primary group aggregation ───────────────────────
+    // Walk up the group parent chain to find each group's PRIMARY
+    // (root) group, then aggregate ledger balances by primary group.
+    // This produces the same view Tally shows: "Current Liabilities
+    // ₹23,40,507" instead of showing each sub-group separately.
+    function findPrimary(grpId) {
+      let g = groupMap[grpId?.toString()];
+      if (!g) return null;
+      let depth = 0;
+      while (depth < 10) {
+        const pid = g.parentId || g.parent;
+        if (!pid) break;
+        const parent = groupMap[pid.toString()];
+        if (!parent) break;
+        g = parent;
+        depth++;
+      }
+      return g;
+    }
+    function buildPrimaryGroups(lines) {
+      const map = {};
+      for (const ln of lines) {
+        const primary = findPrimary(ln.groupId);
+        const pName = primary ? primary.name : ln.groupName || "Other";
+        if (!map[pName]) {
+          map[pName] = {
+            groupName: pName,
+            total: 0,
+            ledgerCount: 0,
+            subGroups: {},
+          };
+        }
+        map[pName].total += ln.amount || 0;
+        map[pName].ledgerCount++;
+        const sg = ln.groupName || "Other";
+        if (!map[pName].subGroups[sg]) {
+          map[pName].subGroups[sg] = {
+            groupName: sg,
+            total: 0,
+            ledgerCount: 0,
+          };
+        }
+        map[pName].subGroups[sg].total += ln.amount || 0;
+        map[pName].subGroups[sg].ledgerCount++;
+      }
+      return Object.values(map)
+        .map((pg) => ({
+          ...pg,
+          displayTotal: Math.abs(pg.total),
+          subGroups: Object.values(pg.subGroups).sort(
+            (a, b) => Math.abs(b.total) - Math.abs(a.total),
+          ),
+        }))
+        .sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
+    }
+
+    // Per-line Dr/Cr
+    function applyDrCr(arr) {
+      for (const ln of arr) {
+        const v = ln.amount || 0;
+        ln.debit = v > 0 ? v : 0;
+        ln.credit = v < 0 ? -v : 0;
+        if (ln.displayAmount == null) ln.displayAmount = Math.abs(v);
+      }
+    }
+    applyDrCr(buckets.asset);
+    applyDrCr(buckets.liability);
+    applyDrCr(buckets.equity);
+
+    const sumDr = (arr) => arr.reduce((s, x) => s + (x.debit || 0), 0);
+    const sumCr = (arr) => arr.reduce((s, x) => s + (x.credit || 0), 0);
+    const difference = assetsTotal - liabEquityTotal;
+
+    const sectionNet = (arr) => sumDr(arr) - sumCr(arr);
 
     res.json({
       companyId,
       asOf: asOfDate,
-      assets: { lines: buckets.asset, total: sumOf(buckets.asset) },
+      assets: {
+        lines: buckets.asset,
+        groups: buildPrimaryGroups(buckets.asset),
+        total: assetsTotal,
+        debit: sumDr(buckets.asset),
+        credit: sumCr(buckets.asset),
+        net: sectionNet(buckets.asset),
+      },
       liabilities: {
         lines: buckets.liability,
-        total: sumOf(buckets.liability),
+        groups: buildPrimaryGroups(buckets.liability),
+        total: liabilitiesTotal,
+        debit: sumDr(buckets.liability),
+        credit: sumCr(buckets.liability),
+        net: sectionNet(buckets.liability),
       },
-      equity: { lines: buckets.equity, total: sumOf(buckets.equity) },
+      equity: {
+        lines: buckets.equity,
+        groups: buildPrimaryGroups(buckets.equity),
+        total: equityTotal,
+        debit: sumDr(buckets.equity),
+        credit: sumCr(buckets.equity),
+        net: sectionNet(buckets.equity),
+      },
+      netProfit,
       check: {
-        assetsTotal: sumOf(buckets.asset),
-        liabEquityTotal: sumOf(buckets.liability) + sumOf(buckets.equity),
-        difference:
-          sumOf(buckets.asset) -
-          (sumOf(buckets.liability) + sumOf(buckets.equity)),
+        assetsTotal,
+        liabEquityTotal,
+        difference,
+        isBalanced: Math.abs(difference) < 1,
       },
     });
   } catch (e) {
@@ -685,6 +931,98 @@ router.get("/gst-summary", auth, async (req, res) => {
     const outwardTotals = sumGroup(outward);
     const inwardTotals = sumGroup(inward);
 
+    // ── Fallback: derive GST from ledger entries ───────────────────────
+    // Imported Tally vouchers (Day Book / B-Sheet) do NOT carry a
+    // `gstBreakup` object — only raw ledgerEntries — so the aggregation
+    // above returns all-zeros for imported data and the GST report looked
+    // empty. When the breakup totals are empty, reconstruct CGST/SGST/
+    // IGST/cess from the GST ledger lines by name pattern:
+    //   • "Output ..." / "... Payable" → outward (sales) tax
+    //   • "Input ..."                  → inward (purchase) ITC
+    function classifyGst(name) {
+      const n = String(name || "").toLowerCase();
+      if (!/gst|cess/.test(n)) return null;
+      let comp = null;
+      if (/cess/.test(n)) comp = "cess";
+      else if (/igst/.test(n)) comp = "igst";
+      else if (/cgst/.test(n)) comp = "cgst";
+      else if (/sgst|utgst/.test(n)) comp = "sgst";
+      if (!comp) return null;
+      const dir = /input/.test(n)
+        ? "inward"
+        : /output|payable/.test(n)
+          ? "outward"
+          : null;
+      return { comp, dir };
+    }
+
+    const breakupEmpty =
+      outwardTotals.cgst +
+        outwardTotals.sgst +
+        outwardTotals.igst +
+        outwardTotals.cess +
+        inwardTotals.cgst +
+        inwardTotals.sgst +
+        inwardTotals.igst +
+        inwardTotals.cess ===
+      0;
+
+    if (breakupEmpty) {
+      const vouchers = await Acc_Voucher.find(match)
+        .select("voucherType ledgerEntries")
+        .lean();
+      for (const v of vouchers) {
+        for (const e of v.ledgerEntries || []) {
+          const c = classifyGst(e.ledgerName);
+          if (!c) continue;
+          const amt = Math.abs(e.amount || 0);
+          if (amt === 0) continue;
+          let dir = c.dir;
+          if (!dir)
+            dir = ["sales", "credit_note"].includes(v.voucherType)
+              ? "outward"
+              : "inward";
+          const bucket = dir === "outward" ? outwardTotals : inwardTotals;
+          bucket[c.comp] += amt;
+          bucket.total += amt;
+        }
+      }
+      const grossOut = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            ...match,
+            voucherType: { $in: ["sales", "credit_note"] },
+          },
+        },
+        { $group: { _id: null, g: { $sum: "$grandTotal" } } },
+      ]);
+      const grossIn = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            ...match,
+            voucherType: { $in: ["purchase", "debit_note"] },
+          },
+        },
+        { $group: { _id: null, g: { $sum: "$grandTotal" } } },
+      ]);
+      outwardTotals.grandTotal = grossOut[0]?.g || 0;
+      inwardTotals.grandTotal = grossIn[0]?.g || 0;
+      outwardTotals.taxable =
+        outwardTotals.grandTotal -
+        (outwardTotals.cgst +
+          outwardTotals.sgst +
+          outwardTotals.igst +
+          outwardTotals.cess);
+      inwardTotals.taxable =
+        inwardTotals.grandTotal -
+        (inwardTotals.cgst +
+          inwardTotals.sgst +
+          inwardTotals.igst +
+          inwardTotals.cess);
+      outwardTotals.derivedFromLedgers = true;
+      inwardTotals.derivedFromLedgers = true;
+    }
+
     res.json({
       companyId,
       dateRange: { from, to },
@@ -757,7 +1095,11 @@ router.get("/cash-flow", auth, async (req, res) => {
           inflow: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.entryType", "Dr"] },
+                // Schema field is `type` (enum Dr/Cr). The old code keyed
+                // off `entryType`, which does not exist on any voucher —
+                // so cash flow always summed to 0 and showed no data.
+                // Cash/bank DEBIT = money in (inflow).
+                { $eq: ["$ledgerEntries.type", "Dr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -766,7 +1108,7 @@ router.get("/cash-flow", auth, async (req, res) => {
           outflow: {
             $sum: {
               $cond: [
-                { $eq: ["$ledgerEntries.entryType", "Cr"] },
+                { $eq: ["$ledgerEntries.type", "Cr"] },
                 "$ledgerEntries.amount",
                 0,
               ],
@@ -951,6 +1293,89 @@ router.get("/dashboard", auth, async (req, res) => {
       recentVouchers,
     });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /data-range?companyId=                                          */
+/* Returns the actual first/last posted-voucher dates for this company */
+/* plus the financial year (Apr–Mar) that CONTAINS the data. The       */
+/* report pages use this to default their date filter to where the    */
+/* data actually is — otherwise a freshly-imported prior-year data set */
+/* shows empty Cash Flow / GST / Balance Sheet because the UI defaulted */
+/* to the calendar-current FY (which has no vouchers yet).             */
+/* ------------------------------------------------------------------ */
+router.get("/data-range", auth, async (req, res) => {
+  try {
+    let cId;
+    if (req.query.companyId) {
+      cId = new mongoose.Types.ObjectId(req.query.companyId);
+    } else {
+      // Some report pages (e.g. GST) don't carry a companyId — resolve
+      // the primary/only accounting company like the other bridges do.
+      let company = await Acc_Company.findOne({ isPrimary: true })
+        .select("_id")
+        .lean();
+      if (!company) {
+        const all = await Acc_Company.find({}).select("_id").limit(2).lean();
+        if (all.length === 1) company = all[0];
+      }
+      if (!company)
+        return res.json({
+          hasData: false,
+          minDate: null,
+          maxDate: null,
+          count: 0,
+          fy: null,
+        });
+      cId = company._id;
+    }
+
+    const agg = await Acc_Voucher.aggregate([
+      { $match: { companyId: cId, status: "posted" } },
+      {
+        $group: {
+          _id: null,
+          minDate: { $min: "$voucherDate" },
+          maxDate: { $max: "$voucherDate" },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    if (!agg.length || !agg[0].minDate) {
+      return res.json({
+        hasData: false,
+        minDate: null,
+        maxDate: null,
+        count: 0,
+        fy: null,
+      });
+    }
+
+    const min = new Date(agg[0].minDate);
+    const max = new Date(agg[0].maxDate);
+    // FY that contains the EARLIEST voucher (Indian FY: Apr 1 – Mar 31).
+    const fyStartYear =
+      min.getMonth() >= 3 ? min.getFullYear() : min.getFullYear() - 1;
+    const fyStart = new Date(fyStartYear, 3, 1);
+    const fyEnd = new Date(fyStartYear + 1, 2, 31);
+
+    res.json({
+      hasData: true,
+      minDate: min.toISOString().slice(0, 10),
+      maxDate: max.toISOString().slice(0, 10),
+      count: agg[0].count,
+      fy: {
+        startYear: fyStartYear,
+        label: `FY ${fyStartYear}-${String(fyStartYear + 1).slice(2)}`,
+        start: fyStart.toISOString().slice(0, 10),
+        end: fyEnd.toISOString().slice(0, 10),
+      },
+    });
+  } catch (e) {
+    console.error("[data-range]", e);
     res.status(500).json({ error: e.message });
   }
 });
