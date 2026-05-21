@@ -380,6 +380,19 @@ router.get("/", auth, async (req, res) => {
       Acc_Voucher.countDocuments(filter),
     ]);
 
+    // For vouchers without a party name (common in Tally-imported payments),
+    // derive a display name from the first Dr ledger entry.
+    for (const v of items) {
+      if (!v.partyLedgerName && (!v.partyLedgerId || !v.partyLedgerId.name)) {
+        const firstDr = (v.ledgerEntries || []).find(
+          (e) => e.type === "Dr" || (e.signedAmount || 0) > 0,
+        );
+        if (firstDr) {
+          v.partyLedgerName = firstDr.ledgerName || "";
+        }
+      }
+    }
+
     res.json({
       items,
       total,
@@ -1284,6 +1297,95 @@ router.get("/unpaid-bills", auth, async (req, res) => {
     res.json({ bills: filtered });
   } catch (e) {
     console.error("[unpaid-bills]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /dispatch-lookup — Customer orders/dispatches for sales invoice  */
+/* ------------------------------------------------------------------ */
+router.get("/dispatch-lookup", auth, async (req, res) => {
+  try {
+    const { q, customerId, limit = 30 } = req.query;
+    let CustomerRequest;
+    try {
+      CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+    } catch {
+      return res.json({
+        orders: [],
+        message: "CustomerRequest module not available",
+      });
+    }
+
+    const filter = {};
+    // Show orders that need invoicing — not yet fully invoiced
+    if (!q) {
+      filter.status = { $nin: ["cancelled", "rejected"] };
+    }
+    if (customerId) filter.customerId = customerId;
+    if (q) {
+      filter.$or = [
+        {
+          requestId: new RegExp(
+            String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+            "i",
+          ),
+        },
+      ];
+    }
+
+    const requests = await CustomerRequest.find(filter)
+      .populate("customerId", "name companyName email phone gstin")
+      .select(
+        "requestId quotations totalPaidAmount customerId status createdAt finalOrderPrice measurements",
+      )
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .lean();
+
+    const result = requests.map((r) => {
+      const q0 = r.quotations?.[0];
+      const items = q0?.items || q0?.lineItems || q0?.products || [];
+      const grandTotal = q0?.grandTotal || r.finalOrderPrice || 0;
+      const paid = r.totalPaidAmount || 0;
+      return {
+        _id: r._id,
+        requestId: r.requestId,
+        orderDate: r.createdAt,
+        status: r.status,
+        grandTotal,
+        paid,
+        outstanding: Math.max(0, grandTotal - paid),
+        customer: r.customerId
+          ? {
+              _id: r.customerId._id,
+              name: r.customerId.name || r.customerId.companyName,
+              companyName: r.customerId.companyName,
+              email: r.customerId.email,
+              phone: r.customerId.phone,
+              gstin: r.customerId.gstin,
+            }
+          : null,
+        items: items.map((item) => ({
+          name: item.productName || item.name || item.description || "",
+          variant: item.variant || item.variantName || "",
+          sku: item.sku || "",
+          hsnCode: item.hsnCode || item.hsn || "",
+          quantity: item.quantity || item.qty || 0,
+          unit: item.unit || "Nos",
+          rate: item.rate || item.unitPrice || item.price || 0,
+          gstRate: item.gstRate || item.taxRate || 18,
+          amount: item.amount || item.total || 0,
+          discount: item.discount || 0,
+        })),
+        measurements: r.measurements || null,
+        itemCount: items.length,
+      };
+    });
+
+    res.json({ orders: result, count: result.length });
+  } catch (e) {
+    console.error("[dispatch-lookup]", e);
     res.status(500).json({ error: e.message });
   }
 });

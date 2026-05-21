@@ -210,13 +210,30 @@ router.get("/", async (req, res) => {
     let filter = {};
 
     if (search) {
-      filter.$or = [
-        { companyName: { $regex: search, $options: "i" } },
-        { contactPerson: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } },
-        { gstNumber: { $regex: search, $options: "i" } },
-        { phone: { $regex: search, $options: "i" } },
-      ];
+      // Support searching by vendor code (VEN-XXXXXX)
+      const vendorCodeMatch = search.match(/^VEN-?([A-Fa-f0-9]{4,12})$/i);
+      if (vendorCodeMatch) {
+        // Vendor code is derived from last 6 chars of ObjectId
+        // Find vendors whose _id ends with these hex chars
+        const suffix = vendorCodeMatch[1].toLowerCase();
+        const allVendorsRaw = await Vendor.find(filter).select("_id").lean();
+        const matchingIds = allVendorsRaw
+          .filter((v) => v._id.toString().endsWith(suffix))
+          .map((v) => v._id);
+        if (matchingIds.length > 0) {
+          filter._id = { $in: matchingIds };
+        } else {
+          filter._id = null; // no match — will return empty
+        }
+      } else {
+        filter.$or = [
+          { companyName: { $regex: search, $options: "i" } },
+          { contactPerson: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+          { gstNumber: { $regex: search, $options: "i" } },
+          { phone: { $regex: search, $options: "i" } },
+        ];
+      }
     }
 
     if (status && status !== "all") {
@@ -326,7 +343,7 @@ router.get("/", async (req, res) => {
         return {
           id: vendor._id,
           ledgerId: vendorLedger?._id || null, // Acc_Ledger _id for View → Ledger link
-          vendorId: `VEN-${vendor._id.toString().substring(18, 24).toUpperCase()}`,
+          vendorId: `VEN-${(vendorLedger?._id || vendor._id).toString().substring(18, 24).toUpperCase()}`,
           name: vendor.companyName,
           contactPerson: vendor.contactPerson,
           email: vendor.email,
@@ -401,6 +418,7 @@ router.get("/", async (req, res) => {
           (v) =>
             (v.name || "").toLowerCase().includes(q) ||
             (v.gstin || "").toLowerCase().includes(q) ||
+            (v.vendorId || "").toLowerCase().includes(q) ||
             (v.aliases || []).some((al) => al.toLowerCase().includes(q)),
         );
       }
@@ -528,9 +546,34 @@ router.get("/:id", async (req, res) => {
       return sum + poPaid;
     }, 0);
 
+    // Find linked Acc_Ledger for consistent vendor code
+    let detailLedger = null;
+    try {
+      detailLedger = await Acc_Ledger.findOne({
+        linkedVendorId: vendor._id,
+        isActive: { $ne: false },
+      })
+        .select("_id")
+        .lean();
+      if (!detailLedger) {
+        detailLedger = await Acc_Ledger.findOne({
+          name: new RegExp(
+            "^" +
+              vendor.companyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+              "$",
+            "i",
+          ),
+          isActive: { $ne: false },
+        })
+          .select("_id")
+          .lean();
+      }
+    } catch (_) {}
+
     const vendorData = {
       id: vendor._id,
-      vendorId: `VEN-${vendor._id.toString().substring(18, 24).toUpperCase()}`,
+      ledgerId: detailLedger?._id || null,
+      vendorId: `VEN-${(detailLedger?._id || vendor._id).toString().substring(18, 24).toUpperCase()}`,
       name: vendor.companyName,
       contactPerson: vendor.contactPerson,
       email: vendor.email,
