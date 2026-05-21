@@ -720,6 +720,9 @@ app.use("/api/ceo/merchandiser", merchandiserRoutes);
 const ceoOverviewRoutes = require("./routes/CEO_Routes/overview");
 app.use("/api/ceo/overview", ceoOverviewRoutes);
 
+const ceoVendorRoutes = require("./routes/CEO_Routes/HistoryReport/vendor");
+app.use("/api/ceo/inventory/vendors", ceoVendorRoutes);
+
 /* =====================
     Normal Employees ROUTES
   ===================== */
@@ -884,6 +887,8 @@ app.use(
 
 const mrfRoutes = require("./routes/CMS_Routes/Inventory/Operations/mrfRoutes")
 app.use("/api/cms/inventory/mrf", mrfRoutes)
+
+app.use("/api/cowork/mrf", require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"))
 
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
