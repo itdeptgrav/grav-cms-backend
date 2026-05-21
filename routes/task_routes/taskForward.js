@@ -898,7 +898,13 @@ router.get("/task/list-hierarchy", verifyCoworkToken, verifyEmployeeToken, async
         return assignedToMe || createdByMe || isMyApproval;
       });
     } else if (role === "tl") {
-      // TL: sees tasks they created OR tasks assigned to them — handled in service
+      // TL: sees tasks they created OR assigned to them OR self-assign tasks where TL is approver
+      filtered = allTasks.filter(t => {
+        const assignedToMe = (t.assigneeIds || []).includes(employeeId);
+        const createdByMe = t.assignedBy === employeeId;
+        const isMyApproval = t.approverId === employeeId || (Array.isArray(t.visibleTo) && t.visibleTo.includes(employeeId));
+        return assignedToMe || createdByMe || isMyApproval;
+      });
     }
     // Employee: sees their own assigned tasks only (handled in svc.listTasksWithHierarchy)
 
