@@ -79,13 +79,33 @@ async function adjustStock(rawItemId, variantId, variantCombination, delta, txnM
 async function buildUnitConversions() {
   const units = await Unit.find({}).populate("conversions.toUnit", "name").lean();
   const map = {};
+
+  // Pass 1 — forward conversions exactly as stored
   units.forEach(u => {
     if (!map[u.name]) map[u.name] = [];
     (u.conversions || []).forEach(c => {
       const toName = c.toUnit?.name || c.toUnit;
-      if (toName) map[u.name].push({ name: toName, factor: c.quantity });
+      if (toName && c.quantity > 0) {
+        map[u.name].push({ name: toName, factor: c.quantity });
+      }
     });
   });
+
+  // Pass 2 — reverse conversions
+  // If "packet → 10 pcs" exists, then "pcs → 0.1 packet" should also appear
+  units.forEach(u => {
+    (u.conversions || []).forEach(c => {
+      const toName = c.toUnit?.name || c.toUnit;
+      if (!toName || !c.quantity || c.quantity <= 0) return;
+      // Add reverse: toName → u.name  with factor = 1/c.quantity
+      if (!map[toName]) map[toName] = [];
+      const alreadyHas = map[toName].some(x => x.name === u.name);
+      if (!alreadyHas) {
+        map[toName].push({ name: u.name, factor: +(1 / c.quantity).toFixed(8) });
+      }
+    });
+  });
+
   return map;
 }
 
@@ -238,7 +258,20 @@ router.get("/", async (req, res) => {
     } = req.query;
 
     const filter = {};
-    if (req.user.role === "employee") filter.requestedFor = req.user.id;
+
+    // ── Scope by employee ─────────────────────────────────────────────────────
+    // Cowork employees authenticate via Firebase; req.user.id = biometricId.
+    // Store managers have role "projectManager" or "admin" and see all MRFs.
+    // Employees (any role that is NOT a store manager) only see their own MRFs.
+    const isStoreManager = ["projectManager", "admin", "store", "ceo"].includes(req.user.role);
+    if (!isStoreManager) {
+      // resolve biometricId → MongoDB _id
+      const empDoc = await Employee.findOne({
+        $or: [{ biometricId: req.user.id }, { identityId: req.user.id }]
+      }).select("_id").lean();
+      if (empDoc) filter.requestedFor = empDoc._id;
+      else        filter.requestedForId = req.user.id; // fallback: match stored biometricId string
+    }
     if (status)       filter.status       = status;
     if (requestType)  filter.requestType  = requestType;
     if (creationMode) filter.creationMode = creationMode;
@@ -340,13 +373,13 @@ router.post("/", async (req, res) => {
     if (!builtItems.length)
       return res.status(400).json({ success: false, message: "No valid items found" });
 
-    const employee = await Employee.findById(req.user.id)
+    const employee = await Employee.findOne({ $or: [{ biometricId: req.user.id }, { identityId: req.user.id }] })
       .select("firstName middleName lastName biometricId identityId department").lean();
     const fullName    = buildFullName(employee);
     const biometricId = employee?.biometricId || employee?.identityId || "";
 
     const mrf = new MRF({
-      requestedFor:     req.user.id,
+      requestedFor:     employee?._id || req.user.id,
       requestedForName: fullName,
       requestedForDept: employee?.department || "",
       requestedForId:   biometricId,
@@ -441,11 +474,28 @@ router.patch("/:id/approve", async (req, res) => {
     if (mrf.status !== "PENDING")
       return res.status(400).json({ success: false, message: `Cannot approve — status is ${mrf.status}` });
 
+    const { storeNotes, itemApprovals } = req.body;
+    if (req.body.storeNotes) mrf.storeNotes = storeNotes;
+
+    // Apply per-item approvals if provided; otherwise approve all
+    if (itemApprovals && typeof itemApprovals === "object") {
+      mrf.items.forEach(item => {
+        const decision = itemApprovals[String(item._id)];
+        item.itemStatus = decision === "REJECTED" ? "REJECTED" : "APPROVED";
+      });
+    } else {
+      mrf.items.forEach(item => { item.itemStatus = "APPROVED"; });
+    }
+
+    // If ALL items rejected → reject the whole MRF instead
+    const allRejected = mrf.items.every(i => i.itemStatus === "REJECTED");
+    if (allRejected) {
+      return res.status(400).json({ success: false, message: "At least one item must be approved." });
+    }
+
     mrf.status     = "APPROVED";
     mrf.approvedBy = req.user.id;
     mrf.approvedAt = new Date();
-    if (req.body.storeNotes) mrf.storeNotes = req.body.storeNotes;
-    mrf.items.forEach(item => { item.itemStatus = "APPROVED"; });
     await mrf.save();
     res.json({ success: true, message: "MRF approved", mrf });
   } catch (err) {
