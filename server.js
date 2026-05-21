@@ -723,6 +723,9 @@ app.use("/api/ceo/overview", ceoOverviewRoutes);
 const ceoVendorRoutes = require("./routes/CEO_Routes/HistoryReport/vendor");
 app.use("/api/ceo/inventory/vendors", ceoVendorRoutes);
 
+
+app.use("/api/cms/inventory/stock-ledger", require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"));
+
 /* =====================
     Normal Employees ROUTES
   ===================== */
