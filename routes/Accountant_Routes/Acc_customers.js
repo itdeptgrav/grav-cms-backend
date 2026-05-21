@@ -340,6 +340,116 @@ const verifyAccountantToken = async (req, res, next) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SHARED HELPER: getAllCustomersForExport
+// Same logic as /all — merges CRM + imported Tally Sundry Debtors
+// ─────────────────────────────────────────────────────────────────────────────
+async function getAllCustomersForExport(companyId) {
+  const allCustomers = await Customer.find({})
+    .select("name companyName email phone gstin createdAt")
+    .lean();
+  const allIds = allCustomers.map((c) => c._id);
+
+  let ledgerByCustomerId = new Map();
+  try {
+    const linked = await Acc_Ledger.find({
+      linkedCustomerId: { $in: allIds },
+      isActive: { $ne: false },
+    })
+      .select("_id linkedCustomerId")
+      .lean();
+    for (const ll of linked)
+      ledgerByCustomerId.set(String(ll.linkedCustomerId), ll);
+  } catch (_) {}
+
+  const requestAgg = await CustomerRequest.aggregate([
+    { $match: { customerId: { $in: allIds } } },
+    {
+      $project: {
+        customerId: 1,
+        totalPaidAmount: 1,
+        createdAt: 1,
+        firstQuotation: { $arrayElemAt: ["$quotations", 0] },
+      },
+    },
+    {
+      $group: {
+        _id: "$customerId",
+        totalRevenue: { $sum: { $ifNull: ["$firstQuotation.grandTotal", 0] } },
+        totalPaid: { $sum: { $ifNull: ["$totalPaidAmount", 0] } },
+        orderCount: { $sum: 1 },
+        lastOrderDate: { $max: "$createdAt" },
+      },
+    },
+  ]);
+  const aggMap = new Map(requestAgg.map((a) => [String(a._id), a]));
+
+  const crmRows = allCustomers.map((c) => {
+    const a = aggMap.get(String(c._id)) || {};
+    const ll = ledgerByCustomerId.get(String(c._id));
+    const codeId = ll ? ll._id : c._id;
+    return {
+      code: customerCodeForId(codeId),
+      name: c.name || c.companyName || "Unnamed",
+      email: c.email || "",
+      phone: c.phone || "",
+      gstin: c.gstin || "",
+      revenue: a.totalRevenue || 0,
+      paid: a.totalPaid || 0,
+      outstanding: Math.max(0, (a.totalRevenue || 0) - (a.totalPaid || 0)),
+      orders: a.orderCount || 0,
+      lastOrder: a.lastOrderDate
+        ? new Date(a.lastOrderDate).toLocaleDateString("en-IN")
+        : "",
+      created: c.createdAt
+        ? new Date(c.createdAt).toLocaleDateString("en-IN")
+        : "",
+      source: "crm",
+    };
+  });
+
+  // Merge imported Tally Sundry Debtors
+  let importedRows = [];
+  try {
+    const imported = await importedPartyRows(companyId, {
+      groupRx: /sundry debtor/i,
+      kind: "customer",
+    });
+    importedRows = imported.map((c) => ({
+      code: c.customerCode || customerCodeForId(c._id),
+      name: c.name || c.companyName || "Unnamed",
+      email: c.email || "",
+      phone: c.phone || "",
+      gstin: c.gstin || "",
+      revenue: c.totalRevenue || 0,
+      paid: c.totalPaid || 0,
+      outstanding: c.totalOutstanding || 0,
+      orders: c.orderCount || 0,
+      lastOrder: c.lastOrderDate
+        ? new Date(c.lastOrderDate).toLocaleDateString("en-IN")
+        : "",
+      created: "",
+      source: "tally",
+    }));
+  } catch (_) {}
+
+  const all = [...crmRows, ...importedRows].sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+  const totalRevenue = all.reduce((s, c) => s + c.revenue, 0);
+  const totalPaid = all.reduce((s, c) => s + c.paid, 0);
+  const totalOutstanding = all.reduce((s, c) => s + c.outstanding, 0);
+  const withOutstanding = all.filter((c) => c.outstanding > 0).length;
+
+  return {
+    customers: all,
+    totalRevenue,
+    totalPaid,
+    totalOutstanding,
+    withOutstanding,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/accountant/customers
 //
 // List customers with financial summary per row + page-level KPIs.
@@ -815,13 +925,34 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
     ]);
     const aggMap = new Map(requestAgg.map((a) => [String(a._id), a]));
 
+    // Batch-lookup linked Acc_Ledgers for all customers so the customer
+    // code is derived from the LEDGER _id (matching Ledger Balances / CoA
+    // search). Falls back to Customer._id when no ledger is linked.
+    let ledgerByCustomerId = new Map();
+    try {
+      const linkedLedgers = await Acc_Ledger.find({
+        linkedCustomerId: { $in: allIds },
+        isActive: { $ne: false },
+      })
+        .select("_id linkedCustomerId")
+        .lean();
+      for (const ll of linkedLedgers) {
+        ledgerByCustomerId.set(String(ll.linkedCustomerId), ll);
+      }
+    } catch (_) {
+      /* Acc_Ledger may not be available */
+    }
+
     const customers = allCustomers.map((c) => {
       const a = aggMap.get(String(c._id)) || {};
       const totalRevenue = a.totalRevenue || 0;
       const totalPaid = a.totalPaid || 0;
+      const linkedLedger = ledgerByCustomerId.get(String(c._id));
+      const codeSourceId = linkedLedger ? linkedLedger._id : c._id;
       return {
         ...c,
-        customerCode: customerCodeForId(c._id),
+        customerCode: customerCodeForId(codeSourceId),
+        ledgerId: linkedLedger?._id || null,
         totalRevenue,
         totalPaid,
         totalOutstanding: Math.max(0, totalRevenue - totalPaid),
@@ -943,6 +1074,475 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
       success: false,
       message: "Server error while fetching all customers",
     });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /export/xlsx — Professional Excel export of all customers
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/export/xlsx", verifyAccountantToken, async (req, res) => {
+  try {
+    const ExcelJS = require("exceljs");
+    const {
+      customers,
+      totalRevenue,
+      totalPaid,
+      totalOutstanding,
+      withOutstanding,
+    } = await getAllCustomersForExport(req.query.companyId);
+
+    // Build workbook
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "GRAV Accounts";
+    wb.created = new Date();
+    const ws = wb.addWorksheet("Customer Master", {
+      views: [{ state: "frozen", ySplit: 6 }],
+    });
+
+    // Column widths
+    ws.columns = [
+      { width: 12 },
+      { width: 35 },
+      { width: 28 },
+      { width: 16 },
+      { width: 20 },
+      { width: 16 },
+      { width: 16 },
+      { width: 16 },
+      { width: 10 },
+      { width: 14 },
+      { width: 14 },
+    ];
+
+    // Title row
+    ws.mergeCells("A1:K1");
+    const titleCell = ws.getCell("A1");
+    titleCell.value = "GRAV CLOTHING — Customer Master";
+    titleCell.font = {
+      name: "Arial",
+      size: 14,
+      bold: true,
+      color: { argb: "FF1E293B" },
+    };
+    titleCell.alignment = { horizontal: "left", vertical: "middle" };
+    ws.getRow(1).height = 30;
+
+    // Subtitle
+    ws.mergeCells("A2:K2");
+    ws.getCell("A2").value =
+      `Generated: ${new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })} · ${customers.length} customers`;
+    ws.getCell("A2").font = {
+      name: "Arial",
+      size: 9,
+      color: { argb: "FF64748B" },
+    };
+
+    // Summary strip (row 4)
+    const summaryLabels = [
+      "Total Customers",
+      "Total Revenue",
+      "Total Paid",
+      "Total Outstanding",
+      "With Outstanding",
+    ];
+    const summaryValues = [
+      customers.length,
+      totalRevenue,
+      totalPaid,
+      totalOutstanding,
+      withOutstanding,
+    ];
+    summaryLabels.forEach((label, i) => {
+      const col = i * 2 + 1;
+      const labelCell = ws.getCell(4, col);
+      labelCell.value = label;
+      labelCell.font = {
+        name: "Arial",
+        size: 8,
+        bold: true,
+        color: { argb: "FF64748B" },
+      };
+      const valCell = ws.getCell(4, col + 1);
+      valCell.value =
+        typeof summaryValues[i] === "number" && i > 0
+          ? summaryValues[i]
+          : summaryValues[i];
+      if (i >= 1 && i <= 3) valCell.numFmt = "₹#,##0";
+      valCell.font = {
+        name: "Arial",
+        size: 10,
+        bold: true,
+        color: { argb: i === 3 ? "FFDC2626" : "FF1E293B" },
+      };
+    });
+    ws.getRow(4).height = 22;
+
+    // Header row (row 6)
+    const headers = [
+      "Code",
+      "Customer Name",
+      "Email",
+      "Phone",
+      "GSTIN",
+      "Revenue",
+      "Paid",
+      "Outstanding",
+      "Orders",
+      "Last Order",
+      "Registered",
+    ];
+    headers.forEach((h, i) => {
+      const cell = ws.getCell(6, i + 1);
+      cell.value = h;
+      cell.font = {
+        name: "Arial",
+        size: 9,
+        bold: true,
+        color: { argb: "FFFFFFFF" },
+      };
+      cell.fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: "FF4F46E5" },
+      };
+      cell.alignment = {
+        horizontal: i >= 5 ? "right" : "left",
+        vertical: "middle",
+      };
+      cell.border = {
+        top: { style: "thin", color: { argb: "FF4F46E5" } },
+        bottom: { style: "thin", color: { argb: "FF4F46E5" } },
+        left: { style: "thin", color: { argb: "FF4F46E5" } },
+        right: { style: "thin", color: { argb: "FF4F46E5" } },
+      };
+    });
+    ws.getRow(6).height = 24;
+
+    // Data rows
+    customers.forEach((c, idx) => {
+      const row = ws.getRow(7 + idx);
+      row.values = [
+        c.code,
+        c.name,
+        c.email,
+        c.phone,
+        c.gstin,
+        c.revenue,
+        c.paid,
+        c.outstanding,
+        c.orders,
+        c.lastOrder,
+        c.created,
+      ];
+
+      // Formatting
+      [6, 7, 8].forEach((col) => {
+        row.getCell(col).numFmt = "₹#,##0.00";
+      });
+      row.getCell(1).font = {
+        name: "Consolas",
+        size: 9,
+        color: { argb: "FF4F46E5" },
+      };
+
+      // Highlight outstanding > 0
+      if (c.outstanding > 0) {
+        row.getCell(8).font = {
+          name: "Arial",
+          size: 9,
+          bold: true,
+          color: { argb: "FFDC2626" },
+        };
+        row.getCell(8).fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFFEF2F2" },
+        };
+      }
+
+      // Zebra striping
+      if (idx % 2 === 0) {
+        for (let col = 1; col <= 11; col++) {
+          if (!row.getCell(col).fill || !row.getCell(col).fill.fgColor) {
+            row.getCell(col).fill = {
+              type: "pattern",
+              pattern: "solid",
+              fgColor: { argb: "FFF8FAFC" },
+            };
+          }
+        }
+      }
+
+      // Default font for data cells
+      const thinBorder = { style: "thin", color: { argb: "FFE2E8F0" } };
+      for (let col = 1; col <= 11; col++) {
+        const cell = row.getCell(col);
+        if (!cell.font) cell.font = { name: "Arial", size: 9 };
+        else if (!cell.font.name) cell.font.name = "Arial";
+        cell.border = {
+          top: thinBorder,
+          bottom: thinBorder,
+          left: thinBorder,
+          right: thinBorder,
+        };
+      }
+      row.height = 20;
+    });
+
+    // Auto-filter
+    ws.autoFilter = { from: "A6", to: `K${6 + customers.length}` };
+
+    // Send
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=customer-master-${new Date().toISOString().slice(0, 10)}.xlsx`,
+    );
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (e) {
+    if (e.code === "MODULE_NOT_FOUND") {
+      return res
+        .status(500)
+        .json({ error: "exceljs not installed. Run: npm install exceljs" });
+    }
+    console.error("[customers/export/xlsx]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /export/pdf — Professional PDF export of all customers
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/export/pdf", verifyAccountantToken, async (req, res) => {
+  try {
+    const PDFDocument = require("pdfkit");
+    const { customers, totalRevenue, totalPaid, totalOutstanding } =
+      await getAllCustomersForExport(req.query.companyId);
+    const fmtAmt = (n) =>
+      "₹" +
+      Number(n || 0).toLocaleString("en-IN", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+
+    // Build PDF
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 40,
+    });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=customer-master-${new Date().toISOString().slice(0, 10)}.pdf`,
+    );
+    doc.pipe(res);
+
+    // Header
+    doc
+      .fontSize(18)
+      .font("Helvetica-Bold")
+      .fillColor("#1e293b")
+      .text("GRAV CLOTHING", 40, 30);
+    doc
+      .fontSize(12)
+      .font("Helvetica")
+      .fillColor("#4f46e5")
+      .text("Customer Master", 40, 52);
+    doc
+      .fontSize(8)
+      .font("Helvetica")
+      .fillColor("#64748b")
+      .text(
+        `Generated: ${new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })} · ${customers.length} customers`,
+        40,
+        68,
+      );
+
+    // Divider
+    doc
+      .moveTo(40, 82)
+      .lineTo(760, 82)
+      .strokeColor("#e2e8f0")
+      .lineWidth(1)
+      .stroke();
+
+    // Summary KPIs
+    const kpis = [
+      { label: "Total Customers", value: String(customers.length) },
+      { label: "Total Revenue", value: fmtAmt(totalRevenue) },
+      { label: "Total Paid", value: fmtAmt(totalPaid) },
+      { label: "Outstanding", value: fmtAmt(totalOutstanding) },
+    ];
+    let kx = 40;
+    kpis.forEach((k) => {
+      doc
+        .fontSize(7)
+        .font("Helvetica-Bold")
+        .fillColor("#64748b")
+        .text(k.label.toUpperCase(), kx, 90);
+      doc
+        .fontSize(11)
+        .font("Helvetica-Bold")
+        .fillColor(k.label === "Outstanding" ? "#dc2626" : "#1e293b")
+        .text(k.value, kx, 102);
+      kx += 180;
+    });
+
+    // Table
+    const tableTop = 125;
+    const cols = [
+      { label: "Code", x: 40, w: 65 },
+      { label: "Customer", x: 105, w: 160 },
+      { label: "Email", x: 265, w: 140 },
+      { label: "Phone", x: 405, w: 80 },
+      { label: "Revenue", x: 485, w: 80, align: "right" },
+      { label: "Paid", x: 565, w: 80, align: "right" },
+      { label: "Outstanding", x: 645, w: 80, align: "right" },
+      { label: "Orders", x: 725, w: 35, align: "center" },
+    ];
+
+    // Header row
+    doc.rect(40, tableTop, 720, 18).fill("#4f46e5");
+    cols.forEach((col) => {
+      doc
+        .fontSize(7)
+        .font("Helvetica-Bold")
+        .fillColor("#ffffff")
+        .text(col.label.toUpperCase(), col.x + 3, tableTop + 5, {
+          width: col.w - 6,
+          align: col.align || "left",
+        });
+    });
+
+    // Data rows
+    let y = tableTop + 20;
+    const rowH = 16;
+    let pageNum = 1;
+
+    customers.forEach((c, idx) => {
+      // Page break
+      if (y + rowH > 540) {
+        // Footer
+        doc
+          .fontSize(7)
+          .font("Helvetica")
+          .fillColor("#94a3b8")
+          .text(`Page ${pageNum}`, 40, 550, { width: 720, align: "center" });
+        doc.addPage();
+        pageNum++;
+        y = 40;
+        // Re-draw header on new page
+        doc.rect(40, y, 720, 18).fill("#4f46e5");
+        cols.forEach((col) => {
+          doc
+            .fontSize(7)
+            .font("Helvetica-Bold")
+            .fillColor("#ffffff")
+            .text(col.label.toUpperCase(), col.x + 3, y + 5, {
+              width: col.w - 6,
+              align: col.align || "left",
+            });
+        });
+        y += 20;
+      }
+
+      // Zebra
+      if (idx % 2 === 0) {
+        doc.rect(40, y, 720, rowH).fill("#f8fafc");
+      }
+
+      // Outstanding highlight
+      if (c.outstanding > 0) {
+        doc.rect(645, y, 80, rowH).fill("#fef2f2");
+      }
+
+      doc.fillColor("#1e293b");
+      doc
+        .fontSize(7)
+        .font("Courier")
+        .fillColor("#4f46e5")
+        .text(c.code, cols[0].x + 3, y + 4, { width: cols[0].w - 6 });
+      doc
+        .font("Helvetica")
+        .fillColor("#1e293b")
+        .text(c.name, cols[1].x + 3, y + 4, { width: cols[1].w - 6 });
+      doc
+        .fontSize(6)
+        .fillColor("#64748b")
+        .text(c.email, cols[2].x + 3, y + 4, { width: cols[2].w - 6 });
+      doc.text(c.phone, cols[3].x + 3, y + 4, { width: cols[3].w - 6 });
+      doc.fontSize(7).font("Courier").fillColor("#1e293b");
+      doc.text(c.revenue > 0 ? fmtAmt(c.revenue) : "—", cols[4].x + 3, y + 4, {
+        width: cols[4].w - 6,
+        align: "right",
+      });
+      doc.text(c.paid > 0 ? fmtAmt(c.paid) : "—", cols[5].x + 3, y + 4, {
+        width: cols[5].w - 6,
+        align: "right",
+      });
+      doc.fillColor(c.outstanding > 0 ? "#dc2626" : "#1e293b");
+      doc.text(
+        c.outstanding > 0 ? fmtAmt(c.outstanding) : "—",
+        cols[6].x + 3,
+        y + 4,
+        { width: cols[6].w - 6, align: "right" },
+      );
+      doc.fillColor("#1e293b").font("Helvetica");
+      doc.text(c.orders > 0 ? String(c.orders) : "—", cols[7].x + 3, y + 4, {
+        width: cols[7].w - 6,
+        align: "center",
+      });
+
+      y += rowH;
+    });
+
+    // Total row
+    doc.rect(40, y, 720, 18).fill("#eef2ff");
+    doc
+      .fontSize(8)
+      .font("Helvetica-Bold")
+      .fillColor("#1e293b")
+      .text("TOTAL", cols[1].x + 3, y + 5);
+    doc.font("Courier-Bold");
+    doc.text(fmtAmt(totalRevenue), cols[4].x + 3, y + 5, {
+      width: cols[4].w - 6,
+      align: "right",
+    });
+    doc.text(fmtAmt(totalPaid), cols[5].x + 3, y + 5, {
+      width: cols[5].w - 6,
+      align: "right",
+    });
+    doc
+      .fillColor("#dc2626")
+      .text(fmtAmt(totalOutstanding), cols[6].x + 3, y + 5, {
+        width: cols[6].w - 6,
+        align: "right",
+      });
+
+    // Footer
+    doc
+      .fontSize(7)
+      .font("Helvetica")
+      .fillColor("#94a3b8")
+      .text(`Page ${pageNum} · GRAV Accounts · Confidential`, 40, 550, {
+        width: 720,
+        align: "center",
+      });
+
+    doc.end();
+  } catch (e) {
+    if (e.code === "MODULE_NOT_FOUND") {
+      return res
+        .status(500)
+        .json({ error: "pdfkit not installed. Run: npm install pdfkit" });
+    }
+    console.error("[customers/export/pdf]", e);
+    res.status(500).json({ error: e.message });
   }
 });
 

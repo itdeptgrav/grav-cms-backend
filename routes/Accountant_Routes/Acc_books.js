@@ -1380,4 +1380,293 @@ router.get("/data-range", auth, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* GET /dashboard-overview — Dashboard metrics from Acc_Voucher        */
+/* ------------------------------------------------------------------ */
+/* Computes all dashboard KPIs from actual voucher data (not CMS).
+ * Uses voucherDate (not createdAt) for accurate period matching.
+ * Accepts optional from/to date range; defaults to current Indian FY.
+ *
+ * Query params:
+ *   companyId — required
+ *   from      — ISO date (default: FY start, April 1)
+ *   to        — ISO date (default: today)
+ */
+router.get("/dashboard-overview", auth, async (req, res) => {
+  try {
+    const { companyId, from, to } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+
+    const cId = new mongoose.Types.ObjectId(companyId);
+    const today = new Date();
+
+    // Default to current Indian FY (April–March)
+    let fyStart = new Date(today.getFullYear(), 3, 1); // April 1
+    if (today.getMonth() < 3) fyStart.setFullYear(today.getFullYear() - 1);
+
+    const dateFrom = from ? new Date(from) : fyStart;
+    const dateTo = to ? new Date(to) : today;
+
+    // ── 1. Aggregate ALL voucher entries in date range ─────────────
+    const entries = await Acc_Voucher.aggregate([
+      {
+        $match: {
+          companyId: cId,
+          status: "posted",
+          voucherDate: { $gte: dateFrom, $lte: dateTo },
+        },
+      },
+      { $unwind: "$ledgerEntries" },
+      {
+        $lookup: {
+          from: "acc_ledgers",
+          localField: "ledgerEntries.ledgerId",
+          foreignField: "_id",
+          as: "_led",
+        },
+      },
+      { $unwind: { path: "$_led", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          voucherType: 1,
+          voucherDate: 1,
+          voucherNumber: 1,
+          ledgerId: "$ledgerEntries.ledgerId",
+          ledgerName: "$ledgerEntries.ledgerName",
+          groupName: {
+            $ifNull: ["$_led.groupName", "$ledgerEntries.groupName"],
+          },
+          nature: "$_led.nature",
+          type: "$ledgerEntries.type",
+          amount: "$ledgerEntries.amount",
+          signedAmount: {
+            $cond: {
+              if: {
+                $ne: [{ $ifNull: ["$ledgerEntries.signedAmount", null] }, null],
+              },
+              then: "$ledgerEntries.signedAmount",
+              else: {
+                $cond: {
+                  if: { $eq: ["$ledgerEntries.type", "Dr"] },
+                  then: { $ifNull: ["$ledgerEntries.amount", 0] },
+                  else: {
+                    $multiply: [{ $ifNull: ["$ledgerEntries.amount", 0] }, -1],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    ]);
+
+    // ── 2. Compute KPIs from entries ──────────────────────────────
+    let totalRevenue = 0,
+      totalExpenses = 0;
+    let totalReceivables = 0,
+      totalPayables = 0;
+    let salesCount = 0,
+      purchaseCount = 0,
+      paymentCount = 0,
+      receiptCount = 0,
+      journalCount = 0;
+    const seenVouchers = new Set();
+    const monthlyMap = {}; // "YYYY-MM" → { revenue, expenses }
+    const dailyMap = {}; // "YYYY-MM-DD" → { revenue, expenses }
+
+    // Group names that indicate revenue / expense
+    const revenueGroups =
+      /sales\s*account|direct\s*income|indirect\s*income|revenue/i;
+    const expenseGroups =
+      /direct\s*expense|indirect\s*expense|purchase\s*account|manufacturing\s*expense/i;
+    const receivableGroups = /sundry\s*debtor/i;
+    const payableGroups = /sundry\s*creditor/i;
+
+    for (const e of entries) {
+      const gn = e.groupName || "";
+      const sa = e.signedAmount || 0;
+
+      // Revenue (Cr to revenue accounts = negative signed, so negate)
+      if (revenueGroups.test(gn)) {
+        totalRevenue += Math.abs(sa);
+      }
+      // Expenses (Dr to expense accounts = positive signed)
+      if (expenseGroups.test(gn)) {
+        totalExpenses += Math.abs(sa);
+      }
+      // Receivables (Dr balance in Sundry Debtors)
+      if (receivableGroups.test(gn) && sa > 0) {
+        totalReceivables += sa;
+      }
+      // Payables (Cr balance in Sundry Creditors)
+      if (payableGroups.test(gn) && sa < 0) {
+        totalPayables += Math.abs(sa);
+      }
+
+      // Count voucher types (deduplicate by voucher _id)
+      const vKey = `${e.voucherType}:${e.voucherNumber}`;
+      if (!seenVouchers.has(vKey)) {
+        seenVouchers.add(vKey);
+        if (e.voucherType === "sales") salesCount++;
+        else if (e.voucherType === "purchase") purchaseCount++;
+        else if (e.voucherType === "payment") paymentCount++;
+        else if (e.voucherType === "receipt") receiptCount++;
+        else if (e.voucherType === "journal") journalCount++;
+      }
+
+      // Monthly trend (by voucherDate)
+      const d = new Date(e.voucherDate);
+      const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      if (!monthlyMap[mk]) monthlyMap[mk] = { revenue: 0, expenses: 0 };
+      if (revenueGroups.test(gn)) monthlyMap[mk].revenue += Math.abs(sa);
+      if (expenseGroups.test(gn)) monthlyMap[mk].expenses += Math.abs(sa);
+
+      // Daily trend
+      const dk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      if (!dailyMap[dk]) dailyMap[dk] = { revenue: 0, expenses: 0 };
+      if (revenueGroups.test(gn)) dailyMap[dk].revenue += Math.abs(sa);
+      if (expenseGroups.test(gn)) dailyMap[dk].expenses += Math.abs(sa);
+    }
+
+    // Build sorted monthly trend array
+    const monthKeys = Object.keys(monthlyMap).sort();
+    const monthNames = [
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sep",
+      "Oct",
+      "Nov",
+      "Dec",
+    ];
+    const revenueTrend = monthKeys.map((mk) => {
+      const [y, m] = mk.split("-");
+      const data = monthlyMap[mk];
+      return {
+        month: `${monthNames[parseInt(m) - 1]} ${y}`,
+        revenue: parseFloat(data.revenue.toFixed(2)),
+        expenses: parseFloat(data.expenses.toFixed(2)),
+        profit: parseFloat((data.revenue - data.expenses).toFixed(2)),
+      };
+    });
+
+    // Build sorted daily trend array
+    const dailyKeys = Object.keys(dailyMap).sort();
+    const dailyTrend = dailyKeys.map((dk) => {
+      const data = dailyMap[dk];
+      const dd = new Date(dk + "T00:00:00");
+      return {
+        day: dk,
+        label: `${dd.getDate()} ${monthNames[dd.getMonth()]}`,
+        revenue: parseFloat(data.revenue.toFixed(2)),
+        expenses: parseFloat(data.expenses.toFixed(2)),
+        profit: parseFloat((data.revenue - data.expenses).toFixed(2)),
+      };
+    });
+
+    // ── 3. Ledger/group counts ────────────────────────────────────
+    const [totalLedgers, totalGroups, debtorCount, creditorCount] =
+      await Promise.all([
+        Acc_Ledger.countDocuments({ companyId: cId, isActive: true }),
+        Acc_Group.countDocuments({ companyId: cId, isActive: true }),
+        Acc_Ledger.countDocuments({
+          companyId: cId,
+          isActive: true,
+          groupName: /sundry\s*debtor/i,
+        }),
+        Acc_Ledger.countDocuments({
+          companyId: cId,
+          isActive: true,
+          groupName: /sundry\s*creditor/i,
+        }),
+      ]);
+
+    // ── 4. Voucher type distribution ──────────────────────────────
+    const voucherDist = await Acc_Voucher.aggregate([
+      {
+        $match: {
+          companyId: cId,
+          status: "posted",
+          voucherDate: { $gte: dateFrom, $lte: dateTo },
+        },
+      },
+      {
+        $group: {
+          _id: "$voucherType",
+          count: { $sum: 1 },
+          total: { $sum: "$grandTotal" },
+        },
+      },
+      { $sort: { count: -1 } },
+    ]);
+
+    // ── 5. Top parties by volume ──────────────────────────────────
+    const topParties = await Acc_Voucher.aggregate([
+      {
+        $match: {
+          companyId: cId,
+          status: "posted",
+          voucherDate: { $gte: dateFrom, $lte: dateTo },
+          partyLedgerName: { $exists: true, $ne: "" },
+        },
+      },
+      {
+        $group: {
+          _id: "$partyLedgerName",
+          count: { $sum: 1 },
+          total: { $sum: "$grandTotal" },
+        },
+      },
+      { $sort: { total: -1 } },
+      { $limit: 10 },
+    ]);
+
+    res.json({
+      success: true,
+      overview: {
+        dateRange: { from: dateFrom, to: dateTo },
+        financial: {
+          totalRevenue: parseFloat(totalRevenue.toFixed(2)),
+          totalExpenses: parseFloat(totalExpenses.toFixed(2)),
+          netProfit: parseFloat((totalRevenue - totalExpenses).toFixed(2)),
+          totalReceivables: parseFloat(totalReceivables.toFixed(2)),
+          totalPayables: parseFloat(totalPayables.toFixed(2)),
+          cashFlow: {
+            inflow: parseFloat(totalRevenue.toFixed(2)),
+            outflow: parseFloat(totalExpenses.toFixed(2)),
+            net: parseFloat((totalRevenue - totalExpenses).toFixed(2)),
+          },
+        },
+        voucherCounts: {
+          sales: salesCount,
+          purchase: purchaseCount,
+          payment: paymentCount,
+          receipt: receiptCount,
+          journal: journalCount,
+          total: seenVouchers.size,
+        },
+        voucherDistribution: voucherDist,
+        revenueTrend,
+        dailyTrend,
+        topParties,
+        counts: {
+          ledgers: totalLedgers,
+          groups: totalGroups,
+          debtors: debtorCount,
+          creditors: creditorCount,
+        },
+      },
+    });
+  } catch (e) {
+    console.error("[dashboard-overview]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

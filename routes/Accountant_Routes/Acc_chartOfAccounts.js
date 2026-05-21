@@ -184,7 +184,16 @@ router.get("/version", (req, res) => {
 // Helper — sum currentBalance for a list of leaf ledgers (signed)
 // ─────────────────────────────────────────────────────────────────────────────
 function sumBalances(ledgers = []) {
-  return ledgers.reduce((acc, l) => acc + (l.currentBalance || 0), 0);
+  return ledgers.reduce((acc, l) => {
+    // Use currentBalance if set, fall back to openingBalance.
+    // For Tally-imported ledgers, currentBalance may be 0/null while
+    // openingBalance has the actual value from the import.
+    const bal =
+      l.currentBalance != null && l.currentBalance !== 0
+        ? l.currentBalance
+        : l.openingBalance || 0;
+    return acc + bal;
+  }, 0);
 }
 
 function rollupGroupTotals(group) {
@@ -221,11 +230,83 @@ router.get("/tree", async (req, res) => {
       Acc_Ledger.find({ companyId, isActive: true }).lean(),
     ]);
 
+    // Compute actual balances from posted vouchers — the stored
+    // currentBalance/openingBalance fields can be stale or 0.
+    // Single aggregate: net movement per ledger from all posted vouchers.
+    // Handle BOTH formats: signedAmount (newer) and amount+type (Tally import).
+    let movementByLedger = new Map();
+    try {
+      const movements = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            companyId: new mongoose.Types.ObjectId(companyId),
+            status: "posted",
+          },
+        },
+        { $unwind: "$ledgerEntries" },
+        {
+          $group: {
+            _id: "$ledgerEntries.ledgerId",
+            net: {
+              $sum: {
+                $cond: {
+                  if: {
+                    $ne: [
+                      { $ifNull: ["$ledgerEntries.signedAmount", null] },
+                      null,
+                    ],
+                  },
+                  then: "$ledgerEntries.signedAmount",
+                  else: {
+                    $cond: {
+                      if: { $eq: ["$ledgerEntries.type", "Dr"] },
+                      then: { $ifNull: ["$ledgerEntries.amount", 0] },
+                      else: {
+                        $multiply: [
+                          { $ifNull: ["$ledgerEntries.amount", 0] },
+                          -1,
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      ]);
+      for (const m of movements) {
+        movementByLedger.set(String(m._id), m);
+      }
+    } catch (_) {
+      /* Acc_Voucher not available */
+    }
+
     const groupMap = new Map(
       groups.map((g) => [String(g._id), { ...g, children: [], ledgers: [] }]),
     );
 
     ledgers.forEach((l) => {
+      // Enrich with computed balance from vouchers
+      const mov = movementByLedger.get(String(l._id));
+      const opening = l.openingBalance || 0;
+      if (mov) {
+        l.currentBalance = opening + mov.net;
+      } else if (!l.currentBalance && opening) {
+        l.currentBalance = opening;
+      }
+
+      // Add vendor code and customer code for search
+      l.vendorCode = `VEN-${l._id.toString().substring(18, 24).toUpperCase()}`;
+      const hex = l._id.toString().slice(-6);
+      const num = parseInt(hex, 16);
+      l.customerCode = Number.isNaN(num)
+        ? "C-00000"
+        : "C-" + num.toString(36).toUpperCase().padStart(5, "0");
+      if (!l.aliases) l.aliases = [];
+      if (!l.aliases.includes(l.vendorCode)) l.aliases.push(l.vendorCode);
+      if (!l.aliases.includes(l.customerCode)) l.aliases.push(l.customerCode);
+
       const parent = groupMap.get(String(l.groupId));
       if (parent) parent.ledgers.push(l);
     });
@@ -613,11 +694,29 @@ router.get("/ledgers", async (req, res) => {
 
     if (nature) filter.nature = nature;
     if (search) {
-      filter.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { aliases: { $regex: search, $options: "i" } },
-        { gstin: { $regex: search, $options: "i" } },
-      ];
+      // Support vendor code search (VEN-XXXXXX → ObjectId suffix match)
+      const codeMatch = search.match(/^VEN-?([A-Fa-f0-9]{4,12})$/i);
+      if (codeMatch) {
+        const suffix = codeMatch[1].toLowerCase();
+        // Find all ledgers and filter by _id suffix
+        const candidates = await Acc_Ledger.find({ ...filter, $or: undefined })
+          .select("_id")
+          .lean();
+        const matchingIds = candidates
+          .filter((l) => l._id.toString().endsWith(suffix))
+          .map((l) => l._id);
+        if (matchingIds.length > 0) {
+          filter._id = { $in: matchingIds };
+        } else {
+          filter._id = null;
+        }
+      } else {
+        filter.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { aliases: { $regex: search, $options: "i" } },
+          { gstin: { $regex: search, $options: "i" } },
+        ];
+      }
     }
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const [ledgersRaw, total] = await Promise.all([
@@ -628,6 +727,57 @@ router.get("/ledgers", async (req, res) => {
         .lean(),
       Acc_Ledger.countDocuments(filter),
     ]);
+
+    // Enrich with computed balance from posted vouchers (same as /tree)
+    try {
+      const ledgerIds = ledgersRaw.map((l) => l._id);
+      const movements = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            companyId: new mongoose.Types.ObjectId(companyId),
+            status: "posted",
+          },
+        },
+        { $unwind: "$ledgerEntries" },
+        { $match: { "ledgerEntries.ledgerId": { $in: ledgerIds } } },
+        {
+          $group: {
+            _id: "$ledgerEntries.ledgerId",
+            net: {
+              $sum: {
+                $cond: {
+                  if: {
+                    $ne: [
+                      { $ifNull: ["$ledgerEntries.signedAmount", null] },
+                      null,
+                    ],
+                  },
+                  then: "$ledgerEntries.signedAmount",
+                  else: {
+                    $cond: {
+                      if: { $eq: ["$ledgerEntries.type", "Dr"] },
+                      then: { $ifNull: ["$ledgerEntries.amount", 0] },
+                      else: {
+                        $multiply: [
+                          { $ifNull: ["$ledgerEntries.amount", 0] },
+                          -1,
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      ]);
+      const movMap = new Map(movements.map((m) => [String(m._id), m.net]));
+      for (const l of ledgersRaw) {
+        const mov = movMap.get(String(l._id)) || 0;
+        const opening = l.openingBalance || 0;
+        l.currentBalance = opening + mov;
+      }
+    } catch (_) {}
 
     // Auto-derive stateCode from GSTIN for any ledger that has GSTIN
     // but is missing stateCode (common for Tally imports).
@@ -673,6 +823,22 @@ router.get("/ledgers", async (req, res) => {
     };
     const bulkFixOps = [];
     const ledgers = ledgersRaw.map((l) => {
+      // Add vendor code (VEN-XXXXXX) so client-side search can find
+      // ledgers by vendor code. The code is derived from the last 6
+      // hex chars of the ledger's ObjectId — same as vendor page.
+      l.vendorCode = `VEN-${l._id.toString().substring(18, 24).toUpperCase()}`;
+      // Also inject into aliases so existing client-side search
+      // (which checks aliases[]) picks it up without frontend changes.
+      if (!l.aliases) l.aliases = [];
+      if (!l.aliases.includes(l.vendorCode)) l.aliases.push(l.vendorCode);
+      // Customer code (C-XXXXX) for Sundry Debtor ledgers
+      const ccHex = l._id.toString().slice(-6);
+      const ccNum = parseInt(ccHex, 16);
+      l.customerCode = Number.isNaN(ccNum)
+        ? "C-00000"
+        : "C-" + ccNum.toString(36).toUpperCase().padStart(5, "0");
+      if (!l.aliases.includes(l.customerCode)) l.aliases.push(l.customerCode);
+
       if (l.gstin && l.gstin.length >= 2) {
         const code = l.gstin.slice(0, 2);
         if (GST_STATES[code]) {
@@ -745,6 +911,43 @@ router.post("/ledgers", async (req, res) => {
     res.status(201).json({ success: true, ledger });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /ledgers/search-by-voucher — find ledgers involved in a voucher */
+/* ------------------------------------------------------------------ */
+/* When the user searches by invoice/voucher number (e.g. RC/0017/26-27)
+ * in the Ledger Balances page, this endpoint finds all ledgers that
+ * have transactions with that voucher number.
+ */
+router.get("/ledgers/search-by-voucher", async (req, res) => {
+  try {
+    const { companyId, q } = req.query;
+    if (!companyId || !q) return res.json({ ledgerIds: [] });
+    const rx = new RegExp(
+      String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      "i",
+    );
+    // Find vouchers matching the number
+    const vouchers = await Acc_Voucher.find({
+      companyId,
+      $or: [{ voucherNumber: rx }, { referenceNumber: rx }],
+    })
+      .select("ledgerEntries.ledgerId partyLedgerId")
+      .limit(50)
+      .lean();
+    // Collect all unique ledger IDs
+    const ids = new Set();
+    for (const v of vouchers) {
+      if (v.partyLedgerId) ids.add(String(v.partyLedgerId));
+      for (const e of v.ledgerEntries || []) {
+        if (e.ledgerId) ids.add(String(e.ledgerId));
+      }
+    }
+    res.json({ ledgerIds: [...ids], voucherCount: vouchers.length });
+  } catch (err) {
+    res.json({ ledgerIds: [], error: err.message });
   }
 });
 
