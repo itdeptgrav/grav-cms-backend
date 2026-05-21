@@ -15,6 +15,31 @@ const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 const svc = require("../../services/taskForward.service");
 const { db, admin } = require("../../config/firebaseAdmin");
+const { v4: _nuuid } = require("uuid");
+const _socket = require("../../config/socketInstance");
+
+// ── Local notify helper (saves to Firestore + FCM push) ──────────────────────
+async function _notify({ recipientIds, type, title, body, data, senderId, senderName }) {
+  if (!recipientIds?.length) return;
+  try {
+    const batch = db.batch();
+    recipientIds.forEach(id => {
+      batch.set(db.collection("cowork_notifications").doc(_nuuid()), {
+        recipientEmployeeId: id, type, title, body,
+        data: data || {}, read: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+    await batch.commit();
+    _socket.emitToMany(recipientIds, "new_notification", { type, title, body, data });
+    setImmediate(() => {
+      try {
+        const { sendPushToEmployees } = require("../../services/fcmPush.service");
+        sendPushToEmployees(recipientIds, title, body, { type, ...(data || {}) }).catch(() => { });
+      } catch (_) { }
+    });
+  } catch (e) { console.error("[_notify]", e.message); }
+}
 
 // ── Helper: get employee info (name + email) from Firestore ──────────────────
 async function getAssigneeContacts(assigneeIds) {
@@ -72,7 +97,6 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
-    console.log("[task/create] senderTimerWindowSecs:", senderTimerWindowSecs);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     // isFolder can be boolean true OR string "true" from some clients
     const folderFlag = isFolder === true || isFolder === "true";
@@ -315,12 +339,14 @@ router.post("/task/:taskId/self-assign-approve", verifyCoworkToken, verifyEmploy
 
       // Notify the task creator (self-assignee)
       if (task.assigneeIds?.length) {
-        await sendPushToEmployees(
-          task.assigneeIds,
-          `✅ Self-Task Approved · ${task.title}`,
-          `${approverName} approved your self-assigned task. You can now begin work.`,
-          { type: "self_assign_approved", taskId }
-        );
+        await _notify({
+          recipientIds: task.assigneeIds,
+          type: "self_assign_approved",
+          title: `✅ Self-Task Approved · ${task.title}`,
+          body: `${approverName} approved your self-assigned task. You can now begin work.`,
+          data: { taskId, taskTitle: task.title },
+          senderId: employeeId, senderName: approverName,
+        });
       }
       return res.json({ success: true, message: "Task approved. Employee can now begin work." });
 
@@ -336,12 +362,14 @@ router.post("/task/:taskId/self-assign-approve", verifyCoworkToken, verifyEmploy
       });
 
       if (task.assigneeIds?.length) {
-        await sendPushToEmployees(
-          task.assigneeIds,
-          `❌ Self-Task Rejected · ${task.title}`,
-          `${approverName} rejected your self-assigned task${rejectionReason ? ": " + rejectionReason : "."}`,
-          { type: "self_assign_rejected", taskId }
-        );
+        await _notify({
+          recipientIds: task.assigneeIds,
+          type: "self_assign_rejected",
+          title: `❌ Self-Task Rejected · ${task.title}`,
+          body: `${approverName} rejected your self-assigned task${rejectionReason ? ": " + rejectionReason : "."}`,
+          data: { taskId, taskTitle: task.title },
+          senderId: employeeId, senderName: approverName,
+        });
       }
       return res.json({ success: true, message: "Task rejected." });
     }
@@ -1192,8 +1220,7 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     if (!snap.exists) return res.status(404).json({ error: "Task not found" });
     const task = snap.data();
 
-    if (!task.isThirdParty && !task.isGoal && !task.isRepeat)
-      return res.status(400).json({ error: "Only third-party, goal, or repeat tasks support this flow" });
+    // Allow all task types with fixedDeadline OR any standard task to request extension
 
     if (!task.assigneeIds?.includes(req.coworkUser.employeeId))
       return res.status(403).json({ error: "Only assigned employees can request an extension" });
@@ -1209,6 +1236,19 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
       },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // Notify CEO/TL who assigned the task
+    try {
+      const notifyIds = [task.assignedBy].filter(Boolean);
+      await _notify({
+        recipientIds: notifyIds,
+        type: "deadline_extension_requested",
+        title: `⏰ Extension Requested · ${task.title}`,
+        body: `${req.coworkUser.name} requested a deadline extension.`,
+        data: { taskId, taskTitle: task.title },
+        senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name,
+      });
+    } catch (e) { console.error("ext req notif:", e.message); }
 
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1252,6 +1292,21 @@ router.post("/task/:taskId/review-deadline-extension", verifyCoworkToken, verify
     }
 
     await taskRef.update(update);
+
+    // Notify assignees about extension review result
+    try {
+      const assigneeIds = task.assigneeIds || [];
+      const actionLabel = action === "approve" ? "✅ Approved" : action === "counter" ? "📅 Counter-proposed" : "❌ Rejected";
+      await _notify({
+        recipientIds: assigneeIds,
+        type: "deadline_extension_reviewed",
+        title: `${actionLabel} · ${task.title}`,
+        body: action === "approve" ? `Your deadline extension was approved by ${req.coworkUser.name}.` : action === "counter" ? `${req.coworkUser.name} suggested a new deadline.` : `Your deadline extension was rejected by ${req.coworkUser.name}.`,
+        data: { taskId, taskTitle: task.title, action },
+        senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name,
+      });
+    } catch (e) { console.error("ext review notif:", e.message); }
+
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

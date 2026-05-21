@@ -475,6 +475,7 @@ async function submitDailyReport({ taskId, employeeId, employeeName, message, im
   return { report, status: newStatus };
 }
 
+
 // ─── Sync parent progress from children ──────────────────
 async function _syncParentProgress(parentTaskId) {
   const parentDoc = await db.collection("cowork_tasks").doc(parentTaskId).get();
