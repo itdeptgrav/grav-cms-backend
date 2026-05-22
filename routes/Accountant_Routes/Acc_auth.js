@@ -40,10 +40,10 @@ if (
   const have = Object.keys(orgAuthModule || {}).join(", ") || "(empty module)";
   throw new Error(
     `[accountantAuthRoutes] AccountantOrgAuthMiddleware.js is missing required exports.\n` +
-      `  Expected: orgAuth, signOrgToken, extractToken (all functions).\n` +
-      `  Got: ${have}\n` +
-      `  Fix: replace backend/Middlewear/AccountantOrgAuthMiddleware.js with the latest version\n` +
-      `  from coa-updates/backend/Middlewear/AccountantOrgAuthMiddleware.js, then restart node.`,
+    `  Expected: orgAuth, signOrgToken, extractToken (all functions).\n` +
+    `  Got: ${have}\n` +
+    `  Fix: replace backend/Middlewear/AccountantOrgAuthMiddleware.js with the latest version\n` +
+    `  from coa-updates/backend/Middlewear/AccountantOrgAuthMiddleware.js, then restart node.`,
   );
 }
 
@@ -52,10 +52,10 @@ if (
 const COOKIE_NAME = "accountant_token";
 const COOKIE_OPTS = {
   httpOnly: true,
-  sameSite: "lax",
-  secure: process.env.NODE_ENV === "production",
+  secure: isProduction,
+  sameSite: isProduction ? "none" : "lax",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
   path: "/",
-  maxAge: 12 * 60 * 60 * 1000, // 12h — matches JWT expiry
 };
 
 function setAuthCookie(res, token) {
@@ -189,11 +189,11 @@ router.get("/me", orgAuth, async (req, res) => {
     },
     organization: req.organization
       ? {
-          id: req.organization._id,
-          name: req.organization.name,
-          tallyCompanyIds: req.organization.tallyCompanyIds,
-          settings: req.organization.settings,
-        }
+        id: req.organization._id,
+        name: req.organization.name,
+        tallyCompanyIds: req.organization.tallyCompanyIds,
+        settings: req.organization.settings,
+      }
       : null,
     permissions: req.user.permissions,
     hiddenNavItems,
