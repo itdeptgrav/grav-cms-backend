@@ -50,6 +50,7 @@ if (
 // Cookie settings. We use a dedicated cookie name `accountant_token` so it
 // doesn't collide with other auth cookies the host CMS might use.
 const COOKIE_NAME = "accountant_token";
+const isProduction = process.env.NODE_ENV === "production";
 const COOKIE_OPTS = {
   httpOnly: true,
   secure: isProduction,
