@@ -460,12 +460,10 @@ router.put("/groups/:id", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Group not found" });
-    if (grp.isReserved && req.body.name && req.body.name !== grp.name) {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot rename a reserved Tally group",
-      });
-    }
+
+    // ← REMOVED: the isReserved rename block that used to be here.
+    //   Groups can now be renamed freely, including system-reserved ones.
+
     Object.assign(grp, req.body);
     await grp.save();
     res.json({ success: true, group: grp });
