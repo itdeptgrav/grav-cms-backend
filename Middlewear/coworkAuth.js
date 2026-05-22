@@ -1,3 +1,5 @@
+// middlewear/coworkAuth.js
+
 const { auth, db, admin } = require("../config/firebaseAdmin");
 
 async function verifyCoworkToken(req, res, next) {
