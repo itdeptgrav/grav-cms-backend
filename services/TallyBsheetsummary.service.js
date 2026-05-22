@@ -1,4 +1,4 @@
-// services/tallyBSheetSummary.service.js
+// services/TallyBsheetsummary.service.js
 //
 // TALLY BALANCE-SHEET *SUMMARY* PARSER  (reconciliation / verification)
 // ─────────────────────────────────────────────────────────────────────────────
