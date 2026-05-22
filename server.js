@@ -723,8 +723,10 @@ app.use("/api/ceo/overview", ceoOverviewRoutes);
 const ceoVendorRoutes = require("./routes/CEO_Routes/HistoryReport/vendor");
 app.use("/api/ceo/inventory/vendors", ceoVendorRoutes);
 
-
-app.use("/api/cms/inventory/stock-ledger", require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"));
+app.use(
+  "/api/cms/inventory/stock-ledger",
+  require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"),
+);
 
 /* =====================
     Normal Employees ROUTES
@@ -888,13 +890,13 @@ app.use(
   workOrderProgressRoutes,
 );
 
+const mrfRoutes = require("./routes/CMS_Routes/Inventory/Operations/mrfRoutes");
+app.use("/api/cms/inventory/mrf", mrfRoutes);
 
-
-const mrfRoutes = require("./routes/CMS_Routes/Inventory/Operations/mrfRoutes")
-app.use("/api/cms/inventory/mrf", mrfRoutes)
-
-app.use("/api/cowork/mrf", require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"))
-
+app.use(
+  "/api/cowork/mrf",
+  require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
+);
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
@@ -1125,6 +1127,11 @@ app.use(
 app.use(
   "/api/accountant/import-mapping",
   require("./routes/Accountant_Routes/Acc_importMapping"),
+);
+
+app.use(
+  "/api/accountant/gstr2b",
+  require("./routes/Accountant_Routes/Acc_gstr2b"),
 );
 
 // ── Health probe (open in browser to verify mounting) ────────────────
