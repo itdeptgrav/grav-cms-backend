@@ -45,7 +45,7 @@ const bSheetImporter = require("../../services/tallyBSheetImporter.service");
 const mastersImporter = require("../../services/tallyMastersImporter.service");
 // Tiny top-level "Balance Sheet" summary export — used ONLY to verify an
 // import is accurate against Tally's own totals (never to create data).
-const bSheetSummary = require("../../services/tallyBSheetSummary.service");
+const bSheetSummary = require("../../services/TallyBsheetsummary.service");
 // Tally Day Book export (Display More Reports → Day Book → Alt+E → JSON).
 // The cleanest voucher source — full GST detail, all voucher types.
 const dayBookImporter = require("../../services/tallyDayBookImporter.service");
