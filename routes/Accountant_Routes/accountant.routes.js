@@ -79,6 +79,9 @@ const mounts = [
   ["/tally/reports", "./Accountant_Routes/Acc_books"],
   ["/vouchers", "./Accountant_Routes/Acc_vouchers"],
 
+  // === Ghost ledger / stock-item merge engine ===
+  ["/merge", "./Accountant_Routes/Acc_merge"],
+
   // === Generic UI persistence (every list page uses these) ===
   // pins   → "pin this row to top" (star button)
   // priorities → "drag-reorder these rows" (grip button)

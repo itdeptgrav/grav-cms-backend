@@ -4,24 +4,7 @@
 //
 // This module does NOT have its own collection. Instead it reads from
 // the unified Acc_Voucher collection (voucherType: "sales") and
-// enriches each invoice with:
-//
-//   • paymentStatus   — derived from receipt allocations + credit notes
-//                       against this invoice ("paid" / "partial" /
-//                       "unpaid" / "overdue")
-//   • receivedAmount  — sum of receipts allocated against this invoice
-//   • creditedAmount  — sum of CNs linked to this invoice
-//   • outstanding     — grandTotal − received − credited
-//   • ageInDays       — days since voucherDate (or dueDate when set)
-//   • isOverdue       — true if dueDate is past AND outstanding > 0
-//
-// The Sales Vouchers page = accountant's transaction-entry view of
-// these same documents. The Invoices page = AR officer's collection
-// view of those documents with payment lifecycle focus.
-//
-// LEGACY NOTE: The previous version of this file imported a non-existent
-// "AccountantModels" module and crashed at module-load. This new version
-// is a clean rewrite using Acc_Voucher.
+// enriches each invoice with payment lifecycle data.
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -48,7 +31,6 @@ async function enrichInvoices(invoices, companyId) {
   const invoiceIds = invoices.map((i) => i._id);
   const invoiceNumbers = invoices.map((i) => i.voucherNumber);
 
-  // ── Tally credit notes linked to each invoice ──
   const cnAgg = await Acc_Voucher.aggregate([
     {
       $match: {
@@ -69,15 +51,10 @@ async function enrichInvoices(invoices, companyId) {
   const creditedMap = new Map(
     cnAgg.map((c) => [
       String(c._id),
-      {
-        amount: c.totalCredited,
-        count: c.count,
-      },
+      { amount: c.totalCredited, count: c.count },
     ]),
   );
 
-  // ── Tally receipt allocations against each invoice (by voucherNumber
-  //    in billAllocations.agst_ref) ──
   const receipts = await Acc_Voucher.find({
     companyId,
     voucherType: "receipt",
@@ -106,7 +83,6 @@ async function enrichInvoices(invoices, companyId) {
     }
   }
 
-  // ── Compute per-invoice status ──
   const today = new Date();
   return invoices.map((inv) => {
     const k = String(inv._id);
@@ -145,19 +121,8 @@ async function enrichInvoices(invoices, companyId) {
 }
 
 /* ------------------------------------------------------------------ */
-/* GET / — list invoices with computed payment status                  */
+/* GET / — list invoices                                               */
 /* ------------------------------------------------------------------ */
-/* Query params:
- *   companyId       — required
- *   paymentStatus   — filter: paid / partial / unpaid / overdue
- *   customerId      — partyLedgerId filter
- *   dateFrom        — ISO date
- *   dateTo          — ISO date
- *   search          — voucherNumber / partyLedgerName / narration
- *   ageBucket       — "0-30" / "31-60" / "61-90" / "90+" (only overdue)
- *   page, limit
- *   sort            — default "-voucherDate"
- */
 router.get("/", async (req, res) => {
   try {
     const {
@@ -176,12 +141,7 @@ router.get("/", async (req, res) => {
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
 
-    // Build base filter — always sales + posted (drafts don't show in AR)
-    const filter = {
-      companyId,
-      voucherType: "sales",
-      status: "posted",
-    };
+    const filter = { companyId, voucherType: "sales", status: "posted" };
     if (customerId) filter.partyLedgerId = customerId;
     if (dateFrom || dateTo) {
       filter.voucherDate = {};
@@ -198,15 +158,8 @@ router.get("/", async (req, res) => {
       ];
     }
 
-    // We compute paymentStatus/aging AFTER the DB query, since they
-    // depend on data from other voucher types. Apply paymentStatus and
-    // ageBucket filters post-enrich.
     const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    // Read more than needed and trim after enrich+filter, to keep the
-    // post-filtered pagination reasonable. Cap at limit*5 or 500 max.
     const overFetchLimit = Math.min(500, parseInt(limit) * 5);
-
     const sortObj = {};
     const sortKey = sort.replace(/^-/, "");
     sortObj[sortKey] = sort.startsWith("-") ? -1 : 1;
@@ -216,16 +169,11 @@ router.get("/", async (req, res) => {
       .skip(skip)
       .limit(overFetchLimit)
       .lean();
-
     const enriched = await enrichInvoices(raw, companyId);
 
-    // Apply payment-status filter
     let filtered = enriched;
-    if (paymentStatus) {
+    if (paymentStatus)
       filtered = filtered.filter((i) => i.paymentStatus === paymentStatus);
-    }
-
-    // Apply age-bucket filter (only meaningful for overdue / unpaid)
     if (ageBucket) {
       filtered = filtered.filter((i) => {
         if (!i.isOverdue && i.paymentStatus !== "unpaid") return false;
@@ -238,13 +186,9 @@ router.get("/", async (req, res) => {
       });
     }
 
-    // Total count for pagination — accurate when no post-filter,
-    // approximate otherwise (we tell the client this).
     const totalNoPostFilter = await Acc_Voucher.countDocuments(filter);
-    const filteredAndTrimmed = filtered.slice(0, parseInt(limit));
-
     res.json({
-      invoices: filteredAndTrimmed,
+      invoices: filtered.slice(0, parseInt(limit)),
       total: totalNoPostFilter,
       filteredCount: filtered.length,
       page: parseInt(page),
@@ -258,7 +202,7 @@ router.get("/", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* GET /summary — receivables KPIs + aging breakdown                   */
+/* GET /summary                                                        */
 /* ------------------------------------------------------------------ */
 router.get("/summary", async (req, res) => {
   try {
@@ -266,10 +210,6 @@ router.get("/summary", async (req, res) => {
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
 
-    // Fetch ALL posted sales for this company. We need them all to
-    // compute aggregates correctly. For very large datasets (10k+
-    // invoices) this becomes slow; would need to move computation into
-    // aggregation pipelines. For our scale this is fine.
     const raw = await Acc_Voucher.find({
       companyId,
       voucherType: "sales",
@@ -280,7 +220,6 @@ router.get("/summary", async (req, res) => {
       )
       .limit(2000)
       .lean();
-
     const enriched = await enrichInvoices(raw, companyId);
 
     const summary = {
@@ -292,7 +231,6 @@ router.get("/summary", async (req, res) => {
       aging: { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 },
       byCustomer: new Map(),
     };
-
     for (const inv of enriched) {
       summary.totalInvoiced += inv.grandTotal || 0;
       summary.totalReceived += inv.receivedAmount || 0;
@@ -300,15 +238,13 @@ router.get("/summary", async (req, res) => {
       summary.totalOutstanding += inv.outstanding || 0;
       summary.counts[inv.paymentStatus] =
         (summary.counts[inv.paymentStatus] || 0) + 1;
-
       if (inv.outstanding > 0.01) {
         const d = inv.ageInDays;
         if (d <= 30) summary.aging["0-30"] += inv.outstanding;
         else if (d <= 60) summary.aging["31-60"] += inv.outstanding;
         else if (d <= 90) summary.aging["61-90"] += inv.outstanding;
         else summary.aging["90+"] += inv.outstanding;
-
-        const k = inv.partyLedgerName || "—";
+        const k = inv.partyLedgerName || "";
         const prev = summary.byCustomer.get(k) || {
           outstanding: 0,
           count: 0,
@@ -321,17 +257,11 @@ router.get("/summary", async (req, res) => {
         });
       }
     }
-
     const topCustomers = [...summary.byCustomer.entries()]
       .map(([name, v]) => ({ name, ...v }))
       .sort((a, b) => b.outstanding - a.outstanding)
       .slice(0, 10);
-
-    res.json({
-      ...summary,
-      byCustomer: undefined, // strip Map from response
-      topCustomers,
-    });
+    res.json({ ...summary, byCustomer: undefined, topCustomers });
   } catch (e) {
     console.error("[invoices/summary]", e);
     res.status(500).json({ error: e.message });
@@ -339,25 +269,7 @@ router.get("/summary", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* GET /all — return ALL posted invoices + summary in one call.        */
-/*                                                                     */
-/* Designed for client-side filtering, sorting, and pagination. The    */
-/* invoices page calls this once on initial load and never again       */
-/* (unless the user clicks Refresh or logs a reminder). After that,    */
-/* every state change (filter pills, status pills, period preset,      */
-/* search, column-header sort, Next/Prev) is handled in-browser.       */
-/*                                                                     */
-/* Returns:                                                            */
-/*   invoices  — every posted sales invoice for this company,          */
-/*               enriched with paymentStatus, outstanding, ageInDays,  */
-/*               receivedAmount, creditedAmount, etc.                  */
-/*   summary   — the same KPI block the old /summary endpoint returns: */
-/*               totalInvoiced / Received / Credited / Outstanding,    */
-/*               counts by status, aging buckets, top customers.       */
-/*                                                                     */
-/* Same scale caveat as /summary: caps the fetch at 2000 invoices.     */
-/* If you have more than that, the older Mongo-paginated / endpoint    */
-/* is still available.                                                 */
+/* GET /all                                                            */
 /* ------------------------------------------------------------------ */
 router.get("/all", async (req, res) => {
   try {
@@ -365,10 +277,6 @@ router.get("/all", async (req, res) => {
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
 
-    // Fetch every posted sales voucher for this company. No filter, no
-    // pagination — the frontend owns everything after this. Sort the
-    // raw list by voucherDate desc so client-side default ordering
-    // matches what /summary would have shown.
     const raw = await Acc_Voucher.find({
       companyId,
       voucherType: "sales",
@@ -377,11 +285,8 @@ router.get("/all", async (req, res) => {
       .sort({ voucherDate: -1 })
       .limit(2000)
       .lean();
-
     const enriched = await enrichInvoices(raw, companyId);
 
-    // Compute summary KPIs from the enriched set — mirrors the logic
-    // in /summary so the frontend shape doesn't change.
     const summary = {
       totalInvoiced: 0,
       totalReceived: 0,
@@ -391,7 +296,6 @@ router.get("/all", async (req, res) => {
       aging: { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 },
     };
     const byCustomer = new Map();
-
     for (const inv of enriched) {
       summary.totalInvoiced += inv.grandTotal || 0;
       summary.totalReceived += inv.receivedAmount || 0;
@@ -399,15 +303,13 @@ router.get("/all", async (req, res) => {
       summary.totalOutstanding += inv.outstanding || 0;
       summary.counts[inv.paymentStatus] =
         (summary.counts[inv.paymentStatus] || 0) + 1;
-
       if (inv.outstanding > 0.01) {
         const d = inv.ageInDays;
         if (d <= 30) summary.aging["0-30"] += inv.outstanding;
         else if (d <= 60) summary.aging["31-60"] += inv.outstanding;
         else if (d <= 90) summary.aging["61-90"] += inv.outstanding;
         else summary.aging["90+"] += inv.outstanding;
-
-        const k = inv.partyLedgerName || "—";
+        const k = inv.partyLedgerName || "";
         const prev = byCustomer.get(k) || {
           outstanding: 0,
           count: 0,
@@ -420,18 +322,715 @@ router.get("/all", async (req, res) => {
         });
       }
     }
-
     const topCustomers = [...byCustomer.entries()]
       .map(([name, v]) => ({ name, ...v }))
       .sort((a, b) => b.outstanding - a.outstanding)
       .slice(0, 10);
-
-    res.json({
-      invoices: enriched,
-      summary: { ...summary, topCustomers },
-    });
+    res.json({ invoices: enriched, summary: { ...summary, topCustomers } });
   } catch (e) {
     console.error("[invoices/all]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /:id/download-pdf — Tally-format Tax Invoice PDF                */
+/* ------------------------------------------------------------------ */
+/* MUST be before /:id so Express doesn't treat "download-pdf" as an id */
+router.get("/:id/download-pdf", async (req, res) => {
+  try {
+    const PDFDocument = require("pdfkit");
+
+    const inv = await Acc_Voucher.findById(req.params.id).lean();
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
+
+    // Company + Settings (same as /:id detail)
+    const [co, settings] = await Promise.all([
+      Acc_Company.findById(inv.companyId)
+        .select(
+          "companyName address contact gstin pan cin tan declaration bankDetails",
+        )
+        .lean(),
+      Acc_Settings.findOne()
+        .select(
+          "companyName companyGSTIN companyPAN companyAddress companyPhone companyEmail bankAccounts invoiceTerms companyLogo companyStamp signature declaration",
+        )
+        .lean(),
+    ]);
+
+    const companyName =
+      settings?.companyName ||
+      co?.companyName ||
+      "GRAV CLOTHING OPC PRIVATE LIMITED";
+    const gstin = settings?.companyGSTIN || co?.gstin || "";
+    const pan = settings?.companyPAN || co?.pan || "";
+    const stateName = co?.address?.state || "Odisha";
+    const stateCode = co?.address?.stateCode || "21";
+    const address = co?.address
+      ? [
+          co.address.street,
+          co.address.line1,
+          co.address.city,
+          co.address.state,
+          co.address.pincode,
+        ]
+          .filter(Boolean)
+          .join(", ")
+      : settings?.companyAddress || "";
+    const contactPhone = settings?.companyPhone || co?.contact?.phone || "";
+    const declaration =
+      settings?.declaration ||
+      co?.declaration ||
+      "We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.";
+    const defaultBank =
+      (settings?.bankAccounts || []).find((b) => b.isDefault) ||
+      (settings?.bankAccounts || [])[0] ||
+      co?.bankDetails ||
+      null;
+    const logoBase64 =
+      settings?.companyLogo ||
+      process.env.NEXT_PUBLIC_COMPANY_LOGO_BASE64 ||
+      process.env.COMPANY_LOGO_BASE64 ||
+      "";
+    const stampBase64 =
+      settings?.companyStamp ||
+      settings?.signature ||
+      process.env.NEXT_PUBLIC_COMPANY_SIGNATURE_BASE64 ||
+      process.env.COMPANY_SIGNATURE_BASE64 ||
+      "";
+
+    const lines = inv.inventoryEntries || [];
+    const cgst = inv.gstBreakup?.cgst || 0;
+    const sgst = inv.gstBreakup?.sgst || 0;
+    const igst = inv.gstBreakup?.igst || 0;
+    const isInter = igst > 0;
+    const subtotal = inv.subtotal || 0;
+    const totalTax = cgst + sgst + igst;
+    const grandTotal = inv.grandTotal || 0;
+    const roundOff = inv.roundOff || 0;
+
+    // HSN summary
+    const taxMap = new Map();
+    for (const ln of lines) {
+      const hsn = ln.hsnCode || "";
+      const rate = ln.taxRate || 0;
+      const key = `${hsn}::${rate}`;
+      const taxable = ln.amount || 0;
+      const tax = ln.taxAmount || (taxable * rate) / 100;
+      const prev = taxMap.get(key) || { hsn, rate, taxable: 0, tax: 0 };
+      taxMap.set(key, {
+        hsn,
+        rate,
+        taxable: prev.taxable + taxable,
+        tax: prev.tax + tax,
+      });
+    }
+    const hsnRows = Array.from(taxMap.values());
+
+    // ── Build PDF ──
+    const doc = new PDFDocument({ size: "A4", margin: 30 });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=Invoice-${(inv.voucherNumber || "").replace(/\//g, "-")}.pdf`,
+    );
+    doc.pipe(res);
+
+    const W = 535,
+      L = 30;
+    let y = 30;
+    const box = (x, by, w, h) => doc.rect(x, by, w, h).stroke();
+    const hline = (x1, ly, x2) => doc.moveTo(x1, ly).lineTo(x2, ly).stroke();
+    const vline = (x, y1, y2) => doc.moveTo(x, y1).lineTo(x, y2).stroke();
+    doc.lineWidth(0.5).strokeColor("#000");
+
+    const fN = (n, d = 2) =>
+      Number(n || 0).toLocaleString("en-IN", {
+        minimumFractionDigits: d,
+        maximumFractionDigits: d,
+      });
+    const fmtDt = (d) => {
+      if (!d) return "";
+      const dt = new Date(d);
+      const m = [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+      ];
+      return `${dt.getDate()}-${m[dt.getMonth()]}-${dt.getFullYear()}`;
+    };
+
+    // ─── Title ───
+    box(L, y, W, 20);
+    doc
+      .fontSize(12)
+      .font("Helvetica-Bold")
+      .fillColor("#000")
+      .text("Tax Invoice", L, y + 4, { width: W, align: "center" });
+    y += 20;
+
+    // ─── Seller + Meta Grid ───
+    const sellerH = 72;
+    box(L, y, W, sellerH);
+    vline(L + W * 0.5, y, y + sellerH);
+    vline(L + W * 0.75, y, y + sellerH);
+    const cellH = sellerH / 4;
+    for (let i = 1; i < 4; i++) hline(L + W * 0.5, y + cellH * i, L + W);
+
+    // Logo + seller
+    let sy = y + 3;
+    if (logoBase64) {
+      try {
+        const buf = Buffer.from(
+          logoBase64.replace(/^data:image\/\w+;base64,/, ""),
+          "base64",
+        );
+        doc.image(buf, L + 3, sy, { width: 28, height: 28 });
+        doc
+          .fontSize(11)
+          .font("Helvetica-Bold")
+          .text(companyName, L + 34, sy, { width: W * 0.5 - 40 });
+      } catch (_) {
+        doc
+          .fontSize(11)
+          .font("Helvetica-Bold")
+          .text(companyName, L + 3, sy, { width: W * 0.5 - 8 });
+      }
+    } else {
+      doc
+        .fontSize(11)
+        .font("Helvetica-Bold")
+        .text(companyName, L + 3, sy, { width: W * 0.5 - 8 });
+    }
+    sy = y + 18;
+    doc.fontSize(7).font("Helvetica").fillColor("#000");
+    if (address) {
+      doc.text(address, L + 3, sy, { width: W * 0.5 - 8 });
+      sy += 9;
+    }
+    if (gstin) {
+      doc.text(`GSTIN/UIN: ${gstin}`, L + 3, sy);
+      sy += 8;
+    }
+    if (pan) {
+      doc.text(`PAN: ${pan}`, L + 3, sy);
+      sy += 8;
+    }
+    doc.text(`State Name: ${stateName}, Code: ${stateCode}`, L + 3, sy);
+    sy += 8;
+    if (contactPhone) {
+      doc.text(`Contact: ${contactPhone}`, L + 3, sy);
+    }
+
+    // Meta cells
+    const rx1 = L + W * 0.5,
+      rx2 = L + W * 0.75,
+      rw = W * 0.25;
+    const mc = (x, ry, label, value) => {
+      doc
+        .fontSize(6)
+        .font("Helvetica")
+        .fillColor("#666")
+        .text(label, x + 2, ry + 1, { width: rw - 4 });
+      if (value)
+        doc
+          .fontSize(8)
+          .font("Helvetica-Bold")
+          .fillColor("#000")
+          .text(value, x + 2, ry + 9, { width: rw - 4 });
+    };
+    mc(rx1, y, "Invoice No.", inv.voucherNumber);
+    mc(rx2, y, "Dated", fmtDt(inv.voucherDate));
+    mc(rx1, y + cellH, "Reference No. & Date", inv.referenceNumber || "");
+    mc(rx2, y + cellH, "Other References", "");
+    mc(rx1, y + cellH * 2, "Buyer's Order No.", inv.buyersOrderNumber || "");
+    mc(rx2, y + cellH * 2, "Dated", "");
+    mc(rx1, y + cellH * 3, "Dispatch Doc No.", "");
+    mc(rx2, y + cellH * 3, "Delivery Note Date", "");
+    y += sellerH;
+
+    // ─── Consignee ───
+    const consH = 36;
+    box(L, y, W, consH);
+    vline(L + W * 0.5, y, y + consH);
+    vline(L + W * 0.75, y, y + consH);
+    doc
+      .fontSize(6)
+      .font("Helvetica")
+      .fillColor("#666")
+      .text("Consignee (Ship to)", L + 2, y + 1);
+    doc
+      .fontSize(8)
+      .font("Helvetica-Bold")
+      .fillColor("#000")
+      .text(inv.partyLedgerName || "", L + 2, y + 9, { width: W * 0.5 - 6 });
+    if (inv.partyGstin)
+      doc
+        .fontSize(7)
+        .font("Helvetica")
+        .text(`GSTIN/UIN: ${inv.partyGstin}`, L + 2, y + 19);
+    if (inv.placeOfSupply)
+      doc
+        .fontSize(7)
+        .text(
+          `State Name: ${inv.placeOfSupply}${inv.placeOfSupplyCode ? `, Code: ${inv.placeOfSupplyCode}` : ""}`,
+          L + 2,
+          y + 27,
+        );
+    mc(rx1, y, "Dispatched through", "");
+    mc(rx2, y, "Destination", "");
+    y += consH;
+
+    // ─── Buyer ───
+    const buyH = 36;
+    box(L, y, W, buyH);
+    vline(L + W * 0.5, y, y + buyH);
+    doc
+      .fontSize(6)
+      .font("Helvetica")
+      .fillColor("#666")
+      .text("Buyer (Bill to)", L + 2, y + 1);
+    doc
+      .fontSize(8)
+      .font("Helvetica-Bold")
+      .fillColor("#000")
+      .text(inv.partyLedgerName || "", L + 2, y + 9, { width: W * 0.5 - 6 });
+    if (inv.partyGstin)
+      doc
+        .fontSize(7)
+        .font("Helvetica")
+        .text(`GSTIN/UIN: ${inv.partyGstin}`, L + 2, y + 19);
+    if (inv.placeOfSupply)
+      doc
+        .fontSize(7)
+        .text(
+          `State Name: ${inv.placeOfSupply}${inv.placeOfSupplyCode ? `, Code: ${inv.placeOfSupplyCode}` : ""}`,
+          L + 2,
+          y + 27,
+        );
+    doc
+      .fontSize(6)
+      .font("Helvetica")
+      .fillColor("#666")
+      .text("Terms of Delivery", rx1 + 2, y + 1);
+    y += buyH;
+
+    // ─── Line Items ───
+    const cols = [
+      { l: "Sl\nNo.", x: L, w: 20, a: "center" },
+      { l: "Description of Goods", x: L + 20, w: 165, a: "left" },
+      { l: "HSN/SAC", x: L + 185, w: 50, a: "left" },
+      { l: "GST\nRate", x: L + 235, w: 35, a: "center" },
+      { l: "Quantity", x: L + 270, w: 62, a: "right" },
+      { l: "Rate", x: L + 332, w: 55, a: "right" },
+      { l: "per", x: L + 387, w: 23, a: "center" },
+      { l: "Amount", x: L + 410, w: 125, a: "right" },
+    ];
+
+    // Header
+    box(L, y, W, 18);
+    cols.forEach((c, i) => {
+      if (i > 0) vline(c.x, y, y + 18);
+      doc
+        .fontSize(6.5)
+        .font("Helvetica-Bold")
+        .fillColor("#000")
+        .text(c.l, c.x + 2, y + 2, { width: c.w - 4, align: c.a });
+    });
+    y += 18;
+
+    // Data rows
+    const rowH = 14;
+    lines.forEach((ln, i) => {
+      if (y + rowH > 720) {
+        doc.addPage();
+        y = 30;
+      }
+      box(L, y, W, rowH);
+      cols.forEach((c, ci) => {
+        if (ci > 0) vline(c.x, y, y + rowH);
+        let val = "";
+        switch (ci) {
+          case 0:
+            val = String(i + 1);
+            break;
+          case 1:
+            val = ln.stockItemName || "";
+            break;
+          case 2:
+            val = ln.hsnCode || "";
+            break;
+          case 3:
+            val = `${ln.taxRate || 0} %`;
+            break;
+          case 4:
+            val = `${fN(ln.quantity || 0, 3)} ${ln.unit || "Pc"}`;
+            break;
+          case 5:
+            val = fN(ln.rate || 0, 2);
+            break;
+          case 6:
+            val = ln.unit || "Pc";
+            break;
+          case 7:
+            val = fN(ln.amount || 0, 2);
+            break;
+        }
+        doc
+          .fontSize(7)
+          .font(ci === 2 ? "Courier" : "Helvetica")
+          .fillColor("#000")
+          .text(val, c.x + 2, y + 3, { width: c.w - 4, align: c.a });
+      });
+      y += rowH;
+    });
+
+    // Subtotal
+    const amtCol = cols[7];
+    box(L, y, W, 12);
+    vline(amtCol.x, y, y + 12);
+    doc
+      .fontSize(7)
+      .font("Helvetica-Bold")
+      .text("Subtotal", L + 2, y + 2, {
+        width: amtCol.x - L - 4,
+        align: "right",
+      });
+    doc.text(fN(subtotal, 2), amtCol.x + 2, y + 2, {
+      width: amtCol.w - 4,
+      align: "right",
+    });
+    y += 12;
+
+    // Tax rows
+    const taxRow = (label, amt) => {
+      box(L, y, W, 12);
+      vline(amtCol.x, y, y + 12);
+      doc
+        .fontSize(7)
+        .font("Helvetica")
+        .text(label, L + 2, y + 2, { width: amtCol.x - L - 4, align: "right" });
+      doc.text(fN(amt, 2), amtCol.x + 2, y + 2, {
+        width: amtCol.w - 4,
+        align: "right",
+      });
+      y += 12;
+    };
+    if (isInter && igst > 0) taxRow("IGST", igst);
+    else {
+      if (cgst > 0) taxRow("CGST", cgst);
+      if (sgst > 0) taxRow("SGST/UTGST", sgst);
+    }
+    if (Math.abs(roundOff) > 0.001) taxRow("Round Off", roundOff);
+
+    // Grand Total
+    box(L, y, W, 14);
+    vline(amtCol.x, y, y + 14);
+    doc
+      .fontSize(9)
+      .font("Helvetica-Bold")
+      .text("Total ₹", L + 2, y + 3, {
+        width: amtCol.x - L - 4,
+        align: "right",
+      });
+    doc.text(fN(grandTotal, 2), amtCol.x + 2, y + 3, {
+      width: amtCol.w - 4,
+      align: "right",
+    });
+    y += 14;
+
+    // ─── Amount in Words ───
+    box(L, y, W, 22);
+    doc
+      .fontSize(6)
+      .font("Helvetica")
+      .fillColor("#666")
+      .text("Amount Chargeable (in words)", L + 3, y + 2);
+    doc.fontSize(6).text("E. & O.E", L + W - 40, y + 2);
+    doc
+      .fontSize(7.5)
+      .font("Helvetica-Bold")
+      .fillColor("#000")
+      .text(`INR ${_numToWords(grandTotal)} Only`, L + 3, y + 11, {
+        width: W - 8,
+      });
+    y += 22;
+
+    // ─── HSN Summary ───
+    if (hsnRows.length > 0) {
+      const hc = isInter
+        ? [
+            { l: "HSN/SAC", x: L, w: 100 },
+            { l: "Taxable\nValue", x: L + 100, w: 80 },
+            { l: "IGST\nRate", x: L + 180, w: 50 },
+            { l: "IGST\nAmount", x: L + 230, w: 80 },
+            { l: "Total\nTax Amount", x: L + 310, w: 225 },
+          ]
+        : [
+            { l: "HSN/SAC", x: L, w: 90 },
+            { l: "Taxable\nValue", x: L + 90, w: 75 },
+            { l: "CGST\nRate", x: L + 165, w: 40 },
+            { l: "CGST\nAmount", x: L + 205, w: 65 },
+            { l: "SGST/UTGST\nRate", x: L + 270, w: 45 },
+            { l: "SGST/UTGST\nAmount", x: L + 315, w: 65 },
+            { l: "Total\nTax Amount", x: L + 380, w: 155 },
+          ];
+
+      if (y + 40 > 720) {
+        doc.addPage();
+        y = 30;
+      }
+      box(L, y, W, 22);
+      hc.forEach((c, i) => {
+        if (i > 0) vline(c.x, y, y + 22);
+        doc
+          .fontSize(6)
+          .font("Helvetica-Bold")
+          .fillColor("#000")
+          .text(c.l, c.x + 2, y + 2, {
+            width: c.w - 4,
+            align: i === 0 ? "left" : "right",
+          });
+      });
+      y += 22;
+
+      hsnRows.forEach((row) => {
+        box(L, y, W, 12);
+        hc.forEach((c, i) => {
+          if (i > 0) vline(c.x, y, y + 12);
+        });
+        const halfR = row.rate / 2,
+          halfT = row.tax / 2;
+        doc
+          .fontSize(7)
+          .font("Courier")
+          .text(row.hsn, hc[0].x + 2, y + 2, { width: hc[0].w - 4 });
+        doc.font("Helvetica");
+        if (isInter) {
+          doc.text(fN(row.taxable, 2), hc[1].x + 2, y + 2, {
+            width: hc[1].w - 4,
+            align: "right",
+          });
+          doc.text(`${row.rate}%`, hc[2].x + 2, y + 2, {
+            width: hc[2].w - 4,
+            align: "right",
+          });
+          doc.text(fN(row.tax, 2), hc[3].x + 2, y + 2, {
+            width: hc[3].w - 4,
+            align: "right",
+          });
+          doc.font("Helvetica-Bold").text(fN(row.tax, 2), hc[4].x + 2, y + 2, {
+            width: hc[4].w - 4,
+            align: "right",
+          });
+        } else {
+          doc.text(fN(row.taxable, 2), hc[1].x + 2, y + 2, {
+            width: hc[1].w - 4,
+            align: "right",
+          });
+          doc.text(`${halfR}%`, hc[2].x + 2, y + 2, {
+            width: hc[2].w - 4,
+            align: "right",
+          });
+          doc.text(fN(halfT, 2), hc[3].x + 2, y + 2, {
+            width: hc[3].w - 4,
+            align: "right",
+          });
+          doc.text(`${halfR}%`, hc[4].x + 2, y + 2, {
+            width: hc[4].w - 4,
+            align: "right",
+          });
+          doc.text(fN(halfT, 2), hc[5].x + 2, y + 2, {
+            width: hc[5].w - 4,
+            align: "right",
+          });
+          doc.font("Helvetica-Bold").text(fN(row.tax, 2), hc[6].x + 2, y + 2, {
+            width: hc[6].w - 4,
+            align: "right",
+          });
+        }
+        y += 12;
+      });
+
+      // HSN Total
+      box(L, y, W, 12);
+      hc.forEach((c, i) => {
+        if (i > 0) vline(c.x, y, y + 12);
+      });
+      doc.fontSize(7).font("Helvetica-Bold");
+      doc.text("Total", hc[0].x + 2, y + 2);
+      if (isInter) {
+        doc.text(fN(subtotal, 2), hc[1].x + 2, y + 2, {
+          width: hc[1].w - 4,
+          align: "right",
+        });
+        doc.text(fN(igst, 2), hc[3].x + 2, y + 2, {
+          width: hc[3].w - 4,
+          align: "right",
+        });
+        doc.text(fN(totalTax, 2), hc[4].x + 2, y + 2, {
+          width: hc[4].w - 4,
+          align: "right",
+        });
+      } else {
+        doc.text(fN(subtotal, 2), hc[1].x + 2, y + 2, {
+          width: hc[1].w - 4,
+          align: "right",
+        });
+        doc.text(fN(cgst, 2), hc[3].x + 2, y + 2, {
+          width: hc[3].w - 4,
+          align: "right",
+        });
+        doc.text(fN(sgst, 2), hc[5].x + 2, y + 2, {
+          width: hc[5].w - 4,
+          align: "right",
+        });
+        doc.text(fN(totalTax, 2), hc[6].x + 2, y + 2, {
+          width: hc[6].w - 4,
+          align: "right",
+        });
+      }
+      y += 12;
+    }
+
+    // ─── Tax in Words ───
+    box(L, y, W, 14);
+    doc
+      .fontSize(7)
+      .font("Helvetica")
+      .fillColor("#666")
+      .text("Tax Amount (in words): ", L + 3, y + 3);
+    doc
+      .font("Helvetica-Bold")
+      .fillColor("#000")
+      .text(`INR ${_numToWords(totalTax)} Only`, L + 110, y + 3);
+    y += 14;
+
+    // ─── Declaration + Signature ───
+    const declH = 72;
+    if (y + declH > 780) {
+      doc.addPage();
+      y = 30;
+    }
+    box(L, y, W, declH);
+    vline(L + W * 0.55, y, y + declH);
+
+    doc
+      .fontSize(6)
+      .font("Helvetica-Bold")
+      .fillColor("#666")
+      .text("Declaration", L + 3, y + 2);
+    doc
+      .fontSize(6.5)
+      .font("Helvetica")
+      .fillColor("#000")
+      .text(declaration, L + 3, y + 10, { width: W * 0.55 - 8 });
+
+    if (defaultBank) {
+      const bky = y + 30;
+      doc
+        .fontSize(6)
+        .font("Helvetica-Bold")
+        .fillColor("#666")
+        .text("Company's Bank Details", L + 3, bky);
+      let bky2 = bky + 8;
+      if (defaultBank.bankName) {
+        doc
+          .fontSize(6.5)
+          .font("Helvetica")
+          .fillColor("#000")
+          .text(`Bank Name: ${defaultBank.bankName}`, L + 3, bky2);
+        bky2 += 8;
+      }
+      if (defaultBank.accountNumber) {
+        doc.text(`A/c No.: ${defaultBank.accountNumber}`, L + 3, bky2);
+        bky2 += 8;
+      }
+      if (defaultBank.ifsc) {
+        doc.text(
+          `Branch & IFS Code: ${defaultBank.branch || ""} & ${defaultBank.ifsc}`,
+          L + 3,
+          bky2,
+        );
+      }
+    }
+
+    // Right: company name + stamp + signature
+    const sigX = L + W * 0.55,
+      sigW = W * 0.45;
+    doc
+      .fontSize(7)
+      .font("Helvetica")
+      .text(`for ${companyName}`, sigX + 2, y + 2, {
+        width: sigW - 6,
+        align: "right",
+      });
+
+    if (stampBase64) {
+      try {
+        const sBuf = Buffer.from(
+          stampBase64.replace(/^data:image\/\w+;base64,/, ""),
+          "base64",
+        );
+        doc.image(sBuf, sigX + sigW / 2 - 25, y + 14, {
+          width: 50,
+          height: 35,
+        });
+      } catch (_) {}
+    }
+
+    const sigLineY = y + declH - 14;
+    ["Prepared by", "Verified by", "Authorised Signatory"].forEach((lbl, i) => {
+      const sx = sigX + i * (sigW / 3);
+      doc
+        .moveTo(sx + 4, sigLineY)
+        .lineTo(sx + sigW / 3 - 4, sigLineY)
+        .stroke();
+      doc
+        .fontSize(6)
+        .font("Helvetica")
+        .fillColor("#000")
+        .text(lbl, sx + 2, sigLineY + 2, {
+          width: sigW / 3 - 4,
+          align: "center",
+        });
+    });
+    y += declH;
+
+    // ─── Jurisdiction ───
+    const city = co?.address?.city || "BHUBANESWAR";
+    doc
+      .fontSize(7)
+      .font("Helvetica")
+      .fillColor("#000")
+      .text(`SUBJECT TO ${city.toUpperCase()} JURISDICTION`, L, y + 3, {
+        width: W,
+        align: "center",
+      });
+    doc
+      .fontSize(6.5)
+      .fillColor("#888")
+      .text("This is a Computer Generated Invoice", L, y + 13, {
+        width: W,
+        align: "center",
+      });
+
+    doc.end();
+  } catch (e) {
+    if (e.code === "MODULE_NOT_FOUND")
+      return res
+        .status(500)
+        .json({ error: "pdfkit not installed. Run: npm install pdfkit" });
+    console.error("[invoices/download-pdf]", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -449,14 +1048,6 @@ router.get("/:id", async (req, res) => {
 
     const [enriched] = await enrichInvoices([inv], inv.companyId);
 
-    // Fetch (in parallel):
-    //   • The seller Acc_Company doc — used as fallback for the seller
-    //     block when Acc_Settings doesn't have a value.
-    //   • The Acc_Settings singleton — this is where the visible
-    //     Settings page (Organization / Address / Tax / Bank Accounts)
-    //     persists its data. The PDF reads from settings FIRST (it's the
-    //     accountant-controlled invoice identity), then falls back to
-    //     the Acc_Company doc for anything not set there.
     const [company, settings] = await Promise.all([
       Acc_Company.findById(inv.companyId)
         .select("companyName address contact gstin pan cin tan")
@@ -468,17 +1059,11 @@ router.get("/:id", async (req, res) => {
         .lean(),
     ]);
 
-    // The default bank account that prints on the invoice is whichever
-    // entry in settings.bankAccounts[] has isDefault: true. If none has
-    // the flag (shouldn't normally happen since the Settings UI marks
-    // the first one default), we fall back to the first entry so the
-    // PDF isn't empty when there's clearly a bank configured.
     const defaultBank =
       (settings?.bankAccounts || []).find((b) => b.isDefault) ||
       (settings?.bankAccounts || [])[0] ||
       null;
 
-    // Also fetch the linked CNs and receipts for the trail
     const [linkedCNs, linkedReceipts] = await Promise.all([
       Acc_Voucher.find({
         companyId: inv.companyId,
@@ -488,7 +1073,6 @@ router.get("/:id", async (req, res) => {
       })
         .select("voucherNumber voucherDate grandTotal creditNoteReason")
         .lean(),
-
       Acc_Voucher.find({
         companyId: inv.companyId,
         voucherType: "receipt",
@@ -501,7 +1085,6 @@ router.get("/:id", async (req, res) => {
         .lean()
         .then((receipts) =>
           receipts.map((r) => {
-            // Calculate the amount actually allocated to THIS invoice
             let allocated = 0;
             for (const entry of r.ledgerEntries || []) {
               for (const alloc of entry.billAllocations || []) {
@@ -513,7 +1096,6 @@ router.get("/:id", async (req, res) => {
                 }
               }
             }
-            // Strip the heavy ledgerEntries from response
             const { ledgerEntries, ...rest } = r;
             return { ...rest, allocatedToThisInvoice: allocated };
           }),
@@ -523,8 +1105,8 @@ router.get("/:id", async (req, res) => {
     res.json({
       invoice: enriched,
       company,
-      settings, // full Acc_Settings doc (singleton)
-      defaultBank, // bankAccounts entry with isDefault:true (or first)
+      settings,
+      defaultBank,
       linkedCreditNotes: linkedCNs,
       linkedReceipts,
     });
@@ -535,14 +1117,8 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* POST /:id/reminder — log a payment reminder                         */
+/* POST /:id/reminder                                                  */
 /* ------------------------------------------------------------------ */
-/* Records that a reminder was issued. Does NOT actually send anything
- * (that's a future integration with email/WhatsApp). Just an audit
- * trail accountants use during AR follow-up.
- *
- * Body: { channel, note }
- */
 router.post("/:id/reminder", async (req, res) => {
   try {
     const { channel = "other", note = "" } = req.body || {};
@@ -561,12 +1137,75 @@ router.post("/:id/reminder", async (req, res) => {
       note,
     });
     await inv.save();
-
     res.json({ success: true, reminderCount: inv.reminderLog.length });
   } catch (e) {
     console.error("[invoices/reminder]", e);
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── Number to INR words helper ──
+function _numToWords(num) {
+  if (!num || isNaN(num)) return "Zero";
+  const rupees = Math.floor(Math.abs(num));
+  const paise = Math.round((Math.abs(num) - rupees) * 100);
+  let r = _r2w(rupees);
+  if (paise > 0) r += ` and ${_r2w(paise)} paise`;
+  return r || "Zero";
+}
+function _r2w(n) {
+  if (n === 0) return "Zero";
+  const a = [
+    "",
+    "One",
+    "Two",
+    "Three",
+    "Four",
+    "Five",
+    "Six",
+    "Seven",
+    "Eight",
+    "Nine",
+    "Ten",
+    "Eleven",
+    "Twelve",
+    "Thirteen",
+    "Fourteen",
+    "Fifteen",
+    "Sixteen",
+    "Seventeen",
+    "Eighteen",
+    "Nineteen",
+  ];
+  const b = [
+    "",
+    "",
+    "Twenty",
+    "Thirty",
+    "Forty",
+    "Fifty",
+    "Sixty",
+    "Seventy",
+    "Eighty",
+    "Ninety",
+  ];
+  const t2 = (x) =>
+    x < 20 ? a[x] : b[Math.floor(x / 10)] + (x % 10 ? " " + a[x % 10] : "");
+  const t3 = (x) => {
+    const h = Math.floor(x / 100),
+      r = x % 100;
+    return (h ? a[h] + " Hundred" + (r ? " " : "") : "") + (r ? t2(r) : "");
+  };
+  const cr = Math.floor(n / 10000000),
+    lk = Math.floor((n % 10000000) / 100000),
+    th = Math.floor((n % 100000) / 1000),
+    rest = n % 1000;
+  let o = "";
+  if (cr) o += t3(cr) + " Crore ";
+  if (lk) o += t2(lk) + " Lakh ";
+  if (th) o += t2(th) + " Thousand ";
+  if (rest) o += t3(rest);
+  return o.trim();
+}
 
 module.exports = router;

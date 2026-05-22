@@ -48,34 +48,42 @@
 // ─── Encoding ────────────────────────────────────────────────────────────────
 
 function decodeBuffer(buffer) {
-  // Detect UTF-16 by BOM, or by checking if the first byte after BOM is "{"
-  // followed by a null byte (typical of UTF-16 LE text).
+  // Try multiple decodings and pick the first that contains a Tally marker.
+  const attempts = [];
+
   if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
-    return buffer.slice(2).toString("utf16le");
+    attempts.push(buffer.slice(2).toString("utf16le"));
   }
   if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
-    // UTF-16 BE — swap byte pairs then decode
     const swapped = Buffer.alloc(buffer.length - 2);
     for (let i = 2; i < buffer.length; i += 2) {
-      swapped[i - 2] = buffer[i + 1];
-      swapped[i - 1] = buffer[i];
+      if (i + 1 < buffer.length) {
+        swapped[i - 2] = buffer[i + 1];
+        swapped[i - 1] = buffer[i];
+      }
     }
-    return swapped.toString("utf16le");
+    attempts.push(swapped.toString("utf16le"));
   }
-  // Heuristic: if every other byte is null, treat as UTF-16 LE
   if (buffer.length >= 4 && buffer[1] === 0x00 && buffer[3] === 0x00) {
-    return buffer.toString("utf16le");
+    attempts.push(buffer.toString("utf16le"));
   }
-  // UTF-8 BOM
   if (
     buffer.length >= 3 &&
     buffer[0] === 0xef &&
     buffer[1] === 0xbb &&
     buffer[2] === 0xbf
   ) {
-    return buffer.slice(3).toString("utf8");
+    attempts.push(buffer.slice(3).toString("utf8"));
   }
-  return buffer.toString("utf8");
+  attempts.push(buffer.toString("utf8"));
+
+  const MARKERS = ['"mlvbody"', '"mlvledbody"', '"tallymessage"', '"metadata"'];
+  for (const text of attempts) {
+    for (const marker of MARKERS) {
+      if (text.includes(marker)) return text;
+    }
+  }
+  return attempts[0] || buffer.toString("utf8");
 }
 
 // ─── Duplicate-key-tolerant parser ───────────────────────────────────────────
