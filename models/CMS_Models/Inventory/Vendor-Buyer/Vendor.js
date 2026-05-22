@@ -85,6 +85,12 @@ const vendorSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
+
+  isVerified:             { type: Boolean, default: false },
+  verifiedAt:             { type: Date, default: null },
+  verifiedBy:             { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+  verifiedByName:         { type: String, default: null },
+  verificationSignature:  { type: String, default: null }, // typed full name / drawn data-URI
   
   // Audit Fields
   createdBy: {
