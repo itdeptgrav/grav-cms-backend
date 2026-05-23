@@ -425,10 +425,12 @@ router.post(
           .json({ success: false, message: "companyId is required" });
       }
       if (!req.file) {
-        return res.status(400).json({
-          success: false,
-          message: "No file uploaded (field name 'file')",
-        });
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: "No file uploaded (field name 'file')",
+          });
       }
 
       // Parse JSON
@@ -560,10 +562,12 @@ router.post(
       });
     } catch (e) {
       console.error("[gstr2b/upload]", e);
-      res.status(500).json({
-        success: false,
-        message: "Failed to import GSTR-2B: " + e.message,
-      });
+      res
+        .status(500)
+        .json({
+          success: false,
+          message: "Failed to import GSTR-2B: " + e.message,
+        });
     }
   },
 );
@@ -623,6 +627,186 @@ router.get("/periods", accountantAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /recon-range — multi-period reconciliation rollup for Excel export
+// ─────────────────────────────────────────────────────────────────────────────
+// Returns the combined reconciliation result for every imported 2B/2A whose
+// period intersects the requested date range. Used by the frontend when the
+// accountant selects a multi-month range (e.g. full FY) and clicks Export.
+//
+// Returns cached recon results only — if a period in the range hasn't been
+// reconciled yet, it's listed in `missingPeriods` so the frontend can decide
+// whether to prompt the user to run those recons first.
+//
+// Query params:
+//   companyId    — required, the company being reported on
+//   from         — required, YYYY-MM-DD (inclusive start of range)
+//   to           — required, YYYY-MM-DD (inclusive end of range)
+//   returnType   — optional, GSTR2B | GSTR2A | (omit for both, defaults to GSTR2B)
+//
+// Period-in-range logic: a 2B/2A doc is "in range" if any part of its
+// calendar month overlaps the request range. This means a range starting
+// April 5 still includes April's 2B (which is for April 1–30).
+router.get("/recon-range", accountantAuth, async (req, res) => {
+  try {
+    await ensureIndexMigration();
+    const { companyId, from, to, returnType } = req.query;
+    if (!companyId || !from || !to) {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "companyId, from, and to are all required",
+        });
+    }
+    const fromDate = new Date(from);
+    const toDate = new Date(to);
+    if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "from/to must be valid dates (YYYY-MM-DD)",
+        });
+    }
+    if (fromDate > toDate) {
+      return res
+        .status(400)
+        .json({ success: false, message: "from must be <= to" });
+    }
+
+    // Enumerate every (year, month) tuple between the two dates inclusive.
+    // We work in calendar months because 2B/2A periods are monthly.
+    const periodsInRange = [];
+    let y = fromDate.getFullYear(),
+      m = fromDate.getMonth() + 1; // 1-12
+    const endY = toDate.getFullYear(),
+      endM = toDate.getMonth() + 1;
+    while (y < endY || (y === endY && m <= endM)) {
+      periodsInRange.push({
+        periodMonth: m,
+        periodYear: y,
+        returnPeriod: String(m).padStart(2, "0") + String(y), // "MMYYYY"
+        label: new Date(y, m - 1).toLocaleString("en-IN", {
+          month: "long",
+          year: "numeric",
+        }),
+      });
+      m++;
+      if (m > 12) {
+        m = 1;
+        y++;
+      }
+    }
+
+    // Query all matching docs in one shot — faster than N round trips.
+    const docQuery = {
+      companyId: new mongoose.Types.ObjectId(companyId),
+      returnPeriod: { $in: periodsInRange.map((p) => p.returnPeriod) },
+    };
+    if (returnType === "GSTR2A") {
+      docQuery.returnType = "GSTR2A";
+    } else if (returnType === "GSTR2B") {
+      // Legacy docs without returnType are implicitly GSTR2B — accept both.
+      docQuery.$or = [
+        { returnType: "GSTR2B" },
+        { returnType: { $exists: false } },
+      ];
+    }
+    // If returnType omitted, return both 2A and 2B docs in range.
+
+    const docs = await Acc_GSTR2B.find(docQuery).lean();
+
+    // Index docs by (period, type) for easy lookup
+    const docKey = (p, t) => `${p}__${t || "GSTR2B"}`;
+    const docMap = new Map();
+    for (const d of docs)
+      docMap.set(docKey(d.returnPeriod, d.returnType || "GSTR2B"), d);
+
+    // Categorize: each requested period either has cached recon, has imported
+    // 2B but no recon yet (needs to be run), or has no import at all.
+    const ready = []; // {period, returnType, label, summary, buckets, lastReconAt, recordCount, tolerance}
+    const missingRecon = []; // period imported but not yet reconciled
+    const notImported = []; // period has no import at all
+
+    for (const p of periodsInRange) {
+      // Look up matching doc(s) — could be 2B, 2A, or both if returnType wasn't filtered
+      const candidateTypes = returnType ? [returnType] : ["GSTR2B", "GSTR2A"];
+      for (const t of candidateTypes) {
+        const doc = docMap.get(docKey(p.returnPeriod, t));
+        if (!doc) {
+          // Only track "not imported" for 2B (canonical) unless 2A explicitly requested
+          if (t === "GSTR2B" || returnType === "GSTR2A") {
+            notImported.push({ ...p, returnType: t });
+          }
+          continue;
+        }
+        if (doc.lastReconAt && doc.lastReconBuckets) {
+          ready.push({
+            period: doc.returnPeriod,
+            returnType: doc.returnType || "GSTR2B",
+            label: p.label,
+            recordCount: doc.records.length,
+            lastReconAt: doc.lastReconAt,
+            tolerance: doc.lastReconTolerance || { amount: 1, days: 3 },
+            summary: doc.lastReconSummary,
+            buckets: doc.lastReconBuckets,
+          });
+        } else {
+          missingRecon.push({
+            ...p,
+            returnType: doc.returnType || "GSTR2B",
+            _id: doc._id,
+          });
+        }
+      }
+    }
+
+    // Aggregate summary across all ready periods so the frontend can show
+    // single-number headlines for the range (e.g. "Per books across FY:
+    // ₹X, Per portal: ₹Y, diff: ₹Z").
+    const rangeSummary = {
+      periodCount: ready.length,
+      matched: { count: 0, totalTax: 0 },
+      mismatched: { count: 0, totalTaxDiff: 0 },
+      onlyIn2B: { count: 0, totalTax: 0, availableITC: 0 },
+      onlyInBooks: { count: 0, totalTax: 0 },
+      portalTotalTax: 0,
+      booksTotalTax: 0,
+    };
+    for (const r of ready) {
+      const s = r.summary || {};
+      rangeSummary.matched.count += s.matched?.count || 0;
+      rangeSummary.matched.totalTax += s.matched?.totalTax || 0;
+      rangeSummary.mismatched.count += s.mismatched?.count || 0;
+      rangeSummary.mismatched.totalTaxDiff += s.mismatched?.totalTaxDiff || 0;
+      rangeSummary.onlyIn2B.count += s.onlyIn2B?.count || 0;
+      rangeSummary.onlyIn2B.totalTax += s.onlyIn2B?.totalTax || 0;
+      rangeSummary.onlyIn2B.availableITC += s.onlyIn2B?.availableITC || 0;
+      rangeSummary.onlyInBooks.count += s.onlyInBooks?.count || 0;
+      rangeSummary.onlyInBooks.totalTax += s.onlyInBooks?.totalTax || 0;
+      rangeSummary.portalTotalTax += s.portalTotalTax || 0;
+      rangeSummary.booksTotalTax += s.booksTotalTax || 0;
+    }
+
+    res.json({
+      success: true,
+      from,
+      to,
+      rangeLabel: `${fromDate.toLocaleString("en-IN", { month: "short", year: "numeric" })} – ${toDate.toLocaleString("en-IN", { month: "short", year: "numeric" })}`,
+      requestedReturnType: returnType || "ANY",
+      periodsRequested: periodsInRange.length,
+      periodsReady: ready.length,
+      missingRecon: missingRecon.map(({ _id, ...rest }) => rest),
+      notImported,
+      rangeSummary,
+      periods: ready, // each with its own summary + buckets
+    });
+  } catch (e) {
+    console.error("[gstr2b/recon-range]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /:period — fetch records for a period (with optional pagination + filter)
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:period", accountantAuth, async (req, res) => {
@@ -645,10 +829,12 @@ router.get("/:period", accountantAuth, async (req, res) => {
       returnType,
     }).lean();
     if (!doc) {
-      return res.status(404).json({
-        success: false,
-        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
-      });
+      return res
+        .status(404)
+        .json({
+          success: false,
+          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+        });
     }
 
     let records = doc.records;
@@ -742,10 +928,12 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
         : { returnType };
     const doc = await Acc_GSTR2B.findOne({ ...baseQuery, ...typeQuery }).lean();
     if (!doc)
-      return res.status(404).json({
-        success: false,
-        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
-      });
+      return res
+        .status(404)
+        .json({
+          success: false,
+          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+        });
 
     // ── Cache hit path ─────────────────────────────────────────────────
     if (useCache && doc.lastReconAt && doc.lastReconBuckets) {
@@ -1126,10 +1314,12 @@ router.get("/:period/supplier-summary", accountantAuth, async (req, res) => {
       returnType,
     }).lean();
     if (!doc)
-      return res.status(404).json({
-        success: false,
-        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
-      });
+      return res
+        .status(404)
+        .json({
+          success: false,
+          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+        });
 
     // Aggregate by supplier GSTIN
     const bySupplier = new Map();
@@ -1191,10 +1381,12 @@ router.delete("/:period", accountantAuth, async (req, res) => {
       returnType,
     });
     if (r.deletedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} found for this period`,
-      });
+      return res
+        .status(404)
+        .json({
+          success: false,
+          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} found for this period`,
+        });
     }
     res.json({ success: true, deleted: 1 });
   } catch (e) {
