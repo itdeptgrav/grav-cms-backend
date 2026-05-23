@@ -54,6 +54,61 @@ const upload = multer({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ONE-TIME INDEX MIGRATION
+// ─────────────────────────────────────────────────────────────────────────────
+// When 2A support was added, the unique index on the Acc_GSTR2B collection
+// changed from `{companyId, returnPeriod}` to `{companyId, returnPeriod,
+// returnType}`. Mongoose's schema change doesn't drop the old index — it just
+// queues the new one. If the old 2-field index is still present, every
+// upload (even for a different returnType than the existing doc) will fail
+// with E11000.
+//
+// This runs once on the first request, drops any stale `companyId_1_returnPeriod_1`
+// index, and lets Mongoose's auto-indexing create the new 3-field one.
+// Subsequent requests skip this work (memoized in the module).
+//
+// Also fixes any legacy documents that don't have a `returnType` field set
+// (created before the migration) by defaulting them to "GSTR2B".
+let __indexMigrationDone = false;
+async function ensureIndexMigration() {
+  if (__indexMigrationDone) return;
+  __indexMigrationDone = true; // optimistic — if it fails we'll see in logs
+  try {
+    const coll = Acc_GSTR2B.collection;
+    const existing = await coll.indexes();
+    const stale = existing.find(
+      (ix) =>
+        ix.unique &&
+        Object.keys(ix.key).length === 2 &&
+        ix.key.companyId === 1 &&
+        ix.key.returnPeriod === 1,
+    );
+    if (stale) {
+      console.log("[gstr2b] Dropping stale index", stale.name);
+      await coll.dropIndex(stale.name);
+    }
+    // Backfill returnType on legacy documents that don't have it.
+    const r = await Acc_GSTR2B.updateMany(
+      { returnType: { $exists: false } },
+      { $set: { returnType: "GSTR2B" } },
+    );
+    if (r.modifiedCount > 0) {
+      console.log(
+        `[gstr2b] Backfilled returnType="GSTR2B" on ${r.modifiedCount} legacy docs`,
+      );
+    }
+    // Let Mongoose ensure the new 3-field index exists.
+    await Acc_GSTR2B.syncIndexes();
+  } catch (e) {
+    // Don't crash the route on migration failure — just log and continue.
+    // The next request will retry because we set the flag before running;
+    // reset it so retry is possible.
+    console.error("[gstr2b] Index migration failed:", e.message);
+    __indexMigrationDone = false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -362,6 +417,7 @@ router.post(
   upload.single("file"),
   async (req, res) => {
     try {
+      await ensureIndexMigration();
       const { companyId } = req.body;
       if (!companyId) {
         return res
@@ -369,12 +425,10 @@ router.post(
           .json({ success: false, message: "companyId is required" });
       }
       if (!req.file) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "No file uploaded (field name 'file')",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "No file uploaded (field name 'file')",
+        });
       }
 
       // Parse JSON
@@ -385,7 +439,7 @@ router.post(
         return res.status(400).json({
           success: false,
           message:
-            "Could not parse uploaded file as JSON. Ensure you downloaded the GSTR-2B 'JSON' format (not Excel) from the GST portal.",
+            "Could not parse uploaded file as JSON. Ensure you downloaded the GSTR-2A or GSTR-2B 'JSON' format (not Excel) from the GST portal.",
         });
       }
 
@@ -395,6 +449,21 @@ router.post(
         parsed = parseGstr2bJson(raw);
       } catch (e) {
         return res.status(400).json({ success: false, message: e.message });
+      }
+
+      // Detect 2A vs 2B from the filename. GSTN names downloads as
+      // `returns_R2A_<GSTIN>_<MMYYYY>.json` or `returns_R2B_<GSTIN>_<MMYYYY>.json`.
+      // Caller can override via req.body.returnType. Default to 2B since that's
+      // the canonical one for ITC claims.
+      //
+      // We could also detect from the JSON itself — 2B has a `chksum` at root
+      // and `itcsumm` is a locked snapshot; 2A is dynamic and doesn't include
+      // `chksum`. But the filename signal is reliable and explicit.
+      const fname = (req.file.originalname || "").toUpperCase();
+      let returnType = (req.body.returnType || "").toUpperCase();
+      if (returnType !== "GSTR2A" && returnType !== "GSTR2B") {
+        if (/R2A|GSTR-?2A|GSTR_?2A/.test(fname)) returnType = "GSTR2A";
+        else returnType = "GSTR2B"; // default
       }
 
       // Sanity check: the GSTIN in the file must match the company we're importing into.
@@ -410,18 +479,31 @@ router.post(
       ) {
         return res.status(400).json({
           success: false,
-          message: `GSTIN mismatch. Uploaded 2B is for ${parsed.taxpayerGSTIN}, but the selected company's GSTIN is ${company.gstin}. Did you upload the wrong file?`,
+          message: `GSTIN mismatch. Uploaded file is for ${parsed.taxpayerGSTIN}, but the selected company's GSTIN is ${company.gstin}. Did you upload the wrong file?`,
         });
       }
 
-      // Upsert — re-uploading the same period replaces the prior import.
+      // Upsert — re-uploading the same (period, type) replaces the prior import.
+      // A company can hold both a 2A and a 2B for the same period.
+      // Legacy 2B docs may lack a `returnType` field; treat absent as GSTR2B.
+      const existingTypeQuery =
+        returnType === "GSTR2B"
+          ? {
+              $or: [
+                { returnType: "GSTR2B" },
+                { returnType: { $exists: false } },
+              ],
+            }
+          : { returnType };
       const existing = await Acc_GSTR2B.findOne({
         companyId: new mongoose.Types.ObjectId(companyId),
         returnPeriod: parsed.returnPeriod,
+        ...existingTypeQuery,
       });
 
       const payload = {
         companyId: new mongoose.Types.ObjectId(companyId),
+        returnType,
         taxpayerGSTIN: parsed.taxpayerGSTIN,
         returnPeriod: parsed.returnPeriod,
         periodMonth: parsed.periodMonth,
@@ -457,6 +539,7 @@ router.post(
           period: parsed.returnPeriod,
           month: parsed.periodMonth,
           year: parsed.periodYear,
+          returnType, // GSTR2A or GSTR2B
           recordCount: parsed.records.length,
           sectionCounts: parsed.records.reduce((acc, r) => {
             acc[r.section] = (acc[r.section] || 0) + 1;
@@ -469,16 +552,18 @@ router.post(
             parsed.summaryTotals.itcAvailable.cess,
           warnings: parsed.warnings,
         },
-        gstr2b: { _id: doc._id, returnPeriod: doc.returnPeriod },
+        gstr2b: {
+          _id: doc._id,
+          returnPeriod: doc.returnPeriod,
+          returnType: doc.returnType,
+        },
       });
     } catch (e) {
       console.error("[gstr2b/upload]", e);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Failed to import GSTR-2B: " + e.message,
-        });
+      res.status(500).json({
+        success: false,
+        message: "Failed to import GSTR-2B: " + e.message,
+      });
     }
   },
 );
@@ -488,17 +573,25 @@ router.post(
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/periods", accountantAuth, async (req, res) => {
   try {
-    const { companyId } = req.query;
+    await ensureIndexMigration();
+    const { companyId, returnType } = req.query;
     if (!companyId)
       return res
         .status(400)
         .json({ success: false, message: "companyId required" });
 
+    // Filter by returnType if specified; otherwise return both 2A and 2B
+    // (UI can filter client-side if it wants).
+    const match = { companyId: new mongoose.Types.ObjectId(companyId) };
+    if (returnType === "GSTR2A" || returnType === "GSTR2B")
+      match.returnType = returnType;
+
     const periods = await Acc_GSTR2B.aggregate([
-      { $match: { companyId: new mongoose.Types.ObjectId(companyId) } },
+      { $match: match },
       {
         $project: {
           returnPeriod: 1,
+          returnType: 1,
           periodMonth: 1,
           periodYear: 1,
           generationDate: 1,
@@ -513,14 +606,13 @@ router.get("/periods", accountantAuth, async (req, res) => {
               "$summaryTotals.itcAvailable.cess",
             ],
           },
-          // Surface recon status so the UI can show "last reconciled: 3 days ago"
-          // and a small badge count of unresolved issues on each period chip.
           lastReconAt: 1,
           lastReconBy: 1,
           lastReconSummary: 1,
         },
       },
-      { $sort: { periodYear: -1, periodMonth: -1 } },
+      // 2B before 2A within the same period (2B is canonical), then by date desc
+      { $sort: { periodYear: -1, periodMonth: -1, returnType: 1 } },
     ]);
 
     res.json({ success: true, periods });
@@ -535,7 +627,13 @@ router.get("/periods", accountantAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:period", accountantAuth, async (req, res) => {
   try {
-    const { companyId, section, page = 1, limit = 100 } = req.query;
+    const {
+      companyId,
+      section,
+      page = 1,
+      limit = 100,
+      returnType = "GSTR2B",
+    } = req.query;
     if (!companyId)
       return res
         .status(400)
@@ -544,14 +642,13 @@ router.get("/:period", accountantAuth, async (req, res) => {
     const doc = await Acc_GSTR2B.findOne({
       companyId: new mongoose.Types.ObjectId(companyId),
       returnPeriod: req.params.period,
+      returnType,
     }).lean();
     if (!doc) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "No GSTR-2B imported for this period",
-        });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+      });
     }
 
     let records = doc.records;
@@ -609,11 +706,13 @@ router.get("/:period", accountantAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:period/recon", accountantAuth, async (req, res) => {
   try {
+    await ensureIndexMigration();
     const {
       companyId,
       amountTolerance = 1,
       dateTolerance = 3,
       cache,
+      returnType = "GSTR2B",
     } = req.query;
     if (!companyId)
       return res
@@ -628,23 +727,32 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
     // a manual "Refresh" call omits the param to force a fresh computation.
     const useCache = cache === "true" || cache === "1";
 
-    const doc = await Acc_GSTR2B.findOne({
+    // Look for the doc matching this period + returnType. Legacy docs
+    // created before the 2A migration don't have a `returnType` field — those
+    // are implicitly GSTR-2B, so we accept them when the caller asks for 2B.
+    const baseQuery = {
       companyId: new mongoose.Types.ObjectId(companyId),
       returnPeriod: req.params.period,
-    }).lean();
+    };
+    const typeQuery =
+      returnType === "GSTR2B"
+        ? {
+            $or: [{ returnType: "GSTR2B" }, { returnType: { $exists: false } }],
+          }
+        : { returnType };
+    const doc = await Acc_GSTR2B.findOne({ ...baseQuery, ...typeQuery }).lean();
     if (!doc)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "No GSTR-2B imported for this period",
-        });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+      });
 
     // ── Cache hit path ─────────────────────────────────────────────────
     if (useCache && doc.lastReconAt && doc.lastReconBuckets) {
       return res.json({
         success: true,
         cached: true,
+        returnType: doc.returnType,
         period: doc.returnPeriod,
         periodLabel: new Date(
           doc.periodYear,
@@ -984,6 +1092,7 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
     res.json({
       success: true,
       cached: false,
+      returnType: doc.returnType,
       period: doc.returnPeriod,
       periodLabel: new Date(doc.periodYear, doc.periodMonth - 1).toLocaleString(
         "en-IN",
@@ -1005,7 +1114,7 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:period/supplier-summary", accountantAuth, async (req, res) => {
   try {
-    const { companyId } = req.query;
+    const { companyId, returnType = "GSTR2B" } = req.query;
     if (!companyId)
       return res
         .status(400)
@@ -1014,14 +1123,13 @@ router.get("/:period/supplier-summary", accountantAuth, async (req, res) => {
     const doc = await Acc_GSTR2B.findOne({
       companyId: new mongoose.Types.ObjectId(companyId),
       returnPeriod: req.params.period,
+      returnType,
     }).lean();
     if (!doc)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "No GSTR-2B imported for this period",
-        });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+      });
 
     // Aggregate by supplier GSTIN
     const bySupplier = new Map();
@@ -1071,7 +1179,7 @@ router.get("/:period/supplier-summary", accountantAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.delete("/:period", accountantAuth, async (req, res) => {
   try {
-    const { companyId } = req.query;
+    const { companyId, returnType = "GSTR2B" } = req.query;
     if (!companyId)
       return res
         .status(400)
@@ -1080,11 +1188,13 @@ router.delete("/:period", accountantAuth, async (req, res) => {
     const r = await Acc_GSTR2B.deleteOne({
       companyId: new mongoose.Types.ObjectId(companyId),
       returnPeriod: req.params.period,
+      returnType,
     });
     if (r.deletedCount === 0) {
-      return res
-        .status(404)
-        .json({ success: false, message: "No GSTR-2B found for this period" });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} found for this period`,
+      });
     }
     res.json({ success: true, deleted: 1 });
   } catch (e) {
