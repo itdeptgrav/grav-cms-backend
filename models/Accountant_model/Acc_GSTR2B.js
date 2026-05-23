@@ -105,6 +105,24 @@ const acc_GSTR2B_schema = new mongoose.Schema(
       index: true,
     },
 
+    // Which return type produced this data. 2B and 2A are nearly identical in
+    // JSON shape (same docdata.b2b/cdnr/impg/isd structure) but serve different
+    // purposes: 2B is the LOCKED monthly statement (canonical), 2A is the
+    // REAL-TIME running view that keeps changing until 2B locks. We store
+    // both in the same collection but tag the source so the UI can label and
+    // filter them. A company may have BOTH a 2A and a 2B for the same period
+    // (e.g. before the 14th lock date).
+    //
+    // The collection name `Acc_GSTR2B` is kept for backward compatibility
+    // with existing data; the model now handles both 2A and 2B.
+    returnType: {
+      type: String,
+      enum: ["GSTR2B", "GSTR2A"],
+      default: "GSTR2B",
+      required: true,
+      index: true,
+    },
+
     // Our (taxpayer's) GSTIN from the file. Sanity-checked against the company
     // record on import; mismatch → reject the upload so the wrong file can't
     // contaminate another company's reconciliation.
@@ -180,8 +198,13 @@ const acc_GSTR2B_schema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// Unique constraint: one 2B file per (company, period). Re-uploading replaces.
-acc_GSTR2B_schema.index({ companyId: 1, returnPeriod: 1 }, { unique: true });
+// Unique constraint: one file per (company, period, type). Re-uploading the
+// same type for the same period replaces. A company can hold a 2A and a 2B
+// for April 2026 simultaneously — they're different sources.
+acc_GSTR2B_schema.index(
+  { companyId: 1, returnPeriod: 1, returnType: 1 },
+  { unique: true },
+);
 
 // Fast supplier-wise lookup on a single 2B document
 acc_GSTR2B_schema.index({ "records.supplierGSTIN": 1 });
