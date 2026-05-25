@@ -723,6 +723,12 @@ app.use("/api/ceo/overview", ceoOverviewRoutes);
 const ceoVendorRoutes = require("./routes/CEO_Routes/HistoryReport/vendor");
 app.use("/api/ceo/inventory/vendors", ceoVendorRoutes);
 
+const dispatchChallanRoutes = require("./routes/CMS_Routes/Manufacturing/Dispatch/dispatchChallanRoutes");
+app.use("/api/cms/manufacturing/dispatch-challans", dispatchChallanRoutes);
+
+const returnRequestRoutes = require("./routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes");
+app.use("/api/cms/manufacturing/return-requests", returnRequestRoutes);
+
 
 app.use("/api/cms/inventory/stock-ledger", require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"));
 
