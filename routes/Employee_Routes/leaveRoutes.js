@@ -11,6 +11,18 @@ const {
 } = require("../../services/leaveNotification.service");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 
+// Email service — used to notify HR when a leave reaches final manager approval.
+// Wrapped in try/catch so missing env vars / disabled emails never crash the route.
+let emailService = {};
+try {
+  emailService = require("../../services/emailService");
+} catch (e) {
+  console.warn(
+    "[LEAVE-ROUTES] emailService not found, email features disabled:",
+    e.message,
+  );
+}
+
 const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -699,6 +711,35 @@ router.post(
           console.warn("[MGR]", e.message);
         }
       }
+
+      // ── Notify HR via email when add-on-behalf lands as hr_approved ──
+      // (Manager added → goes straight to hr_approved if no secondary, OR
+      // skips to manager_approved if secondary exists. We email HR only on
+      // hr_approved — the "Final approval" branch in /manager/:id/approve
+      // covers the other path when secondary finally approves.)
+      if (st === "hr_approved") {
+        try {
+          if (emailService?.sendLeaveManagerApprovedToHR) {
+            emailService
+              .sendLeaveManagerApprovedToHR({
+                employeeName: app.employeeName,
+                department: app.department,
+                designation: app.designation,
+                leaveType: app.leaveType,
+                fromDate: app.fromDate,
+                toDate: app.toDate,
+                totalDays: app.totalDays,
+                paidDays: app.paidDays,
+                lwpDays: app.lwpDays,
+                reason: app.reason,
+                approvalChain: app.managerDecisions || [],
+                applicationId: app._id.toString(),
+              })
+              .catch((e) => console.warn("[LEAVE-HR-EMAIL]", e.message));
+          }
+        } catch (_) {}
+      }
+
       res.status(201).json({
         success: true,
         data: app,
@@ -1475,6 +1516,7 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MANAGER APPROVAL/REJECT
 //  ✅ FIX 7: LOP approvals don't deduct any balance (paidDays is 0)
+//  ✅ NEW:   Email HR (hr@grav.in / configured recipients) on FINAL approval
 // ═══════════════════════════════════════════════════════════════════════════════
 router.patch(
   "/manager/:id/approve",
@@ -1542,7 +1584,10 @@ router.patch(
         });
       }
 
-      // Final approval
+      // ────────────────────────────────────────────────────────────────
+      //  FINAL APPROVAL — leave reaches hr_approved
+      //  Triggers: balance deduction → attendance sync → HR email → push
+      // ────────────────────────────────────────────────────────────────
       const {
         LeaveConfig: LC,
         LeaveBalance: LB,
@@ -1592,6 +1637,36 @@ router.patch(
       } catch (e) {
         console.warn("[APPROVE]", e.message);
       }
+
+      // ── NEW: Notify HR via email on final manager approval ──
+      // Fire-and-forget so a slow Brevo response never blocks the API.
+      // sendLeaveManagerApprovedToHR uses getHRRecipients() internally to
+      // fetch all HR users from the database — no env var needed for the
+      // recipient address.
+      try {
+        if (emailService?.sendLeaveManagerApprovedToHR) {
+          emailService
+            .sendLeaveManagerApprovedToHR({
+              employeeName: a.employeeName,
+              department: a.department,
+              designation: a.designation,
+              leaveType: a.leaveType,
+              fromDate: a.fromDate,
+              toDate: a.toDate,
+              totalDays: a.totalDays,
+              paidDays: a.paidDays,
+              lwpDays: a.lwpDays,
+              reason: a.reason,
+              approvalChain: a.managerDecisions || [],
+              applicationId: a._id.toString(),
+            })
+            .catch((e) => console.warn("[LEAVE-HR-EMAIL]", e.message));
+          console.log(
+            `[APPROVE] HR email queued for ${a.employeeName}'s ${a.leaveType}`,
+          );
+        }
+      } catch (_) {}
+
       try {
         const io = req.app.get("io");
         if (io)
