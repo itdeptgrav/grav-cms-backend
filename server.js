@@ -729,8 +729,10 @@ app.use("/api/cms/manufacturing/dispatch-challans", dispatchChallanRoutes);
 const returnRequestRoutes = require("./routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes");
 app.use("/api/cms/manufacturing/return-requests", returnRequestRoutes);
 
-
-app.use("/api/cms/inventory/stock-ledger", require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"));
+app.use(
+  "/api/cms/inventory/stock-ledger",
+  require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"),
+);
 
 /* =====================
     Normal Employees ROUTES
@@ -763,8 +765,11 @@ app.use("/api/ceo/sop", ceoSopRoutes);
 /* =====================
     Customer ROUTES
   ===================== */
-const customerRoutes = require("./routes/Customer_Routes/auth");
-app.use("/api/customer", customerRoutes);
+const customerAuthRoutes = require("./routes/Customer_Routes/auth");
+app.use("/api/customer/auth", customerAuthRoutes);
+
+const salesCustomersRoutes = require("./routes/CMS_Routes/Sales/salesCustomers");
+app.use("/api/cms/sales/customers", salesCustomersRoutes);
 
 const customerRequestsRoutes = require("./routes/Customer_Routes/CustomerRequests.js");
 app.use("/api/customer/requests", customerRequestsRoutes);
@@ -801,6 +806,14 @@ app.use(
 /* ===================
   CMS ROUTES
 ===================== */
+const crmLeadsRoutes = require("./routes/CMS_Routes/Sales/leads");
+const crmContactsRoutes = require("./routes/CMS_Routes/Sales/contacts");
+const crmAccountsRoutes = require("./routes/CMS_Routes/Sales/accounts");
+
+app.use("/api/cms/crm/leads", crmLeadsRoutes);
+app.use("/api/cms/crm/contacts", crmContactsRoutes);
+app.use("/api/cms/crm/accounts", crmAccountsRoutes);
+
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
