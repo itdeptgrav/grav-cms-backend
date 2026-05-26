@@ -19,7 +19,9 @@ router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
-      return res.status(400).json({ success: false, message: "Email and password are required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Email and password are required" });
     }
 
     let user = null;
@@ -37,26 +39,40 @@ router.post("/login", async (req, res) => {
           user = await MpcMeasurement.findOne({ email: email.toLowerCase() });
           if (user) userModel = "mpc-measurement";
           else {
-            user = await CuttingMasterDepartment.findOne({ email: email.toLowerCase() });
+            user = await CuttingMasterDepartment.findOne({
+              email: email.toLowerCase(),
+            });
             if (user) userModel = "cutting-master";
             else {
-              user = await AccountantDepartment.findOne({ email: email.toLowerCase() });
+              user = await AccountantDepartment.findOne({
+                email: email.toLowerCase(),
+              });
               if (user) userModel = "accountant";
               else {
-                user = await PackagingDispatchDepartment.findOne({ email: email.toLowerCase() });
+                user = await PackagingDispatchDepartment.findOne({
+                  email: email.toLowerCase(),
+                });
                 if (user) userModel = "packaging-dispatch";
                 else {
-                  user = await ProductionSupervisorDepartment.findOne({ email: email.toLowerCase() });
+                  user = await ProductionSupervisorDepartment.findOne({
+                    email: email.toLowerCase(),
+                  });
                   if (user) userModel = "production-supervisor";
                   else {
-                    user = await QCDepartment.findOne({ email: email.toLowerCase() });
+                    user = await QCDepartment.findOne({
+                      email: email.toLowerCase(),
+                    });
                     if (user) userModel = "qc";
                     else {
-                      user = await CEODepartment.findOne({ email: email.toLowerCase() });
+                      user = await CEODepartment.findOne({
+                        email: email.toLowerCase(),
+                      });
                       if (user) userModel = "ceo";
                       else {
                         // ✅ NEW: Store
-                        user = await StoreDepartment.findOne({ email: email.toLowerCase() });
+                        user = await StoreDepartment.findOne({
+                          email: email.toLowerCase(),
+                        });
                         if (user) userModel = "store";
                       }
                     }
@@ -70,16 +86,26 @@ router.post("/login", async (req, res) => {
     }
 
     if (!user || !user.isActive) {
-      return res.status(401).json({ success: false, message: "Invalid email or password" });
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid email or password" });
     }
 
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
-      return res.status(401).json({ success: false, message: "Invalid email or password" });
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid email or password" });
     }
 
     const token = jwt.sign(
-      { id: user._id, role: user.role, employeeId: user.employeeId, userType: userModel, name: user.name },
+      {
+        id: user._id,
+        role: user.role,
+        employeeId: user.employeeId,
+        userType: userModel,
+        name: user.name,
+      },
       process.env.JWT_SECRET || "grav_clothing_secret_key",
       { expiresIn: "7d" },
     );
@@ -89,21 +115,27 @@ router.post("/login", async (req, res) => {
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? "none" : "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: 24 * 60 * 60 * 1000,
     });
 
     let redirectPath = "/";
     if (user.role === "hr_manager") redirectPath = "/hr/dashboard";
     if (user.role === "ceo") redirectPath = "/ceo/dashboard";
-    if (user.role === "project_manager") redirectPath = "/project-manager/dashboard";
+    if (user.role === "project_manager")
+      redirectPath = "/project-manager/dashboard";
     if (user.role === "sales") redirectPath = "/sales/dashboard";
-    if (user.role === "mpc-measurement") redirectPath = "/mpc-measurement/dashboard";
-    if (user.role === "cutting_master") redirectPath = "/cutting-master/dashboard";
+    if (user.role === "mpc-measurement")
+      redirectPath = "/mpc-measurement/dashboard";
+    if (user.role === "cutting_master")
+      redirectPath = "/cutting-master/dashboard";
     if (user.role === "accountant") redirectPath = "/accountant/";
-    if (user.role === "packaging_dispatch") redirectPath = "/packaging-dispatch/dashboard";
-    if (user.role === "production_supervisor") redirectPath = "/production-supervisor/dashboard";
+    if (user.role === "packaging_dispatch")
+      redirectPath = "/packaging-dispatch/dashboard";
+    if (user.role === "production_supervisor")
+      redirectPath = "/production-supervisor/dashboard";
     if (user.role === "quality_control") redirectPath = "/qc/dashboard";
-    if (user.role === "store_manager") redirectPath = "/store/dashboard/overview"; // ✅ NEW
+    if (user.role === "store_manager")
+      redirectPath = "/store/dashboard/overview"; // ✅ NEW
 
     res.status(200).json({
       success: true,
@@ -111,8 +143,12 @@ router.post("/login", async (req, res) => {
       redirectTo: redirectPath,
       userType: userModel,
       user: {
-        id: user._id, name: user.name, email: user.email,
-        role: user.role, department: user.department, employeeId: user.employeeId,
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        department: user.department,
+        employeeId: user.employeeId,
       },
     });
   } catch (error) {
@@ -124,37 +160,80 @@ router.post("/login", async (req, res) => {
 router.post("/verify", async (req, res) => {
   try {
     const token = req.cookies.auth_token;
-    if (!token) return res.status(401).json({ success: false, message: "Not authenticated" });
+    if (!token)
+      return res
+        .status(401)
+        .json({ success: false, message: "Not authenticated" });
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "grav_clothing_secret_key");
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET || "grav_clothing_secret_key",
+    );
     let user = null;
 
     switch (decoded.userType) {
-      case "project_manager": user = await ProjectManager.findById(decoded.id).select("-password"); break;
-      case "sales": user = await SalesDepartment.findById(decoded.id).select("-password"); break;
-      case "ceo": user = await CEODepartment.findById(decoded.id).select("-password"); break;
-      case "mpc-measurement": user = await MpcMeasurement.findById(decoded.id).select("-password"); break;
-      case "cutting-master": user = await CuttingMasterDepartment.findById(decoded.id).select("-password"); break;
-      case "accountant": user = await AccountantDepartment.findById(decoded.id).select("-password"); break;
-      case "packaging-dispatch": user = await PackagingDispatchDepartment.findById(decoded.id).select("-password"); break;
-      case "production-supervisor": user = await ProductionSupervisorDepartment.findById(decoded.id).select("-password"); break;
-      case "qc": user = await QCDepartment.findById(decoded.id).select("-password"); break;
-      case "store": user = await StoreDepartment.findById(decoded.id).select("-password"); break; // ✅ NEW
-      default: user = await HRDepartment.findById(decoded.id).select("-password"); break;
+      case "project_manager":
+        user = await ProjectManager.findById(decoded.id).select("-password");
+        break;
+      case "sales":
+        user = await SalesDepartment.findById(decoded.id).select("-password");
+        break;
+      case "ceo":
+        user = await CEODepartment.findById(decoded.id).select("-password");
+        break;
+      case "mpc-measurement":
+        user = await MpcMeasurement.findById(decoded.id).select("-password");
+        break;
+      case "cutting-master":
+        user = await CuttingMasterDepartment.findById(decoded.id).select(
+          "-password",
+        );
+        break;
+      case "accountant":
+        user = await AccountantDepartment.findById(decoded.id).select(
+          "-password",
+        );
+        break;
+      case "packaging-dispatch":
+        user = await PackagingDispatchDepartment.findById(decoded.id).select(
+          "-password",
+        );
+        break;
+      case "production-supervisor":
+        user = await ProductionSupervisorDepartment.findById(decoded.id).select(
+          "-password",
+        );
+        break;
+      case "qc":
+        user = await QCDepartment.findById(decoded.id).select("-password");
+        break;
+      case "store":
+        user = await StoreDepartment.findById(decoded.id).select("-password");
+        break; // ✅ NEW
+      default:
+        user = await HRDepartment.findById(decoded.id).select("-password");
+        break;
     }
 
-    if (!user || !user.isActive) return res.status(401).json({ success: false, message: "Unauthorized" });
+    if (!user || !user.isActive)
+      return res.status(401).json({ success: false, message: "Unauthorized" });
 
     res.status(200).json({
       success: true,
       user: {
-        id: user._id, name: user.name, email: user.email, role: user.role,
-        employeeId: user.employeeId, department: user.department,
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        employeeId: user.employeeId,
+        department: user.department,
         userType: decoded.userType || "hr",
       },
     });
   } catch (error) {
-    return res.status(401).json({ success: false, message: "Invalid or expired token" });
+    return res
+      .status(401)
+      .json({ success: false, message: "Invalid or expired token" });
   }
 });
 
