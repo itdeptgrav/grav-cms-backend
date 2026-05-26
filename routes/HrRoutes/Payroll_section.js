@@ -253,6 +253,39 @@ function computeEmployeePayroll(employee, ctx) {
           paid = true;
           stats.plUsedDays++;
           break;
+        // ── Half-day Present + Half-day Leave variants ─────────────────
+        // P/CL, P/SL, P/PL: employee is paid for the FULL day (the leave
+        // covers the missing half). 0.5 is consumed from the relevant
+        // leave bucket — that's already deducted from LeaveBalance at the
+        // /day-override step, so here we only record the usage for the
+        // payslip / salary register breakdown.
+        case "P/CL":
+          category = "P/CL";
+          paid = true;
+          lopWeight = 0;
+          stats.clUsedDays += 0.5;
+          break;
+        case "P/SL":
+          category = "P/SL";
+          paid = true;
+          lopWeight = 0;
+          stats.slUsedDays += 0.5;
+          break;
+        case "P/PL":
+          category = "P/PL";
+          paid = true;
+          lopWeight = 0;
+          stats.plUsedDays += 0.5;
+          break;
+        // P/LWP: employee present for half the day, the other half is
+        // unpaid (LOP). lopWeight=0.5 means payableDays gets +0.5 and
+        // lopDays gets +0.5 — gross is reduced by half a day's pay.
+        case "P/LWP":
+          category = "P/LWP";
+          paid = true;
+          lopWeight = 0.5;
+          stats.lwpDays += 0.5;
+          break;
         case "WFH":
         case "CO":
           category = rawStatus;
@@ -287,6 +320,14 @@ function computeEmployeePayroll(employee, ctx) {
     }
 
     if (["P", "P*", "P~", "MP"].includes(category)) stats.presentDays++;
+    // Half-day variants count as Present (employee was there for half the day).
+    else if (
+      category === "P/CL" ||
+      category === "P/SL" ||
+      category === "P/PL" ||
+      category === "P/LWP"
+    )
+      stats.presentDays++;
     else if (category === "HD") stats.halfDays++;
     else if (category === "AB") stats.absentDays++;
     else if (category === "WO") stats.weekOffDays++;
@@ -297,6 +338,11 @@ function computeEmployeePayroll(employee, ctx) {
       ["WFH", "CO"].includes(category)
     ) {
       stats.paidLeaveDays++;
+    }
+    // Half-CL/SL/PL count under paidLeaveDays as 0.5 each — the day is also
+    // counted as Present (above), and these together describe the split.
+    if (category === "P/CL" || category === "P/SL" || category === "P/PL") {
+      stats.paidLeaveDays += 0.5;
     }
 
     if (category && category !== "—") {

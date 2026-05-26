@@ -1,37 +1,3 @@
-// routes/Accountant_Routes/Acc_chartOfAccounts.js
-// =============================================================================
-// CHART OF ACCOUNTS — Groups + Ledgers
-// -----------------------------------------------------------------------------
-// Endpoints:
-//   GET    /tree                        — Group→Ledger tree (with rollups)
-//   GET    /trial-balance               — Flat trial balance (Dr/Cr columns,
-//                                          group totals, balanced check)
-//   GET    /groups, POST/PUT/DELETE     — Group CRUD
-//   GET    /groups/:id/statement        — Consolidated statement for a group
-//                                          (all descendant ledgers in one view)
-//   GET    /ledgers, POST/PUT/DELETE    — Ledger CRUD
-//   GET    /ledgers/:id/statement       — Ledger statement (running balance,
-//                                          monthly + daily buckets, contra
-//                                          entries, bill-wise outstanding,
-//                                          previous-period comparison)
-//   POST   /ledgers/:id/transactions    — Quick add 2-line journal voucher
-//   POST   /ledgers/:id/transfer-balance — Move (full or partial) balance from
-//                                          one ledger to another via journal
-//   GET    /gstin-lookup/:gstin         — Validate GSTIN format + checksum,
-//                                          extract state + PAN; optional API
-//                                          fetch (env-configured) for name/addr
-//   GET    /payroll/runs                — List payroll runs + posting status
-//   GET    /payroll/runs/:id/preview    — Preview salary journal voucher
-//   POST   /payroll/runs/:id/post       — Post a single payroll run as voucher
-//   POST   /payroll/runs/post-all       — Post every unposted run
-//   POST   /payroll/runs/:id/unpost     — Cancel the auto-created vouchers
-//                                          (handles paid runs with two vouchers)
-//   POST   /seed-manufacturing          — Seed manufacturing-industry chart
-//   GET    /parties/preview             — Preview party-ledger sync (dry-run)
-//   POST   /parties/sync                — Create Sundry Debtor / Creditor
-//                                          ledgers from CMS Customer + Vendor
-// =============================================================================
-
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -44,6 +10,12 @@ const {
 const {
   Acc_Voucher,
 } = require("../../models/Accountant_model/Acc_VoucherModels");
+// Single source of truth for GSTIN→state-code derivation. Bridges
+// `contactDetails.{state,stateCode}` (where the ledger edit form saves) to
+// the top-level `address.{state,stateCode}` shape that voucher/invoice forms
+// read. Without this bridge, customers with a properly-saved state code in
+// contactDetails still trigger "no state code" errors on the voucher form.
+const { applyGstAutoState } = require("../../services/gstState.util");
 // Payroll models live in the HR module. We require them lazily inside the
 // payroll endpoints below so this route file still loads on systems that don't
 // have the HR module installed yet.
@@ -460,10 +432,12 @@ router.put("/groups/:id", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Group not found" });
-
-    // ← REMOVED: the isReserved rename block that used to be here.
-    //   Groups can now be renamed freely, including system-reserved ones.
-
+    if (grp.isReserved && req.body.name && req.body.name !== grp.name) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot rename a reserved Tally group",
+      });
+    }
     Object.assign(grp, req.body);
     await grp.save();
     res.json({ success: true, group: grp });
@@ -861,6 +835,13 @@ router.get("/ledgers", async (req, res) => {
       }
       return l;
     });
+
+    // Bridge contactDetails.{state,stateCode} → top-level address.{state,stateCode}
+    // so voucher/invoice forms (which read selectedCustomer.address.stateCode)
+    // see the value. Without this, a ledger with a perfectly-good stateCode in
+    // contactDetails still trips the "no state code" validator.
+    for (const l of ledgers) applyGstAutoState(l);
+
     // Fire-and-forget bulk fix so next request doesn't need it
     if (bulkFixOps.length > 0) {
       Acc_Ledger.bulkWrite(bulkFixOps).catch(() => {});
@@ -1017,7 +998,11 @@ router.get("/ledgers/:id", async (req, res) => {
       }
     }
 
-    res.json({ success: true, ledger: ledger.toObject() });
+    // Mirror contactDetails.{state,stateCode} → top-level address.{state,stateCode}
+    // for forms that read the address shape. See helper for details.
+    const obj = ledger.toObject();
+    applyGstAutoState(obj);
+    res.json({ success: true, ledger: obj });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1046,7 +1031,11 @@ router.put("/ledgers/:id", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Ledger not found" });
-    res.json({ success: true, ledger });
+    // Bridge contactDetails → address shape so callers that re-read the
+    // returned ledger get a consistent shape.
+    const obj = ledger.toObject();
+    applyGstAutoState(obj);
+    res.json({ success: true, ledger: obj });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
