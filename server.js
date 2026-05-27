@@ -746,6 +746,8 @@ const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
 app.use("/api/hr/overview", hrOverviewRoutes);
 
+app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
+
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
