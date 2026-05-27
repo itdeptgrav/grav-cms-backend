@@ -1068,6 +1068,10 @@ app.use(
   require("./routes/Accountant_Routes/Acc_proformaInvoices"),
 );
 app.use(
+  "/api/accountant/eway-bill",
+  require("./routes/Accountant_Routes/Acc_ewayBill"),
+);
+app.use(
   "/api/accountant/vendors",
   require("./routes/Accountant_Routes/Acc_vendors"),
 );
