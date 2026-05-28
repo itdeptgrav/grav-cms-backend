@@ -746,6 +746,8 @@ const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
 app.use("/api/hr/overview", hrOverviewRoutes);
 
+app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
+
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
@@ -1071,6 +1073,10 @@ app.use(
 app.use(
   "/api/accountant/proforma-invoices",
   require("./routes/Accountant_Routes/Acc_proformaInvoices"),
+);
+app.use(
+  "/api/accountant/eway-bill",
+  require("./routes/Accountant_Routes/Acc_ewayBill"),
 );
 app.use(
   "/api/accountant/vendors",
