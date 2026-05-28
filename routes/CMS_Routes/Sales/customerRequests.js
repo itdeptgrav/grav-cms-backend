@@ -1,4 +1,4 @@
-// routes/CMS_Routes/Sales/salesRoutes.js
+// routes/CMS_Routes/Sales/customerRequests.js
 
 const express = require("express");
 const router = express.Router();

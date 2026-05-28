@@ -762,6 +762,11 @@ const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 app.use("/api/hr/sop", hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
 
+
+const salesSettingsRoutes = require("./routes/CMS_Routes/Sales/salesSettings");
+
+app.use("/api/cms/sales/settings", salesSettingsRoutes);
+
 /* =====================
     Customer ROUTES
   ===================== */
