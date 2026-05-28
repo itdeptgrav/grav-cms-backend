@@ -1749,6 +1749,213 @@ router.delete("/requests/:requestId", async (req, res) => {
 });
 
 
+router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { approvalNotes, customerInfoOverride, payment } = req.body;
+ 
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+ 
+    if (request.quotations.length === 0)
+      return res.status(400).json({ success: false, message: "No quotation found for this request" });
+ 
+    const quotation = request.quotations[0];
+ 
+    // Allow on-behalf approval only when the quotation is sent_to_customer
+    if (!["sent_to_customer", "draft"].includes(quotation.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot approve on behalf — quotation is already '${quotation.status}'`,
+      });
+    }
+ 
+    // 1. Mark customer approval
+    quotation.customerApproval = {
+      approved:   true,
+      approvedAt: new Date(),
+      approvedBy: null, // no customer ObjectId since sales is acting on behalf
+      notes:      approvalNotes
+        ? `[On Behalf by Sales] ${approvalNotes}`
+        : `Approved on behalf of customer by ${req.user?.name || "Sales Team"}`,
+    };
+    quotation.status     = "customer_approved";
+    quotation.updatedAt  = new Date();
+ 
+    // 2. Update request status
+    request.status       = "quotation_customer_approved";
+ 
+    // 3. Update customer info if overrides provided
+    if (customerInfoOverride) {
+      if (customerInfoOverride.address)
+        request.customerInfo.address = customerInfoOverride.address;
+      if (customerInfoOverride.city)
+        request.customerInfo.city = customerInfoOverride.city;
+      if (customerInfoOverride.postalCode)
+        request.customerInfo.postalCode = customerInfoOverride.postalCode;
+      if (customerInfoOverride.deliveryDeadline)
+        request.customerInfo.deliveryDeadline = new Date(customerInfoOverride.deliveryDeadline);
+      if (customerInfoOverride.preferredContactMethod)
+        request.customerInfo.preferredContactMethod = customerInfoOverride.preferredContactMethod;
+      if (customerInfoOverride.description !== undefined)
+        request.customerInfo.description = customerInfoOverride.description;
+    }
+ 
+    // 4. Record payment submission
+    let paymentUpdated = false;
+    if (payment && payment.submittedAmount > 0) {
+      const submission = {
+        paymentStepNumber: payment.paymentStepNumber || 1,
+        submissionDate:    new Date(),
+        submittedAmount:   Number(payment.submittedAmount),
+        paymentMethod:     payment.paymentMethod,
+        transactionId:     payment.transactionId || "",
+        utrNumber:         payment.utrNumber || "",
+        receiptImage:      payment.receiptImage || "",
+        additionalNotes:   payment.additionalNotes || "",
+        submittedBy:       null, // on behalf
+        status:            "verified", // sales-recorded payments are auto-verified
+        verifiedBy:        req.user?.id,
+        verifiedAt:        new Date(),
+        verificationNotes: `Recorded on behalf of customer by ${req.user?.name || "Sales Team"}`,
+      };
+ 
+      quotation.paymentSubmissions = quotation.paymentSubmissions || [];
+      quotation.paymentSubmissions.push(submission);
+ 
+      // Update the payment schedule step status
+      const step = quotation.paymentSchedule.find(
+        (p) => p.stepNumber === submission.paymentStepNumber
+      );
+      if (step) {
+        step.paidAmount = (step.paidAmount || 0) + submission.submittedAmount;
+        step.paidDate   = new Date();
+        if (step.paidAmount >= step.amount) step.status = "paid";
+        else step.status = "partially_paid";
+        step.paymentMethod = payment.paymentMethod;
+      }
+ 
+      // Update top-level payment tracking
+      request.totalPaidAmount  = (request.totalPaidAmount || 0) + submission.submittedAmount;
+      request.lastPaymentDate  = new Date();
+ 
+      paymentUpdated = true;
+    }
+ 
+    // 5. Add note
+    request.notes = request.notes || [];
+    request.notes.push({
+      text:       `Quotation approved on behalf of customer by ${req.user?.name || "Sales Team"}.${paymentUpdated ? ` Advance payment of ₹${payment.submittedAmount} recorded (${payment.paymentMethod}).` : ""}`,
+      addedBy:    req.user?.id,
+      addedByModel: "SalesDepartment",
+      createdAt:  new Date(),
+    });
+ 
+    request.updatedAt = new Date();
+    await request.save();
+ 
+    res.json({
+      success: true,
+      message: `Quotation approved on behalf of customer.${paymentUpdated ? " Advance payment recorded." : ""}`,
+      request,
+    });
+  } catch (error) {
+    console.error("Error in approve-on-behalf:", error);
+    res.status(500).json({ success: false, message: "Server error while processing on-behalf approval" });
+  }
+});
+ 
+ 
+// ═══════════════════════════════════════════════════════════════════════════════
+// RECORD A PAYMENT STEP (sales-side manual recording)
+//
+// POST /api/cms/sales/requests/:requestId/record-payment
+//
+// Body:
+//   {
+//     paymentStepNumber: number,
+//     submittedAmount:   number,
+//     paymentMethod:     string,
+//     transactionId:     string,
+//     utrNumber:         string,
+//     receiptImage:      string,
+//     additionalNotes:   string,
+//   }
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post("/requests/:requestId/record-payment", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const {
+      paymentStepNumber, submittedAmount, paymentMethod,
+      transactionId, utrNumber, receiptImage, additionalNotes,
+    } = req.body;
+ 
+    if (!submittedAmount || submittedAmount <= 0)
+      return res.status(400).json({ success: false, message: "Amount must be greater than zero" });
+    if (!paymentMethod)
+      return res.status(400).json({ success: false, message: "Payment method is required" });
+ 
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+ 
+    if (request.quotations.length === 0)
+      return res.status(400).json({ success: false, message: "No quotation found for this request" });
+ 
+    const quotation = request.quotations[0];
+ 
+    const submission = {
+      paymentStepNumber: paymentStepNumber || 1,
+      submissionDate:    new Date(),
+      submittedAmount:   Number(submittedAmount),
+      paymentMethod,
+      transactionId:     transactionId || "",
+      utrNumber:         utrNumber || "",
+      receiptImage:      receiptImage || "",
+      additionalNotes:   additionalNotes || "",
+      submittedBy:       null,
+      status:            "verified", // sales-recorded = auto verified
+      verifiedBy:        req.user?.id,
+      verifiedAt:        new Date(),
+      verificationNotes: `Recorded by sales: ${req.user?.name || "Sales Team"}`,
+    };
+ 
+    quotation.paymentSubmissions = quotation.paymentSubmissions || [];
+    quotation.paymentSubmissions.push(submission);
+ 
+    // Update schedule step
+    const step = quotation.paymentSchedule.find(
+      (p) => p.stepNumber === submission.paymentStepNumber
+    );
+    if (step) {
+      step.paidAmount    = (step.paidAmount || 0) + submission.submittedAmount;
+      step.paidDate      = new Date();
+      step.paymentMethod = paymentMethod;
+      if (step.paidAmount >= step.amount) step.status = "paid";
+      else if (step.paidAmount > 0) step.status = "partially_paid";
+    }
+ 
+    // Top-level totals
+    request.totalPaidAmount = (request.totalPaidAmount || 0) + submission.submittedAmount;
+    request.lastPaymentDate = new Date();
+ 
+    request.notes = request.notes || [];
+    request.notes.push({
+      text:         `Payment of ₹${submittedAmount} recorded for Step ${paymentStepNumber} by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
+      addedBy:      req.user?.id,
+      addedByModel: "SalesDepartment",
+      createdAt:    new Date(),
+    });
+ 
+    request.updatedAt = new Date();
+    await request.save();
+ 
+    res.json({ success: true, message: "Payment recorded successfully", request });
+  } catch (error) {
+    console.error("Error in record-payment:", error);
+    res.status(500).json({ success: false, message: "Server error while recording payment" });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET /requests/:requestId/po-breakdown
 // (unchanged)
