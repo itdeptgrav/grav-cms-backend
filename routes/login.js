@@ -1,3 +1,16 @@
+// routes/login.js
+//
+// Main CMS login route — authenticates all non-accountant-module users.
+//
+// ─── FIX (auth-fix v3) ────────────────────────────────────────────────────────
+// Added `token` to the JSON response body.  The token was already being signed
+// and set as an HttpOnly cookie — we now ALSO return it in the body so the
+// frontend (app/login/page.js) can save it to localStorage under "acc_token".
+// This is needed so the accountant module's lib/api.js can inject it as an
+// Authorization: Bearer header the very first time the browser hits /accountant,
+// before sync-legacy has had a chance to run and issue an accountant_token.
+// ──────────────────────────────────────────────────────────────────────────────
+
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
@@ -105,6 +118,8 @@ router.post("/login", async (req, res) => {
         employeeId: user.employeeId,
         userType: userModel,
         name: user.name,
+        // Include email so sync-legacy can identify the user without a DB lookup
+        email: user.email || "",
       },
       process.env.JWT_SECRET || "grav_clothing_secret_key",
       { expiresIn: "7d" },
@@ -115,7 +130,7 @@ router.post("/login", async (req, res) => {
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? "none" : "lax",
-      maxAge: 24 * 60 * 60 * 1000,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days — matches JWT expiresIn
     });
 
     let redirectPath = "/";
@@ -141,6 +156,12 @@ router.post("/login", async (req, res) => {
       success: true,
       message: "Login successful",
       redirectTo: redirectPath,
+      // ── FIX: return token in body ──────────────────────────────────────
+      // Used by app/login/page.js to save to localStorage("acc_token") so
+      // the accountant module's lib/api.js can inject it as Bearer header.
+      // Matches the pattern already used by /api/accountant/auth/login.
+      token,
+      // ──────────────────────────────────────────────────────────────────
       userType: userModel,
       user: {
         id: user._id,
