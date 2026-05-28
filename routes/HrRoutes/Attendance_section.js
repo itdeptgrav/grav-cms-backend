@@ -3507,14 +3507,50 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     // P/CL → L-CL, L-CL → P/CL, anything → P/LWP refund, etc).
     // P/LWP is NOT in leaveAmountForStatus → contributes no balance change
     // (its 0.5-day pay deduction is handled by the payroll engine).
-    // Math.max(0, …) ensures balance never drops below zero.
+    //
+    // Two guard rails on the math:
+    //   • Math.max(0, …): consumed can never drop below 0 (refund safety)
+    //   • Math.min(entitlement, …): consumed can never exceed entitlement,
+    //     so an HR override on someone already at 5/5 CL stays at 5/5
+    //     instead of going to 6/5.
     try {
       const newEffective = emp.hrFinalStatus || emp.systemPrediction;
       const oldAmt = leaveAmountForStatus(oldStatus);
       const newAmt = leaveAmountForStatus(newEffective);
       const buckets = new Set([...Object.keys(oldAmt), ...Object.keys(newAmt)]);
       if (buckets.size) {
-        const empRef = emp.employeeDbId || null;
+        // Resolve the LeaveBalance reference. Older DailyAttendance entries
+        // (and entries created by applyLeaveToAttendance before the schema
+        // added employeeDbId) often have employeeDbId unset — that silently
+        // skipped the balance update and is the root cause of CL refunds
+        // not appearing on HR override. Fall back to looking up Employee
+        // by biometricId so the sync never fails quietly.
+        let empRef = emp.employeeDbId || null;
+        if (!empRef) {
+          try {
+            const empDoc = await Employee.findOne({
+              $or: [
+                { biometricId: bid },
+                { "basicInfo.biometricId": bid },
+                { "workInfo.biometricId": bid },
+              ],
+            })
+              .select("_id")
+              .lean();
+            if (empDoc) {
+              empRef = empDoc._id;
+              // Persist on the entry so future overrides skip this lookup.
+              emp.employeeDbId = empDoc._id;
+              dayDoc.markModified("employees");
+              await dayDoc.save();
+            }
+          } catch (lookupErr) {
+            console.warn(
+              `[DAY-OVERRIDE] ${bid} ${dateStr}: Employee lookup failed:`,
+              lookupErr.message,
+            );
+          }
+        }
         const year = parseInt(dateStr.split("-")[0], 10);
         if (empRef) {
           let bal = await getLeaveBalance().findOne({
@@ -3545,16 +3581,32 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
           for (const k of buckets) {
             const delta = (newAmt[k] || 0) - (oldAmt[k] || 0);
             if (delta === 0) continue;
-            const next = (bal.consumed[k] || 0) + delta;
-            bal.consumed[k] = Math.max(0, next);
+            const ent = Number(bal.entitlement?.[k] || 0);
+            const before = Number(bal.consumed?.[k] || 0);
+            const proposed = before + delta;
+            // Clamp at both ends: floor=0 (refund safety),
+            // ceiling=entitlement (can't go to 6/5).
+            const capped = Math.max(0, Math.min(ent, proposed));
+            const wasCapped = delta > 0 && proposed > ent;
+            bal.consumed[k] = capped;
             changed = true;
             console.log(
-              `[DAY-OVERRIDE] ${bid} ${dateStr}: consumed.${k} ${
-                (bal.consumed[k] || 0) - delta
-              } → ${bal.consumed[k]} (delta=${delta}, oldStatus=${oldStatus}, newStatus=${newEffective})`,
+              `[DAY-OVERRIDE] ${bid} ${dateStr}: consumed.${k} ${before} → ${capped} ` +
+                `(delta=${delta}, proposed=${proposed}, entitlement=${ent}` +
+                `${wasCapped ? ", CAPPED at entitlement" : ""}, ` +
+                `oldStatus=${oldStatus}, newStatus=${newEffective})`,
             );
           }
           if (changed) await bal.save();
+        } else {
+          // empRef still null after fallback — log loudly so HR knows the
+          // balance update was skipped and can re-link the entry.
+          console.warn(
+            `[DAY-OVERRIDE] ${bid} ${dateStr}: no Employee record found, ` +
+              `BALANCE NOT UPDATED (oldStatus=${oldStatus}, ` +
+              `newStatus=${emp.hrFinalStatus || emp.systemPrediction}). ` +
+              `Check biometricId is set on the Employee document.`,
+          );
         }
       }
     } catch (leaveErr) {
