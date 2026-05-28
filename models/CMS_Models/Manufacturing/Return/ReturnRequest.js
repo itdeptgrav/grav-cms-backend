@@ -2,16 +2,21 @@
 
 const mongoose = require("mongoose");
 
+// Product-level return dispatch tracking
 const returnProductSchema = new mongoose.Schema(
   {
-    workOrderId:       { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder",  default: null },
+    workOrderId:       { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder", default: null },
     workOrderNumber:   { type: String, default: "" },
-    stockItemId:       { type: mongoose.Schema.Types.ObjectId, ref: "StockItem",  default: null },
+    stockItemId:       { type: mongoose.Schema.Types.ObjectId, ref: "StockItem", default: null },
     variantId:         { type: String, default: "" },
     productName:       { type: String, required: true },
     productRef:        { type: String, default: "" },
     variantAttributes: [{ name: { type: String }, value: { type: String } }],
     returnQuantity:    { type: Number, required: true, min: 1 },
+    // Return dispatch tracking — set to in_progress when MO is created, dispatched when physically sent back
+    returnDispatchStatus: { type: String, enum: ["pending", "in_progress", "dispatched"], default: "pending" },
+    returnDispatchedAt:   { type: Date, default: null },
+    returnDispatchedBy:   { type: String, default: "" },
   },
   { _id: false }
 );
@@ -26,6 +31,8 @@ const returnPersonSchema = new mongoose.Schema(
     gender:           { type: String, default: "" },
     products:         [returnProductSchema],
     totalReturnUnits: { type: Number, default: 0 },
+    // Aggregated return dispatch status for this person
+    returnDispatchStatus: { type: String, enum: ["pending", "in_progress", "partial", "dispatched"], default: "pending" },
   },
   { _id: false }
 );
@@ -64,17 +71,17 @@ const returnRequestSchema = new mongoose.Schema(
 
     // Status: pending → store_processing → mo_created → completed | rejected
     status: {
-      type:    String,
-      enum:    ["pending", "store_processing", "mo_created", "completed", "rejected"],
+      type:  String,
+      enum:  ["pending", "store_processing", "mo_created", "completed", "rejected"],
       default: "pending",
-      index:   true,
+      index: true,
     },
 
     // Processing
-    processingStartedBy:   { type: mongoose.Schema.Types.ObjectId, default: null },
-    processingStartedAt:   { type: Date, default: null },
+    processingStartedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+    processingStartedAt: { type: Date, default: null },
 
-    // Final data store person finalizes before MO creation (may differ from original)
+    // Final data store person finalises before MO creation
     processedPersons:      [returnPersonSchema],
     processedBulkProducts: [returnProductSchema],
 
@@ -87,6 +94,16 @@ const returnRequestSchema = new mongoose.Schema(
     rejectedBy:      { type: mongoose.Schema.Types.ObjectId, default: null },
     rejectedAt:      { type: Date, default: null },
     rejectionReason: { type: String, trim: true, default: "" },
+
+    // Return dispatch tracking (populated after MO is created)
+    // "in_progress" = MO created, items being reworked
+    // "partial"     = some items dispatched back
+    // "dispatched"  = all items dispatched back
+    returnDispatchStatus: {
+      type: String, enum: ["pending", "in_progress", "partial", "dispatched"], default: "pending",
+    },
+    returnDispatchedAt: { type: Date, default: null },
+    returnDispatchedBy: { type: String, default: "" },
 
     notes: { type: String, trim: true, default: "" },
   },
