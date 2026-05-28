@@ -99,12 +99,19 @@ router.post("/login-password", async (req, res) => {
 // ── EXISTING: Phone-based signup ──────────────────────────────────────────────
 router.post("/signup", async (req, res) => {
   try {
-    const { name, email, phone } = req.body;
+    const { name, email, phone, password } = req.body;
 
-    if (!name || !email || !phone) {
+    if (!name || !email || !phone || !password) {
       return res.status(400).json({
         success: false,
-        message: "Name, email and phone are required",
+        message: "Name, email, phone and password are required",
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters",
       });
     }
 
@@ -119,11 +126,11 @@ router.post("/signup", async (req, res) => {
         message: "Customer already exists with this email or phone",
       });
     }
-
     const customer = await Customer.create({
       name,
       email: email.toLowerCase(),
       phone: formattedPhone,
+      password,
       isPhoneVerified: true,
       isEmailVerified: false,
     });
