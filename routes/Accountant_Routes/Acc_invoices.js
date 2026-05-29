@@ -5,6 +5,15 @@
 // This module does NOT have its own collection. Instead it reads from
 // the unified Acc_Voucher collection (voucherType: "sales") and
 // enriches each invoice with payment lifecycle data.
+//
+// ─── ADDITIONS (everything else is identical to the original) ────────────────
+// GET  /next-number      — next invoice number from Settings prefix
+//                          format: {prefix}/{4-digit-seq}/{FY-short-dash}
+//                          e.g. RC/0016/26-27
+// PUT  /:id              — edit a draft or posted invoice; handles ledger
+//                          balance reversal + reapplication in a transaction
+// PATCH/:id/status       — cancel (reverses balances) or void (does not)
+// ─────────────────────────────────────────────────────────────────────────────
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -14,6 +23,7 @@ const {
 } = require("../../models/Accountant_model/Acc_VoucherModels");
 const {
   Acc_Company,
+  Acc_Ledger, // ← added for applyLedgerBalances
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const {
   Acc_Settings,
@@ -21,6 +31,173 @@ const {
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
 router.use(accountantAuth);
+
+/* ================================================================== */
+/* NEW HELPERS (used only by the three new routes below)              */
+/* ================================================================== */
+
+function _computeFY(date) {
+  const d = new Date(date);
+  const fy = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  return `${fy}-${(fy + 1).toString().slice(2)}`;
+}
+function _fyShortDash(date) {
+  const d = new Date(date);
+  const fy = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  return `${fy.toString().slice(2)}-${(fy + 1).toString().slice(2)}`;
+}
+function _fyShortNoDash(date) {
+  const d = new Date(date);
+  const fy = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  return `${fy.toString().slice(2)}${(fy + 1).toString().slice(2)}`;
+}
+function _esc(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Next invoice number: reads Settings.numbering.invoicePrefix, scans all
+// vouchers that share the prefix, returns max_seq+1 in the new format.
+async function _nextInvoiceNum(companyId, voucherDate) {
+  const st = await Acc_Settings.findOne()
+    .select("numbering invoicePrefix invoiceStartNumber")
+    .lean();
+  const pfx = st?.numbering?.invoicePrefix || st?.invoicePrefix || "SL";
+  async function _nextInvoiceNum(companyId, voucherDate) {
+    const st = await Acc_Settings.findOne()
+      .select("numbering invoicePrefix invoiceStartNumber")
+      .lean();
+    const pfx = st?.numbering?.invoicePrefix || st?.invoicePrefix || "SL";
+
+    // ── FY suffix: use the settings override if the accountant has set one,
+    //    otherwise auto-derive from the invoice date. This lets the accountant
+    //    manually switch to "27-28" before April, or correct a wrong FY without
+    //    touching the code.
+    const fyDash = (() => {
+      const override = (st?.numbering?.fyOverride || "").trim();
+      if (override) {
+        // Normalise: accept "2627" → "26-27" as well as the canonical "26-27"
+        if (/^\d{4}$/.test(override)) {
+          return `${override.slice(0, 2)}-${override.slice(2)}`;
+        }
+        return override; // already "26-27" format
+      }
+      return _fyShortDash(voucherDate);
+    })();
+    const fyNoDash = fyDash.replace("-", "");
+
+    const pe = _esc(pfx);
+    const re1 = new RegExp(`^${pe}/(\\d+)/${_esc(fyDash)}$`);
+    const re2 = new RegExp(`^${pe}/${fyNoDash}/(\\d+)$`);
+
+    const rows = await Acc_Voucher.find({
+      companyId,
+      voucherNumber: { $regex: `^${pe}/` },
+    })
+      .select("voucherNumber")
+      .lean();
+
+    let maxSeq = 0;
+    for (const r of rows) {
+      const n = r.voucherNumber || "";
+      const m1 = n.match(re1);
+      if (m1) {
+        maxSeq = Math.max(maxSeq, parseInt(m1[1], 10));
+        continue;
+      }
+      const m2 = n.match(re2);
+      if (m2) {
+        maxSeq = Math.max(maxSeq, parseInt(m2[1], 10));
+      }
+    }
+    const floor =
+      (st?.numbering?.invoiceNextNum || st?.invoiceStartNumber || 1) - 1;
+    maxSeq = Math.max(maxSeq, floor);
+
+    return `${pfx}/${(maxSeq + 1).toString().padStart(4, "0")}/${fyDash}`;
+  }
+  const pe = _esc(pfx);
+  const re1 = new RegExp(`^${pe}/(\\d+)/${_esc(fyDash)}$`);
+  const re2 = new RegExp(`^${pe}/${fyNoDash}/(\\d+)$`); 
+
+  const rows = await Acc_Voucher.find({
+    companyId,
+    voucherNumber: { $regex: `^${pe}/` },
+  })
+    .select("voucherNumber")
+    .lean();
+
+  let maxSeq = 0;
+  for (const r of rows) {
+    const n = r.voucherNumber || "";
+    const m1 = n.match(re1);
+    if (m1) {
+      maxSeq = Math.max(maxSeq, parseInt(m1[1], 10));
+      continue;
+    }
+    const m2 = n.match(re2);
+    if (m2) {
+      maxSeq = Math.max(maxSeq, parseInt(m2[1], 10));
+    }
+  }
+  // respect manual floor from settings
+  const floor =
+    (st?.numbering?.invoiceNextNum || st?.invoiceStartNumber || 1) - 1;
+  maxSeq = Math.max(maxSeq, floor);
+
+  return `${pfx}/${(maxSeq + 1).toString().padStart(4, "0")}/${fyDash}`;
+}
+
+// Apply / reverse ledger balances. direction = +1 post, -1 reverse.
+async function _applyLedgerBalances(voucher, direction, session) {
+  const ops = [];
+  for (const entry of voucher.ledgerEntries || []) {
+    const lid = entry.ledgerId || entry.ledger;
+    if (!lid) continue;
+    const delta = (entry.signedAmount || 0) * direction;
+    ops.push({
+      updateOne: {
+        filter: { _id: lid },
+        update: { $inc: { currentBalance: delta } },
+      },
+    });
+  }
+  if (ops.length) {
+    await Acc_Ledger.bulkWrite(ops, session ? { session } : {});
+    for (const entry of voucher.ledgerEntries || []) {
+      const lid = entry.ledgerId || entry.ledger;
+      if (!lid) continue;
+      const led = await Acc_Ledger.findById(lid).session(session || null);
+      if (led) {
+        led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+        await led.save(session ? { session } : {});
+      }
+    }
+  }
+}
+
+/* ================================================================== */
+/* NEW ROUTE 1: GET /next-number                                       */
+/* ================================================================== */
+// MUST be before /:id routes so "next-number" isn't treated as an id.
+router.get("/next-number", async (req, res) => {
+  try {
+    const { companyId, date } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+    const voucherNumber = await _nextInvoiceNum(
+      companyId,
+      date ? new Date(date) : new Date(),
+    );
+    res.json({ voucherNumber });
+  } catch (e) {
+    console.error("[invoices/next-number]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================================================== */
+/* ORIGINAL HELPERS (unchanged)                                       */
+/* ================================================================== */
 
 /* ------------------------------------------------------------------ */
 /* Helper: enrich a batch of invoices with payment lifecycle data      */
@@ -119,6 +296,10 @@ async function enrichInvoices(invoices, companyId) {
     };
   });
 }
+
+/* ================================================================== */
+/* ORIGINAL ROUTES (completely unchanged)                             */
+/* ================================================================== */
 
 /* ------------------------------------------------------------------ */
 /* GET / — list invoices                                               */
@@ -1113,6 +1294,131 @@ router.get("/:id", async (req, res) => {
   } catch (e) {
     console.error("[invoices/:id]", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================================================== */
+/* NEW ROUTE 2: PUT /:id — edit a draft or posted invoice             */
+/* ================================================================== */
+router.put("/:id", async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction();
+
+    const inv = await Acc_Voucher.findOne({
+      _id: req.params.id,
+      voucherType: "sales",
+    }).session(session);
+    if (!inv) throw new Error("Invoice not found");
+
+    if (inv.status === "cancelled" || inv.status === "void") {
+      throw new Error(`Cannot edit a ${inv.status} invoice.`);
+    }
+
+    const wasPosted = inv.status === "posted";
+    if (wasPosted) await _applyLedgerBalances(inv, -1, session);
+
+    const body = req.body || {};
+    const EDITABLE = [
+      "voucherDate",
+      "partyLedgerId",
+      "partyLedgerName",
+      "partyGstin",
+      "placeOfSupply",
+      "placeOfSupplyCode",
+      "billDate",
+      "dueDate",
+      "billingAddress",
+      "shippingAddress",
+      "ledgerEntries",
+      "inventoryEntries",
+      "subtotal",
+      "discountTotal",
+      "gstBreakup",
+      "totalTax",
+      "roundOff",
+      "grandTotal",
+      "totalDebit",
+      "totalCredit",
+      "narration",
+      "referenceNumber",
+      "referenceDate",
+      "buyersOrderNumber",
+      "buyersOrderDate",
+      "dispatchDocNumber",
+      "deliveryNote",
+      "deliveryNoteDate",
+      "dispatchedThrough",
+      "destination",
+      "termsOfDelivery",
+      "paymentTerms",
+      "eWayBillDetails",
+      "eInvoiceDetails",
+      "declaration",
+    ];
+    for (const key of EDITABLE) {
+      if (body[key] !== undefined) inv[key] = body[key];
+    }
+    if (body.voucherDate) inv.financialYear = _computeFY(body.voucherDate);
+    inv.updatedBy = req.user?.id;
+
+    await inv.save({ session });
+    if (wasPosted) await _applyLedgerBalances(inv, +1, session);
+
+    await session.commitTransaction();
+    res.json({ success: true, invoice: inv });
+  } catch (e) {
+    await session.abortTransaction();
+    console.error("[invoices/put]", e);
+    res.status(400).json({ error: e.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+/* ================================================================== */
+/* NEW ROUTE 3: PATCH /:id/status — cancel or void                    */
+/* ================================================================== */
+router.patch("/:id/status", async (req, res) => {
+  const { status, reason } = req.body || {};
+  if (!["cancelled", "void"].includes(status)) {
+    return res
+      .status(400)
+      .json({ error: "status must be 'cancelled' or 'void'" });
+  }
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction();
+
+    const inv = await Acc_Voucher.findOne({
+      _id: req.params.id,
+      voucherType: "sales",
+    }).session(session);
+    if (!inv) throw new Error("Invoice not found");
+    if (inv.status === "cancelled" || inv.status === "void") {
+      throw new Error(`Invoice is already ${inv.status}`);
+    }
+
+    // Cancel reverses ledger entries; Void does not
+    if (status === "cancelled" && inv.status === "posted") {
+      await _applyLedgerBalances(inv, -1, session);
+    }
+
+    inv.status = status;
+    inv.cancelledBy = req.user?.id;
+    inv.cancelledAt = new Date();
+    inv.updatedBy = req.user?.id;
+    if (reason) inv.cancellationReason = String(reason);
+
+    await inv.save({ session });
+    await session.commitTransaction();
+    res.json({ success: true, invoice: inv });
+  } catch (e) {
+    await session.abortTransaction();
+    console.error("[invoices/status]", e);
+    res.status(400).json({ error: e.message });
+  } finally {
+    session.endSession();
   }
 });
 
