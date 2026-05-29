@@ -33,6 +33,38 @@ const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 router.use(accountantAuth);
 
 /* ================================================================== */
+/* DIAGNOSTIC — inspect what's actually stored for an invoice.         */
+/* Visit: /api/accountant/invoices/:id/debug-dispatch                  */
+/* Remove after debugging. Shows whether dispatchDetails is persisted. */
+/* MUST be before "/:id" so Express doesn't treat the suffix as an id. */
+/* ================================================================== */
+router.get("/:id/debug-dispatch", async (req, res) => {
+  try {
+    const inv = await Acc_Voucher.findById(req.params.id).lean();
+    if (!inv) return res.status(404).json({ error: "Not found" });
+    res.json({
+      voucherNumber: inv.voucherNumber,
+      status: inv.status,
+      hasDispatchDetailsField: Object.prototype.hasOwnProperty.call(
+        inv,
+        "dispatchDetails",
+      ),
+      dispatchDetails: inv.dispatchDetails || null,
+      // legacy flat fields, in case anything wrote there instead
+      flat: {
+        dispatchDocNumber: inv.dispatchDocNumber ?? null,
+        deliveryNote: inv.deliveryNote ?? null,
+        dispatchedThrough: inv.dispatchedThrough ?? null,
+        destination: inv.destination ?? null,
+        buyersOrderNumber: inv.buyersOrderNumber ?? null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================================================== */
 /* NEW HELPERS (used only by the three new routes below)              */
 /* ================================================================== */
 
@@ -117,7 +149,7 @@ async function _nextInvoiceNum(companyId, voucherDate) {
   }
   const pe = _esc(pfx);
   const re1 = new RegExp(`^${pe}/(\\d+)/${_esc(fyDash)}$`);
-  const re2 = new RegExp(`^${pe}/${fyNoDash}/(\\d+)$`); 
+  const re2 = new RegExp(`^${pe}/${fyNoDash}/(\\d+)$`);
 
   const rows = await Acc_Voucher.find({
     companyId,
@@ -729,14 +761,45 @@ router.get("/:id/download-pdf", async (req, res) => {
           .fillColor("#000")
           .text(value, x + 2, ry + 9, { width: rw - 4 });
     };
+    const dd = inv.dispatchDetails || {};
     mc(rx1, y, "Invoice No.", inv.voucherNumber);
     mc(rx2, y, "Dated", fmtDt(inv.voucherDate));
-    mc(rx1, y + cellH, "Reference No. & Date", inv.referenceNumber || "");
-    mc(rx2, y + cellH, "Other References", "");
-    mc(rx1, y + cellH * 2, "Buyer's Order No.", inv.buyersOrderNumber || "");
-    mc(rx2, y + cellH * 2, "Dated", "");
-    mc(rx1, y + cellH * 3, "Dispatch Doc No.", "");
-    mc(rx2, y + cellH * 3, "Delivery Note Date", "");
+    mc(
+      rx1,
+      y + cellH,
+      "Delivery Note",
+      dd.deliveryNoteNumbers || inv.deliveryNote || "",
+    );
+    mc(
+      rx2,
+      y + cellH,
+      "Mode/Terms of Payment",
+      inv.paymentTerms || dd.termsOfDelivery || "",
+    );
+    mc(
+      rx1,
+      y + cellH * 2,
+      "Buyer's Order No.",
+      dd.buyersOrderNumber || inv.buyersOrderNumber || "",
+    );
+    mc(
+      rx2,
+      y + cellH * 2,
+      "Dated",
+      dd.buyersOrderDate ? fmtDt(dd.buyersOrderDate) : "",
+    );
+    mc(
+      rx1,
+      y + cellH * 3,
+      "Dispatch Doc No.",
+      dd.dispatchDocNumber || inv.dispatchDocNumber || "",
+    );
+    mc(
+      rx2,
+      y + cellH * 3,
+      "Delivery Note Date",
+      dd.deliveryNoteDate ? fmtDt(dd.deliveryNoteDate) : "",
+    );
     y += sellerH;
 
     // ─── Consignee ───
@@ -767,8 +830,13 @@ router.get("/:id/download-pdf", async (req, res) => {
           L + 2,
           y + 27,
         );
-    mc(rx1, y, "Dispatched through", "");
-    mc(rx2, y, "Destination", "");
+    mc(
+      rx1,
+      y,
+      "Dispatched through",
+      dd.dispatchedThrough || inv.dispatchedThrough || "",
+    );
+    mc(rx2, y, "Destination", dd.destination || inv.destination || "");
     y += consH;
 
     // ─── Buyer ───
@@ -803,6 +871,28 @@ router.get("/:id/download-pdf", async (req, res) => {
       .font("Helvetica")
       .fillColor("#666")
       .text("Terms of Delivery", rx1 + 2, y + 1);
+    // Carrier / LR-RR / vehicle details + terms of delivery text, stacked in
+    // the right half of the buyer row (mirrors Tally's layout).
+    {
+      const transportBits = [];
+      if (dd.carrierName) transportBits.push(`Carrier: ${dd.carrierName}`);
+      if (dd.billOfLadingNumber)
+        transportBits.push(`LR/RR: ${dd.billOfLadingNumber}`);
+      if (dd.motorVehicleNumber)
+        transportBits.push(`Vehicle: ${dd.motorVehicleNumber}`);
+      if (dd.dispatchDate)
+        transportBits.push(`Date: ${fmtDt(dd.dispatchDate)}`);
+      const termsText = dd.termsOfDelivery || inv.termsOfDelivery || "";
+      const rightLines = [];
+      if (termsText) rightLines.push(termsText);
+      if (transportBits.length) rightLines.push(transportBits.join("  ·  "));
+      if (rightLines.length)
+        doc
+          .fontSize(7)
+          .font("Helvetica")
+          .fillColor("#000")
+          .text(rightLines.join("\n"), rx1 + 2, y + 9, { width: W * 0.5 - 6 });
+    }
     y += buyH;
 
     // ─── Line Items ───
@@ -1229,6 +1319,38 @@ router.get("/:id", async (req, res) => {
 
     const [enriched] = await enrichInvoices([inv], inv.companyId);
 
+    // ── Flatten dispatchDetails onto the invoice ──────────────────────────────
+    // The React-PDF invoice generator (components/accountant/InvoicePDFGenerator.js)
+    // reads FLAT fields (invoice.dispatchDocNumber, invoice.dispatchedThrough,
+    // invoice.destination, invoice.deliveryNote, invoice.buyersOrderNumber,
+    // invoice.termsOfDelivery, …) but the sales form saves these NESTED under
+    // `dispatchDetails`. We copy the nested values up to the flat names the PDF
+    // expects (only when a flat value isn't already set), so the PDF and the
+    // on-screen detail render the dispatch data without changing the frontend.
+    const dd = enriched.dispatchDetails || {};
+    const flatFromDispatch = {
+      deliveryNote: enriched.deliveryNote || dd.deliveryNoteNumbers || "",
+      deliveryNoteDate:
+        enriched.deliveryNoteDate || dd.deliveryNoteDate || null,
+      buyersOrderNumber:
+        enriched.buyersOrderNumber || dd.buyersOrderNumber || "",
+      buyersOrderDate: enriched.buyersOrderDate || dd.buyersOrderDate || null,
+      dispatchDocNumber:
+        enriched.dispatchDocNumber || dd.dispatchDocNumber || "",
+      dispatchedThrough:
+        enriched.dispatchedThrough || dd.dispatchedThrough || "",
+      destination: enriched.destination || dd.destination || "",
+      otherReferences: enriched.otherReferences || dd.otherReferences || "",
+      termsOfDelivery: enriched.termsOfDelivery || dd.termsOfDelivery || "",
+      carrierName: enriched.carrierName || dd.carrierName || "",
+      billOfLadingNumber:
+        enriched.billOfLadingNumber || dd.billOfLadingNumber || "",
+      motorVehicleNumber:
+        enriched.motorVehicleNumber || dd.motorVehicleNumber || "",
+      dispatchDate: enriched.dispatchDate || dd.dispatchDate || null,
+    };
+    Object.assign(enriched, flatFromDispatch);
+
     const [company, settings] = await Promise.all([
       Acc_Company.findById(inv.companyId)
         .select("companyName address contact gstin pan cin tan")
@@ -1351,6 +1473,7 @@ router.put("/:id", async (req, res) => {
       "dispatchedThrough",
       "destination",
       "termsOfDelivery",
+      "dispatchDetails",
       "paymentTerms",
       "eWayBillDetails",
       "eInvoiceDetails",
