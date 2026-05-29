@@ -470,6 +470,63 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     request.taxSummary = { totalGST, sgst: totalGST / 2, cgst: totalGST / 2, igst: 0 };
     request.quotationValidUntil = new Date(quotationData.validUntil);
     request.updatedAt = new Date();
+ 
+    // ── Sync request.items when flagged by frontend ──────────────────────────
+    if (quotationData._syncRequestItems) {
+      console.log(`[quotationRoutes] _syncRequestItems triggered — ${itemsWithCalculations.length} item(s) in quotation`);
+ 
+      const attrsMatch = (a = [], b = []) => {
+        if (a.length !== b.length) return false;
+        return a.every(qa => b.some(va => va.name === qa.name && va.value === qa.value));
+      };
+ 
+      for (const qItem of itemsWithCalculations) {
+        const qSid = (qItem.stockItemId?._id || qItem.stockItemId)?.toString();
+ 
+        // Find the matching request item by stockItemId
+        const reqItem = request.items.find(i => {
+          const iSid = (i.stockItemId?._id || i.stockItemId)?.toString();
+          return iSid === qSid;
+        });
+ 
+        if (reqItem) {
+          // Find matching variant by attributes
+          const qAttrs  = qItem.attributes || [];
+          const variant = qAttrs.length > 0
+            ? (reqItem.variants.find(v => attrsMatch(v.attributes || [], qAttrs)) || reqItem.variants[0])
+            : reqItem.variants[0];
+ 
+          if (variant && variant.quantity !== qItem.quantity) {
+            console.log(`[quotationRoutes] Qty sync: "${reqItem.stockItemName || reqItem.mpcDisplayName}" ${variant.quantity} → ${qItem.quantity}`);
+            variant.quantity = qItem.quantity;
+          }
+          // Recalc totalQuantity for the item
+          reqItem.totalQuantity = reqItem.variants.reduce((s, v) => s + (v.quantity || 0), 0);
+ 
+        } else if (qItem._isNew) {
+          // Product was added via search inside the quotation builder — add it to request.items
+          console.log(`[quotationRoutes] New item added to request.items from quotation: "${qItem.itemName}"`);
+          request.items.push({
+            stockItemId:        qItem.stockItemId,
+            stockItemName:      qItem.description || qItem.itemName || "",
+            stockItemReference: qItem.itemCode    || "",
+            mpcDisplayName:     qItem.itemName    || "",
+            genderCategory:     qItem.genderCategory || "",
+            variants: [{
+              attributes:          qItem.attributes || [],
+              quantity:            qItem.quantity,
+              estimatedPrice:      parseFloat((qItem.priceIncludingGST || 0).toFixed(2)),
+              specialInstructions: [],
+            }],
+            totalQuantity:      qItem.quantity,
+            totalEstimatedPrice: parseFloat((qItem.priceIncludingGST || 0).toFixed(2)),
+          });
+        }
+      }
+      request.markModified("items");
+      console.log(`[quotationRoutes] request.items sync complete — ${request.items.length} total item(s)`);
+    }
+ 
     await request.save();
 
     res.json({ success: true, message: existingQuotation ? "Quotation updated successfully" : "Quotation created successfully", quotation: currentQuotation, request });
@@ -1183,6 +1240,12 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
       : "Quotation approved but no work orders were created";
     if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
 
+    try {
+      await CustomerEmailService.sendSalesApprovalEmail(request, quotation);
+    } catch (emailErr) {
+      console.error("[sales-approve] Approval notification email failed:", emailErr.message);
+    }
+ 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
@@ -1813,11 +1876,21 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
         utrNumber:         payment.utrNumber || "",
         receiptImage:      payment.receiptImage || "",
         additionalNotes:   payment.additionalNotes || "",
-        submittedBy:       null, // on behalf
-        status:            "verified", // sales-recorded payments are auto-verified
+        submittedBy:       null,
+        status:            "verified",
         verifiedBy:        req.user?.id,
         verifiedAt:        new Date(),
         verificationNotes: `Recorded on behalf of customer by ${req.user?.name || "Sales Team"}`,
+        // ── On-behalf audit trail ───────────────────────────────────────
+        isOnBehalf:            true,
+        onBehalfCustomerName:  request.customerInfo?.name || "",
+        recordedByName:        req.user?.name || "Sales Team",
+        recordedById:          req.user?.id || null,
+        signatoryName:         payment.signatoryName  || "",
+        signatoryContact:      payment.signatoryContact || "",
+        authorizationNote:     payment.authorizationNote || "",
+        digitalSignature:      payment.digitalSignature  || "",
+        recordedAt:            payment.recordedAt ? new Date(payment.recordedAt) : new Date(),
       };
  
       quotation.paymentSubmissions = quotation.paymentSubmissions || [];
@@ -1854,6 +1927,16 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
     request.updatedAt = new Date();
     await request.save();
  
+    // Notify customer about the payment recorded on their behalf
+    if (paymentUpdated) {
+      try {
+        const lastSubmission = quotation.paymentSubmissions[quotation.paymentSubmissions.length - 1];
+        await CustomerEmailService.sendPaymentRecordedEmail(request, quotation, lastSubmission, true);
+      } catch (emailErr) {
+        console.error("[approve-on-behalf] Payment notification email failed:", emailErr.message);
+      }
+    }
+ 
     res.json({
       success: true,
       message: `Quotation approved on behalf of customer.${paymentUpdated ? " Advance payment recorded." : ""}`,
@@ -1888,6 +1971,8 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
     const {
       paymentStepNumber, submittedAmount, paymentMethod,
       transactionId, utrNumber, receiptImage, additionalNotes,
+      signatoryName, signatoryContact, authorizationNote,
+      digitalSignature, recordedAt,
     } = req.body;
  
     if (!submittedAmount || submittedAmount <= 0)
@@ -1913,10 +1998,20 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
       receiptImage:      receiptImage || "",
       additionalNotes:   additionalNotes || "",
       submittedBy:       null,
-      status:            "verified", // sales-recorded = auto verified
+      status:            "verified",
       verifiedBy:        req.user?.id,
       verifiedAt:        new Date(),
       verificationNotes: `Recorded by sales: ${req.user?.name || "Sales Team"}`,
+      // ── Audit trail ──────────────────────────────────────────────────
+      isOnBehalf:            false,
+      onBehalfCustomerName:  request.customerInfo?.name || "",
+      recordedByName:        req.user?.name || "Sales Team",
+      recordedById:          req.user?.id || null,
+      signatoryName:         signatoryName  || "",
+      signatoryContact:      signatoryContact || "",
+      authorizationNote:     authorizationNote || "",
+      digitalSignature:      digitalSignature  || "",
+      recordedAt:            recordedAt ? new Date(recordedAt) : new Date(),
     };
  
     quotation.paymentSubmissions = quotation.paymentSubmissions || [];
@@ -1948,6 +2043,14 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
  
     request.updatedAt = new Date();
     await request.save();
+ 
+    // Notify customer about the payment recorded
+    try {
+      const lastSubmission = quotation.paymentSubmissions[quotation.paymentSubmissions.length - 1];
+      await CustomerEmailService.sendPaymentRecordedEmail(request, quotation, lastSubmission, false);
+    } catch (emailErr) {
+      console.error("[record-payment] Payment notification email failed:", emailErr.message);
+    }
  
     res.json({ success: true, message: "Payment recorded successfully", request });
   } catch (error) {
