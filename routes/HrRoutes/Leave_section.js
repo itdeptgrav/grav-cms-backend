@@ -33,6 +33,10 @@ function countCalendarDays(fromStr, toStr) {
   return Math.round((to - from) / (24 * 60 * 60 * 1000)) + 1;
 }
 
+// Calendar days since joining — Sundays INCLUDED. PL eligibility
+// (config.daysRequiredForPL, e.g. 240) is measured in calendar days, so this
+// count must include Sundays. Previously it skipped Sundays, under-counting by
+// ~1 day/week (e.g. 250 calendar days showed as 215 after dropping 35 Sundays).
 function workingDaysSince(joiningDate) {
   if (!joiningDate) return 0;
   const join = new Date(joiningDate);
@@ -41,8 +45,7 @@ function workingDaysSince(joiningDate) {
   const cur = new Date(join.getFullYear(), join.getMonth(), join.getDate());
   const end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
   while (cur <= end) {
-    const dow = cur.getDay();
-    if (dow !== 0) count++;
+    count++; // every calendar day counts, Sundays included
     cur.setDate(cur.getDate() + 1);
   }
   return count;
