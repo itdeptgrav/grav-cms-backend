@@ -387,6 +387,21 @@ router.post("/work-orders/assign-deadlines-batch", async (req, res) => {
   }
 });
 
+router.get("/requests/:requestId/employee-progress", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const progress = await EmployeeProductionProgress.find({
+      manufacturingOrderId: requestId,
+    })
+      .populate("workOrderId", "stockItemName stockItemReference workOrderNumber variantAttributes")
+      .lean();
+    res.json({ success: true, progress });
+  } catch (err) {
+    console.error("Employee progress fetch error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/requests/:requestId/work-orders", async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -471,60 +486,113 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     request.quotationValidUntil = new Date(quotationData.validUntil);
     request.updatedAt = new Date();
  
-    // ── Sync request.items when flagged by frontend ──────────────────────────
+    // ── Sync request.items + customerInfo when flagged by frontend ───────────
     if (quotationData._syncRequestItems) {
       console.log(`[quotationRoutes] _syncRequestItems triggered — ${itemsWithCalculations.length} item(s) in quotation`);
  
       const attrsMatch = (a = [], b = []) => {
+        if (!a || !b) return false;
         if (a.length !== b.length) return false;
         return a.every(qa => b.some(va => va.name === qa.name && va.value === qa.value));
       };
  
+      // ── 1. Sync customer info if provided ──────────────────────────────────
+      if (quotationData.customerInfo) {
+        const ci = quotationData.customerInfo;
+        const fields = ["name", "email", "phone", "address", "city", "postalCode",
+                        "deliveryDeadline", "preferredContactMethod", "description"];
+        fields.forEach(f => {
+          if (ci[f] !== undefined && ci[f] !== null) {
+            request.customerInfo[f] = ci[f];
+          }
+        });
+        request.markModified("customerInfo");
+        console.log(`[quotationRoutes] customerInfo synced — name: ${ci.name}`);
+      }
+ 
+      // ── 2. Build set of stockItemIds still in the quotation ────────────────
+      const qItemSids = new Set(
+        itemsWithCalculations.map(qi => (qi.stockItemId?._id || qi.stockItemId)?.toString()).filter(Boolean)
+      );
+ 
+      // ── 3. Remove request items that were deleted from the quotation ────────
+      //       Only remove non-new items (items that existed before this quotation was created)
+      //       Keep items that have no corresponding quotation item and are NOT _isNew
+      const removedItems = [];
+      request.items = request.items.filter(reqItem => {
+        const iSid = (reqItem.stockItemId?._id || reqItem.stockItemId)?.toString();
+        // Keep if still present in quotation
+        if (qItemSids.has(iSid)) return true;
+        // Keep if it was never part of this quotation flow (e.g. measurement items)
+        // Only remove if this quotation explicitly had items and this one was removed
+        removedItems.push(reqItem.stockItemName || iSid);
+        return false;
+      });
+      if (removedItems.length > 0) {
+        console.log(`[quotationRoutes] Items removed from request: ${removedItems.join(", ")}`);
+      }
+ 
+      // ── 4. Sync qty + price for each quotation item ─────────────────────────
       for (const qItem of itemsWithCalculations) {
         const qSid = (qItem.stockItemId?._id || qItem.stockItemId)?.toString();
+        const qAttrs = qItem.attributes || [];
  
-        // Find the matching request item by stockItemId
+        // Find matching request item
         const reqItem = request.items.find(i => {
           const iSid = (i.stockItemId?._id || i.stockItemId)?.toString();
           return iSid === qSid;
         });
  
         if (reqItem) {
-          // Find matching variant by attributes
-          const qAttrs  = qItem.attributes || [];
+          // Find matching variant by attributes, fall back to first
           const variant = qAttrs.length > 0
-            ? (reqItem.variants.find(v => attrsMatch(v.attributes || [], qAttrs)) || reqItem.variants[0])
+            ? (reqItem.variants.find(v => attrsMatch(qAttrs, v.attributes || [])) || reqItem.variants[0])
             : reqItem.variants[0];
  
-          if (variant && variant.quantity !== qItem.quantity) {
-            console.log(`[quotationRoutes] Qty sync: "${reqItem.stockItemName || reqItem.mpcDisplayName}" ${variant.quantity} → ${qItem.quantity}`);
-            variant.quantity = qItem.quantity;
+          if (variant) {
+            const oldQty   = variant.quantity;
+            const oldPrice = variant.estimatedPrice;
+            const newPrice = parseFloat((qItem.priceIncludingGST || 0).toFixed(2));
+ 
+            if (oldQty !== qItem.quantity || oldPrice !== newPrice) {
+              console.log(
+                `[quotationRoutes] Syncing "${reqItem.stockItemName || reqItem.mpcDisplayName}": ` +
+                `qty ${oldQty}→${qItem.quantity}, price ${oldPrice}→${newPrice}`
+              );
+            }
+            variant.quantity       = qItem.quantity;
+            variant.estimatedPrice = newPrice;
           }
-          // Recalc totalQuantity for the item
-          reqItem.totalQuantity = reqItem.variants.reduce((s, v) => s + (v.quantity || 0), 0);
+ 
+          // Recalc item totals
+          reqItem.totalQuantity      = reqItem.variants.reduce((s, v) => s + (v.quantity || 0), 0);
+          reqItem.totalEstimatedPrice = parseFloat(
+            reqItem.variants.reduce((s, v) => s + (v.estimatedPrice || 0), 0).toFixed(2)
+          );
  
         } else if (qItem._isNew) {
-          // Product was added via search inside the quotation builder — add it to request.items
-          console.log(`[quotationRoutes] New item added to request.items from quotation: "${qItem.itemName}"`);
+          // New product added via quotation search — push to request.items
+          console.log(`[quotationRoutes] New item added to request: "${qItem.itemName}"`);
           request.items.push({
-            stockItemId:        qItem.stockItemId,
-            stockItemName:      qItem.description || qItem.itemName || "",
-            stockItemReference: qItem.itemCode    || "",
-            mpcDisplayName:     qItem.itemName    || "",
-            genderCategory:     qItem.genderCategory || "",
+            stockItemId:         qItem.stockItemId,
+            stockItemName:       qItem.description || qItem.itemName || "",
+            stockItemReference:  qItem.itemCode    || "",
+            mpcDisplayName:      qItem.itemName    || "",
+            genderCategory:      qItem.genderCategory || "",
             variants: [{
               attributes:          qItem.attributes || [],
               quantity:            qItem.quantity,
               estimatedPrice:      parseFloat((qItem.priceIncludingGST || 0).toFixed(2)),
               specialInstructions: [],
             }],
-            totalQuantity:      qItem.quantity,
+            totalQuantity:       qItem.quantity,
             totalEstimatedPrice: parseFloat((qItem.priceIncludingGST || 0).toFixed(2)),
           });
         }
       }
+ 
       request.markModified("items");
-      console.log(`[quotationRoutes] request.items sync complete — ${request.items.length} total item(s)`);
+      console.log(`[quotationRoutes] Sync complete — ${request.items.length} item(s) in request`);
     }
  
     await request.save();
