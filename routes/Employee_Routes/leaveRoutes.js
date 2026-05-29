@@ -59,6 +59,11 @@ function countLeaveDays(startStr, endStr) {
   return Math.round((to - from) / (24 * 60 * 60 * 1000)) + 1;
 }
 
+// Calendar days since joining — Sundays INCLUDED. Both the new-joiner waiting
+// period (config.initialWaitingDays) and PL eligibility (config.daysRequiredForPL,
+// e.g. 240) are defined in calendar days, so this count must include Sundays.
+// Previously this skipped Sundays, under-counting by ~1 day/week (e.g. 250
+// calendar days showed as 215 after dropping 35 Sundays).
 function workingDaysSinceJoining(joiningDate) {
   if (!joiningDate) return 0;
   const join = new Date(joiningDate),
@@ -67,7 +72,7 @@ function workingDaysSinceJoining(joiningDate) {
   const cur = new Date(join.getFullYear(), join.getMonth(), join.getDate()),
     end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
   while (cur <= end) {
-    if (cur.getDay() !== 0) count++;
+    count++; // every calendar day counts, Sundays included
     cur.setDate(cur.getDate() + 1);
   }
   return count;
@@ -1347,6 +1352,15 @@ router.post(
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MANAGER EDIT
+//  ✅ FIX (manager access): A manager may ONLY adjust the dates / duration of a
+//     leave (e.g. trim a 2-day leave to 1 day). They CANNOT change the leave
+//     TYPE, and the leave always stays fully of its applied type — managers
+//     never split a leave into paid + LOP. The previous version recomputed
+//     paid/lwp against balance + monthly CL cap, which silently turned (say) a
+//     2-day CL into "1 CL + 1 LOP". That behaviour is removed here.
+//       • leaveType in the request body is ignored — original type is kept.
+//       • paidDays = totalDays (LOP stays all-unpaid); lwpDays = 0.
+//       • Any balance/entitlement clamping happens later at approval time.
 // ═══════════════════════════════════════════════════════════════════════════════
 router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
   try {
@@ -1362,20 +1376,14 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
         .status(400)
         .json({ success: false, message: `Cannot edit — ${a.status}` });
 
-    const { fromDate, toDate, leaveType, reason, isHalfDay, halfDaySlot } =
-      req.body;
+    // Managers can only touch dates/duration/reason — NOT the leave type.
+    const { fromDate, toDate, reason, isHalfDay, halfDaySlot } = req.body;
+    const nType = a.leaveType; // locked to what the employee applied for
     const nF = fromDate || a.fromDate;
     const nT =
       isHalfDay || (isHalfDay === undefined && a.isHalfDay)
         ? nF
         : toDate || a.toDate;
-    const nType = leaveType || a.leaveType;
-
-    // ✅ FIX 6: Accept LOP as valid type in manager edit too
-    if (!["CL", "SL", "PL", "LOP"].includes(nType))
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid leave type" });
 
     const totalDays = (isHalfDay !== undefined ? isHalfDay : a.isHalfDay)
       ? 0.5
@@ -1397,76 +1405,19 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
         code: "OVERLAP",
       });
 
+    // Keep the leave entirely as its applied type — no manager-driven LOP split.
+    // LOP is all-unpaid by definition; every other type stays fully paid for
+    // the adjusted span. Balance/cap clamping is applied at approval, not here.
     let paidDays, lwpDays;
-
     if (nType === "LOP") {
       paidDays = 0;
       lwpDays = totalDays;
     } else {
-      const config = await LeaveConfig.getConfig();
-      const year = new Date(nF).getFullYear();
-      const bal = await ensureBalance(
-        a.employeeId,
-        year,
-        a.biometricId,
-        config,
-      );
-      const le = {
-        CL: config.clPerYear,
-        SL: config.slPerYear,
-        PL: bal.plEligible ? config.plPerYear : 0,
-      };
-      let effectiveAvailable = Math.max(0, le[nType] - bal.consumed[nType]);
-
-      if (nType === "CL") {
-        const maxCLMonth = config.maxCLPerMonth || 3;
-        const { used: clUsed } = await countMonthlyUsage(
-          a.employeeId,
-          nF,
-          "CL",
-          a._id,
-        );
-        effectiveAvailable = Math.min(
-          effectiveAvailable,
-          Math.max(0, maxCLMonth - clUsed),
-        );
-      }
-
-      const emp = await Employee.findById(a.employeeId)
-        .select("address")
-        .lean();
-      const empState = (
-        emp?.address?.current?.state ||
-        emp?.address?.permanent?.state ||
-        ""
-      )
-        .toLowerCase()
-        .trim();
-      const isOdisha = ["odisha", "orissa"].includes(empState);
-      const monthlyCap = isOdisha
-        ? config.maxLeaveDaysPerMonthOdisha || 7
-        : config.maxLeaveDaysPerMonth || 10;
-      const { used: totalMonthUsed } = await countMonthlyUsage(
-        a.employeeId,
-        nF,
-        null,
-        a._id,
-      );
-      effectiveAvailable = Math.min(
-        effectiveAvailable,
-        Math.max(0, monthlyCap - totalMonthUsed),
-      );
-
-      if (req.body.paidDays !== undefined && req.body.paidDays !== null) {
-        paidDays = Math.max(
-          0,
-          Math.min(Number(req.body.paidDays), effectiveAvailable, totalDays),
-        );
-      } else {
-        paidDays = Math.min(totalDays, effectiveAvailable);
-      }
-      lwpDays = Math.max(0, totalDays - paidDays);
+      paidDays = totalDays;
+      lwpDays = 0;
     }
+
+    const config = await LeaveConfig.getConfig();
 
     a.fromDate = nF;
     a.toDate = nT;
@@ -1480,14 +1431,13 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       a.halfDaySlot = isHalfDay ? halfDaySlot || "first_half" : null;
     }
     a.requiresDocument =
-      nType === "SL" &&
-      totalDays > (await LeaveConfig.getConfig()).slDocumentThreshold;
+      nType === "SL" && totalDays > config.slDocumentThreshold;
 
     const mgr = await Employee.findById(myId)
       .select("firstName lastName")
       .lean();
     const mgrName = mgr ? `${mgr.firstName} ${mgr.lastName}`.trim() : "Manager";
-    a.hrRemarks = `Edited by ${mgrName}: ${paidDays} ${nType} paid, ${lwpDays} LOP`;
+    a.hrRemarks = `Dates adjusted by ${mgrName}: ${nType} ${nF}→${nT} (${totalDays} day${totalDays !== 1 ? "s" : ""})`;
 
     await a.save();
 
@@ -1499,13 +1449,13 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
     ).catch((e) => console.warn("[PUSH-EDIT]", e.message));
 
     console.log(
-      `[MGR-EDIT] ${mgrName} edited leave ${a._id}: ${nType} ${nF}→${nT}, paid=${paidDays}, lwp=${lwpDays}`,
+      `[MGR-EDIT] ${mgrName} edited leave ${a._id}: ${nType} ${nF}→${nT}, totalDays=${totalDays} (type locked, no LOP split)`,
     );
 
     res.json({
       success: true,
       data: a,
-      message: `Updated: ${paidDays} ${nType} (paid) + ${lwpDays} LOP`,
+      message: `Updated: ${nType} ${nF} → ${nT} (${totalDays} day${totalDays !== 1 ? "s" : ""})`,
     });
   } catch (e) {
     console.error("[MGR-EDIT]", e);

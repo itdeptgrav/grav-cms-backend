@@ -3624,10 +3624,6 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. POST /punch-correction
-// ─────────────────────────────────────────────────────────────────────────────
-
 router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { dateStr, biometricId, punchType, action, punchTime, hrRemarks } =
@@ -5195,6 +5191,11 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     // Number of day columns we'll render. Replaces the old `lastDay`
     // which was the # of days in a single month.
     const lastDay = allDays.length;
+    // "Total Days" must reflect only the days that have actually occurred. In
+    // an in-progress month the trailing future dates are still rendered as
+    // blank day-columns (so they're part of lastDay), but they must NOT be
+    // counted as worked/paid days. elapsedDays = non-future days in the range.
+    const elapsedDays = allDays.filter((c) => !c.isFuture).length;
     function toSheetCode(status) {
       const map = {
         P: "P",
@@ -5311,6 +5312,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           PL: 0,
           NHFH: 0,
           Total: 0,
+          TotalWorking: 0,
         },
       };
       for (const cal of allDays) {
@@ -5337,19 +5339,49 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           )
             row.hrOverrides.add(cal.dateStr);
         } else if (cal.isSunday && !cal.isWorkingSunday) {
-          const didPunch = !!entry && (entry.punchCount || 0) > 0;
-          if (didPunch) {
-            const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
-            sheetCode = toSheetCode(finalStatus) || "P";
-            row.totals.P++;
-            if (
-              entry.hrFinalStatus ||
-              (entry.rawPunches || []).some(
-                (p) => p.source === "manual" || p.source === "miss_punch",
-              )
+          // Weekly off counts as WO for EVERY employee, so the WO total is the
+          // same across the whole sheet regardless of who punched on a Sunday.
+          // A worked Sunday is NOT auto-credited as Present — if the company
+          // wants to pay for it, HR manually overrides that day (e.g. to CO /
+          // comp-off) and that override is honored below.
+          const sundayOverride = entry?.hrFinalStatus || null;
+          if (sundayOverride) {
+            sheetCode = toSheetCode(sundayOverride) || "WO";
+            row.hrOverrides.add(cal.dateStr);
+            if (["P", "P*", "P~", "MP", "WFH"].includes(sundayOverride))
+              row.totals.P++;
+            else if (sundayOverride === "CO") row.totals.CO++;
+            else if (sundayOverride === "HD" || sundayOverride === "LHD")
+              row.totals.HD++;
+            else if (sundayOverride === "L-CL") row.totals.CL++;
+            else if (sundayOverride === "L-SL") row.totals.SL++;
+            else if (sundayOverride === "L-EL") row.totals.PL++;
+            else if (sundayOverride === "P/CL") {
+              row.totals.P++;
+              row.totals.CL = (row.totals.CL || 0) + 0.5;
+            } else if (sundayOverride === "P/SL") {
+              row.totals.P++;
+              row.totals.SL = (row.totals.SL || 0) + 0.5;
+            } else if (sundayOverride === "P/PL") {
+              row.totals.P++;
+              row.totals.PL = (row.totals.PL || 0) + 0.5;
+            } else if (sundayOverride === "P/LWP") {
+              row.totals.P++;
+              row.totals.A = (row.totals.A || 0) + 0.5;
+            } else if (
+              ["AB", "LWP", "LAB", "EAB"].includes(sundayOverride)
             )
-              row.hrOverrides.add(cal.dateStr);
+              row.totals.A++;
+            else if (
+              ["FH", "NH", "OH", "RH", "PH"].includes(sundayOverride)
+            )
+              row.totals.NHFH++;
+            else {
+              sheetCode = "WO";
+              row.totals.WO++;
+            }
           } else {
+            // No override → plain weekly off, counted for everyone.
             sheetCode = "WO";
             row.totals.WO++;
           }
@@ -5406,7 +5438,15 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         }
         row.dayCodes[cal.dateStr] = sheetCode;
       }
-      row.totals.Total = lastDay - row.totals.A;
+      // "Total Days" = calendar days in the period that have actually elapsed
+      //   (future days of an in-progress month are excluded so they don't
+      //   inflate the count).
+      // "Total Working Days" = elapsed days minus full absences minus half of
+      //   each half-day. row.totals.A already includes the 0.5 contributed by
+      //   each P/LWP, so its unpaid half is deducted automatically.
+      row.totals.Total = elapsedDays;
+      row.totals.TotalWorking =
+        elapsedDays - row.totals.A - row.totals.HD * 0.5;
       return row;
     }
     const processedBids = new Set();
@@ -5484,9 +5524,10 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       "PL",
       "NH/FH",
       "Total Days",
+      "Total Working Days",
     ];
     sumCols.forEach((_, i) => {
-      ws.getColumn(sumStart + i).width = 7;
+      ws.getColumn(sumStart + i).width = i >= sumCols.length - 2 ? 11 : 7;
     });
     const totalCols = 4 + lastDay + sumCols.length;
     ws.mergeCells(1, 1, 1, totalCols);
@@ -5776,7 +5817,9 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       const vals = [
         emp.totals.P,
         emp.totals.A,
-        emp.totals.HD,
+        // HD is stored as a count of half-days; display it in DAY units so
+        // 1 HD → 0.5, 2 → 1, 3 → 1.5, etc. (a half-day is half a day).
+        emp.totals.HD * 0.5,
         emp.totals.WO,
         emp.totals.CO,
         emp.totals.CL,
@@ -5784,17 +5827,22 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         emp.totals.PL,
         emp.totals.NHFH,
         emp.totals.Total,
+        emp.totals.TotalWorking,
       ];
       vals.forEach((v, si) => {
         const cell = r.getCell(sumStart + si);
         cell.value = v;
-        cell.font = { name: "Arial", size: 9, bold: si === sumCols.length - 1 };
+        cell.font = {
+          name: "Arial",
+          size: 9,
+          bold: si >= sumCols.length - 2,
+        };
         cell.alignment = { horizontal: "center", vertical: "middle" };
         const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
         cell.fill = {
           type: "pattern",
           pattern: "solid",
-          fgColor: { argb: si === sumCols.length - 1 ? "FFF4B942" : altBg },
+          fgColor: { argb: si >= sumCols.length - 2 ? "FFF4B942" : altBg },
         };
         cell.border = {
           top: { style: "thin" },
