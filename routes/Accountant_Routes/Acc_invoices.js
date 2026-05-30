@@ -94,59 +94,24 @@ async function _nextInvoiceNum(companyId, voucherDate) {
     .select("numbering invoicePrefix invoiceStartNumber")
     .lean();
   const pfx = st?.numbering?.invoicePrefix || st?.invoicePrefix || "SL";
-  async function _nextInvoiceNum(companyId, voucherDate) {
-    const st = await Acc_Settings.findOne()
-      .select("numbering invoicePrefix invoiceStartNumber")
-      .lean();
-    const pfx = st?.numbering?.invoicePrefix || st?.invoicePrefix || "SL";
 
-    // ── FY suffix: use the settings override if the accountant has set one,
-    //    otherwise auto-derive from the invoice date. This lets the accountant
-    //    manually switch to "27-28" before April, or correct a wrong FY without
-    //    touching the code.
-    const fyDash = (() => {
-      const override = (st?.numbering?.fyOverride || "").trim();
-      if (override) {
-        // Normalise: accept "2627" → "26-27" as well as the canonical "26-27"
-        if (/^\d{4}$/.test(override)) {
-          return `${override.slice(0, 2)}-${override.slice(2)}`;
-        }
-        return override; // already "26-27" format
+  // ── FY suffix: use the settings override if the accountant has set one,
+  //    otherwise auto-derive from the invoice date. This lets the accountant
+  //    manually switch to "27-28" before April, or correct a wrong FY without
+  //    touching the code.
+  const fyDash = (() => {
+    const override = (st?.numbering?.fyOverride || "").trim();
+    if (override) {
+      // Normalise: accept "2627" → "26-27" as well as the canonical "26-27"
+      if (/^\d{4}$/.test(override)) {
+        return `${override.slice(0, 2)}-${override.slice(2)}`;
       }
-      return _fyShortDash(voucherDate);
-    })();
-    const fyNoDash = fyDash.replace("-", "");
-
-    const pe = _esc(pfx);
-    const re1 = new RegExp(`^${pe}/(\\d+)/${_esc(fyDash)}$`);
-    const re2 = new RegExp(`^${pe}/${fyNoDash}/(\\d+)$`);
-
-    const rows = await Acc_Voucher.find({
-      companyId,
-      voucherNumber: { $regex: `^${pe}/` },
-    })
-      .select("voucherNumber")
-      .lean();
-
-    let maxSeq = 0;
-    for (const r of rows) {
-      const n = r.voucherNumber || "";
-      const m1 = n.match(re1);
-      if (m1) {
-        maxSeq = Math.max(maxSeq, parseInt(m1[1], 10));
-        continue;
-      }
-      const m2 = n.match(re2);
-      if (m2) {
-        maxSeq = Math.max(maxSeq, parseInt(m2[1], 10));
-      }
+      return override; // already "26-27" format
     }
-    const floor =
-      (st?.numbering?.invoiceNextNum || st?.invoiceStartNumber || 1) - 1;
-    maxSeq = Math.max(maxSeq, floor);
+    return _fyShortDash(voucherDate);
+  })();
+  const fyNoDash = fyDash.replace("-", "");
 
-    return `${pfx}/${(maxSeq + 1).toString().padStart(4, "0")}/${fyDash}`;
-  }
   const pe = _esc(pfx);
   const re1 = new RegExp(`^${pe}/(\\d+)/${_esc(fyDash)}$`);
   const re2 = new RegExp(`^${pe}/${fyNoDash}/(\\d+)$`);

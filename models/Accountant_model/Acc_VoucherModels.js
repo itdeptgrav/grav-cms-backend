@@ -395,6 +395,32 @@ const tallyVoucherSchema = new mongoose.Schema(
       transporter: { type: String, trim: true },
       vehicleNo: { type: String, trim: true },
       distance: { type: Number, default: 0 },
+
+      // Full set of e-way bill transport details, auto-saved when the e-Way
+      // Bill JSON is generated so they don't need re-entering next time.
+      // Mirrors the `overrides` object the e-way bill generator uses.
+      transporterId: { type: String, trim: true },
+      transMode: { type: Number },
+      transDistance: { type: Number },
+      transDocNo: { type: String, trim: true },
+      transDocDate: { type: String, trim: true },
+      vehicleType: { type: String, trim: true },
+      subSupplyType: { type: Number },
+      subSupplyDesc: { type: String, trim: true },
+      docType: { type: String, trim: true },
+      transType: { type: Number },
+      supplyType: { type: String, trim: true },
+      // Ship-to overrides (when consignee differs from buyer)
+      shipMatchesBill: { type: Boolean },
+      shipName: { type: String, trim: true },
+      shipGstin: { type: String, trim: true },
+      shipStateCode: { type: String, trim: true },
+      shipPincode: { type: String, trim: true },
+      shipAddr1: { type: String, trim: true },
+      shipAddr2: { type: String, trim: true },
+      shipPlace: { type: String, trim: true },
+      // Timestamp of the last time these were saved via the EWB generator
+      lastGeneratedAt: { type: Date },
     },
 
     // ─── CMS bridge ─────────────────────────────────────────────────────────
