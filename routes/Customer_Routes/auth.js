@@ -28,6 +28,36 @@ const setCustomerCookie = (res, token) => {
   });
 };
 
+
+// ── Check Phone — verify if a phone number is already registered ──────────────
+// POST /api/customer/auth/check-phone
+// Body: { phone: "9876543210" }
+router.post("/check-phone", async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) {
+      return res.status(400).json({ success: false, message: "Phone number is required" });
+    }
+
+    const formattedPhone = phone.startsWith("+91") ? phone : `+91${phone}`;
+    const customer = await Customer.findOne({ phone: formattedPhone }).select("name email phone isActive");
+
+    if (!customer) {
+      return res.json({ exists: false });
+    }
+
+    return res.json({
+      exists: true,
+      isActive: customer.isActive !== false,
+      name: customer.name,
+      email: customer.email,
+    });
+  } catch (err) {
+    console.error("[customer auth] check-phone:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // ── NEW: Email + Password login ───────────────────────────────────────────────
 // Used by sales-created customer accounts. Portal login page should use this.
 router.post("/login-password", async (req, res) => {

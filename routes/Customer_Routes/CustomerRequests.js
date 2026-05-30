@@ -355,27 +355,31 @@ router.post('/', verifyCustomerToken, async (req, res) => {
 
     // Send request confirmation email
     try {
-      CustomerEmailService.sendRequestConfirmationEmail(
+      await CustomerEmailService.sendRequestConfirmationEmail(
         {
           requestId: populatedRequest.requestId,
           createdAt: populatedRequest.createdAt,
           items: populatedRequest.items.map(item => ({
-            name: item.stockItemName,
-            reference: item.stockItemReference,
-            variants: item.variants,
-            totalQuantity: item.totalQuantity,
-            totalEstimatedPrice: item.totalEstimatedPrice
+            stockItemName:      item.stockItemName,
+            stockItemReference: item.stockItemReference,
+            totalQuantity:      item.totalQuantity,
+            totalEstimatedPrice: item.totalEstimatedPrice,
+            variants: (item.variants || []).map(v => ({
+              attributes:    v.attributes || [],
+              quantity:      v.quantity,
+              estimatedPrice: v.estimatedPrice,
+              specialInstructions: (v.specialInstructions || []).filter(i => i?.trim()),
+            })),
           })),
-          totalEstimatedPrice: populatedRequest.items.reduce((sum, item) => sum + item.totalEstimatedPrice, 0)
         },
         {
-          name: customer.name,
+          name:  customer.name,
           email: customer.email,
-          phone: customer.phone
+          phone: customer.phone,
         }
       );
     } catch (emailError) {
-      console.error('Request email sending failed:', emailError);
+      console.error('Request confirmation email failed:', emailError);
     }
 
     res.status(201).json({
