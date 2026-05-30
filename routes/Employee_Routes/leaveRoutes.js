@@ -137,6 +137,56 @@ async function countMonthlyUsage(
   return { used, monthStart, monthEnd };
 }
 
+// Decide what to do when a new leave request overlaps an existing (non-terminal)
+// one for the same employee:
+//   { action: "none" }              → no overlap, proceed normally
+//   { action: "replace", existing } → SAME type + IDENTICAL date range (and same
+//                                      half-day flag): treat as the same leave,
+//                                      never create a duplicate
+//   { action: "block", existing }   → DIFFERENT type, or overlapping but not the
+//                                      same dates: caller must reject and tell the
+//                                      user to withdraw the existing leave first
+async function resolveLeaveOverlap({
+  employeeId,
+  fromDate,
+  toDate,
+  leaveType,
+  isHalfDay,
+  excludeId,
+}) {
+  const q = {
+    employeeId,
+    status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
+    fromDate: { $lte: toDate },
+    toDate: { $gte: fromDate },
+  };
+  if (excludeId) q._id = { $ne: excludeId };
+  const existing = await LeaveApplication.findOne(q);
+  if (!existing) return { action: "none" };
+  const sameType = String(existing.leaveType) === String(leaveType);
+  const sameRange =
+    existing.fromDate === fromDate && existing.toDate === toDate;
+  const sameHalf = !!existing.isHalfDay === !!isHalfDay;
+  if (sameType && sameRange && sameHalf) return { action: "replace", existing };
+  return { action: "block", existing };
+}
+
+// Standard 409 payload telling the user to withdraw the conflicting leave first.
+function overlapBlockResponse(res, existing) {
+  return res.status(409).json({
+    success: false,
+    code: "OVERLAP_WITHDRAW_FIRST",
+    message: `You already have a ${existing.leaveType} leave from ${existing.fromDate} to ${existing.toDate}. Please withdraw that leave first, then apply again for these dates.`,
+    existing: {
+      id: existing._id,
+      leaveType: existing.leaveType,
+      fromDate: existing.fromDate,
+      toDate: existing.toDate,
+      status: existing.status,
+    },
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PUBLIC ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -587,17 +637,21 @@ router.post(
         return res
           .status(400)
           .json({ success: false, message: "No valid days" });
-      const oc = await LeaveApplication.findOne({
+      const overlap = await resolveLeaveOverlap({
         employeeId,
-        status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
-        fromDate: { $lte: toDate },
-        toDate: { $gte: fromDate },
+        fromDate,
+        toDate,
+        leaveType,
+        isHalfDay,
       });
-      if (oc)
-        return res.status(400).json({
-          success: false,
-          message: `Already has leave ${oc.fromDate}–${oc.toDate}`,
-          code: "OVERLAP",
+      if (overlap.action === "block")
+        return overlapBlockResponse(res, overlap.existing);
+      if (overlap.action === "replace")
+        return res.status(200).json({
+          success: true,
+          data: overlap.existing,
+          replaced: true,
+          message: `This employee already has a ${overlap.existing.leaveType} leave for ${overlap.existing.fromDate}–${overlap.existing.toDate}. No duplicate was created.`,
         });
 
       // ✅ FIX 3: LOP — all days are LWP, no balance deduction
@@ -846,19 +900,31 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         .status(400)
         .json({ success: false, message: "No valid leave days" });
 
-    // Overlap check (hard block)
-    const oc = await LeaveApplication.findOne({
+    // Overlap handling: same type + same dates → no duplicate (return existing);
+    // different type or different overlapping dates → block, withdraw first.
+    const overlap = await resolveLeaveOverlap({
       employeeId: req.user.id,
-      status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
-      fromDate: { $lte: toDate },
-      toDate: { $gte: fromDate },
+      fromDate,
+      toDate,
+      leaveType,
+      isHalfDay,
     });
-    if (oc)
-      return res.status(400).json({
-        success: false,
-        message: `Already have leave ${oc.fromDate}–${oc.toDate}.`,
-        code: "OVERLAP",
+    if (overlap.action === "block")
+      return overlapBlockResponse(res, overlap.existing);
+    if (overlap.action === "replace") {
+      const ex = overlap.existing;
+      // Idempotent re-apply of the exact same leave — never create a second row.
+      if (ex.status === "pending" && reason !== undefined) {
+        ex.reason = reason;
+        await ex.save();
+      }
+      return res.status(200).json({
+        success: true,
+        data: ex,
+        replaced: true,
+        message: `You already have this ${ex.leaveType} leave for ${ex.fromDate}–${ex.toDate}. No duplicate was created.`,
       });
+    }
 
     // ══════════════════════════════════════════════════════════════════
     //  LOP — no balance calculation, all days are unpaid

@@ -2766,6 +2766,17 @@ router.post("/combined/commit", async (req, res) => {
       existingLedgers.map((l) => [l.name.trim().toLowerCase(), l]),
     );
 
+    // ── Merge-into support ────────────────────────────────────────────────
+    // The import review screen lets the accountant fold a Tally ledger into an
+    // existing one (e.g. Tally "SALARY A/C" → "Office Staff"). When
+    // overrides[name].mergeIntoLedgerId is set we DON'T create the Tally
+    // ledger. Instead we point its name in ledgerByName at the target, so every
+    // voucher line referencing the Tally name resolves to the target in PHASE
+    // 3. We also add the Tally ledger's signed opening balance into the target,
+    // and record the Tally name as an alias so future re-imports auto-merge.
+    const mergeResult = { merged: 0, openingAdded: 0, errors: [] };
+    const mergeTargetById = new Map(); // id → target ledger doc (lean)
+
     const toInsert = [];
     for (const l of masters.ledgers) {
       const ov = overrides[l.name] || {};
@@ -2773,6 +2784,89 @@ router.post("/combined/commit", async (req, res) => {
         skipped.ledgers++;
         continue;
       }
+
+      // ── MERGE: fold this Tally ledger into an existing target ledger ──
+      if (ov.mergeIntoLedgerId) {
+        try {
+          let target = mergeTargetById.get(String(ov.mergeIntoLedgerId));
+          if (!target) {
+            target = await Acc_Ledger.findOne({
+              _id: ov.mergeIntoLedgerId,
+              companyId,
+            }).lean();
+            if (target)
+              mergeTargetById.set(String(ov.mergeIntoLedgerId), target);
+          }
+          if (!target) {
+            mergeResult.errors.push(
+              `${l.name}: merge target not found — imported as a normal ledger`,
+            );
+            // fall through to normal create
+          } else {
+            // Route every voucher reference for the Tally name to the target.
+            ledgerByName.set(l.name.trim().toLowerCase(), target);
+
+            // Add the Tally ledger's signed opening into the target.
+            const ovHasOpeningM = typeof ov.openingBalance === "number";
+            let signedMasterM;
+            if (ovHasOpeningM) {
+              signedMasterM = ov.openingBalance;
+            } else {
+              const magM = Math.abs(l.openingBalance || 0);
+              signedMasterM = (l.openingBalanceType === "Cr" ? -1 : 1) * magM;
+            }
+            // If the master file is closing-as-opening, the opening already
+            // contains the vouchers; strip the voucher net to avoid double
+            // count (same rule as the normal ledger path below).
+            if (haveVouchers && !ovHasOpeningM && masterIsClosingAsOpening) {
+              const vnetM =
+                voucherNetByLedger.get(l.name.trim().toLowerCase()) || 0;
+              signedMasterM = signedMasterM - vnetM;
+            }
+
+            if (Math.abs(signedMasterM) > 0.005) {
+              // Combine with the target's existing signed opening.
+              const tgtSigned =
+                (target.openingBalanceType === "Cr" ? -1 : 1) *
+                Math.abs(target.openingBalance || 0);
+              const combined = tgtSigned + signedMasterM;
+              const newOpening = Math.abs(combined);
+              const newType = combined < 0 ? "Cr" : "Dr";
+              await Acc_Ledger.updateOne(
+                { _id: target._id, companyId },
+                {
+                  $set: {
+                    openingBalance: newOpening,
+                    openingBalanceType: newType,
+                    currentBalance: newOpening,
+                    currentBalanceType: newType,
+                  },
+                  $addToSet: { aliases: l.name },
+                },
+              );
+              // Keep the cached copy + ledgerByName in sync for any further
+              // merges that target the same ledger in this run.
+              target.openingBalance = newOpening;
+              target.openingBalanceType = newType;
+              mergeResult.openingAdded++;
+            } else {
+              // No opening to add — still record the alias.
+              await Acc_Ledger.updateOne(
+                { _id: target._id, companyId },
+                { $addToSet: { aliases: l.name } },
+              );
+            }
+
+            mergeResult.merged++;
+            skipped.ledgers++; // not created as a new ledger
+            continue;
+          }
+        } catch (e) {
+          mergeResult.errors.push(`${l.name}: merge failed — ${e.message}`);
+          // fall through to normal create on error
+        }
+      }
+
       if (ledgerByName.has(l.name.trim().toLowerCase())) {
         skipped.ledgers++;
         continue;
@@ -3294,6 +3388,11 @@ router.post("/combined/commit", async (req, res) => {
           for (const a of l.aliases || [])
             if (!byNorm.has(norm(a))) byNorm.set(norm(a), l);
         }
+        // Accumulate signed closings PER target ledger. When a Tally ledger
+        // was merged into an existing one, BOTH names (the target's own name
+        // and the merged Tally name, now an alias) can appear as separate TB
+        // lines — they must SUM onto the one ledger, not overwrite each other.
+        const closingByLedger = new Map(); // id → { hit, signed, type }
         for (const tb of op.closings) {
           const hit = byNorm.get(norm(tb.name));
           if (!hit) {
@@ -3304,15 +3403,28 @@ router.post("/combined/commit", async (req, res) => {
             continue;
           }
           openingResult.matched++;
+          const key = String(hit._id);
+          const prev = closingByLedger.get(key);
+          if (prev) {
+            prev.signed += tb.closingSigned || 0;
+          } else {
+            closingByLedger.set(key, {
+              hit,
+              signed: tb.closingSigned || 0,
+            });
+          }
+        }
+        for (const { hit, signed } of closingByLedger.values()) {
+          const newType = signed < 0 ? "Cr" : "Dr";
           await Acc_Ledger.updateOne(
             { _id: hit._id, companyId },
             {
               $set: {
                 // Store signed (Dr +, Cr −) closing as the balance.
-                openingBalance: tb.closingSigned,
-                openingBalanceType: tb.closingType,
-                currentBalance: tb.closingSigned,
-                currentBalanceType: tb.closingType,
+                openingBalance: signed,
+                openingBalanceType: newType,
+                currentBalance: signed,
+                currentBalanceType: newType,
                 balanceFromTrialBalance: true,
               },
             },
@@ -3385,13 +3497,15 @@ router.post("/combined/commit", async (req, res) => {
     session.sessionErrors = errors
       .slice(0, 50)
       .map((e) => `${e.kind}: ${e.item} — ${e.reason}`);
+    session.mergeResult = mergeResult;
     await session.save();
 
     res.json({
       success: true,
-      message: `Imported ${created.groups} groups, ${created.ledgers} ledgers, ${created.vouchers} vouchers (${skipped.ledgers} ledgers already existed, ${errors.length} errors)${openingResult.applied ? `; applied ${openingResult.applied} opening balance(s)` : ""}`,
+      message: `Imported ${created.groups} groups, ${created.ledgers} ledgers, ${created.vouchers} vouchers (${skipped.ledgers} ledgers already existed, ${errors.length} errors)${openingResult.applied ? `; applied ${openingResult.applied} opening balance(s)` : ""}${mergeResult.merged ? `; merged ${mergeResult.merged} ledger(s) into existing` : ""}`,
       summary: { created, skipped, errors: errors.slice(0, 100) },
       openingBalances: openingResult,
+      mergeResult,
       sessionId: session._id,
     });
   } catch (err) {
