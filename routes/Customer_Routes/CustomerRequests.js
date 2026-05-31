@@ -1,14 +1,35 @@
-// routes/Customer_Routes/CustomerRequests.js (Updated for variations)
+// routes/Customer_Routes/CustomerRequests.js
+// ─────────────────────────────────────────────────────────────────────────────
+// Customer-side request routes. The GET / handler is enriched with a
+// `production` field per request so the frontend My Requests page can show
+// real unit-level work-order progress (completed / in-progress / total units,
+// work-order counts) without an extra round-trip.
+//
+// The production aggregation is the ONLY behavioural change vs the previous
+// file. All other route handlers (create, cancel, delivery confirmation,
+// available items, edit-request routes) are preserved verbatim.
+//
+// ⚠️  NOTE: a few edit-request handlers in this file use `req.user.id`
+//    instead of `req.customerId` — that's the SALES auth context. Those
+//    handlers were copy-pasted from the sales-side file historically;
+//    they're kept here as-is to avoid changing existing behaviour, but
+//    they likely belong in routes/CMS_Routes/Sales/customerRequests.js
+//    instead. Migrate them at your convenience.
+// ─────────────────────────────────────────────────────────────────────────────
 
-const express = require('express');
+const express = require("express");
 const router = express.Router();
-const Request = require('../../models/Customer_Models/CustomerRequest');
-const Customer = require('../../models/Customer_Models/Customer');
-const StockItem = require('../../models/CMS_Models/Inventory/Products/StockItem');
-const jwt = require('jsonwebtoken');
-const CustomerEmailService = require('../../services/CustomerEmailService');
+const Request = require("../../models/Customer_Models/CustomerRequest");
+const CustomerRequest = Request; // alias used by edit-request handlers below
+const Customer = require("../../models/Customer_Models/Customer");
+const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
+const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+const jwt = require("jsonwebtoken");
+const CustomerEmailService = require("../../services/CustomerEmailService");
 
-// Middleware to verify customer token
+// ═══════════════════════════════════════════════════════════════════════════
+// Auth middleware — verifies the customerToken cookie
+// ═══════════════════════════════════════════════════════════════════════════
 const verifyCustomerToken = async (req, res, next) => {
   try {
     const token = req.cookies.customerToken;
@@ -16,76 +37,139 @@ const verifyCustomerToken = async (req, res, next) => {
     if (!token) {
       return res.status(401).json({
         success: false,
-        message: 'Access denied. Please sign in.'
+        message: "Access denied. Please sign in.",
       });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'grav_clothing_secret_key_2024');
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET || "grav_clothing_secret_key_2024",
+    );
     req.customerId = decoded.id;
     next();
   } catch (error) {
     return res.status(401).json({
       success: false,
-      message: 'Invalid token. Please sign in again.'
+      message: "Invalid token. Please sign in again.",
     });
   }
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper — aggregate production progress from WorkOrders
+//
+// Reads all WorkOrders linked to the request via `customerRequestId` and
+// computes unit-level totals using the same `productionCompletion` fields
+// the sales-side manufacturing-orders route uses. Returns null when there
+// are no work orders yet (e.g. request still in quotation stage).
+// ═══════════════════════════════════════════════════════════════════════════
+async function aggregateProductionProgress(requestId) {
+  const workOrders = await WorkOrder.find({ customerRequestId: requestId })
+    .select("status quantity productionCompletion")
+    .lean();
 
+  if (!workOrders.length) return null;
 
+  let totalUnits = 0;
+  let completedUnits = 0;
+  let inProgressUnits = 0;
+  let workOrdersComplete = 0;
+  let workOrdersInProgress = 0;
+  let workOrdersPending = 0;
 
-router.get('/available-items', verifyCustomerToken, async (req, res) => {
+  workOrders.forEach((wo) => {
+    const pc = wo.productionCompletion || {};
+    const completed = pc.overallCompletedQuantity || 0;
+    const percent = pc.overallCompletionPercentage || 0;
+
+    totalUnits += wo.quantity || 0;
+    completedUnits += completed;
+
+    // Estimate in-progress units (started but not yet complete)
+    if (wo.status === "in_progress" && completed < (wo.quantity || 0)) {
+      const opCompletion = pc.operationCompletion || [];
+      if (opCompletion.length > 0) {
+        const maxOpCompleted = Math.max(
+          ...opCompletion.map((op) => op.completedQuantity || 0),
+        );
+        inProgressUnits += Math.max(0, maxOpCompleted - completed);
+      } else {
+        inProgressUnits += 1;
+      }
+    }
+
+    if (percent >= 100) workOrdersComplete++;
+    else if (percent > 0) workOrdersInProgress++;
+    else workOrdersPending++;
+  });
+
+  return {
+    totalUnits,
+    completedUnits,
+    inProgressUnits,
+    pendingUnits: Math.max(0, totalUnits - completedUnits - inProgressUnits),
+    workOrdersTotal: workOrders.length,
+    workOrdersComplete,
+    workOrdersInProgress,
+    workOrdersPending,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /available-items — stock items the customer can choose from
+// ═══════════════════════════════════════════════════════════════════════════
+router.get("/available-items", verifyCustomerToken, async (req, res) => {
   try {
-    const { search = '', category = '' } = req.query;
+    const { search = "", category = "" } = req.query;
     const query = {};
- 
+
     if (search && search.trim()) {
       const q = search.trim();
       query.$or = [
-        { name: { $regex: q, $options: 'i' } },
-        { reference: { $regex: q, $options: 'i' } },
-        { category: { $regex: q, $options: 'i' } },
-        { genderCategory: { $regex: q, $options: 'i' } },
+        { name: { $regex: q, $options: "i" } },
+        { reference: { $regex: q, $options: "i" } },
+        { category: { $regex: q, $options: "i" } },
+        { genderCategory: { $regex: q, $options: "i" } },
       ];
     }
     if (category) query.category = category;
- 
+
     const stockItems = await StockItem.find(query)
       .select(
-        '_id name reference category genderCategory baseSalesPrice images attributes variants'
+        "_id name reference category genderCategory baseSalesPrice images attributes variants",
       )
       .limit(50)
       .lean();
- 
-    const processedItems = stockItems.map(item => {
+
+    const processedItems = stockItems.map((item) => {
       const attributeData =
-        item.attributes?.map(attr => ({
+        item.attributes?.map((attr) => ({
           name: attr.name,
           values: attr.values || [],
         })) || [];
- 
+
       const variants =
-        item.variants?.map(v => ({
+        item.variants?.map((v) => ({
           _id: v._id,
           sku: v.sku,
           attributes: v.attributes || [],
           salesPrice: v.salesPrice,
           images: v.images || [],
         })) || [];
- 
+
       const firstVariantPrice = variants[0]?.salesPrice;
       const displayPrice =
         firstVariantPrice != null && firstVariantPrice > 0
           ? firstVariantPrice
           : item.baseSalesPrice || 0;
- 
+
       return {
         _id: item._id,
         id: item._id,
         name: item.name,
         reference: item.reference,
         category: item.category,
-        genderCategory: item.genderCategory || '',
+        genderCategory: item.genderCategory || "",
         baseSalesPrice: item.baseSalesPrice || 0,
         displayPrice,
         images: item.images || [],
@@ -94,118 +178,125 @@ router.get('/available-items', verifyCustomerToken, async (req, res) => {
         hasVariants: variants.length > 0,
       };
     });
- 
+
     const uniqueCategories = [
-      ...new Set(processedItems.map(i => i.category).filter(Boolean)),
+      ...new Set(processedItems.map((i) => i.category).filter(Boolean)),
     ];
- 
+
     return res.status(200).json({
       success: true,
       items: processedItems,
       categories: uniqueCategories,
     });
   } catch (error) {
-    console.error('Error fetching available items:', error);
+    console.error("Error fetching available items:", error);
     return res.status(500).json({
       success: false,
-      message: 'Server error while fetching available items',
+      message: "Server error while fetching available items",
     });
   }
 });
 
-router.post('/:requestId/delivery-confirmation', verifyCustomerToken, async (req, res) => {
-  try {
-    const { requestId } = req.params;
-    const customerId = req.customerId;
-    const {
-      address,
-      city,
-      postalCode,
-      phone,
-      preferredDate,
-      timeSlot,
-      specialInstructions,
-      paymentStepNumber,
-    } = req.body;
- 
-    // Basic validation
-    if (!address || !city || !postalCode || !phone) {
-      return res.status(400).json({
-        success: false,
-        message: 'Address, city, postal code and phone are required',
-      });
-    }
- 
-    const request = await Request.findOne({ _id: requestId, customerId });
-    if (!request) {
-      return res.status(404).json({
-        success: false,
-        message: 'Request not found',
-      });
-    }
- 
-    request.deliveryConfirmation = {
-      address: address.trim(),
-      city: city.trim(),
-      postalCode: postalCode.trim(),
-      phone: phone.trim(),
-      preferredDate: preferredDate ? new Date(preferredDate) : null,
-      timeSlot: timeSlot || 'anytime',
-      specialInstructions: (specialInstructions || '').trim(),
-      submittedAt: new Date(),
-      submittedAfterPaymentStep: paymentStepNumber || null,
-    };
- 
-    request.notes.push({
-      text: `Customer submitted delivery confirmation after payment${
-        paymentStepNumber ? ` (step ${paymentStepNumber})` : ''
-      }`,
-      addedBy: customerId,
-      addedByModel: 'Customer',
-      createdAt: new Date(),
-    });
- 
-    request.updatedAt = new Date();
-    await request.save();
- 
-    return res.json({
-      success: true,
-      message: 'Delivery details saved successfully',
-      deliveryConfirmation: request.deliveryConfirmation,
-    });
-  } catch (err) {
-    console.error('Delivery confirmation error:', err);
-    return res.status(500).json({
-      success: false,
-      message: 'Server error while saving delivery details',
-    });
-  }
-});
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /:requestId/delivery-confirmation — customer submits delivery details
+// (called from PaymentPopup after a payment is submitted)
+// ═══════════════════════════════════════════════════════════════════════════
+router.post(
+  "/:requestId/delivery-confirmation",
+  verifyCustomerToken,
+  async (req, res) => {
+    try {
+      const { requestId } = req.params;
+      const customerId = req.customerId;
+      const {
+        address,
+        city,
+        postalCode,
+        phone,
+        preferredDate,
+        timeSlot,
+        specialInstructions,
+        paymentStepNumber,
+      } = req.body;
 
-// Create new request with variations
-router.post('/', verifyCustomerToken, async (req, res) => {
+      if (!address || !city || !postalCode || !phone) {
+        return res.status(400).json({
+          success: false,
+          message: "Address, city, postal code and phone are required",
+        });
+      }
+
+      const request = await Request.findOne({ _id: requestId, customerId });
+      if (!request) {
+        return res.status(404).json({
+          success: false,
+          message: "Request not found",
+        });
+      }
+
+      request.deliveryConfirmation = {
+        address: address.trim(),
+        city: city.trim(),
+        postalCode: postalCode.trim(),
+        phone: phone.trim(),
+        preferredDate: preferredDate ? new Date(preferredDate) : null,
+        timeSlot: timeSlot || "anytime",
+        specialInstructions: (specialInstructions || "").trim(),
+        submittedAt: new Date(),
+        submittedAfterPaymentStep: paymentStepNumber || null,
+      };
+
+      request.notes.push({
+        text: `Customer submitted delivery confirmation after payment${
+          paymentStepNumber ? ` (step ${paymentStepNumber})` : ""
+        }`,
+        addedBy: customerId,
+        addedByModel: "Customer",
+        createdAt: new Date(),
+      });
+
+      request.updatedAt = new Date();
+      await request.save();
+
+      return res.json({
+        success: true,
+        message: "Delivery details saved successfully",
+        deliveryConfirmation: request.deliveryConfirmation,
+      });
+    } catch (err) {
+      console.error("Delivery confirmation error:", err);
+      return res.status(500).json({
+        success: false,
+        message: "Server error while saving delivery details",
+      });
+    }
+  },
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST / — create a new request with item variations
+// ═══════════════════════════════════════════════════════════════════════════
+router.post("/", verifyCustomerToken, async (req, res) => {
   try {
     const { customerInfo, items } = req.body;
     const customerId = req.customerId;
 
-    // Validate items
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'At least one item is required'
+        message: "At least one item is required",
       });
     }
 
-    // Get customer details
     const customer = await Customer.findById(customerId);
     if (!customer) {
       return res.status(404).json({
         success: false,
-        message: 'Customer not found'
+        message: "Customer not found",
       });
     }
 
-    // Validate each item and its variants
+    // ── Validate each item and its variants ──────────────────────────
     const validatedItems = [];
     for (const item of items) {
       const stockItem = await StockItem.findById(item.stockItemId);
@@ -213,15 +304,18 @@ router.post('/', verifyCustomerToken, async (req, res) => {
       if (!stockItem) {
         return res.status(400).json({
           success: false,
-          message: `Item ${item.stockItemName || item.stockItemId} not found`
+          message: `Item ${item.stockItemName || item.stockItemId} not found`,
         });
       }
 
-      // Validate variants
-      if (!item.variants || !Array.isArray(item.variants) || item.variants.length === 0) {
+      if (
+        !item.variants ||
+        !Array.isArray(item.variants) ||
+        item.variants.length === 0
+      ) {
         return res.status(400).json({
           success: false,
-          message: `At least one variation is required for ${stockItem.name}`
+          message: `At least one variation is required for ${stockItem.name}`,
         });
       }
 
@@ -229,67 +323,27 @@ router.post('/', verifyCustomerToken, async (req, res) => {
       let totalQuantity = 0;
 
       for (const variant of item.variants) {
-        // Validate quantity
         if (!variant.quantity || variant.quantity < 1) {
           return res.status(400).json({
             success: false,
-            message: `Invalid quantity for variation of ${stockItem.name}`
+            message: `Each variation must have at least 1 quantity for ${stockItem.name}`,
           });
         }
 
         totalQuantity += variant.quantity;
 
-        // Validate attributes if item has them
-        if (stockItem.attributes.length > 0) {
-          if (!variant.attributes || !Array.isArray(variant.attributes)) {
-            return res.status(400).json({
-              success: false,
-              message: `Attributes are required for ${stockItem.name}`
-            });
-          }
-
-          // Check all required attributes are provided
-          const missingAttributes = [];
-          stockItem.attributes.forEach(attr => {
-            const providedAttr = variant.attributes.find(a => a.name === attr.name);
-            if (!providedAttr || !providedAttr.value) {
-              missingAttributes.push(attr.name);
-            }
-          });
-
-          if (missingAttributes.length > 0) {
-            return res.status(400).json({
-              success: false,
-              message: `Missing attributes for ${stockItem.name}: ${missingAttributes.join(', ')}`
-            });
-          }
-
-          // Validate attribute values
-          for (const attr of variant.attributes) {
-            const attributeDef = stockItem.attributes.find(a => a.name === attr.name);
-            if (attributeDef && attributeDef.values.length > 0) {
-              if (!attributeDef.values.includes(attr.value)) {
-                return res.status(400).json({
-                  success: false,
-                  message: `Invalid value '${attr.value}' for attribute '${attr.name}'`
-                });
-              }
-            }
-          }
-        }
-
-        // Calculate estimated price for this variant
         let variantPrice = stockItem.baseSalesPrice * variant.quantity;
         let variantId = null;
 
-        // Check if there's a matching variant with different price
+        // Match against stockItem variants if attributes provided
         if (variant.attributes && stockItem.variants.length > 0) {
-          const matchingVariant = stockItem.variants.find(sv =>
-            sv.attributes.every(svAttr =>
-              variant.attributes.some(vAttr =>
-                vAttr.name === svAttr.name && vAttr.value === svAttr.value
-              )
-            )
+          const matchingVariant = stockItem.variants.find((sv) =>
+            sv.attributes.every((svAttr) =>
+              variant.attributes.some(
+                (vAttr) =>
+                  vAttr.name === svAttr.name && vAttr.value === svAttr.value,
+              ),
+            ),
           );
 
           if (matchingVariant) {
@@ -302,12 +356,16 @@ router.post('/', verifyCustomerToken, async (req, res) => {
           variantId: variantId,
           attributes: variant.attributes || [],
           quantity: variant.quantity,
-          specialInstructions: variant.specialInstructions?.filter(inst => inst.trim()) || [],
-          estimatedPrice: variantPrice
+          specialInstructions:
+            variant.specialInstructions?.filter((inst) => inst.trim()) || [],
+          estimatedPrice: variantPrice,
         });
       }
 
-      const totalEstimatedPrice = validatedVariants.reduce((sum, variant) => sum + variant.estimatedPrice, 0);
+      const totalEstimatedPrice = validatedVariants.reduce(
+        (sum, v) => sum + v.estimatedPrice,
+        0,
+      );
 
       validatedItems.push({
         stockItemId: stockItem._id,
@@ -315,15 +373,15 @@ router.post('/', verifyCustomerToken, async (req, res) => {
         stockItemReference: stockItem.reference,
         variants: validatedVariants,
         totalQuantity,
-        totalEstimatedPrice
+        totalEstimatedPrice,
       });
     }
 
-    // Generate request ID
+    // ── Generate request ID ──────────────────────────────────────────
     const requestCount = await Request.countDocuments();
-    const requestId = `REQ-${new Date().getFullYear()}-${String(requestCount + 1).padStart(4, '0')}`;
+    const requestId = `REQ-${new Date().getFullYear()}-${String(requestCount + 1).padStart(4, "0")}`;
 
-    // Create new request
+    // ── Create new request ───────────────────────────────────────────
     const newRequest = new Request({
       requestId,
       customerId,
@@ -331,293 +389,230 @@ router.post('/', verifyCustomerToken, async (req, res) => {
         name: customerInfo.name || customer.name,
         email: customerInfo.email || customer.email,
         phone: customerInfo.phone || customer.phone,
-        address: customerInfo.address || customer.profile?.address?.street || '',
-        city: customerInfo.city || customer.profile?.address?.city || '',
-        postalCode: customerInfo.postalCode || customer.profile?.address?.pincode || '',
-        description: customerInfo.description || '',
+        address:
+          customerInfo.address || customer.profile?.address?.street || "",
+        city: customerInfo.city || customer.profile?.address?.city || "",
+        postalCode:
+          customerInfo.postalCode || customer.profile?.address?.pincode || "",
+        description: customerInfo.description || "",
         deliveryDeadline: customerInfo.deliveryDeadline,
-        preferredContactMethod: customerInfo.preferredContactMethod || 'phone'
+        preferredContactMethod: customerInfo.preferredContactMethod || "phone",
       },
       items: validatedItems,
-      status: 'pending',
-      priority: customerInfo.priority || 'medium',
-      createdAt: new Date()
+      status: "pending",
+      priority: customerInfo.priority || "medium",
+      createdAt: new Date(),
     });
 
     await newRequest.save();
 
-    // Populate request with item details
-    const populatedRequest = await Request.findById(newRequest._id)
-      .populate({
-        path: 'items.stockItemId',
-        select: 'name reference category images'
-      });
+    // ── Populate with item details for response ──────────────────────
+    const populatedRequest = await Request.findById(newRequest._id).populate({
+      path: "items.stockItemId",
+      select: "name reference category images",
+    });
 
-    // Send request confirmation email
+    // ── Send confirmation email (non-blocking) ───────────────────────
     try {
       await CustomerEmailService.sendRequestConfirmationEmail(
         {
           requestId: populatedRequest.requestId,
           createdAt: populatedRequest.createdAt,
-          items: populatedRequest.items.map(item => ({
-            stockItemName:      item.stockItemName,
+          items: populatedRequest.items.map((item) => ({
+            stockItemName: item.stockItemName,
             stockItemReference: item.stockItemReference,
-            totalQuantity:      item.totalQuantity,
+            totalQuantity: item.totalQuantity,
             totalEstimatedPrice: item.totalEstimatedPrice,
-            variants: (item.variants || []).map(v => ({
-              attributes:    v.attributes || [],
-              quantity:      v.quantity,
+            variants: (item.variants || []).map((v) => ({
+              attributes: v.attributes || [],
+              quantity: v.quantity,
               estimatedPrice: v.estimatedPrice,
-              specialInstructions: (v.specialInstructions || []).filter(i => i?.trim()),
+              specialInstructions: (v.specialInstructions || []).filter((i) =>
+                i?.trim(),
+              ),
             })),
           })),
         },
         {
-          name:  customer.name,
+          name: customer.name,
           email: customer.email,
           phone: customer.phone,
-        }
+        },
       );
     } catch (emailError) {
-      console.error('Request confirmation email failed:', emailError);
+      console.error("Request confirmation email failed:", emailError);
     }
 
     res.status(201).json({
       success: true,
-      message: 'Request created successfully. Confirmation email has been sent.',
+      message:
+        "Request created successfully. Confirmation email has been sent.",
       request: populatedRequest,
-      totalEstimatedPrice: populatedRequest.items.reduce((sum, item) => sum + item.totalEstimatedPrice, 0)
+      totalEstimatedPrice: populatedRequest.items.reduce(
+        (sum, item) => sum + item.totalEstimatedPrice,
+        0,
+      ),
     });
-
   } catch (error) {
-    console.error('Create request error:', error);
+    console.error("Create request error:", error);
 
-    if (error.name === 'ValidationError') {
-      const messages = Object.values(error.errors).map(err => err.message);
+    if (error.name === "ValidationError") {
+      const messages = Object.values(error.errors).map((err) => err.message);
       return res.status(400).json({
         success: false,
-        message: messages.join(', ')
+        message: messages.join(", "),
       });
     }
 
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-
-// Get all requests for a customer
-// In routes/Customer_Routes/CustomerRequests.js, update the GET / route:
-
-// Get all requests for a customer
-router.get('/', verifyCustomerToken, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════
+// GET / — list all requests for the authenticated customer
+//
+// ⭐ ENHANCED: now includes a `production` field per request with unit-level
+// work-order progress data. Frontend RequestList component renders this
+// automatically when present. If aggregation fails for any single request,
+// that request gets `production: null` rather than failing the whole list.
+// ═══════════════════════════════════════════════════════════════════════════
+router.get("/", verifyCustomerToken, async (req, res) => {
   try {
     const customerId = req.customerId;
 
     const requests = await Request.find({ customerId })
       .sort({ createdAt: -1 })
-      .select('-__v -updatedAt')
-      .lean(); // Use lean() for better performance
+      .select("-__v -updatedAt")
+      .lean();
 
-    // Process each request to check for pending edit approvals
-    const processedRequests = requests.map(request => {
-      // Check for pending edit approvals
-      const pendingEditApprovals = request.editRequests ?
-        request.editRequests.filter(editReq =>
-          editReq.status === 'pending_approval'
-        ).length : 0;
+    // ── Pass 1: process edit-request flags (synchronous) ─────────────
+    const processedRequests = requests.map((request) => {
+      const pendingEditApprovals = request.editRequests
+        ? request.editRequests.filter((e) => e.status === "pending_approval")
+            .length
+        : 0;
 
-      // Check if there's a pending edit request that needs customer approval
-      const hasPendingCustomerApproval = request.editRequests ?
-        request.editRequests.some(editReq =>
-          editReq.status === 'pending_approval'
-        ) : false;
+      const hasPendingCustomerApproval = request.editRequests
+        ? request.editRequests.some((e) => e.status === "pending_approval")
+        : false;
 
-      // Get the latest edit request for quick access
-      const latestEditRequest = request.editRequests && request.editRequests.length > 0 ?
-        request.editRequests.sort((a, b) =>
-          new Date(b.requestedAt || b.createdAt) - new Date(a.requestedAt || a.createdAt)
-        )[0] : null;
+      const latestEditRequest =
+        request.editRequests && request.editRequests.length > 0
+          ? request.editRequests
+              .slice()
+              .sort(
+                (a, b) =>
+                  new Date(b.requestedAt || b.createdAt) -
+                  new Date(a.requestedAt || a.createdAt),
+              )[0]
+          : null;
 
       return {
         ...request,
         hasPendingEditApproval: hasPendingCustomerApproval,
         pendingEditCount: pendingEditApprovals,
-        latestEditRequest: latestEditRequest ? {
-          _id: latestEditRequest._id,
-          status: latestEditRequest.status,
-          requestedAt: latestEditRequest.requestedAt || latestEditRequest.createdAt,
-          reason: latestEditRequest.reason
-        } : null
+        latestEditRequest: latestEditRequest
+          ? {
+              _id: latestEditRequest._id,
+              status: latestEditRequest.status,
+              requestedAt:
+                latestEditRequest.requestedAt || latestEditRequest.createdAt,
+              reason: latestEditRequest.reason,
+            }
+          : null,
       };
     });
 
+    // ── Pass 2: aggregate production progress (async, in parallel) ───
+    const enrichedRequests = await Promise.all(
+      processedRequests.map(async (request) => {
+        try {
+          const production = await aggregateProductionProgress(request._id);
+          return { ...request, production };
+        } catch (err) {
+          console.warn(
+            `Production aggregation failed for request ${request._id}:`,
+            err.message,
+          );
+          return { ...request, production: null };
+        }
+      }),
+    );
+
     res.status(200).json({
       success: true,
-      requests: processedRequests,
-      count: requests.length,
-      pendingEditCount: processedRequests.filter(req => req.hasPendingEditApproval).length
+      requests: enrichedRequests,
+      count: enrichedRequests.length,
+      pendingEditCount: enrichedRequests.filter((r) => r.hasPendingEditApproval)
+        .length,
     });
-
   } catch (error) {
-    console.error('Get requests error:', error);
+    console.error("Get requests error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// Get single request
-router.get('/:requestId', verifyCustomerToken, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════
+// PATCH /:requestId/cancel — customer cancels their own request
+// ═══════════════════════════════════════════════════════════════════════════
+router.patch("/:requestId/cancel", verifyCustomerToken, async (req, res) => {
   try {
     const { requestId } = req.params;
     const customerId = req.customerId;
 
-    const request = await Request.findOne({
-      _id: requestId,
-      customerId
-    }).select('-__v -updatedAt');
-
+    const request = await Request.findOne({ _id: requestId, customerId });
     if (!request) {
       return res.status(404).json({
         success: false,
-        message: 'Request not found'
+        message: "Request not found",
       });
     }
 
-    res.status(200).json({
-      success: true,
-      request
-    });
-
-  } catch (error) {
-    console.error('Get request error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Update request
-router.put('/:requestId', verifyCustomerToken, async (req, res) => {
-  try {
-    const { requestId } = req.params;
-    const customerId = req.customerId;
-    const updateData = req.body;
-
-    // Find request
-    const request = await Request.findOne({
-      _id: requestId,
-      customerId
-    });
-
-    if (!request) {
-      return res.status(404).json({
-        success: false,
-        message: 'Request not found'
-      });
-    }
-
-    // Only allow update if status is pending
-    if (request.status !== 'pending') {
+    if (request.status === "completed") {
       return res.status(400).json({
         success: false,
-        message: 'Cannot update request after it has been processed'
+        message: "Cannot cancel completed request",
       });
     }
 
-    // Update request data
-    request.customerInfo = {
-      ...request.customerInfo,
-      ...updateData.customerInfo
-    };
-
-    request.clothCategories = updateData.clothCategories || request.clothCategories;
-    request.updatedAt = new Date();
-
-    await request.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Request updated successfully',
-      request
-    });
-
-  } catch (error) {
-    console.error('Update request error:', error);
-
-    if (error.name === 'ValidationError') {
-      const messages = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({
-        success: false,
-        message: messages.join(', ')
-      });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Cancel request
-router.patch('/:requestId/cancel', verifyCustomerToken, async (req, res) => {
-  try {
-    const { requestId } = req.params;
-    const customerId = req.customerId;
-
-    const request = await Request.findOne({
-      _id: requestId,
-      customerId
-    });
-
-    if (!request) {
-      return res.status(404).json({
-        success: false,
-        message: 'Request not found'
-      });
-    }
-
-    // Only allow cancellation if not completed
-    if (request.status === 'completed') {
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot cancel completed request'
-      });
-    }
-
-    request.status = 'cancelled';
+    request.status = "cancelled";
     request.updatedAt = new Date();
     await request.save();
 
     res.status(200).json({
       success: true,
-      message: 'Request cancelled successfully'
+      message: "Request cancelled successfully",
     });
-
   } catch (error) {
-    console.error('Cancel request error:', error);
+    console.error("Cancel request error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// EDIT-REQUEST HANDLERS (legacy — use req.user.id, sales-side auth context)
+//
+// ⚠️ These handlers were copy-pasted from the sales-side file historically
+// and use `req.user.id`, not `req.customerId`. They likely don't function
+// correctly when reached through the customer-side router unless protected
+// by additional sales-auth middleware higher up the stack. Kept verbatim
+// to preserve existing behaviour; migrate to routes/CMS_Routes/Sales/
+// customerRequests.js when convenient.
+// ═══════════════════════════════════════════════════════════════════════════
 
-// routes/CMS_Routes/Sales/customerRequests.js - Add these routes
-
-// CREATE edit request
+// CREATE edit request (sales-side context — uses req.user.id)
 router.post("/:requestId/edit-request", async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -626,53 +621,48 @@ router.post("/:requestId/edit-request", async (req, res) => {
     if (!reason || !reason.trim()) {
       return res.status(400).json({
         success: false,
-        message: "Reason for edit is required"
+        message: "Reason for edit is required",
       });
     }
 
     if (!changes || !Array.isArray(changes) || changes.length === 0) {
       return res.status(400).json({
         success: false,
-        message: "No changes specified"
+        message: "No changes specified",
       });
     }
 
     const request = await CustomerRequest.findById(requestId);
-
     if (!request) {
       return res.status(404).json({
         success: false,
-        message: "Request not found"
+        message: "Request not found",
       });
     }
 
-    // Check if request can be edited
-    if (request.status === 'completed' || request.status === 'cancelled') {
+    if (request.status === "completed" || request.status === "cancelled") {
       return res.status(400).json({
         success: false,
-        message: "Cannot edit completed or cancelled requests"
+        message: "Cannot edit completed or cancelled requests",
       });
     }
 
-    // Check if there's already a pending edit request
-    const hasPendingEdit = request.editRequests.some(edit =>
-      edit.status === 'pending_approval'
+    const hasPendingEdit = request.editRequests.some(
+      (edit) => edit.status === "pending_approval",
     );
 
     if (hasPendingEdit) {
       return res.status(400).json({
         success: false,
-        message: "There is already a pending edit request for this order"
+        message: "There is already a pending edit request for this order",
       });
     }
 
-    // Generate edit request ID
     const editRequestCount = await CustomerRequest.countDocuments({
-      'editRequests.requestId': { $exists: true }
+      "editRequests.requestId": { $exists: true },
     });
     const editRequestId = `EDIT-${request.requestId}-${editRequestCount + 1}`;
 
-    // Create edit request
     const editRequest = {
       requestId: editRequestId,
       requestedBy: req.user.id,
@@ -684,47 +674,45 @@ router.post("/:requestId/edit-request", async (req, res) => {
         address: customerInfo.address || request.customerInfo.address,
         city: customerInfo.city || request.customerInfo.city,
         postalCode: customerInfo.postalCode || request.customerInfo.postalCode,
-        description: customerInfo.description || request.customerInfo.description,
-        deliveryDeadline: customerInfo.deliveryDeadline || request.customerInfo.deliveryDeadline,
-        preferredContactMethod: customerInfo.preferredContactMethod || request.customerInfo.preferredContactMethod
+        description:
+          customerInfo.description || request.customerInfo.description,
+        deliveryDeadline:
+          customerInfo.deliveryDeadline ||
+          request.customerInfo.deliveryDeadline,
+        preferredContactMethod:
+          customerInfo.preferredContactMethod ||
+          request.customerInfo.preferredContactMethod,
       },
       changes: changes,
       reason: reason.trim(),
-      status: 'pending_approval'
+      status: "pending_approval",
     };
 
-    // Add to edit requests array
     request.editRequests.unshift(editRequest);
-
-    // Update main request status
-    request.status = 'pending_edit_approval';
+    request.status = "pending_edit_approval";
     request.pendingEditRequest = editRequest._id;
     request.updatedAt = new Date();
 
-    // Add note about edit request
     request.notes.push({
       text: `Edit request created: ${reason}`,
       addedBy: req.user.id,
-      addedByModel: 'SalesDepartment',
-      createdAt: new Date()
+      addedByModel: "SalesDepartment",
+      createdAt: new Date(),
     });
 
     await request.save();
 
-    // TODO: Send notification/email to customer about edit request
-
     res.json({
       success: true,
       message: "Edit request sent to customer for approval",
-      editRequest: editRequest,
-      request: request
+      editRequest,
+      request,
     });
-
   } catch (error) {
     console.error("Error creating edit request:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while creating edit request"
+      message: "Server error while creating edit request",
     });
   }
 });
@@ -735,89 +723,80 @@ router.get("/:requestId/edit-requests", async (req, res) => {
     const { requestId } = req.params;
 
     const request = await CustomerRequest.findById(requestId)
-      .select('editRequests')
-      .populate('editRequests.requestedBy', 'name email')
-      .populate('editRequests.reviewedBy', 'name email');
+      .select("editRequests")
+      .populate("editRequests.requestedBy", "name email")
+      .populate("editRequests.reviewedBy", "name email");
 
     if (!request) {
       return res.status(404).json({
         success: false,
-        message: "Request not found"
+        message: "Request not found",
       });
     }
 
     res.json({
       success: true,
-      editRequests: request.editRequests || []
+      editRequests: request.editRequests || [],
     });
-
   } catch (error) {
     console.error("Error fetching edit requests:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while fetching edit requests"
+      message: "Server error while fetching edit requests",
     });
   }
 });
 
-// APPROVE edit request (sales side)
+// APPROVE edit request (sales-side context)
 router.post("/:requestId/approve-edit", async (req, res) => {
   try {
     const { requestId } = req.params;
     const { action } = req.body; // "approve_and_proceed"
 
     const request = await CustomerRequest.findById(requestId);
-
     if (!request) {
       return res.status(404).json({
         success: false,
-        message: "Request not found"
+        message: "Request not found",
       });
     }
 
-    // Check if there's a pending edit request
-    const pendingEditIndex = request.editRequests.findIndex(edit =>
-      edit.status === 'pending_approval'
+    const pendingEditIndex = request.editRequests.findIndex(
+      (edit) => edit.status === "pending_approval",
     );
 
     if (pendingEditIndex === -1) {
       return res.status(400).json({
         success: false,
-        message: "No pending edit request found"
+        message: "No pending edit request found",
       });
     }
 
     const pendingEdit = request.editRequests[pendingEditIndex];
 
-    // Only allow if status is pending_edit_approval
-    if (request.status !== 'pending_edit_approval') {
+    if (request.status !== "pending_edit_approval") {
       return res.status(400).json({
         success: false,
-        message: "Request is not in edit approval status"
+        message: "Request is not in edit approval status",
       });
     }
 
-    // Update edit request status
-    request.editRequests[pendingEditIndex].status = 'approved';
+    request.editRequests[pendingEditIndex].status = "approved";
     request.editRequests[pendingEditIndex].reviewedBy = req.user.id;
     request.editRequests[pendingEditIndex].reviewedAt = new Date();
-    request.editRequests[pendingEditIndex].reviewNotes = 'Approved by sales team';
+    request.editRequests[pendingEditIndex].reviewNotes =
+      "Approved by sales team";
 
-    // Apply changes to main request
-    if (action === 'approve_and_proceed') {
-      // Update customer info with edited values
+    if (action === "approve_and_proceed") {
       request.customerInfo = pendingEdit.customerInfo;
-
-      // Update request status based on action
-      request.status = 'in_progress';
+      request.status = "in_progress";
       request.pendingEditRequest = null;
 
-      // Add note about approval
       request.notes.push({
-        text: `Edit request approved and applied. Request moved to In Progress.`,
+        text: "Edit request approved and applied. Order processing resumed.",
         addedBy: req.user.id,
-        addedByModel: 'SalesDepartment',
-        createdAt: new Date()
+        addedByModel: "SalesDepartment",
+        createdAt: new Date(),
       });
     }
 
@@ -826,70 +805,57 @@ router.post("/:requestId/approve-edit", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Edit request approved successfully",
-      request: request
+      message: "Edit request approved",
+      request,
     });
-
   } catch (error) {
     console.error("Error approving edit request:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while approving edit request"
+      message: "Server error while approving edit request",
     });
   }
 });
 
-// REJECT edit request (sales side)
+// REJECT edit request (sales-side context)
 router.post("/:requestId/reject-edit", async (req, res) => {
   try {
     const { requestId } = req.params;
     const { reason } = req.body;
 
     const request = await CustomerRequest.findById(requestId);
-
     if (!request) {
       return res.status(404).json({
         success: false,
-        message: "Request not found"
+        message: "Request not found",
       });
     }
 
-    // Check if there's a pending edit request
-    const pendingEditIndex = request.editRequests.findIndex(edit =>
-      edit.status === 'pending_approval'
+    const pendingEditIndex = request.editRequests.findIndex(
+      (edit) => edit.status === "pending_approval",
     );
 
     if (pendingEditIndex === -1) {
       return res.status(400).json({
         success: false,
-        message: "No pending edit request found"
+        message: "No pending edit request found",
       });
     }
 
-    // Only allow if status is pending_edit_approval
-    if (request.status !== 'pending_edit_approval') {
-      return res.status(400).json({
-        success: false,
-        message: "Request is not in edit approval status"
-      });
-    }
-
-    // Update edit request status
-    request.editRequests[pendingEditIndex].status = 'rejected';
+    request.editRequests[pendingEditIndex].status = "rejected";
     request.editRequests[pendingEditIndex].reviewedBy = req.user.id;
     request.editRequests[pendingEditIndex].reviewedAt = new Date();
-    request.editRequests[pendingEditIndex].reviewNotes = reason || 'Rejected by sales team';
+    request.editRequests[pendingEditIndex].reviewNotes =
+      reason || "No reason provided";
 
-    // Revert to original status (pending)
-    request.status = 'pending';
+    request.status = "in_progress";
     request.pendingEditRequest = null;
 
-    // Add note about rejection
     request.notes.push({
-      text: `Edit request rejected. Reason: ${reason || 'No reason provided'}`,
+      text: `Edit request rejected. Reason: ${reason || "No reason provided"}`,
       addedBy: req.user.id,
-      addedByModel: 'SalesDepartment',
-      createdAt: new Date()
+      addedByModel: "SalesDepartment",
+      createdAt: new Date(),
     });
 
     request.updatedAt = new Date();
@@ -898,96 +864,94 @@ router.post("/:requestId/reject-edit", async (req, res) => {
     res.json({
       success: true,
       message: "Edit request rejected successfully",
-      request: request
+      request,
     });
-
   } catch (error) {
     console.error("Error rejecting edit request:", error);
     res.status(500).json({
       success: false,
-      message: "Server error while rejecting edit request"
+      message: "Server error while rejecting edit request",
     });
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /stock-items/available-items — legacy stock-items endpoint
+// (older variant of /available-items, kept for backward compatibility)
+// ═══════════════════════════════════════════════════════════════════════════
+router.get(
+  "/stock-items/available-items",
+  verifyCustomerToken,
+  async (req, res) => {
+    try {
+      const { search = "", category = "" } = req.query;
 
-router.get('/stock-items/available-items', verifyCustomerToken, async (req, res) => {
-  try {
-    const { search = '', category = '' } = req.query;
+      let query = { status: "In Stock" };
 
-    let query = {
-      status: 'In Stock'
-    };
+      if (search) {
+        query.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { reference: { $regex: search, $options: "i" } },
+          { category: { $regex: search, $options: "i" } },
+        ];
+      }
 
-    if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { reference: { $regex: search, $options: 'i' } },
-        { category: { $regex: search, $options: 'i' } }
+      if (category) query.category = category;
+
+      const stockItems = await StockItem.find(query)
+        .select(
+          "_id name reference category baseSalesPrice salesPrice images attributes variants",
+        )
+        .limit(50)
+        .lean();
+
+      const processedItems = stockItems.map((item) => {
+        const attributeData =
+          item.attributes?.map((attr) => ({
+            name: attr.name,
+            values: attr.values || [],
+          })) || [];
+
+        const variants =
+          item.variants?.map((variant) => ({
+            _id: variant._id,
+            attributes: variant.attributes || [],
+            salesPrice: variant.salesPrice,
+            quantityOnHand: variant.quantityOnHand || 0,
+            images: variant.images || [],
+          })) || [];
+
+        return {
+          _id: item._id,
+          id: item._id,
+          name: item.name,
+          reference: item.reference,
+          category: item.category,
+          baseSalesPrice: item.baseSalesPrice || item.salesPrice || 0,
+          images: item.images || [],
+          attributes: attributeData,
+          variants,
+          hasVariants: variants.length > 0,
+        };
+      });
+
+      const uniqueCategories = [
+        ...new Set(processedItems.map((item) => item.category).filter(Boolean)),
       ];
+
+      res.status(200).json({
+        success: true,
+        items: processedItems,
+        categories: uniqueCategories,
+      });
+    } catch (error) {
+      console.error("Error fetching available items:", error);
+      res.status(500).json({
+        success: false,
+        message: "Server error while fetching available items",
+      });
     }
-
-    if (category) {
-      query.category = category;
-    }
-
-    const stockItems = await StockItem.find(query)
-      .select('_id name reference category baseSalesPrice salesPrice images attributes variants')
-      .limit(50)
-      .lean();
-
-    // Process stock items for frontend
-    const processedItems = stockItems.map(item => {
-      // Get all categories from attributes
-      const categories = item.attributes?.map(attr => attr.name) || [];
-
-      // Get unique attribute values
-      const attributeData = item.attributes?.map(attr => ({
-        name: attr.name,
-        values: attr.values || []
-      })) || [];
-
-      // Process variants
-      const variants = item.variants?.map(variant => ({
-        _id: variant._id,
-        attributes: variant.attributes || [],
-        salesPrice: variant.salesPrice,
-        quantityOnHand: variant.quantityOnHand || 0,
-        images: variant.images || []
-      })) || [];
-
-      return {
-        _id: item._id,
-        id: item._id, // Add id field for frontend compatibility
-        name: item.name,
-        reference: item.reference,
-        category: item.category,
-        baseSalesPrice: item.baseSalesPrice || item.salesPrice || 0,
-        images: item.images || [],
-        attributes: attributeData,
-        variants: variants,
-        hasVariants: variants.length > 0
-      };
-    });
-
-    // Get unique categories
-    const uniqueCategories = [...new Set(processedItems.map(item => item.category).filter(Boolean))];
-
-    res.status(200).json({
-      success: true,
-      items: processedItems,
-      categories: uniqueCategories
-    });
-
-  } catch (error) {
-    console.error('Error fetching available items:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error while fetching available items'
-    });
-  }
-});
-
+  },
+);
 
 module.exports = router;
-

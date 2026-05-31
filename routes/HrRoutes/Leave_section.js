@@ -121,6 +121,52 @@ async function applyBalanceDelta({
   return { applied, balance: bal };
 }
 
+// Decide what to do when a new HR leave request overlaps an existing
+// (non-terminal) one for the same employee. Mirrors the employee-side rule:
+//   { action: "none" }              → no overlap, proceed
+//   { action: "replace", existing } → same type + identical dates: no duplicate
+//   { action: "block", existing }   → different type / different overlapping
+//                                      dates: caller rejects, withdraw first
+async function resolveLeaveOverlap({
+  employeeId,
+  fromDate,
+  toDate,
+  leaveType,
+  isHalfDay,
+  excludeId,
+}) {
+  const q = {
+    employeeId,
+    status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
+    fromDate: { $lte: toDate },
+    toDate: { $gte: fromDate },
+  };
+  if (excludeId) q._id = { $ne: excludeId };
+  const existing = await LeaveApplication.findOne(q);
+  if (!existing) return { action: "none" };
+  const sameType = String(existing.leaveType) === String(leaveType);
+  const sameRange =
+    existing.fromDate === fromDate && existing.toDate === toDate;
+  const sameHalf = !!existing.isHalfDay === !!isHalfDay;
+  if (sameType && sameRange && sameHalf) return { action: "replace", existing };
+  return { action: "block", existing };
+}
+
+function overlapBlockResponse(res, existing) {
+  return res.status(409).json({
+    success: false,
+    code: "OVERLAP_WITHDRAW_FIRST",
+    message: `This employee already has a ${existing.leaveType} leave from ${existing.fromDate} to ${existing.toDate}. Withdraw that leave first, then add the new one.`,
+    existing: {
+      id: existing._id,
+      leaveType: existing.leaveType,
+      fromDate: existing.fromDate,
+      toDate: existing.toDate,
+      status: existing.status,
+    },
+  });
+}
+
 // ─── Shared: apply leave + increment balance (replaces old finaliseApproval) ──
 async function finaliseApproval(app, approverId, remarks = "") {
   app.status = "hr_approved";
@@ -1102,6 +1148,39 @@ router.post("/add-on-behalf", EmployeeAuthMiddleware, async (req, res) => {
           Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1,
         );
 
+    // Prevent duplicate leaves. Same type + identical dates → no duplicate
+    // (return the existing one). Different type / different overlapping dates →
+    // block and tell HR to withdraw the existing leave first.
+    const fromStr =
+      typeof startDate === "string"
+        ? startDate.slice(0, 10)
+        : new Date(startDate).toISOString().slice(0, 10);
+    const toStr =
+      typeof endDate === "string"
+        ? endDate.slice(0, 10)
+        : new Date(endDate).toISOString().slice(0, 10);
+    const overlap = await resolveLeaveOverlap({
+      employeeId: emp._id,
+      fromDate: fromStr,
+      toDate: toStr,
+      leaveType,
+      isHalfDay,
+    });
+    if (overlap.action === "block")
+      return overlapBlockResponse(res, overlap.existing);
+    if (overlap.action === "replace") {
+      const ex = overlap.existing;
+      if (hrRemarks !== undefined) ex.hrRemarks = hrRemarks;
+      if (reason !== undefined) ex.reason = reason;
+      await ex.save();
+      return res.status(200).json({
+        success: true,
+        data: ex,
+        replaced: true,
+        message: `${emp.firstName} already has this ${ex.leaveType} leave for ${ex.fromDate}–${ex.toDate}. No duplicate created.`,
+      });
+    }
+
     const app = await LeaveApplication.create({
       employeeId: emp._id,
       biometricId: emp.biometricId,
@@ -1404,6 +1483,109 @@ router.patch("/:id/reject", EmployeeAuthMiddleware, async (req, res) => {
     } catch (_) {}
 
     res.json({ success: true, data: app, message: "Leave rejected" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── HR Withdraw / Cancel — recovers balance (never below 0) ──────────────────
+//  Cancels an existing leave from the HR side and:
+//    • Refunds any balance that was deducted (only for CL/SL/PL leaves that had
+//      reached hr_approved). The refund goes through applyBalanceDelta with a
+//      NEGATIVE delta, so consumed is clamped at 0 — balance can never go
+//      negative.
+//    • Clears the leave status code from DailyAttendance for the affected dates
+//      (best-effort) so the withdrawn days stop counting as leave.
+//  A leave that is already cancelled/rejected returns 400.
+router.patch("/:id/cancel", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id))
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid application ID" });
+
+    const app = await LeaveApplication.findById(req.params.id);
+    if (!app)
+      return res
+        .status(404)
+        .json({ success: false, message: "Application not found" });
+    if (["cancelled", "hr_rejected", "manager_rejected"].includes(app.status))
+      return res
+        .status(400)
+        .json({ success: false, message: `Leave is already ${app.status}` });
+
+    const wasApproved = app.status === "hr_approved";
+    let refunded = 0;
+
+    // Refund balance only if it was actually deducted (hr_approved paid leave).
+    if (wasApproved && ["CL", "SL", "PL"].includes(app.leaveType)) {
+      const refund =
+        app.paidDays != null ? Number(app.paidDays) : Number(app.totalDays);
+      if (refund > 0) {
+        const year = parseLocalDate(app.fromDate).getFullYear();
+        const config = await LeaveConfig.getConfig();
+        const { applied } = await applyBalanceDelta({
+          employeeId: app.employeeId,
+          year,
+          biometricId: app.biometricId || "",
+          deltas: { [app.leaveType]: -refund }, // negative = refund, clamped ≥ 0
+          config,
+        });
+        const info = applied[app.leaveType];
+        refunded = refund;
+        console.log(
+          `[HR-WITHDRAW] ${app.employeeName}: ${app.leaveType} refunded ${refund} → consumed ${info?.after}`,
+        );
+      }
+    }
+
+    // Best-effort: clear the leave code from attendance for the affected dates.
+    try {
+      const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+      const code =
+        { CL: "L-CL", SL: "L-SL", PL: "L-EL" }[app.leaveType] ||
+        `L-${app.leaveType}`;
+      let cur = parseLocalDate(app.fromDate);
+      const end = parseLocalDate(app.toDate);
+      while (cur <= end) {
+        const ds = `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, "0")}-${String(cur.getDate()).padStart(2, "0")}`;
+        await DailyAttendance.findOneAndUpdate(
+          {
+            dateStr: ds,
+            employees: {
+              $elemMatch: {
+                biometricId: app.biometricId,
+                hrFinalStatus: code,
+              },
+            },
+          },
+          {
+            $set: {
+              "employees.$.hrFinalStatus": null,
+              "employees.$.hrRemarks": `Leave withdrawn by HR (${app.leaveType})`,
+              "employees.$.hrReviewedAt": new Date(),
+            },
+          },
+        ).catch(() => {});
+        cur.setDate(cur.getDate() + 1);
+      }
+    } catch (e) {
+      console.warn("[HR-WITHDRAW] attendance clear failed:", e.message);
+    }
+
+    app.status = "cancelled";
+    app.cancelledBy = req.user.id;
+    app.cancelledAt = new Date();
+    app.cancelReason = req.body?.cancelReason || "Withdrawn by HR";
+    await app.save();
+
+    res.json({
+      success: true,
+      data: app,
+      message: refunded
+        ? `Leave withdrawn. ${refunded} ${app.leaveType} day(s) restored to balance.`
+        : "Leave withdrawn.",
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

@@ -219,6 +219,40 @@ const tallyVoucherSchema = new mongoose.Schema(
       gstin: { type: String, trim: true },
     },
 
+    // ─── Dispatch details (printed in the invoice header) ───────────────────
+    // The fields that appear in the Tally-style invoice header's right-hand
+    // meta block and the consignee row. All optional. Captured per-invoice on
+    // the sales-voucher form's "Dispatch Details" section so the exported PDF
+    // can show them (previously these cells were hardcoded blank).
+    //
+    // Buyer's-order + delivery-note + dispatch-doc + transport-carrier are the
+    // standard fields a GST tax invoice prints. The invoice PUT route already
+    // referenced several of these as editable; this is their schema home.
+    dispatchDetails: {
+      // "Delivery Note No(s)" — can be several; stored as a free string the
+      // user types (e.g. "DN/12, DN/13") so multiple notes fit one cell.
+      deliveryNoteNumbers: { type: String, trim: true },
+      deliveryNoteDate: { type: Date },
+
+      buyersOrderNumber: { type: String, trim: true },
+      buyersOrderDate: { type: Date },
+
+      dispatchDocNumber: { type: String, trim: true },
+      dispatchedThrough: { type: String, trim: true },
+      destination: { type: String, trim: true },
+
+      // "Other References" — free text printed in the header meta block
+      otherReferences: { type: String, trim: true },
+
+      // Transport / shipping
+      carrierName: { type: String, trim: true }, // Carrier Name / Agent
+      billOfLadingNumber: { type: String, trim: true }, // Bill of Lading / LR-RR No.
+      motorVehicleNumber: { type: String, trim: true },
+      dispatchDate: { type: Date }, // the "Date:" under dispatch details
+
+      termsOfDelivery: { type: String, trim: true },
+    },
+
     // ─── Lines ──────────────────────────────────────────────────────────────
     ledgerEntries: { type: [ledgerEntrySchema], default: [] },
     inventoryEntries: { type: [inventoryEntrySchema], default: [] },
@@ -361,6 +395,32 @@ const tallyVoucherSchema = new mongoose.Schema(
       transporter: { type: String, trim: true },
       vehicleNo: { type: String, trim: true },
       distance: { type: Number, default: 0 },
+
+      // Full set of e-way bill transport details, auto-saved when the e-Way
+      // Bill JSON is generated so they don't need re-entering next time.
+      // Mirrors the `overrides` object the e-way bill generator uses.
+      transporterId: { type: String, trim: true },
+      transMode: { type: Number },
+      transDistance: { type: Number },
+      transDocNo: { type: String, trim: true },
+      transDocDate: { type: String, trim: true },
+      vehicleType: { type: String, trim: true },
+      subSupplyType: { type: Number },
+      subSupplyDesc: { type: String, trim: true },
+      docType: { type: String, trim: true },
+      transType: { type: Number },
+      supplyType: { type: String, trim: true },
+      // Ship-to overrides (when consignee differs from buyer)
+      shipMatchesBill: { type: Boolean },
+      shipName: { type: String, trim: true },
+      shipGstin: { type: String, trim: true },
+      shipStateCode: { type: String, trim: true },
+      shipPincode: { type: String, trim: true },
+      shipAddr1: { type: String, trim: true },
+      shipAddr2: { type: String, trim: true },
+      shipPlace: { type: String, trim: true },
+      // Timestamp of the last time these were saved via the EWB generator
+      lastGeneratedAt: { type: Date },
     },
 
     // ─── CMS bridge ─────────────────────────────────────────────────────────
@@ -413,6 +473,23 @@ const tallyVoucherSchema = new mongoose.Schema(
     },
     cancelledAt: { type: Date },
     cancellationReason: { type: String, trim: true },
+
+    // ─── Approval workflow ──────────────────────────────────────────────────
+    // When an Editor (a user without canPostDirectly) creates a sales voucher,
+    // it is saved as status "pending_approval" (a draft that is NOT posted to
+    // any ledger). An Owner/Approver then approves it (→ posted, balances
+    // applied) or rejects it (→ cancelled, with a reason). These fields record
+    // who did what, for the audit timeline.
+    submittedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    submittedByName: { type: String, trim: true },
+    submittedAt: { type: Date },
+    approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    approvedByName: { type: String, trim: true },
+    approvedAt: { type: Date },
+    rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    rejectedByName: { type: String, trim: true },
+    rejectedAt: { type: Date },
+    rejectionReason: { type: String, trim: true },
   },
   { timestamps: true, collection: "acc_vouchers" },
 );

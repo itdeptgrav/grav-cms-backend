@@ -450,12 +450,17 @@ function buildEwbForVoucher(voucher, company, billToResolved, overrides = {}) {
   const itemList = (voucher.inventoryEntries || []).map((it, idx) => {
     const taxableAmount = round2(it.amount || 0);
     const rate = Number(it.taxRate) || 0;
-    const hsnDigits = String(it.hsnCode || "").replace(/\D/g, "");
+    // e-Way Bill: HSN must be the first 4 digits only. Even if a 6- or 8-digit
+    // HSN is stored on the invoice line, the EWB JSON carries just the leading
+    // 4 digits (strip non-digits, then take the first 4).
+    const hsnDigits = String(it.hsnCode || "")
+      .replace(/\D/g, "")
+      .slice(0, 4);
     return {
       itemNo: idx + 1,
       productName: (it.stockItemName || `Item ${idx + 1}`).slice(0, 100),
       productDesc: (it.stockItemName || "").slice(0, 100),
-      hsnCode: hsnDigits || "", // STRING — empty if missing
+      hsnCode: hsnDigits || "", // STRING — first 4 digits, empty if missing
       quantity: round3(it.quantity || 0),
       qtyUnit: mapUnit(it.unit),
       taxableAmount,
@@ -670,9 +675,16 @@ router.post("/preflight", accountantAuth, async (req, res) => {
         billTo,
         shipTo,
         shipMatchesBill: ewb._meta.shipMatchesBill,
+        // Previously-saved e-way bill transport details (auto-saved on last
+        // generate). The frontend seeds the per-invoice overrides from this so
+        // they don't need re-entering.
+        savedEwbDetails: v.eWayBillDetails || null,
         inventoryEntries: (v.inventoryEntries || []).map((it, idx) => ({
           stockItemName: it.stockItemName || `Item ${idx + 1}`,
-          hsnCode: it.hsnCode || "",
+          // e-Way Bill uses only the first 4 HSN digits
+          hsnCode: String(it.hsnCode || "")
+            .replace(/\D/g, "")
+            .slice(0, 4),
           quantity: it.quantity || 0,
           unit: it.unit || "",
           rate: it.rate || 0,
@@ -777,6 +789,64 @@ router.post("/generate", accountantAuth, async (req, res) => {
       // Strip internal flag — _meta is not part of the NIC schema
       delete ewb._meta;
       billLists.push(ewb);
+
+      // ── Persist the filled transport details back to the voucher ──────────
+      // So the next time this invoice's e-way bill is needed, the values are
+      // pre-filled instead of being re-entered. We save the full overrides blob
+      // plus the common named fields. Best-effort: a save failure here must not
+      // break JSON generation.
+      try {
+        const o = item.overrides || {};
+        const ewbSet = {
+          "eWayBillDetails.transporter":
+            o.transporterName || v.eWayBillDetails?.transporter || "",
+          "eWayBillDetails.transporterId": o.transporterId || "",
+          "eWayBillDetails.vehicleNo":
+            o.vehicleNo || v.eWayBillDetails?.vehicleNo || "",
+          "eWayBillDetails.vehicleType": o.vehicleType || "",
+          "eWayBillDetails.distance": Number(o.transDistance) || 0,
+          "eWayBillDetails.transMode":
+            o.transMode != null ? Number(o.transMode) : undefined,
+          "eWayBillDetails.transDistance":
+            o.transDistance != null ? Number(o.transDistance) : undefined,
+          "eWayBillDetails.transDocNo": o.transDocNo || "",
+          "eWayBillDetails.transDocDate": o.transDocDate || "",
+          "eWayBillDetails.subSupplyType":
+            o.subSupplyType != null ? Number(o.subSupplyType) : undefined,
+          "eWayBillDetails.subSupplyDesc": o.subSupplyDesc || "",
+          "eWayBillDetails.docType": o.docType || "",
+          "eWayBillDetails.transType":
+            o.transType != null
+              ? Number(o.transType)
+              : o.transactionType != null
+                ? Number(o.transactionType)
+                : undefined,
+          "eWayBillDetails.supplyType": o.supplyType || "",
+          "eWayBillDetails.shipMatchesBill":
+            typeof o.shipMatchesBill === "boolean"
+              ? o.shipMatchesBill
+              : undefined,
+          "eWayBillDetails.shipName": o.shipName || "",
+          "eWayBillDetails.shipGstin": o.shipGstin || "",
+          "eWayBillDetails.shipStateCode": o.shipStateCode || "",
+          "eWayBillDetails.shipPincode": o.shipPincode || "",
+          "eWayBillDetails.shipAddr1": o.shipAddr1 || "",
+          "eWayBillDetails.shipAddr2": o.shipAddr2 || "",
+          "eWayBillDetails.shipPlace": o.shipPlace || "",
+          "eWayBillDetails.lastGeneratedAt": new Date(),
+        };
+        // Drop undefined keys so we don't overwrite with nulls
+        Object.keys(ewbSet).forEach(
+          (k) => ewbSet[k] === undefined && delete ewbSet[k],
+        );
+        await Acc_Voucher.updateOne({ _id: v._id }, { $set: ewbSet });
+      } catch (saveErr) {
+        console.error(
+          "[eway-bill/generate] could not persist details for",
+          v.voucherNumber,
+          saveErr.message,
+        );
+      }
     }
 
     if (blockers.length > 0) {

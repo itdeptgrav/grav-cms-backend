@@ -2011,6 +2011,10 @@ const recomputeSummary = (emps) =>
     })),
   );
 function getDisplayLabel(rawStatus, settings) {
+  // Privilege Leave is stored under the legacy code "L-EL"; always surface it
+  // to users as "PL" regardless of any stale display-label setting. "L-PL" is
+  // accepted as a forward-compatible synonym.
+  if (rawStatus === "L-EL" || rawStatus === "L-PL") return "PL";
   return (settings?.displayLabels || {})[rawStatus] || rawStatus || "";
 }
 
@@ -5368,13 +5372,9 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
             } else if (sundayOverride === "P/LWP") {
               row.totals.P++;
               row.totals.A = (row.totals.A || 0) + 0.5;
-            } else if (
-              ["AB", "LWP", "LAB", "EAB"].includes(sundayOverride)
-            )
+            } else if (["AB", "LWP", "LAB", "EAB"].includes(sundayOverride))
               row.totals.A++;
-            else if (
-              ["FH", "NH", "OH", "RH", "PH"].includes(sundayOverride)
-            )
+            else if (["FH", "NH", "OH", "RH", "PH"].includes(sundayOverride))
               row.totals.NHFH++;
             else {
               sheetCode = "WO";
