@@ -1645,6 +1645,14 @@ router.get("/next-number/:companyId/:voucherType", auth, async (req, res) => {
 router.post("/", auth, async (req, res) => {
   try {
     const body = req.body || {};
+    // DEBUG: log what dispatch data arrives so we can confirm the client is
+    // sending it. Remove once verified. Shows in the Node server console.
+    if (body.voucherType === "sales") {
+      console.log(
+        "[vouchers POST] dispatchDetails received:",
+        JSON.stringify(body.dispatchDetails || null),
+      );
+    }
     if (!body.companyId)
       return res.status(400).json({ error: "companyId required" });
     if (!body.voucherType || !VOUCHER_TYPES.includes(body.voucherType))
@@ -1745,11 +1753,84 @@ router.post("/", auth, async (req, res) => {
     }
 
     const voucher = new Acc_Voucher(body);
+
+    // ── Approval workflow (sales vouchers only) ──────────────────────────────
+    // An Editor (a user WITHOUT canPostDirectly) cannot post to the ledgers
+    // directly. We save their sales voucher as a DRAFT (not posted — no ledger
+    // impact) and register it in the unified approval queue (Acc_ApprovalRequest)
+    // as a kind="voucher" action="post" request. An Owner/Approver then approves
+    // it from the Approvals page, which runs the existing executor to flip the
+    // draft to posted and apply balances. Owners/Approvers (canPostDirectly) are
+    // unaffected and post directly as before.
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    // Roles that may always post directly, regardless of how the permissions
+    // object was populated (guards against legacy/edge token shapes where
+    // permissions might be incomplete). Editors/viewers do NOT post directly.
+    const fullAccessRole =
+      role === "owner" ||
+      role === "approver" ||
+      role === "admin" ||
+      role === "accountant";
+    const canPostDirectly = !!perms.canPostDirectly || fullAccessRole;
+    const isSales = body.voucherType === "sales";
+    const needsApproval = isSales && !canPostDirectly;
+
+    if (needsApproval) {
+      // Status pending_approval: NOT posted (no ledger impact) and the UI shows
+      // it's awaiting review. The existing approval executor accepts both
+      // "draft" and "pending_approval" when posting, so this is safe.
+      voucher.status = "pending_approval";
+      voucher.submittedBy = req.user?.id;
+      voucher.submittedByName = req.user?.name || "";
+      voucher.submittedAt = new Date();
+      await voucher.save();
+
+      // Register it in the unified approval queue so it shows on the
+      // Approvals page for owners/approvers. We require an organizationId
+      // (present on new-role tokens). If it's somehow missing we still leave
+      // the voucher pending and tell the client it needs approval.
+      try {
+        const {
+          Acc_ApprovalRequest,
+        } = require("../../models/Accountant_model/Acc_OrgModels");
+        if (req.user?.organizationId) {
+          await Acc_ApprovalRequest.create({
+            organizationId: req.user.organizationId,
+            companyId: voucher.companyId,
+            kind: "voucher",
+            action: "post",
+            title: `Post sales invoice ${voucher.voucherNumber} · ${
+              voucher.partyLedgerName || "—"
+            } · ₹${Number(voucher.grandTotal || 0).toLocaleString("en-IN")}`,
+            target: { collection: "Acc_Voucher", id: voucher._id },
+            payload: { voucherId: voucher._id },
+            requestedBy: req.user.id,
+            requestedByName: req.user.name || "",
+            status: "pending",
+          });
+        }
+      } catch (approvalErr) {
+        // Don't fail the whole save if the queue write hiccups — the voucher
+        // is safely pending and can be posted by an approver later.
+        console.error(
+          "[vouchers] approval-request create failed:",
+          approvalErr.message,
+        );
+      }
+
+      return res
+        .status(201)
+        .json({ ...voucher.toObject(), _pendingApproval: true });
+    }
+
     await voucher.save();
 
-    // Auto-post if requested and balanced
+    // Auto-post if requested and balanced (owners / approvers only reach here)
     if (body.autoPost && voucher.isBalanced) {
       voucher.status = "posted";
+      voucher.postedBy = req.user?.id;
+      voucher.postedAt = new Date();
       await voucher.save();
       await applyLedgerBalances(voucher, +1);
     }
@@ -1849,6 +1930,89 @@ router.post("/:id/void", auth, async (req, res) => {
       await applyLedgerBalances(voucher, -1);
     }
     voucher.status = "void";
+    voucher.updatedBy = req.user?.id;
+    await voucher.save();
+    res.json(voucher);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Approval workflow — approve / reject a pending_approval voucher     */
+/* ------------------------------------------------------------------ */
+
+// Approve: only a user with canApprove (owner/approver) may approve. The
+// voucher must be in pending_approval. On approve it becomes posted and its
+// ledger balances are applied — exactly as if an approver had posted it.
+router.post("/:id/approve", auth, async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const perms = req.user?.permissions || {};
+    if (!perms.canApprove) {
+      session.endSession();
+      return res
+        .status(403)
+        .json({ error: "Only an approver or owner can approve vouchers." });
+    }
+
+    session.startTransaction();
+    const voucher = await Acc_Voucher.findById(req.params.id).session(session);
+    if (!voucher) throw new Error("Voucher not found");
+    if (voucher.status !== "pending_approval")
+      throw new Error(
+        `Only vouchers awaiting approval can be approved (this one is '${voucher.status}').`,
+      );
+    if (!voucher.isBalanced)
+      throw new Error("Voucher Dr/Cr totals do not balance — cannot approve.");
+
+    voucher.status = "posted";
+    voucher.approvedBy = req.user?.id;
+    voucher.approvedByName = req.user?.name || "";
+    voucher.approvedAt = new Date();
+    voucher.postedBy = req.user?.id;
+    voucher.postedAt = new Date();
+    voucher.updatedBy = req.user?.id;
+    await voucher.save({ session });
+    await applyLedgerBalances(voucher, +1, session);
+
+    await session.commitTransaction();
+    res.json(voucher);
+  } catch (e) {
+    try {
+      await session.abortTransaction();
+    } catch (_) {}
+    res.status(400).json({ error: e.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+// Reject: only canApprove. Moves a pending_approval voucher to cancelled with
+// a reason. No ledger impact (it was never posted).
+router.post("/:id/reject", auth, async (req, res) => {
+  try {
+    const perms = req.user?.permissions || {};
+    if (!perms.canApprove) {
+      return res
+        .status(403)
+        .json({ error: "Only an approver or owner can reject vouchers." });
+    }
+
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    if (!voucher) return res.status(404).json({ error: "Voucher not found" });
+    if (voucher.status !== "pending_approval")
+      return res.status(400).json({
+        error: `Only vouchers awaiting approval can be rejected (this one is '${voucher.status}').`,
+      });
+
+    voucher.status = "cancelled";
+    voucher.rejectedBy = req.user?.id;
+    voucher.rejectedByName = req.user?.name || "";
+    voucher.rejectedAt = new Date();
+    voucher.rejectionReason =
+      (req.body && req.body.reason) || "Rejected by approver";
+    voucher.cancellationReason = voucher.rejectionReason;
     voucher.updatedBy = req.user?.id;
     await voucher.save();
     res.json(voucher);

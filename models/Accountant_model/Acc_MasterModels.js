@@ -83,7 +83,7 @@ tallyCompanySchema.index({ isPrimary: 1 });
 // We pre-seed the 28 default Tally groups; users can add custom sub-groups.
 //
 // Default Tally primary groups:
-//   Capital Account, Loans (Liability), Current Liabilities, Suspense A/c,
+//   Capital Account, Loans & Advances (Liability), Current Liabilities, Suspense A/c,
 //   Branch / Divisions, Misc. Expenses (Asset), Loans & Advances (Asset),
 //   Investments, Current Assets, Fixed Assets, Sales Accounts,
 //   Purchase Accounts, Direct Expenses, Indirect Expenses, Direct Incomes,
@@ -104,7 +104,7 @@ const ACC_DEFAULT_GROUPS = [
     parent: "Capital Account",
   },
   {
-    name: "Loans (Liability)",
+    name: "Loans & Advances (Liability)",
     nature: "liability",
     isReserved: true,
     parent: null,
@@ -114,19 +114,19 @@ const ACC_DEFAULT_GROUPS = [
     name: "Bank OD A/c",
     nature: "liability",
     isReserved: true,
-    parent: "Loans (Liability)",
+    parent: "Loans & Advances (Liability)",
   },
   {
     name: "Secured Loans",
     nature: "liability",
     isReserved: true,
-    parent: "Loans (Liability)",
+    parent: "Loans & Advances (Liability)",
   },
   {
     name: "Unsecured Loans",
     nature: "liability",
     isReserved: true,
-    parent: "Loans (Liability)",
+    parent: "Loans & Advances (Liability)",
   },
   {
     name: "Current Liabilities",
