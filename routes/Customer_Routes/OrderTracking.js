@@ -1,30 +1,38 @@
 // routes/Customer_Routes/OrderTracking.js
+// ─────────────────────────────────────────────────────────────────────────────
+// CUSTOMER-FACING tracking endpoints.
 //
-// Customer-facing order tracking endpoints.
+//   GET /:id/tracking
+//     Returns per-product progress (quantities, percentages, stage) +
+//     dispatch event list + person-wise summary counters.
 //
-// FIXES IN THIS REVISION:
-//  1. Product images now resolved with variant-first fallback (matching the
-//     pattern used by cross-org-assign.js and other modules).
-//  2. Employee tracking now $lookups WorkOrder to populate productName/Ref
-//     in the per-employee expanded product list (previously the source field
-//     didn't exist on EmployeeProductionProgress, so frontend showed "—").
+//   GET /:id/tracking/employees
+//     Paginated employee progress for measurement (person-wise) orders.
+//     Returns dispatchedUnits per employee + optionally all products
+//     (?full=true) for use in the customer-side return drawer.
 //
-// Quantity math (unchanged from previous fix):
-//   pending      = total - started   (never touched)
-//   inProduction = started - completed
-//   completed    = passed all ops
-//   pending + inProduction + completed === total
+// FIX in this version:
+//   - Dispatched quantity is computed as MAX(wo.dispatchedQuantity,
+//     sum(wo.dispatchRecords[].dispatchedQuantity)).
+//     The dispatch routes update both the direct field AND push a record;
+//     reading both and taking the max removes any sync gap from edge cases
+//     (legacy data, partial writes, missed migrations).
+//   - Employees endpoint now returns dispatchedUnits (sum of totalUnits
+//     for products where isDispatched is true) instead of only a count.
+//   - ?full=true returns every product per employee instead of slicing to 5,
+//     so the return drawer can show the complete picker list.
+// ─────────────────────────────────────────────────────────────────────────────
 
 const express = require("express");
 const router = express.Router();
-const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
+const jwt = require("jsonwebtoken");
 
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const EmployeeProductionProgress = require("../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 
-// ─── Auth ────────────────────────────────────────────────────────────────────
+// ─── Customer auth ──────────────────────────────────────────────────────────
 const verifyCustomerToken = async (req, res, next) => {
   try {
     const token = req.cookies.customerToken;
@@ -47,50 +55,33 @@ const verifyCustomerToken = async (req, res, next) => {
   }
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-const variantLabel = (attrs) =>
-  Array.isArray(attrs) && attrs.length
-    ? attrs
-        .map((a) => a.value)
-        .filter(Boolean)
-        .join(" / ")
-    : "Default";
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
-// Resolve a usable image URL from a populated StockItem. Tries variants first
-// (those usually have the actual product photos), then falls back to the
-// product-level images array. Returns null if nothing usable exists.
+// Build a "Color: Red · Size: M" style label from variantAttributes
+const variantLabel = (attrs) => {
+  if (!Array.isArray(attrs) || attrs.length === 0) return "—";
+  return attrs
+    .filter((a) => a && a.name && a.value)
+    .map((a) => `${a.name}: ${a.value}`)
+    .join(" · ");
+};
+
+// Resolve product image: matching variant → any variant with image → product
 const resolveProductImage = (stockItem, variantAttrs) => {
   if (!stockItem) return null;
-
-  // 1) Try to match the WO's specific variant
-  if (
-    Array.isArray(variantAttrs) &&
-    variantAttrs.length &&
-    Array.isArray(stockItem.variants)
-  ) {
-    const norm = (s) =>
-      String(s || "")
-        .trim()
-        .toLowerCase();
-    const matchedVariant = stockItem.variants.find((v) => {
-      const va = v.attributes || [];
-      if (va.length !== variantAttrs.length) return false;
-      return variantAttrs.every((ra) =>
-        va.some(
-          (x) =>
-            norm(x.name) === norm(ra.name) && norm(x.value) === norm(ra.value),
+  if (Array.isArray(variantAttrs) && variantAttrs.length > 0) {
+    const matchedVariant = (stockItem.variants || []).find((v) =>
+      (v.attributes || []).every((va) =>
+        variantAttrs.some(
+          (woa) => woa.name === va.name && woa.value === va.value,
         ),
-      );
-    });
+      ),
+    );
     if (matchedVariant?.images?.[0]) return matchedVariant.images[0];
   }
-
-  // 2) Try any variant that has an image
   for (const v of stockItem.variants || []) {
     if (v?.images?.[0]) return v.images[0];
   }
-
-  // 3) Fall back to product-level image
   return stockItem.images?.[0] || null;
 };
 
@@ -111,6 +102,20 @@ const deriveStage = ({
   if (completed > 0) return "in_production";
   if (inProduction > 0) return "in_production";
   return "not_started";
+};
+
+// ★ DISPATCH SYNC FIX ★
+// The dispatch routes update wo.dispatchedQuantity AND push to
+// wo.dispatchRecords. In edge cases (legacy data, partial writes, schema
+// migrations) the direct field can be out of sync. Take MAX of both sources
+// so the customer never sees a stale 0.
+const computeDispatched = (wo) => {
+  const directField = Number(wo.dispatchedQuantity || 0);
+  const fromRecords = (wo.dispatchRecords || []).reduce(
+    (sum, rec) => sum + (Number(rec.dispatchedQuantity) || 0),
+    0,
+  );
+  return Math.max(directField, fromRecords);
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -140,7 +145,6 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Order not found" });
 
-    // ── Pull WOs + STOCK ITEM with variant images (so we can resolve photos)
     const workOrders = await WorkOrder.find({ customerRequestId: cr._id })
       .select(
         "workOrderNumber stockItemId stockItemName stockItemReference " +
@@ -150,7 +154,9 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
       )
       .populate({
         path: "stockItemId",
-        select: "name reference images variants.images variants.attributes",
+        select:
+          "name reference images variants.images variants.attributes " +
+          "gender genderCategory category",
       })
       .sort({ createdAt: 1 })
       .lean();
@@ -160,7 +166,9 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
       const total = wo.quantity || 0;
       const completed = pc.overallCompletedQuantity || 0;
       const packaged = wo.packagedQuantity || 0;
-      const dispatched = wo.dispatchedQuantity || 0;
+
+      // ★ Use the safer computed dispatched value, capped at total ★
+      const dispatched = Math.min(total, computeDispatched(wo));
 
       const opCompletion = Array.isArray(pc.operationCompletion)
         ? pc.operationCompletion
@@ -184,11 +192,17 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
       });
       const pct = (n) => (total > 0 ? Math.round((n / total) * 100) : 0);
 
-      // Resolve product image (variant → any variant → product-level)
       const productImage = resolveProductImage(
         wo.stockItemId,
         wo.variantAttributes,
       );
+
+      // Gender info — StockItem.genderCategory is the canonical field, with
+      // older docs falling back to .gender. Empty string if not set.
+      const stockItem = wo.stockItemId;
+      const productGender =
+        stockItem?.genderCategory || stockItem?.gender || "";
+      const productCategory = stockItem?.category || "";
 
       return {
         workOrderId: wo._id,
@@ -196,6 +210,8 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
         productName: wo.stockItemName || wo.stockItemId?.name || "—",
         productRef: wo.stockItemReference || wo.stockItemId?.reference || "",
         productImage,
+        productGender,
+        productCategory,
         variantLabel: variantLabel(wo.variantAttributes),
         variantAttributes: wo.variantAttributes || [],
 
@@ -247,6 +263,7 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
         ? Math.round((totals.dispatched / totals.total) * 100)
         : 0;
 
+    // Dispatch events — flatten all dispatchRecords across WOs, newest first
     const dispatchEvents = [];
     for (const wo of workOrders) {
       for (const rec of wo.dispatchRecords || []) {
@@ -269,6 +286,7 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
       (a, b) => new Date(b.dispatchedAt) - new Date(a.dispatchedAt),
     );
 
+    // Person-wise summary (employee counts by stage)
     let personWise = null;
     const isPersonWise = cr.requestType === "measurement_conversion";
     if (isPersonWise) {
@@ -282,7 +300,11 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
             totalUnits: { $sum: "$totalUnits" },
             completedUnits: { $sum: "$completedUnits" },
             packagedUnits: { $sum: "$packagedUnits" },
+            dispatchedUnits: {
+              $sum: { $cond: ["$isDispatched", "$totalUnits", 0] },
+            },
             anyDispatched: { $max: { $cond: ["$isDispatched", 1, 0] } },
+            allDispatched: { $min: { $cond: ["$isDispatched", 1, 0] } },
           },
         },
       ]);
@@ -290,6 +312,9 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
       const counts = agg.reduce(
         (acc, e) => {
           acc.totalEmployees += 1;
+          acc.totalUnits += e.totalUnits || 0;
+          acc.completedUnits += e.completedUnits || 0;
+          acc.dispatchedUnits += e.dispatchedUnits || 0;
           if (e.completedUnits >= e.totalUnits && e.totalUnits > 0)
             acc.fullyCompleted += 1;
           else if (e.completedUnits > 0) acc.inProgress += 1;
@@ -297,6 +322,7 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
           if (e.packagedUnits >= e.totalUnits && e.totalUnits > 0)
             acc.fullyPackaged += 1;
           if (e.anyDispatched) acc.dispatched += 1;
+          if (e.allDispatched) acc.allDispatched += 1;
           return acc;
         },
         {
@@ -306,6 +332,10 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
           fullyCompleted: 0,
           fullyPackaged: 0,
           dispatched: 0,
+          allDispatched: 0,
+          totalUnits: 0,
+          completedUnits: 0,
+          dispatchedUnits: 0,
         },
       );
 
@@ -352,8 +382,8 @@ router.get("/:id/tracking", verifyCustomerToken, async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /api/customer/requests/:id/tracking/employees
-// FIX: $lookup WorkOrder to attach stockItemName onto each progress doc
-// BEFORE grouping, so each pushed product carries its real product name.
+// Paginated employee progress. Returns dispatched units per person.
+// ?full=true → returns ALL products per employee (default slices to 5)
 // ═════════════════════════════════════════════════════════════════════════════
 router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
   try {
@@ -377,13 +407,14 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
 
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(
-      200,
+      500,
       Math.max(1, parseInt(req.query.limit, 10) || 50),
     );
     const skip = (page - 1) * limit;
     const search = String(req.query.search || "").trim();
     const stage = String(req.query.stage || "all").trim();
     const sort = String(req.query.sort || "name-asc").trim();
+    const full = String(req.query.full || "").toLowerCase() === "true";
 
     const pipeline = [
       { $match: { manufacturingOrderId: new mongoose.Types.ObjectId(cr._id) } },
@@ -395,26 +426,34 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
         "i",
       );
       pipeline.push({
-        $match: { $or: [{ employeeName: regex }, { employeeUIN: regex }] },
+        $match: {
+          $or: [{ employeeName: regex }, { employeeUIN: regex }],
+        },
       });
     }
 
-    // ── NEW: Join WorkOrder to pull stockItemName / Reference ────────────
-    // EmployeeProductionProgress doesn't store product name, so without this
-    // every pushed product in the expanded row came back as null.
+    // Join WorkOrder to pull stockItemName + Reference + variantAttributes
     pipeline.push({
       $lookup: {
-        from: WorkOrder.collection.name, // safe: derived from model, not hardcoded
+        from: WorkOrder.collection.name,
         localField: "workOrderId",
         foreignField: "_id",
         as: "_wo",
-        pipeline: [{ $project: { stockItemName: 1, stockItemReference: 1 } }],
+        pipeline: [
+          {
+            $project: {
+              stockItemName: 1,
+              stockItemReference: 1,
+              variantAttributes: 1,
+              workOrderNumber: 1,
+            },
+          },
+        ],
       },
     });
 
     pipeline.push({
       $addFields: {
-        // Prefer existing snapshot field if your schema has it; fall back to WO
         productNameResolved: {
           $ifNull: [
             "$productName",
@@ -422,6 +461,12 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
           ],
         },
         productRefResolved: { $arrayElemAt: ["$_wo.stockItemReference", 0] },
+        productVariantAttrs: {
+          $arrayElemAt: ["$_wo.variantAttributes", 0],
+        },
+        workOrderNumberResolved: {
+          $arrayElemAt: ["$_wo.workOrderNumber", 0],
+        },
       },
     });
 
@@ -434,6 +479,10 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
         totalUnits: { $sum: "$totalUnits" },
         completedUnits: { $sum: "$completedUnits" },
         packagedUnits: { $sum: "$packagedUnits" },
+        // ★ NEW: sum dispatched UNITS (not just count of dispatched WOs) ★
+        dispatchedUnits: {
+          $sum: { $cond: ["$isDispatched", "$totalUnits", 0] },
+        },
         productCount: { $sum: 1 },
         dispatchedDocs: { $sum: { $cond: ["$isDispatched", 1, 0] } },
         lastSyncedAt: { $max: "$lastSyncedAt" },
@@ -441,11 +490,16 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
           $push: {
             productName: "$productNameResolved",
             productRef: "$productRefResolved",
+            variantAttributes: "$productVariantAttrs",
+            workOrderNumber: "$workOrderNumberResolved",
+            workOrderId: "$workOrderId",
             totalUnits: "$totalUnits",
             completedUnits: "$completedUnits",
             packagedUnits: "$packagedUnits",
             isDispatched: "$isDispatched",
-            workOrderId: "$workOrderId",
+            dispatchedUnits: {
+              $cond: ["$isDispatched", "$totalUnits", 0],
+            },
           },
         },
       },
@@ -467,6 +521,18 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
             { $gt: ["$totalUnits", 0] },
             {
               $multiply: [{ $divide: ["$packagedUnits", "$totalUnits"] }, 100],
+            },
+            0,
+          ],
+        },
+        dispatchedPct: {
+          $cond: [
+            { $gt: ["$totalUnits", 0] },
+            {
+              $multiply: [
+                { $divide: ["$dispatchedUnits", "$totalUnits"] },
+                100,
+              ],
             },
             0,
           ],
@@ -515,6 +581,8 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
       "uin-desc": { employeeUIN: -1 },
       "progress-asc": { completionPct: 1 },
       "progress-desc": { completionPct: -1 },
+      "dispatch-asc": { dispatchedPct: 1 },
+      "dispatch-desc": { dispatchedPct: -1 },
       "stage-asc": { stage: 1, employeeName: 1 },
       "stage-desc": { stage: -1, employeeName: 1 },
     };
@@ -531,28 +599,38 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
       await EmployeeProductionProgress.aggregate(pipeline);
     const total = agg.meta?.[0]?.total || 0;
 
-    const employees = (agg.rows || []).map((e) => ({
-      employeeId: e._id,
-      employeeName: e.employeeName || "—",
-      employeeUIN: e.employeeUIN || "—",
-      gender: e.gender || "",
-      productCount: e.productCount || 0,
-      products: (e.products || []).slice(0, 5).map((p) => ({
+    const employees = (agg.rows || []).map((e) => {
+      const allProducts = (e.products || []).map((p) => ({
         productName: p.productName || "—",
         productRef: p.productRef || "",
+        variantAttributes: p.variantAttributes || [],
+        workOrderNumber: p.workOrderNumber || "",
+        workOrderId: p.workOrderId || null,
         totalUnits: p.totalUnits || 0,
         completedUnits: p.completedUnits || 0,
         packagedUnits: p.packagedUnits || 0,
+        dispatchedUnits: p.dispatchedUnits || 0,
         isDispatched: !!p.isDispatched,
-      })),
-      totalUnits: e.totalUnits || 0,
-      completedUnits: e.completedUnits || 0,
-      packagedUnits: e.packagedUnits || 0,
-      completionPct: Math.round(e.completionPct || 0),
-      packagedPct: Math.round(e.packagedPct || 0),
-      stage: e.stage || "not_started",
-      lastSyncedAt: e.lastSyncedAt || null,
-    }));
+      }));
+
+      return {
+        employeeId: e._id,
+        employeeName: e.employeeName || "—",
+        employeeUIN: e.employeeUIN || "—",
+        gender: e.gender || "",
+        productCount: e.productCount || 0,
+        products: full ? allProducts : allProducts.slice(0, 5),
+        totalUnits: e.totalUnits || 0,
+        completedUnits: e.completedUnits || 0,
+        packagedUnits: e.packagedUnits || 0,
+        dispatchedUnits: e.dispatchedUnits || 0,
+        completionPct: Math.round(e.completionPct || 0),
+        packagedPct: Math.round(e.packagedPct || 0),
+        dispatchedPct: Math.round(e.dispatchedPct || 0),
+        stage: e.stage || "not_started",
+        lastSyncedAt: e.lastSyncedAt || null,
+      };
+    });
 
     res.json({
       success: true,
@@ -563,7 +641,7 @@ router.get("/:id/tracking/employees", verifyCustomerToken, async (req, res) => {
         total,
         totalPages: Math.max(1, Math.ceil(total / limit)),
       },
-      filters: { search, stage, sort },
+      filters: { search, stage, sort, full },
     });
   } catch (err) {
     console.error("[customer/tracking/employees] error:", err);
