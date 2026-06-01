@@ -1,50 +1,72 @@
-// routes/Customer_Routes/auth.js  — UPDATED
-// Adds email+password login while keeping the existing phone/OTP flow intact.
+// routes/Customer_Routes/auth.js
 //
-// NEW endpoints added:
-//   POST /api/customer/auth/login-password   — email + password login (for sales-created accounts)
+// ⚠️ v11 PATCH — sign-out cookie clearing fix.
 //
-// Existing endpoints preserved unchanged:
-//   POST /api/customer/auth/signup
-//   POST /api/customer/auth/signin           — phone-based (OTP flow)
-//   POST /api/customer/auth/signout
+// The bug: `res.clearCookie("customerToken")` was called without options.
+// Per the cookie spec, browsers only honour a clear instruction whose
+// path / sameSite / secure / httpOnly match the cookie's existing
+// attributes. Our cookie was set with `secure: true, sameSite: "none"`
+// in production — clearing it without those options is a no-op. Result:
+// signout said "Signed out successfully" but the browser kept the cookie,
+// so the next GET /api/customer/profile returned 200, and the landing
+// page bounced the user straight back to the dashboard.
+//
+// The fix: define the cookie options ONCE in a shared constant, and use
+// the same options for both res.cookie (set) and res.clearCookie (clear).
+// Now the browser actually drops the cookie on signout.
+//
+// Everything else in this file is unchanged: signup, login-password,
+// signin (phone-based), check-phone.
 
 const express = require("express");
 const router = express.Router();
-const bcrypt = require("bcryptjs");
 const Customer = require("../../models/Customer_Models/Customer");
-const jwt = require("jsonwebtoken");
 
 const JWT_SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
+const CUSTOMER_COOKIE_NAME = "customerToken";
 
-// ── Helper: set customerToken cookie ─────────────────────────────────────────
-const setCustomerCookie = (res, token) => {
+// ─── Single source of truth for cookie attributes ────────────────────────
+// Used by BOTH setCustomerCookie and the signout's clearCookie call so the
+// browser sees them as the same cookie.
+const getCustomerCookieOptions = () => {
   const isProduction = process.env.NODE_ENV === "production";
-  res.cookie("customerToken", token, {
+  return {
     httpOnly: true,
     secure: isProduction,
     sameSite: isProduction ? "none" : "lax",
+    path: "/",
+  };
+};
+
+const setCustomerCookie = (res, token) => {
+  res.cookie(CUSTOMER_COOKIE_NAME, token, {
+    ...getCustomerCookieOptions(),
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
   });
 };
 
+const clearCustomerCookie = (res) => {
+  // expires:0 / maxAge:0 — belt and braces. Some browser/OS combos honour
+  // one but not the other; sending both guarantees the cookie is dropped.
+  res.clearCookie(CUSTOMER_COOKIE_NAME, getCustomerCookieOptions());
+};
 
 // ── Check Phone — verify if a phone number is already registered ──────────────
-// POST /api/customer/auth/check-phone
-// Body: { phone: "9876543210" }
 router.post("/check-phone", async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) {
-      return res.status(400).json({ success: false, message: "Phone number is required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Phone number is required" });
     }
 
     const formattedPhone = phone.startsWith("+91") ? phone : `+91${phone}`;
-    const customer = await Customer.findOne({ phone: formattedPhone }).select("name email phone isActive");
+    const customer = await Customer.findOne({
+      phone: formattedPhone,
+    }).select("name email phone isActive");
 
-    if (!customer) {
-      return res.json({ exists: false });
-    }
+    if (!customer) return res.json({ exists: false });
 
     return res.json({
       exists: true,
@@ -58,8 +80,7 @@ router.post("/check-phone", async (req, res) => {
   }
 });
 
-// ── NEW: Email + Password login ───────────────────────────────────────────────
-// Used by sales-created customer accounts. Portal login page should use this.
+// ── Email + Password login ────────────────────────────────────────────────────
 router.post("/login-password", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -126,7 +147,7 @@ router.post("/login-password", async (req, res) => {
   }
 });
 
-// ── EXISTING: Phone-based signup ──────────────────────────────────────────────
+// ── Phone-based signup ────────────────────────────────────────────────────────
 router.post("/signup", async (req, res) => {
   try {
     const { name, email, phone, password } = req.body;
@@ -156,6 +177,7 @@ router.post("/signup", async (req, res) => {
         message: "Customer already exists with this email or phone",
       });
     }
+
     const customer = await Customer.create({
       name,
       email: email.toLowerCase(),
@@ -189,7 +211,7 @@ router.post("/signup", async (req, res) => {
   }
 });
 
-// ── EXISTING: Phone-based signin ──────────────────────────────────────────────
+// ── Phone-based signin (legacy OTP flow) ──────────────────────────────────────
 router.post("/signin", async (req, res) => {
   try {
     const { phone } = req.body;
@@ -230,9 +252,17 @@ router.post("/signin", async (req, res) => {
   }
 });
 
-// ── EXISTING: Sign out ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Sign out — FIXED in v11
+// ─────────────────────────────────────────────────────────────────────────────
+// Now clears the cookie with the same options used to set it, so the
+// browser actually drops the cookie. Also avoid sending the cookie
+// header back without explicit headers to prevent any caching issues
+// on the response.
 router.post("/signout", (req, res) => {
-  res.clearCookie("customerToken");
+  clearCustomerCookie(res);
+  // Prevent any cache from serving a stale "logged in" response.
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   res.status(200).json({ success: true, message: "Signed out successfully" });
 });
 

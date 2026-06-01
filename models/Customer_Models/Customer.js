@@ -96,6 +96,12 @@ const customerSchema = new mongoose.Schema(
     // The customer portal should ONLY show these items.
     assignedStockItems: [assignedStockItemSchema],
 
+    passwordResetOTP: {
+      hash: { type: String, default: null, select: false },
+      expiresAt: { type: Date, default: null },
+      attempts: { type: Number, default: 0 },
+    },
+
     // Who created this customer from the sales dashboard
     createdBySales: { type: Boolean, default: false },
     salesAssignedBy: {
