@@ -1,6 +1,6 @@
 // routes/Customer_Routes/PasswordResetOTP.js
 // ─────────────────────────────────────────────────────────────────────────
-// SELF-SERVICE PASSWORD RESET VIA EMAIL OTP — v14
+// SELF-SERVICE PASSWORD RESET VIA EMAIL OTP — v23
 //
 // Now supports BOTH:
 //
@@ -11,9 +11,18 @@
 //      needs only { otp, newPassword }.
 //
 // 2. PUBLIC /forgot-password FLOW (no cookie)
-//    - /request-otp  → look up the customer by submitted email. Always
-//      respond with a generic success message so the route doesn't leak
-//      which emails are registered.
+//    - /request-otp  → look up the customer by submitted email.
+//      ⚠️ v23 CHANGE: previously returned a generic "If an account exists,
+//      an OTP has been sent" message regardless of whether the email
+//      was actually registered. The customer asked for explicit
+//      validation on the login page's forgot-password flow — they want
+//      to be told "no account found" when the email isn't registered,
+//      rather than the form pretending to send an OTP and proceeding
+//      to a useless code-entry screen. v23 now returns 404 + "No
+//      account is registered with this email address" in that case.
+//      Trade-off: this allows email enumeration (any attacker can
+//      probe whether an email is registered). Acceptable for this B2B
+//      portal where the customer list is closed and known.
 //    - /verify-otp   → body must include { email, otp, newPassword }.
 //      We look up the customer by email and verify the OTP they received.
 //
@@ -83,7 +92,8 @@ const otpEmailHtml = (name, otp) => `<!doctype html>
     <div style="padding:28px;">
       <p style="margin:0 0 14px;font-size:14px;color:#475569;">Hi ${escapeHtml(name || "there")},</p>
       <p style="margin:0 0 20px;font-size:14px;line-height:1.6;color:#475569;">
-        You requested a password reset for your Grav Clothing portal account. Use the OTP below to complete the reset. This code is valid for <strong>10 minutes</strong>.
+        You requested a password reset for your Grav Clothing portal account.
+        Use the OTP below to complete the reset. This code is valid for <strong>10 minutes</strong>.
       </p>
       <div style="background:#f1f5f9;border:1px solid #cbd5e1;border-radius:10px;padding:18px;text-align:center;margin:0 0 22px;">
         <p style="margin:0 0 6px;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:#64748b;">Your One-Time Code</p>
@@ -161,9 +171,11 @@ const isValidEmail = (e) =>
 // Branching:
 //   - If req.customerId (logged in) → submitted email MUST match the
 //     logged-in customer's email. No silent fallback.
-//   - If no auth (public /forgot-password flow) → look up by email. Always
-//     respond with a generic success message (don't leak whether the
-//     email is registered).
+//   - If no auth (public /forgot-password flow) → look up by email.
+//     v23: respond with explicit 404 + "no account registered" message
+//     when the email isn't found, so the login-page forgot-password
+//     flow stops at the email step instead of pretending to send an
+//     OTP and advancing to a useless code-entry screen.
 router.post("/request-otp", optionalCustomerAuth, async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -176,10 +188,10 @@ router.post("/request-otp", optionalCustomerAuth, async (req, res) => {
 
     const submitted = email.trim().toLowerCase();
     let customer;
-    let isPublicFlow = false;
 
     if (req.customerId) {
-      // IN-PORTAL FLOW
+      // ── IN-PORTAL FLOW ────────────────────────────────────────────
+      // Submitted email must match the logged-in customer's email.
       customer = await Customer.findById(req.customerId);
       if (!customer) {
         return res
@@ -204,23 +216,27 @@ router.post("/request-otp", optionalCustomerAuth, async (req, res) => {
         });
       }
     } else {
-      // PUBLIC /forgot-password FLOW
-      isPublicFlow = true;
+      // ── PUBLIC /forgot-password FLOW ──────────────────────────────
       customer = await Customer.findOne({ email: submitted });
-      // Don't reveal whether the email exists. If it doesn't, just return
-      // the same generic success message after a small constant-time delay.
+
+      // ⚠️ v23 — explicit "no account found" rejection.
+      //
+      // The previous behaviour returned a generic success message even
+      // when the email was unregistered (so callers couldn't probe the
+      // user list via this endpoint). The customer specifically asked
+      // for the login-page forgot-password form to STOP at the email
+      // step instead of advancing to the OTP entry screen, and to be
+      // told plainly that no account exists. We oblige here.
       if (!customer) {
-        // Mimic the cost of a real OTP generation so timing doesn't leak.
-        await hashOtp(generateOtp());
-        return res.json({
-          success: true,
+        return res.status(404).json({
+          success: false,
           message:
-            "If an account exists for that email, a 4-digit OTP has been sent. Please check your inbox (and spam folder).",
+            "No account is registered with this email address. Please check the spelling, or sign up first.",
         });
       }
     }
 
-    // ── At this point we have a customer to send to ────────────────
+    // ── Generate, hash, store OTP ────────────────────────────────────
     const otp = generateOtp();
     customer.passwordResetOTP = {
       hash: await hashOtp(otp),
@@ -233,11 +249,9 @@ router.post("/request-otp", optionalCustomerAuth, async (req, res) => {
 
     return res.json({
       success: true,
-      message: isPublicFlow
-        ? "If an account exists for that email, a 4-digit OTP has been sent. Please check your inbox (and spam folder)."
-        : result.success
-          ? `A 4-digit OTP has been sent to ${customer.email}. It expires in 10 minutes.`
-          : "OTP was generated but the email service is unavailable right now. Please contact support or try again.",
+      message: result.success
+        ? `A 4-digit OTP has been sent to ${customer.email}. It expires in 10 minutes.`
+        : "OTP was generated but the email service is unavailable right now. Please contact support or try again.",
       _devOtp: process.env.NODE_ENV !== "production" ? otp : undefined,
     });
   } catch (err) {
