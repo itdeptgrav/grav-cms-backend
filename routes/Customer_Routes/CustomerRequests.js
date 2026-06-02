@@ -121,78 +121,163 @@ async function aggregateProductionProgress(requestId) {
 router.get("/available-items", verifyCustomerToken, async (req, res) => {
   try {
     const { search = "", category = "" } = req.query;
-    const query = {};
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(
+      100,
+      Math.max(1, parseInt(req.query.limit, 10) || 12),
+    );
+
+    // ── 1. Load the customer's whitelist ────────────────────────────────
+    const customer = await Customer.findById(req.customerId)
+      .select("assignedStockItems")
+      .lean();
+
+    if (!customer) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
+    }
+
+    // The assignedStockItems schema stores objects like
+    //   { stockItemId, stockItemName, stockItemReference, assignedAt, ... }
+    // but historical data might be raw ObjectIds — handle both.
+    const assignedIds = (customer.assignedStockItems || [])
+      .map((a) => {
+        if (!a) return null;
+        if (typeof a === "string") return a;
+        if (a.stockItemId) return a.stockItemId;
+        if (a._id) return a._id;
+        return null;
+      })
+      .filter(Boolean);
+
+    // No whitelist → return empty, with a flag so the UI can show a
+    // helpful "no products assigned" message instead of generic "no
+    // products found".
+    if (!assignedIds.length) {
+      return res.status(200).json({
+        success: true,
+        items: [],
+        categories: [],
+        page: 1,
+        limit,
+        total: 0,
+        totalPages: 0,
+        hasMore: false,
+        hasAssignments: false,
+      });
+    }
+
+    // ── 2. Build the filter ─────────────────────────────────────────────
+    const filter = { _id: { $in: assignedIds } };
 
     if (search && search.trim()) {
       const q = search.trim();
-      query.$or = [
-        { name: { $regex: q, $options: "i" } },
-        { reference: { $regex: q, $options: "i" } },
-        { category: { $regex: q, $options: "i" } },
-        { genderCategory: { $regex: q, $options: "i" } },
+      const re = new RegExp(q.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&"), "i");
+      // MongoDB applies a regex on an array field to each element
+      // automatically, so { additionalNames: re } already matches any
+      // element. An explicit $elemMatch around the regex is BOTH
+      // redundant and invalid — $elemMatch expects an object query,
+      // not a bare regex, and throws "$elemMatch needs an Object".
+      // v20: removed that bad line; the plain match is enough.
+      filter.$or = [
+        { name: re },
+        { reference: re },
+        { category: re },
+        { genderCategory: re },
+        { additionalNames: re },
       ];
     }
-    if (category) query.category = category;
 
-    const stockItems = await StockItem.find(query)
+    if (category && category.trim()) filter.category = category.trim();
+
+    // ── 3. Count + fetch the current page ───────────────────────────────
+    const total = await StockItem.countDocuments(filter);
+    const totalPages = total > 0 ? Math.ceil(total / limit) : 0;
+    const skip = (page - 1) * limit;
+
+    const stockItems = await StockItem.find(filter)
       .select(
-        "_id name reference category genderCategory baseSalesPrice images attributes variants",
+        "_id name reference category genderCategory baseSalesPrice salesPrice images attributes variants additionalNames",
       )
-      .limit(50)
+      .sort({ name: 1 })
+      .skip(skip)
+      .limit(limit)
       .lean();
 
-    const processedItems = stockItems.map((item) => {
-      const attributeData =
-        item.attributes?.map((attr) => ({
-          name: attr.name,
-          values: attr.values || [],
-        })) || [];
+    // ── 4. Resolve best image URL per product ───────────────────────────
+    // Tries top-level images first, then walks variants. Returned as
+    // singular `product.image` so the frontend doesn't have to do this
+    // fallback walk every render.
+    const resolveImage = (item) => {
+      if (Array.isArray(item.images) && item.images[0]) {
+        const first = item.images[0];
+        return typeof first === "string" ? first : first?.url || null;
+      }
+      if (Array.isArray(item.variants)) {
+        for (const v of item.variants) {
+          if (Array.isArray(v?.images) && v.images[0]) {
+            const first = v.images[0];
+            return typeof first === "string" ? first : first?.url || null;
+          }
+        }
+      }
+      return null;
+    };
 
-      const variants =
-        item.variants?.map((v) => ({
-          _id: v._id,
-          sku: v.sku,
-          attributes: v.attributes || [],
-          salesPrice: v.salesPrice,
-          images: v.images || [],
-        })) || [];
+    // ── 5. Shape each product for the frontend ──────────────────────────
+    const items = stockItems.map((item) => ({
+      id: item._id,
+      _id: item._id,
+      name: item.name,
+      reference: item.reference,
+      category: item.category,
+      genderCategory: item.genderCategory || null,
+      baseSalesPrice: item.baseSalesPrice || item.salesPrice || 0,
+      image: resolveImage(item),
+      images: item.images || [],
+      attributes: (item.attributes || []).map((a) => ({
+        name: a.name,
+        values: a.values || [],
+      })),
+      variants: (item.variants || []).map((v) => ({
+        _id: v._id,
+        sku: v.sku,
+        attributes: v.attributes || [],
+        salesPrice: v.salesPrice,
+        images: v.images || [],
+      })),
+      hasVariants: (item.variants || []).length > 0,
+    }));
 
-      const firstVariantPrice = variants[0]?.salesPrice;
-      const displayPrice =
-        firstVariantPrice != null && firstVariantPrice > 0
-          ? firstVariantPrice
-          : item.baseSalesPrice || 0;
-
-      return {
-        _id: item._id,
-        id: item._id,
-        name: item.name,
-        reference: item.reference,
-        category: item.category,
-        genderCategory: item.genderCategory || "",
-        baseSalesPrice: item.baseSalesPrice || 0,
-        displayPrice,
-        images: item.images || [],
-        attributes: attributeData,
-        variants,
-        hasVariants: variants.length > 0,
-      };
-    });
-
-    const uniqueCategories = [
-      ...new Set(processedItems.map((i) => i.category).filter(Boolean)),
-    ];
+    // ── 6. Categories scoped to the whitelist ───────────────────────────
+    // Only categories the customer can actually pick from — not every
+    // category in the entire StockItem collection.
+    const categoryDocs = await StockItem.find({ _id: { $in: assignedIds } })
+      .select("category")
+      .lean();
+    const categories = [
+      ...new Set(
+        categoryDocs.map((c) => c.category).filter((c) => c && c.trim()),
+      ),
+    ].sort();
 
     return res.status(200).json({
       success: true,
-      items: processedItems,
-      categories: uniqueCategories,
+      items,
+      categories,
+      page,
+      limit,
+      total,
+      totalPages,
+      hasMore: page < totalPages,
+      hasAssignments: true,
     });
   } catch (error) {
-    console.error("Error fetching available items:", error);
+    console.error("[available-items] error:", error);
     return res.status(500).json({
       success: false,
-      message: "Server error while fetching available items",
+      message: "Server error while loading catalogue",
     });
   }
 });
