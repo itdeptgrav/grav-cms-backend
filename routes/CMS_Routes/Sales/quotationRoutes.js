@@ -393,7 +393,14 @@ router.get("/requests/:requestId/employee-progress", async (req, res) => {
     const progress = await EmployeeProductionProgress.find({
       manufacturingOrderId: requestId,
     })
-      .populate("workOrderId", "stockItemName stockItemReference workOrderNumber variantAttributes")
+      .populate({
+        path: "workOrderId",
+        select: "stockItemName stockItemReference workOrderNumber variantAttributes variantId stockItemId",
+        populate: {
+          path: "stockItemId",
+          select: "images variants.images variants._id variants.attributes",
+        },
+      })
       .lean();
     res.json({ success: true, progress });
   } catch (err) {
@@ -408,7 +415,7 @@ router.get("/requests/:requestId/work-orders", async (req, res) => {
     const workOrders = await WorkOrder.find({ customerRequestId: requestId })
       .populate({
         path: "stockItemId",
-        select: "name reference genderCategory category",
+        select: "name reference genderCategory category images variants.images variants.attributes variants._id",
       })
       .sort({ createdAt: 1 })
       .lean();
