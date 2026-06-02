@@ -194,18 +194,28 @@ router.get("/users", EmployeeAuthMiddleware, hrOnly, async (req, res) => {
 
     // Query builder for Employee model (firstName/lastName split)
     const buildEmployeeQuery = () => {
-      const q = { isActive: true };
+      // "Active" must match the rest of the system: an employee counts as
+      // active if EITHER status === "active" OR isActive === true. The old
+      // filter used only { isActive: true }, which silently hid employees that
+      // were marked active via `status` (e.g. GR0080 / LIZARANI BEHERA) — they
+      // never appeared here even though they exist and can log in.
+      const activeCond = { $or: [{ status: "active" }, { isActive: true }] };
+      if (!search && !department) return activeCond;
+      const and = [activeCond];
       if (search) {
-        q.$or = [
-          { firstName: { $regex: search, $options: "i" } },
-          { lastName: { $regex: search, $options: "i" } },
-          { email: { $regex: search, $options: "i" } },
-          { biometricId: { $regex: search, $options: "i" } },
-          { phone: { $regex: search, $options: "i" } },
-        ];
+        and.push({
+          $or: [
+            { firstName: { $regex: search, $options: "i" } },
+            { lastName: { $regex: search, $options: "i" } },
+            { email: { $regex: search, $options: "i" } },
+            { biometricId: { $regex: search, $options: "i" } },
+            { phone: { $regex: search, $options: "i" } },
+          ],
+        });
       }
-      if (department) q.department = { $regex: department, $options: "i" };
-      return q;
+      if (department)
+        and.push({ department: { $regex: department, $options: "i" } });
+      return { $and: and };
     };
 
     let results = [];
@@ -634,7 +644,11 @@ const ADMIN_PROTECTED_DEPT_KEYS = new Set([
 
 async function computeDeptReconcile() {
   // 1. Active employees — the source of truth for who can already log in.
-  const employees = await Employee.find({ isActive: true })
+  //    "Active" = status "active" OR isActive true (matches the rest of the
+  //    system), so an employee marked active via `status` still counts.
+  const employees = await Employee.find({
+    $or: [{ status: "active" }, { isActive: true }],
+  })
     .select("firstName lastName email phone biometricId department jobTitle")
     .lean();
 
@@ -780,7 +794,9 @@ router.post(
       });
     } catch (err) {
       console.error("Sync apply error:", err);
-      res.status(500).json({ success: false, message: "Error applying sync" });
+      res
+        .status(500)
+        .json({ success: false, message: "Error applying sync" });
     }
   },
 );
