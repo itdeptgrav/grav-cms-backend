@@ -768,6 +768,9 @@ const salesSettingsRoutes = require("./routes/CMS_Routes/Sales/salesSettings");
 
 app.use("/api/cms/sales/settings", salesSettingsRoutes);
 
+app.use("/api/cms/crm/call-schedules", require("./routes/CMS_Routes/Sales/callSchedule"));
+app.use("/api/cms/crm/settings",       require("./routes/CMS_Routes/Sales/crmSettings"));
+
 /* =====================
     Customer ROUTES
   ===================== */
