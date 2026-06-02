@@ -1,374 +1,429 @@
-// routes/CustomerProfile_Routes.js
-const express = require('express');
+// routes/Customer_Routes/Profile.js
+// ─────────────────────────────────────────────────────────────────────────
+// Customer profile routes.
+//
+// ⚠️ v13 — middleware is now imported from the new shared file
+//          Middlewear/CustomerAuthMiddleware.js. The inline verifyCustomerToken
+//          that used to live at the top of this file is gone — same code,
+//          but now also used by PasswordResetOTP.js.
+//
+// ⚠️ v12 fixes preserved:
+//
+//   1. PUT /  ACCEPTS email updates. The original route did
+//      `delete updates.email` at the top, which silently dropped every
+//      email change a customer made on their profile page — the value
+//      always reverted on refresh because it was never sent to the
+//      database. Now: format-validated, uniqueness-checked, persisted,
+//      isEmailVerified flipped to false.
+//
+//   2. Nested-object edits (profile.preferences/measurements/address)
+//      call markModified("profile") so mongoose definitely persists the
+//      change. Without it, sub-doc edits sometimes no-op on .save().
+//
+// Phone and password are still NOT updatable through PUT /:
+//   - Phone is the legacy primary identity; changing it would orphan
+//     the account.
+//   - Password has its own dedicated route (PUT /password) with current-
+//     password verification, and the self-service flow lives in
+//     /api/customer/password-reset.
+// ─────────────────────────────────────────────────────────────────────────
+
+const express = require("express");
 const router = express.Router();
-const Customer = require('../../models/Customer_Models/Customer');
-const jwt = require('jsonwebtoken');
+const Customer = require("../../models/Customer_Models/Customer");
+const verifyCustomerToken = require("../../Middlewear/CustomerAuthMiddleware");
 
-// Middleware to verify customer token
-const verifyCustomerToken = async (req, res, next) => {
+// ── Helpers ─────────────────────────────────────────────────────────────
+const isValidEmail = (e) =>
+  typeof e === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
+
+// ─────────────────────────────────────────────────────────────────────────
+// GET /api/customer/profile
+// ─────────────────────────────────────────────────────────────────────────
+router.get("/", verifyCustomerToken, async (req, res) => {
   try {
-    const token = req.cookies.customerToken;
-    
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: 'Access denied. Please sign in.'
-      });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'grav_clothing_secret_key_2024');
-    req.customerId = decoded.id;
-    next();
-  } catch (error) {
-    return res.status(401).json({
-      success: false,
-      message: 'Invalid token. Please sign in again.'
-    });
-  }
-};
-
-// Get customer profile
-router.get('/', verifyCustomerToken, async (req, res) => {
-  try {
-    const customerId = req.customerId;
-    
-    const customer = await Customer.findById(customerId)
-      .select('-password -__v -cart -orders -favorites');
-
+    const customer = await Customer.findById(req.customerId).select(
+      "-password -__v -cart -orders -favorites",
+    );
     if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found'
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
     }
 
-    // Check if address is complete
-    const hasCompleteAddress = customer.profile.address.street && 
-                              customer.profile.address.city && 
-                              customer.profile.address.pincode;
+    // Preserve the "hasCompleteAddress" convenience flag the old route
+    // returned, in case any frontend code depends on it.
+    const a = customer.profile?.address || {};
+    const hasCompleteAddress = !!(a.street && a.city && a.pincode);
 
     res.status(200).json({
       success: true,
       customer: customer.toObject(),
-      hasCompleteAddress
+      hasCompleteAddress,
     });
-
   } catch (error) {
-    console.error('Get profile error:', error);
+    console.error("Get profile error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// Update customer profile
-router.put('/', verifyCustomerToken, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/customer/profile
+// Updates: name, email, profile.address, profile.measurements,
+//          profile.preferences
+// Phone and password are NOT accepted here.
+// ─────────────────────────────────────────────────────────────────────────
+router.put("/", verifyCustomerToken, async (req, res) => {
   try {
     const customerId = req.customerId;
-    const updates = req.body;
+    const updates = req.body || {};
 
-    // Find customer
     const customer = await Customer.findById(customerId);
     if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found'
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
     }
 
-    // Don't allow updating email, phone, or password through this route
-    delete updates.email;
+    // Phone and password are off-limits via this route.
     delete updates.phone;
     delete updates.password;
 
-    // Update basic info
-    if (updates.name) customer.name = updates.name;
+    // ── Name ──────────────────────────────────────────────────────
+    if (typeof updates.name === "string") {
+      const trimmed = updates.name.trim();
+      if (trimmed.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Name cannot be empty.",
+        });
+      }
+      customer.name = trimmed;
+    }
 
-    // Update profile fields
-    if (updates.profile) {
+    // ── Email (NEW — was being silently dropped) ──────────────────
+    if (typeof updates.email === "string") {
+      const newEmail = updates.email.trim().toLowerCase();
+      const currentEmail = String(customer.email || "")
+        .trim()
+        .toLowerCase();
+
+      // Only do the work if it actually changed.
+      if (newEmail !== currentEmail) {
+        if (!isValidEmail(newEmail)) {
+          return res.status(400).json({
+            success: false,
+            message: "Please enter a valid email address.",
+          });
+        }
+
+        // Uniqueness check — case-insensitive.
+        const taken = await Customer.findOne({
+          email: newEmail,
+          _id: { $ne: customer._id },
+        }).select("_id");
+        if (taken) {
+          return res.status(409).json({
+            success: false,
+            message: "That email address is already used by another account.",
+          });
+        }
+
+        customer.email = newEmail;
+        // New email needs to be (re-)verified at some point. For now
+        // we just flip the flag — a future flow can wire actual
+        // verification email + click-to-confirm.
+        customer.isEmailVerified = false;
+      }
+    }
+
+    // ── Nested profile fields ─────────────────────────────────────
+    if (updates.profile && typeof updates.profile === "object") {
       if (updates.profile.address) {
         customer.profile.address = {
-          ...customer.profile.address,
-          ...updates.profile.address
+          ...(customer.profile?.address || {}),
+          ...updates.profile.address,
         };
       }
       if (updates.profile.measurements) {
         customer.profile.measurements = {
-          ...customer.profile.measurements,
-          ...updates.profile.measurements
+          ...(customer.profile?.measurements || {}),
+          ...updates.profile.measurements,
         };
       }
       if (updates.profile.preferences) {
         customer.profile.preferences = {
-          ...customer.profile.preferences,
-          ...updates.profile.preferences
+          ...(customer.profile?.preferences || {}),
+          ...updates.profile.preferences,
         };
       }
+      // Belt-and-braces: nested sub-doc edits don't always trigger
+      // mongoose's change detection. markModified guarantees the save.
+      customer.markModified("profile");
     }
 
     await customer.save();
 
-    const updatedCustomer = await Customer.findById(customerId)
-      .select('-password -__v -cart -orders -favorites');
+    const updated = await Customer.findById(customerId).select(
+      "-password -__v -cart -orders -favorites",
+    );
 
     res.status(200).json({
       success: true,
-      message: 'Profile updated successfully',
-      customer: updatedCustomer
+      message: "Profile updated successfully",
+      customer: updated,
     });
-
   } catch (error) {
-    console.error('Update profile error:', error);
-    
-    if (error.name === 'ValidationError') {
-      const messages = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({
+    console.error("Update profile error:", error);
+    if (error.name === "ValidationError") {
+      const messages = Object.values(error.errors).map((e) => e.message);
+      return res
+        .status(400)
+        .json({ success: false, message: messages.join(", ") });
+    }
+    if (error.code === 11000) {
+      // Unique index collision (e.g. email)
+      return res.status(409).json({
         success: false,
-        message: messages.join(', ')
+        message: "That email is already taken by another account.",
       });
     }
-
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// Update only address
-router.put('/address', verifyCustomerToken, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/customer/profile/address
+// ─────────────────────────────────────────────────────────────────────────
+router.put("/address", verifyCustomerToken, async (req, res) => {
   try {
-    const customerId = req.customerId;
-    const addressData = req.body;
-
-    // Validate required fields
+    const addressData = req.body || {};
     if (!addressData.street || !addressData.city || !addressData.pincode) {
       return res.status(400).json({
         success: false,
-        message: 'Street, city, and pincode are required'
+        message: "Street, city, and pincode are required",
       });
     }
 
-    const customer = await Customer.findById(customerId);
+    const customer = await Customer.findById(req.customerId);
     if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found'
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
     }
 
-    // Update address
     customer.profile.address = {
-      ...customer.profile.address,
+      ...(customer.profile?.address || {}),
       ...addressData,
-      country: addressData.country || 'India'
+      country: addressData.country || "India",
     };
-
+    customer.markModified("profile");
     await customer.save();
 
     res.status(200).json({
       success: true,
-      message: 'Address updated successfully',
-      address: customer.profile.address
+      message: "Address updated successfully",
+      address: customer.profile.address,
     });
-
   } catch (error) {
-    console.error('Update address error:', error);
+    console.error("Update address error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// Update preferences
-router.put('/preferences', verifyCustomerToken, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/customer/profile/preferences
+// ─────────────────────────────────────────────────────────────────────────
+router.put("/preferences", verifyCustomerToken, async (req, res) => {
   try {
-    const customerId = req.customerId;
-    const preferences = req.body;
-
-    const customer = await Customer.findById(customerId);
+    const preferences = req.body || {};
+    const customer = await Customer.findById(req.customerId);
     if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found'
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
     }
 
-    // Update preferences
     customer.profile.preferences = {
-      ...customer.profile.preferences,
-      ...preferences
+      ...(customer.profile?.preferences || {}),
+      ...preferences,
     };
-
+    customer.markModified("profile");
     await customer.save();
 
     res.status(200).json({
       success: true,
-      message: 'Preferences updated successfully',
-      preferences: customer.profile.preferences
+      message: "Preferences updated successfully",
+      preferences: customer.profile.preferences,
     });
-
   } catch (error) {
-    console.error('Update preferences error:', error);
+    console.error("Update preferences error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// Update measurements
-router.put('/measurements', verifyCustomerToken, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/customer/profile/measurements
+// ─────────────────────────────────────────────────────────────────────────
+router.put("/measurements", verifyCustomerToken, async (req, res) => {
   try {
-    const customerId = req.customerId;
-    const measurements = req.body;
-
-    const customer = await Customer.findById(customerId);
+    const measurements = req.body || {};
+    const customer = await Customer.findById(req.customerId);
     if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found'
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
     }
 
-    // Update measurements
     customer.profile.measurements = {
-      ...customer.profile.measurements,
-      ...measurements
+      ...(customer.profile?.measurements || {}),
+      ...measurements,
     };
-
+    customer.markModified("profile");
     await customer.save();
 
     res.status(200).json({
       success: true,
-      message: 'Measurements updated successfully',
-      measurements: customer.profile.measurements
+      message: "Measurements updated successfully",
+      measurements: customer.profile.measurements,
     });
-
   } catch (error) {
-    console.error('Update measurements error:', error);
+    console.error("Update measurements error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// Update email (requires verification)
-router.put('/email', verifyCustomerToken, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/customer/profile/email
+// Legacy dedicated email-update endpoint with uniqueness check + verify
+// flag flip. Kept for backwards compatibility; the main PUT / route now
+// handles email too, so new code can just use that.
+// ─────────────────────────────────────────────────────────────────────────
+router.put("/email", verifyCustomerToken, async (req, res) => {
   try {
-    const customerId = req.customerId;
-    const { email } = req.body;
+    const { email } = req.body || {};
 
     if (!email) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Email is required" });
+    }
+    if (!isValidEmail(email)) {
       return res.status(400).json({
         success: false,
-        message: 'Email is required'
+        message: "Please enter a valid email address.",
       });
     }
 
-    // Check if email already exists
-    const existingCustomer = await Customer.findOne({ 
-      email: email.toLowerCase(),
-      _id: { $ne: customerId }
-    });
+    const normalized = email.trim().toLowerCase();
 
+    const existingCustomer = await Customer.findOne({
+      email: normalized,
+      _id: { $ne: req.customerId },
+    }).select("_id");
     if (existingCustomer) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email already in use'
-      });
+      return res
+        .status(400)
+        .json({ success: false, message: "Email already in use" });
     }
 
-    const customer = await Customer.findById(customerId);
+    const customer = await Customer.findById(req.customerId);
     if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found'
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
     }
 
-    // Update email and reset verification
-    customer.email = email.toLowerCase();
+    customer.email = normalized;
     customer.isEmailVerified = false;
-
     await customer.save();
 
     res.status(200).json({
       success: true,
-      message: 'Email updated successfully. Please verify your new email.',
-      email: customer.email
+      message: "Email updated successfully. Please verify your new email.",
+      email: customer.email,
     });
-
   } catch (error) {
-    console.error('Update email error:', error);
+    console.error("Update email error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// Change password
-router.put('/password', verifyCustomerToken, async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/customer/profile/password
+// Change password with current-password verification.
+// (The self-service OTP flow lives in /api/customer/password-reset.)
+// ─────────────────────────────────────────────────────────────────────────
+router.put("/password", verifyCustomerToken, async (req, res) => {
   try {
-    const customerId = req.customerId;
-    const { currentPassword, newPassword } = req.body;
+    const { currentPassword, newPassword } = req.body || {};
 
     if (!currentPassword || !newPassword) {
       return res.status(400).json({
         success: false,
-        message: 'Current password and new password are required'
+        message: "Current password and new password are required",
       });
     }
 
     if (newPassword.length < 8) {
       return res.status(400).json({
         success: false,
-        message: 'New password must be at least 8 characters long'
+        message: "New password must be at least 8 characters long",
       });
     }
 
-    const customer = await Customer.findById(customerId);
+    const customer = await Customer.findById(req.customerId);
     if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found'
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
     }
 
-    // Verify current password
     const isPasswordValid = await customer.comparePassword(currentPassword);
     if (!isPasswordValid) {
       return res.status(400).json({
         success: false,
-        message: 'Current password is incorrect'
+        message: "Current password is incorrect",
       });
     }
 
-    // Update password
     customer.password = newPassword;
     await customer.save();
 
     res.status(200).json({
       success: true,
-      message: 'Password updated successfully'
+      message: "Password updated successfully",
     });
-
   } catch (error) {
-    console.error('Change password error:', error);
+    console.error("Change password error:", error);
     res.status(500).json({
       success: false,
-      message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: "Server error",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
