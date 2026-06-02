@@ -764,7 +764,6 @@ const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 app.use("/api/hr/sop", hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
 
-
 const salesSettingsRoutes = require("./routes/CMS_Routes/Sales/salesSettings");
 
 app.use("/api/cms/sales/settings", salesSettingsRoutes);
@@ -786,6 +785,12 @@ app.use("/api/customer/requests", customerRequestsRoutes);
 
 const customerProfileRoutes = require("./routes/Customer_Routes/Profile.js");
 app.use("/api/customer/profile", customerProfileRoutes);
+
+const customerReturnsRoutes = require("./routes/Customer_Routes/CustomerReturns");
+app.use("/api/customer/returns", customerReturnsRoutes);
+
+const customerPasswordResetRoutes = require("./routes/Customer_Routes/PasswordResetOTP");
+app.use("/api/customer/password-reset", customerPasswordResetRoutes);
 
 const sopRoutes = require("./routes/soproutes/soproute");
 app.use("/cowork/sop", sopRoutes);
