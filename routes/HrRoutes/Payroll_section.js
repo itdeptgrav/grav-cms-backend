@@ -1568,6 +1568,249 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+// ── PATCH /item/:id/recalculate ───────────────────────────────────────────────
+//  Re-runs payroll for ONE already-processed employee against their CURRENT
+//  salary (re-fetched + decrypted), then persists the result so the stored
+//  PayrollItem permanently reflects the new figures — no need to re-click on
+//  the next page refresh.
+//
+//  Why this exists: HR can't edit gross directly inside payroll. If they
+//  process the run, then realise an employee's salary was raised in the
+//  Employee form AFTER processing, the stored item still carries the old
+//  rateGross. This route picks up the new salary for just that employee and
+//  rebuilds basic/HRA/EPF/ESIC/PT/gross/net using the SAME computation engine
+//  used at process time (computeEmployeePayroll), so the numbers are identical
+//  to a fresh run.
+//
+//  What it preserves: the manual edits HR already made on this item —
+//  loanDeduction, advanceDeduction, otherDeductions, overtime, bonus,
+//  incentives, remarks, and any manual payable-days override
+//  (isManuallyOverridden). Recalculate only refreshes the salary-derived
+//  numbers; it does not wipe the other deductions HR entered earlier.
+//
+//  Guards: hr_manager only; refuses when the item is paid-and-locked; refuses
+//  when the employee's current gross is 0.
+router.patch(
+  "/item/:id/recalculate",
+  EmployeeAuthMiddlewear,
+  async (req, res) => {
+    try {
+      const { user } = req;
+      if (user.role !== "hr_manager") {
+        return res
+          .status(403)
+          .json({ success: false, message: "Only HR managers can edit" });
+      }
+
+      const item = await PayrollItem.findById(req.params.id);
+      if (!item)
+        return res.status(404).json({ success: false, message: "Not found" });
+
+      const settings = await PayrollSettings.getConfig();
+      if (item.status === "paid" && settings.lockAfterPaid) {
+        return res.status(400).json({
+          success: false,
+          message: "Paid payroll is locked. Unlock it first.",
+        });
+      }
+
+      // Re-fetch + decrypt the employee so we pick up their CURRENT salary.
+      const employeeRaw = await Employee.findById(item.employeeId)
+        .select("-password -temporaryPassword -__v")
+        .lean();
+      if (!employeeRaw)
+        return res
+          .status(404)
+          .json({ success: false, message: "Employee not found" });
+      const employee = decryptEmployeeDoc(employeeRaw);
+
+      const newGross = Number(employee.salary?.gross || 0);
+      if (newGross <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Employee has no gross salary set",
+        });
+      }
+
+      // Rebuild the month context exactly like the process route, then keep
+      // only this employee's slice (attendance for their biometric id + their
+      // leave balance for the year).
+      const {
+        settings: ctxSettings,
+        salaryCfg,
+        holidayMap,
+        attendanceByEmp,
+        leaveConfig,
+      } = await loadMonthContext(item.month, item.year);
+      const bid = (employee.biometricId || "").toUpperCase();
+      const balance = await LeaveBalance.findOne({
+        employeeId: employee._id,
+        year: item.year,
+      });
+
+      const ctx = {
+        month: item.month,
+        year: item.year,
+        settings: ctxSettings,
+        salaryCfg,
+        holidayMap,
+        leaveConfig,
+        attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        leaveBalance: balance,
+      };
+
+      // Canonical fresh compute against the current salary.
+      const computed = computeEmployeePayroll(employee, ctx);
+
+      // ── Preserve the manual edits HR made on this item ──────────────────
+      // Manual day override: if HR had manually set payable/LOP days, keep
+      // those days and re-derive earnings on the NEW per-day rate. Otherwise
+      // use the freshly-computed payable days.
+      const divisor =
+        computed.workingDays ||
+        new Date(item.year, item.month, 0).getDate() ||
+        31;
+      const usedManualDays = !!item.isManuallyOverridden;
+      const payableDays = usedManualDays
+        ? Number(item.payableDays ?? computed.payableDays)
+        : computed.payableDays;
+      const lopDays = usedManualDays
+        ? Number(item.lopDays ?? computed.lopDays)
+        : computed.lopDays;
+
+      // New rate snapshot (this is the field that was stale before).
+      const fullGross = Number(computed.rateGross || newGross);
+      const fullBasic = Number(
+        computed.rateBasic || employee.salary?.basic || 0,
+      );
+
+      // Salary-derived earnings. If HR kept the auto day-count, computed.*
+      // already holds the right earned figures. If HR had manually overridden
+      // days, re-derive the base earned on the new per-day rate so the manual
+      // day-count is honoured against the new salary.
+      let basicEarned = computed.earnings.basicSalary;
+      let hraEarned = computed.earnings.houseRentAllowance;
+      let grossEarnedBase =
+        computed.earnings.grossEarnings -
+        (item.earnings?.overtime || 0) -
+        (item.earnings?.bonus || 0) -
+        (item.earnings?.incentives || 0) -
+        (item.earnings?.otherEarnings || 0);
+      if (usedManualDays) {
+        const perDay = fullGross / Math.max(1, divisor);
+        const basicRatio = fullGross > 0 ? fullBasic / fullGross : 0.5;
+        grossEarnedBase = Math.round(perDay * payableDays);
+        basicEarned = Math.round(grossEarnedBase * basicRatio);
+        hraEarned = grossEarnedBase - basicEarned;
+      } else {
+        grossEarnedBase = computed.earnings.grossEarnings;
+      }
+
+      // Carry over the manual earnings/deductions HR previously entered.
+      const ot = item.earnings?.overtime || 0;
+      const bn = item.earnings?.bonus || 0;
+      const inc = item.earnings?.incentives || 0;
+      const oth = item.earnings?.otherEarnings || 0;
+      const loan = item.deductions?.loanDeduction || 0;
+      const advance = item.deductions?.advanceDeduction || 0;
+      const otherD = item.deductions?.otherDeductions || 0;
+
+      const grossTotal = grossEarnedBase + ot + bn + inc + oth;
+
+      // Statutory deductions recomputed on the NEW earned basic.
+      const epfCap = salaryCfg?.epfCapAmount ?? 1800;
+      const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
+      const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
+      const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
+      const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
+
+      const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
+      const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
+      const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
+      const erEsic = esiApplicable ? Math.ceil(basicEarned * erEsicPct) : 0;
+      const pt =
+        ctxSettings.ptEnabled && ctxSettings.ptForBasic
+          ? ctxSettings.ptForBasic(basicEarned)
+          : 0;
+
+      const totalDeductions = epf + esic + pt + loan + advance + otherD;
+      const netPay = grossTotal - totalDeductions;
+
+      // ── Persist ─────────────────────────────────────────────────────────
+      // Refresh the rate snapshot to the new salary (this is what makes the
+      // recalc stick across refreshes).
+      item.rateBasic = computed.rateBasic;
+      item.rateHra = computed.rateHra;
+      item.rateGross = computed.rateGross;
+      item.perDayRate = computed.perDayRate;
+
+      item.earnings = {
+        ...(item.earnings || {}),
+        basicSalary: basicEarned,
+        houseRentAllowance: hraEarned,
+        specialAllowance: computed.earnings.specialAllowance || 0,
+        overtime: ot,
+        bonus: bn,
+        incentives: inc,
+        otherEarnings: oth,
+        grossEarnings: grossTotal,
+      };
+      item.deductions = {
+        ...(item.deductions || {}),
+        providentFund: epf,
+        employerPF: epf,
+        esic: esic,
+        employerESIC: erEsic,
+        professionalTax: pt,
+        loanDeduction: loan,
+        advanceDeduction: advance,
+        otherDeductions: otherD,
+        totalDeductions,
+      };
+      item.netPay = netPay;
+      item.roundedNetPay = ctxSettings.roundNetPay
+        ? Math.round(netPay)
+        : netPay;
+
+      // If HR had NOT manually overridden days, also refresh the day-derived
+      // stats from the fresh compute so the Summary tab stays consistent.
+      if (!usedManualDays) {
+        item.payableDays = computed.payableDays;
+        item.effectivePayableDays = computed.effectivePayableDays;
+        item.lopDays = computed.lopDays;
+        item.presentDays = computed.presentDays;
+        item.absentDays = computed.absentDays;
+        item.halfDays = computed.halfDays;
+        item.missPunchDays = computed.missPunchDays;
+        item.paidLeaveDays = computed.paidLeaveDays;
+        item.weekOffDays = computed.weekOffDays;
+        item.holidayDays = computed.holidayDays;
+        item.clUsedDays = computed.clUsedDays;
+        item.slUsedDays = computed.slUsedDays;
+        item.plUsedDays = computed.plUsedDays;
+      } else {
+        item.payableDays = payableDays;
+        item.lopDays = lopDays;
+      }
+
+      item.lastEditedBy = user.id;
+      item.lastEditedAt = new Date();
+      item.markModified("earnings");
+      item.markModified("deductions");
+      await item.save();
+
+      res.json({
+        success: true,
+        message: `Recalculated against current salary (gross ₹${newGross.toLocaleString("en-IN")}).`,
+        data: item.toObject(),
+      });
+    } catch (err) {
+      console.error("[PAYROLL-RECALCULATE]", err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  },
+);
+
 // ── PATCH /mark-paid ──────────────────────────────────────────────────────────
 router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
   try {
