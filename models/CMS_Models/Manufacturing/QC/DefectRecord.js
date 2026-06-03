@@ -1,38 +1,53 @@
+// models/CMS_Models/Manufacturing/QC/DefectRecord.js
+
 const mongoose = require("mongoose");
 
-// Embedded — one entry per defective operation in an inspection.
-const DefectEntrySchema = new mongoose.Schema({
-  operationCode: { type: String, required: true },
-  operationName: { type: String },
-  // Informational — who performed this op (if scan data exists)
-  operators: [{
-    operatorId:   { type: String },
-    operatorName: { type: String },
-    _id: false,
-  }],
-}, { _id: false });
+const defectOperatorSchema = new mongoose.Schema(
+  {
+    operatorId:   { type: String, default: "" },
+    operatorName: { type: String, default: "" },
+  },
+  { _id: false }
+);
 
-// One doc per QC inspection action. Re-inspections create new docs.
-const QCInspectionSchema = new mongoose.Schema({
-  date: { type: String, required: true, index: true }, // YYYY-MM-DD (IST)
+const defectEntrySchema = new mongoose.Schema(
+  {
+    operationCode: { type: String, required: true, trim: true },
+    operationName: { type: String, default: "",   trim: true },
+    operators:     { type: [defectOperatorSchema], default: [] },
+  },
+  { _id: false }
+);
 
-  barcodeId:        { type: String, required: true, index: true },
-  workOrderShortId: { type: String, required: true },
-  workOrderId:      { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder" },
+const defectRecordSchema = new mongoose.Schema(
+  {
+    // ── Piece identification ────────────────────────────────────────────────
+    date:             { type: String, index: true },          // "YYYY-MM-DD" IST
+    barcodeId:        { type: String, index: true },          // full barcode e.g. WO-abc123-005
+    workOrderShortId: { type: String },                       // abc123
+    workOrderId:      { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder",       default: null },
+    moRequestId:      { type: String },
+    manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: null },
 
-  moRequestId:          { type: String },
-  manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
+    // ── Inspection result ───────────────────────────────────────────────────
+    status:  { type: String, enum: ["passed", "defective"], required: true },
+    defects: { type: [defectEntrySchema], default: [] },
 
-  status:  { type: String, enum: ["passed", "defective"], required: true },
-  defects: [DefectEntrySchema], // empty when status === "passed"
+    // ── QC person who performed the inspection ──────────────────────────────
+    inspectedByQCName:        { type: String, default: "QC" },
+    inspectedByBiometricId:   { type: String, default: "" },  // from employee ID card scan
+    inspectedByQCId:          { type: String, default: "" },  // legacy / session id fallback
 
-  inspectedByQCName: { type: String },
-  inspectedByQCId:   { type: String },
-  inspectedAt:       { type: Date, default: Date.now, index: true },
-}, { timestamps: false });
+    inspectedAt: { type: Date, default: Date.now, index: true },
+  },
+  { timestamps: true }
+);
 
-QCInspectionSchema.index({ barcodeId: 1, inspectedAt: -1 });
-QCInspectionSchema.index({ date: 1, status: 1 });
-QCInspectionSchema.index({ "defects.operationCode": 1 });
+// ── Indexes ──────────────────────────────────────────────────────────────────
+defectRecordSchema.index({ barcodeId: 1, inspectedAt: -1 });
+defectRecordSchema.index({ date: 1, status: 1 });
+defectRecordSchema.index({ workOrderId: 1 });
+defectRecordSchema.index({ manufacturingOrderId: 1 });
+defectRecordSchema.index({ inspectedByBiometricId: 1 });   // query by QC person
 
-module.exports = mongoose.model("QCInspection", QCInspectionSchema);
+module.exports = mongoose.model("QCInspection", defectRecordSchema);
