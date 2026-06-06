@@ -118,7 +118,8 @@ router.get("/", async (req, res) => {
         { name: { $regex: search, $options: "i" } },
         { sku: { $regex: search, $options: "i" } },
         { category: { $regex: search, $options: "i" } },
-        { customCategory: { $regex: search, $options: "i" } }
+        { customCategory: { $regex: search, $options: "i" } },
+        { "variants.vendorNicknames.nickname": { $regex: search, $options: "i" } }
       ];
     }
 
@@ -134,6 +135,7 @@ router.get("/", async (req, res) => {
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email")
       .populate("primaryVendor", "companyName")
+      .populate({ path: "variants.vendorNicknames.vendor", select: "companyName" })
       .sort({ createdAt: -1 })
       .lean();
 
@@ -288,7 +290,6 @@ router.post("/", async (req, res) => {
       discounts,
       attributes,
       variants,
-      unitConversion,
       description,
       notes
     } = req.body;
@@ -347,7 +348,8 @@ router.post("/", async (req, res) => {
           minStock: parseFloat(variant.minStock) || parseFloat(minStock) || 0,
           maxStock: parseFloat(variant.maxStock) || parseFloat(maxStock) || 0,
           sku: variant.sku || "",
-          image: variant.image || ""
+          image: variant.image || "",
+          unitConversion: normaliseUnitConversion(variant.unitConversion)
         };
         const nks = normaliseVariantNicknames(variant.vendorNicknames);
         if (nks) out.vendorNicknames = nks;
@@ -377,7 +379,6 @@ router.post("/", async (req, res) => {
               price: parseFloat(d.price)
             }))
         : [],
-      unitConversion: normaliseUnitConversion(unitConversion),
       attributes: attributes && Array.isArray(attributes)
         ? attributes
             .filter(attr => attr.name && attr.name.trim() && attr.values && attr.values.length > 0)
@@ -437,7 +438,6 @@ router.put("/:id", async (req, res) => {
       discounts,
       attributes,
       variants,
-      unitConversion,
       description,
       notes
     } = req.body;
@@ -483,10 +483,6 @@ router.put("/:id", async (req, res) => {
         : [];
     }
 
-    if (unitConversion !== undefined) {
-      rawItem.unitConversion = normaliseUnitConversion(unitConversion);
-    }
-
     if (attributes !== undefined) {
       rawItem.attributes = Array.isArray(attributes)
         ? attributes
@@ -519,8 +515,12 @@ router.put("/:id", async (req, res) => {
             nicknames = existing?.vendorNicknames || [];
           }
 
+          const uc = incoming.unitConversion !== undefined
+            ? normaliseUnitConversion(incoming.unitConversion)
+            : (existing?.unitConversion || null)
+
           return {
-            _id: existing?._id, // preserve where possible
+            _id: existing?._id,
             combination: incoming.combination || existing?.combination || [],
             quantity: parseFloat(incoming.quantity ?? existing?.quantity ?? 0) || 0,
             minStock: parseFloat(incoming.minStock ?? existing?.minStock ?? rawItem.minStock) || 0,
@@ -528,6 +528,7 @@ router.put("/:id", async (req, res) => {
             sku: incoming.sku ?? existing?.sku ?? "",
             image,
             vendorNicknames: nicknames,
+            unitConversion: uc,
             status: incoming.status || existing?.status || "In Stock"
           };
         });
