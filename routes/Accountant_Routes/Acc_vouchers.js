@@ -1571,6 +1571,18 @@ router.post("/", auth, async (req, res) => {
 
     const voucher = new Acc_Voucher(body);
 
+    // Persist debit note classification fields even if not in schema (strict bypass)
+    if (body.debitNoteType) {
+      try {
+        voucher.set("debitNoteType", body.debitNoteType, { strict: false });
+      } catch {}
+    }
+    if (body.originalBill && typeof body.originalBill === "object") {
+      try {
+        voucher.set("originalBill", body.originalBill, { strict: false });
+      } catch {}
+    }
+
     // ── Approval workflow (sales vouchers only) ──────────────────────────────
     const perms = req.user?.permissions || {};
     const role = req.user?.role;
