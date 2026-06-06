@@ -119,6 +119,11 @@ async function processVariantRawItems(rawItemsInput) {
     const chosenUnit = rawItem.unit || registeredUnit;
     const baseUnit = rawItem.baseUnit || registeredUnit;
 
+    // If frontend sent an explicit unitCost (manually edited), honour it over DB-derived price
+    const finalUnitCost = (rawItem.unitCost != null && parseFloat(rawItem.unitCost) > 0)
+      ? parseFloat(rawItem.unitCost)
+      : unitCost;
+
     processedRawItems.push({
       rawItemId: rawItemData._id,
       rawItemName: rawItemData.name,
@@ -128,8 +133,8 @@ async function processVariantRawItems(rawItemsInput) {
       quantity: parseFloat(rawItem.quantity),
       unit: chosenUnit,
       baseUnit,
-      unitCost,
-      totalCost: parseFloat(rawItem.quantity) * unitCost
+      unitCost: finalUnitCost,
+      totalCost: parseFloat(rawItem.quantity) * finalUnitCost
     });
   }
 
