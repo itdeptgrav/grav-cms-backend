@@ -24,6 +24,7 @@ const {
 const {
   Acc_Company,
   Acc_Ledger, // ← added for applyLedgerBalances
+  Acc_Group, // ← added so edits can resolve/create ledgers by name (parity with create)
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const {
   Acc_Settings,
@@ -170,6 +171,55 @@ async function _applyLedgerBalances(voucher, direction, session) {
       }
     }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Resolve a ledger entry's name → an existing ledger, auto-creating it */
+/* if it truly doesn't exist yet. Mirrors the create path in            */
+/* Acc_vouchers.js so an EDITED invoice resolves/creates ledgers the    */
+/* exact same way a NEW one does — otherwise a name-only line (e.g. a    */
+/* "Round Off" or an as-yet-unmatched GST band) would be written to the */
+/* voucher with no ledgerId and then silently skipped by the rebalance, */
+/* leaving the edit out of the ledgers and the Balance Sheet.           */
+/* ------------------------------------------------------------------ */
+async function _resolveOrCreateByName(name, companyId, createdBy, session) {
+  const clean = String(name || "").trim();
+  if (!clean) return null;
+  let led = await Acc_Ledger.findOne({
+    companyId,
+    name: new RegExp(`^${clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+  }).session(session || null);
+  if (led) return led;
+
+  // Pick a sensible parent group: prefer Indirect Expenses (where Round Off
+  // lives), then any expense-natured group, then anything for the company.
+  const grp =
+    (await Acc_Group.findOne({ companyId, name: /indirect expense/i }).session(
+      session || null,
+    )) ||
+    (await Acc_Group.findOne({ companyId, nature: "expense" }).session(
+      session || null,
+    )) ||
+    (await Acc_Group.findOne({ companyId }).session(session || null));
+  if (!grp) return null;
+
+  const created = await Acc_Ledger.create(
+    [
+      {
+        companyId,
+        name: clean,
+        groupId: grp._id,
+        groupName: grp.name,
+        openingBalance: 0,
+        openingBalanceType: "Dr",
+        currentBalance: 0,
+        sourceSystem: "auto_from_voucher",
+        createdBy,
+      },
+    ],
+    { session },
+  );
+  return created[0];
 }
 
 /* ================================================================== */
@@ -1406,6 +1456,41 @@ router.put("/:id", async (req, res) => {
     if (wasPosted) await _applyLedgerBalances(inv, -1, session);
 
     const body = req.body || {};
+
+    // ── Resolve ledger entries exactly like the create path ──────────────
+    // Every entry must carry a real ledgerId before we save, otherwise the
+    // re-apply below skips it and the edit never reaches the ledgers / Balance
+    // Sheet. Entries that arrive with only a name (e.g. "Round Off", or a GST
+    // band whose rate-specific ledger doesn't exist yet) are resolved or
+    // auto-created here. Transient client flags are stripped.
+    if (Array.isArray(body.ledgerEntries)) {
+      for (const entry of body.ledgerEntries) {
+        const ledId = entry.ledgerId || entry.ledger;
+        if (ledId) {
+          entry.ledgerId = ledId;
+          if (!entry.ledgerName) {
+            const led = await Acc_Ledger.findById(ledId)
+              .select("name")
+              .session(session);
+            if (led) entry.ledgerName = led.name;
+          }
+        } else if (entry.ledgerName) {
+          const led = await _resolveOrCreateByName(
+            entry.ledgerName,
+            inv.companyId,
+            req.user?.id,
+            session,
+          );
+          if (led) {
+            entry.ledgerId = led._id;
+            entry.ledgerName = led.name;
+          }
+        }
+        delete entry.ledger;
+        delete entry.autoLedger;
+      }
+    }
+
     const EDITABLE = [
       "voucherDate",
       "partyLedgerId",
