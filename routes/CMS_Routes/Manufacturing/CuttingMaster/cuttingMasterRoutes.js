@@ -103,6 +103,123 @@ function pickStockItemImage(si, variantAttributes) {
   return (Array.isArray(si.images) && si.images[0]) || null;
 }
 
+// ── GET /master-stats?from=YYYY-MM-DD&to=YYYY-MM-DD ──────────────────────────
+router.get("/master-stats", async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const fromDate = from || new Date().toISOString().slice(0, 10);
+    const toDate   = to   || fromDate;
+
+    const CuttingMasterRecord = require("../../../../models/CMS_Models/Manufacturing/CuttingMaster/CuttingMasterRecord");
+
+    const records = await CuttingMasterRecord.find({
+      date: { $gte: fromDate, $lte: toDate }
+    }).lean();
+
+    const masterMap = new Map();
+    for (const record of records) {
+      const key = record.employeeId.toString();
+      if (!masterMap.has(key)) {
+        masterMap.set(key, {
+          employeeId:    record.employeeId,
+          employeeName:  record.employeeName,
+          biometricId:   record.biometricId  || "",
+          department:    record.department   || "",
+          designation:   record.designation  || "",
+          totalUnitsCut: 0,
+          daysWorked:    0,
+          woSet:         new Set()
+        });
+      }
+      const m = masterMap.get(key);
+      m.totalUnitsCut += record.totalUnitsCut || 0;
+      m.daysWorked++;
+      (record.entries || []).forEach(e => { if (e.woNumber) m.woSet.add(e.woNumber); });
+    }
+
+    const masters = [...masterMap.values()]
+      .map(({ woSet, ...m }) => ({ ...m, woCount: woSet.size }))
+      .sort((a, b) => b.totalUnitsCut - a.totalUnitsCut);
+
+    res.json({ success: true, masters, total: masters.length });
+  } catch (error) {
+    console.error("master-stats error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ── GET /barcode-search?barcode=WO-7e891fe6-005 ──────────────────────────────
+router.get("/barcode-search", async (req, res) => {
+  try {
+    const { barcode = "" } = req.query;
+    if (!barcode.trim()) return res.json({ success: true, results: [] });
+
+    const CuttingMasterRecord = require("../../../../models/CMS_Models/Manufacturing/CuttingMaster/CuttingMasterRecord");
+
+    const input = barcode.trim();
+
+    // Parse format: WO-{8hexChars}-{unit} or {8hexChars}-{unit}
+    const match = input.match(/^(?:WO-)?([A-Fa-f0-9]{8})-0*(\d+)$/);
+    let woShortId = null;
+    let unitNum   = null;
+    if (match) {
+      woShortId = match[1].toLowerCase();
+      unitNum   = parseInt(match[2]);
+    }
+
+    let dbRecords = [];
+
+    if (woShortId && unitNum != null) {
+      // Find records where any entry covers this unit number
+      dbRecords = await CuttingMasterRecord.find({
+        entries: {
+          $elemMatch: {
+            startUnit: { $lte: unitNum },
+            endUnit:   { $gte: unitNum }
+          }
+        }
+      }).lean();
+    } else {
+      // Fallback: search by WO number string
+      dbRecords = await CuttingMasterRecord.find({
+        "entries.woNumber": { $regex: input, $options: "i" }
+      }).lean();
+    }
+
+    const results = [];
+    for (const record of dbRecords) {
+      for (const entry of record.entries || []) {
+        const unitInRange  = unitNum != null ? (entry.startUnit <= unitNum && entry.endUnit >= unitNum) : true;
+        const woIdMatch    = woShortId ? entry.woId?.toString().endsWith(woShortId) : false;
+        const woNumMatch   = woShortId ? (entry.woNumber || "").toLowerCase().includes(woShortId) : false;
+        const fallbackMatch = !woShortId && (entry.woNumber || "").toLowerCase().includes(input.toLowerCase());
+
+        if (unitInRange && (woIdMatch || woNumMatch || fallbackMatch)) {
+          results.push({
+            employeeName:  record.employeeName,
+            biometricId:   record.biometricId  || "",
+            department:    record.department   || "",
+            designation:   record.designation  || "",
+            date:          record.date,
+            woNumber:      entry.woNumber      || "",
+            stockItemName: entry.stockItemName || "",
+            variants:      entry.variants      || "",
+            unitNumber:    unitNum,
+            startUnit:     entry.startUnit,
+            endUnit:       entry.endUnit,
+            timestamp:     entry.timestamp
+          });
+        }
+      }
+    }
+
+    res.json({ success: true, results, barcode: input });
+  } catch (error) {
+    console.error("barcode-search error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET all manufacturing orders (listing endpoint — unchanged from previous step)
 // ─────────────────────────────────────────────────────────────────────────────
