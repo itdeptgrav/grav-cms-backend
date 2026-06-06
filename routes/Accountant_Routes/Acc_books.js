@@ -23,11 +23,16 @@ const auth = accountantAuth;
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+// IST-aware date range parser.
+// dateFrom → start of that calendar day in IST (T00:00:00+05:30)
+// dateTo   → end of that calendar day in IST   (T23:59:59.999+05:30)
+// Prevents Tally-imported vouchers (stored as IST midnight = UTC-5:30)
+// from being included or excluded on the wrong side of a day boundary.
 function parseDateRange(req) {
   const { dateFrom, dateTo } = req.query;
   return {
-    from: dateFrom ? new Date(dateFrom) : null,
-    to: dateTo ? new Date(dateTo) : null,
+    from: dateFrom ? new Date(`${dateFrom}T00:00:00.000+05:30`) : null,
+    to: dateTo ? new Date(`${dateTo}T23:59:59.999+05:30`) : null,
   };
 }
 
@@ -257,25 +262,9 @@ router.get("/day-book", auth, async (req, res) => {
     const filter = { companyId, status };
     if (voucherType) filter.voucherType = voucherType;
     if (date) {
-      const d = new Date(date);
-      const dayStart = new Date(
-        d.getFullYear(),
-        d.getMonth(),
-        d.getDate(),
-        0,
-        0,
-        0,
-        0,
-      );
-      const dayEnd = new Date(
-        d.getFullYear(),
-        d.getMonth(),
-        d.getDate(),
-        23,
-        59,
-        59,
-        999,
-      );
+      // Single-day: use IST full-day boundaries (same fix as parseDateRange)
+      const dayStart = new Date(`${date}T00:00:00.000+05:30`);
+      const dayEnd = new Date(`${date}T23:59:59.999+05:30`);
       filter.voucherDate = { $gte: dayStart, $lte: dayEnd };
     } else if (from || to) {
       filter.voucherDate = {};
@@ -482,14 +471,11 @@ router.get("/balance-sheet", auth, async (req, res) => {
     const { companyId, asOf, from } = req.query;
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
-    const asOfDate = asOf ? new Date(asOf) : new Date();
-    // Optional period start. A Balance Sheet is fundamentally an
-    // "as at <date>" snapshot, but the accountant asked to also bound
-    // the start so they can view a specific period's closing position
-    // (movements from `from` … `asOf`, opening balances still included
-    // as the brought-forward position). When `from` is omitted it's the
-    // classic cumulative-to-date balance sheet.
-    const fromDate = from ? new Date(from) : null;
+    // IST-aware: treat asOf as end of that IST calendar day so all
+    // transactions dated that day in India are included.
+    const asOfDate = asOf ? new Date(`${asOf}T23:59:59.999+05:30`) : new Date();
+    // Optional period start: treat as start of that IST calendar day.
+    const fromDate = from ? new Date(`${from}T00:00:00.000+05:30`) : null;
 
     const cId = new mongoose.Types.ObjectId(companyId);
     const groups = await Acc_Group.find({
