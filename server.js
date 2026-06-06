@@ -1176,6 +1176,9 @@ app.use(
   require("./routes/Accountant_Routes/Acc_gstr2b"),
 );
 
+const searchRoute = require("./routes/Accountant_Routes/Acc_search");
+app.use("/api/accountant/search", searchRoute);
+
 // ── Health probe (open in browser to verify mounting) ────────────────
 // http://localhost:5000/api/accountant/_health
 app.get("/api/accountant/_health", (req, res) => {
