@@ -380,6 +380,14 @@ const tallyVoucherSchema = new mongoose.Schema(
     // (planning-only, not posted to the ledger).
     isOptional: { type: Boolean, default: false },
 
+    // Uniqueness gate for the voucher-number index. TRUE for "live" vouchers
+    // (draft / pending_approval / posted), FALSE once cancelled or voided.
+    // The unique index on (companyId, voucherType, voucherNumber) is PARTIAL
+    // on this flag, so a cancelled/void voucher releases its number for reuse
+    // — matching the way an accountant re-issues a number after voiding.
+    // Auto-maintained in the pre-save hook.
+    isLive: { type: Boolean, default: true, index: true },
+
     // ─── e-Acc_Invoice / e-Way Bill (sales) ─────────────────────────────────────
     eInvoiceDetails: {
       irn: { type: String, trim: true },
@@ -514,6 +522,10 @@ tallyVoucherSchema.pre("save", function (next) {
   );
   this.isBalanced = Math.abs(this.totalDebit - this.totalCredit) < 0.01;
 
+  // Live flag drives the partial unique index on voucherNumber. A
+  // cancelled/void voucher is NOT live, so its number is freed for reuse.
+  this.isLive = !["cancelled", "void"].includes(this.status);
+
   // GST aggregate
   if (this.gstBreakup) {
     this.gstBreakup.total =
@@ -538,16 +550,18 @@ tallyVoucherSchema.pre("save", function (next) {
 // INDEXES
 // ─────────────────────────────────────────────────────────────────────────────
 tallyVoucherSchema.index({ companyId: 1, voucherDate: -1 });
-tallyVoucherSchema.index(
-  { companyId: 1, voucherType: 1, voucherNumber: 1 },
-  { unique: true },
-);
+// NOTE: the unique (companyId, voucherType, voucherNumber) index is created
+// PROGRAMMATICALLY below as a PARTIAL index on isLive — see ensureVoucherIndexes.
+// It is intentionally NOT declared here so autoIndex doesn't race/conflict with
+// the legacy full-unique index it replaces.
 tallyVoucherSchema.index({ companyId: 1, partyLedgerId: 1 });
 tallyVoucherSchema.index({ companyId: 1, financialYear: 1 });
 tallyVoucherSchema.index({ "ledgerEntries.ledgerId": 1, voucherDate: -1 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATIC: get the next voucher number for a given company + type
+// Skips numbers already held by a LIVE voucher (draft/pending/posted) and
+// ignores cancelled/void ones, so a freshly-suggested number never collides.
 // ─────────────────────────────────────────────────────────────────────────────
 tallyVoucherSchema.statics.nextVoucherNumber = async function (
   companyId,
@@ -573,22 +587,46 @@ tallyVoucherSchema.statics.nextVoucherNumber = async function (
   const fy =
     today.getMonth() >= 3 ? today.getFullYear() : today.getFullYear() - 1;
   const fyShort = `${fy.toString().slice(2)}${(fy + 1).toString().slice(2)}`;
+  const fyTag = `${fy}-${(fy + 1).toString().slice(2)}`;
 
-  const last = await this.findOne({
+  // Highest trailing sequence among LIVE vouchers of this type+FY whose
+  // number was generated with THIS prefix (ignores manually-numbered ones
+  // in other schemes, and ignores cancelled/void).
+  const prefixRx = new RegExp(
+    `^${fmtPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`,
+    "i",
+  );
+  const live = await this.find({
     companyId,
     voucherType,
-    financialYear: `${fy}-${(fy + 1).toString().slice(2)}`,
+    financialYear: fyTag,
+    voucherNumber: prefixRx,
+    status: { $nin: ["cancelled", "void"] },
   })
-    .sort({ createdAt: -1 })
     .select("voucherNumber")
     .lean();
 
-  let seq = 1;
-  if (last && last.voucherNumber) {
-    const match = last.voucherNumber.match(/(\d+)$/);
-    if (match) seq = parseInt(match[1], 10) + 1;
+  let maxSeq = 0;
+  for (const v of live) {
+    const m = (v.voucherNumber || "").match(/(\d+)\s*$/);
+    if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
   }
-  return `${fmtPrefix}/${fyShort}/${seq.toString().padStart(5, "0")}`;
+
+  // Advance past any LIVE voucher already holding the candidate number
+  // (covers manual entries / odd schemes that share the prefix).
+  let seq = maxSeq + 1;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const candidate = `${fmtPrefix}/${fyShort}/${seq.toString().padStart(5, "0")}`;
+    const taken = await this.exists({
+      companyId,
+      voucherType,
+      voucherNumber: candidate,
+      status: { $nin: ["cancelled", "void"] },
+    });
+    if (!taken) return candidate;
+    seq++;
+  }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -623,6 +661,94 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
 // ─────────────────────────────────────────────────────────────────────────────
 const Acc_Voucher = mongoose.model("Acc_Voucher", tallyVoucherSchema);
 const Acc_Godown = mongoose.model("Acc_Godown", tallyGodownSchema);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INDEX RECONCILIATION (one-time, on connection)
+// -----------------------------------------------------------------------------
+// The original unique index on (companyId, voucherType, voucherNumber) was a
+// FULL unique index — it blocked re-using a voucher number even after the old
+// voucher had been cancelled/voided. We replace it with a PARTIAL unique index
+// that only enforces uniqueness among LIVE vouchers (isLive: true), so a
+// cancelled/void voucher releases its number.
+//
+// Mongoose autoIndex can't switch an index's options in place, so we:
+//   1. backfill isLive on any existing docs that lack it,
+//   2. drop the legacy full-unique index if present,
+//   3. create the partial unique index.
+// All steps are idempotent and safe to run on every boot.
+// ─────────────────────────────────────────────────────────────────────────────
+async function ensureVoucherIndexes() {
+  try {
+    const coll = Acc_Voucher.collection;
+
+    // 1) Backfill isLive so the partial index covers pre-existing vouchers.
+    try {
+      await coll.updateMany(
+        { status: { $in: ["cancelled", "void"] }, isLive: { $ne: false } },
+        { $set: { isLive: false } },
+      );
+      await coll.updateMany(
+        {
+          status: { $nin: ["cancelled", "void"] },
+          isLive: { $ne: true },
+        },
+        { $set: { isLive: true } },
+      );
+    } catch (e) {
+      console.warn("[Acc_Voucher] isLive backfill skipped:", e.message);
+    }
+
+    // 2) Drop the legacy FULL unique index if it exists (any non-partial
+    //    unique index on this exact key).
+    let indexes = [];
+    try {
+      indexes = await coll.indexes();
+    } catch (_) {
+      indexes = [];
+    }
+    for (const ix of indexes) {
+      const k = ix.key || {};
+      const sameKey =
+        k.companyId === 1 && k.voucherType === 1 && k.voucherNumber === 1;
+      if (sameKey && ix.unique && !ix.partialFilterExpression) {
+        try {
+          await coll.dropIndex(ix.name);
+          console.log(`[Acc_Voucher] dropped legacy unique index ${ix.name}`);
+        } catch (e) {
+          console.warn(`[Acc_Voucher] could not drop ${ix.name}:`, e.message);
+        }
+      }
+    }
+
+    // 3) Create the partial unique index (live vouchers only).
+    try {
+      await coll.createIndex(
+        { companyId: 1, voucherType: 1, voucherNumber: 1 },
+        {
+          unique: true,
+          partialFilterExpression: { isLive: true },
+          name: "uniq_voucher_number_live",
+        },
+      );
+    } catch (e) {
+      // Most likely an older MongoDB without partial-index support, or a
+      // transient build error. The application-layer duplicate check in the
+      // create/update routes still guards uniqueness, so we just log.
+      console.warn(
+        "[Acc_Voucher] partial unique index not created:",
+        e.message,
+      );
+    }
+  } catch (e) {
+    console.error("[Acc_Voucher] index reconcile failed:", e.message);
+  }
+}
+
+if (mongoose.connection.readyState === 1) {
+  ensureVoucherIndexes();
+} else {
+  mongoose.connection.once("open", ensureVoucherIndexes);
+}
 
 module.exports = {
   Acc_Voucher,
