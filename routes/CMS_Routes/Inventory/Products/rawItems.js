@@ -641,6 +641,57 @@ router.get("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
   }
 });
 
+// BULK upsert + delete aliases — single MongoDB save instead of N round trips
+router.post("/:id/variants/bulk-vendor-nicknames", async (req, res) => {
+  try {
+    const { operations = [] } = req.body;
+
+    const rawItem = await RawItem.findById(req.params.id);
+    if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
+
+    for (const op of operations) {
+      const variant = rawItem.variants.id(op.variantId);
+      if (!variant) continue;
+
+      if (op.action === "delete" && op.aliasId) {
+        const entry = variant.vendorNicknames.id(op.aliasId);
+        if (entry) entry.deleteOne();
+
+      } else if (op.action === "upsert") {
+        if (op.aliasId) {
+          // Update existing alias
+          const entry = variant.vendorNicknames.id(op.aliasId);
+          if (entry) {
+            if (op.nickname !== undefined) entry.nickname     = op.nickname.toString().trim() || entry.nickname;
+            if (op.price    !== undefined) entry.price        = parseFloat(op.price)           || 0;
+            if (op.deliveryDays !== undefined) entry.deliveryDays = parseInt(op.deliveryDays)  || 0;
+            if (op.notes    !== undefined) entry.notes        = (op.notes || "").trim();
+          }
+        } else if (op.vendor) {
+          // Create — skip if this vendor already has an alias on this variant
+          const exists = (variant.vendorNicknames || []).find(vn => vn.vendor?.toString() === op.vendor);
+          if (!exists) {
+            variant.vendorNicknames.push({
+              vendor:       op.vendor,
+              nickname:     (op.nickname || "").toString().trim(),
+              price:        parseFloat(op.price)        || 0,
+              deliveryDays: parseInt(op.deliveryDays)   || 0,
+              notes:        (op.notes || "").trim()
+            });
+          }
+        }
+      }
+    }
+
+    rawItem.updatedBy = req.user.id;
+    await rawItem.save();
+    res.json({ success: true, message: "Bulk alias update complete" });
+  } catch (error) {
+    console.error("bulk-vendor-nicknames error:", error);
+    res.status(500).json({ success: false, message: "Server error: " + error.message });
+  }
+});
+
 // ADD nickname to a specific variant
 router.post("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
   try {
