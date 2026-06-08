@@ -350,7 +350,8 @@ router.post("/", async (req, res) => {
           maxStock: parseFloat(variant.maxStock) || parseFloat(maxStock) || 0,
           sku: variant.sku || "",
           image: variant.image || "",
-          unitConversion: normaliseUnitConversion(variant.unitConversion)
+          unitConversions: (Array.isArray(variant.unitConversions) ? variant.unitConversions : [])
+            .map(uc => normaliseUnitConversion(uc)).filter(Boolean)
         };
         const nks = normaliseVariantNicknames(variant.vendorNicknames);
         if (nks) out.vendorNicknames = nks;
@@ -516,9 +517,10 @@ router.put("/:id", async (req, res) => {
             nicknames = existing?.vendorNicknames || [];
           }
 
-          const uc = incoming.unitConversion !== undefined
-            ? normaliseUnitConversion(incoming.unitConversion)
-            : (existing?.unitConversion || null)
+          const ucs = incoming.unitConversions !== undefined
+            ? (Array.isArray(incoming.unitConversions) ? incoming.unitConversions : [])
+                .map(u => normaliseUnitConversion(u)).filter(Boolean)
+            : (existing?.unitConversions || [])
 
           return {
             _id: existing?._id,
@@ -529,7 +531,7 @@ router.put("/:id", async (req, res) => {
             sku: incoming.sku ?? existing?.sku ?? "",
             image,
             vendorNicknames: nicknames,
-            unitConversion: uc,
+            unitConversions: ucs,
             status: incoming.status || existing?.status || "In Stock"
           };
         });
