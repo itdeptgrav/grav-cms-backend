@@ -472,7 +472,18 @@ function computeEmployeePayroll(employee, ctx) {
   const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
   const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
-  const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
+  // EPF — respect the HR per-employee override stored on the employee's
+  // salary. When epfOverride is set, the HR-entered monthly EPF is treated as
+  // the full-month figure and prorated by the same ratio the earned gross
+  // bears to the full gross (so LOP days reduce it proportionally, like every
+  // other earned figure). When not overridden, it's the usual statutory
+  // ROUND(MIN(earned basic * 12%, cap)).
+  const epfOverridden = !!employee.salary?.epfOverride;
+  const overrideEpfFull = Number(employee.salary?.epf || 0);
+  const earnedRatio = fullGross > 0 ? grossEarned / fullGross : 1;
+  const epf = epfOverridden
+    ? Math.round(overrideEpfFull * earnedRatio)
+    : Math.round(Math.min(basicEarned * eepfPct, epfCap));
   const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
   const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
   const pt =
@@ -1480,7 +1491,14 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
     const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
     const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
-    const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
+    // EPF — respect the employee's HR override. When set, prorate the stored
+    // full-month EPF by the earned-gross ratio; otherwise statutory on basic.
+    const epfOverridden = !!empSalary.epfOverride;
+    const overrideEpfFull = Number(empSalary.epf || 0);
+    const earnedRatio = fullGross > 0 ? grossEarnedBase / fullGross : 1;
+    const epf = epfOverridden
+      ? Math.round(overrideEpfFull * earnedRatio)
+      : Math.round(Math.min(basicEarned * eepfPct, epfCap));
     const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
     const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
     const erEsic = esiApplicable ? Math.ceil(basicEarned * erEsicPct) : 0;
@@ -1724,7 +1742,14 @@ router.patch(
       const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
       const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
-      const epf = Math.round(Math.min(basicEarned * eepfPct, epfCap));
+      // EPF — respect the employee's HR override. When set, prorate the stored
+      // full-month EPF by the earned-gross ratio; otherwise statutory on basic.
+      const epfOverridden = !!employee.salary?.epfOverride;
+      const overrideEpfFull = Number(employee.salary?.epf || 0);
+      const earnedRatio = fullGross > 0 ? grossEarnedBase / fullGross : 1;
+      const epf = epfOverridden
+        ? Math.round(overrideEpfFull * earnedRatio)
+        : Math.round(Math.min(basicEarned * eepfPct, epfCap));
       const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
       const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
       const erEsic = esiApplicable ? Math.ceil(basicEarned * erEsicPct) : 0;
