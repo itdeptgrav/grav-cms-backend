@@ -1391,8 +1391,8 @@ router.get("/dashboard-overview", auth, async (req, res) => {
     let fyStart = new Date(today.getFullYear(), 3, 1); // April 1
     if (today.getMonth() < 3) fyStart.setFullYear(today.getFullYear() - 1);
 
-    const dateFrom = from ? new Date(from) : fyStart;
-    const dateTo = to ? new Date(to) : today;
+    const dateFrom = from ? new Date(`${from}T00:00:00.000+05:30`) : fyStart;
+    const dateTo = to ? new Date(`${to}T23:59:59.999+05:30`) : today;
 
     // ── 1. Aggregate ALL voucher entries in date range ─────────────
     const entries = await Acc_Voucher.aggregate([
