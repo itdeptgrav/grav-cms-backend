@@ -67,7 +67,6 @@ const matchExistingVariant = (incoming, existingList) => {
   return null;
 };
 
-// Normalise per-variant vendorNicknames input
 const normaliseVariantNicknames = (incoming) => {
   if (!Array.isArray(incoming)) return null;
   return incoming
@@ -76,6 +75,8 @@ const normaliseVariantNicknames = (incoming) => {
       _id: vn._id && mongoose.Types.ObjectId.isValid(vn._id) ? vn._id : undefined,
       vendor: vn.vendor,
       nickname: vn.nickname.toString().trim(),
+      price: parseFloat(vn.price) || 0,
+      deliveryDays: parseInt(vn.deliveryDays) || 0,
       notes: (vn.notes || "").toString().trim()
     }));
 };
