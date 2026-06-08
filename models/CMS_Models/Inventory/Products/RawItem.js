@@ -50,7 +50,8 @@ const variantSchema = new mongoose.Schema({
   // ── NEW: per-variant fields ──
   image:           { type: String, default: "" },          // Cloudinary URL
   vendorNicknames: [variantVendorNicknameSchema],          // per-variant aliases
-  unitConversion:  { type: unitConversionSchema, default: null },
+  unitConversion:  { type: unitConversionSchema, default: null },   // legacy — kept for backward compat
+  unitConversions: [unitConversionSchema],
 
   status: { type: String, default: "In Stock" }
 });
