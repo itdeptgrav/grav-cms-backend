@@ -1298,7 +1298,7 @@ router.get("/ledgers/:id/statement", async (req, res) => {
           $match: {
             "ledgerEntries.ledgerId": ledger._id,
             status: "posted",
-            voucherDate: { $lt: new Date(startDate) },
+            voucherDate: { $lt: new Date(`${startDate}T00:00:00.000+05:30`) },
           },
         },
         { $unwind: "$ledgerEntries" },
@@ -1655,11 +1655,10 @@ router.get("/ledgers/:id/statement", async (req, res) => {
     // Same date span, one year earlier
     let previousPeriodComparison = null;
     if (startDate && endDate) {
-      const s = new Date(startDate);
-      s.setFullYear(s.getFullYear() - 1);
-      const e = new Date(endDate);
-      e.setFullYear(e.getFullYear() - 1);
-      e.setHours(23, 59, 59, 999);
+      const prevStartStr = `${parseInt(startDate.slice(0, 4)) - 1}${startDate.slice(4)}`;
+      const prevEndStr = `${parseInt(endDate.slice(0, 4)) - 1}${endDate.slice(4)}`;
+      const s = new Date(`${prevStartStr}T00:00:00.000+05:30`);
+      const e = new Date(`${prevEndStr}T23:59:59.999+05:30`);
       const prevAgg = await Acc_Voucher.aggregate([
         {
           $match: {
@@ -1940,12 +1939,8 @@ router.get("/trial-balance", async (req, res) => {
       .lean();
 
     const dateMatch = {};
-    if (startDate) dateMatch.$gte = new Date(startDate);
-    if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
-      dateMatch.$lte = e;
-    }
+    if (startDate) dateMatch.$gte = new Date(`${startDate}T00:00:00.000+05:30`);
+    if (endDate) dateMatch.$lte = new Date(`${endDate}T23:59:59.999+05:30`);
 
     // Aggregate per-ledger debit/credit totals in the period
     const periodMatch = {
@@ -1992,7 +1987,7 @@ router.get("/trial-balance", async (req, res) => {
           $match: {
             companyId: new mongoose.Types.ObjectId(companyId),
             status: "posted",
-            voucherDate: { $lt: new Date(startDate) },
+            voucherDate: { $lt: new Date(`${startDate}T00:00:00.000+05:30`) },
           },
         },
         { $unwind: "$ledgerEntries" },
@@ -2155,12 +2150,9 @@ router.get("/groups/:id/statement", async (req, res) => {
     const ledgerIds = ledgers.map((l) => l._id);
 
     const dateFilter = {};
-    if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
-      dateFilter.$lte = e;
-    }
+    if (startDate)
+      dateFilter.$gte = new Date(`${startDate}T00:00:00.000+05:30`);
+    if (endDate) dateFilter.$lte = new Date(`${endDate}T23:59:59.999+05:30`);
 
     const filter = {
       "ledgerEntries.ledgerId": { $in: ledgerIds },
