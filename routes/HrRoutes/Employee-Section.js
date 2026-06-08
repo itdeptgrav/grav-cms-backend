@@ -37,8 +37,11 @@ function recalculateSalary(salary = {}, cfg = {}) {
   const basic = Math.round(gross * basicPct);
   const hra = Math.round(gross * hraPct);
 
-  // EPF: ROUND(MIN(basic * 12%, epfCapAmount)) — rupee cap of 1,800/mo
-  const epf = Math.round(Math.min(basic * eepfPct, epfCapAmount));
+  // EPF — respect HR override. When epfOverride is set, keep the HR-entered
+  // value; otherwise ROUND(MIN(basic * 12%, epfCapAmount)) — rupee cap 1,800/mo
+  const epf = s.epfOverride
+    ? s.epf || 0
+    : Math.round(Math.min(basic * eepfPct, epfCapAmount));
 
   // EDLI & Admin — respect HR override
   const edli = s.edliOverride
@@ -68,6 +71,7 @@ function recalculateSalary(salary = {}, cfg = {}) {
     epf,
     edli,
     adminCharges,
+    epfOverride: s.epfOverride || false,
     edliOverride: s.edliOverride || false,
     adminOverride: s.adminOverride || false,
     eeesic,
@@ -370,6 +374,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       const calculated = recalculateSalary(updateData.salary, cfg.toObject());
       updateData.salary = encryptSalaryFields(calculated);
       // Boolean override flags are not encrypted
+      updateData.salary.epfOverride = calculated.epfOverride;
       updateData.salary.edliOverride = calculated.edliOverride;
       updateData.salary.adminOverride = calculated.adminOverride;
     }
@@ -386,13 +391,11 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     // Decrypt salary before sending to client
     const decryptedDoc = decryptEmployeeDoc(updated);
-    res
-      .status(200)
-      .json({
-        success: true,
-        message: "Employee updated successfully",
-        data: decryptedDoc,
-      });
+    res.status(200).json({
+      success: true,
+      message: "Employee updated successfully",
+      data: decryptedDoc,
+    });
   } catch (error) {
     console.error("Update employee error:", error);
     if (error.code === 11000)
@@ -453,13 +456,11 @@ router.patch("/:id/documents", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
-    res
-      .status(200)
-      .json({
-        success: true,
-        message: "Documents updated successfully",
-        data: updated.documents,
-      });
+    res.status(200).json({
+      success: true,
+      message: "Documents updated successfully",
+      data: updated.documents,
+    });
   } catch (error) {
     console.error("Update documents error:", error);
     res
@@ -482,12 +483,10 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
     }
 
     if (!profilePhoto?.url || !profilePhoto?.publicId) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Valid profilePhoto with url and publicId required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Valid profilePhoto with url and publicId required",
+      });
     }
 
     if (
@@ -510,13 +509,11 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
-    res
-      .status(200)
-      .json({
-        success: true,
-        message: "Profile photo updated successfully",
-        data: updated.profilePhoto,
-      });
+    res.status(200).json({
+      success: true,
+      message: "Profile photo updated successfully",
+      data: updated.profilePhoto,
+    });
   } catch (error) {
     console.error("Update profile photo error:", error);
     res
@@ -909,12 +906,10 @@ router.get(
     try {
       const { departmentId, designation } = req.query;
       if (!departmentId || !designation) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "departmentId and designation required",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "departmentId and designation required",
+        });
       }
 
       const employees = await Employee.find({
@@ -964,12 +959,10 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
     if (user.role !== "hr_manager") {
-      return res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only HR managers can delete employees",
-        });
+      return res.status(403).json({
+        success: false,
+        message: "Only HR managers can delete employees",
+      });
     }
 
     // BEFORE (broken): loads full doc then calls .save() → triggers full validation

@@ -139,6 +139,7 @@ const employeeSchema = new mongoose.Schema({
 
     // ── PF (auto) ─────────────────────────────────────────────────────────────
     epf: { type: mongoose.Schema.Types.Mixed, default: 0 },
+    epfOverride: { type: Boolean, default: false }, // kept as boolean
     edli: { type: mongoose.Schema.Types.Mixed, default: 0 },
     edliOverride: { type: Boolean, default: false }, // kept as boolean
     adminCharges: { type: mongoose.Schema.Types.Mixed, default: 0 },
@@ -354,7 +355,11 @@ employeeSchema.pre("save", async function (next) {
     const basic = Math.round(gross * basicPct);
     const hra = Math.round(gross * hraPct);
 
-    const epf = Math.round(Math.min(basic * eepfPct, epfCapAmount));
+    // EPF — respect HR override. When epfOverride is set, the HR-entered epf
+    // value is kept verbatim instead of being recomputed from basic.
+    const epf = s.epfOverride
+      ? s.epf || 0
+      : Math.round(Math.min(basic * eepfPct, epfCapAmount));
     const edli = s.edliOverride
       ? s.edli || 0
       : Math.round(Math.min(basic * edliPct, edliCapAmount));
@@ -379,6 +384,7 @@ employeeSchema.pre("save", async function (next) {
       epf,
       edli,
       adminCharges,
+      epfOverride: this.salary.epfOverride || false,
       edliOverride: this.salary.edliOverride || false,
       adminOverride: this.salary.adminOverride || false,
       eeesic,
@@ -394,6 +400,7 @@ employeeSchema.pre("save", async function (next) {
     // ── 3. Encrypt all monetary fields before persisting ─────────────────────
     const encrypted = encryptSalaryFields(calculated);
     // Preserve boolean override flags (not encrypted)
+    encrypted.epfOverride = calculated.epfOverride;
     encrypted.edliOverride = calculated.edliOverride;
     encrypted.adminOverride = calculated.adminOverride;
 
