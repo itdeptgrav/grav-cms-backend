@@ -122,12 +122,21 @@ router.get("/:barcodeId", async (req, res) => {
       return res.status(404).json({ success: false, message: "Barcode not found" });
     }
 
-    const openSession =
-      (barcode.cuttingSessions || []).find((s) => !s.closedAt) || null;
+    // Pull variant-level unit conversions so the client can offer unit choices
+    let unitConversions = [];
+    if (barcode.rawItem && barcode.variantId) {
+      const rawItemDoc = await RawItem.findById(barcode.rawItem).select("variants").lean();
+      const variant = rawItemDoc?.variants?.find(v => v._id?.toString() === barcode.variantId?.toString());
+      if (variant?.unitConversions?.length) {
+        unitConversions = variant.unitConversions.filter(uc => uc.toUnit);
+      }
+    }
+
+    const openSession = (barcode.cuttingSessions || []).find((s) => !s.closedAt) || null;
 
     return res.json({
       success: true,
-      barcode: formatBarcode(barcode),
+      barcode: { ...formatBarcode(barcode), unitConversions },
       openSession: formatSession(openSession),
     });
   } catch (err) {
@@ -160,6 +169,14 @@ router.post("/start-cutting-session", async (req, res) => {
       return res.status(404).json({ success: false, message: "Barcode not found" });
     }
 
+    // Fetch variant-level unit conversions once (used by both resume + new paths)
+    let unitConversions = [];
+    if (barcode.rawItem && barcode.variantId) {
+      const riDoc = await RawItem.findById(barcode.rawItem).select("variants").lean();
+      const vDoc = riDoc?.variants?.find(v => v._id?.toString() === barcode.variantId?.toString());
+      if (vDoc?.unitConversions?.length) unitConversions = vDoc.unitConversions.filter(uc => uc.toUnit);
+    }
+
     // Resume open session if any
     const existingOpen = (barcode.cuttingSessions || []).find((s) => !s.closedAt);
     if (existingOpen) {
@@ -167,7 +184,7 @@ router.post("/start-cutting-session", async (req, res) => {
         success: true,
         resumed: true,
         session: formatSession(existingOpen),
-        barcode: formatBarcode(barcode.toObject()),
+        barcode: { ...formatBarcode(barcode.toObject()), unitConversions },
       });
     }
 
@@ -195,7 +212,7 @@ router.post("/start-cutting-session", async (req, res) => {
       success: true,
       resumed: false,
       session: formatSession(newSession),
-      barcode: formatBarcode(barcode.toObject()),
+      barcode: { ...formatBarcode(barcode.toObject()), unitConversions },
     });
   } catch (err) {
     console.error("start-cutting-session error:", err);
@@ -259,7 +276,7 @@ router.post("/add-piece-scan", async (req, res) => {
 
 router.post("/close-cutting-session", async (req, res) => {
   try {
-    const { barcodeId, sessionId, remainingQty } = req.body;
+    const { barcodeId, sessionId, remainingQty, remainingUnit } = req.body;
  
     if (!mongoose.Types.ObjectId.isValid(barcodeId)) {
       return res.status(400).json({ success: false, message: "Invalid barcode id" });
@@ -268,8 +285,8 @@ router.post("/close-cutting-session", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid session id" });
     }
  
-    const remaining = parseFloat(remainingQty);
-    if (isNaN(remaining) || remaining < 0) {
+    const rawRemaining = parseFloat(remainingQty);
+    if (isNaN(rawRemaining) || rawRemaining < 0) {
       return res.status(400).json({
         success: false,
         message: "Remaining quantity must be a non-negative number",
@@ -288,10 +305,43 @@ router.post("/close-cutting-session", async (req, res) => {
     if (session.closedAt) {
       return res.status(400).json({ success: false, message: "Session is already closed" });
     }
+
+    // Convert remainingQty to barcode's native unit if a different unit was submitted
+    const inputUnit = (remainingUnit || "").trim();
+    let remaining = rawRemaining;
+    if (inputUnit && barcode.unit && inputUnit !== barcode.unit) {
+      let converted = false;
+
+      // Variant-level unitConversions checked FIRST — takes priority over global Unit model
+      if (barcode.rawItem && barcode.variantId) {
+        const rawItemForConv = await RawItem.findById(barcode.rawItem).select("variants").lean();
+        const vForConv = rawItemForConv?.variants?.find(
+          v => v._id?.toString() === barcode.variantId?.toString()
+        );
+        const vc = (vForConv?.unitConversions || []).find(uc =>
+          (uc.fromUnit === inputUnit && uc.toUnit === barcode.unit) ||
+          (uc.toUnit   === inputUnit && uc.fromUnit === barcode.unit)
+        );
+        if (vc?.quantity) {
+          // fromUnit === inputUnit  →  1 inputUnit = quantity barcodeUnit  →  multiply
+          // toUnit   === inputUnit  →  1 barcodeUnit = quantity inputUnit  →  divide
+          remaining  = vc.fromUnit === inputUnit
+            ? rawRemaining * vc.quantity
+            : rawRemaining / vc.quantity;
+          converted = true;
+        }
+      }
+
+      // Only hit the global Unit model if the variant had no matching conversion
+      if (!converted) {
+        remaining = await convertQuantity(rawRemaining, inputUnit, barcode.unit);
+      }
+    }
+
     if (remaining > session.startQty) {
       return res.status(400).json({
         success: false,
-        message: `Remaining (${remaining}) cannot exceed session start qty (${session.startQty})`,
+        message: `Remaining (${remaining.toFixed(4)} ${barcode.unit}) cannot exceed session start qty (${session.startQty} ${barcode.unit})`,
       });
     }
  
