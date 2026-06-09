@@ -34,7 +34,8 @@ const variantVendorNicknameSchema = new mongoose.Schema(
     nickname:     { type: String, required: true, trim: true },  // vendor's code/name for this variant
     price:        { type: Number, default: 0, min: 0 },          // vendor's price for this variant
     deliveryDays: { type: Number, default: 0, min: 0 },          // delivery timeline in days
-    notes:        { type: String, default: "", trim: true }
+    notes:          { type: String, default: "", trim: true },
+    specifications: [{ key: { type: String, default: "" }, value: { type: String, default: "" } }]
   },
   { timestamps: true }
 );

@@ -77,7 +77,10 @@ const normaliseVariantNicknames = (incoming) => {
       nickname: vn.nickname.toString().trim(),
       price: parseFloat(vn.price) || 0,
       deliveryDays: parseInt(vn.deliveryDays) || 0,
-      notes: (vn.notes || "").toString().trim()
+      notes: (vn.notes || "").toString().trim(),
+      specifications: Array.isArray(vn.specifications)
+        ? vn.specifications.filter(s => s.key && s.key.trim()).map(s => ({ key: s.key.trim(), value: (s.value || "").trim() }))
+        : []
     }));
 };
 
