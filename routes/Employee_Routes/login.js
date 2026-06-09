@@ -105,7 +105,7 @@ router.post("/login", async (req, res) => {
 
     const employee = await Employee.findOne({
       phone: phoneNumber,
-      isActive: true,
+      $or: [{ status: "active" }, { isActive: true }],
     }).select("+password");
     if (!employee)
       return res
