@@ -289,6 +289,7 @@ router.get("/data/raw-items", async (req, res) => {
 
     const rawItems = await RawItem.find(filter)
       .select("name sku category unit customUnit variants quantity minStock maxStock sellingPrice stockTransactions")
+      .populate("variants.vendorNicknames.vendor", "companyName")
       .limit(parseInt(limit))
       .sort({ name: 1 });
 
@@ -341,7 +342,15 @@ router.get("/data/raw-items", async (req, res) => {
             unit: baseUnitName,
             cost: latestCost,
             status: variant.status || "Out of Stock",
-            sku: variant.sku || `${baseItem.sku}-var`
+            sku: variant.sku || `${baseItem.sku}-var`,
+            vendorAliases: (variant.vendorNicknames || [])
+              .filter(vn => vn.price > 0)
+              .map(vn => ({
+                vendorId: vn.vendor?._id?.toString() || vn.vendor?.toString(),
+                vendorName: vn.vendor?.companyName || "—",
+                vendorCode: vn.nickname || "",
+                price: vn.price || 0
+              }))
           };
         });
       } else {
