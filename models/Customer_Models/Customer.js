@@ -25,7 +25,7 @@ const assignedStockItemSchema = new mongoose.Schema(
 const customerSchema = new mongoose.Schema(
   {
     // ── Auto ID ────────────────────────────────────────────────────────────
-    customerId: { type: String, unique: true, sparse: true },
+    customerId: { type: String},
 
     // ── Basic Info ─────────────────────────────────────────────────────────
     name: {
@@ -36,7 +36,7 @@ const customerSchema = new mongoose.Schema(
     email: {
       type: String,
       required: [true, "Email is required"],
-      unique: true,
+      
       lowercase: true,
       trim: true,
       match: [
@@ -46,8 +46,6 @@ const customerSchema = new mongoose.Schema(
     },
     phone: {
       type: String,
-      required: [true, "Phone number is required"],
-      unique: true,
       trim: true,
     },
 
