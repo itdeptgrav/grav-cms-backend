@@ -1120,6 +1120,8 @@ app.use(
   "/api/accountant/bank-transactions",
   require("./routes/Accountant_Routes/Acc_bankTransactions"),
 );
+const bankReconRoutes = require("./routes/Accountant_Routes/Acc_bankRecon");
+app.use("/api/accountant/bank-recon", bankReconRoutes);
 
 app.use(
   "/api/accountant/setu-aa",
