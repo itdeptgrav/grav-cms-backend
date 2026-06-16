@@ -14,7 +14,7 @@
 //   DELETE /sessions/:id                → delete session
 //   GET    /sessions/:id/match-candidates → vouchers eligible for manual match
 //   GET    /bank-ledgers                → bank/cash ledgers for a company
-//   GET    /annual-summary              → aggregate all sessions for a year
+//   GET    /annual-summary             → aggregate all sessions for a year
 // =============================================================================
 "use strict";
 
@@ -141,13 +141,24 @@ const MONTH_NAMES = [
 function parseDate(str) {
   if (!str) return null;
   const s = String(str).trim();
-  const m1 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (m1)
+  // DD-MM-YYYY or DD/MM/YYYY (Indian bank format — dashes OR slashes).
+  // Indian Bank exports use dashes (e.g. 23-07-2025); the old code only
+  // accepted slashes, so every date came back null and the whole month
+  // got filtered out.
+  let m = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/);
+  if (m) {
     return new Date(
-      `${m1[3]}-${m1[2].padStart(2, "0")}-${m1[1].padStart(2, "0")}T00:00:00.000+05:30`,
+      `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}T00:00:00.000+05:30`,
     );
-  const m2 = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (m2) return new Date(`${m2[1]}-${m2[2]}-${m2[3]}T00:00:00.000+05:30`);
+  }
+  // YYYY-MM-DD or YYYY/MM/DD (ISO)
+  m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b/);
+  if (m) {
+    return new Date(
+      `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}T00:00:00.000+05:30`,
+    );
+  }
+  // Excel serial date number
   if (/^\d+(\.\d+)?$/.test(s)) {
     const d = XLSX.SSF.parse_date_code(parseFloat(s));
     if (d)
@@ -175,6 +186,25 @@ function parseBalStr(s) {
     amount: parseFloat(m[1].replace(/,/g, "")) || 0,
     suffix: (m[2] || "CR").toUpperCase(),
   };
+}
+
+// Stable identity for a single statement line — used to carry over manual
+// matches / reconciled flags when the SAME month is re-uploaded, so prior
+// reconciliation work is never wiped.
+function txnKey(t) {
+  const d = t.valueDate || t.postDate;
+  const ds = d ? new Date(d).toISOString().slice(0, 10) : "";
+  return [
+    ds,
+    Number(t.debit || 0).toFixed(2),
+    Number(t.credit || 0).toFixed(2),
+    Number(t.balance || 0).toFixed(2),
+    String(t.description || "")
+      .slice(0, 60)
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim(),
+  ].join("|");
 }
 
 // ─── Statement parser ─────────────────────────────────────────────────────────
@@ -210,14 +240,22 @@ function parseBankStatement(buffer, filename) {
     const line = cells.join(" ").trim();
     if (!line) continue;
 
-    if (
-      cells.some(
-        (c) =>
-          /value\s*date/i.test(c) ||
-          (c.toLowerCase() === "date" &&
-            cells.some((x) => /debit|credit/i.test(x))),
-      )
-    ) {
+    // A header row has BOTH a date-like column AND a debit/credit/amount
+    // column. This catches "Transaction Date" + "Credit Amount" / "Debit
+    // Amount" (Indian Bank), "Value Date" + "Withdrawal"/"Deposit" (HDFC/
+    // ICICI), "Date" + "Debit"/"Credit" (SBI), etc. The old check only
+    // recognised "value date" or an exact "date" cell, so Indian Bank's
+    // "Transaction Date" header was never found.
+    const hasDateCol = cells.some(
+      (c) =>
+        /(value|txn|transaction|post(ing)?)\s*date/i.test(c) ||
+        /^date$/i.test(c),
+    );
+    const hasAmountCol = cells.some(
+      (c) =>
+        /(debit|credit|withdrawal|deposit)/i.test(c) || /\bamount\b/i.test(c),
+    );
+    if (hasDateCol && hasAmountCol) {
       headerRowIdx = i;
       break;
     }
@@ -241,7 +279,11 @@ function parseBankStatement(buffer, filename) {
   }
 
   if (headerRowIdx === -1)
-    throw new Error("Could not find transaction header row.");
+    throw new Error(
+      "Could not find the transaction header row. Expected a row with a " +
+        "date column (Transaction/Value/Posting Date) and a Debit/Credit " +
+        "(or Withdrawal/Deposit/Amount) column.",
+    );
 
   const headers = rows[headerRowIdx].map((c) =>
     String(c || "")
@@ -260,12 +302,23 @@ function parseBankStatement(buffer, filename) {
   const colPostDate = col([/post\s*date/, /transaction\s*date/]);
   const colDesc = col([/description/, /narration/, /particulars/, /remarks/]);
   const colCheque = col([/cheque/, /chq/, /ref\s*no/]);
-  const colDebit = col([/debit\s*amount/, /withdrawal/, /debit/, /^dr$/]);
-  const colCredit = col([/credit\s*amount/, /deposit/, /credit/, /^cr$/]);
-  const colBalance = col([/balance/]);
+  const colDebit = col([/debit\s*amount/, /withdrawal/, /\bdebit\b/, /^dr$/]);
+  const colCredit = col([/credit\s*amount/, /deposit/, /\bcredit\b/, /^cr$/]);
+  // "Closing Balance" / "Balance" — but NOT the credit/debit amount columns.
+  const colBalance = col([
+    /closing\s*balance/,
+    /running\s*balance/,
+    /^balance$/,
+    /balance/,
+  ]);
   const colBranch = col([/remitter\s*branch/, /branch/, /remitter/]);
+  const colAcct = col([/account\s*(number|no)/, /^a\/c/, /account/]);
 
   if (colDesc === -1) throw new Error("Could not identify Description column.");
+  if (colDebit === -1 && colCredit === -1)
+    throw new Error(
+      "Could not identify the Debit/Credit (or Withdrawal/Deposit) columns.",
+    );
 
   const transactions = [];
   for (let i = headerRowIdx + 1; i < rows.length; i++) {
@@ -294,6 +347,12 @@ function parseBankStatement(buffer, filename) {
     );
     const vDate = colValueDate !== -1 ? parseDate(row[colValueDate]) : null;
     const pDate = colPostDate !== -1 ? parseDate(row[colPostDate]) : null;
+    // Grab the account number from the first data row if the header block
+    // didn't carry one (Indian Bank puts it in a per-row column).
+    if (!meta.accountNumber && colAcct !== -1) {
+      const acct = String(row[colAcct] || "").trim();
+      if (/^\d{6,20}$/.test(acct)) meta.accountNumber = acct;
+    }
     transactions.push({
       valueDate: vDate || pDate,
       postDate: pDate || vDate,
@@ -479,7 +538,39 @@ router.post("/upload", upload.single("file"), async (req, res) => {
       ? (await Acc_Ledger.findById(bankLedgerId).select("name").lean())?.name ||
         ""
       : "";
-    const matchedTxns = await autoMatch(companyId, bankLedgerId, periodTxns);
+    let matchedTxns = await autoMatch(companyId, bankLedgerId, periodTxns);
+
+    // ── Preserve prior reconciliation work ────────────────────────────────
+    // If a session already exists for this exact bank ledger + month + year,
+    // carry over its manual matches / reconciled ticks / notes by line key,
+    // and UPDATE that session in place instead of creating a duplicate. So
+    // re-uploading the same statement never makes you redo work — only new
+    // lines come in unmatched; everything already reconciled stays as-is.
+    const existing = await Acc_BankReconSession.findOne({
+      companyId,
+      periodMonth: month,
+      periodYear: year,
+      ...(bankLedgerId ? { bankLedgerId } : {}),
+    });
+    if (existing && existing.transactions && existing.transactions.length) {
+      const prior = new Map();
+      for (const t of existing.transactions) prior.set(txnKey(t), t);
+      matchedTxns = matchedTxns.map((t) => {
+        const p = prior.get(txnKey(t));
+        if (!p) return t;
+        const carried = { ...t };
+        // A match already on record for this exact line wins over auto-match.
+        if (p.matched && p.matchedVoucherId) {
+          carried.matched = true;
+          carried.matchedVoucherId = p.matchedVoucherId;
+          carried.matchedVoucherNumber = p.matchedVoucherNumber;
+          carried.matchedVoucherType = p.matchedVoucherType;
+        }
+        if (p.reconciled) carried.reconciled = true;
+        if (p.note) carried.note = p.note;
+        return carried;
+      });
+    }
 
     const totalCredits = matchedTxns.reduce((s, t) => s + t.credit, 0);
     const totalDebits = matchedTxns.reduce((s, t) => s + t.debit, 0);
@@ -487,34 +578,69 @@ router.post("/upload", upload.single("file"), async (req, res) => {
     const unmatchedCount = matchedTxns.length - matchedCount;
     const periodLabel = `${MONTH_NAMES[month - 1]} ${year}`;
 
-    const session = await Acc_BankReconSession.create({
-      companyId,
-      bankLedgerId: bankLedgerId || undefined,
-      bankLedgerName: ledgerName,
-      accountNumber: parsed.accountNumber,
-      bankName: parsed.bankName,
-      ifscCode: parsed.ifscCode,
-      branch: parsed.branch,
-      periodMonth: month,
-      periodYear: year,
-      periodLabel,
-      periodFrom: periodStart,
-      periodTo: periodEnd,
-      openingBalance: parsed.openingBalance,
-      closingBalance: parsed.closingBalance,
-      totalCredits,
-      totalDebits,
-      txnCount: matchedTxns.length,
-      matchedCount,
-      unmatchedCount,
-      filename: req.file.originalname,
-      filesize: req.file.size,
-      transactions: matchedTxns,
-    });
+    let session;
+    if (existing) {
+      // Update the existing month in place — keeps the same row in the
+      // sidebar with all carried-over matches, no duplicate session.
+      existing.bankLedgerId = bankLedgerId || existing.bankLedgerId;
+      existing.bankLedgerName = ledgerName || existing.bankLedgerName;
+      existing.accountNumber = parsed.accountNumber || existing.accountNumber;
+      existing.bankName = parsed.bankName || existing.bankName;
+      existing.ifscCode = parsed.ifscCode || existing.ifscCode;
+      existing.branch = parsed.branch || existing.branch;
+      existing.periodLabel = periodLabel;
+      existing.periodFrom = periodStart;
+      existing.periodTo = periodEnd;
+      if (parsed.openingBalance != null)
+        existing.openingBalance = parsed.openingBalance;
+      if (parsed.closingBalance != null)
+        existing.closingBalance = parsed.closingBalance;
+      existing.totalCredits = totalCredits;
+      existing.totalDebits = totalDebits;
+      existing.txnCount = matchedTxns.length;
+      existing.matchedCount = matchedCount;
+      existing.unmatchedCount = unmatchedCount;
+      existing.filename = req.file.originalname;
+      existing.filesize = req.file.size;
+      existing.transactions = matchedTxns;
+      existing.status = matchedTxns.every((t) => t.reconciled)
+        ? "reconciled"
+        : matchedCount > 0
+          ? "in_progress"
+          : "pending";
+      await existing.save();
+      session = existing;
+    } else {
+      session = await Acc_BankReconSession.create({
+        companyId,
+        bankLedgerId: bankLedgerId || undefined,
+        bankLedgerName: ledgerName,
+        accountNumber: parsed.accountNumber,
+        bankName: parsed.bankName,
+        ifscCode: parsed.ifscCode,
+        branch: parsed.branch,
+        periodMonth: month,
+        periodYear: year,
+        periodLabel,
+        periodFrom: periodStart,
+        periodTo: periodEnd,
+        openingBalance: parsed.openingBalance,
+        closingBalance: parsed.closingBalance,
+        totalCredits,
+        totalDebits,
+        txnCount: matchedTxns.length,
+        matchedCount,
+        unmatchedCount,
+        filename: req.file.originalname,
+        filesize: req.file.size,
+        transactions: matchedTxns,
+      });
+    }
 
     res.json({
       success: true,
       sessionId: session._id,
+      merged: !!existing,
       summary: {
         txnCount: session.txnCount,
         totalCredits,
