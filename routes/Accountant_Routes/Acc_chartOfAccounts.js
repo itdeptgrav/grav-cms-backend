@@ -1631,14 +1631,42 @@ router.get("/ledgers/:id/statement", async (req, res) => {
           voucherCount: bill.voucherNumbers.size,
         });
       }
+      // ── Reconcile to the ledger's ACTUAL closing balance ───────────────
+      // Bill allocations alone miss opening balances and imported entries
+      // that carry no bill refs, so the bill-wise sum can be 0 even when the
+      // ledger clearly has a balance. The headline outstanding must equal the
+      // ledger's real closing balance (Dr positive / Cr negative) — the same
+      // number shown on the header card — and any gap is surfaced as an
+      // "Opening / Unallocated" line in the Current bucket so it reconciles.
+      const billSigned = openBills.reduce(
+        (s, b) => s + b.remainingAbs * (b.remainingType === "Dr" ? 1 : -1),
+        0,
+      );
+      const unallocated = parseFloat((closing - billSigned).toFixed(2));
+      if (Math.abs(unallocated) >= 0.01) {
+        openBills.push({
+          billName: "Opening / Unallocated",
+          firstDate: ledger.openingBalanceDate || startDate || null,
+          dueDate: null,
+          creditDays: 0,
+          originalAmount: Math.abs(unallocated),
+          remaining: unallocated,
+          remainingAbs: Math.abs(unallocated),
+          remainingType: unallocated >= 0 ? "Dr" : "Cr",
+          daysOverdue: 0,
+          bucket: "current",
+          voucherCount: 0,
+        });
+        buckets.current += Math.abs(unallocated);
+      }
       openBills.sort((a, b) => b.daysOverdue - a.daysOverdue);
 
       billWiseOutstanding = {
         applicable: true,
-        totalOutstanding: openBills.reduce(
-          (s, b) => s + b.remainingAbs * (b.remainingType === "Dr" ? 1 : -1),
-          0,
-        ),
+        // Signed total = the ledger's actual closing balance.
+        // + = Dr (receivable), − = Cr (payable). Drives the headline label.
+        totalOutstanding: parseFloat(closing.toFixed(2)),
+        closingType: closing >= 0 ? "Dr" : "Cr",
         bills: openBills,
         agingBuckets: buckets,
         bucketTotals: {
