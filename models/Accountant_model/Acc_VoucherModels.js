@@ -96,15 +96,23 @@ const inventoryEntrySchema = new mongoose.Schema(
 
     // Sales/purchase ledger this line posts against (optional — voucher-level
     // sales ledger is the more common pattern)
+    // Sales/purchase ledger this line posts against (optional — voucher-level
+    // sales ledger is the more common pattern)
     accountingLedgerId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Acc_Ledger",
     },
     accountingLedgerName: { type: String, trim: true },
+
+    // ─── Charge line (courier, freight, packing etc.) ───────────────────────
+    // A charge is a non-stock line: no quantity, posts a Cr to its own ledger
+    // (NOT to Sales). isCharge:true distinguishes it from a product row.
+    isCharge: { type: Boolean, default: false },
+    chargeLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+    chargeDescription: { type: String, trim: true },
   },
   { _id: true },
 );
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SUB-SCHEMA: GST breakup (carried on the voucher header)
 // ─────────────────────────────────────────────────────────────────────────────
