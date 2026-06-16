@@ -425,12 +425,10 @@ router.post(
           .json({ success: false, message: "companyId is required" });
       }
       if (!req.file) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "No file uploaded (field name 'file')",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "No file uploaded (field name 'file')",
+        });
       }
 
       // Parse JSON
@@ -562,12 +560,10 @@ router.post(
       });
     } catch (e) {
       console.error("[gstr2b/upload]", e);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Failed to import GSTR-2B: " + e.message,
-        });
+      res.status(500).json({
+        success: false,
+        message: "Failed to import GSTR-2B: " + e.message,
+      });
     }
   },
 );
@@ -651,22 +647,18 @@ router.get("/recon-range", accountantAuth, async (req, res) => {
     await ensureIndexMigration();
     const { companyId, from, to, returnType } = req.query;
     if (!companyId || !from || !to) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "companyId, from, and to are all required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "companyId, from, and to are all required",
+      });
     }
     const fromDate = new Date(from);
     const toDate = new Date(to);
     if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "from/to must be valid dates (YYYY-MM-DD)",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "from/to must be valid dates (YYYY-MM-DD)",
+      });
     }
     if (fromDate > toDate) {
       return res
@@ -829,12 +821,10 @@ router.get("/:period", accountantAuth, async (req, res) => {
       returnType,
     }).lean();
     if (!doc) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
-        });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+      });
     }
 
     let records = doc.records;
@@ -928,12 +918,10 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
         : { returnType };
     const doc = await Acc_GSTR2B.findOne({ ...baseQuery, ...typeQuery }).lean();
     if (!doc)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
-        });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+      });
 
     // ── Cache hit path ─────────────────────────────────────────────────
     if (useCache && doc.lastReconAt && doc.lastReconBuckets) {
@@ -984,7 +972,7 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
     }
 
     // Purchase vouchers (Tally import path)
-    const purchaseTypes = ["purchase", "debit_note"]; // debit_note = purchase-side returns
+    const purchaseTypes = ["purchase", "debit_note", "journal"]; // journal covers freight/expense entries posted directly
     const vouchers = await Acc_Voucher.find({
       companyId: new mongoose.Types.ObjectId(companyId),
       voucherType: { $in: purchaseTypes },
@@ -992,15 +980,26 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
       status: "posted",
     })
       .select(
-        "voucherNumber voucherDate voucherType partyLedgerName ledgerEntries inventoryEntries",
+        "voucherNumber voucherDate voucherType partyLedgerName partyLedgerId ledgerEntries inventoryEntries",
       )
       .lean();
 
     // Flatten vouchers into bookRecords matching the 2B record shape
     const bookRecords = [];
     for (const v of vouchers) {
-      const supplierGSTIN = gstinByLedger[v.partyLedgerName] || "";
-      // Sum GST line amounts from ledgerEntries that look like tax ledgers.
+      let supplierGSTIN = gstinByLedger[v.partyLedgerName] || "";
+
+      // For journal vouchers, partyLedgerName may be empty (freight entries).
+      // Scan Cr ledger entries to find a vendor/creditor with a GSTIN.
+      if (!supplierGSTIN && v.voucherType === "journal") {
+        for (const le of v.ledgerEntries || []) {
+          const g = gstinByLedger[le.ledgerName];
+          if (g) {
+            supplierGSTIN = g;
+            break;
+          }
+        }
+      } // Sum GST line amounts from ledgerEntries that look like tax ledgers.
       // Everything else on a purchase voucher (purchase/expense/discount
       // ledger, etc.) contributes to the taxable base — NOT just lines named
       // "purchase". A telephone expense voucher posts to "Telephone Expenses"
@@ -1032,6 +1031,7 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
       }
       bookRecords.push({
         _id: v._id,
+        partyLedgerId: v.partyLedgerId ? String(v.partyLedgerId) : null,
         voucherType: v.voucherType,
         bookDocNumber: v.voucherNumber || "",
         bookDocDate: v.voucherDate,
@@ -1080,6 +1080,62 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
         });
       }
     }
+
+    // Build a fast lookup: (normalized GSTIN + invoice number) → bookRecord
+    // ── Live GSTIN + name refresh from current ledger state ───────────────────
+    // Problem 1: Vouchers booked BEFORE a supplier's GSTIN was added to
+    // their ledger have partyGstin="" and supplierGSTIN="". The match key
+    // becomes "::INV-001" which can never match "19AADFK6889N1ZC::INV-001"
+    // from the portal, so these entries land in "Only in Books" forever.
+    //
+    // Problem 2: The voucher snapshot has the OLD party name ("Kishore rothers")
+    // even after the ledger was renamed ("Kishore Brothers"). The reconciliation
+    // display shows stale names until the voucher itself is re-saved.
+    //
+    // Fix: after all bookRecords are built (vouchers + expenses), do a single
+    // batch lookup against the CURRENT ledger master and back-fill:
+    //   a) missing GSTINs (by ledgerId first, then by normalized name)
+    //   b) stale party display names → current ledger name
+    // This is a read-only pass — vouchers in MongoDB are NOT modified.
+    const _liveledgers = await Acc_Ledger.find({
+      companyId: new mongoose.Types.ObjectId(companyId),
+      isActive: true,
+    })
+      .select("_id name gstin")
+      .lean();
+
+    const _gstinById = new Map(); // ledgerId   → current GSTIN (upper)
+    const _gstinByName = new Map(); // lower(name) → current GSTIN (upper)
+    const _nameById = new Map(); // ledgerId   → current display name
+
+    for (const l of _liveledgers) {
+      const lid = l._id.toString();
+      const g = (l.gstin || "").toUpperCase().trim();
+      const nm = (l.name || "").trim();
+      if (g) {
+        _gstinById.set(lid, g);
+        _gstinByName.set(nm.toLowerCase(), g);
+      }
+      _nameById.set(lid, nm);
+    }
+
+    for (const br of bookRecords) {
+      // a) Back-fill GSTIN missing from voucher snapshot
+      if (!br.supplierGSTIN) {
+        if (br.partyLedgerId)
+          br.supplierGSTIN = _gstinById.get(br.partyLedgerId) || "";
+        if (!br.supplierGSTIN && br.partyLedgerName)
+          br.supplierGSTIN =
+            _gstinByName.get((br.partyLedgerName || "").trim().toLowerCase()) ||
+            "";
+      }
+      // b) Refresh party display name to current ledger name (fixes renames)
+      if (br.partyLedgerId) {
+        const currentName = _nameById.get(br.partyLedgerId);
+        if (currentName) br.partyLedgerName = currentName;
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Build a fast lookup: (normalized GSTIN + invoice number) → bookRecord
     const bookByKey = new Map();
@@ -1314,12 +1370,10 @@ router.get("/:period/supplier-summary", accountantAuth, async (req, res) => {
       returnType,
     }).lean();
     if (!doc)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
-        });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} imported for this period`,
+      });
 
     // Aggregate by supplier GSTIN
     const bySupplier = new Map();
@@ -1381,12 +1435,10 @@ router.delete("/:period", accountantAuth, async (req, res) => {
       returnType,
     });
     if (r.deletedCount === 0) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} found for this period`,
-        });
+      return res.status(404).json({
+        success: false,
+        message: `No ${returnType === "GSTR2A" ? "GSTR-2A" : "GSTR-2B"} found for this period`,
+      });
     }
     res.json({ success: true, deleted: 1 });
   } catch (e) {

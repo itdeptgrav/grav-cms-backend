@@ -649,7 +649,7 @@ router.get("/sessions/:id/match-candidates", async (req, res) => {
 
     const vouchers = await Acc_Voucher.find(filter)
       .select(
-        "_id voucherNumber voucherType voucherDate partyLedgerName narration grandTotal ledgerEntries",
+        "_id voucherNumber voucherType voucherDate partyLedgerName partyGstin partyLedgerId ledgerEntries narration",
       )
       .sort({ voucherDate: -1 })
       .limit(30)
