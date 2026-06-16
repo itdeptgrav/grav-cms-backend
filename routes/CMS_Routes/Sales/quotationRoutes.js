@@ -241,11 +241,21 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         }
       }
  
+      // Pick best available image — variant-first, then product-level
+      const productImage = (() => {
+        if (stockItem?.variants?.length) {
+          const withImg = stockItem.variants.find(v => v.images?.length > 0)
+          if (withImg) return withImg.images[0]
+        }
+        return stockItem?.images?.[0] || null
+      })()
+
       perProduct.push({
         productName: item.mpcDisplayName || item.stockItemName,
         stockItemReference: item.stockItemReference || "",
         totalQuantity: item.totalQuantity || 0,
         rawItems: productRawItems,
+        image: productImage,
       });
     }
  
