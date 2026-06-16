@@ -156,6 +156,17 @@ async function importedPartyRows(companyId, { groupRx, kind }) {
       totalRevenue: netMagnitude,
       totalPaid: advanceFrom,
       totalOutstanding: stillOwed,
+      // Ledger-only party: figures ARE the books figures; it has no CRM side.
+      ledgerRevenue: netMagnitude,
+      ledgerPaid: advanceFrom,
+      ledgerOutstanding: stillOwed,
+      voucherCount: a.orderCount || 0,
+      ledgerLastDate: a.lastOrderDate || null,
+      crmRevenue: 0,
+      crmPaid: 0,
+      crmOutstanding: 0,
+      crmOrderCount: 0,
+      crmLastOrderDate: null,
       balance: netMagnitude,
       balanceType: closingSigned < 0 ? "Cr" : "Dr",
       outstandingType: closingSigned < 0 ? "Cr" : "Dr",
@@ -259,12 +270,10 @@ const verifyAccountantToken = async (req, res, next) => {
   } catch (error) {
     console.error("Accountant auth middleware error:", error);
     if (error.name === "TokenExpiredError") {
-      return res
-        .status(401)
-        .json({
-          success: false,
-          message: "Session expired. Please login again.",
-        });
+      return res.status(401).json({
+        success: false,
+        message: "Session expired. Please login again.",
+      });
     }
     if (error.name === "JsonWebTokenError") {
       return res
@@ -715,12 +724,10 @@ router.get("/", verifyAccountantToken, async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching customers:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching customers",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching customers",
+    });
   }
 });
 
@@ -874,6 +881,22 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
         ...c,
         customerCode: customerCodeForId(codeSourceId),
         ledgerId: linkedLedger?._id || null,
+        // ── Side-separated figures (NO mixing of CRM and books) ──────────
+        // CRM (orders/quotations) — shown on the Sales/CRM side
+        crmRevenue: parseFloat(totalRevenue.toFixed(2)),
+        crmPaid: parseFloat(totalPaid.toFixed(2)),
+        crmOutstanding: parseFloat(
+          Math.max(0, totalRevenue - totalPaid).toFixed(2),
+        ),
+        crmOrderCount: a.orderCount || 0,
+        crmLastOrderDate: a.lastOrderDate || null,
+        // Books (posted ledger vouchers) — shown on the Accounting side
+        ledgerRevenue: parseFloat((ledgerBal?.revenue || 0).toFixed(2)),
+        ledgerPaid: parseFloat((ledgerBal?.paid || 0).toFixed(2)),
+        ledgerOutstanding: parseFloat((ledgerBal?.outstanding || 0).toFixed(2)),
+        voucherCount: ledgerBal?.orderCount || 0,
+        ledgerLastDate: ledgerBal?.lastOrderDate || null,
+        // Legacy combined fields (kept so other callers don't break)
         totalRevenue: parseFloat(combinedRevenue.toFixed(2)),
         totalPaid: parseFloat(combinedPaid.toFixed(2)),
         totalOutstanding: parseFloat(combinedOutstanding.toFixed(2)),
@@ -1046,12 +1069,10 @@ router.get("/all", verifyAccountantToken, async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching all customers:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching all customers",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching all customers",
+    });
   }
 });
 
@@ -1536,12 +1557,10 @@ router.get("/:customerId", verifyAccountantToken, async (req, res) => {
       .json({ success: false, message: "Customer not found" });
   } catch (error) {
     console.error("Error fetching customer:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching customer",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching customer",
+    });
   }
 });
 
@@ -1558,12 +1577,10 @@ router.get("/:customerId/requests", verifyAccountantToken, async (req, res) => {
     res.status(200).json({ success: true, requests, count: requests.length });
   } catch (error) {
     console.error("Error fetching customer requests:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching customer requests",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching customer requests",
+    });
   }
 });
 
@@ -1598,21 +1615,17 @@ router.get("/:customerId/payments", verifyAccountantToken, async (req, res) => {
     allPayments.sort(
       (a, b) => new Date(b.submissionDate) - new Date(a.submissionDate),
     );
-    res
-      .status(200)
-      .json({
-        success: true,
-        payments: allPayments,
-        count: allPayments.length,
-      });
+    res.status(200).json({
+      success: true,
+      payments: allPayments,
+      count: allPayments.length,
+    });
   } catch (error) {
     console.error("Error fetching customer payments:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching customer payments",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching customer payments",
+    });
   }
 });
 
@@ -1663,12 +1676,10 @@ router.get(
       });
     } catch (error) {
       console.error("Error fetching financial summary:", error);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Server error while fetching financial summary",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Server error while fetching financial summary",
+      });
     }
   },
 );
@@ -1685,12 +1696,10 @@ router.get(
       const { customerId } = req.params;
       const { companyId } = req.query;
       if (!companyId) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "companyId query param is required",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "companyId query param is required",
+        });
       }
 
       const customer = await Customer.findById(customerId)
@@ -1850,12 +1859,10 @@ router.get(
       });
     } catch (error) {
       console.error("Error fetching customer accounting:", error);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Server error while fetching customer accounting",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Server error while fetching customer accounting",
+      });
     }
   },
 );
@@ -1899,21 +1906,17 @@ router.get(
       pendingVerifications.sort(
         (a, b) => new Date(a.submissionDate) - new Date(b.submissionDate),
       );
-      res
-        .status(200)
-        .json({
-          success: true,
-          pendingVerifications,
-          count: pendingVerifications.length,
-        });
+      res.status(200).json({
+        success: true,
+        pendingVerifications,
+        count: pendingVerifications.length,
+      });
     } catch (error) {
       console.error("Error fetching pending verifications:", error);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Server error while fetching pending verifications",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Server error while fetching pending verifications",
+      });
     }
   },
 );
@@ -1961,12 +1964,10 @@ router.post(
         .json({ success: true, message: "Payment marked as reviewed" });
     } catch (error) {
       console.error("Error marking payment as reviewed:", error);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Server error while marking payment",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Server error while marking payment",
+      });
     }
   },
 );
@@ -2018,12 +2019,10 @@ router.get(
       res.status(200).json({ success: true, statistics: stats });
     } catch (error) {
       console.error("Error fetching customer statistics:", error);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Server error while fetching statistics",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Server error while fetching statistics",
+      });
     }
   },
 );
@@ -2053,23 +2052,19 @@ router.post(
           .status(404)
           .json({ success: false, message: "Quotation not found" });
       if (!quotation.customerApproval || !quotation.customerApproval.approved) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "Cannot approve: Customer approval required first",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "Cannot approve: Customer approval required first",
+        });
       }
       if (
         quotation.accountantApproval &&
         quotation.accountantApproval.approved
       ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "Quotation already approved by accountant",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "Quotation already approved by accountant",
+        });
       }
       if (!quotation.accountantApproval) quotation.accountantApproval = {};
       quotation.accountantApproval.approved = true;
@@ -2086,25 +2081,21 @@ router.post(
         notes: notes || "Approved for payment processing",
       });
       await request.save();
-      res
-        .status(200)
-        .json({
-          success: true,
-          message: "Quotation approved successfully",
-          quotation: {
-            id: quotation._id,
-            quotationNumber: quotation.quotationNumber,
-            accountantApproval: quotation.accountantApproval,
-          },
-        });
+      res.status(200).json({
+        success: true,
+        message: "Quotation approved successfully",
+        quotation: {
+          id: quotation._id,
+          quotationNumber: quotation.quotationNumber,
+          accountantApproval: quotation.accountantApproval,
+        },
+      });
     } catch (error) {
       console.error("Error approving quotation:", error);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Server error while approving quotation",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Server error while approving quotation",
+      });
     }
   },
 );
@@ -2151,12 +2142,10 @@ router.post(
         .json({ success: true, message: "Approval revoked successfully" });
     } catch (error) {
       console.error("Error revoking approval:", error);
-      res
-        .status(500)
-        .json({
-          success: false,
-          message: "Server error while revoking approval",
-        });
+      res.status(500).json({
+        success: false,
+        message: "Server error while revoking approval",
+      });
     }
   },
 );
@@ -2199,21 +2188,17 @@ router.get("/pending-approvals", verifyAccountantToken, async (req, res) => {
     pendingApprovals.sort(
       (a, b) => new Date(a.createdAt) - new Date(b.createdAt),
     );
-    res
-      .status(200)
-      .json({
-        success: true,
-        pendingApprovals,
-        count: pendingApprovals.length,
-      });
+    res.status(200).json({
+      success: true,
+      pendingApprovals,
+      count: pendingApprovals.length,
+    });
   } catch (error) {
     console.error("Error fetching pending approvals:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching pending approvals",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching pending approvals",
+    });
   }
 });
 
@@ -2230,12 +2215,10 @@ router.post("/:id/merge", verifyAccountantToken, async (req, res) => {
         .status(400)
         .json({ success: false, message: "mergeFromId required" });
     if (String(keeperId) === String(mergeFromId))
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Cannot merge a customer into itself",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Cannot merge a customer into itself",
+      });
 
     const keeper = await Customer.findById(keeperId);
     if (!keeper)
