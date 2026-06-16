@@ -2444,6 +2444,45 @@ async function resolveBankLedgerForPayroll(companyId, explicitBankLedgerId) {
   return primary || banks[0];
 }
 
+// Extract advance salary amount from a PayrollItem.
+// Defensive — tries every field name the HR module has used across versions.
+function getItemAdvance(item) {
+  const d = item.deductions || {};
+
+  // Try every direct scalar field the HR module might use
+  const direct =
+    d.advanceSalary ||
+    d.advance ||
+    d.salaryAdvance ||
+    d.advanceDeduction ||
+    d.salaryAdvanceDeduction ||
+    d.advanceRecovery ||
+    d.salaryAdvanceRecovery ||
+    d.loanDeduction ||
+    d.loanRecovery ||
+    0;
+  if (direct > 0) return direct;
+
+  // Try array-based "others" or "otherDeductions" (some HR systems
+  // store miscellaneous deductions as [{name, amount}] items)
+  const arr =
+    d.others ||
+    d.otherDeductions ||
+    d.additionalDeductions ||
+    d.miscDeductions ||
+    [];
+  if (Array.isArray(arr)) {
+    const hit = arr.find((o) =>
+      /advance|salary.*adv|adv.*sal|loan/i.test(
+        o.name || o.type || o.label || o.description || "",
+      ),
+    );
+    if (hit) return hit.amount || hit.value || hit.amt || 0;
+  }
+
+  return 0;
+}
+
 async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   // Resolve every ledger we'll need
   const salariesLedger = await findOrCreateLedger(
@@ -2514,10 +2553,185 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   const computedNet = totals.gross - totals.pf - totals.esi - totals.tdsOther;
   if (Math.abs(computedNet - totals.net) > 1) {
     throw new Error(
-      `Payroll math doesn't reconcile: gross ${totals.gross.toFixed(2)} − deductions = ${computedNet.toFixed(2)}, but net pay is ${totals.net.toFixed(2)} (diff ${Math.abs(computedNet - totals.net).toFixed(2)}). Re-process the payroll run before posting.`,
+      `Payroll math doesn't reconcile: gross ${totals.gross.toFixed(2)} − deductions = ${computedNet.toFixed(2)}, but net pay is ${totals.net.toFixed(2)} (diff ${Math.abs(computedNet - totals.net).toFixed(2)}).
+  Re-process the payroll run before posting.`,
     );
   }
 
+  // ── Advance salary ledger mapping ─────────────────────────────────────
+  // Advance salary deductions must post to the employee's individual
+  // "Advance Salary <Name> A/c" ledger under Current Assets — NOT to
+  // Other Deductions Payable and NOT to any Expense ledger.
+  //
+  // Only look at ASSET-nature ledgers (Cr here reduces the outstanding
+  // advance balance, which is an asset). Expense-named ledgers that
+  // accidentally match are intentionally skipped.
+  const allAdvanceLedgers = await Acc_Ledger.find({
+    companyId,
+    isActive: true,
+    nature: "asset",
+    name: /advance.*salary|salary.*advance/i,
+  }).lean();
+
+  // Find Current Assets group — correct home for employee advance accounts.
+  const advanceGroup =
+    (await Acc_Group.findOne({
+      companyId,
+      isActive: true,
+      name: /^current assets$/i,
+    }).lean()) ||
+    (await Acc_Group.findOne({
+      companyId,
+      isActive: true,
+      nature: "asset",
+      name: /current/i,
+    }).lean()) ||
+    (await Acc_Group.findOne({
+      companyId,
+      isActive: true,
+      nature: "asset",
+    }).lean());
+
+  // Name-based match against pre-fetched asset ledgers only.
+  function findAdvanceLedger(empName) {
+    if (!empName || !allAdvanceLedgers.length) return null;
+    const lower = empName.toLowerCase();
+    const exact = allAdvanceLedgers.find((l) =>
+      l.name.toLowerCase().includes(lower),
+    );
+    if (exact) return exact;
+    const parts = lower.split(/\s+/).filter((p) => p.length > 2);
+    return (
+      allAdvanceLedgers.find((l) => {
+        const ln = l.name.toLowerCase();
+        return parts.some((p) => ln.includes(p));
+      }) || null
+    );
+  }
+
+  // Find or AUTO-CREATE the advance salary ledger for an employee.
+  // Also MIGRATES wrongly-grouped advance ledgers (e.g. Expenses → Current Assets).
+  async function findOrCreateAdvanceLedger(empName) {
+    const existing = findAdvanceLedger(empName);
+    if (existing) return existing;
+
+    // Check if there's a non-asset advance ledger for this employee and migrate it
+    if (empName && advanceGroup) {
+      const lower = empName.toLowerCase();
+      const parts = lower.split(/\s+/).filter((p) => p.length > 2);
+      const wrongLedger = await Acc_Ledger.findOne({
+        companyId,
+        isActive: true,
+        name: /advance.*salary|salary.*advance/i,
+        nature: { $ne: "asset" },
+      }).lean();
+      if (wrongLedger) {
+        const wName = wrongLedger.name.toLowerCase();
+        const nameMatch =
+          wName.includes(lower) || parts.some((p) => wName.includes(p));
+        if (nameMatch) {
+          await Acc_Ledger.updateOne(
+            { _id: wrongLedger._id },
+            {
+              $set: {
+                groupId: advanceGroup._id,
+                groupName: advanceGroup.name,
+                nature: "asset",
+                openingBalanceType: "Dr",
+              },
+            },
+          );
+          const migrated = {
+            ...wrongLedger,
+            groupId: advanceGroup._id,
+            groupName: advanceGroup.name,
+            nature: "asset",
+          };
+          allAdvanceLedgers.push(migrated);
+          return migrated;
+        }
+      }
+    }
+
+    if (!advanceGroup || !empName) return null;
+    const ledgerName = `Advance Salary ${empName} A/c`;
+    try {
+      const newLedger = await Acc_Ledger.create({
+        companyId,
+        name: ledgerName,
+        groupId: advanceGroup._id,
+        groupName: advanceGroup.name,
+        nature: "asset",
+        openingBalance: 0,
+        openingBalanceType: "Dr",
+        currentBalance: 0,
+        currentBalanceType: "Dr",
+        isActive: true,
+        importSource: "auto_payroll",
+        notes: `Auto-created during payroll posting for ${empName}`,
+      });
+      allAdvanceLedgers.push(newLedger); // cache so later employees in same run find it
+      return newLedger;
+    } catch (e) {
+      console.warn(
+        `[payroll] Could not create advance ledger for ${empName}: ${e.message}`,
+      );
+      return null;
+    }
+  }
+
+  // Build ledgerId → { ledger, amount } for all employees with advance deductions.
+  //
+  // Two-pass detection:
+  //   Pass A — direct field lookup via getItemAdvance() (fast, exact)
+  //   Pass B — fallback for employees whose HR field name isn't in our list:
+  //            if the employee already has an advance ledger with a positive
+  //            Dr balance AND has non-PF/ESI deductions this month, infer
+  //            the advance as min(ledgerBalance, itemOther).
+  const advanceLedgerMap = new Map();
+  let totalMappedAdvance = 0;
+
+  for (const item of items) {
+    let adv = getItemAdvance(item);
+
+    // ── Fallback: infer from ledger balance ──────────────────────────────
+    if ((!adv || adv <= 0) && item.employeeName) {
+      const existingLed = findAdvanceLedger(item.employeeName);
+      if (existingLed) {
+        // Only infer if the employee actually has other deductions this run
+        const itemOther = Math.max(
+          0,
+          (item.deductions?.totalDeductions || 0) -
+            (item.deductions?.providentFund || 0) -
+            (item.deductions?.esic || 0),
+        );
+        if (itemOther > 0) {
+          // Cap at whichever is smaller: ledger Dr balance or itemOther
+          const ledBal = Math.abs(existingLed.currentBalance || 0);
+          adv = ledBal > 0 ? Math.min(ledBal, itemOther) : itemOther;
+        }
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────
+
+    if (!adv || adv <= 0) continue;
+    const ledger = await findOrCreateAdvanceLedger(item.employeeName);
+    if (ledger) {
+      const lid = ledger._id.toString();
+      if (advanceLedgerMap.has(lid)) {
+        advanceLedgerMap.get(lid).amount += adv;
+      } else {
+        advanceLedgerMap.set(lid, { ledger, amount: adv });
+      }
+      totalMappedAdvance += adv;
+    }
+  }
+
+  // Remaining deductions after extracting all mapped advances.
+  // Math invariant: pf + esi + tdsOtherRemaining + Σadvances + net = gross ✓
+  const tdsOtherRemaining = parseFloat(
+    Math.max(0, totals.tdsOther - totalMappedAdvance).toFixed(2),
+  );
   // ── Voucher 1: PROCESSING (always created) ────────────────────────────
   // Dr Salaries A/c (gross) / Cr PF + ESI + Other Deductions + Salary Payable
   // This is the journal entry recognising the salary expense and accruing
@@ -2548,14 +2762,26 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       type: "Cr",
       amount: totals.esi,
     });
-  if (totals.tdsOther > 0)
+  if (tdsOtherRemaining > 0)
     processingEntries.push({
       ledgerId: otherDeductionsPayable._id,
       ledgerName: otherDeductionsPayable.name,
       groupName: otherDeductionsPayable.groupName,
       type: "Cr",
-      amount: totals.tdsOther,
+      amount: tdsOtherRemaining,
     });
+  // Per-employee advance salary entries — Cr reduces the outstanding
+  // advance balance on each employee's "Advance Salary <Name> A/c" ledger.
+  for (const { ledger, amount } of advanceLedgerMap.values()) {
+    if (amount > 0)
+      processingEntries.push({
+        ledgerId: ledger._id,
+        ledgerName: ledger.name,
+        groupName: ledger.groupName,
+        type: "Cr",
+        amount: parseFloat(amount.toFixed(2)),
+      });
+  }
   if (totals.net > 0)
     processingEntries.push({
       ledgerId: salaryPayable._id,
@@ -2631,7 +2857,13 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
 // returning the FIRST voucher only, so anything that hasn't been migrated still
 // produces a sensible journal even if it doesn't know about payments.
 async function buildPayrollVoucher(companyId, run, items, opts = {}) {
-  const built = await buildPayrollVouchers(companyId, run, items, opts);
+  // If caller provided manually-confirmed entries, use them directly.
+  let built;
+  if (opts.overrideVouchers && opts.overrideVouchers.length > 0) {
+    built = { vouchers: opts.overrideVouchers };
+  } else {
+    built = await buildPayrollVouchers(companyId, run, items, opts);
+  }
   const first = built.vouchers[0];
   return {
     entries: first.entries,
@@ -2915,7 +3147,14 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
 
     let result;
     try {
-      result = await postPayrollRun(companyId, run, items, { bankLedgerId });
+      const { overrideVouchers } = req.body;
+      const result = await postPayrollRun(companyId, run, items, {
+        bankLedgerId,
+        overrideVouchers:
+          Array.isArray(overrideVouchers) && overrideVouchers.length
+            ? overrideVouchers
+            : undefined,
+      });
     } catch (e) {
       return res.status(400).json({
         success: false,
