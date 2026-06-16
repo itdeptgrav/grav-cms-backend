@@ -714,6 +714,14 @@ const customerRequestSchema = new mongoose.Schema(
       enum: ["customer_request", "measurement_conversion"],
       default: "customer_request",
     },
+    isInternalOrder: {
+      type: Boolean,
+      default: false,
+    },
+    internalOrderMarkedAt: {
+      type: Date,
+      default: null,
+    },
     measurementId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Measurement",
