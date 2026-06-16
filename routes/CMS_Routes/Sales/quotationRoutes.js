@@ -213,6 +213,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
               variantCombination: ri.variantCombination || [],
               unit: ri.unit,
               baseUnit: ri.baseUnit || ri.unit,
+              perPieceQty: ri.quantity || 0,
               quantityRequired: required,
               unitCost: ri.unitCost || 0,
               totalCost: (ri.unitCost || 0) * required,
@@ -300,12 +301,30 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
       if (available !== null) totalAvailable += available;
       if (shortfall && shortfall > 0) shortfallCount++;
  
+      // Collect unitConversions from the matched variant (or first variant as fallback)
+      let unitConversions = [];
+      if (doc) {
+        let varDoc = null;
+        if (t.variantId && Array.isArray(doc.variants)) {
+          varDoc = doc.variants.find(vv => vv._id?.toString() === t.variantId);
+        }
+        if (!varDoc && Array.isArray(doc.variants) && doc.variants.length > 0) {
+          varDoc = doc.variants[0];
+        }
+        if (varDoc?.unitConversions?.length) {
+          unitConversions = varDoc.unitConversions;
+        } else if (varDoc?.unitConversion?.toUnit) {
+          unitConversions = [varDoc.unitConversion]; // single legacy conversion
+        }
+      }
+
       totals.push({
         ...t,
         available,
         shortfall,
         minStock,
         status,
+        unitConversions,
       });
     }
  
