@@ -1115,7 +1115,173 @@ router.get("/requests/:requestId/quotation/:quotationId/payment-submissions", as
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SALES APPROVAL — Creates WOs + EmployeeProductionProgress docs
+// SHARED HELPER — WO + EmployeeProductionProgress creation
+// Used by both sales-approve and mark-internal-order
+// ═══════════════════════════════════════════════════════════════════════════════
+async function createWorkOrdersAndProgress(request, userId) {
+  const isMeasurementOrder = !!(request.requestType === "measurement_conversion" || request.measurementId);
+  const orderType = isMeasurementOrder ? "measurement_conversion" : "customer_request";
+
+  let measurement = null;
+  if (isMeasurementOrder && request.measurementId) {
+    measurement = await Measurement.findById(request.measurementId)
+      .select("_id employeeMeasurements")
+      .lean();
+  }
+
+  const createdWorkOrders = [];
+  const skippedVariants = [];
+  const createdProgressDocs = [];
+
+  for (const item of request.items) {
+    const stockItem = await StockItem.findById(item.stockItemId);
+    if (!stockItem) { console.warn(`StockItem not found: ${item.stockItemId}`); continue; }
+
+    for (const variant of item.variants) {
+      let variantData = null;
+      let usedFallback = false;
+
+      if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
+        variantData = stockItem.variants.find(v => v._id.toString() === variant.variantId);
+      }
+      if (!variantData && variant.attributes?.length > 0) {
+        variantData = stockItem.variants.find(v => {
+          if (!v.attributes || v.attributes.length !== variant.attributes.length) return false;
+          return variant.attributes.every(reqAttr => {
+            const stockAttr = v.attributes.find(a => a.name === reqAttr.name);
+            return stockAttr && stockAttr.value === reqAttr.value;
+          });
+        });
+      }
+      if (!variantData && variant.variantId) {
+        variantData = stockItem.variants.find(v => v.sku === variant.variantId);
+      }
+      if (!variantData && stockItem.variants?.length > 0) {
+        variantData = stockItem.variants[0];
+        usedFallback = true;
+        skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, selectedVariant: { id: variantData._id, sku: variantData.sku } });
+      }
+      if (!variantData) {
+        skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, error: "No variants available" });
+        continue;
+      }
+
+      const operations = stockItem.operations.map(op => ({
+        operationType: op.type || op.name || op.operationType,
+        operationCode: op.operationCode || op.code || "",
+        plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
+        status: "pending",
+      }));
+
+      let rawMaterials = [];
+      if (variantData.rawItems?.length > 0) {
+        rawMaterials = variantData.rawItems.map(rawItem => ({
+          rawItemId: rawItem.rawItemId, name: rawItem.rawItemName, sku: rawItem.rawItemSku,
+          rawItemVariantId: rawItem.variantId || null,
+          rawItemVariantCombination: rawItem.variantCombination || [],
+          quantityRequired: rawItem.quantity * variant.quantity,
+          quantityAllocated: 0, quantityIssued: 0,
+          unit: rawItem.unit, unitCost: rawItem.unitCost,
+          totalCost: rawItem.totalCost * variant.quantity,
+          allocationStatus: "not_allocated",
+        }));
+      }
+
+      const variantAttributes = variant.attributes || [];
+      if (variantAttributes.length === 0 && variantData.attributes) variantAttributes.push(...variantData.attributes);
+
+      const workOrder = new WorkOrder({
+        customerRequestId: request._id, stockItemId: item.stockItemId,
+        stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
+        variantId: variantData._id.toString(), variantAttributes,
+        quantity: variant.quantity, customerId: request.customerId,
+        customerName: request.customerInfo.name, priority: request.priority,
+        status: "pending", operations, rawMaterials,
+        timeline: { plannedStartDate: null, plannedEndDate: null, actualStartDate: null, actualEndDate: null, scheduledStartDate: null, scheduledEndDate: null },
+        specialInstructions: variant.specialInstructions || [],
+        estimatedCost: rawMaterials.reduce((total, rm) => total + (rm.totalCost || 0), 0),
+        actualCost: 0, createdBy: userId,
+      });
+      await workOrder.save();
+
+      createdWorkOrders.push({
+        _id: workOrder._id, workOrderNumber: workOrder.workOrderNumber,
+        stockItemName: workOrder.stockItemName, stockItemId: item.stockItemId,
+        variantId: variantData._id.toString(),
+        quantity: workOrder.quantity, rawMaterialCount: workOrder.rawMaterials.length,
+        autoSelectedVariant: usedFallback,
+      });
+
+      if (isMeasurementOrder && measurement) {
+        const stockIdStr = item.stockItemId.toString();
+        const woVariantIdStr = variantData._id.toString();
+        const employeeEntries = [];
+
+        for (const empM of measurement.employeeMeasurements || []) {
+          const productEntry = (empM.products || []).find(p => {
+            const pIdMatch = p.productId?.toString() === stockIdStr;
+            if (!pIdMatch) {
+              if (p.productId) return false;
+              if (p.productName !== item.stockItemName) return false;
+              if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
+              return true;
+            }
+            if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
+            if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
+            return true;
+          });
+          if (!productEntry) continue;
+          employeeEntries.push({
+            employeeId: empM.employeeId, employeeName: empM.employeeName,
+            employeeUIN: empM.employeeUIN, gender: empM.gender,
+            quantity: productEntry.quantity || variant.quantity,
+          });
+        }
+
+        if (employeeEntries.length > 0) {
+          const woNumber = workOrder.workOrderNumber;
+          let unitCursor = 1;
+          for (const emp of employeeEntries) {
+            const unitStart = unitCursor;
+            const unitEnd = unitCursor + emp.quantity - 1;
+            const assignedBarcodeIds = [];
+            for (let u = unitStart; u <= unitEnd; u++) {
+              assignedBarcodeIds.push(`${woNumber}-${u.toString().padStart(3, "0")}`);
+            }
+            try {
+              await EmployeeProductionProgress.findOneAndUpdate(
+                { workOrderId: workOrder._id, employeeId: emp.employeeId },
+                {
+                  $set: {
+                    measurementId: measurement._id, manufacturingOrderId: request._id,
+                    orderType, employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
+                    gender: emp.gender, unitStart, unitEnd, totalUnits: emp.quantity,
+                    assignedBarcodeIds, completedUnits: 0, completedUnitNumbers: [],
+                    completionPercentage: 0, lastSyncedAt: new Date(),
+                  },
+                },
+                { upsert: true, new: true }
+              );
+              createdProgressDocs.push({
+                employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
+                productName: workOrder.stockItemName, unitStart, unitEnd,
+                totalUnits: emp.quantity, barcodeCount: assignedBarcodeIds.length,
+              });
+            } catch (progressErr) {
+              console.error(`[createWorkOrdersAndProgress] Progress error for ${emp.employeeName}:`, progressErr.message);
+            }
+            unitCursor = unitEnd + 1;
+          }
+        }
+      }
+    }
+  }
+
+  return { createdWorkOrders, skippedVariants, createdProgressDocs };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SALES APPROVAL — now delegates WO creation to shared helper
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => {
   try {
@@ -1127,186 +1293,17 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });
 
     const quotation = request.quotations[0];
-    if (quotation.status !== 'customer_approved') return res.status(400).json({ success: false, message: "Quotation is not approved by customer" });
+    if (quotation.status !== "customer_approved") return res.status(400).json({ success: false, message: "Quotation is not approved by customer" });
 
-    quotation.status = 'sales_approved';
-    quotation.salesApproval = { approved: true, approvedAt: new Date(), approvedBy: req.user.id, notes: notes || '' };
+    quotation.status = "sales_approved";
+    quotation.salesApproval = { approved: true, approvedAt: new Date(), approvedBy: req.user.id, notes: notes || "" };
     quotation.updatedAt = new Date();
-    request.status = 'quotation_sales_approved';
+    request.status = "quotation_sales_approved";
     request.finalOrderPrice = quotation.grandTotal;
     request.updatedAt = new Date();
-    request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== 'sales_approval_required');
+    request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== "sales_approval_required");
 
-    const isMeasurementOrder = !!(request.requestType === 'measurement_conversion' || request.measurementId);
-    const orderType = isMeasurementOrder ? 'measurement_conversion' : 'customer_request';
-
-    let measurement = null;
-    if (isMeasurementOrder && request.measurementId) {
-      measurement = await Measurement.findById(request.measurementId)
-        .select('_id employeeMeasurements')
-        .lean();
-    }
-
-    const createdWorkOrders = [];
-    const skippedVariants = [];
-    const createdProgressDocs = [];
-
-    for (const item of request.items) {
-      const stockItem = await StockItem.findById(item.stockItemId);
-      if (!stockItem) { console.warn(`StockItem not found: ${item.stockItemId}`); continue; }
-
-      for (const variant of item.variants) {
-        let variantData = null;
-        let usedFallback = false;
-
-        if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
-          variantData = stockItem.variants.find(v => v._id.toString() === variant.variantId);
-        }
-        if (!variantData && variant.attributes?.length > 0) {
-          variantData = stockItem.variants.find(v => {
-            if (!v.attributes || v.attributes.length !== variant.attributes.length) return false;
-            return variant.attributes.every(reqAttr => {
-              const stockAttr = v.attributes.find(a => a.name === reqAttr.name);
-              return stockAttr && stockAttr.value === reqAttr.value;
-            });
-          });
-        }
-        if (!variantData && variant.variantId) {
-          variantData = stockItem.variants.find(v => v.sku === variant.variantId);
-        }
-        if (!variantData && stockItem.variants?.length > 0) {
-          variantData = stockItem.variants[0];
-          usedFallback = true;
-          skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, selectedVariant: { id: variantData._id, sku: variantData.sku } });
-        }
-        if (!variantData) {
-          skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, error: "No variants available" });
-          continue;
-        }
-
-        const operations = stockItem.operations.map(op => ({
-          operationType: op.type || op.name || op.operationType,
-          operationCode: op.operationCode || op.code || "",
-          plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
-          status: "pending",
-        }));
-
-        let rawMaterials = [];
-        if (variantData.rawItems?.length > 0) {
-          rawMaterials = variantData.rawItems.map(rawItem => ({
-            rawItemId: rawItem.rawItemId, name: rawItem.rawItemName, sku: rawItem.rawItemSku,
-            rawItemVariantId: rawItem.variantId || null,
-            rawItemVariantCombination: rawItem.variantCombination || [],
-            quantityRequired: rawItem.quantity * variant.quantity,
-            quantityAllocated: 0, quantityIssued: 0,
-            unit: rawItem.unit, unitCost: rawItem.unitCost,
-            totalCost: rawItem.totalCost * variant.quantity,
-            allocationStatus: "not_allocated"
-          }));
-        }
-
-        const variantAttributes = variant.attributes || [];
-        if (variantAttributes.length === 0 && variantData.attributes) variantAttributes.push(...variantData.attributes);
-
-        const workOrder = new WorkOrder({
-          customerRequestId: request._id, stockItemId: item.stockItemId,
-          stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
-          variantId: variantData._id.toString(), variantAttributes,
-          quantity: variant.quantity, customerId: request.customerId,
-          customerName: request.customerInfo.name, priority: request.priority,
-          status: "pending", operations, rawMaterials,
-          timeline: { plannedStartDate: null, plannedEndDate: null, actualStartDate: null, actualEndDate: null, scheduledStartDate: null, scheduledEndDate: null },
-          specialInstructions: variant.specialInstructions || [],
-          estimatedCost: rawMaterials.reduce((total, rm) => total + (rm.totalCost || 0), 0),
-          actualCost: 0, createdBy: req.user.id
-        });
-        await workOrder.save();
-
-        createdWorkOrders.push({
-          _id: workOrder._id, workOrderNumber: workOrder.workOrderNumber,
-          stockItemName: workOrder.stockItemName, stockItemId: item.stockItemId,
-          variantId: variantData._id.toString(),
-          quantity: workOrder.quantity, rawMaterialCount: workOrder.rawMaterials.length,
-          autoSelectedVariant: usedFallback
-        });
-
-        if (isMeasurementOrder && measurement) {
-          const stockIdStr = item.stockItemId.toString();
-          const woVariantIdStr = variantData._id.toString();
-
-          const employeeEntries = [];
-          for (const empM of measurement.employeeMeasurements || []) {
-            const productEntry = (empM.products || []).find((p) => {
-              const pIdMatch = p.productId?.toString() === stockIdStr;
-              if (!pIdMatch) {
-                if (p.productId) return false;
-                if (p.productName !== item.stockItemName) return false;
-                if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
-                return true;
-              }
-              if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
-              if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
-              return true;
-            });
-            if (!productEntry) continue;
-            employeeEntries.push({
-              employeeId: empM.employeeId,
-              employeeName: empM.employeeName,
-              employeeUIN: empM.employeeUIN,
-              gender: empM.gender,
-              quantity: productEntry.quantity || variant.quantity,
-            });
-          }
-
-          if (employeeEntries.length > 0) {
-            const woNumber = workOrder.workOrderNumber;
-            let unitCursor = 1;
-            for (const emp of employeeEntries) {
-              const unitStart = unitCursor;
-              const unitEnd = unitCursor + emp.quantity - 1;
-
-              const assignedBarcodeIds = [];
-              for (let u = unitStart; u <= unitEnd; u++) {
-                assignedBarcodeIds.push(`${woNumber}-${u.toString().padStart(3, '0')}`);
-              }
-
-              try {
-                await EmployeeProductionProgress.findOneAndUpdate(
-                  { workOrderId: workOrder._id, employeeId: emp.employeeId },
-                  {
-                    $set: {
-                      measurementId: measurement._id,
-                      manufacturingOrderId: request._id,
-                      orderType,
-                      employeeName: emp.employeeName,
-                      employeeUIN: emp.employeeUIN,
-                      gender: emp.gender,
-                      unitStart, unitEnd,
-                      totalUnits: emp.quantity,
-                      assignedBarcodeIds,
-                      completedUnits: 0,
-                      completedUnitNumbers: [],
-                      completionPercentage: 0,
-                      lastSyncedAt: new Date(),
-                    },
-                  },
-                  { upsert: true, new: true }
-                );
-                createdProgressDocs.push({
-                  employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
-                  productName: workOrder.stockItemName,
-                  unitStart, unitEnd, totalUnits: emp.quantity,
-                  barcodeCount: assignedBarcodeIds.length,
-                });
-              } catch (progressErr) {
-                console.error(`[sales-approve] Progress doc error for ${emp.employeeName}:`, progressErr.message);
-              }
-              unitCursor = unitEnd + 1;
-            }
-          }
-        }
-      }
-    }
+    const { createdWorkOrders, skippedVariants, createdProgressDocs } = await createWorkOrdersAndProgress(request, req.user.id);
 
     await request.save();
 
@@ -1320,7 +1317,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     } catch (emailErr) {
       console.error("[sales-approve] Approval notification email failed:", emailErr.message);
     }
- 
+
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
@@ -1329,6 +1326,64 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
   } catch (error) {
     console.error("Error processing sales approval:", error);
     res.status(500).json({ success: false, message: "Server error while processing approval" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERNAL / COMPANY ORDER — bypass PI, go directly to production
+// ═══════════════════════════════════════════════════════════════════════════════
+router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (request.status !== "pending") return res.status(400).json({ success: false, message: "Only pending requests can be marked as internal orders" });
+
+    // Mark as internal
+    request.isInternalOrder = true;
+    request.internalOrderMarkedAt = new Date();
+
+    // Minimal pre-approved quotation — no monetary value
+    request.quotations = [{
+      date: new Date(),
+      validUntil: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      items: [],
+      subtotalBeforeGST: 0, totalDiscount: 0, totalGST: 0, shippingCharges: 0, grandTotal: 0,
+      status: "sales_approved",
+      notes: "Internal / Company Order — no PI or payment required.",
+      customerApproval: { approved: true, approvedAt: new Date() },
+      salesApproval: { approved: true, approvedAt: new Date(), approvedBy: req.user.id },
+    }];
+
+    request.status = "quotation_sales_approved";
+    request.finalOrderPrice = 0;
+    if (!request.salesPersonAssigned) request.salesPersonAssigned = req.user.id;
+
+    // Run the exact same WO + employee progress creation as a normal sales-approve
+    const { createdWorkOrders, skippedVariants, createdProgressDocs } = await createWorkOrdersAndProgress(request, req.user.id);
+
+    request.notes = request.notes || [];
+    request.notes.push({
+      text: `Marked as Internal Order (no PI required). ${createdWorkOrders.length} work order(s) created directly for production.`,
+      addedBy: req.user.id,
+      addedByModel: "SalesDepartment",
+      createdAt: new Date(),
+    });
+    request.updatedAt = new Date();
+    await request.save();
+
+    let msg = `Internal Order approved. ${createdWorkOrders.length} work order(s) sent to production`;
+    if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
+
+    res.json({
+      success: true, message: msg, request, createdWorkOrders,
+      skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
+      employeeTrackingCreated: createdProgressDocs.length,
+    });
+  } catch (error) {
+    console.error("Error marking internal order:", error);
+    res.status(500).json({ success: false, message: "Server error while marking internal order" });
   }
 });
 

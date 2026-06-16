@@ -116,6 +116,22 @@ async function aggregateProductionProgress(requestId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// GET /profile — customer's own profile for form pre-fill
+// ═══════════════════════════════════════════════════════════════════════════
+router.get("/profile", verifyCustomerToken, async (req, res) => {
+  try {
+    const customer = await Customer.findById(req.customerId)
+      .select("name email phone profile")
+      .lean();
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found" });
+    res.json({ success: true, customer });
+  } catch (err) {
+    console.error("[profile] error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // GET /available-items — stock items the customer can choose from
 // ═══════════════════════════════════════════════════════════════════════════
 router.get("/available-items", verifyCustomerToken, async (req, res) => {
@@ -642,6 +658,130 @@ router.get("/", verifyCustomerToken, async (req, res) => {
       message: "Server error",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
+  }
+});
+
+
+
+// ─── ADD THESE TWO ROUTES to CustomerRequests.js ─────────────────────────────
+// Place them right before the existing PATCH /:requestId/cancel route.
+// Both routes were missing, causing the Express catch-all to serve the
+// frontend HTML — which then crashed res.json() with "Unexpected token '<'".
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GET /:requestId — fetch a single request by ID
+// ═══════════════════════════════════════════════════════════════════════════
+router.get("/:requestId", verifyCustomerToken, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const customerId = req.customerId;
+
+    const request = await Request.findOne({ _id: requestId, customerId }).lean();
+    if (!request) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+
+    res.json({ success: true, request });
+  } catch (error) {
+    console.error("Get single request error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUT /:requestId — update a pending request (customer edits before approval)
+// ═══════════════════════════════════════════════════════════════════════════
+router.put("/:requestId", verifyCustomerToken, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const customerId = req.customerId;
+    const { customerInfo, items } = req.body;
+
+    const request = await Request.findOne({ _id: requestId, customerId });
+    if (!request) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+
+    if (!["pending", "in_progress"].includes(request.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot edit a request with status "${request.status}"`
+      });
+    }
+
+    // Update customer info
+    if (customerInfo) {
+      request.customerInfo = {
+        ...request.customerInfo.toObject?.() || request.customerInfo,
+        ...customerInfo
+      };
+    }
+
+    // Update items if provided
+    if (items && Array.isArray(items) && items.length > 0) {
+      const validatedItems = [];
+
+      for (const item of items) {
+        const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
+        const stockItem = await StockItem.findById(item.stockItemId);
+        if (!stockItem) continue;
+
+        const validatedVariants = [];
+        let totalQuantity = 0;
+
+        for (const variant of item.variants || []) {
+          if (!variant.quantity || variant.quantity < 1) continue;
+          totalQuantity += variant.quantity;
+
+          let variantPrice = stockItem.baseSalesPrice * variant.quantity;
+          let variantId = null;
+
+          if (variant.attributes && stockItem.variants.length > 0) {
+            const match = stockItem.variants.find(sv =>
+              sv.attributes.every(sva =>
+                (variant.attributes || []).some(
+                  a => a.name === sva.name && a.value === sva.value
+                )
+              )
+            );
+            if (match) {
+              variantPrice = match.salesPrice * variant.quantity;
+              variantId = match._id;
+            }
+          }
+
+          validatedVariants.push({
+            variantId,
+            attributes: variant.attributes || [],
+            quantity: variant.quantity,
+            specialInstructions: (variant.specialInstructions || []).filter(i => i?.trim()),
+            estimatedPrice: variantPrice
+          });
+        }
+
+        if (!validatedVariants.length) continue;
+
+        validatedItems.push({
+          stockItemId: stockItem._id,
+          stockItemName: stockItem.name,
+          stockItemReference: stockItem.reference,
+          variants: validatedVariants,
+          totalQuantity,
+          totalEstimatedPrice: validatedVariants.reduce((s, v) => s + v.estimatedPrice, 0)
+        });
+      }
+
+      if (validatedItems.length > 0) request.items = validatedItems;
+    }
+
+    request.updatedAt = new Date();
+    await request.save();
+
+    res.json({ success: true, message: "Request updated successfully", request });
+  } catch (error) {
+    console.error("Update request error:", error);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
