@@ -324,11 +324,29 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
           }
         }
         if (available === null) {
-          // Fall back to item-level qty
           available = doc.quantity || 0;
           minStock = doc.minStock || 0;
         }
       }
+
+      // Collect unitConversions — must be before shortfall computation
+      let unitConversions = [];
+      if (doc) {
+        let varDoc = null;
+        if (t.variantId && Array.isArray(doc.variants)) {
+          varDoc = doc.variants.find(vv => vv._id?.toString() === t.variantId);
+        }
+        if (!varDoc && Array.isArray(doc.variants) && doc.variants.length > 0) {
+          varDoc = doc.variants[0];
+        }
+        if (varDoc?.unitConversions?.length) {
+          unitConversions = varDoc.unitConversions;
+        } else if (varDoc?.unitConversion?.toUnit) {
+          unitConversions = [varDoc.unitConversion];
+        }
+      }
+
+      // Convert available from raw item's native baseUnit → BOM unit before comparing.
  
       // Convert available from raw item's native baseUnit → BOM unit before comparing.
       // e.g. available=148 Pkt, BOM unit=Pcs, conversion 1 Pkt=300 Pcs → 44,400 Pcs available.
@@ -352,23 +370,6 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
       if (available !== null) totalAvailable += available;
       if (shortfall && shortfall > 0) shortfallCount++;
  
-      // Collect unitConversions from the matched variant (or first variant as fallback)
-      let unitConversions = [];
-      if (doc) {
-        let varDoc = null;
-        if (t.variantId && Array.isArray(doc.variants)) {
-          varDoc = doc.variants.find(vv => vv._id?.toString() === t.variantId);
-        }
-        if (!varDoc && Array.isArray(doc.variants) && doc.variants.length > 0) {
-          varDoc = doc.variants[0];
-        }
-        if (varDoc?.unitConversions?.length) {
-          unitConversions = varDoc.unitConversions;
-        } else if (varDoc?.unitConversion?.toUnit) {
-          unitConversions = [varDoc.unitConversion]; // single legacy conversion
-        }
-      }
-
       totals.push({
         ...t,
         available,
