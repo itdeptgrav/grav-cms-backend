@@ -774,16 +774,7 @@ router.post("/:id/complete-planning", async (req, res) => {
     if (!workOrder)
       return res.status(404).json({ success: false, message: "Work order not found" });
  
-    const insufficientAllocations = workOrder.rawMaterials.filter(
-      rm => rm.allocationStatus === "not_allocated"
-    );
-    if (insufficientAllocations.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Some raw materials are not allocated at all",
-        insufficientAllocations,
-      });
-    }
+    
  
     // NOTE: Raw-item stock deduction intentionally removed.
     // Allocation status is preserved as-is — actual issuance will be handled
@@ -988,31 +979,7 @@ router.post("/bulk-plan", async (req, res) => {
           continue;
         }
  
-        const insufficientAllocations = workOrder.rawMaterials.filter(
-          rm => rm.allocationStatus === "not_allocated"
-        );
-        if (insufficientAllocations.length > 0) {
-          results.failed.push({
-            id: workOrderId,
-            workOrderNumber: workOrder.workOrderNumber,
-            reason: `${insufficientAllocations.length} raw material(s) not allocated`,
-          });
-          results.totalFailed++;
-          continue;
-        }
- 
-        const partiallyAllocated = workOrder.rawMaterials.filter(
-          rm => rm.allocationStatus === "partially_allocated"
-        );
-        if (partiallyAllocated.length > 0) {
-          results.failed.push({
-            id: workOrderId,
-            workOrderNumber: workOrder.workOrderNumber,
-            reason: `${partiallyAllocated.length} raw material(s) partially allocated`,
-          });
-          results.totalFailed++;
-          continue;
-        }
+        
  
         // NOTE: Raw-item stock deduction intentionally removed.
         // No RawItem.quantity / variant.quantity / stockTransactions touched here.
