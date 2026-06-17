@@ -180,7 +180,8 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         continue;
       }
  
-      const productRawItems = []; // accumulated for this product
+     const productRawItems = []; // accumulated for this product
+      const variantBreakdowns = []; // per-variant detail for expanded frontend view
  
       for (const reqVariant of item.variants || []) {
         const qtyOrdered = reqVariant.quantity || 0;
@@ -188,6 +189,9 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
  
         const matchedVariant = findStockVariant(stockItem, reqVariant);
         if (!matchedVariant || !Array.isArray(matchedVariant.rawItems)) continue;
+
+        const variantLabel = (reqVariant.attributes || []).map(a => a.value).join(" / ") || "Default";
+        const variantRawItemsForBreakdown = [];
  
         for (const ri of matchedVariant.rawItems) {
           const required = (ri.quantity || 0) * qtyOrdered;
@@ -238,6 +242,23 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
           const totalEntry = totalsMap.get(key);
           totalEntry.quantityRequired += required;
           totalEntry.totalCost += (ri.unitCost || 0) * required;
+
+          variantRawItemsForBreakdown.push({
+            rawItemId:     rawItemIdStr,
+            variantId:     variantIdStr,
+            rawItemName:   ri.rawItemName,
+            perPieceQty:   ri.quantity || 0,
+            quantityRequired: required,
+            unit:          ri.unit,
+          });
+        }
+
+        if (variantRawItemsForBreakdown.length > 0) {
+          variantBreakdowns.push({
+            variantLabel,
+            quantity: qtyOrdered,
+            rawItems: variantRawItemsForBreakdown,
+          });
         }
       }
  
@@ -255,6 +276,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         stockItemReference: item.stockItemReference || "",
         totalQuantity: item.totalQuantity || 0,
         rawItems: productRawItems,
+        variantBreakdowns,
         image: productImage,
       });
     }
