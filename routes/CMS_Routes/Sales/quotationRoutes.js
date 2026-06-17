@@ -16,6 +16,17 @@ const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem")
 router.use(EmployeeAuthMiddleware);
 
 // ─── GST RULE ─────────────────────────────────────────────────────────────────
+// Convert qty between units using unitConversions [{fromUnit, toUnit, quantity}]
+// where quantity means: 1 fromUnit = quantity toUnit
+function convertBetweenUnits(qty, fromUnit, toUnit, conversions = []) {
+  if (!fromUnit || !toUnit || fromUnit === toUnit || !qty || !conversions.length) return null;
+  const direct = conversions.find(c => c.fromUnit === fromUnit && c.toUnit === toUnit);
+  if (direct?.quantity) return qty * direct.quantity;
+  const inverse = conversions.find(c => c.fromUnit === toUnit && c.toUnit === fromUnit);
+  if (inverse?.quantity) return qty / inverse.quantity;
+  return null;
+}
+
 const getGSTPercentage = (unitPrice) => {
   const price = parseFloat(unitPrice) || 0;
   return price < 2499 ? 5 : 18;
@@ -319,13 +330,21 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         }
       }
  
-      const shortfall = available !== null ? Math.max(0, t.quantityRequired - available) : null;
- 
+      // Convert available from raw item's native baseUnit → BOM unit before comparing.
+      // e.g. available=148 Pkt, BOM unit=Pcs, conversion 1 Pkt=300 Pcs → 44,400 Pcs available.
+      let availableInBomUnit = available;
+      if (available !== null && t.baseUnit && t.unit && t.baseUnit !== t.unit) {
+        const converted = convertBetweenUnits(available, t.baseUnit, t.unit, unitConversions);
+        if (converted !== null) availableInBomUnit = converted;
+      }
+
+      const shortfall = availableInBomUnit !== null ? Math.max(0, t.quantityRequired - availableInBomUnit) : null;
+
       let status = "unknown";
-      if (available !== null) {
-        if (available <= 0) status = "out_of_stock";
+      if (availableInBomUnit !== null) {
+        if (availableInBomUnit <= 0) status = "out_of_stock";
         else if (shortfall > 0) status = "shortage";
-        else if (available - t.quantityRequired <= minStock) status = "low";
+        else if (availableInBomUnit - t.quantityRequired <= minStock) status = "low";
         else status = "ok";
       }
  
