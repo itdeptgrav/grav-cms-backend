@@ -1124,6 +1124,11 @@ const bankReconRoutes = require("./routes/Accountant_Routes/Acc_bankRecon");
 app.use("/api/accountant/bank-recon", bankReconRoutes);
 
 app.use(
+  "/api/accountant/voucher-files",
+  require("./routes/Accountant_Routes/Acc_voucherUploads"),
+);
+
+app.use(
   "/api/accountant/setu-aa",
   require("./routes/Accountant_Routes/Acc_setuAA"),
 );
