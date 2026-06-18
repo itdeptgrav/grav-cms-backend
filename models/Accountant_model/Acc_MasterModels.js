@@ -417,6 +417,20 @@ const tallyLedgerSchema = new mongoose.Schema(
       default: "unknown",
     },
     gstin: { type: String, trim: true },
+    // Additional GSTINs — for a vendor/customer with more than one GST
+    // registration (e.g. branches in different states, or multiple
+    // registrations under the same PAN). The PRIMARY GSTIN stays in `gstin`
+    // above and remains what every report / voucher / e-way-bill reads by
+    // default; these are extra options the user can pick from on a voucher.
+    additionalGstins: [
+      {
+        _id: false,
+        gstin: { type: String, trim: true },
+        label: { type: String, trim: true }, // optional human label e.g. "Mumbai branch"
+        stateCode: { type: String, trim: true },
+        state: { type: String, trim: true },
+      },
+    ],
     hsnCode: { type: String, trim: true },
     taxRate: { type: Number, default: 0 }, // for income/expense ledgers
 
