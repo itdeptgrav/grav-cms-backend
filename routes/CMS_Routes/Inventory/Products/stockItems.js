@@ -343,6 +343,8 @@ router.get("/data/raw-items", async (req, res) => {
             cost: latestCost,
             status: variant.status || "Out of Stock",
             sku: variant.sku || `${baseItem.sku}-var`,
+            // variant-level unit conversions (fromUnit/toUnit/quantity format from RawItem schema)
+            unitConversions: (variant.unitConversions || []).filter(c => c.fromUnit && c.toUnit && c.quantity),
             vendorAliases: (variant.vendorNicknames || [])
               .filter(vn => vn.price > 0)
               .map(vn => ({
@@ -459,6 +461,31 @@ router.get("/:id/tab/:tabName", async (req, res) => {
     if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
 
     const response = { success: true, tab: tabName, data: stockItem };
+
+    // For raw-items tab, build a map of rawItemId|variantId → unitConversions
+    // so the frontend can show correct conversion units without extra fetches
+    if (tabName === "raw-items") {
+      const rawItemIds = [
+        ...new Set(
+          stockItem.variants.flatMap(v =>
+            (v.rawItems || []).map(ri => ri.rawItemId?.toString()).filter(Boolean)
+          )
+        )
+      ];
+      if (rawItemIds.length > 0) {
+        const rawDocs = await RawItem.find({ _id: { $in: rawItemIds } })
+          .select("_id variants._id variants.unitConversions")
+          .lean();
+        const convMap = {};
+        rawDocs.forEach(doc => {
+          (doc.variants || []).forEach(v => {
+            const key = `${doc._id}|${v._id}`;
+            convMap[key] = (v.unitConversions || []).filter(c => c.fromUnit && c.toUnit && c.quantity);
+          });
+        });
+        response.variantUnitConvMap = convMap;
+      }
+    }
 
     if (tabName === "operations") {
       const [registeredOperations, registeredGroups] = await Promise.all([

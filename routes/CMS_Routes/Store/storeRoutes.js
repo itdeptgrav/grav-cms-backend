@@ -145,14 +145,29 @@ router.get("/order-requests/:id/work-orders", async (req, res) => {
     const stockItems = await StockItem.find({
       _id: { $in: stockItemIds.map((id) => new mongoose.Types.ObjectId(id)) },
     })
-      .select("_id genderCategory")
+      .select("_id genderCategory images variants._id variants.images")
       .lean();
-    const genderMap = new Map(stockItems.map((s) => [s._id.toString(), s.genderCategory || ""]));
 
-    const enriched = workOrders.map((wo) => ({
-      ...wo,
-      genderCategory: genderMap.get(wo.stockItemId?.toString()) || "",
-    }));
+    const stockItemMap = new Map(stockItems.map((s) => [s._id.toString(), s]));
+
+    const enriched = workOrders.map((wo) => {
+      const si = stockItemMap.get(wo.stockItemId?.toString())
+      // Variant-matched image first, then any variant with image, then product-level
+      const productImage = (() => {
+        if (si?.variants?.length) {
+          const matched = si.variants.find(v => v._id?.toString() === wo.variantId?.toString())
+          if (matched?.images?.[0]) return matched.images[0]
+          const anyWithImg = si.variants.find(v => v.images?.length > 0)
+          if (anyWithImg?.images?.[0]) return anyWithImg.images[0]
+        }
+        return si?.images?.[0] || null
+      })()
+      return {
+        ...wo,
+        genderCategory: si?.genderCategory || "",
+        productImage,
+      }
+    });
 
     return res.json({ success: true, workOrders: enriched });
   } catch (err) {

@@ -16,6 +16,17 @@ const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem")
 router.use(EmployeeAuthMiddleware);
 
 // ─── GST RULE ─────────────────────────────────────────────────────────────────
+// Convert qty between units using unitConversions [{fromUnit, toUnit, quantity}]
+// where quantity means: 1 fromUnit = quantity toUnit
+function convertBetweenUnits(qty, fromUnit, toUnit, conversions = []) {
+  if (!fromUnit || !toUnit || fromUnit === toUnit || !qty || !conversions.length) return null;
+  const direct = conversions.find(c => c.fromUnit === fromUnit && c.toUnit === toUnit);
+  if (direct?.quantity) return qty * direct.quantity;
+  const inverse = conversions.find(c => c.fromUnit === toUnit && c.toUnit === fromUnit);
+  if (inverse?.quantity) return qty / inverse.quantity;
+  return null;
+}
+
 const getGSTPercentage = (unitPrice) => {
   const price = parseFloat(unitPrice) || 0;
   return price < 2499 ? 5 : 18;
@@ -180,7 +191,8 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         continue;
       }
  
-      const productRawItems = []; // accumulated for this product
+     const productRawItems = []; // accumulated for this product
+      const variantBreakdowns = []; // per-variant detail for expanded frontend view
  
       for (const reqVariant of item.variants || []) {
         const qtyOrdered = reqVariant.quantity || 0;
@@ -188,6 +200,9 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
  
         const matchedVariant = findStockVariant(stockItem, reqVariant);
         if (!matchedVariant || !Array.isArray(matchedVariant.rawItems)) continue;
+
+        const variantLabel = (reqVariant.attributes || []).map(a => a.value).join(" / ") || "Default";
+        const variantRawItemsForBreakdown = [];
  
         for (const ri of matchedVariant.rawItems) {
           const required = (ri.quantity || 0) * qtyOrdered;
@@ -213,6 +228,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
               variantCombination: ri.variantCombination || [],
               unit: ri.unit,
               baseUnit: ri.baseUnit || ri.unit,
+              perPieceQty: ri.quantity || 0,
               quantityRequired: required,
               unitCost: ri.unitCost || 0,
               totalCost: (ri.unitCost || 0) * required,
@@ -237,14 +253,42 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
           const totalEntry = totalsMap.get(key);
           totalEntry.quantityRequired += required;
           totalEntry.totalCost += (ri.unitCost || 0) * required;
+
+          variantRawItemsForBreakdown.push({
+            rawItemId:     rawItemIdStr,
+            variantId:     variantIdStr,
+            rawItemName:   ri.rawItemName,
+            perPieceQty:   ri.quantity || 0,
+            quantityRequired: required,
+            unit:          ri.unit,
+          });
+        }
+
+        if (variantRawItemsForBreakdown.length > 0) {
+          variantBreakdowns.push({
+            variantLabel,
+            quantity: qtyOrdered,
+            rawItems: variantRawItemsForBreakdown,
+          });
         }
       }
  
+      // Pick best available image — variant-first, then product-level
+      const productImage = (() => {
+        if (stockItem?.variants?.length) {
+          const withImg = stockItem.variants.find(v => v.images?.length > 0)
+          if (withImg) return withImg.images[0]
+        }
+        return stockItem?.images?.[0] || null
+      })()
+
       perProduct.push({
         productName: item.mpcDisplayName || item.stockItemName,
         stockItemReference: item.stockItemReference || "",
         totalQuantity: item.totalQuantity || 0,
         rawItems: productRawItems,
+        variantBreakdowns,
+        image: productImage,
       });
     }
  
@@ -280,19 +324,45 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
           }
         }
         if (available === null) {
-          // Fall back to item-level qty
           available = doc.quantity || 0;
           minStock = doc.minStock || 0;
         }
       }
+
+      // Collect unitConversions — must be before shortfall computation
+      let unitConversions = [];
+      if (doc) {
+        let varDoc = null;
+        if (t.variantId && Array.isArray(doc.variants)) {
+          varDoc = doc.variants.find(vv => vv._id?.toString() === t.variantId);
+        }
+        if (!varDoc && Array.isArray(doc.variants) && doc.variants.length > 0) {
+          varDoc = doc.variants[0];
+        }
+        if (varDoc?.unitConversions?.length) {
+          unitConversions = varDoc.unitConversions;
+        } else if (varDoc?.unitConversion?.toUnit) {
+          unitConversions = [varDoc.unitConversion];
+        }
+      }
+
+      // Convert available from raw item's native baseUnit → BOM unit before comparing.
  
-      const shortfall = available !== null ? Math.max(0, t.quantityRequired - available) : null;
- 
+      // Convert available from raw item's native baseUnit → BOM unit before comparing.
+      // e.g. available=148 Pkt, BOM unit=Pcs, conversion 1 Pkt=300 Pcs → 44,400 Pcs available.
+      let availableInBomUnit = available;
+      if (available !== null && t.baseUnit && t.unit && t.baseUnit !== t.unit) {
+        const converted = convertBetweenUnits(available, t.baseUnit, t.unit, unitConversions);
+        if (converted !== null) availableInBomUnit = converted;
+      }
+
+      const shortfall = availableInBomUnit !== null ? Math.max(0, t.quantityRequired - availableInBomUnit) : null;
+
       let status = "unknown";
-      if (available !== null) {
-        if (available <= 0) status = "out_of_stock";
+      if (availableInBomUnit !== null) {
+        if (availableInBomUnit <= 0) status = "out_of_stock";
         else if (shortfall > 0) status = "shortage";
-        else if (available - t.quantityRequired <= minStock) status = "low";
+        else if (availableInBomUnit - t.quantityRequired <= minStock) status = "low";
         else status = "ok";
       }
  
@@ -306,6 +376,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         shortfall,
         minStock,
         status,
+        unitConversions,
       });
     }
  
