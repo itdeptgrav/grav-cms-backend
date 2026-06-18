@@ -1174,21 +1174,22 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
 
       matchedBookIds.add(String(book._id));
 
-      // Compare amounts within tolerance
+      // ── Match criteria ─────────────────────────────────────────────────
+      // A record MATCHES when it agrees with the book on exactly these four
+      // parameters: GSTIN, Invoice number, Taxable value, Tax amount.
+      //   • GSTIN + Invoice number → already enforced by the pairing key
+      //     (`${supplierGSTIN}::${normInvNum(docNumber)}`); if we reached here
+      //     they already agree.
+      //   • Taxable value and total Tax amount → checked within tolerance below.
+      // Document date and the individual CGST/SGST/IGST/Cess split are NOT part
+      // of the match decision — they're computed only for on-screen display.
+      const taxR2b = r2b.cgst + r2b.sgst + r2b.igst + r2b.cess;
       const diffTaxable = Math.abs(r2b.taxableValue - book.taxableValue);
-      const diffCgst = Math.abs(r2b.cgst - book.cgst);
-      const diffSgst = Math.abs(r2b.sgst - book.sgst);
-      const diffIgst = Math.abs(r2b.igst - book.igst);
-      const diffCess = Math.abs(r2b.cess - book.cess);
+      const diffTotalTax = Math.abs(taxR2b - book.totalTax);
 
-      const amountsMatch =
-        diffTaxable <= amtTol &&
-        diffCgst <= amtTol &&
-        diffSgst <= amtTol &&
-        diffIgst <= amtTol &&
-        diffCess <= amtTol;
+      const amountsMatch = diffTaxable <= amtTol && diffTotalTax <= amtTol;
 
-      // Date diff (informational only — don't bucket on this alone)
+      // Date diff — informational only (shown in the UI, never affects match).
       let daysDiff = null;
       if (r2b.docDate && book.bookDocDate) {
         daysDiff = Math.round(
@@ -1196,7 +1197,6 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
             (1000 * 60 * 60 * 24),
         );
       }
-      const dateOk = daysDiff == null || daysDiff <= dayTol;
 
       const entry = {
         gstr2b: r2b,
@@ -1207,27 +1207,22 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
           sgst: r2b.sgst - book.sgst,
           igst: r2b.igst - book.igst,
           cess: r2b.cess - book.cess,
-          totalTax: r2b.cgst + r2b.sgst + r2b.igst + r2b.cess - book.totalTax,
+          totalTax: taxR2b - book.totalTax,
           dateDiffDays: daysDiff,
         },
       };
 
-      if (amountsMatch && dateOk) {
+      if (amountsMatch) {
         matched.push(entry);
       } else {
-        // Build a human-readable reason for the mismatch
+        // Mismatch reasons are limited to the two amount parameters we match
+        // on — Taxable value and Tax amount. (GSTIN + Invoice number already
+        // agree; date and tax-split differences never drive the bucket.)
         const reasons = [];
         if (diffTaxable > amtTol)
           reasons.push(`taxable value differs by ₹${diffTaxable.toFixed(2)}`);
-        if (diffCgst > amtTol)
-          reasons.push(`CGST differs by ₹${diffCgst.toFixed(2)}`);
-        if (diffSgst > amtTol)
-          reasons.push(`SGST differs by ₹${diffSgst.toFixed(2)}`);
-        if (diffIgst > amtTol)
-          reasons.push(`IGST differs by ₹${diffIgst.toFixed(2)}`);
-        if (diffCess > amtTol)
-          reasons.push(`Cess differs by ₹${diffCess.toFixed(2)}`);
-        if (!dateOk) reasons.push(`document date differs by ${daysDiff} days`);
+        if (diffTotalTax > amtTol)
+          reasons.push(`tax amount differs by ₹${diffTotalTax.toFixed(2)}`);
         mismatched.push({ ...entry, reasons });
       }
     }
