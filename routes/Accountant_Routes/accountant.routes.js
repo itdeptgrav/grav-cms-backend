@@ -97,6 +97,9 @@ const mounts = [
   // raised from CoA, BS, P&L, TB, and Day Book pages.
   ["/cashflow-adjustments", "./Accountant_Routes/Acc_cashflowAdjustments"],
   ["/ledger-reclass", "./Accountant_Routes/Acc_ledgerReclass"],
+
+  // === Backup / restore (Google Drive) ===
+  ["/backup", "./Accountant_Routes/Acc_backup"],
 ];
 
 let mounted = 0;
