@@ -1592,8 +1592,11 @@ router.post("/", auth, async (req, res) => {
       role === "admin" ||
       role === "accountant";
     const canPostDirectly = !!perms.canPostDirectly || fullAccessRole;
-    const isSales = body.voucherType === "sales";
-    const needsApproval = isSales && !canPostDirectly;
+    // Editors (no direct-post privilege) can't post straight away — their
+    // SALES or PURCHASE vouchers go to an admin for approval instead.
+    const approvalTypes = ["sales", "purchase"];
+    const needsApproval =
+      !canPostDirectly && approvalTypes.includes(body.voucherType);
 
     if (needsApproval) {
       voucher.status = "pending_approval";
@@ -1612,7 +1615,7 @@ router.post("/", auth, async (req, res) => {
             companyId: voucher.companyId,
             kind: "voucher",
             action: "post",
-            title: `Post sales invoice ${voucher.voucherNumber} · ${
+            title: `Post ${voucher.voucherType} ${voucher.voucherNumber} · ${
               voucher.partyLedgerName || "—"
             } · ₹${Number(voucher.grandTotal || 0).toLocaleString("en-IN")}`,
             target: { collection: "Acc_Voucher", id: voucher._id },
@@ -1782,28 +1785,86 @@ router.post("/:id/post", auth, async (req, res) => {
 });
 
 router.post("/:id/cancel", auth, async (req, res) => {
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
-    const voucher = await Acc_Voucher.findById(req.params.id).session(session);
-    if (!voucher) throw new Error("Voucher not found");
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    if (!voucher) return res.status(404).json({ error: "Voucher not found" });
     if (!["posted", "draft"].includes(voucher.status))
-      throw new Error(`Cannot cancel voucher in '${voucher.status}' status`);
+      return res
+        .status(400)
+        .json({ error: `Cannot cancel voucher in '${voucher.status}' status` });
 
-    if (voucher.status === "posted") {
-      await applyLedgerBalances(voucher, -1, session);
+    // Editors (no direct-post privilege) route the cancel through approval.
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    const canActDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    if (!canActDirectly) {
+      if (!req.user?.organizationId) {
+        return res
+          .status(403)
+          .json({ error: "Your role can't cancel vouchers." });
+      }
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "cancel",
+        "target.id": voucher._id,
+        status: "pending",
+      });
+      if (dup) {
+        return res.status(200).json({
+          ...voucher.toObject(),
+          _pendingApproval: true,
+          message: "A cancel request is already pending for this voucher.",
+        });
+      }
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: voucher.companyId,
+        kind: "voucher",
+        action: "cancel",
+        title: `Cancel ${voucher.voucherType} ${voucher.voucherNumber} · ${
+          voucher.partyLedgerName || "—"
+        } · ₹${Number(voucher.grandTotal || 0).toLocaleString("en-IN")}`,
+        target: { collection: "Acc_Voucher", id: voucher._id },
+        payload: { voucherId: voucher._id },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+      return res.status(202).json({
+        ...voucher.toObject(),
+        _pendingApproval: true,
+        message: "Cancel request sent to an admin for approval.",
+      });
     }
-    voucher.status = "cancelled";
-    voucher.updatedBy = req.user?.id;
-    await voucher.save({ session });
 
-    await session.commitTransaction();
-    res.json(voucher);
+    // Owners / approvers / accountants cancel directly (balances reversed).
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const v = await Acc_Voucher.findById(req.params.id).session(session);
+      if (v.status === "posted") {
+        await applyLedgerBalances(v, -1, session);
+      }
+      v.status = "cancelled";
+      v.updatedBy = req.user?.id;
+      await v.save({ session });
+      await session.commitTransaction();
+      res.json(v);
+    } catch (e) {
+      await session.abortTransaction();
+      throw e;
+    } finally {
+      session.endSession();
+    }
   } catch (e) {
-    await session.abortTransaction();
     res.status(400).json({ error: e.message });
-  } finally {
-    session.endSession();
   }
 });
 
@@ -1811,6 +1872,59 @@ router.post("/:id/void", auth, async (req, res) => {
   try {
     const voucher = await Acc_Voucher.findById(req.params.id);
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
+
+    // Editors (no direct-post privilege) route the void through approval.
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    const canActDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    if (!canActDirectly) {
+      if (!req.user?.organizationId) {
+        return res
+          .status(403)
+          .json({ error: "Your role can't void vouchers." });
+      }
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "void",
+        "target.id": voucher._id,
+        status: "pending",
+      });
+      if (dup) {
+        return res.status(200).json({
+          ...voucher.toObject(),
+          _pendingApproval: true,
+          message: "A void request is already pending for this voucher.",
+        });
+      }
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: voucher.companyId,
+        kind: "voucher",
+        action: "void",
+        title: `Void ${voucher.voucherType} ${voucher.voucherNumber} · ${
+          voucher.partyLedgerName || "—"
+        } · ₹${Number(voucher.grandTotal || 0).toLocaleString("en-IN")}`,
+        target: { collection: "Acc_Voucher", id: voucher._id },
+        payload: { voucherId: voucher._id },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+      return res.status(202).json({
+        ...voucher.toObject(),
+        _pendingApproval: true,
+        message: "Void request sent to an admin for approval.",
+      });
+    }
+
+    // Owners / approvers / accountants void directly (balances reversed).
     if (voucher.status === "posted") {
       await applyLedgerBalances(voucher, -1);
     }

@@ -215,8 +215,31 @@ async function applyApprovedAction(reqDoc, approver) {
     }
   }
 
-  // Add more kinds here as you migrate modules to the approval flow.
-  //
+  // VOUCHER ── void a voucher (mirror of cancel; status becomes "void")
+  if (kind === "voucher" && action === "void") {
+    if (!target?.id) throw new Error("voucher void: target.id missing");
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const voucher = await Acc_Voucher.findById(target.id).session(session);
+      if (!voucher) throw new Error("Voucher not found");
+      if (voucher.status === "posted") {
+        await applyLedgerBalances(voucher, -1, session);
+      }
+      voucher.status = "void";
+      voucher.updatedBy = approver.id;
+      await voucher.save({ session });
+      await session.commitTransaction();
+      return { entityId: voucher._id };
+    } catch (e) {
+      await session.abortTransaction();
+      throw e;
+    } finally {
+      session.endSession();
+    }
+  }
+
+  // Add more kinds here as you migrate modules to the approval flow.  //
   // NOTE: cashflow-adjustments and ledger-reclass have their own
   // approve/reject endpoints under /cashflow-adjustments/:id/approve
   // and /ledger-reclass/:id/approve respectively. They are NOT queued
