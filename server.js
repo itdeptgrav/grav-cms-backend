@@ -1071,6 +1071,11 @@ app.use(
   require("./routes/Accountant_Routes/Acc_ledgerReclass"),
 );
 
+app.use(
+  "/api/accountant/backup",
+  require("./routes/Accountant_Routes/Acc_backup"),
+);
+
 // ── Operational routes ────────────────────────────────────────────────
 app.use(
   "/api/accountant/dashboard",

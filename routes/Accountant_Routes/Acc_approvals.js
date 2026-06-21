@@ -45,6 +45,46 @@ const {
 router.use(orgAuth);
 
 // ─────────────────────────────────────────────────────────────────────────
+// GET /list — unified feed for the Approvals page (history, not just pending)
+// ─────────────────────────────────────────────────────────────────────────
+// ?scope=org|mine  &status=pending|approved|rejected|cancelled|all
+//   scope=org  → approver/owner org-wide view (canApprove required), limited
+//                to editor-originated requests (the only ones that ever
+//                needed approval).
+//   scope=mine → the caller's OWN requests in any status, so an editor can
+//                see whether what they submitted was approved or rejected.
+router.get("/list", async (req, res) => {
+  try {
+    if (!requireOrg(req, res)) return;
+    const scope = req.query.scope === "org" ? "org" : "mine";
+    if (scope === "org" && !requireCanApprove(req, res)) return;
+
+    const q = { organizationId: req.user.organizationId };
+    if (scope === "mine") q.createdBy = req.user.id;
+    else q.createdByRole = "editor";
+    if (req.query.companyId) q.companyId = req.query.companyId;
+
+    const statusMap = {
+      pending: "pending_approval",
+      approved: "approved",
+      rejected: "rejected",
+      cancelled: "void",
+    };
+    const s = req.query.status;
+    if (s && s !== "all" && statusMap[s]) q.status = statusMap[s];
+
+    const rows = await Acc_LedgerReclassRequest.find(q)
+      .sort({ createdAt: -1 })
+      .limit(300)
+      .lean();
+    res.json({ success: true, requests: rows });
+  } catch (e) {
+    console.error("[ledger-reclass/list]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
 function orgFilter(req) {
@@ -211,7 +251,7 @@ router.get("/", async (req, res) => {
       page = 1,
     } = req.query;
     const filter = { ...orgFilter(req) };
-    if (status) filter.status = status;
+    if (status && status !== "all") filter.status = status;
     if (kind) filter.kind = kind;
     if (requestedBy) filter.requestedBy = requestedBy;
 
@@ -223,7 +263,10 @@ router.get("/", async (req, res) => {
         .limit(Number(limit))
         .lean(),
       Acc_ApprovalRequest.countDocuments(filter),
-      Acc_ApprovalRequest.countDocuments({ ...orgFilter(req), status: "pending" }),
+      Acc_ApprovalRequest.countDocuments({
+        ...orgFilter(req),
+        status: "pending",
+      }),
     ]);
 
     res.json({
