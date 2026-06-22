@@ -1268,13 +1268,14 @@ router.get("/ledgers/:id/statement", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Ledger not found" });
 
+    // IST boundaries — must match the carry-forward cutoff used for the
+    // opening balance below (both +05:30), otherwise a voucher dated the
+    // 1st of the period between 00:00–05:30 IST falls into neither the
+    // opening nor the period and the closing comes out wrong.
     const dateFilter = {};
-    if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
-      dateFilter.$lte = e;
-    }
+    if (startDate)
+      dateFilter.$gte = new Date(`${startDate}T00:00:00.000+05:30`);
+    if (endDate) dateFilter.$lte = new Date(`${endDate}T23:59:59.999+05:30`);
 
     const filter = {
       "ledgerEntries.ledgerId": ledger._id,
@@ -1374,17 +1375,29 @@ router.get("/ledgers/:id/statement", async (req, res) => {
 
     // ── Monthly summary buckets ─────────────────────────────────────────
     // Each month's opening = previous month's closing.
+    // IST calendar parts of any date — server-TZ-independent, so a voucher
+    // stored at IST-midnight (UTC-5:30) is bucketed into the correct IST
+    // month/day regardless of the timezone the Node process runs in.
+    const istParts = (val) => {
+      const ymd = new Date(val).toLocaleDateString("en-CA", {
+        timeZone: "Asia/Kolkata",
+      });
+      const [yy, mm, dd] = ymd.split("-").map(Number);
+      return { y: yy, m: mm, d: dd, ymd };
+    };
+
     const byMonth = new Map();
     for (const l of lines) {
-      const d = new Date(l.date);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const { y, m } = istParts(l.date);
+      const key = `${y}-${String(m).padStart(2, "0")}`;
       if (!byMonth.has(key)) {
+        const dt = new Date(y, m - 1, 1);
         byMonth.set(key, {
           monthKey: key,
-          year: d.getFullYear(),
-          month: d.getMonth() + 1,
-          monthName: d.toLocaleString("en-IN", { month: "long" }),
-          monthShort: d.toLocaleString("en-IN", { month: "short" }),
+          year: y,
+          month: m,
+          monthName: dt.toLocaleString("en-IN", { month: "long" }),
+          monthShort: dt.toLocaleString("en-IN", { month: "short" }),
           debit: 0,
           credit: 0,
           txCount: 0,
@@ -1395,7 +1408,6 @@ router.get("/ledgers/:id/statement", async (req, res) => {
       bucket.credit += l.credit;
       bucket.txCount += 1;
     }
-
     // Determine the FULL month range to display. The accountant wants
     // EVERY month of the selected period shown — even months with no
     // transactions — each carrying the previous month's closing forward
@@ -1413,20 +1425,18 @@ router.get("/ledgers/:id/statement", async (req, res) => {
     let rangeStart = null;
     let rangeEnd = null;
     if (startDate) {
-      const s = new Date(startDate);
-      rangeStart = { y: s.getFullYear(), m: s.getMonth() + 1 };
+      const [y, m] = startDate.split("-").map(Number);
+      rangeStart = { y, m };
     }
     if (endDate) {
-      const e = new Date(endDate);
-      rangeEnd = { y: e.getFullYear(), m: e.getMonth() + 1 };
+      const [y, m] = endDate.split("-").map(Number);
+      rangeEnd = { y, m };
     }
     if ((!rangeStart || !rangeEnd) && lines.length > 0) {
-      const first = new Date(lines[0].date);
-      const last = new Date(lines[lines.length - 1].date);
-      if (!rangeStart)
-        rangeStart = { y: first.getFullYear(), m: first.getMonth() + 1 };
-      if (!rangeEnd)
-        rangeEnd = { y: last.getFullYear(), m: last.getMonth() + 1 };
+      const first = istParts(lines[0].date);
+      const last = istParts(lines[lines.length - 1].date);
+      if (!rangeStart) rangeStart = { y: first.y, m: first.m };
+      if (!rangeEnd) rangeEnd = { y: last.y, m: last.m };
     }
     if (!rangeStart && !rangeEnd) {
       const now = new Date();
@@ -1498,12 +1508,12 @@ router.get("/ledgers/:id/statement", async (req, res) => {
     // ── Daily summary buckets ───────────────────────────────────────────
     const byDay = new Map();
     for (const l of lines) {
-      const d = new Date(l.date);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      const { y, m, d: dd } = istParts(l.date);
+      const key = `${y}-${String(m).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
       if (!byDay.has(key)) {
         byDay.set(key, {
           dayKey: key,
-          date: d,
+          date: new Date(l.date),
           debit: 0,
           credit: 0,
           txCount: 0,
@@ -1724,8 +1734,8 @@ router.get("/ledgers/:id/statement", async (req, res) => {
       ]);
       const p = prevAgg[0] || { debit: 0, credit: 0, txCount: 0 };
       previousPeriodComparison = {
-        startDate: s.toISOString().slice(0, 10),
-        endDate: e.toISOString().slice(0, 10),
+        startDate: prevStartStr,
+        endDate: prevEndStr,
         debit: p.debit,
         credit: p.credit,
         txCount: p.txCount,
