@@ -4561,4 +4561,193 @@ router.post("/ledgers/:id/transfer-balance", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/accountant/chart-of-accounts/trial-balance/diagnose
+//   ?companyId=&endDate=   (endDate = the TB's "to" date; defaults to today)
+//
+// Pinpoints the source of a Trial Balance imbalance. The TB closing total is
+//   Σ_active [ openingBalance + Σ(movements ≤ endDate) ]
+// so the gap can only come from:
+//   A) opening balances of ACTIVE ledgers that don't net to zero, and/or
+//   B) vouchers whose ACTIVE-leg debits ≠ credits — either internally
+//      unbalanced (debit ≠ credit), OR balanced but with a leg on a deleted/
+//      inactive ledger (which the TB drops, leaving the rest lopsided).
+// startDate is irrelevant to the imbalance (it only splits opening vs period;
+// the sum is identical), so only endDate matters. READ-ONLY.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/trial-balance/diagnose", async (req, res) => {
+  try {
+    // Lazy-require so the top-of-file imports don't need touching.
+    const {
+      Acc_Company,
+    } = require("../../models/Accountant_model/Acc_MasterModels");
+
+    // Resolve company: explicit param, else the primary/only company.
+    let cId;
+    if (req.query.companyId) {
+      cId = new mongoose.Types.ObjectId(req.query.companyId);
+    } else {
+      let company = await Acc_Company.findOne({ isPrimary: true })
+        .select("_id")
+        .lean();
+      if (!company) {
+        const all = await Acc_Company.find({}).select("_id").limit(2).lean();
+        if (all.length === 1) company = all[0];
+      }
+      if (!company)
+        return res.status(400).json({
+          success: false,
+          message:
+            "companyId required (no single primary company found to default to).",
+        });
+      cId = company._id;
+    }
+
+    // Cutoff = end of the TB's "to" day in IST. Default: now.
+    const endDate = req.query.endDate || req.query.asOf;
+    const cutoff = endDate
+      ? new Date(`${endDate}T23:59:59.999+05:30`)
+      : new Date();
+
+    // ── Source A — opening balances of ACTIVE ledgers ────────────────────
+    const ledgers = await Acc_Ledger.find({ companyId: cId, isActive: true })
+      .select("name openingBalance")
+      .lean();
+    let openingImbalance = 0;
+    for (const l of ledgers) openingImbalance += l.openingBalance || 0;
+    openingImbalance = parseFloat(openingImbalance.toFixed(2));
+
+    // Hidden cause — inactive ledgers that STILL carry an opening balance
+    // (e.g. a ledger soft-deleted after it had a balance). The TB drops it.
+    const inactiveWithOpening = await Acc_Ledger.find({
+      companyId: cId,
+      isActive: false,
+      openingBalance: { $ne: 0 },
+    })
+      .select("name openingBalance")
+      .lean();
+
+    // ── Source B — vouchers whose ACTIVE-leg debits ≠ credits ────────────
+    // Per voucher, sum (Dr +amount / Cr -amount) over entries on an ACTIVE
+    // ledger (mirrors how the TB builds rows from active ledgers only).
+    const signedAmt = {
+      $cond: [
+        { $eq: ["$ledgerEntries.type", "Dr"] },
+        { $ifNull: ["$ledgerEntries.amount", 0] },
+        { $multiply: [{ $ifNull: ["$ledgerEntries.amount", 0] }, -1] },
+      ],
+    };
+    const voucherAgg = await Acc_Voucher.aggregate([
+      {
+        $match: {
+          companyId: cId,
+          status: "posted",
+          voucherDate: { $lte: cutoff },
+        },
+      },
+      { $unwind: "$ledgerEntries" },
+      {
+        $lookup: {
+          from: "acc_ledgers",
+          localField: "ledgerEntries.ledgerId",
+          foreignField: "_id",
+          as: "_led",
+        },
+      },
+      { $unwind: { path: "$_led", preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: "$_id",
+          voucherNumber: { $first: "$voucherNumber" },
+          voucherType: { $first: "$voucherType" },
+          voucherDate: { $first: "$voucherDate" },
+          // Net over ACTIVE legs (what the TB actually counts).
+          activeNet: {
+            $sum: { $cond: [{ $eq: ["$_led.isActive", true] }, signedAmt, 0] },
+          },
+          // Net over ALL legs (tells internally-unbalanced from dead-leg).
+          fullNet: { $sum: signedAmt },
+          deadLegs: {
+            $sum: { $cond: [{ $ne: ["$_led.isActive", true] }, 1, 0] },
+          },
+        },
+      },
+      { $match: { $expr: { $gt: [{ $abs: "$activeNet" }, 0.005] } } },
+      { $sort: { voucherDate: 1 } },
+      { $limit: 200 },
+    ]);
+
+    const unbalancedVouchers = voucherAgg.map((v) => {
+      const internalDiff = parseFloat((v.fullNet || 0).toFixed(2));
+      const internallyBalanced = Math.abs(internalDiff) < 0.005;
+      return {
+        voucherId: v._id,
+        voucherNumber: v.voucherNumber,
+        voucherType: v.voucherType,
+        voucherDate: v.voucherDate,
+        offBy: parseFloat(v.activeNet.toFixed(2)),
+        internalDiff,
+        reason: internallyBalanced
+          ? `Debits and credits inside this voucher DO match, but ${v.deadLegs} leg(s) post to a deleted/inactive ledger that the Trial Balance ignores — leaving ${Math.abs(
+              v.activeNet,
+            ).toFixed(
+              2,
+            )} stranded. Restore that ledger (set it active) or repost the voucher to an active ledger.`
+          : `Debits do not equal credits inside this voucher — off by ${internalDiff.toFixed(
+              2,
+            )}. Open it and correct the line amounts.`,
+      };
+    });
+
+    const voucherImbalanceTotal = parseFloat(
+      unbalancedVouchers.reduce((s, v) => s + v.offBy, 0).toFixed(2),
+    );
+    const accountedFor = parseFloat(
+      (openingImbalance + voucherImbalanceTotal).toFixed(2),
+    );
+
+    // ── Human-readable diagnosis ─────────────────────────────────────────
+    const lines = [];
+    if (unbalancedVouchers.length > 0)
+      lines.push(
+        `${unbalancedVouchers.length} voucher(s) contribute ${voucherImbalanceTotal.toFixed(
+          2,
+        )} to the imbalance — listed below; fix those first.`,
+      );
+    if (Math.abs(openingImbalance) >= 0.005)
+      lines.push(
+        `Active-ledger opening balances net to ${openingImbalance.toFixed(
+          2,
+        )} instead of 0 — this is baked into every Trial Balance. Usually rounding from the Tally opening-balance import; compare each ledger's opening to the Tally Trial Balance, or post a small rounding adjustment.`,
+      );
+    if (inactiveWithOpening.length > 0)
+      lines.push(
+        `${inactiveWithOpening.length} inactive ledger(s) still carry an opening balance — if one was deleted by mistake, restoring it may close the gap.`,
+      );
+    if (lines.length === 0)
+      lines.push(
+        "No internally-unbalanced vouchers and opening balances net to zero. Any residual difference is sub-paise float rounding across many ledgers — safe to absorb with a rounding ledger.",
+      );
+
+    res.json({
+      success: true,
+      cutoff,
+      diagnosis: lines.join(" "),
+      openingImbalance,
+      voucherImbalanceTotal,
+      // openingImbalance + voucherImbalanceTotal — should match the TB's diff.
+      accountedFor,
+      unbalancedVoucherCount: unbalancedVouchers.length,
+      unbalancedVouchers,
+      inactiveLedgersWithOpening: inactiveWithOpening.map((l) => ({
+        name: l.name,
+        openingBalance: parseFloat((l.openingBalance || 0).toFixed(2)),
+      })),
+    });
+  } catch (err) {
+    console.error("TB diagnose:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;
