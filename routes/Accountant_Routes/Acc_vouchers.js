@@ -1593,8 +1593,9 @@ router.post("/", auth, async (req, res) => {
       role === "accountant";
     const canPostDirectly = !!perms.canPostDirectly || fullAccessRole;
     // Editors (no direct-post privilege) can't post straight away — their
-    // SALES or PURCHASE vouchers go to an admin for approval instead.
-    const approvalTypes = ["sales", "purchase"];
+    // sales / purchase / credit-note / debit-note vouchers go to an admin for
+    // approval instead.
+    const approvalTypes = ["sales", "purchase", "credit_note", "debit_note"];
     const needsApproval =
       !canPostDirectly && approvalTypes.includes(body.voucherType);
     // Voucher types that require approval when posted by a non-direct-poster.
@@ -1736,9 +1737,84 @@ router.put("/:id", auth, async (req, res) => {
         });
       }
     }
-
     if (body.voucherDate) body.financialYear = computeFY(body.voucherDate);
     body.updatedBy = req.user?.id;
+
+    // ── Approval workflow for EDITS ──────────────────────────────────────────
+    // Editors (no direct-post privilege) cannot change a POSTED voucher in
+    // place — that would move the ledger without review. Their edit is held as
+    // an approval request carrying the proposed body; the posted voucher is
+    // left untouched until an admin approves, at which point the SAME
+    // reverse → apply → re-apply runs server-side (see Acc_approvals.js, the
+    // "update" executor). Editing a draft or a still-pending voucher (no ledger
+    // impact yet) stays direct.
+    {
+      const editorPerms = req.user?.permissions || {};
+      const editorRole = req.user?.role;
+      const canEditDirectly =
+        editorPerms.canPostDirectly ||
+        ["owner", "approver", "admin", "accountant"].includes(editorRole);
+
+      if (!canEditDirectly && wasPosted) {
+        if (!req.user?.organizationId) {
+          return res
+            .status(403)
+            .json({ error: "Your role can't edit posted vouchers." });
+        }
+        const {
+          Acc_ApprovalRequest,
+        } = require("../../models/Accountant_model/Acc_OrgModels");
+
+        const dup = await Acc_ApprovalRequest.findOne({
+          organizationId: req.user.organizationId,
+          kind: "voucher",
+          action: "update",
+          "target.id": existing._id,
+          status: "pending",
+        });
+        if (dup) {
+          return res.status(200).json({
+            ...existing.toObject(),
+            _pendingApproval: true,
+            message: "An edit request is already pending for this voucher.",
+          });
+        }
+
+        await Acc_ApprovalRequest.create({
+          organizationId: req.user.organizationId,
+          companyId: existing.companyId,
+          kind: "voucher",
+          action: "update",
+          title: `Edit ${existing.voucherType} ${existing.voucherNumber} · ${
+            existing.partyLedgerName || "—"
+          } · ₹${Number(existing.grandTotal || 0).toLocaleString("en-IN")}`,
+          target: { collection: "Acc_Voucher", id: existing._id },
+          payload: body,
+          diff: {
+            before: {
+              voucherNumber: existing.voucherNumber,
+              partyLedgerName: existing.partyLedgerName || "",
+              grandTotal: Number(existing.grandTotal || 0),
+            },
+            after: {
+              voucherNumber: body.voucherNumber ?? existing.voucherNumber,
+              partyLedgerName:
+                body.partyLedgerName ?? existing.partyLedgerName ?? "",
+              grandTotal: Number(body.grandTotal ?? existing.grandTotal ?? 0),
+            },
+          },
+          requestedBy: req.user.id,
+          requestedByName: req.user.name || "",
+          status: "pending",
+        });
+
+        return res.status(202).json({
+          ...existing.toObject(),
+          _pendingApproval: true,
+          message: "Edit request sent to an admin for approval.",
+        });
+      }
+    }
 
     // For a posted voucher, reverse the OLD balances before mutating entries.
     if (wasPosted) {
