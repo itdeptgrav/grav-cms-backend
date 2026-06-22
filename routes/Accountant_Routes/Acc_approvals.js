@@ -239,7 +239,56 @@ async function applyApprovedAction(reqDoc, approver) {
     }
   }
 
-  // Add more kinds here as you migrate modules to the approval flow.  //
+  // VOUCHER ── apply a held edit to an existing voucher
+  if (kind === "voucher" && action === "update") {
+    if (!target?.id) throw new Error("voucher update: target.id missing");
+    if (!payload) throw new Error("voucher update: payload missing");
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const voucher = await Acc_Voucher.findById(target.id).session(session);
+      if (!voucher) throw new Error("Voucher not found");
+      if (["cancelled", "void"].includes(voucher.status)) {
+        throw new Error(`Cannot edit a ${voucher.status} voucher`);
+      }
+      const wasPosted = voucher.status === "posted";
+
+      // Reverse the old balances first (mirror of the direct edit path).
+      if (wasPosted) {
+        await applyLedgerBalances(voucher, -1, session);
+      }
+
+      // Apply the proposed changes. These were canonicalised when the edit was
+      // submitted; re-strip the protected fields defensively.
+      const body = { ...payload };
+      delete body._id;
+      delete body.companyId;
+      delete body.voucherType;
+      delete body.status;
+      delete body.autoPost;
+      delete body.createdBy;
+      delete body.createdAt;
+      body.updatedBy = approver.id;
+
+      Object.assign(voucher, body);
+      await voucher.save({ session });
+
+      // Re-apply balances if it remains posted.
+      if (wasPosted) {
+        await applyLedgerBalances(voucher, +1, session);
+      }
+
+      await session.commitTransaction();
+      return { entityId: voucher._id };
+    } catch (e) {
+      await session.abortTransaction();
+      throw e;
+    } finally {
+      session.endSession();
+    }
+  }
+
+  // Add more kinds here as you migrate modules to the approval flow.
   // NOTE: cashflow-adjustments and ledger-reclass have their own
   // approve/reject endpoints under /cashflow-adjustments/:id/approve
   // and /ledger-reclass/:id/approve respectively. They are NOT queued
