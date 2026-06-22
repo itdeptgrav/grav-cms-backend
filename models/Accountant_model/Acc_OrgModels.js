@@ -107,6 +107,10 @@ const accountantUserSchema = new mongoose.Schema(
 
     lastLoginAt: { type: Date },
 
+    // Web-push device tokens (FCM). Populated by the accountant app when a
+    // user grants notification permission. Empty until the frontend registers
+    // one — email notifications work without it.
+    fcmTokens: { type: [String], default: [] },
     // Audit
     invitedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
   },
@@ -282,6 +286,39 @@ const approvalRequestSchema = new mongoose.Schema(
 approvalRequestSchema.index({ organizationId: 1, status: 1, createdAt: -1 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Notification hooks — web-push + email on approval-workflow events.
+//   created (status "pending")  → notify owner + approvers
+//   status → "approved"         → notify the requester
+//   status → "rejected"         → notify the requester
+// Centralised here so every submit/cancel/void/approve/reject site is covered
+// without editing route files. Fire-and-forget: never blocks or throws back
+// into the request.
+// ─────────────────────────────────────────────────────────────────────────────
+approvalRequestSchema.pre("save", function (next) {
+  this.$locals = this.$locals || {};
+  this.$locals._wasNew = this.isNew;
+  this.$locals._statusChanged = !this.isNew && this.isModified("status");
+  next();
+});
+approvalRequestSchema.post("save", function (doc) {
+  try {
+    const loc = doc.$locals || {};
+    let event = null;
+    if (loc._wasNew && doc.status === "pending") event = "created";
+    else if (loc._statusChanged && doc.status === "approved")
+      event = "approved";
+    else if (loc._statusChanged && doc.status === "rejected")
+      event = "rejected";
+    if (!event) return;
+    const svc = require("../../services/accountantApprovalNotifications.service");
+    Promise.resolve(svc.notifyApprovalEvent(doc, event)).catch((e) =>
+      console.error("[acc-approval-notif] async error:", e.message),
+    );
+  } catch (e) {
+    console.error("[acc-approval-notif] hook error:", e.message);
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
 // EXPORTS
 // ─────────────────────────────────────────────────────────────────────────────
 const Acc_Organization =
@@ -289,8 +326,7 @@ const Acc_Organization =
   mongoose.model("Acc_Organization", accountantOrganizationSchema);
 
 const Acc_User =
-  mongoose.models.Acc_User ||
-  mongoose.model("Acc_User", accountantUserSchema);
+  mongoose.models.Acc_User || mongoose.model("Acc_User", accountantUserSchema);
 
 const Acc_Invite =
   mongoose.models.Acc_Invite ||

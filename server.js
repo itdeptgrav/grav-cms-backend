@@ -574,7 +574,7 @@ const createDefaultAccountant = async () => {
 
     const defaultAccountant = new AccountantDepartment({
       name: "Accountant Admin",
-      email: "accountant@grav.in",
+      email: "accounts@grav.in",
       password: "Account@12345", // will be hashed automatically
       employeeId: "ACC001",
       phone: "9999999999",

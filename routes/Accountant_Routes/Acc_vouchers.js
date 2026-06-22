@@ -1597,8 +1597,19 @@ router.post("/", auth, async (req, res) => {
     const approvalTypes = ["sales", "purchase"];
     const needsApproval =
       !canPostDirectly && approvalTypes.includes(body.voucherType);
+    // Voucher types that require approval when posted by a non-direct-poster.
+    // Recomputed from a set so adding a type is a one-line change. Covers the
+    // original sales/purchase gate plus receipt + payment.
+    const APPROVAL_REQUIRED_TYPES = new Set([
+      "sales",
+      "purchase",
+      "receipt",
+      "payment",
+    ]);
+    const needsApprovalFinal =
+      APPROVAL_REQUIRED_TYPES.has(body.voucherType) && !canPostDirectly;
 
-    if (needsApproval) {
+    if (needsApprovalFinal) {
       voucher.status = "pending_approval";
       voucher.submittedBy = req.user?.id;
       voucher.submittedByName = req.user?.name || "";
