@@ -57,9 +57,24 @@ const txnSchema = new mongoose.Schema(
     balanceSuffix: { type: String, default: "CR" },
     branch: { type: String, trim: true },
     matched: { type: Boolean, default: false },
+    // Legacy single-match fields — kept for back-compat with old sessions and
+    // any old reader. New matches go into `allocations` below.
     matchedVoucherId: mongoose.Types.ObjectId,
     matchedVoucherNumber: String,
     matchedVoucherType: String,
+    // Amount-tracked, split matching. A bank line can be allocated across
+    // several vouchers; a voucher can be covered by several bank lines. The
+    // sum of a line's allocations can never exceed the line amount, and the
+    // sum of a voucher's allocations (across all lines) can never exceed the
+    // voucher amount — both enforced in the /match endpoint below.
+    allocations: [
+      {
+        voucherId: mongoose.Types.ObjectId,
+        voucherNumber: String,
+        voucherType: String,
+        amount: { type: Number, default: 0 },
+      },
+    ],
     reconciled: { type: Boolean, default: false },
     note: { type: String, trim: true },
   },
@@ -101,6 +116,17 @@ const sessionSchema = new mongoose.Schema(
       default: "pending",
     },
     transactions: [txnSchema],
+    // Ledger vouchers the user has marked reconciled WITHOUT a bank line —
+    // timing items or charges the bank bundled into another line. Each records
+    // how much of the voucher was cleared this way so buildLedgerSide counts it
+    // as matched and the voucher leaves the unmatched list.
+    manualClears: [
+      {
+        voucherId: mongoose.Types.ObjectId,
+        amount: { type: Number, default: 0 },
+        note: { type: String, trim: true },
+      },
+    ],
   },
   { timestamps: true, collection: "acc_bank_recon_sessions" },
 );
@@ -443,6 +469,54 @@ async function autoMatch(companyId, bankLedgerId, transactions) {
   });
 }
 
+// ─── Amount-tracked matching helpers ──────────────────────────────────────────
+// A bank line's amount is its credit (money in) or debit (money out).
+function bankAmt(t) {
+  return (t.credit || 0) > 0 ? t.credit || 0 : t.debit || 0;
+}
+// Effective allocations: the new `allocations` array if present, otherwise a
+// single full-amount allocation synthesised from the legacy matchedVoucherId so
+// sessions matched before this change keep reading correctly.
+function effectiveAllocations(t) {
+  if (Array.isArray(t.allocations) && t.allocations.length)
+    return t.allocations;
+  if (t.matchedVoucherId)
+    return [
+      {
+        voucherId: t.matchedVoucherId,
+        voucherNumber: t.matchedVoucherNumber,
+        voucherType: t.matchedVoucherType,
+        amount: bankAmt(t),
+      },
+    ];
+  return [];
+}
+function sumTxnAllocated(t) {
+  return effectiveAllocations(t).reduce((s, a) => s + (a.amount || 0), 0);
+}
+function sumVoucherAllocated(txns, voucherId) {
+  const vid = String(voucherId);
+  let sum = 0;
+  for (const t of txns || [])
+    for (const a of effectiveAllocations(t))
+      if (String(a.voucherId) === vid) sum += a.amount || 0;
+  return sum;
+}
+// Move a legacy single-match into the allocations array so more can be added.
+function migrateLegacyMatch(txn) {
+  if ((!txn.allocations || !txn.allocations.length) && txn.matchedVoucherId) {
+    txn.allocations = [
+      {
+        voucherId: txn.matchedVoucherId,
+        voucherNumber: txn.matchedVoucherNumber,
+        voucherType: txn.matchedVoucherType,
+        amount: bankAmt(txn),
+      },
+    ];
+  }
+  if (!txn.allocations) txn.allocations = [];
+}
+
 // ─── Ledger side builder ──────────────────────────────────────────────────────
 async function buildLedgerSide(session) {
   if (!session.bankLedgerId || !session.periodFrom || !session.periodTo)
@@ -460,15 +534,30 @@ async function buildLedgerSide(session) {
     .sort({ voucherDate: 1 })
     .lean();
 
-  const matchedVoucherIds = new Set(
-    session.transactions
-      .filter((t) => t.matched && t.matchedVoucherId)
-      .map((t) => String(t.matchedVoucherId)),
-  );
+  // How much of each voucher has been matched, summed across every bank line's
+  // allocations (a legacy single-match counts as one full allocation), plus any
+  // amount the user manually marked reconciled without a bank line.
+  const matchedByVoucher = new Map();
+  for (const t of session.transactions || []) {
+    for (const a of effectiveAllocations(t)) {
+      const k = String(a.voucherId);
+      matchedByVoucher.set(k, (matchedByVoucher.get(k) || 0) + (a.amount || 0));
+    }
+  }
+  for (const c of session.manualClears || []) {
+    const k = String(c.voucherId);
+    matchedByVoucher.set(k, (matchedByVoucher.get(k) || 0) + (c.amount || 0));
+  }
   const entries = [];
   for (const v of vouchers) {
     for (const e of v.ledgerEntries || []) {
       if (String(e.ledgerId) !== String(ledId)) continue;
+      const amount = e.amount || 0;
+      const matchedAmount = Math.min(
+        amount,
+        matchedByVoucher.get(String(v._id)) || 0,
+      );
+      const remaining = Math.max(0, amount - matchedAmount);
       entries.push({
         voucherId: v._id,
         voucherNumber: v.voucherNumber,
@@ -476,8 +565,10 @@ async function buildLedgerSide(session) {
         date: v.voucherDate,
         description: v.partyLedgerName || v.narration || v.voucherNumber,
         type: e.type,
-        amount: e.amount || 0,
-        matched: matchedVoucherIds.has(String(v._id)),
+        amount,
+        matchedAmount,
+        remaining,
+        matched: remaining <= 0.01,
       });
     }
   }
@@ -811,7 +902,7 @@ router.get("/sessions/:id/match-candidates", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 router.put("/sessions/:id/match", async (req, res) => {
   try {
-    const { txnId, voucherId } = req.body;
+    const { txnId, voucherId, amount } = req.body;
     const session = await Acc_BankReconSession.findById(req.params.id);
     if (!session)
       return res
@@ -823,16 +914,71 @@ router.put("/sessions/:id/match", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Transaction not found" });
     const voucher = await Acc_Voucher.findById(voucherId)
-      .select("voucherNumber voucherType")
+      .select("voucherNumber voucherType ledgerEntries")
       .lean();
     if (!voucher)
       return res
         .status(404)
         .json({ success: false, message: "Voucher not found" });
-    txn.matched = true;
-    txn.matchedVoucherId = voucher._id;
-    txn.matchedVoucherNumber = voucher.voucherNumber;
-    txn.matchedVoucherType = voucher.voucherType;
+
+    // The voucher's amount ON THIS BANK LEDGER (sum its bank-ledger lines).
+    const bankLedgerId = String(session.bankLedgerId || "");
+    let voucherAmount = 0;
+    for (const e of voucher.ledgerEntries || [])
+      if (String(e.ledgerId) === bankLedgerId) voucherAmount += e.amount || 0;
+    if (voucherAmount <= 0) voucherAmount = bankAmt(txn); // fallback: treat 1:1
+
+    // Room left on each side.
+    const voucherRemaining =
+      voucherAmount - sumVoucherAllocated(session.transactions, voucherId);
+    const txnTotal = bankAmt(txn);
+    const txnRemaining = txnTotal - sumTxnAllocated(txn);
+
+    if (voucherRemaining <= 0.01)
+      return res.status(400).json({
+        success: false,
+        message: `Voucher ${voucher.voucherNumber} is already fully matched (₹${voucherAmount.toFixed(2)}). Nothing left to allocate.`,
+      });
+    if (txnRemaining <= 0.01)
+      return res.status(400).json({
+        success: false,
+        message: `This bank line is already fully matched (₹${txnTotal.toFixed(2)}).`,
+      });
+
+    // Allocate the caller's amount if given, else the most that fits both sides.
+    let alloc =
+      amount != null && amount !== ""
+        ? Number(amount)
+        : Math.min(voucherRemaining, txnRemaining);
+    alloc = Math.round(alloc * 100) / 100;
+    if (!(alloc > 0))
+      return res
+        .status(400)
+        .json({ success: false, message: "Nothing left to match." });
+    if (alloc > voucherRemaining + 0.01)
+      return res.status(400).json({
+        success: false,
+        message: `That exceeds the voucher. Only ₹${voucherRemaining.toFixed(2)} of ${voucher.voucherNumber} is still unmatched.`,
+      });
+    if (alloc > txnRemaining + 0.01)
+      return res.status(400).json({
+        success: false,
+        message: `That exceeds this bank line. Only ₹${txnRemaining.toFixed(2)} of it is still unallocated.`,
+      });
+
+    migrateLegacyMatch(txn);
+    txn.allocations.push({
+      voucherId: voucher._id,
+      voucherNumber: voucher.voucherNumber,
+      voucherType: voucher.voucherType,
+      amount: alloc,
+    });
+    txn.matched = sumTxnAllocated(txn) >= txnTotal - 0.01;
+    // Keep legacy fields pointing at the first allocation for any old reader.
+    txn.matchedVoucherId = txn.allocations[0].voucherId;
+    txn.matchedVoucherNumber = txn.allocations[0].voucherNumber;
+    txn.matchedVoucherType = txn.allocations[0].voucherType;
+
     session.matchedCount = session.transactions.filter((t) => t.matched).length;
     session.unmatchedCount = session.transactions.length - session.matchedCount;
     await session.save();
@@ -847,7 +993,7 @@ router.put("/sessions/:id/match", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 router.put("/sessions/:id/unmatch", async (req, res) => {
   try {
-    const { txnId } = req.body;
+    const { txnId, voucherId } = req.body;
     const session = await Acc_BankReconSession.findById(req.params.id);
     if (!session)
       return res
@@ -858,13 +1004,91 @@ router.put("/sessions/:id/unmatch", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Transaction not found" });
-    txn.matched = false;
-    txn.matchedVoucherId =
-      txn.matchedVoucherNumber =
-      txn.matchedVoucherType =
-        undefined;
+
+    migrateLegacyMatch(txn);
+    if (voucherId) {
+      // Remove just this voucher's slice from the bank line.
+      txn.allocations = (txn.allocations || []).filter(
+        (a) => String(a.voucherId) !== String(voucherId),
+      );
+    } else {
+      // Clear the whole line.
+      txn.allocations = [];
+    }
+
+    if (!txn.allocations.length) {
+      txn.matched = false;
+      txn.matchedVoucherId =
+        txn.matchedVoucherNumber =
+        txn.matchedVoucherType =
+          undefined;
+    } else {
+      txn.matched = sumTxnAllocated(txn) >= bankAmt(txn) - 0.01;
+      txn.matchedVoucherId = txn.allocations[0].voucherId;
+      txn.matchedVoucherNumber = txn.allocations[0].voucherNumber;
+      txn.matchedVoucherType = txn.allocations[0].voucherType;
+    }
     session.matchedCount = session.transactions.filter((t) => t.matched).length;
     session.unmatchedCount = session.transactions.length - session.matchedCount;
+    await session.save();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+// ═════════════════════════════════════════════════════════════════════════════
+// PUT /sessions/:id/clear-ledger
+// Mark a ledger voucher reconciled WITHOUT a bank line (a timing or bundled
+// item), or undo that. Body: { voucherId, cleared: true|false, note? }
+// ═════════════════════════════════════════════════════════════════════════════
+router.put("/sessions/:id/clear-ledger", async (req, res) => {
+  try {
+    const { voucherId, cleared, note } = req.body;
+    if (!voucherId)
+      return res
+        .status(400)
+        .json({ success: false, message: "voucherId required" });
+    const session = await Acc_BankReconSession.findById(req.params.id);
+    if (!session)
+      return res
+        .status(404)
+        .json({ success: false, message: "Session not found" });
+    if (!Array.isArray(session.manualClears)) session.manualClears = [];
+
+    if (cleared === false) {
+      // Undo: drop any manual clear for this voucher.
+      session.manualClears = session.manualClears.filter(
+        (c) => String(c.voucherId) !== String(voucherId),
+      );
+      await session.save();
+      return res.json({ success: true });
+    }
+
+    // Clear whatever is still unmatched on this voucher.
+    const ledger = await buildLedgerSide(session);
+    const rows = (ledger.entries || []).filter(
+      (e) => String(e.voucherId) === String(voucherId),
+    );
+    if (!rows.length)
+      return res.status(404).json({
+        success: false,
+        message: "Voucher not found in this period's ledger.",
+      });
+    const remaining = rows.reduce((s, e) => s + (e.remaining || 0), 0);
+    if (remaining <= 0.01)
+      return res.status(400).json({
+        success: false,
+        message: "This voucher is already fully matched.",
+      });
+
+    session.manualClears = session.manualClears.filter(
+      (c) => String(c.voucherId) !== String(voucherId),
+    );
+    session.manualClears.push({
+      voucherId,
+      amount: Math.round(remaining * 100) / 100,
+      note: note || "Reconciled without a bank line",
+    });
     await session.save();
     res.json({ success: true });
   } catch (e) {
