@@ -349,6 +349,42 @@ router.post(
 );
 
 // ─────────────────────────────────────────────────────────────────────────
+// DELETE /:userId — permanently remove a sub-account from the database
+// ─────────────────────────────────────────────────────────────────────────
+// Hard delete (not deactivate). The owner cannot be deleted, and you cannot
+// delete your own account. Past vouchers/approvals keep the stored name
+// snapshot, so the books are unaffected.
+router.delete("/:userId", requireRole("owner"), async (req, res) => {
+  try {
+    const user = await Acc_User.findOne({
+      _id: req.params.userId,
+      organizationId: req.user.organizationId,
+    });
+    if (!user)
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    if (user.role === "owner")
+      return res
+        .status(400)
+        .json({ success: false, message: "Cannot delete the owner" });
+    if (String(user._id) === String(req.user.id))
+      return res.status(400).json({
+        success: false,
+        message: "You cannot delete your own account",
+      });
+    await Acc_User.deleteOne({
+      _id: user._id,
+      organizationId: req.user.organizationId,
+    });
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[team] delete user:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // GET /:userId/nav-prefs — read a user's sidebar visibility (owner only)
 // ─────────────────────────────────────────────────────────────────────────
 // Returns the hiddenNavItems list for the target user. Used by the Team

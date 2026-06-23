@@ -375,6 +375,202 @@ router.get("/tree", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GROUPS — CRUD
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// CHART-OF-ACCOUNTS APPROVAL GATE
+// Editors (no direct-post privilege) cannot create / edit / delete ledgers or
+// groups outright — each such change is filed as an Acc_ApprovalRequest and the
+// owner/approvers are notified (same queue the vouchers use). Owners, approvers,
+// admins and accountants fall straight through to the handlers below. Only the
+// six write ops on /ledgers and /groups are intercepted; bulk seeders, reorders,
+// statements, party-sync, etc. pass untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+async function coaApprovalGate(req, res, next) {
+  const m = req.method;
+  if (m !== "POST" && m !== "PUT" && m !== "DELETE") return next();
+
+  const p = req.path; // $-anchored regexes below are robust to the mount prefix
+  let kind, action;
+  if (m === "POST" && /\/ledgers$/.test(p)) {
+    kind = "ledger";
+    action = "create";
+  } else if (m === "PUT" && /\/ledgers\/[^/]+$/.test(p)) {
+    kind = "ledger";
+    action = "update";
+  } else if (m === "DELETE" && /\/ledgers\/[^/]+$/.test(p)) {
+    kind = "ledger";
+    action = "delete";
+  } else if (m === "POST" && /\/groups$/.test(p)) {
+    kind = "group";
+    action = "create";
+  } else if (m === "PUT" && /\/groups\/[^/]+$/.test(p)) {
+    kind = "group";
+    action = "update";
+  } else if (m === "DELETE" && /\/groups\/[^/]+$/.test(p)) {
+    kind = "group";
+    action = "delete";
+  } else return next();
+
+  const perms = req.user?.permissions || {};
+  const role = req.user?.role;
+  const canActDirectly =
+    perms.canPostDirectly ||
+    ["owner", "approver", "admin", "accountant"].includes(role);
+  if (canActDirectly) return next();
+
+  if (!req.user?.organizationId) {
+    return res.status(403).json({
+      success: false,
+      message: "Your role can't modify the chart of accounts.",
+    });
+  }
+
+  try {
+    const {
+      Acc_ApprovalRequest,
+    } = require("../../models/Accountant_model/Acc_OrgModels");
+    const {
+      Acc_Ledger,
+      Acc_Group,
+    } = require("../../models/Accountant_model/Acc_MasterModels");
+
+    const targetId =
+      action === "create" ? null : String(req.path.split("/").pop());
+    const collection = kind === "ledger" ? "Acc_Ledger" : "Acc_Group";
+
+    let companyId, title, payload;
+
+    if (action === "create") {
+      payload = req.body || {};
+      companyId = payload.companyId;
+      const label = payload.name || kind;
+      title = `Create ${kind} "${label}"`;
+    } else {
+      const Model = kind === "ledger" ? Acc_Ledger : Acc_Group;
+      const ent = await Model.findById(targetId).select(
+        "companyId name isReserved",
+      );
+      if (!ent)
+        return res
+          .status(404)
+          .json({ success: false, message: `${kind} not found` });
+      companyId = ent.companyId;
+      title = `${action === "delete" ? "Delete" : "Edit"} ${kind} "${ent.name}"`;
+      payload = action === "update" ? req.body || {} : { id: targetId };
+
+      // Mirror the handlers' hard guards so an editor can't queue an
+      // impossible action.
+      if (kind === "group" && ent.isReserved) {
+        if (action === "delete") {
+          return res.status(400).json({
+            success: false,
+            message: "Cannot delete a reserved group",
+          });
+        }
+        if (
+          action === "update" &&
+          req.body?.name &&
+          req.body.name !== ent.name
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "Cannot rename a reserved Tally group",
+          });
+        }
+      }
+
+      if (action === "delete") {
+        if (kind === "ledger") {
+          const {
+            Acc_Voucher,
+          } = require("../../models/Accountant_model/Acc_VoucherModels");
+          const txnCount = await Acc_Voucher.countDocuments({
+            "ledgerEntries.ledgerId": targetId,
+            status: "posted",
+          });
+          const partyCount = await Acc_Voucher.countDocuments({
+            partyLedgerId: targetId,
+          });
+          if (txnCount + partyCount > 0) {
+            return res.status(409).json({
+              success: false,
+              message: `This ledger is used in ${txnCount + partyCount} place(s). Ask an owner to reassign and delete it.`,
+            });
+          }
+        } else {
+          const childCount = await Acc_Group.countDocuments({
+            parent: targetId,
+            isActive: true,
+          });
+          const ledgerCount = await Acc_Ledger.countDocuments({
+            groupId: targetId,
+            isActive: true,
+          });
+          if (childCount + ledgerCount > 0) {
+            return res.status(400).json({
+              success: false,
+              message: `Group has ${childCount} sub-group(s) and ${ledgerCount} ledger(s). Move or delete them first.`,
+            });
+          }
+        }
+      }
+    }
+
+    if (targetId) {
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind,
+        action,
+        "target.id": targetId,
+        status: "pending",
+      });
+      if (dup) {
+        return res.status(200).json({
+          success: true,
+          _pendingApproval: true,
+          message: `A ${action} request is already pending for this ${kind}.`,
+        });
+      }
+    }
+
+    const _coaReq = await Acc_ApprovalRequest.create({
+      organizationId: req.user.organizationId,
+      companyId,
+      kind,
+      action,
+      title,
+      target: targetId ? { collection, id: targetId } : undefined,
+      payload,
+      requestedBy: req.user.id,
+      requestedByName: req.user.name || "",
+      status: "pending",
+    });
+
+    // Notify the owner/approvers directly (email + push). The model has a
+    // post-save hook that is meant to do this on every approval-request
+    // create, but if it isn't firing on this write path the CoA queue would
+    // stay silent — so we call the same notifier explicitly. Fire-and-forget;
+    // it can never block or throw back into the request.
+    try {
+      const _notif = require("../../services/accountantApprovalNotifications.service");
+      Promise.resolve(_notif.notifyApprovalEvent(_coaReq, "created")).catch(
+        (e) => console.error("[coa-gate] notify error:", e.message),
+      );
+    } catch (e) {
+      console.error("[coa-gate] notify require error:", e.message);
+    }
+
+    return res.status(202).json({
+      success: true,
+      _pendingApproval: true,
+      message: `${action[0].toUpperCase()}${action.slice(1)} request sent to an admin for approval.`,
+    });
+  } catch (e) {
+    return res.status(400).json({ success: false, message: e.message });
+  }
+}
+
+router.use(coaApprovalGate);
+
 router.get("/groups", async (req, res) => {
   try {
     const { companyId, nature, parent } = req.query;
@@ -2283,6 +2479,45 @@ router.get("/groups/:id/statement", async (req, res) => {
 
 // ── Helper: load HR Payroll models (lazy require so this file loads even if
 // the HR module is missing in some environments) ─────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYROLL ROLE GATE
+//   viewer            → cannot post / unpost / reset payroll (read-only)
+//   editor            → single-run /post passes through to its handler, which
+//                       files an approval request; bulk post, unpost, and
+//                       cleanup require an owner/approver
+//   owner / approver  → act directly
+// GETs (list, preview) are never blocked.
+// ─────────────────────────────────────────────────────────────────────────────
+function payrollRoleGate(req, res, next) {
+  if (req.method !== "POST") return next();
+  if (!/\/payroll\//.test(req.path)) return next();
+
+  const perms = req.user?.permissions || {};
+  const role = req.user?.role;
+  const canActDirectly =
+    perms.canPostDirectly ||
+    ["owner", "approver", "admin", "accountant"].includes(role);
+  if (canActDirectly) return next();
+
+  if (role === "viewer") {
+    return res
+      .status(403)
+      .json({ success: false, message: "Viewers can't post payroll." });
+  }
+
+  // Editor (or any other non-direct role): only the single-run post may pass
+  // (its handler files an approval request). Bulk post / unpost / cleanup are
+  // owner/approver-only.
+  if (/\/payroll\/runs\/[^/]+\/post$/.test(req.path)) return next();
+
+  return res.status(403).json({
+    success: false,
+    message:
+      "This payroll action needs an owner or approver. Post runs individually to send them for approval.",
+  });
+}
+router.use(payrollRoleGate);
+
 function loadPayrollModels() {
   try {
     return require("../../models/HR_Models/Payroll");
@@ -3163,6 +3398,58 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
         .status(400)
         .json({ success: false, message: "companyId required" });
 
+    // Editor (no direct-post privilege) → route this post to approval instead
+    // of creating the vouchers now. Viewers are blocked by payrollRoleGate
+    // above. On approval, the executor replays postPayrollRunById server-side.
+    {
+      const perms = req.user?.permissions || {};
+      const role = req.user?.role;
+      const canActDirectly =
+        perms.canPostDirectly ||
+        ["owner", "approver", "admin", "accountant"].includes(role);
+      if (!canActDirectly) {
+        if (!req.user?.organizationId)
+          return res
+            .status(403)
+            .json({ success: false, message: "Your role can't post payroll." });
+        const {
+          Acc_ApprovalRequest,
+        } = require("../../models/Accountant_model/Acc_OrgModels");
+        const dup = await Acc_ApprovalRequest.findOne({
+          organizationId: req.user.organizationId,
+          kind: "payroll_post",
+          action: "post",
+          "target.id": req.params.runId,
+          status: "pending",
+        });
+        if (dup) {
+          return res.status(200).json({
+            success: true,
+            _pendingApproval: true,
+            message:
+              "A posting request is already pending for this payroll run.",
+          });
+        }
+        await Acc_ApprovalRequest.create({
+          organizationId: req.user.organizationId,
+          companyId,
+          kind: "payroll_post",
+          action: "post",
+          title: `Post payroll run ${req.params.runId}`,
+          target: { collection: "Payroll", id: req.params.runId },
+          payload: { companyId, bankLedgerId: bankLedgerId || null },
+          requestedBy: req.user.id,
+          requestedByName: req.user.name || "",
+          status: "pending",
+        });
+        return res.status(202).json({
+          success: true,
+          _pendingApproval: true,
+          message: "Payroll posting sent to an admin for approval.",
+        });
+      }
+    }
+
     const HR = loadPayrollModels();
     if (!HR)
       return res
@@ -3186,7 +3473,7 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
     let result;
     try {
       const { overrideVouchers } = req.body;
-      const result = await postPayrollRun(companyId, run, items, {
+      result = await postPayrollRun(companyId, run, items, {
         bankLedgerId,
         overrideVouchers:
           Array.isArray(overrideVouchers) && overrideVouchers.length
@@ -4750,4 +5037,19 @@ router.get("/trial-balance/diagnose", async (req, res) => {
   }
 });
 
+// Exported so the approval executor (Acc_approvals.js) can replay an editor's
+// payroll post once an owner/approver approves it. Fetches the run + items and
+// runs the same posting the /post handler does. Idempotent (re-posting returns
+// the existing vouchers).
+async function postPayrollRunById(companyId, runId, options = {}) {
+  const HR = loadPayrollModels();
+  if (!HR) throw new Error("HR/Payroll module not available.");
+  const run = await HR.Payroll.findById(runId).lean();
+  if (!run) throw new Error("Payroll run not found");
+  const items = await HR.PayrollItem.find({ payrollId: runId }).lean();
+  if (!items.length) throw new Error("Payroll run has no items to post.");
+  return postPayrollRun(companyId, run, items, options);
+}
+
 module.exports = router;
+module.exports.postPayrollRunById = postPayrollRunById;

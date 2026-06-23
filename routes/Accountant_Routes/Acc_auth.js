@@ -110,6 +110,34 @@ router.post("/logout", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// POST /logout-all  — invalidate this user's sessions on EVERY device
+// ─────────────────────────────────────────────────────────────────────────
+// Bumping tokenVersion makes every JWT previously signed for this user fail
+// the version check in orgAuth — including the token on the current device —
+// so all sessions are forced to re-login.
+router.post("/logout-all", orgAuth, async (req, res) => {
+  try {
+    // Legacy / dev sessions have no Acc_User row to bump — just clear locally.
+    if (req.user?.isLegacy || req.user?.isDev || !req.user?.id) {
+      clearAuthCookie(res);
+      return res.json({ success: true, message: "Logged out." });
+    }
+    await Acc_User.findByIdAndUpdate(req.user.id, {
+      $inc: { tokenVersion: 1 },
+      $set: { sessionsRevokedAt: new Date() },
+    });
+    clearAuthCookie(res);
+    res.json({
+      success: true,
+      message: "Logged out from all devices.",
+    });
+  } catch (e) {
+    console.error("[accountant/auth/logout-all]", e);
+    res.status(500).json({ success: false, message: "Logout failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // POST /push-token — register an FCM web-push device token for the current
 // user. The accountant app calls this after the user grants notification
 // permission. Stored on Acc_User.fcmTokens; the approval-notification service
@@ -536,6 +564,24 @@ router.post("/sync-legacy", async (req, res) => {
         return res.status(403).json({
           success: false,
           message: "Account is inactive — contact your owner.",
+        });
+      }
+      // ── Reject a re-bootstrap after "log out of all devices" ─────────────
+      // If this owner hit logout-all, sessionsRevokedAt is set. A CMS token
+      // minted BEFORE that moment must not silently re-create an accountant
+      // session, or other devices never actually log out. The owner has to
+      // sign in again at /login (which issues a fresh CMS token, newer iat).
+      if (
+        user.sessionsRevokedAt &&
+        decoded.iat &&
+        decoded.iat * 1000 < new Date(user.sessionsRevokedAt).getTime()
+      ) {
+        clearAuthCookie(res);
+        return res.status(200).json({
+          success: false,
+          code: "SESSION_REVOKED",
+          message:
+            "You logged out of all devices. Please sign in again from the main login page.",
         });
       }
       user.lastLoginAt = new Date();
