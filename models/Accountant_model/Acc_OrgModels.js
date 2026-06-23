@@ -107,6 +107,14 @@ const accountantUserSchema = new mongoose.Schema(
 
     lastLoginAt: { type: Date },
 
+    // Bumped to invalidate every JWT previously issued to this user
+    // ("log out of all devices"). Each token embeds the value it was signed
+    // with; orgAuth rejects a token whose version is behind this one.
+    tokenVersion: { type: Number, default: 0 },
+    // Set when the user chooses "log out of all devices". Any token issued
+    // before this instant is rejected — and for the CMS-bootstrapped owner,
+    // sync-legacy refuses to mint a fresh one until they sign in again.
+    sessionsRevokedAt: { type: Date },
     // Web-push device tokens (FCM). Populated by the accountant app when a
     // user grants notification permission. Empty until the frontend registers
     // one — email notifications work without it.

@@ -1592,20 +1592,19 @@ router.post("/", auth, async (req, res) => {
       role === "admin" ||
       role === "accountant";
     const canPostDirectly = !!perms.canPostDirectly || fullAccessRole;
-    // Editors (no direct-post privilege) can't post straight away — their
-    // sales / purchase / credit-note / debit-note vouchers go to an admin for
-    // approval instead.
-    const approvalTypes = ["sales", "purchase", "credit_note", "debit_note"];
-    const needsApproval =
-      !canPostDirectly && approvalTypes.includes(body.voucherType);
-    // Voucher types that require approval when posted by a non-direct-poster.
-    // Recomputed from a set so adding a type is a one-line change. Covers the
-    // original sales/purchase gate plus receipt + payment.
+    // Editors (no direct-post privilege) can't post these voucher types
+    // straight away — they go to an admin for approval, which fires the
+    // owner/approver notification (post-save hook on Acc_ApprovalRequest).
+    // Owners / approvers / accountants post directly.
     const APPROVAL_REQUIRED_TYPES = new Set([
       "sales",
       "purchase",
       "receipt",
       "payment",
+      "credit_note",
+      "debit_note",
+      "journal",
+      "contra",
     ]);
     const needsApprovalFinal =
       APPROVAL_REQUIRED_TYPES.has(body.voucherType) && !canPostDirectly;

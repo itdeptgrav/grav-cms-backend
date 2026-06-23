@@ -153,6 +153,7 @@ function signOrgToken(user, expiresIn = "24h") {
       role: user.role,
       email: user.email,
       name: user.name,
+      tokenVersion: user.tokenVersion || 0,
     },
     SECRET,
     { expiresIn },
@@ -296,7 +297,10 @@ async function orgAuth(req, res, next) {
     }
 
     const user = await Acc_User.findById(decoded.id).lean();
-    const userOk = user && user.isActive;
+    const userOk =
+      user &&
+      user.isActive &&
+      (decoded.tokenVersion || 0) === (user.tokenVersion || 0);
     const orgMatches =
       userOk && String(user.organizationId) === String(decoded.organizationId);
 

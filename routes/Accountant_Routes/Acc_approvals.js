@@ -34,6 +34,7 @@ const {
 } = require("../../models/Accountant_model/Acc_VoucherModels");
 const {
   Acc_Ledger,
+  Acc_Group,
 } = require("../../models/Accountant_model/Acc_MasterModels");
 
 const {
@@ -286,6 +287,148 @@ async function applyApprovedAction(reqDoc, approver) {
     } finally {
       session.endSession();
     }
+  }
+
+  // LEDGER ── create a new ledger from payload (mirrors POST /ledgers)
+  if (kind === "ledger" && action === "create") {
+    if (!payload) throw new Error("ledger create: payload missing");
+    const body = payload;
+    if (!body.companyId || !body.name || !body.groupId)
+      throw new Error("ledger create: companyId, name, groupId required");
+    const group = await Acc_Group.findById(body.groupId);
+    if (!group) throw new Error("Group not found");
+    const signedOpen =
+      (body.openingBalanceType === "Cr" ? -1 : 1) *
+      Math.abs(parseFloat(body.openingBalance) || 0);
+    const ledger = await Acc_Ledger.create({
+      ...body,
+      groupName: group.name,
+      nature: body.nature || group.nature,
+      openingBalance: signedOpen,
+      currentBalance: signedOpen,
+      currentBalanceType: body.openingBalanceType || "Dr",
+      createdBy: approver.id,
+    });
+    return { entityId: ledger._id };
+  }
+
+  // LEDGER ── update an existing ledger (mirrors PUT /ledgers/:id)
+  if (kind === "ledger" && action === "update") {
+    if (!target?.id) throw new Error("ledger update: target.id missing");
+    const updates = { ...(payload || {}) };
+    delete updates._id;
+    delete updates.companyId;
+    if (updates.openingBalanceType) {
+      const sign = updates.openingBalanceType === "Cr" ? -1 : 1;
+      updates.openingBalance =
+        sign * Math.abs(parseFloat(updates.openingBalance) || 0);
+    }
+    updates.updatedBy = approver.id;
+    const ledger = await Acc_Ledger.findByIdAndUpdate(target.id, updates, {
+      new: true,
+    });
+    if (!ledger) throw new Error("Ledger not found");
+    return { entityId: ledger._id };
+  }
+
+  // LEDGER ── soft-delete an unused ledger (mirrors DELETE /ledgers/:id, clean case)
+  if (kind === "ledger" && action === "delete") {
+    if (!target?.id) throw new Error("ledger delete: target.id missing");
+    const ledger = await Acc_Ledger.findById(target.id);
+    if (!ledger) throw new Error("Ledger not found");
+    const txnCount = await Acc_Voucher.countDocuments({
+      "ledgerEntries.ledgerId": ledger._id,
+      status: "posted",
+    });
+    const partyCount = await Acc_Voucher.countDocuments({
+      partyLedgerId: ledger._id,
+    });
+    if (txnCount + partyCount > 0)
+      throw new Error(
+        `Ledger is now used in ${txnCount + partyCount} place(s); cannot delete.`,
+      );
+    ledger.isActive = false;
+    ledger.updatedBy = approver.id;
+    await ledger.save();
+    return { entityId: ledger._id };
+  }
+
+  // GROUP ── create a new group from payload (mirrors POST /groups)
+  if (kind === "group" && action === "create") {
+    if (!payload) throw new Error("group create: payload missing");
+    const body = payload;
+    if (!body.companyId || !body.name || !body.nature)
+      throw new Error("group create: companyId, name, nature required");
+    let parentDoc = null;
+    if (body.parent) {
+      parentDoc = await Acc_Group.findById(body.parent);
+      if (!parentDoc) throw new Error("Parent group not found");
+    }
+    const group = await Acc_Group.create({
+      companyId: body.companyId,
+      name: body.name,
+      nature: body.nature,
+      description: body.description,
+      parent: parentDoc?._id || null,
+      parentName: parentDoc?.name || null,
+      level: parentDoc ? (parentDoc.level || 1) + 1 : 1,
+      fullPath: parentDoc ? `${parentDoc.fullPath} > ${body.name}` : body.name,
+      isReserved: false,
+      createdBy: approver.id,
+    });
+    return { entityId: group._id };
+  }
+
+  // GROUP ── update an existing group (mirrors PUT /groups/:id)
+  if (kind === "group" && action === "update") {
+    if (!target?.id) throw new Error("group update: target.id missing");
+    const grp = await Acc_Group.findById(target.id);
+    if (!grp) throw new Error("Group not found");
+    const body = payload || {};
+    if (grp.isReserved && body.name && body.name !== grp.name)
+      throw new Error("Cannot rename a reserved Tally group");
+    Object.assign(grp, body);
+    grp.updatedBy = approver.id;
+    await grp.save();
+    return { entityId: grp._id };
+  }
+
+  // GROUP ── soft-delete an empty group (mirrors DELETE /groups/:id)
+  if (kind === "group" && action === "delete") {
+    if (!target?.id) throw new Error("group delete: target.id missing");
+    const grp = await Acc_Group.findById(target.id);
+    if (!grp) throw new Error("Group not found");
+    if (grp.isReserved) throw new Error("Cannot delete a reserved group");
+    const childCount = await Acc_Group.countDocuments({
+      parent: grp._id,
+      isActive: true,
+    });
+    const ledgerCount = await Acc_Ledger.countDocuments({
+      groupId: grp._id,
+      isActive: true,
+    });
+    if (childCount > 0 || ledgerCount > 0)
+      throw new Error(
+        `Group has ${childCount} sub-group(s) and ${ledgerCount} ledger(s). Move or delete them first.`,
+      );
+    grp.isActive = false;
+    grp.updatedBy = approver.id;
+    await grp.save();
+    return { entityId: grp._id };
+  }
+
+  // PAYROLL ── post a payroll run (replays the chart-of-accounts posting)
+  if (kind === "payroll_post" && action === "post") {
+    if (!target?.id) throw new Error("payroll post: target.id (runId) missing");
+    const companyId = payload?.companyId;
+    if (!companyId) throw new Error("payroll post: companyId missing");
+    const coa = require("./Acc_chartOfAccounts");
+    if (typeof coa.postPayrollRunById !== "function")
+      throw new Error("payroll posting function unavailable");
+    await coa.postPayrollRunById(companyId, target.id, {
+      bankLedgerId: payload?.bankLedgerId || undefined,
+    });
+    return { entityId: target.id };
   }
 
   // Add more kinds here as you migrate modules to the approval flow.
