@@ -1,14 +1,19 @@
 // routes/Employee_Routes/Overtimeroutes.js
 //
-// FIXES applied:
-//   1. Uses `pushToken` (the real field), not `expoPushToken` (which never existed)
-//   2. All notification logic goes through utils/sendExpoPush.js — the proven path
-//   3. IST date helper used everywhere (no more "after midnight" bug)
-//   4. Threshold-based detection per your spec:
-//        - Operators (>=5 punches): notify if last punch after 6:30 PM
-//        - Executives (>=2 punches): notify if last punch after 6:30 PM
-//   5. Cron triggers between 6:30 PM and 11:30 PM IST only — no more random midnight spam
-//   6. Logs are quieter — only when something actually happens
+// COMPLETE FIXES:
+//   1. Uses pushToken (not expoPushToken).
+//   2. Notifications routed through utils/sendExpoPush.js + sendWebPush.js.
+//   3. IST date helpers used everywhere.
+//   4. Threshold-based stay-over detection.
+//   5. Cron runs only 6:30 PM – 11:30 PM IST.
+//   6. _otCronStarted guard makes startOvertimeReminders idempotent.
+//   7. /check looks back 7 days, hides expired entries.
+//   8. /my returns CURRENT MONTH ONLY.
+//   9. /submit rejects if past the 12:00 PM IST cutoff the day after stay-over.
+//  10. PERSISTENT NOTIFICATION DEDUP via OvertimeNotificationLog.
+//      In-memory Map removed entirely. The cron tries to INSERT a dedup row
+//      before sending — duplicate key error means "already notified", we skip.
+//      Survives Render cold starts.
 //
 "use strict";
 
@@ -18,6 +23,7 @@ const mongoose = require("mongoose");
 const multer = require("multer");
 
 const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
+const OvertimeNotificationLog = require("../../models/HR_Models/OvertimeNotificationLog");
 const Employee = require("../../models/Employee");
 const OvertimeReport = require("../../models/HR_Models/OvertimeReport");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
@@ -27,6 +33,27 @@ const {
   dateStrIST,
   minsSinceMidnightIST,
 } = require("../../utils/sendExpoPush");
+
+// ── Web push helper (best-effort, never throws) ────────────────────────────
+async function sendWebPushSafely(
+  employeeIds,
+  { title, body, type, url, extra },
+) {
+  try {
+    const { sendWebPushToMany } = require("../../utils/sendWebPush");
+    const ids = Array.isArray(employeeIds) ? employeeIds : [employeeIds];
+    await sendWebPushToMany({
+      employeeIds: ids.map((id) => String(id)).filter(Boolean),
+      title,
+      body,
+      type,
+      url,
+      extra,
+    });
+  } catch (e) {
+    console.warn("[OT-WEBPUSH]", e.message);
+  }
+}
 
 const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
@@ -49,17 +76,25 @@ const SCHEDULED_OUT_MIN = 30;
 const MIN_STAY_OVER_MINS = 60;
 const SCHEDULED_OUT_TOTAL_MINS = SCHEDULED_OUT_HOUR * 60 + SCHEDULED_OUT_MIN;
 
-// Employee type → minimum punch count to consider "shift completed"
-// Operators have 6 punches (IN/lunch-out/lunch-in/tea-out/tea-in/OUT)
-// Executives have 2 punches (IN/OUT)
 const PUNCH_THRESHOLDS = {
   operator: 5,
   executive: 2,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
-//  HELPER: Convert a punch Date to minutes-since-midnight in IST
+//  HELPERS
 // ════════════════════════════════════════════════════════════════════════════
+
+function isOvertimeExpired(dateStr) {
+  // dateStr is "YYYY-MM-DD" (IST). Cutoff = next day at 12:00 PM IST.
+  // 12:00 PM IST = 06:30 UTC.
+  if (!dateStr) return false;
+  const [y, m, d] = dateStr.split("-").map(Number);
+  if (!y || !m || !d) return false;
+  const cutoffUtcMs = Date.UTC(y, m - 1, d + 1, 6, 30, 0, 0);
+  return Date.now() >= cutoffUtcMs;
+}
+
 function punchMinsIST(date) {
   const istMs = new Date(date).getTime() + 5.5 * 60 * 60 * 1000;
   const ist = new Date(istMs);
@@ -72,13 +107,8 @@ function punchTimeStrIST(date) {
   return `${String(ist.getUTCHours()).padStart(2, "0")}:${String(ist.getUTCMinutes()).padStart(2, "0")}`;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  HELPER: Get employee's punch count from the day's attendance entry
-// ════════════════════════════════════════════════════════════════════════════
 function countPunches(entry) {
   if (!entry) return 0;
-  // Daily attendance stores punches as inTime, lunchOut, lunchIn, teaOut, teaIn, finalOut (or similar fields)
-  // Adjust based on actual structure — counting non-null punch fields
   const candidates = [
     entry.inTime,
     entry.firstIn,
@@ -97,14 +127,9 @@ function countPunches(entry) {
 }
 
 function resolveEmployeeType(emp) {
-  // Adjust based on your actual resolution logic. Default: executive.
-  // Could be enhanced by reading AttendanceSettings + department/designation.
   return emp?.employeeType || "executive";
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  HELPER: Detect if employee stayed late on `dateStr`
-// ════════════════════════════════════════════════════════════════════════════
 async function detectStayOver(biometricId, dateStr) {
   const dayDoc = await DailyAttendance.findOne({ dateStr }).lean();
   if (!dayDoc) return null;
@@ -138,6 +163,7 @@ async function detectStayOver(biometricId, dateStr) {
 
 // ════════════════════════════════════════════════════════════════════════════
 //  GET /overtime/check — Employee checks pending OT reports
+//  Looks back 7 days INCLUDING today. Skips submitted + expired.
 // ════════════════════════════════════════════════════════════════════════════
 router.get("/check", AllEmployeeAppMiddleware, async (req, res) => {
   try {
@@ -146,11 +172,9 @@ router.get("/check", AllEmployeeAppMiddleware, async (req, res) => {
       .lean();
     if (!emp) return res.json({ success: true, data: [] });
 
-    const todayIST = dateStrIST();
     const dates = [];
-    // Check last 3 days (excluding today)
     const baseDate = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
-    for (let i = 1; i <= 3; i++) {
+    for (let i = 0; i <= 7; i++) {
       const d = new Date(baseDate);
       d.setUTCDate(d.getUTCDate() - i);
       dates.push(
@@ -165,6 +189,9 @@ router.get("/check", AllEmployeeAppMiddleware, async (req, res) => {
         dateStr,
       }).lean();
       if (existing) continue;
+
+      if (isOvertimeExpired(dateStr)) continue;
+
       const stayOver = await detectStayOver(emp.biometricId, dateStr);
       if (stayOver) {
         pendingReports.push({
@@ -181,14 +208,22 @@ router.get("/check", AllEmployeeAppMiddleware, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-//  GET /overtime/my — Employee's history
+//  GET /overtime/my — Employee history, CURRENT MONTH ONLY
 // ════════════════════════════════════════════════════════════════════════════
 router.get("/my", AllEmployeeAppMiddleware, async (req, res) => {
   try {
-    const reports = await OvertimeReport.find({ employeeId: req.user.id })
+    const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const y = nowIst.getUTCFullYear();
+    const m = String(nowIst.getUTCMonth() + 1).padStart(2, "0");
+    const monthPrefix = `${y}-${m}`;
+
+    const reports = await OvertimeReport.find({
+      employeeId: req.user.id,
+      dateStr: { $regex: `^${monthPrefix}` },
+    })
       .sort({ createdAt: -1 })
-      .limit(20)
       .lean();
+
     res.json({ success: true, data: reports });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -237,6 +272,14 @@ router.post(
         return res
           .status(400)
           .json({ success: false, message: "Already submitted for this date" });
+      }
+
+      if (isOvertimeExpired(dateStr)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "This overtime report has expired (deadline was 12:00 PM the next day). Contact HR if you need an exception.",
+        });
       }
 
       const stayOver = await detectStayOver(emp.biometricId, dateStr);
@@ -296,7 +339,17 @@ router.post(
         status: "pending",
       });
 
-      // ── Socket.IO notify (in-app realtime) ────────────────────────────
+      // Lock the dedup log so even if the cron re-fires before the report
+      // index propagates, the employee won't be re-notified.
+      try {
+        await OvertimeNotificationLog.updateOne(
+          { employeeId: req.user.id, dateStr },
+          { $setOnInsert: { sentAt: new Date() } },
+          { upsert: true },
+        );
+      } catch (_) {}
+
+      // ── Socket.IO notify managers ─────────────────────────────────────
       try {
         const io = req.app.get("io");
         if (io && managersNotified.length > 0) {
@@ -316,7 +369,7 @@ router.post(
         }
       } catch (_) {}
 
-      // ── Push to managers via shared helper ────────────────────────────
+      // ── Push to managers ──────────────────────────────────────────────
       const managerIds = managersNotified
         .map((m) => m.managerId)
         .filter(Boolean);
@@ -333,6 +386,14 @@ router.post(
           },
           channelId: "general",
         });
+        await sendWebPushSafely(managerIds, {
+          title: "Overtime Report Submitted",
+          body: `${report.employeeName} stayed late on ${dateStr} (${hours}h ${mins}m extra). Review and approve for ${stayOver.graceMinutes}min grace.`,
+          type: "overtime_required",
+          url: "/overtime",
+          extra: { reportId: String(report._id) },
+        });
+
         report.notificationSentToManager = true;
         await report.save();
       }
@@ -399,7 +460,6 @@ router.patch(
       report.approvedAt = new Date();
       report.approvalRemarks = req.body.remarks || "";
 
-      // ── Apply grace to next day's attendance ─────────────────────────
       if (report.graceMinutes > 0 && report.nextDateStr) {
         try {
           const nextDay = await DailyAttendance.findOne({
@@ -459,7 +519,6 @@ router.patch(
 
       await report.save();
 
-      // ── Socket.IO notify ──────────────────────────────────────────────
       try {
         const io = req.app.get("io");
         if (io) {
@@ -476,7 +535,6 @@ router.patch(
         }
       } catch (_) {}
 
-      // ── Push to employee ──────────────────────────────────────────────
       await sendExpoPush(report.employeeId, {
         title: "Overtime Approved ✓",
         body: report.graceApplied
@@ -488,6 +546,15 @@ router.patch(
           screen: "Overtime",
         },
         channelId: "general",
+      });
+      await sendWebPushSafely(report.employeeId, {
+        title: "Overtime Approved ✓",
+        body: report.graceApplied
+          ? `${report.graceMinutes}min grace applied for ${report.nextDateStr}. You're marked Present.`
+          : `Your overtime report for ${report.dateStr} was approved by ${mgrName}.`,
+        type: "overtime_approved",
+        url: "/overtime",
+        extra: { reportId: String(report._id) },
       });
 
       res.json({
@@ -552,6 +619,13 @@ router.patch(
         },
         channelId: "general",
       });
+      await sendWebPushSafely(report.employeeId, {
+        title: "Overtime Report Rejected",
+        body: `Your overtime report for ${report.dateStr} was rejected by ${mgrName}.${report.rejectionReason ? ` Reason: ${report.rejectionReason}` : ""}`,
+        type: "overtime_rejected",
+        url: "/overtime",
+        extra: { reportId: String(report._id) },
+      });
 
       res.json({ success: true, data: report, message: "Rejected" });
     } catch (err) {
@@ -561,22 +635,29 @@ router.patch(
 );
 
 // ════════════════════════════════════════════════════════════════════════════
-//  EXPORTED: detectAndNotifyStayOvers
-//  Called by attendance cron / sync. Notifies employees who:
-//    - Have the required punch count for their employee type
-//    - Have a finalOut after 6:30 PM IST + 1 hour
-//    - Haven't submitted an OT report yet
-//    - Haven't already been notified today (de-dupe via in-memory set)
+//  detectAndNotifyStayOvers — called by the reminder cron.
+//
+//  PERSISTENT DEDUP via OvertimeNotificationLog:
+//    Before sending each push, we try to INSERT a dedup row for
+//    (employeeId, dateStr). The unique index guarantees the insert only
+//    succeeds the FIRST time. Any subsequent attempt — same cron tick,
+//    next tick, next day, after a server restart, anything — fails with
+//    E11000 and we skip the push.
+//
+//    This is the fix for "the same OT reminder keeps firing" — that was
+//    the in-memory Map getting wiped every time Render cold-started the
+//    dyno. Now the dedup state is in Mongo and survives forever (well,
+//    60 days — the TTL index purges old rows).
 // ════════════════════════════════════════════════════════════════════════════
-const notifiedToday = new Map(); // empId → dateStr (so we don't spam)
-
 async function detectAndNotifyStayOvers(dateStr, io) {
   try {
     const dayDoc = await DailyAttendance.findOne({ dateStr }).lean();
     if (!dayDoc || !dayDoc.employees) return { checked: 0, notified: 0 };
 
     let notified = 0;
-    const candidates = [];
+    let skippedExistingReport = 0;
+    let skippedAlreadyNotified = 0;
+    let skippedExpired = 0;
 
     for (const entry of dayDoc.employees) {
       if (!entry.finalOut || !entry.biometricId) continue;
@@ -592,63 +673,95 @@ async function detectAndNotifyStayOvers(dateStr, io) {
       if (!emp) continue;
       if (emp.status !== "active" && emp.isActive === false) continue;
 
-      // De-dupe: don't notify same employee twice for same date
-      const dedupeKey = `${emp._id}|${dateStr}`;
-      if (notifiedToday.get(emp._id.toString()) === dateStr) continue;
-
-      // Check punch count meets threshold for employee type
       const empType = resolveEmployeeType(emp);
       const threshold = PUNCH_THRESHOLDS[empType] ?? PUNCH_THRESHOLDS.executive;
       const punchCount = countPunches(entry);
-      if (punchCount < threshold) {
-        // Not enough punches — likely incomplete day, don't bother them
-        continue;
-      }
+      if (punchCount < threshold) continue;
 
-      // Skip if already submitted
+      // Skip if a report already exists for this date
       const existing = await OvertimeReport.findOne({
         employeeId: emp._id,
         dateStr,
-      });
-      if (existing) continue;
+      })
+        .select("_id")
+        .lean();
+      if (existing) {
+        skippedExistingReport++;
+        continue;
+      }
 
-      candidates.push({ emp, outMins });
-    }
+      // Skip if past the noon-next-day expiry — pinging is pointless
+      if (isOvertimeExpired(dateStr)) {
+        skippedExpired++;
+        continue;
+      }
 
-    if (candidates.length === 0)
-      return { checked: dayDoc.employees.length, notified: 0 };
-
-    // Send pushes in parallel (well, sendExpoPush already serializes per token)
-    for (const { emp, outMins } of candidates) {
-      const outTime = `${String(Math.floor(outMins / 60)).padStart(2, "0")}:${String(outMins % 60).padStart(2, "0")}`;
-      const result = await sendExpoPush(emp._id, {
-        title: "⚠️ Overtime Report Pending",
-        body: `You stayed until ${outTime} on ${dateStr}. Submit your OT report to get grace time tomorrow.`,
-        data: {
-          type: "overtime_required",
+      // ── PERSISTENT DEDUP: claim the notification atomically ──
+      // If create succeeds → we are the FIRST to notify for this
+      // (employee, dateStr). Proceed with the push.
+      // If create throws E11000 → another tick (or a past run) already
+      // notified them. Skip silently.
+      try {
+        await OvertimeNotificationLog.create({
+          employeeId: emp._id,
           dateStr,
-          screen: "Overtime",
-        },
-        channelId: "general",
-        categoryId: "overtime",
-      });
-      if (result.queued > 0) {
-        notified++;
-        notifiedToday.set(emp._id.toString(), dateStr);
-        if (io) {
-          io.to(String(emp._id)).emit("overtime_notification", {
+        });
+      } catch (e) {
+        if (e.code === 11000) {
+          skippedAlreadyNotified++;
+          continue;
+        }
+        console.warn("[OT-DEDUP-LOG]", e.message);
+        continue;
+      }
+
+      // We hold the lock. Send the push.
+      const outTime = `${String(Math.floor(outMins / 60)).padStart(2, "0")}:${String(outMins % 60).padStart(2, "0")}`;
+      try {
+        const result = await sendExpoPush(emp._id, {
+          title: "⚠️ Overtime Report Pending",
+          body: `You stayed until ${outTime} on ${dateStr}. Submit your OT report to get grace time tomorrow.`,
+          data: {
             type: "overtime_required",
             dateStr,
-            actualOutTime: outTime,
-            message: `Submit overtime report for ${dateStr} to get grace time`,
-          });
+            screen: "Overtime",
+          },
+          channelId: "general",
+          categoryId: "overtime",
+        });
+        await sendWebPushSafely(emp._id, {
+          title: "⚠️ Overtime Report Pending",
+          body: `You stayed until ${outTime} on ${dateStr}. Submit your OT report to get grace time tomorrow.`,
+          type: "overtime_required",
+          url: "/overtime",
+          extra: { dateStr },
+        });
+
+        if (result.queued > 0) {
+          notified++;
+          if (io) {
+            io.to(String(emp._id)).emit("overtime_notification", {
+              type: "overtime_required",
+              dateStr,
+              actualOutTime: outTime,
+              message: `Submit overtime report for ${dateStr} to get grace time`,
+            });
+          }
         }
+      } catch (e) {
+        // Push failed but dedup row is already in place. Acceptable — the
+        // employee will see the pending card next time they open the app.
+        console.warn("[OT-PUSH-FAIL]", e.message);
       }
     }
 
-    if (notified > 0) {
+    if (
+      notified > 0 ||
+      skippedExistingReport > 0 ||
+      skippedAlreadyNotified > 0
+    ) {
       console.log(
-        `[OT-REMIND] Notified ${notified} employee(s) for ${dateStr}`,
+        `[OT-REMIND] ${dateStr}: notified=${notified}, skipped_submitted=${skippedExistingReport}, skipped_already_notified=${skippedAlreadyNotified}, skipped_expired=${skippedExpired}`,
       );
     }
     return { checked: dayDoc.employees.length, notified };
@@ -660,37 +773,36 @@ async function detectAndNotifyStayOvers(dateStr, io) {
 
 // ════════════════════════════════════════════════════════════════════════════
 //  REMINDER LOOP — runs every 10 minutes between 6:30 PM and 11:30 PM IST
-//  Outside that window, the timer still ticks but does nothing (no spam logs)
 // ════════════════════════════════════════════════════════════════════════════
 let reminderTimer = null;
-const REMINDER_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-
-// IST minutes: 6:30 PM = 1110, 11:30 PM = 1410
-const REMINDER_WINDOW_START = 18 * 60 + 30;
-const REMINDER_WINDOW_END = 23 * 60 + 30;
+let _otCronStarted = false;
+const REMINDER_INTERVAL_MS = 10 * 60 * 1000;
+const REMINDER_WINDOW_START = 18 * 60 + 30; // 6:30 PM IST
+const REMINDER_WINDOW_END = 23 * 60 + 30; // 11:30 PM IST
 
 function startOvertimeReminders(io) {
+  if (_otCronStarted) {
+    console.log(
+      "[OT-CRON] ⚠ Already started — skipping duplicate registration",
+    );
+    return;
+  }
+  _otCronStarted = true;
+
   async function tick() {
     try {
       const istMins = minsSinceMidnightIST();
-
-      // Only run during 6:30 PM – 11:30 PM IST
       if (istMins >= REMINDER_WINDOW_START && istMins <= REMINDER_WINDOW_END) {
         const todayStr = dateStrIST();
         await detectAndNotifyStayOvers(todayStr, io);
       }
-
-      // Clear yesterday's de-dupe cache shortly after midnight IST
-      if (istMins >= 0 && istMins <= 30) {
-        notifiedToday.clear();
-      }
+      // No more in-memory map to clear — dedup is in Mongo with a TTL index.
     } catch (e) {
       console.warn("[OT-CRON] tick error:", e.message);
     }
     reminderTimer = setTimeout(tick, REMINDER_INTERVAL_MS);
   }
 
-  // First tick after 1 minute
   reminderTimer = setTimeout(tick, 60 * 1000);
   console.log(
     "[OT-CRON] ✅ Overtime reminder loop started (6:30 PM – 11:30 PM IST, every 10 min)",
@@ -702,11 +814,11 @@ function stopOvertimeReminders() {
     clearTimeout(reminderTimer);
     reminderTimer = null;
   }
+  _otCronStarted = false;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  HOOK: Apply grace when attendance syncs (for approvals that came in before
-//  the next day's attendance was synced)
+//  applyPendingGrace
 // ════════════════════════════════════════════════════════════════════════════
 async function applyPendingGrace(dateStr) {
   try {

@@ -20,11 +20,15 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
     const { woId } = req.params;
 
     const workOrder = await WorkOrder.findById(woId)
-      .select("workOrderNumber stockItemName stockItemReference quantity variantAttributes customerRequestId stockItemId _id")
+      .select(
+        "workOrderNumber stockItemName stockItemReference quantity variantAttributes customerRequestId stockItemId _id",
+      )
       .lean();
 
     if (!workOrder) {
-      return res.status(404).json({ success: false, message: "Work order not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Work order not found" });
     }
 
     const stockItem = await StockItem.findById(workOrder.stockItemId)
@@ -40,16 +44,22 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
 
     const measurement = await Measurement.findOne({
       poRequestId: workOrder.customerRequestId,
-    }).select("_id name organizationName employeeMeasurements").lean();
+    })
+      .select("_id name organizationName employeeMeasurements")
+      .lean();
 
     if (!measurement) {
-      return res.status(404).json({ success: false, message: "No measurement data found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "No measurement data found" });
     }
 
     const progressDocs = await EmployeeProductionProgress.find({
       workOrderId: workOrder._id,
     })
-      .select("employeeId employeeName employeeUIN gender unitStart unitEnd totalUnits completedUnits completionPercentage assignedBarcodeIds isDispatched")
+      .select(
+        "employeeId employeeName employeeUIN gender unitStart unitEnd totalUnits completedUnits completionPercentage assignedBarcodeIds isDispatched",
+      )
       .lean();
 
     const progressByEmployee = new Map();
@@ -134,44 +144,48 @@ router.get("/work-orders/:woId/employee-measurements", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching employee measurements:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching employee measurements" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching employee measurements",
+    });
   }
 });
 
 // ============================================================================
 // GET: Search employees by name / UIN / department across an MO
+// ──> CHANGED: If no `q` query is provided, this now returns ALL employees
+//     for the MO (instead of an empty array). This lets the frontend show
+//     every employee by default and use the search bar purely to filter.
 // ============================================================================
 router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
   try {
     const { moId } = req.params;
     const q = (req.query.q || "").trim().toLowerCase();
 
-    if (!q || q.length < 1) {
-      return res.json({ success: true, employees: [] });
-    }
-
     const measurement = await Measurement.findOne({ poRequestId: moId })
       .select("_id name organizationName employeeMeasurements")
       .lean();
 
     if (!measurement) {
-      return res.json({ success: true, employees: [] });
+      return res.json({ success: true, employees: [], measurementId: null });
     }
 
-    const matched = (measurement.employeeMeasurements || []).filter((emp) => {
-      return (
-        emp.employeeName?.toLowerCase().includes(q) ||
-        emp.employeeUIN?.toLowerCase().includes(q)
-      );
-    });
+    const allEmployees = measurement.employeeMeasurements || [];
 
-    if (matched.length === 0) {
-      return res.json({ success: true, employees: [] });
+    // ── If a search query is provided, do name/UIN match first ──────────
+    let matched = allEmployees;
+    if (q && q.length >= 1) {
+      matched = allEmployees.filter((emp) => {
+        return (
+          emp.employeeName?.toLowerCase().includes(q) ||
+          emp.employeeUIN?.toLowerCase().includes(q)
+        );
+      });
     }
 
-    const employeeIds = matched.map((e) => e.employeeId).filter(Boolean);
-
-    const mpcDocs = await EmployeeMpc.find({ _id: { $in: employeeIds } })
+    // ── Always fetch EmployeeMpc docs for dept/designation enrichment ──
+    const allMpcIds = allEmployees.map((e) => e.employeeId).filter(Boolean);
+    const mpcDocs = await EmployeeMpc.find({ _id: { $in: allMpcIds } })
       .select("_id department designation products")
       .lean();
 
@@ -180,35 +194,57 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       mpcById.set(doc._id.toString(), doc);
     }
 
-    const allEmployeeIds = (measurement.employeeMeasurements || [])
-      .filter((emp) => {
+    // ── If we had a query and got nothing by name/UIN, try department ──
+    if (q && q.length >= 1 && matched.length === 0) {
+      const deptMatchIds = allEmployees
+        .filter((emp) => {
+          const empIdStr = emp.employeeId?.toString();
+          const dept = mpcById.get(empIdStr)?.department?.toLowerCase() || "";
+          return dept.includes(q);
+        })
+        .map((e) => e.employeeId?.toString());
+
+      const deptSet = new Set(deptMatchIds);
+      matched = allEmployees.filter((emp) =>
+        deptSet.has(emp.employeeId?.toString()),
+      );
+    } else if (q && q.length >= 1) {
+      // Combine name/UIN matches with department matches
+      const nameUinIds = new Set(matched.map((e) => e.employeeId?.toString()));
+      const deptMatchEmps = allEmployees.filter((emp) => {
         const empIdStr = emp.employeeId?.toString();
+        if (nameUinIds.has(empIdStr)) return false;
         const dept = mpcById.get(empIdStr)?.department?.toLowerCase() || "";
-        const alreadyMatched =
-          emp.employeeName?.toLowerCase().includes(q) ||
-          emp.employeeUIN?.toLowerCase().includes(q);
-        return !alreadyMatched && dept.includes(q);
-      })
-      .map((e) => e.employeeId?.toString());
+        return dept.includes(q);
+      });
+      matched = [...matched, ...deptMatchEmps];
+    }
 
-    const finalEmployeeSet = new Set([
-      ...matched.map((e) => e.employeeId?.toString()),
-      ...allEmployeeIds,
-    ]);
+    if (matched.length === 0) {
+      return res.json({
+        success: true,
+        employees: [],
+        measurementId: measurement._id,
+      });
+    }
 
-    const finalMatched = (measurement.employeeMeasurements || []).filter((emp) =>
-      finalEmployeeSet.has(emp.employeeId?.toString())
-    );
+    const matchedIds = matched
+      .map((e) => e.employeeId?.toString())
+      .filter(Boolean);
 
+    // ── Fetch all WOs for this MO ────────────────────────────────────────
     const workOrders = await WorkOrder.find({ customerRequestId: moId })
       .select("_id workOrderNumber stockItemName stockItemId")
       .lean();
 
+    // ── Fetch progress docs for these employees on these WOs ─────────────
     const progressDocs = await EmployeeProductionProgress.find({
       workOrderId: { $in: workOrders.map((w) => w._id) },
-      employeeId: { $in: Array.from(finalEmployeeSet) },
+      employeeId: { $in: matchedIds },
     })
-      .select("employeeId workOrderId unitStart unitEnd totalUnits completedUnits completionPercentage qrGenerated isDispatched")
+      .select(
+        "employeeId workOrderId unitStart unitEnd totalUnits completedUnits completionPercentage qrGenerated isDispatched",
+      )
       .lean();
 
     const progressMap = new Map();
@@ -217,12 +253,8 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       progressMap.set(key, p);
     }
 
-    const woById = new Map();
-    for (const wo of workOrders) {
-      woById.set(wo._id.toString(), wo);
-    }
-
-    const employees = finalMatched.map((emp) => {
+    // ── Build the response ──────────────────────────────────────────────
+    const employees = matched.map((emp) => {
       const empIdStr = emp.employeeId?.toString();
       const mpc = mpcById.get(empIdStr);
 
@@ -238,17 +270,17 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
         const productEntry = (emp.products || []).find(
           (p) =>
             p.productId?.toString() === wo.stockItemId?.toString() ||
-            p.productName === wo.stockItemName
+            p.productName === wo.stockItemName,
         );
 
         const mpcProduct = (mpc?.products || []).find(
-          (p) => p.productId?.toString() === wo.stockItemId?.toString()
+          (p) => p.productId?.toString() === wo.stockItemId?.toString(),
         );
         const mpcProductName = mpcProduct?.productName || wo.stockItemName;
 
         products.push({
           productName: wo.stockItemName,
-          mpcProductName, 
+          mpcProductName,
           workOrderNumber: wo.workOrderNumber,
           workOrderId: woIdStr,
           quantity: progress.totalUnits,
@@ -274,10 +306,22 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       };
     });
 
+    // Sort: Male first, Female second, then by name
+    const genderOrder = { M: 0, Male: 0, m: 0, F: 1, Female: 1, f: 1 };
+    employees.sort((a, b) => {
+      const ga = genderOrder[a.gender] ?? 2;
+      const gb = genderOrder[b.gender] ?? 2;
+      if (ga !== gb) return ga - gb;
+      return (a.employeeName || "").localeCompare(b.employeeName || "");
+    });
+
     res.json({ success: true, measurementId: measurement._id, employees });
   } catch (error) {
     console.error("Error searching employees:", error);
-    res.status(500).json({ success: false, message: "Server error while searching employees" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while searching employees",
+    });
   }
 });
 
@@ -285,46 +329,57 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
 // POST: Update QR generated status
 // ── Also stamps qrGeneratedAt so cutting-history can filter by date ──────────
 // ============================================================================
-router.post("/employee-measurements/:measurementId/update-status", async (req, res) => {
-  try {
-    const { measurementId } = req.params;
-    const { employeeId, productName } = req.body;
+router.post(
+  "/employee-measurements/:measurementId/update-status",
+  async (req, res) => {
+    try {
+      const { measurementId } = req.params;
+      const { employeeId, productName } = req.body;
 
-    const measurement = await Measurement.findOne({
-      _id: measurementId,
-      "employeeMeasurements.employeeId": employeeId,
-    });
+      const measurement = await Measurement.findOne({
+        _id: measurementId,
+        "employeeMeasurements.employeeId": employeeId,
+      });
 
-    if (!measurement) {
-      return res.status(404).json({ success: false, message: "Measurement not found" });
-    }
+      if (!measurement) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Measurement not found" });
+      }
 
-    let updated = false;
-    const now = new Date();
+      let updated = false;
+      const now = new Date();
 
-    measurement.employeeMeasurements.forEach((emp) => {
-      if (emp.employeeId.toString() === employeeId) {
-        emp.products.forEach((product) => {
-          if (product.productName === productName) {
-            product.qrGenerated = true;
-            product.qrGeneratedAt = now; // ← NEW: stamp the cut date/time
-            updated = true;
-          }
+      measurement.employeeMeasurements.forEach((emp) => {
+        if (emp.employeeId.toString() === employeeId) {
+          emp.products.forEach((product) => {
+            if (product.productName === productName) {
+              product.qrGenerated = true;
+              product.qrGeneratedAt = now; // stamp the cut date/time
+              updated = true;
+            }
+          });
+        }
+      });
+
+      if (!updated) {
+        return res.status(404).json({
+          success: false,
+          message: "Product not found for this employee",
         });
       }
-    });
 
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Product not found for this employee" });
+      await measurement.save();
+      res.json({ success: true, message: "Status updated successfully" });
+    } catch (error) {
+      console.error("Error updating status:", error);
+      res.status(500).json({
+        success: false,
+        message: "Server error while updating status",
+      });
     }
-
-    await measurement.save();
-    res.json({ success: true, message: "Status updated successfully" });
-  } catch (error) {
-    console.error("Error updating status:", error);
-    res.status(500).json({ success: false, message: "Server error while updating status" });
-  }
-});
+  },
+);
 
 // ============================================================================
 // GET: Daily cutting history  (used by the overview dashboard)
@@ -360,10 +415,12 @@ router.get("/cutting-history", async (req, res) => {
     measurements.forEach((m) =>
       (m.employeeMeasurements || []).forEach((e) => {
         if (e.employeeId) allEmpIds.add(e.employeeId.toString());
-      })
+      }),
     );
 
-    const mpcDocs = await EmployeeMpc.find({ _id: { $in: Array.from(allEmpIds) } })
+    const mpcDocs = await EmployeeMpc.find({
+      _id: { $in: Array.from(allEmpIds) },
+    })
       .select("_id department designation")
       .lean();
 
@@ -424,14 +481,23 @@ router.get("/cutting-history", async (req, res) => {
 
     // ── Sort each org's employees: Male first, then Female ──────────────
     const genderOrder = { Male: 0, M: 0, m: 0, Female: 1, F: 1, f: 1 };
-    const groups = Array.from(groupsMap.entries()).map(([orgName, employees]) => {
-      employees.sort((a, b) => (genderOrder[a.gender] ?? 2) - (genderOrder[b.gender] ?? 2));
-      const orgPieces = employees.reduce(
-        (s, e) => s + e.products.reduce((ps, p) => ps + (p.quantity || 0), 0),
-        0
-      );
-      return { organizationName: orgName, employeeCount: employees.length, totalPieces: orgPieces, employees };
-    });
+    const groups = Array.from(groupsMap.entries()).map(
+      ([orgName, employees]) => {
+        employees.sort(
+          (a, b) => (genderOrder[a.gender] ?? 2) - (genderOrder[b.gender] ?? 2),
+        );
+        const orgPieces = employees.reduce(
+          (s, e) => s + e.products.reduce((ps, p) => ps + (p.quantity || 0), 0),
+          0,
+        );
+        return {
+          organizationName: orgName,
+          employeeCount: employees.length,
+          totalPieces: orgPieces,
+          employees,
+        };
+      },
+    );
 
     // Sort orgs alphabetically
     groups.sort((a, b) => a.organizationName.localeCompare(b.organizationName));
@@ -449,7 +515,10 @@ router.get("/cutting-history", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching cutting history:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching cutting history" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching cutting history",
+    });
   }
 });
 

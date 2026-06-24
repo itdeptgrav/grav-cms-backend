@@ -1,37 +1,3 @@
-// routes/Accountant_Routes/Acc_chartOfAccounts.js
-// =============================================================================
-// CHART OF ACCOUNTS — Groups + Ledgers
-// -----------------------------------------------------------------------------
-// Endpoints:
-//   GET    /tree                        — Group→Ledger tree (with rollups)
-//   GET    /trial-balance               — Flat trial balance (Dr/Cr columns,
-//                                          group totals, balanced check)
-//   GET    /groups, POST/PUT/DELETE     — Group CRUD
-//   GET    /groups/:id/statement        — Consolidated statement for a group
-//                                          (all descendant ledgers in one view)
-//   GET    /ledgers, POST/PUT/DELETE    — Ledger CRUD
-//   GET    /ledgers/:id/statement       — Ledger statement (running balance,
-//                                          monthly + daily buckets, contra
-//                                          entries, bill-wise outstanding,
-//                                          previous-period comparison)
-//   POST   /ledgers/:id/transactions    — Quick add 2-line journal voucher
-//   POST   /ledgers/:id/transfer-balance — Move (full or partial) balance from
-//                                          one ledger to another via journal
-//   GET    /gstin-lookup/:gstin         — Validate GSTIN format + checksum,
-//                                          extract state + PAN; optional API
-//                                          fetch (env-configured) for name/addr
-//   GET    /payroll/runs                — List payroll runs + posting status
-//   GET    /payroll/runs/:id/preview    — Preview salary journal voucher
-//   POST   /payroll/runs/:id/post       — Post a single payroll run as voucher
-//   POST   /payroll/runs/post-all       — Post every unposted run
-//   POST   /payroll/runs/:id/unpost     — Cancel the auto-created vouchers
-//                                          (handles paid runs with two vouchers)
-//   POST   /seed-manufacturing          — Seed manufacturing-industry chart
-//   GET    /parties/preview             — Preview party-ledger sync (dry-run)
-//   POST   /parties/sync                — Create Sundry Debtor / Creditor
-//                                          ledgers from CMS Customer + Vendor
-// =============================================================================
-
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -44,6 +10,12 @@ const {
 const {
   Acc_Voucher,
 } = require("../../models/Accountant_model/Acc_VoucherModels");
+// Single source of truth for GSTIN→state-code derivation. Bridges
+// `contactDetails.{state,stateCode}` (where the ledger edit form saves) to
+// the top-level `address.{state,stateCode}` shape that voucher/invoice forms
+// read. Without this bridge, customers with a properly-saved state code in
+// contactDetails still trigger "no state code" errors on the voucher form.
+const { applyGstAutoState } = require("../../services/gstState.util");
 // Payroll models live in the HR module. We require them lazily inside the
 // payroll endpoints below so this route file still loads on systems that don't
 // have the HR module installed yet.
@@ -403,6 +375,202 @@ router.get("/tree", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GROUPS — CRUD
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// CHART-OF-ACCOUNTS APPROVAL GATE
+// Editors (no direct-post privilege) cannot create / edit / delete ledgers or
+// groups outright — each such change is filed as an Acc_ApprovalRequest and the
+// owner/approvers are notified (same queue the vouchers use). Owners, approvers,
+// admins and accountants fall straight through to the handlers below. Only the
+// six write ops on /ledgers and /groups are intercepted; bulk seeders, reorders,
+// statements, party-sync, etc. pass untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+async function coaApprovalGate(req, res, next) {
+  const m = req.method;
+  if (m !== "POST" && m !== "PUT" && m !== "DELETE") return next();
+
+  const p = req.path; // $-anchored regexes below are robust to the mount prefix
+  let kind, action;
+  if (m === "POST" && /\/ledgers$/.test(p)) {
+    kind = "ledger";
+    action = "create";
+  } else if (m === "PUT" && /\/ledgers\/[^/]+$/.test(p)) {
+    kind = "ledger";
+    action = "update";
+  } else if (m === "DELETE" && /\/ledgers\/[^/]+$/.test(p)) {
+    kind = "ledger";
+    action = "delete";
+  } else if (m === "POST" && /\/groups$/.test(p)) {
+    kind = "group";
+    action = "create";
+  } else if (m === "PUT" && /\/groups\/[^/]+$/.test(p)) {
+    kind = "group";
+    action = "update";
+  } else if (m === "DELETE" && /\/groups\/[^/]+$/.test(p)) {
+    kind = "group";
+    action = "delete";
+  } else return next();
+
+  const perms = req.user?.permissions || {};
+  const role = req.user?.role;
+  const canActDirectly =
+    perms.canPostDirectly ||
+    ["owner", "approver", "admin", "accountant"].includes(role);
+  if (canActDirectly) return next();
+
+  if (!req.user?.organizationId) {
+    return res.status(403).json({
+      success: false,
+      message: "Your role can't modify the chart of accounts.",
+    });
+  }
+
+  try {
+    const {
+      Acc_ApprovalRequest,
+    } = require("../../models/Accountant_model/Acc_OrgModels");
+    const {
+      Acc_Ledger,
+      Acc_Group,
+    } = require("../../models/Accountant_model/Acc_MasterModels");
+
+    const targetId =
+      action === "create" ? null : String(req.path.split("/").pop());
+    const collection = kind === "ledger" ? "Acc_Ledger" : "Acc_Group";
+
+    let companyId, title, payload;
+
+    if (action === "create") {
+      payload = req.body || {};
+      companyId = payload.companyId;
+      const label = payload.name || kind;
+      title = `Create ${kind} "${label}"`;
+    } else {
+      const Model = kind === "ledger" ? Acc_Ledger : Acc_Group;
+      const ent = await Model.findById(targetId).select(
+        "companyId name isReserved",
+      );
+      if (!ent)
+        return res
+          .status(404)
+          .json({ success: false, message: `${kind} not found` });
+      companyId = ent.companyId;
+      title = `${action === "delete" ? "Delete" : "Edit"} ${kind} "${ent.name}"`;
+      payload = action === "update" ? req.body || {} : { id: targetId };
+
+      // Mirror the handlers' hard guards so an editor can't queue an
+      // impossible action.
+      if (kind === "group" && ent.isReserved) {
+        if (action === "delete") {
+          return res.status(400).json({
+            success: false,
+            message: "Cannot delete a reserved group",
+          });
+        }
+        if (
+          action === "update" &&
+          req.body?.name &&
+          req.body.name !== ent.name
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "Cannot rename a reserved Tally group",
+          });
+        }
+      }
+
+      if (action === "delete") {
+        if (kind === "ledger") {
+          const {
+            Acc_Voucher,
+          } = require("../../models/Accountant_model/Acc_VoucherModels");
+          const txnCount = await Acc_Voucher.countDocuments({
+            "ledgerEntries.ledgerId": targetId,
+            status: "posted",
+          });
+          const partyCount = await Acc_Voucher.countDocuments({
+            partyLedgerId: targetId,
+          });
+          if (txnCount + partyCount > 0) {
+            return res.status(409).json({
+              success: false,
+              message: `This ledger is used in ${txnCount + partyCount} place(s). Ask an owner to reassign and delete it.`,
+            });
+          }
+        } else {
+          const childCount = await Acc_Group.countDocuments({
+            parent: targetId,
+            isActive: true,
+          });
+          const ledgerCount = await Acc_Ledger.countDocuments({
+            groupId: targetId,
+            isActive: true,
+          });
+          if (childCount + ledgerCount > 0) {
+            return res.status(400).json({
+              success: false,
+              message: `Group has ${childCount} sub-group(s) and ${ledgerCount} ledger(s). Move or delete them first.`,
+            });
+          }
+        }
+      }
+    }
+
+    if (targetId) {
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind,
+        action,
+        "target.id": targetId,
+        status: "pending",
+      });
+      if (dup) {
+        return res.status(200).json({
+          success: true,
+          _pendingApproval: true,
+          message: `A ${action} request is already pending for this ${kind}.`,
+        });
+      }
+    }
+
+    const _coaReq = await Acc_ApprovalRequest.create({
+      organizationId: req.user.organizationId,
+      companyId,
+      kind,
+      action,
+      title,
+      target: targetId ? { collection, id: targetId } : undefined,
+      payload,
+      requestedBy: req.user.id,
+      requestedByName: req.user.name || "",
+      status: "pending",
+    });
+
+    // Notify the owner/approvers directly (email + push). The model has a
+    // post-save hook that is meant to do this on every approval-request
+    // create, but if it isn't firing on this write path the CoA queue would
+    // stay silent — so we call the same notifier explicitly. Fire-and-forget;
+    // it can never block or throw back into the request.
+    try {
+      const _notif = require("../../services/accountantApprovalNotifications.service");
+      Promise.resolve(_notif.notifyApprovalEvent(_coaReq, "created")).catch(
+        (e) => console.error("[coa-gate] notify error:", e.message),
+      );
+    } catch (e) {
+      console.error("[coa-gate] notify require error:", e.message);
+    }
+
+    return res.status(202).json({
+      success: true,
+      _pendingApproval: true,
+      message: `${action[0].toUpperCase()}${action.slice(1)} request sent to an admin for approval.`,
+    });
+  } catch (e) {
+    return res.status(400).json({ success: false, message: e.message });
+  }
+}
+
+router.use(coaApprovalGate);
+
 router.get("/groups", async (req, res) => {
   try {
     const { companyId, nature, parent } = req.query;
@@ -863,6 +1031,13 @@ router.get("/ledgers", async (req, res) => {
       }
       return l;
     });
+
+    // Bridge contactDetails.{state,stateCode} → top-level address.{state,stateCode}
+    // so voucher/invoice forms (which read selectedCustomer.address.stateCode)
+    // see the value. Without this, a ledger with a perfectly-good stateCode in
+    // contactDetails still trips the "no state code" validator.
+    for (const l of ledgers) applyGstAutoState(l);
+
     // Fire-and-forget bulk fix so next request doesn't need it
     if (bulkFixOps.length > 0) {
       Acc_Ledger.bulkWrite(bulkFixOps).catch(() => {});
@@ -1019,7 +1194,11 @@ router.get("/ledgers/:id", async (req, res) => {
       }
     }
 
-    res.json({ success: true, ledger: ledger.toObject() });
+    // Mirror contactDetails.{state,stateCode} → top-level address.{state,stateCode}
+    // for forms that read the address shape. See helper for details.
+    const obj = ledger.toObject();
+    applyGstAutoState(obj);
+    res.json({ success: true, ledger: obj });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1048,7 +1227,11 @@ router.put("/ledgers/:id", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Ledger not found" });
-    res.json({ success: true, ledger });
+    // Bridge contactDetails → address shape so callers that re-read the
+    // returned ledger get a consistent shape.
+    const obj = ledger.toObject();
+    applyGstAutoState(obj);
+    res.json({ success: true, ledger: obj });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });
   }
@@ -1281,13 +1464,14 @@ router.get("/ledgers/:id/statement", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Ledger not found" });
 
+    // IST boundaries — must match the carry-forward cutoff used for the
+    // opening balance below (both +05:30), otherwise a voucher dated the
+    // 1st of the period between 00:00–05:30 IST falls into neither the
+    // opening nor the period and the closing comes out wrong.
     const dateFilter = {};
-    if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
-      dateFilter.$lte = e;
-    }
+    if (startDate)
+      dateFilter.$gte = new Date(`${startDate}T00:00:00.000+05:30`);
+    if (endDate) dateFilter.$lte = new Date(`${endDate}T23:59:59.999+05:30`);
 
     const filter = {
       "ledgerEntries.ledgerId": ledger._id,
@@ -1311,7 +1495,7 @@ router.get("/ledgers/:id/statement", async (req, res) => {
           $match: {
             "ledgerEntries.ledgerId": ledger._id,
             status: "posted",
-            voucherDate: { $lt: new Date(startDate) },
+            voucherDate: { $lt: new Date(`${startDate}T00:00:00.000+05:30`) },
           },
         },
         { $unwind: "$ledgerEntries" },
@@ -1387,17 +1571,29 @@ router.get("/ledgers/:id/statement", async (req, res) => {
 
     // ── Monthly summary buckets ─────────────────────────────────────────
     // Each month's opening = previous month's closing.
+    // IST calendar parts of any date — server-TZ-independent, so a voucher
+    // stored at IST-midnight (UTC-5:30) is bucketed into the correct IST
+    // month/day regardless of the timezone the Node process runs in.
+    const istParts = (val) => {
+      const ymd = new Date(val).toLocaleDateString("en-CA", {
+        timeZone: "Asia/Kolkata",
+      });
+      const [yy, mm, dd] = ymd.split("-").map(Number);
+      return { y: yy, m: mm, d: dd, ymd };
+    };
+
     const byMonth = new Map();
     for (const l of lines) {
-      const d = new Date(l.date);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const { y, m } = istParts(l.date);
+      const key = `${y}-${String(m).padStart(2, "0")}`;
       if (!byMonth.has(key)) {
+        const dt = new Date(y, m - 1, 1);
         byMonth.set(key, {
           monthKey: key,
-          year: d.getFullYear(),
-          month: d.getMonth() + 1,
-          monthName: d.toLocaleString("en-IN", { month: "long" }),
-          monthShort: d.toLocaleString("en-IN", { month: "short" }),
+          year: y,
+          month: m,
+          monthName: dt.toLocaleString("en-IN", { month: "long" }),
+          monthShort: dt.toLocaleString("en-IN", { month: "short" }),
           debit: 0,
           credit: 0,
           txCount: 0,
@@ -1408,7 +1604,6 @@ router.get("/ledgers/:id/statement", async (req, res) => {
       bucket.credit += l.credit;
       bucket.txCount += 1;
     }
-
     // Determine the FULL month range to display. The accountant wants
     // EVERY month of the selected period shown — even months with no
     // transactions — each carrying the previous month's closing forward
@@ -1426,20 +1621,18 @@ router.get("/ledgers/:id/statement", async (req, res) => {
     let rangeStart = null;
     let rangeEnd = null;
     if (startDate) {
-      const s = new Date(startDate);
-      rangeStart = { y: s.getFullYear(), m: s.getMonth() + 1 };
+      const [y, m] = startDate.split("-").map(Number);
+      rangeStart = { y, m };
     }
     if (endDate) {
-      const e = new Date(endDate);
-      rangeEnd = { y: e.getFullYear(), m: e.getMonth() + 1 };
+      const [y, m] = endDate.split("-").map(Number);
+      rangeEnd = { y, m };
     }
     if ((!rangeStart || !rangeEnd) && lines.length > 0) {
-      const first = new Date(lines[0].date);
-      const last = new Date(lines[lines.length - 1].date);
-      if (!rangeStart)
-        rangeStart = { y: first.getFullYear(), m: first.getMonth() + 1 };
-      if (!rangeEnd)
-        rangeEnd = { y: last.getFullYear(), m: last.getMonth() + 1 };
+      const first = istParts(lines[0].date);
+      const last = istParts(lines[lines.length - 1].date);
+      if (!rangeStart) rangeStart = { y: first.y, m: first.m };
+      if (!rangeEnd) rangeEnd = { y: last.y, m: last.m };
     }
     if (!rangeStart && !rangeEnd) {
       const now = new Date();
@@ -1511,12 +1704,12 @@ router.get("/ledgers/:id/statement", async (req, res) => {
     // ── Daily summary buckets ───────────────────────────────────────────
     const byDay = new Map();
     for (const l of lines) {
-      const d = new Date(l.date);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      const { y, m, d: dd } = istParts(l.date);
+      const key = `${y}-${String(m).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
       if (!byDay.has(key)) {
         byDay.set(key, {
           dayKey: key,
-          date: d,
+          date: new Date(l.date),
           debit: 0,
           credit: 0,
           txCount: 0,
@@ -1644,14 +1837,42 @@ router.get("/ledgers/:id/statement", async (req, res) => {
           voucherCount: bill.voucherNumbers.size,
         });
       }
+      // ── Reconcile to the ledger's ACTUAL closing balance ───────────────
+      // Bill allocations alone miss opening balances and imported entries
+      // that carry no bill refs, so the bill-wise sum can be 0 even when the
+      // ledger clearly has a balance. The headline outstanding must equal the
+      // ledger's real closing balance (Dr positive / Cr negative) — the same
+      // number shown on the header card — and any gap is surfaced as an
+      // "Opening / Unallocated" line in the Current bucket so it reconciles.
+      const billSigned = openBills.reduce(
+        (s, b) => s + b.remainingAbs * (b.remainingType === "Dr" ? 1 : -1),
+        0,
+      );
+      const unallocated = parseFloat((closing - billSigned).toFixed(2));
+      if (Math.abs(unallocated) >= 0.01) {
+        openBills.push({
+          billName: "Opening / Unallocated",
+          firstDate: ledger.openingBalanceDate || startDate || null,
+          dueDate: null,
+          creditDays: 0,
+          originalAmount: Math.abs(unallocated),
+          remaining: unallocated,
+          remainingAbs: Math.abs(unallocated),
+          remainingType: unallocated >= 0 ? "Dr" : "Cr",
+          daysOverdue: 0,
+          bucket: "current",
+          voucherCount: 0,
+        });
+        buckets.current += Math.abs(unallocated);
+      }
       openBills.sort((a, b) => b.daysOverdue - a.daysOverdue);
 
       billWiseOutstanding = {
         applicable: true,
-        totalOutstanding: openBills.reduce(
-          (s, b) => s + b.remainingAbs * (b.remainingType === "Dr" ? 1 : -1),
-          0,
-        ),
+        // Signed total = the ledger's actual closing balance.
+        // + = Dr (receivable), − = Cr (payable). Drives the headline label.
+        totalOutstanding: parseFloat(closing.toFixed(2)),
+        closingType: closing >= 0 ? "Dr" : "Cr",
         bills: openBills,
         agingBuckets: buckets,
         bucketTotals: {
@@ -1668,11 +1889,10 @@ router.get("/ledgers/:id/statement", async (req, res) => {
     // Same date span, one year earlier
     let previousPeriodComparison = null;
     if (startDate && endDate) {
-      const s = new Date(startDate);
-      s.setFullYear(s.getFullYear() - 1);
-      const e = new Date(endDate);
-      e.setFullYear(e.getFullYear() - 1);
-      e.setHours(23, 59, 59, 999);
+      const prevStartStr = `${parseInt(startDate.slice(0, 4)) - 1}${startDate.slice(4)}`;
+      const prevEndStr = `${parseInt(endDate.slice(0, 4)) - 1}${endDate.slice(4)}`;
+      const s = new Date(`${prevStartStr}T00:00:00.000+05:30`);
+      const e = new Date(`${prevEndStr}T23:59:59.999+05:30`);
       const prevAgg = await Acc_Voucher.aggregate([
         {
           $match: {
@@ -1710,8 +1930,8 @@ router.get("/ledgers/:id/statement", async (req, res) => {
       ]);
       const p = prevAgg[0] || { debit: 0, credit: 0, txCount: 0 };
       previousPeriodComparison = {
-        startDate: s.toISOString().slice(0, 10),
-        endDate: e.toISOString().slice(0, 10),
+        startDate: prevStartStr,
+        endDate: prevEndStr,
         debit: p.debit,
         credit: p.credit,
         txCount: p.txCount,
@@ -1953,12 +2173,8 @@ router.get("/trial-balance", async (req, res) => {
       .lean();
 
     const dateMatch = {};
-    if (startDate) dateMatch.$gte = new Date(startDate);
-    if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
-      dateMatch.$lte = e;
-    }
+    if (startDate) dateMatch.$gte = new Date(`${startDate}T00:00:00.000+05:30`);
+    if (endDate) dateMatch.$lte = new Date(`${endDate}T23:59:59.999+05:30`);
 
     // Aggregate per-ledger debit/credit totals in the period
     const periodMatch = {
@@ -2005,7 +2221,7 @@ router.get("/trial-balance", async (req, res) => {
           $match: {
             companyId: new mongoose.Types.ObjectId(companyId),
             status: "posted",
-            voucherDate: { $lt: new Date(startDate) },
+            voucherDate: { $lt: new Date(`${startDate}T00:00:00.000+05:30`) },
           },
         },
         { $unwind: "$ledgerEntries" },
@@ -2168,12 +2384,9 @@ router.get("/groups/:id/statement", async (req, res) => {
     const ledgerIds = ledgers.map((l) => l._id);
 
     const dateFilter = {};
-    if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
-      dateFilter.$lte = e;
-    }
+    if (startDate)
+      dateFilter.$gte = new Date(`${startDate}T00:00:00.000+05:30`);
+    if (endDate) dateFilter.$lte = new Date(`${endDate}T23:59:59.999+05:30`);
 
     const filter = {
       "ledgerEntries.ledgerId": { $in: ledgerIds },
@@ -2266,6 +2479,45 @@ router.get("/groups/:id/statement", async (req, res) => {
 
 // ── Helper: load HR Payroll models (lazy require so this file loads even if
 // the HR module is missing in some environments) ─────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYROLL ROLE GATE
+//   viewer            → cannot post / unpost / reset payroll (read-only)
+//   editor            → single-run /post passes through to its handler, which
+//                       files an approval request; bulk post, unpost, and
+//                       cleanup require an owner/approver
+//   owner / approver  → act directly
+// GETs (list, preview) are never blocked.
+// ─────────────────────────────────────────────────────────────────────────────
+function payrollRoleGate(req, res, next) {
+  if (req.method !== "POST") return next();
+  if (!/\/payroll\//.test(req.path)) return next();
+
+  const perms = req.user?.permissions || {};
+  const role = req.user?.role;
+  const canActDirectly =
+    perms.canPostDirectly ||
+    ["owner", "approver", "admin", "accountant"].includes(role);
+  if (canActDirectly) return next();
+
+  if (role === "viewer") {
+    return res
+      .status(403)
+      .json({ success: false, message: "Viewers can't post payroll." });
+  }
+
+  // Editor (or any other non-direct role): only the single-run post may pass
+  // (its handler files an approval request). Bulk post / unpost / cleanup are
+  // owner/approver-only.
+  if (/\/payroll\/runs\/[^/]+\/post$/.test(req.path)) return next();
+
+  return res.status(403).json({
+    success: false,
+    message:
+      "This payroll action needs an owner or approver. Post runs individually to send them for approval.",
+  });
+}
+router.use(payrollRoleGate);
+
 function loadPayrollModels() {
   try {
     return require("../../models/HR_Models/Payroll");
@@ -2465,6 +2717,45 @@ async function resolveBankLedgerForPayroll(companyId, explicitBankLedgerId) {
   return primary || banks[0];
 }
 
+// Extract advance salary amount from a PayrollItem.
+// Defensive — tries every field name the HR module has used across versions.
+function getItemAdvance(item) {
+  const d = item.deductions || {};
+
+  // Try every direct scalar field the HR module might use
+  const direct =
+    d.advanceSalary ||
+    d.advance ||
+    d.salaryAdvance ||
+    d.advanceDeduction ||
+    d.salaryAdvanceDeduction ||
+    d.advanceRecovery ||
+    d.salaryAdvanceRecovery ||
+    d.loanDeduction ||
+    d.loanRecovery ||
+    0;
+  if (direct > 0) return direct;
+
+  // Try array-based "others" or "otherDeductions" (some HR systems
+  // store miscellaneous deductions as [{name, amount}] items)
+  const arr =
+    d.others ||
+    d.otherDeductions ||
+    d.additionalDeductions ||
+    d.miscDeductions ||
+    [];
+  if (Array.isArray(arr)) {
+    const hit = arr.find((o) =>
+      /advance|salary.*adv|adv.*sal|loan/i.test(
+        o.name || o.type || o.label || o.description || "",
+      ),
+    );
+    if (hit) return hit.amount || hit.value || hit.amt || 0;
+  }
+
+  return 0;
+}
+
 async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   // Resolve every ledger we'll need
   const salariesLedger = await findOrCreateLedger(
@@ -2535,10 +2826,185 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   const computedNet = totals.gross - totals.pf - totals.esi - totals.tdsOther;
   if (Math.abs(computedNet - totals.net) > 1) {
     throw new Error(
-      `Payroll math doesn't reconcile: gross ${totals.gross.toFixed(2)} − deductions = ${computedNet.toFixed(2)}, but net pay is ${totals.net.toFixed(2)} (diff ${Math.abs(computedNet - totals.net).toFixed(2)}). Re-process the payroll run before posting.`,
+      `Payroll math doesn't reconcile: gross ${totals.gross.toFixed(2)} − deductions = ${computedNet.toFixed(2)}, but net pay is ${totals.net.toFixed(2)} (diff ${Math.abs(computedNet - totals.net).toFixed(2)}).
+  Re-process the payroll run before posting.`,
     );
   }
 
+  // ── Advance salary ledger mapping ─────────────────────────────────────
+  // Advance salary deductions must post to the employee's individual
+  // "Advance Salary <Name> A/c" ledger under Current Assets — NOT to
+  // Other Deductions Payable and NOT to any Expense ledger.
+  //
+  // Only look at ASSET-nature ledgers (Cr here reduces the outstanding
+  // advance balance, which is an asset). Expense-named ledgers that
+  // accidentally match are intentionally skipped.
+  const allAdvanceLedgers = await Acc_Ledger.find({
+    companyId,
+    isActive: true,
+    nature: "asset",
+    name: /advance.*salary|salary.*advance/i,
+  }).lean();
+
+  // Find Current Assets group — correct home for employee advance accounts.
+  const advanceGroup =
+    (await Acc_Group.findOne({
+      companyId,
+      isActive: true,
+      name: /^current assets$/i,
+    }).lean()) ||
+    (await Acc_Group.findOne({
+      companyId,
+      isActive: true,
+      nature: "asset",
+      name: /current/i,
+    }).lean()) ||
+    (await Acc_Group.findOne({
+      companyId,
+      isActive: true,
+      nature: "asset",
+    }).lean());
+
+  // Name-based match against pre-fetched asset ledgers only.
+  function findAdvanceLedger(empName) {
+    if (!empName || !allAdvanceLedgers.length) return null;
+    const lower = empName.toLowerCase();
+    const exact = allAdvanceLedgers.find((l) =>
+      l.name.toLowerCase().includes(lower),
+    );
+    if (exact) return exact;
+    const parts = lower.split(/\s+/).filter((p) => p.length > 2);
+    return (
+      allAdvanceLedgers.find((l) => {
+        const ln = l.name.toLowerCase();
+        return parts.some((p) => ln.includes(p));
+      }) || null
+    );
+  }
+
+  // Find or AUTO-CREATE the advance salary ledger for an employee.
+  // Also MIGRATES wrongly-grouped advance ledgers (e.g. Expenses → Current Assets).
+  async function findOrCreateAdvanceLedger(empName) {
+    const existing = findAdvanceLedger(empName);
+    if (existing) return existing;
+
+    // Check if there's a non-asset advance ledger for this employee and migrate it
+    if (empName && advanceGroup) {
+      const lower = empName.toLowerCase();
+      const parts = lower.split(/\s+/).filter((p) => p.length > 2);
+      const wrongLedger = await Acc_Ledger.findOne({
+        companyId,
+        isActive: true,
+        name: /advance.*salary|salary.*advance/i,
+        nature: { $ne: "asset" },
+      }).lean();
+      if (wrongLedger) {
+        const wName = wrongLedger.name.toLowerCase();
+        const nameMatch =
+          wName.includes(lower) || parts.some((p) => wName.includes(p));
+        if (nameMatch) {
+          await Acc_Ledger.updateOne(
+            { _id: wrongLedger._id },
+            {
+              $set: {
+                groupId: advanceGroup._id,
+                groupName: advanceGroup.name,
+                nature: "asset",
+                openingBalanceType: "Dr",
+              },
+            },
+          );
+          const migrated = {
+            ...wrongLedger,
+            groupId: advanceGroup._id,
+            groupName: advanceGroup.name,
+            nature: "asset",
+          };
+          allAdvanceLedgers.push(migrated);
+          return migrated;
+        }
+      }
+    }
+
+    if (!advanceGroup || !empName) return null;
+    const ledgerName = `Advance Salary ${empName} A/c`;
+    try {
+      const newLedger = await Acc_Ledger.create({
+        companyId,
+        name: ledgerName,
+        groupId: advanceGroup._id,
+        groupName: advanceGroup.name,
+        nature: "asset",
+        openingBalance: 0,
+        openingBalanceType: "Dr",
+        currentBalance: 0,
+        currentBalanceType: "Dr",
+        isActive: true,
+        importSource: "auto_payroll",
+        notes: `Auto-created during payroll posting for ${empName}`,
+      });
+      allAdvanceLedgers.push(newLedger); // cache so later employees in same run find it
+      return newLedger;
+    } catch (e) {
+      console.warn(
+        `[payroll] Could not create advance ledger for ${empName}: ${e.message}`,
+      );
+      return null;
+    }
+  }
+
+  // Build ledgerId → { ledger, amount } for all employees with advance deductions.
+  //
+  // Two-pass detection:
+  //   Pass A — direct field lookup via getItemAdvance() (fast, exact)
+  //   Pass B — fallback for employees whose HR field name isn't in our list:
+  //            if the employee already has an advance ledger with a positive
+  //            Dr balance AND has non-PF/ESI deductions this month, infer
+  //            the advance as min(ledgerBalance, itemOther).
+  const advanceLedgerMap = new Map();
+  let totalMappedAdvance = 0;
+
+  for (const item of items) {
+    let adv = getItemAdvance(item);
+
+    // ── Fallback: infer from ledger balance ──────────────────────────────
+    if ((!adv || adv <= 0) && item.employeeName) {
+      const existingLed = findAdvanceLedger(item.employeeName);
+      if (existingLed) {
+        // Only infer if the employee actually has other deductions this run
+        const itemOther = Math.max(
+          0,
+          (item.deductions?.totalDeductions || 0) -
+            (item.deductions?.providentFund || 0) -
+            (item.deductions?.esic || 0),
+        );
+        if (itemOther > 0) {
+          // Cap at whichever is smaller: ledger Dr balance or itemOther
+          const ledBal = Math.abs(existingLed.currentBalance || 0);
+          adv = ledBal > 0 ? Math.min(ledBal, itemOther) : itemOther;
+        }
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────
+
+    if (!adv || adv <= 0) continue;
+    const ledger = await findOrCreateAdvanceLedger(item.employeeName);
+    if (ledger) {
+      const lid = ledger._id.toString();
+      if (advanceLedgerMap.has(lid)) {
+        advanceLedgerMap.get(lid).amount += adv;
+      } else {
+        advanceLedgerMap.set(lid, { ledger, amount: adv });
+      }
+      totalMappedAdvance += adv;
+    }
+  }
+
+  // Remaining deductions after extracting all mapped advances.
+  // Math invariant: pf + esi + tdsOtherRemaining + Σadvances + net = gross ✓
+  const tdsOtherRemaining = parseFloat(
+    Math.max(0, totals.tdsOther - totalMappedAdvance).toFixed(2),
+  );
   // ── Voucher 1: PROCESSING (always created) ────────────────────────────
   // Dr Salaries A/c (gross) / Cr PF + ESI + Other Deductions + Salary Payable
   // This is the journal entry recognising the salary expense and accruing
@@ -2569,14 +3035,26 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       type: "Cr",
       amount: totals.esi,
     });
-  if (totals.tdsOther > 0)
+  if (tdsOtherRemaining > 0)
     processingEntries.push({
       ledgerId: otherDeductionsPayable._id,
       ledgerName: otherDeductionsPayable.name,
       groupName: otherDeductionsPayable.groupName,
       type: "Cr",
-      amount: totals.tdsOther,
+      amount: tdsOtherRemaining,
     });
+  // Per-employee advance salary entries — Cr reduces the outstanding
+  // advance balance on each employee's "Advance Salary <Name> A/c" ledger.
+  for (const { ledger, amount } of advanceLedgerMap.values()) {
+    if (amount > 0)
+      processingEntries.push({
+        ledgerId: ledger._id,
+        ledgerName: ledger.name,
+        groupName: ledger.groupName,
+        type: "Cr",
+        amount: parseFloat(amount.toFixed(2)),
+      });
+  }
   if (totals.net > 0)
     processingEntries.push({
       ledgerId: salaryPayable._id,
@@ -2652,7 +3130,13 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
 // returning the FIRST voucher only, so anything that hasn't been migrated still
 // produces a sensible journal even if it doesn't know about payments.
 async function buildPayrollVoucher(companyId, run, items, opts = {}) {
-  const built = await buildPayrollVouchers(companyId, run, items, opts);
+  // If caller provided manually-confirmed entries, use them directly.
+  let built;
+  if (opts.overrideVouchers && opts.overrideVouchers.length > 0) {
+    built = { vouchers: opts.overrideVouchers };
+  } else {
+    built = await buildPayrollVouchers(companyId, run, items, opts);
+  }
   const first = built.vouchers[0];
   return {
     entries: first.entries,
@@ -2914,6 +3398,58 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
         .status(400)
         .json({ success: false, message: "companyId required" });
 
+    // Editor (no direct-post privilege) → route this post to approval instead
+    // of creating the vouchers now. Viewers are blocked by payrollRoleGate
+    // above. On approval, the executor replays postPayrollRunById server-side.
+    {
+      const perms = req.user?.permissions || {};
+      const role = req.user?.role;
+      const canActDirectly =
+        perms.canPostDirectly ||
+        ["owner", "approver", "admin", "accountant"].includes(role);
+      if (!canActDirectly) {
+        if (!req.user?.organizationId)
+          return res
+            .status(403)
+            .json({ success: false, message: "Your role can't post payroll." });
+        const {
+          Acc_ApprovalRequest,
+        } = require("../../models/Accountant_model/Acc_OrgModels");
+        const dup = await Acc_ApprovalRequest.findOne({
+          organizationId: req.user.organizationId,
+          kind: "payroll_post",
+          action: "post",
+          "target.id": req.params.runId,
+          status: "pending",
+        });
+        if (dup) {
+          return res.status(200).json({
+            success: true,
+            _pendingApproval: true,
+            message:
+              "A posting request is already pending for this payroll run.",
+          });
+        }
+        await Acc_ApprovalRequest.create({
+          organizationId: req.user.organizationId,
+          companyId,
+          kind: "payroll_post",
+          action: "post",
+          title: `Post payroll run ${req.params.runId}`,
+          target: { collection: "Payroll", id: req.params.runId },
+          payload: { companyId, bankLedgerId: bankLedgerId || null },
+          requestedBy: req.user.id,
+          requestedByName: req.user.name || "",
+          status: "pending",
+        });
+        return res.status(202).json({
+          success: true,
+          _pendingApproval: true,
+          message: "Payroll posting sent to an admin for approval.",
+        });
+      }
+    }
+
     const HR = loadPayrollModels();
     if (!HR)
       return res
@@ -2936,7 +3472,14 @@ router.post("/payroll/runs/:runId/post", async (req, res) => {
 
     let result;
     try {
-      result = await postPayrollRun(companyId, run, items, { bankLedgerId });
+      const { overrideVouchers } = req.body;
+      result = await postPayrollRun(companyId, run, items, {
+        bankLedgerId,
+        overrideVouchers:
+          Array.isArray(overrideVouchers) && overrideVouchers.length
+            ? overrideVouchers
+            : undefined,
+      });
     } catch (e) {
       return res.status(400).json({
         success: false,
@@ -4305,4 +4848,208 @@ router.post("/ledgers/:id/transfer-balance", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/accountant/chart-of-accounts/trial-balance/diagnose
+//   ?companyId=&endDate=   (endDate = the TB's "to" date; defaults to today)
+//
+// Pinpoints the source of a Trial Balance imbalance. The TB closing total is
+//   Σ_active [ openingBalance + Σ(movements ≤ endDate) ]
+// so the gap can only come from:
+//   A) opening balances of ACTIVE ledgers that don't net to zero, and/or
+//   B) vouchers whose ACTIVE-leg debits ≠ credits — either internally
+//      unbalanced (debit ≠ credit), OR balanced but with a leg on a deleted/
+//      inactive ledger (which the TB drops, leaving the rest lopsided).
+// startDate is irrelevant to the imbalance (it only splits opening vs period;
+// the sum is identical), so only endDate matters. READ-ONLY.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/trial-balance/diagnose", async (req, res) => {
+  try {
+    // Lazy-require so the top-of-file imports don't need touching.
+    const {
+      Acc_Company,
+    } = require("../../models/Accountant_model/Acc_MasterModels");
+
+    // Resolve company: explicit param, else the primary/only company.
+    let cId;
+    if (req.query.companyId) {
+      cId = new mongoose.Types.ObjectId(req.query.companyId);
+    } else {
+      let company = await Acc_Company.findOne({ isPrimary: true })
+        .select("_id")
+        .lean();
+      if (!company) {
+        const all = await Acc_Company.find({}).select("_id").limit(2).lean();
+        if (all.length === 1) company = all[0];
+      }
+      if (!company)
+        return res.status(400).json({
+          success: false,
+          message:
+            "companyId required (no single primary company found to default to).",
+        });
+      cId = company._id;
+    }
+
+    // Cutoff = end of the TB's "to" day in IST. Default: now.
+    const endDate = req.query.endDate || req.query.asOf;
+    const cutoff = endDate
+      ? new Date(`${endDate}T23:59:59.999+05:30`)
+      : new Date();
+
+    // ── Source A — opening balances of ACTIVE ledgers ────────────────────
+    const ledgers = await Acc_Ledger.find({ companyId: cId, isActive: true })
+      .select("name openingBalance")
+      .lean();
+    let openingImbalance = 0;
+    for (const l of ledgers) openingImbalance += l.openingBalance || 0;
+    openingImbalance = parseFloat(openingImbalance.toFixed(2));
+
+    // Hidden cause — inactive ledgers that STILL carry an opening balance
+    // (e.g. a ledger soft-deleted after it had a balance). The TB drops it.
+    const inactiveWithOpening = await Acc_Ledger.find({
+      companyId: cId,
+      isActive: false,
+      openingBalance: { $ne: 0 },
+    })
+      .select("name openingBalance")
+      .lean();
+
+    // ── Source B — vouchers whose ACTIVE-leg debits ≠ credits ────────────
+    // Per voucher, sum (Dr +amount / Cr -amount) over entries on an ACTIVE
+    // ledger (mirrors how the TB builds rows from active ledgers only).
+    const signedAmt = {
+      $cond: [
+        { $eq: ["$ledgerEntries.type", "Dr"] },
+        { $ifNull: ["$ledgerEntries.amount", 0] },
+        { $multiply: [{ $ifNull: ["$ledgerEntries.amount", 0] }, -1] },
+      ],
+    };
+    const voucherAgg = await Acc_Voucher.aggregate([
+      {
+        $match: {
+          companyId: cId,
+          status: "posted",
+          voucherDate: { $lte: cutoff },
+        },
+      },
+      { $unwind: "$ledgerEntries" },
+      {
+        $lookup: {
+          from: "acc_ledgers",
+          localField: "ledgerEntries.ledgerId",
+          foreignField: "_id",
+          as: "_led",
+        },
+      },
+      { $unwind: { path: "$_led", preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: "$_id",
+          voucherNumber: { $first: "$voucherNumber" },
+          voucherType: { $first: "$voucherType" },
+          voucherDate: { $first: "$voucherDate" },
+          // Net over ACTIVE legs (what the TB actually counts).
+          activeNet: {
+            $sum: { $cond: [{ $eq: ["$_led.isActive", true] }, signedAmt, 0] },
+          },
+          // Net over ALL legs (tells internally-unbalanced from dead-leg).
+          fullNet: { $sum: signedAmt },
+          deadLegs: {
+            $sum: { $cond: [{ $ne: ["$_led.isActive", true] }, 1, 0] },
+          },
+        },
+      },
+      { $match: { $expr: { $gt: [{ $abs: "$activeNet" }, 0.005] } } },
+      { $sort: { voucherDate: 1 } },
+      { $limit: 200 },
+    ]);
+
+    const unbalancedVouchers = voucherAgg.map((v) => {
+      const internalDiff = parseFloat((v.fullNet || 0).toFixed(2));
+      const internallyBalanced = Math.abs(internalDiff) < 0.005;
+      return {
+        voucherId: v._id,
+        voucherNumber: v.voucherNumber,
+        voucherType: v.voucherType,
+        voucherDate: v.voucherDate,
+        offBy: parseFloat(v.activeNet.toFixed(2)),
+        internalDiff,
+        reason: internallyBalanced
+          ? `Debits and credits inside this voucher DO match, but ${v.deadLegs} leg(s) post to a deleted/inactive ledger that the Trial Balance ignores — leaving ${Math.abs(
+              v.activeNet,
+            ).toFixed(
+              2,
+            )} stranded. Restore that ledger (set it active) or repost the voucher to an active ledger.`
+          : `Debits do not equal credits inside this voucher — off by ${internalDiff.toFixed(
+              2,
+            )}. Open it and correct the line amounts.`,
+      };
+    });
+
+    const voucherImbalanceTotal = parseFloat(
+      unbalancedVouchers.reduce((s, v) => s + v.offBy, 0).toFixed(2),
+    );
+    const accountedFor = parseFloat(
+      (openingImbalance + voucherImbalanceTotal).toFixed(2),
+    );
+
+    // ── Human-readable diagnosis ─────────────────────────────────────────
+    const lines = [];
+    if (unbalancedVouchers.length > 0)
+      lines.push(
+        `${unbalancedVouchers.length} voucher(s) contribute ${voucherImbalanceTotal.toFixed(
+          2,
+        )} to the imbalance — listed below; fix those first.`,
+      );
+    if (Math.abs(openingImbalance) >= 0.005)
+      lines.push(
+        `Active-ledger opening balances net to ${openingImbalance.toFixed(
+          2,
+        )} instead of 0 — this is baked into every Trial Balance. Usually rounding from the Tally opening-balance import; compare each ledger's opening to the Tally Trial Balance, or post a small rounding adjustment.`,
+      );
+    if (inactiveWithOpening.length > 0)
+      lines.push(
+        `${inactiveWithOpening.length} inactive ledger(s) still carry an opening balance — if one was deleted by mistake, restoring it may close the gap.`,
+      );
+    if (lines.length === 0)
+      lines.push(
+        "No internally-unbalanced vouchers and opening balances net to zero. Any residual difference is sub-paise float rounding across many ledgers — safe to absorb with a rounding ledger.",
+      );
+
+    res.json({
+      success: true,
+      cutoff,
+      diagnosis: lines.join(" "),
+      openingImbalance,
+      voucherImbalanceTotal,
+      // openingImbalance + voucherImbalanceTotal — should match the TB's diff.
+      accountedFor,
+      unbalancedVoucherCount: unbalancedVouchers.length,
+      unbalancedVouchers,
+      inactiveLedgersWithOpening: inactiveWithOpening.map((l) => ({
+        name: l.name,
+        openingBalance: parseFloat((l.openingBalance || 0).toFixed(2)),
+      })),
+    });
+  } catch (err) {
+    console.error("TB diagnose:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Exported so the approval executor (Acc_approvals.js) can replay an editor's
+// payroll post once an owner/approver approves it. Fetches the run + items and
+// runs the same posting the /post handler does. Idempotent (re-posting returns
+// the existing vouchers).
+async function postPayrollRunById(companyId, runId, options = {}) {
+  const HR = loadPayrollModels();
+  if (!HR) throw new Error("HR/Payroll module not available.");
+  const run = await HR.Payroll.findById(runId).lean();
+  if (!run) throw new Error("Payroll run not found");
+  const items = await HR.PayrollItem.find({ payrollId: runId }).lean();
+  if (!items.length) throw new Error("Payroll run has no items to post.");
+  return postPayrollRun(companyId, run, items, options);
+}
+
 module.exports = router;
+module.exports.postPayrollRunById = postPayrollRunById;

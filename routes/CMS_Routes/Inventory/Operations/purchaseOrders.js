@@ -346,7 +346,14 @@ router.get("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items", async (req, res) => {
   try {
-    const rawItems = await RawItem.find({})
+    const { search = "", limit = 50 } = req.query
+    const filter = search
+      ? { $or: [
+          { name: { $regex: search, $options: "i" } },
+          { sku:  { $regex: search, $options: "i" } }
+        ]}
+      : {}
+    const rawItems = await RawItem.find(filter).limit(parseInt(limit)).sort({ name: 1 })
       .select("name sku category customCategory unit customUnit description sellingPrice minStock maxStock quantity status")
       .lean()
       .sort({ name: 1 });

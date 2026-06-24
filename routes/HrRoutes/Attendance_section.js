@@ -281,10 +281,13 @@ function workingDaysInRange(from, to, weeklyOffDay = 0) {
 }
 function isEffectivelyPresent(entry) {
   if (!entry) return false;
+  const st = entry.hrFinalStatus || entry.systemPrediction;
+  // Half-day variants (P/CL, P/SL, P/PL, P/LWP) count as Present — the
+  // employee was physically there for half the day.
+  if (st === "P/CL" || st === "P/SL" || st === "P/PL" || st === "P/LWP")
+    return true;
   if (entry.inTime && entry.finalOut) return true;
-  return ["P", "P*", "P~"].includes(
-    entry.hrFinalStatus || entry.systemPrediction,
-  );
+  return ["P", "P*", "P~"].includes(st);
 }
 
 function designationMatches(designation, list) {
@@ -499,6 +502,10 @@ function getAttendanceValue(status) {
   if (!status) return 0;
   if (status === "HD" || status === "LHD") return 0.5;
   if (["AB", "LAB", "EAB", "LWP"].includes(status)) return 0;
+  // P/CL, P/SL, P/PL are FULLY paid (half-leave covers the missing half).
+  // P/LWP is half paid + half LOP → attendance value 0.5.
+  if (status === "P/LWP") return 0.5;
+  if (status === "P/CL" || status === "P/SL" || status === "P/PL") return 1;
   return 1;
 }
 
@@ -1485,6 +1492,25 @@ function startHourlyAttendanceSync() {
 
 const LEAVE_TYPE_TO_STATUS = { CL: "L-CL", SL: "L-SL", PL: "L-EL", LOP: "LWP" };
 const LEAVE_STATUS_MAP = { "L-CL": "CL", "L-SL": "SL", "L-EL": "PL" };
+// Half-day Present + Half-day Leave variants. Each consumes 0.5 from the
+// corresponding leave bucket. P/LWP is intentionally NOT here — it never
+// touches the leave balance (it deducts half a day's pay at payroll time).
+const HALF_LEAVE_STATUS_MAP = { "P/CL": "CL", "P/SL": "SL", "P/PL": "PL" };
+// All statuses where the employee was physically present (counted as P in stats).
+const HALF_PRESENT_STATUSES = new Set(["P/CL", "P/SL", "P/PL", "P/LWP"]);
+
+// Returns the leave-bucket deduction for a given status code.
+// Used by /day-override to compute deltas when a status changes.
+function leaveAmountForStatus(status) {
+  if (status === "L-CL") return { CL: 1 };
+  if (status === "L-SL") return { SL: 1 };
+  if (status === "L-EL") return { PL: 1 };
+  if (status === "P/CL") return { CL: 0.5 };
+  if (status === "P/SL") return { SL: 0.5 };
+  if (status === "P/PL") return { PL: 0.5 };
+  return {};
+}
+
 function isLeaveStatus(status) {
   return !!LEAVE_STATUS_MAP[status];
 }
@@ -1985,6 +2011,10 @@ const recomputeSummary = (emps) =>
     })),
   );
 function getDisplayLabel(rawStatus, settings) {
+  // Privilege Leave is stored under the legacy code "L-EL"; always surface it
+  // to users as "PL" regardless of any stale display-label setting. "L-PL" is
+  // accepted as a forward-compatible synonym.
+  if (rawStatus === "L-EL" || rawStatus === "L-PL") return "PL";
   return (settings?.displayLabels || {})[rawStatus] || rawStatus || "";
 }
 
@@ -2569,12 +2599,34 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
               ? "AB"
               : final;
         if (b.days[finalCount] !== undefined) b.days[finalCount]++;
-        if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(final))
+        if (
+          [
+            "L-CL",
+            "L-SL",
+            "L-EL",
+            "LWP",
+            "WFH",
+            "CO",
+            "P/CL",
+            "P/SL",
+            "P/PL",
+            "P/LWP",
+          ].includes(final)
+        )
           b.days.leaves++;
         if (agg[finalCount] !== undefined) agg[finalCount]++;
-        if (isEffectivelyPresent({ ...e, systemPrediction: final })) {
+        // Half-day variants (P/CL, P/SL, P/PL, P/LWP) count as Present.
+        if (
+          isEffectivelyPresent({ ...e, systemPrediction: final }) ||
+          HALF_PRESENT_STATUSES.has(final)
+        ) {
           b.effectivePresent++;
           agg.effectivePresent++;
+          if (HALF_PRESENT_STATUSES.has(final)) {
+            // Also bump the P counter so dashboard tiles look right.
+            b.days.P = (b.days.P || 0) + 1;
+            if (agg.P !== undefined) agg.P++;
+          }
         }
         const paidCodes = [
           "P",
@@ -2594,6 +2646,12 @@ router.get("/summary", EmployeeAuthMiddlewear, async (req, res) => {
           "L-EL",
           "WFH",
           "CO",
+          // Half-day variants — P/CL/P/SL/P/PL are fully paid, P/LWP is half-paid
+          // but we still credit it as "totalAttendance" since the person attended.
+          "P/CL",
+          "P/SL",
+          "P/PL",
+          "P/LWP",
         ];
         if (paidCodes.includes(final)) {
           b.totalAttendance++;
@@ -2702,8 +2760,7 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
       if (!["hr_approved", "withdraw_pending"].includes(lv.status)) continue;
       const lvMap = buildLeaveDateMap(lv, null);
       for (const [ds, code] of lvMap) {
-        if (!approvedLeaveByDate.has(ds))
-          approvedLeaveByDate.set(ds, code);
+        if (!approvedLeaveByDate.has(ds)) approvedLeaveByDate.set(ds, code);
       }
     }
 
@@ -2896,6 +2953,15 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
       if (["P", "P*", "P~", "MP", "WFH"].includes(effectiveStatus)) {
         stats.effectivePresent++;
         stats.totalAttendance++;
+      } else if (HALF_PRESENT_STATUSES.has(effectiveStatus)) {
+        // P/CL, P/SL, P/PL, P/LWP: counted as Present (employee was there for
+        // half the day). The half-leave or LWP is tracked separately in
+        // leave balances / payroll.
+        stats.effectivePresent++;
+        stats.totalAttendance++;
+        // Also reflect in the leaves counter for CL/SL/PL variants so the
+        // dashboard sub-counts line up.
+        if (effectiveStatus !== "P/LWP") stats.leaves++;
       } else if (effectiveStatus === "HD" || effectiveStatus === "LHD") {
         stats.totalAttendance++;
       } else if (
@@ -2914,7 +2980,10 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
           ? "HD"
           : effectiveStatus === "LAB" || effectiveStatus === "EAB"
             ? "AB"
-            : effectiveStatus;
+            : // Half-day variants count under P in the stats record.
+              HALF_PRESENT_STATUSES.has(effectiveStatus)
+              ? "P"
+              : effectiveStatus;
       if (stats[_countAs] !== undefined) stats[_countAs]++;
       if (promoted) stats.autoPromotedHDs++;
       stats.totalLateMins += entry.lateMins || 0;
@@ -3079,6 +3148,118 @@ router.post("/sync-period", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  GET /leave-balance-check — pre-flight check for P/CL, P/SL, P/PL overrides.
+//  Returns the employee's current leave-balance available and how many CL/SL/PL
+//  days (full + half) have already been used in the target month. The frontend
+//  uses this to show a soft warning when a half-leave override would push the
+//  balance below 0 or exceed the monthly cap.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/leave-balance-check", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { biometricId, dateStr } = req.query;
+    if (!biometricId || !dateStr)
+      return res.status(400).json({
+        success: false,
+        message: "biometricId and dateStr required",
+      });
+    const bid = String(biometricId).toUpperCase();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr))
+      return res.status(400).json({
+        success: false,
+        message: "dateStr must be YYYY-MM-DD",
+      });
+    const year = parseInt(dateStr.split("-")[0], 10);
+    const yearMonth = dateStr.slice(0, 7);
+
+    // Locate the employee. If not found, return zero balances so the UI can
+    // still render its warning correctly rather than 404.
+    const empDoc = await Employee.findOne({
+      $or: [
+        { biometricId: bid },
+        { "basicInfo.biometricId": bid },
+        { "workInfo.biometricId": bid },
+      ],
+    })
+      .select("_id biometricId")
+      .lean();
+
+    // Load config (for default entitlements + monthly cap).
+    let config;
+    try {
+      config = await getLeaveConfig().getConfig();
+    } catch (_) {
+      config = {
+        clPerYear: 5,
+        slPerYear: 5,
+        plPerYear: 18,
+        maxCLPerMonth: 3,
+      };
+    }
+    const monthlyCap = config.maxCLPerMonth ?? 3;
+
+    if (!empDoc) {
+      return res.json({
+        success: true,
+        data: {
+          available: { CL: 0, SL: 0, PL: 0 },
+          monthUsed: { CL: 0, SL: 0, PL: 0 },
+          monthlyCap,
+        },
+      });
+    }
+
+    const bal = await getLeaveBalance()
+      .findOne({ employeeId: empDoc._id, year })
+      .lean();
+
+    const clEnt = bal?.entitlement?.CL ?? config.clPerYear ?? 5;
+    const slEnt = bal?.entitlement?.SL ?? config.slPerYear ?? 5;
+    const plEnt = bal?.entitlement?.PL ?? config.plPerYear ?? 18;
+    const clCon = bal?.consumed?.CL ?? 0;
+    const slCon = bal?.consumed?.SL ?? 0;
+    const plCon = bal?.consumed?.PL ?? 0;
+
+    // Count this month's CL/SL/PL usage from DailyAttendance.
+    // Full-day codes contribute 1; half-day P/CL, P/SL, P/PL contribute 0.5.
+    // This is the most accurate per-month measure because LeaveBalance.consumed
+    // is yearly cumulative, not segmented by month.
+    const monthDocs = await DailyAttendance.find({ yearMonth })
+      .select("dateStr employees")
+      .lean();
+    const monthUsed = { CL: 0, SL: 0, PL: 0 };
+    for (const doc of monthDocs) {
+      const e = (doc.employees || []).find(
+        (x) => String(x.biometricId || "").toUpperCase() === bid,
+      );
+      if (!e) continue;
+      const st = e.hrFinalStatus || e.systemPrediction;
+      if (st === "L-CL") monthUsed.CL += 1;
+      else if (st === "L-SL") monthUsed.SL += 1;
+      else if (st === "L-EL") monthUsed.PL += 1;
+      else if (st === "P/CL") monthUsed.CL += 0.5;
+      else if (st === "P/SL") monthUsed.SL += 0.5;
+      else if (st === "P/PL") monthUsed.PL += 0.5;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        available: {
+          CL: Math.max(0, clEnt - clCon),
+          SL: Math.max(0, slEnt - slCon),
+          PL: Math.max(0, plEnt - plCon),
+        },
+        monthUsed,
+        monthlyCap,
+      },
+    });
+  } catch (err) {
+    console.error("[LEAVE-BAL-CHECK]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const {
@@ -3121,6 +3302,11 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
       "MP",
       "WFH",
       "CO",
+      // Half-day Present + Half-day Leave variants
+      "P/CL",
+      "P/SL",
+      "P/PL",
+      "P/LWP",
       null,
       "",
     ];
@@ -3319,32 +3505,112 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
       console.error("[DAY-OVERRIDE] Log error:", logErr.message);
     }
 
-    // Sync leaves
+    // ── Sync leaves (handles full-day L-CL/L-SL/L-EL AND half-day P/CL/P/SL/P/PL) ──
+    // We compute a per-bucket delta between oldStatus and newStatus and apply it
+    // in one save() — keeps the math clean for any transition (e.g. P/CL → P/SL,
+    // P/CL → L-CL, L-CL → P/CL, anything → P/LWP refund, etc).
+    // P/LWP is NOT in leaveAmountForStatus → contributes no balance change
+    // (its 0.5-day pay deduction is handled by the payroll engine).
+    //
+    // Two guard rails on the math:
+    //   • Math.max(0, …): consumed can never drop below 0 (refund safety)
+    //   • Math.min(entitlement, …): consumed can never exceed entitlement,
+    //     so an HR override on someone already at 5/5 CL stays at 5/5
+    //     instead of going to 6/5.
     try {
       const newEffective = emp.hrFinalStatus || emp.systemPrediction;
-      const LEAVE_STATUS_TO_TYPE = {
-        "L-CL": "CL",
-        "L-SL": "SL",
-        "L-EL": "PL",
-      };
-      const oldLeaveType = LEAVE_STATUS_TO_TYPE[oldStatus];
-      const newLeaveType = LEAVE_STATUS_TO_TYPE[newEffective];
-      if (oldLeaveType !== newLeaveType) {
-        const empRef = emp.employeeDbId || null;
+      const oldAmt = leaveAmountForStatus(oldStatus);
+      const newAmt = leaveAmountForStatus(newEffective);
+      const buckets = new Set([...Object.keys(oldAmt), ...Object.keys(newAmt)]);
+      if (buckets.size) {
+        // Resolve the LeaveBalance reference. Older DailyAttendance entries
+        // (and entries created by applyLeaveToAttendance before the schema
+        // added employeeDbId) often have employeeDbId unset — that silently
+        // skipped the balance update and is the root cause of CL refunds
+        // not appearing on HR override. Fall back to looking up Employee
+        // by biometricId so the sync never fails quietly.
+        let empRef = emp.employeeDbId || null;
+        if (!empRef) {
+          try {
+            const empDoc = await Employee.findOne({
+              $or: [
+                { biometricId: bid },
+                { "basicInfo.biometricId": bid },
+                { "workInfo.biometricId": bid },
+              ],
+            })
+              .select("_id")
+              .lean();
+            if (empDoc) {
+              empRef = empDoc._id;
+              // Persist on the entry so future overrides skip this lookup.
+              emp.employeeDbId = empDoc._id;
+              dayDoc.markModified("employees");
+              await dayDoc.save();
+            }
+          } catch (lookupErr) {
+            console.warn(
+              `[DAY-OVERRIDE] ${bid} ${dateStr}: Employee lookup failed:`,
+              lookupErr.message,
+            );
+          }
+        }
         const year = parseInt(dateStr.split("-")[0], 10);
         if (empRef) {
-          if (oldLeaveType) {
-            await getLeaveBalance().updateOne(
-              { employeeId: empRef, year },
-              { $inc: { [`consumed.${oldLeaveType}`]: -1 } },
+          let bal = await getLeaveBalance().findOne({
+            employeeId: empRef,
+            year,
+          });
+          if (!bal) {
+            // Create a fresh balance record with default entitlements.
+            let cfg;
+            try {
+              cfg = await getLeaveConfig().getConfig();
+            } catch (_) {
+              cfg = { clPerYear: 5, slPerYear: 5, plPerYear: 18 };
+            }
+            bal = await getLeaveBalance().create({
+              employeeId: empRef,
+              biometricId: bid,
+              year,
+              entitlement: {
+                CL: cfg.clPerYear || 5,
+                SL: cfg.slPerYear || 5,
+                PL: cfg.plPerYear || 18,
+              },
+              consumed: { CL: 0, SL: 0, PL: 0 },
+            });
+          }
+          let changed = false;
+          for (const k of buckets) {
+            const delta = (newAmt[k] || 0) - (oldAmt[k] || 0);
+            if (delta === 0) continue;
+            const ent = Number(bal.entitlement?.[k] || 0);
+            const before = Number(bal.consumed?.[k] || 0);
+            const proposed = before + delta;
+            // Clamp at both ends: floor=0 (refund safety),
+            // ceiling=entitlement (can't go to 6/5).
+            const capped = Math.max(0, Math.min(ent, proposed));
+            const wasCapped = delta > 0 && proposed > ent;
+            bal.consumed[k] = capped;
+            changed = true;
+            console.log(
+              `[DAY-OVERRIDE] ${bid} ${dateStr}: consumed.${k} ${before} → ${capped} ` +
+                `(delta=${delta}, proposed=${proposed}, entitlement=${ent}` +
+                `${wasCapped ? ", CAPPED at entitlement" : ""}, ` +
+                `oldStatus=${oldStatus}, newStatus=${newEffective})`,
             );
           }
-          if (newLeaveType) {
-            await getLeaveBalance().updateOne(
-              { employeeId: empRef, year },
-              { $inc: { [`consumed.${newLeaveType}`]: 1 } },
-            );
-          }
+          if (changed) await bal.save();
+        } else {
+          // empRef still null after fallback — log loudly so HR knows the
+          // balance update was skipped and can re-link the entry.
+          console.warn(
+            `[DAY-OVERRIDE] ${bid} ${dateStr}: no Employee record found, ` +
+              `BALANCE NOT UPDATED (oldStatus=${oldStatus}, ` +
+              `newStatus=${emp.hrFinalStatus || emp.systemPrediction}). ` +
+              `Check biometricId is set on the Employee document.`,
+          );
         }
       }
     } catch (leaveErr) {
@@ -3361,10 +3627,6 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. POST /punch-correction
-// ─────────────────────────────────────────────────────────────────────────────
 
 router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
   try {
@@ -3707,6 +3969,12 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       "L-EL",
       "WFH",
       "CO",
+      // Half-day Present + Half-day Leave variants — all paid (P/LWP only
+      // loses 0.5 day pay, but the day itself is still counted as attendance).
+      "P/CL",
+      "P/SL",
+      "P/PL",
+      "P/LWP",
     ];
     for (const emp of filteredActive) {
       const bid = extractBiometricId(emp);
@@ -3858,13 +4126,36 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
             ? "HD"
             : finalStatus === "LAB" || finalStatus === "EAB"
               ? "AB"
-              : finalStatus;
+              : // Half-day variants count as Present in the P column.
+                finalStatus === "P/CL" ||
+                  finalStatus === "P/SL" ||
+                  finalStatus === "P/PL" ||
+                  finalStatus === "P/LWP"
+                ? "P"
+                : finalStatus;
         if (row.totals[_mr_countAs] !== undefined) row.totals[_mr_countAs]++;
-        if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(finalStatus))
+        if (
+          [
+            "L-CL",
+            "L-SL",
+            "L-EL",
+            "LWP",
+            "WFH",
+            "CO",
+            "P/CL",
+            "P/SL",
+            "P/PL",
+            "P/LWP",
+          ].includes(finalStatus)
+        )
           row.totals.leaves++;
         if (PAID_CODES.includes(finalStatus)) row.totals.totalAttendance++;
         if (
           ["P", "P*", "P~"].includes(finalStatus) ||
+          finalStatus === "P/CL" ||
+          finalStatus === "P/SL" ||
+          finalStatus === "P/PL" ||
+          finalStatus === "P/LWP" ||
           (entry.inTime && entry.finalOut)
         )
           row.totals.effectivePresent++;
@@ -3906,9 +4197,28 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
             ? "HD"
             : d.status === "LAB" || d.status === "EAB"
               ? "AB"
-              : d.status;
+              : // Half-day variants → counted under P in the day totals.
+                d.status === "P/CL" ||
+                  d.status === "P/SL" ||
+                  d.status === "P/PL" ||
+                  d.status === "P/LWP"
+                ? "P"
+                : d.status;
         if (t[_dts] !== undefined) t[_dts]++;
-        if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(d.status))
+        if (
+          [
+            "L-CL",
+            "L-SL",
+            "L-EL",
+            "LWP",
+            "WFH",
+            "CO",
+            "P/CL",
+            "P/SL",
+            "P/PL",
+            "P/LWP",
+          ].includes(d.status)
+        )
           t.leaves++;
         t.total++;
       }
@@ -4035,8 +4345,20 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
       if (g !== 0) return g;
       return (a.name || "").localeCompare(b.name || "");
     });
-    const PRESENT_CODES = ["P", "P*", "P~"],
-      LEAVE_CODES = ["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"],
+    const PRESENT_CODES = ["P", "P*", "P~", "P/CL", "P/SL", "P/PL", "P/LWP"],
+      LEAVE_CODES = [
+        "L-CL",
+        "L-SL",
+        "L-EL",
+        "LWP",
+        "WFH",
+        "CO",
+        // Half-day variants — counted in both present (above) and leave so
+        // both the manpower count and the leave bucket reflect them.
+        "P/CL",
+        "P/SL",
+        "P/PL",
+      ],
       OFF_CODES = ["WO", "FH", "NH", "OH", "RH", "PH"];
     const counterTemplate = () => ({
       total: 0,
@@ -4765,32 +5087,96 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
 
 router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    const { yearMonth, department } = req.query;
-    if (!yearMonth)
-      return res
-        .status(400)
-        .json({ success: false, message: "yearMonth required" });
-    const [yr, mo] = yearMonth.split("-").map(Number);
-    const lastDay = new Date(yr, mo, 0).getDate(),
-      from = `${yearMonth}-01`,
-      to = `${yearMonth}-${String(lastDay).padStart(2, "0")}`;
-    const monthLabel = new Date(from + "T00:00:00")
-      .toLocaleDateString("en-IN", { month: "long", year: "numeric" })
-      .toUpperCase();
+    const { yearMonth, from: qFrom, to: qTo, department } = req.query;
+
+    // Accept EITHER `yearMonth` (single-month, backward-compatible) OR
+    // `from` + `to` (arbitrary date range). This lets the UI export any
+    // period — last month, this quarter, custom ranges, etc.
+    let from, to;
+    if (qFrom && qTo) {
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(qFrom) ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(qTo)
+      )
+        return res.status(400).json({
+          success: false,
+          message: "from and to must be YYYY-MM-DD",
+        });
+      if (qTo < qFrom)
+        return res.status(400).json({
+          success: false,
+          message: "`to` must be on or after `from`",
+        });
+      from = qFrom;
+      to = qTo;
+    } else if (yearMonth) {
+      if (!/^\d{4}-\d{2}$/.test(yearMonth))
+        return res.status(400).json({
+          success: false,
+          message: "yearMonth must be YYYY-MM",
+        });
+      const [yr0, mo0] = yearMonth.split("-").map(Number);
+      const last = new Date(yr0, mo0, 0).getDate();
+      from = `${yearMonth}-01`;
+      to = `${yearMonth}-${String(last).padStart(2, "0")}`;
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "yearMonth OR from+to required",
+      });
+    }
+
+    // Build a friendly title: full month name for single-month ranges,
+    // human-readable "DD MMM YYYY → DD MMM YYYY" for everything else.
+    const fromDt0 = new Date(from + "T00:00:00");
+    const toDt0 = new Date(to + "T00:00:00");
+    const sameMonth =
+      fromDt0.getFullYear() === toDt0.getFullYear() &&
+      fromDt0.getMonth() === toDt0.getMonth();
+    const isFullMonth =
+      sameMonth &&
+      from.endsWith("-01") &&
+      to ===
+        `${to.slice(0, 7)}-${String(
+          new Date(toDt0.getFullYear(), toDt0.getMonth() + 1, 0).getDate(),
+        ).padStart(2, "0")}`;
+    const monthLabel = isFullMonth
+      ? fromDt0
+          .toLocaleDateString("en-IN", { month: "long", year: "numeric" })
+          .toUpperCase()
+      : `${fromDt0
+          .toLocaleDateString("en-IN", {
+            day: "numeric",
+            month: "short",
+            year: "numeric",
+          })
+          .toUpperCase()}  →  ${toDt0
+          .toLocaleDateString("en-IN", {
+            day: "numeric",
+            month: "short",
+            year: "numeric",
+          })
+          .toUpperCase()}`;
+
     const settings = await AttendanceSettings.getConfig();
     const holidayMap = await loadHolidayMap(from, to);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+
+    // Build allDays as a contiguous list of dates from `from` to `to`
+    // (inclusive). Works for any range length and across month boundaries.
     const allDays = [];
-    for (let d = 1; d <= lastDay; d++) {
-      const dateStr = `${yearMonth}-${String(d).padStart(2, "0")}`,
-        dt = new Date(dateStr + "T00:00:00"),
-        dow = dt.getDay();
+    const _cur = new Date(from + "T00:00:00");
+    const _end = new Date(to + "T00:00:00");
+    while (_cur <= _end) {
+      const dateStr = dateStrOf(_cur);
+      const dt = new Date(dateStr + "T00:00:00");
+      const dow = dt.getDay();
       const hol = holidayMap.get(dateStr),
         isDeclaredHoliday = !!hol && hol.type !== "working_sunday",
         isWorkingSunday = !!hol && hol.type === "working_sunday";
       allDays.push({
-        day: d,
+        day: dt.getDate(),
         dateStr,
         dayAbbr: dt
           .toLocaleDateString("en-IN", { weekday: "short" })
@@ -4804,7 +5190,16 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         holidayStatus: isDeclaredHoliday ? holidayTypeToStatus(hol.type) : null,
         holidayName: isDeclaredHoliday ? hol.name : null,
       });
+      _cur.setDate(_cur.getDate() + 1);
     }
+    // Number of day columns we'll render. Replaces the old `lastDay`
+    // which was the # of days in a single month.
+    const lastDay = allDays.length;
+    // "Total Days" must reflect only the days that have actually occurred. In
+    // an in-progress month the trailing future dates are still rendered as
+    // blank day-columns (so they're part of lastDay), but they must NOT be
+    // counted as worked/paid days. elapsedDays = non-future days in the range.
+    const elapsedDays = allDays.filter((c) => !c.isFuture).length;
     function toSheetCode(status) {
       const map = {
         P: "P",
@@ -4828,6 +5223,14 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         FH: "FH",
         NH: "NH",
         PH: "FH",
+        // Half-day Present + Half-day Leave variants — show the literal
+        // code in the muster-roll cell so HR can see at a glance which
+        // half-leave was applied. These still count as Present for the
+        // P column total (see counter logic below).
+        "P/CL": "P/CL",
+        "P/SL": "P/SL",
+        "P/PL": "P/PL",
+        "P/LWP": "P/LWP",
       };
       return map[status] || "";
     }
@@ -4842,14 +5245,21 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
         : allActive;
-    const dayDocs = await DailyAttendance.find({ yearMonth })
+    // Query the attendance docs by date range so this works for any
+    // span (single month, last quarter, custom range, etc.).
+    const dayDocs = await DailyAttendance.find({
+      dateStr: { $gte: from, $lte: to },
+    })
       .sort({ dateStr: 1 })
       .lean();
     const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
 
     // ── Build promotion map: replay applyLateCountPromotion across the ──
-    // full month in date order so LHD/LAB/EAB show up in the export just
-    // like they do in the /daily and /summary API routes.
+    // range in date order so LHD/LAB/EAB show up in the export just like
+    // they do in the /daily and /summary API routes.
+    // The late/early counters reset every month — without that reset, a
+    // multi-month range (e.g. "Last Quarter") would carry running counts
+    // across month boundaries and over-promote statuses.
     // Structure: Map<biometricId(upper), Map<dateStr, "LHD"|"LAB"|"EAB">>
     const promotionMap = new Map();
     const _exportPolicy = settings.lateHalfDayPolicy;
@@ -4857,8 +5267,13 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       const _nowIST = new Date(Date.now() + 330 * 60 * 1000);
       const _todayStr = `${_nowIST.getUTCFullYear()}-${String(_nowIST.getUTCMonth() + 1).padStart(2, "0")}-${String(_nowIST.getUTCDate()).padStart(2, "0")}`;
       const _running = new Map(); // biometricId → { lateCount, earlyCount }
+      let _lastYM = null;
       for (const doc of dayDocs) {
         // already sorted by dateStr asc
+        if (doc.yearMonth !== _lastYM) {
+          _running.clear();
+          _lastYM = doc.yearMonth;
+        }
         for (const e of doc.employees || []) {
           const _bid = String(e.biometricId || "").toUpperCase();
           if (!_bid) continue;
@@ -4901,6 +5316,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           PL: 0,
           NHFH: 0,
           Total: 0,
+          TotalWorking: 0,
         },
       };
       for (const cal of allDays) {
@@ -4927,19 +5343,45 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           )
             row.hrOverrides.add(cal.dateStr);
         } else if (cal.isSunday && !cal.isWorkingSunday) {
-          const didPunch = !!entry && (entry.punchCount || 0) > 0;
-          if (didPunch) {
-            const finalStatus = entry.hrFinalStatus || entry.systemPrediction;
-            sheetCode = toSheetCode(finalStatus) || "P";
-            row.totals.P++;
-            if (
-              entry.hrFinalStatus ||
-              (entry.rawPunches || []).some(
-                (p) => p.source === "manual" || p.source === "miss_punch",
-              )
-            )
-              row.hrOverrides.add(cal.dateStr);
+          // Weekly off counts as WO for EVERY employee, so the WO total is the
+          // same across the whole sheet regardless of who punched on a Sunday.
+          // A worked Sunday is NOT auto-credited as Present — if the company
+          // wants to pay for it, HR manually overrides that day (e.g. to CO /
+          // comp-off) and that override is honored below.
+          const sundayOverride = entry?.hrFinalStatus || null;
+          if (sundayOverride) {
+            sheetCode = toSheetCode(sundayOverride) || "WO";
+            row.hrOverrides.add(cal.dateStr);
+            if (["P", "P*", "P~", "MP", "WFH"].includes(sundayOverride))
+              row.totals.P++;
+            else if (sundayOverride === "CO") row.totals.CO++;
+            else if (sundayOverride === "HD" || sundayOverride === "LHD")
+              row.totals.HD++;
+            else if (sundayOverride === "L-CL") row.totals.CL++;
+            else if (sundayOverride === "L-SL") row.totals.SL++;
+            else if (sundayOverride === "L-EL") row.totals.PL++;
+            else if (sundayOverride === "P/CL") {
+              row.totals.P++;
+              row.totals.CL = (row.totals.CL || 0) + 0.5;
+            } else if (sundayOverride === "P/SL") {
+              row.totals.P++;
+              row.totals.SL = (row.totals.SL || 0) + 0.5;
+            } else if (sundayOverride === "P/PL") {
+              row.totals.P++;
+              row.totals.PL = (row.totals.PL || 0) + 0.5;
+            } else if (sundayOverride === "P/LWP") {
+              row.totals.P++;
+              row.totals.A = (row.totals.A || 0) + 0.5;
+            } else if (["AB", "LWP", "LAB", "EAB"].includes(sundayOverride))
+              row.totals.A++;
+            else if (["FH", "NH", "OH", "RH", "PH"].includes(sundayOverride))
+              row.totals.NHFH++;
+            else {
+              sheetCode = "WO";
+              row.totals.WO++;
+            }
           } else {
+            // No override → plain weekly off, counted for everyone.
             sheetCode = "WO";
             row.totals.WO++;
           }
@@ -4976,12 +5418,35 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           else if (finalStatus === "L-CL") row.totals.CL++;
           else if (finalStatus === "L-SL") row.totals.SL++;
           else if (finalStatus === "L-EL") row.totals.PL++;
-          else if (["FH", "NH", "OH", "RH", "PH"].includes(finalStatus))
+          // Half-day variants: P counter gets +1 (person was present), AND
+          // 0.5 is logged to the relevant leave bucket (or A for P/LWP) so
+          // the salary register totals reflect partial leave usage / pay loss.
+          else if (finalStatus === "P/CL") {
+            row.totals.P++;
+            row.totals.CL = (row.totals.CL || 0) + 0.5;
+          } else if (finalStatus === "P/SL") {
+            row.totals.P++;
+            row.totals.SL = (row.totals.SL || 0) + 0.5;
+          } else if (finalStatus === "P/PL") {
+            row.totals.P++;
+            row.totals.PL = (row.totals.PL || 0) + 0.5;
+          } else if (finalStatus === "P/LWP") {
+            row.totals.P++;
+            row.totals.A = (row.totals.A || 0) + 0.5;
+          } else if (["FH", "NH", "OH", "RH", "PH"].includes(finalStatus))
             row.totals.NHFH++;
         }
         row.dayCodes[cal.dateStr] = sheetCode;
       }
-      row.totals.Total = lastDay - row.totals.A;
+      // "Total Days" = calendar days in the period that have actually elapsed
+      //   (future days of an in-progress month are excluded so they don't
+      //   inflate the count).
+      // "Total Working Days" = elapsed days minus full absences minus half of
+      //   each half-day. row.totals.A already includes the 0.5 contributed by
+      //   each P/LWP, so its unpaid half is deducted automatically.
+      row.totals.Total = elapsedDays;
+      row.totals.TotalWorking =
+        elapsedDays - row.totals.A - row.totals.HD * 0.5;
       return row;
     }
     const processedBids = new Set();
@@ -5045,7 +5510,8 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     ws.getColumn(2).width = 24;
     ws.getColumn(3).width = 14;
     ws.getColumn(4).width = 20;
-    for (let d = 1; d <= lastDay; d++) ws.getColumn(4 + d).width = 4;
+    // Day columns: bumped from 4 → 5.5 so P/CL, P/SL, P/PL, P/LWP fit cleanly.
+    for (let d = 1; d <= lastDay; d++) ws.getColumn(4 + d).width = 5.5;
     const sumStart = 4 + lastDay + 1;
     const sumCols = [
       "P",
@@ -5058,9 +5524,10 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       "PL",
       "NH/FH",
       "Total Days",
+      "Total Working Days",
     ];
     sumCols.forEach((_, i) => {
-      ws.getColumn(sumStart + i).width = 7;
+      ws.getColumn(sumStart + i).width = i >= sumCols.length - 2 ? 11 : 7;
     });
     const totalCols = 4 + lastDay + sumCols.length;
     ws.mergeCells(1, 1, 1, totalCols);
@@ -5080,17 +5547,40 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       bottom: { style: "thin" },
     };
     ws.getRow(1).height = 22;
-    ws.mergeCells(2, 1, 2, Math.min(totalCols - 3, 30));
-    const legendCell = ws.getCell(2, 1);
-    legendCell.value =
-      "P = Present\t\tA= Absent\t\tHD = Half Day\t\tWO = Week Off\t\tCL = Casual Leave\t\tSL = Sick Leave\t\tPL = Privilege Leave\t\t[ Purple border = HR Override ]";
-    legendCell.font = { name: "Arial", size: 8 };
-    legendCell.alignment = { vertical: "middle" };
-    ws.getRow(2).height = 14;
+
+    // ── Row 2: legend on left, optional holiday note on right ─────────────
+    // For narrow ranges (e.g. a 10-day custom export) the legend + note
+    // can overlap if we don't coordinate the bounds. We compute the note's
+    // start column first, then bound the legend's end at (noteStart - 1)
+    // so the two merges can never collide.
     const holidays = [...holidayMap.values()]
       .filter((h) => h.type !== "working_sunday")
       .sort((a, b) => a.date.localeCompare(b.date));
-    if (holidays.length > 0) {
+    const hasHolidayNote = holidays.length > 0;
+
+    // Holiday note wants ~10 cols on the right (mirrors original layout).
+    // For very narrow exports, fall back to fewer cols — never fewer than 1.
+    let noteStart = totalCols + 1; // off-sheet → "no note"
+    if (hasHolidayNote) {
+      const desiredNoteWidth = Math.min(10, Math.max(1, totalCols - 5));
+      noteStart = Math.max(2, totalCols - desiredNoteWidth + 1);
+    }
+    // Legend extends from col 1 to either (noteStart - 1) or totalCols.
+    const legendEnd = hasHolidayNote
+      ? Math.max(1, noteStart - 1)
+      : Math.min(totalCols, 30);
+
+    if (legendEnd >= 1) {
+      if (legendEnd > 1) ws.mergeCells(2, 1, 2, legendEnd);
+      const legendCell = ws.getCell(2, 1);
+      legendCell.value =
+        "P = Present\t\tA= Absent\t\tHD = Half Day\t\tWO = Week Off\t\tCL = Casual Leave\t\tSL = Sick Leave\t\tPL = Privilege Leave\t\tP/CL · P/SL · P/PL = Half Present + Half Leave\t\tP/LWP = Half Present + Half LWP\t\t[ Purple border = HR Override ]";
+      legendCell.font = { name: "Arial", size: 8 };
+      legendCell.alignment = { vertical: "middle" };
+    }
+    ws.getRow(2).height = 14;
+
+    if (hasHolidayNote && noteStart <= totalCols) {
       const h = holidays[0];
       const [y2, m2, d2] = h.date.split("-").map(Number);
       const ordinals = [
@@ -5130,12 +5620,8 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       const mn = new Date(h.date + "T00:00:00").toLocaleDateString("en-IN", {
         month: "long",
       });
-      const noteCol = Math.max(
-        Math.min(totalCols - sumCols.length + 1, totalCols - 2),
-        1,
-      );
-      ws.mergeCells(2, noteCol, 2, totalCols);
-      const noteCell = ws.getCell(2, noteCol);
+      if (noteStart < totalCols) ws.mergeCells(2, noteStart, 2, totalCols);
+      const noteCell = ws.getCell(2, noteStart);
       noteCell.value = `${ordinals[d2]} ${mn} ${y2}\t\t${h.name}`;
       noteCell.font = { name: "Arial", size: 8, italic: true };
       noteCell.alignment = { horizontal: "right", vertical: "middle" };
@@ -5241,6 +5727,12 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       PL: { font: "FF5C2B9C", fill: "FFEDDBFF" },
       FH: { font: "FF1F4E79", fill: "FFDCE6F1" },
       NH: { font: "FF7B1E46", fill: "FFFCE4EC" },
+      // Half-day variants — purple tint like CL/SL/PL for the leave-balance
+      // variants, rose for P/LWP since it's a pay deduction.
+      "P/CL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+      "P/SL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+      "P/PL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
+      "P/LWP": { font: "FF9C0006", fill: "FFFFE0E0" },
       "": { font: "FFAAAAAA", fill: null },
     };
     const colTotals = new Array(totalCols + 1).fill(0);
@@ -5325,7 +5817,9 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       const vals = [
         emp.totals.P,
         emp.totals.A,
-        emp.totals.HD,
+        // HD is stored as a count of half-days; display it in DAY units so
+        // 1 HD → 0.5, 2 → 1, 3 → 1.5, etc. (a half-day is half a day).
+        emp.totals.HD * 0.5,
         emp.totals.WO,
         emp.totals.CO,
         emp.totals.CL,
@@ -5333,17 +5827,22 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         emp.totals.PL,
         emp.totals.NHFH,
         emp.totals.Total,
+        emp.totals.TotalWorking,
       ];
       vals.forEach((v, si) => {
         const cell = r.getCell(sumStart + si);
         cell.value = v;
-        cell.font = { name: "Arial", size: 9, bold: si === sumCols.length - 1 };
+        cell.font = {
+          name: "Arial",
+          size: 9,
+          bold: si >= sumCols.length - 2,
+        };
         cell.alignment = { horizontal: "center", vertical: "middle" };
         const altBg = i % 2 === 0 ? "FFFFFFFF" : "FFF8F9FA";
         cell.fill = {
           type: "pattern",
           pattern: "solid",
-          fgColor: { argb: si === sumCols.length - 1 ? "FFF4B942" : altBg },
+          fgColor: { argb: si >= sumCols.length - 2 ? "FFF4B942" : altBg },
         };
         cell.border = {
           top: { style: "thin" },
@@ -5375,9 +5874,18 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
     allDays.forEach((cal, di) => {
       const cell = totRow.getCell(5 + di);
       if (!cal.isFuture) {
-        const cnt = employees.filter(
-          (e) => e.dayCodes[cal.dateStr] === "P",
-        ).length;
+        // Count every cell that represents the employee as Present for
+        // that day — plain "P" plus the half-day variants.
+        const cnt = employees.filter((e) => {
+          const c = e.dayCodes[cal.dateStr];
+          return (
+            c === "P" ||
+            c === "P/CL" ||
+            c === "P/SL" ||
+            c === "P/PL" ||
+            c === "P/LWP"
+          );
+        }).length;
         cell.value = cnt || 0;
       } else {
         cell.value = 0;
@@ -5421,7 +5929,11 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       };
     });
     const buffer = await wb.xlsx.writeBuffer();
-    const filename = `attendance_${yearMonth}${department && department !== "all" ? `_${department}` : ""}.xlsx`;
+    const _deptSuffix =
+      department && department !== "all" ? `_${department}` : "";
+    const filename = isFullMonth
+      ? `attendance_${from.slice(0, 7)}${_deptSuffix}.xlsx`
+      : `attendance_${from}_to_${to}${_deptSuffix}.xlsx`;
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -5475,8 +5987,7 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
       if (!["hr_approved", "withdraw_pending"].includes(lv.status)) continue;
       const lvMap = buildLeaveDateMap(lv, null);
       for (const [ds, code] of lvMap) {
-        if (!approvedLeaveByDate.has(ds))
-          approvedLeaveByDate.set(ds, code);
+        if (!approvedLeaveByDate.has(ds)) approvedLeaveByDate.set(ds, code);
       }
     }
     const start = new Date(from + "T00:00:00"),
@@ -5638,8 +6149,26 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
       if (isEffectivelyPresent({ ...entry, systemPrediction: finalStatus }))
         stats.effectivePresent++;
       if (stats[finalStatus] !== undefined) stats[finalStatus]++;
-      if (["L-CL", "L-SL", "L-EL", "LWP", "WFH", "CO"].includes(finalStatus))
+      // Bump leaves counter for full-day leave codes AND half-day CL/SL/PL
+      // variants (P/LWP intentionally excluded — it's a pay-deduction, not leave).
+      if (
+        [
+          "L-CL",
+          "L-SL",
+          "L-EL",
+          "LWP",
+          "WFH",
+          "CO",
+          "P/CL",
+          "P/SL",
+          "P/PL",
+        ].includes(finalStatus)
+      )
         stats.leaves++;
+      // Bump the P counter for half-day variants since they count as Present.
+      if (HALF_PRESENT_STATUSES.has(finalStatus)) {
+        stats.P = (stats.P || 0) + 1;
+      }
       const paidCodes = [
         "P",
         "P*",
@@ -5656,6 +6185,12 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
         "L-EL",
         "WFH",
         "CO",
+        // Half-day variants are paid days (P/LWP loses only 0.5 day's pay
+        // but is still counted as attendance for monthly totals).
+        "P/CL",
+        "P/SL",
+        "P/PL",
+        "P/LWP",
       ];
       if (paidCodes.includes(finalStatus)) stats.totalAttendance++;
       stats.totalLateMins += entry.lateMins || 0;

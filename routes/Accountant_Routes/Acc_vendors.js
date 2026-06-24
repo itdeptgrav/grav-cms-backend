@@ -1,4 +1,4 @@
-// routes/Accountant_Routes/Acc_vendors.js - UPDATED WITH CORRECT MIDDLEWARE
+// routes/Accountant_Routes/Acc_vendors.js
 
 const express = require("express");
 const router = express.Router();
@@ -15,12 +15,7 @@ const {
 } = require("../../models/Accountant_model/Acc_MasterModels");
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IMPORTED PARTY BRIDGE — Sundry Creditors from a Tally import shown here
-// alongside CMS vendors, with spend/paid/outstanding from posted vouchers.
-// A creditor's natural balance is a CREDIT (we owe them):
-//   totalPayables ≈ total Credit posted (bills raised against us)
-//   totalPaid     ≈ total Debit posted (payments we made)
-//   outstanding   = abs(signed closing) (net still owed)
+// IMPORTED PARTY BRIDGE — Sundry Creditors from a Tally import
 // ─────────────────────────────────────────────────────────────────────────────
 async function importedVendorRows(companyId) {
   const Acc_Company =
@@ -44,10 +39,12 @@ async function importedVendorRows(companyId) {
     if (comp) cId = comp._id;
   }
   if (!cId) return [];
+
   const groups = await Acc_Group.find({ companyId: cId })
     .select("_id name parent parentName")
     .lean();
   if (!groups.length) return [];
+
   const rx = /sundry creditor/i;
   const ids = new Set(
     groups.filter((g) => rx.test(g.name || "")).map((g) => String(g._id)),
@@ -73,23 +70,23 @@ async function importedVendorRows(companyId) {
   }
   if (!ids.size) return [];
   const gIds = [...ids].map((s) => new mongoose.Types.ObjectId(s));
+
   const ledgers = await Acc_Ledger.find({
     companyId: cId,
     groupId: { $in: gIds },
     isActive: { $ne: false },
-    // Skip ledgers already linked to a CMS Vendor — they're not
-    // separate imported vendors, they're the vendor's accounting ledger.
-    // Without this, a merged/relinked ghost keeps re-appearing as a
-    // ghost in an infinite detection loop.
+    // Skip ledgers already linked to a CMS Vendor — those are the keeper's
+    // ledger after a merge, not separate ghost rows.
     linkedVendorId: { $in: [null, undefined] },
   })
     .select(
       "name gstin aliases groupName openingBalance openingBalanceType email phone isActive linkedVendorId",
     )
     .lean();
-  // Also filter out any that slipped through (schema default might not set the field)
+
   const filteredLedgers = ledgers.filter((l) => !l.linkedVendorId);
   if (!filteredLedgers.length) return [];
+
   const ledgerIds = filteredLedgers.map((l) => l._id);
   const agg = await Acc_Voucher.aggregate([
     { $match: { companyId: cId, status: "posted" } },
@@ -121,6 +118,7 @@ async function importedVendorRows(companyId) {
     },
   ]);
   const m = new Map(agg.map((a) => [String(a._id), a]));
+
   return filteredLedgers.map((l) => {
     const a = m.get(String(l._id)) || {};
     const dr = a.dr || 0;
@@ -128,19 +126,12 @@ async function importedVendorRows(companyId) {
     const openSigned =
       (l.openingBalanceType === "Cr" ? -1 : 1) *
       Math.abs(l.openingBalance || 0);
-    // closingSigned: Tally-signed net (Dr +, Cr −). This is the SAME basis
-    // the Balance Sheet uses, so the figures reconcile exactly.
     const closingSigned = openSigned + dr - cr;
-    // For a creditor:
-    //   net CREDIT (closingSigned < 0) → we still owe them  → outstanding
-    //   net DEBIT  (closingSigned > 0) → advance/overpaid    → no payable
-    // We surface the NET only (not misleading gross spend/paid splits,
-    // which were wrong and didn't tie to Tally).
     const owed = closingSigned < 0 ? Math.abs(closingSigned) : 0;
     const advance = closingSigned > 0 ? closingSigned : 0;
     return {
       id: l._id,
-      ledgerId: l._id, // Acc_Ledger _id — used for View → Ledger link
+      ledgerId: l._id,
       isImported: true,
       source: "tally_ledger",
       vendorId: `VEN-${l._id.toString().substring(18, 24).toUpperCase()}`,
@@ -151,7 +142,6 @@ async function importedVendorRows(companyId) {
       company: l.name,
       type: "Imported (Tally)",
       currency: "INR",
-      // "Total Spend" = net business with this party = closing magnitude.
       totalPayables: parseFloat(Math.abs(closingSigned).toFixed(2)),
       outstandingPayables: parseFloat(owed.toFixed(2)),
       advanceToVendor: parseFloat(advance.toFixed(2)),
@@ -174,8 +164,6 @@ async function importedVendorRows(companyId) {
         country: "India",
       },
       totalPOs: a.totalPOs || 0,
-      // "Paid" column: we don't fabricate a gross paid for imported
-      // ledgers (it was wrong). Show the advance if any, else 0.
       totalPaid: parseFloat(advance.toFixed(2)),
       aliases: l.aliases || [],
       groupName: l.groupName || null,
@@ -185,7 +173,6 @@ async function importedVendorRows(companyId) {
   });
 }
 
-// Normalised name for ghost-duplicate detection against CMS vendors.
 function normalizePartyName(s) {
   return String(s || "")
     .toLowerCase()
@@ -202,29 +189,23 @@ function normalizePartyName(s) {
 // Apply accountant auth middleware to all routes
 router.use(AccountantAuthMiddleware.accountantAuth);
 
-// ✅ GET all vendors with financial stats
+// ─────────────────────────────────────────────────────────────────────────────
+// GET / — All vendors with financial stats
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
     const { search = "", status } = req.query;
 
     let filter = {};
-
     if (search) {
-      // Support searching by vendor code (VEN-XXXXXX)
       const vendorCodeMatch = search.match(/^VEN-?([A-Fa-f0-9]{4,12})$/i);
       if (vendorCodeMatch) {
-        // Vendor code is derived from last 6 chars of ObjectId
-        // Find vendors whose _id ends with these hex chars
         const suffix = vendorCodeMatch[1].toLowerCase();
         const allVendorsRaw = await Vendor.find(filter).select("_id").lean();
         const matchingIds = allVendorsRaw
           .filter((v) => v._id.toString().endsWith(suffix))
           .map((v) => v._id);
-        if (matchingIds.length > 0) {
-          filter._id = { $in: matchingIds };
-        } else {
-          filter._id = null; // no match — will return empty
-        }
+        filter._id = matchingIds.length > 0 ? { $in: matchingIds } : null;
       } else {
         filter.$or = [
           { companyName: { $regex: search, $options: "i" } },
@@ -235,10 +216,7 @@ router.get("/", async (req, res) => {
         ];
       }
     }
-
-    if (status && status !== "all") {
-      filter.status = status;
-    }
+    if (status && status !== "all") filter.status = status;
 
     const vendors = await Vendor.find(filter)
       .select(
@@ -246,8 +224,6 @@ router.get("/", async (req, res) => {
       )
       .sort({ companyName: 1 });
 
-    // Get financial statistics for each vendor — from BOTH PurchaseOrders
-    // AND Acc_Voucher (accounting data from Tally imports / merged ghosts).
     const vendorsWithStats = await Promise.all(
       vendors.map(async (vendor) => {
         const purchaseOrders = await PurchaseOrder.find({
@@ -255,7 +231,6 @@ router.get("/", async (req, res) => {
           status: { $in: ["ISSUED", "PARTIALLY_RECEIVED", "COMPLETED"] },
         });
 
-        // PO-based stats
         let totalPayables = 0;
         let outstandingPayables = 0;
         let totalPaid = 0;
@@ -264,16 +239,16 @@ router.get("/", async (req, res) => {
         purchaseOrders.forEach((po) => {
           totalPayables += po.totalAmount || 0;
           const poPaid =
-            po.payments?.reduce(
-              (sum, payment) => sum + (payment.amount || 0),
-              0,
-            ) || 0;
+            po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
           totalPaid += poPaid;
           outstandingPayables += (po.totalAmount || 0) - poPaid;
         });
 
-        // Acc_Voucher-based stats (from Tally imports / merged data).
-        // Find the vendor's linked Acc_Ledger and pull voucher totals.
+        // ── Acc_Voucher-based stats (from Tally imports / merged data) ────────
+        // FIX: compute balance from ledgerEntries aggregation instead of
+        // vendorLedger.currentBalance (which is often stale or zero).
+        // This matches the same method importedVendorRows uses, so figures
+        // reconcile with the Balance Sheet and ledger detail page.
         let vendorLedger = null;
         try {
           vendorLedger = await Acc_Ledger.findOne({
@@ -292,41 +267,57 @@ router.get("/", async (req, res) => {
             }).lean();
           }
           if (vendorLedger) {
-            const voucherAgg = await Acc_Voucher.aggregate([
-              { $match: { partyLedgerId: vendorLedger._id, status: "posted" } },
+            // Aggregate Dr/Cr from ledger entries — reliable even when
+            // currentBalance hasn't been recalculated after a merge.
+            const ledgerAgg = await Acc_Voucher.aggregate([
+              { $match: { status: "posted" } },
+              { $unwind: "$ledgerEntries" },
+              { $match: { "ledgerEntries.ledgerId": vendorLedger._id } },
               {
                 $group: {
                   _id: null,
-                  count: { $sum: 1 },
-                  totalDebit: { $sum: "$totalDebit" },
-                  totalCredit: { $sum: "$totalCredit" },
+                  dr: {
+                    $sum: {
+                      $cond: [
+                        { $eq: ["$ledgerEntries.type", "Dr"] },
+                        "$ledgerEntries.amount",
+                        0,
+                      ],
+                    },
+                  },
+                  cr: {
+                    $sum: {
+                      $cond: [
+                        { $eq: ["$ledgerEntries.type", "Cr"] },
+                        "$ledgerEntries.amount",
+                        0,
+                      ],
+                    },
+                  },
+                  voucherIds: { $addToSet: "$_id" },
                 },
               },
             ]);
-            if (voucherAgg.length > 0) {
-              const agg = voucherAgg[0];
-              // Add voucher count to POs (for display)
-              totalPOs += agg.count || 0;
-              // Compute net from ledger balance (more accurate)
+            if (ledgerAgg.length > 0) {
+              const a = ledgerAgg[0];
+              totalPOs += a.voucherIds ? a.voucherIds.length : 0;
               const openSigned =
                 (vendorLedger.openingBalanceType === "Cr" ? -1 : 1) *
                 Math.abs(vendorLedger.openingBalance || 0);
-              // For creditors: negative closing = we owe them
-              const closingSigned = vendorLedger.currentBalance || openSigned;
+              // Sundry Creditor: negative closing = we still owe them
+              const closingSigned = openSigned + (a.dr || 0) - (a.cr || 0);
               const owed = closingSigned < 0 ? Math.abs(closingSigned) : 0;
-              // Use the larger of PO-based or ledger-based outstanding
               if (owed > outstandingPayables) outstandingPayables = owed;
-              // Use ledger's absolute balance as total spend if PO-based is zero
+              // Use ledger net as totalPayables when PO-based is zero
               if (totalPayables === 0 && Math.abs(closingSigned) > 0) {
                 totalPayables = Math.abs(closingSigned);
               }
             }
           }
         } catch (_) {
-          /* Acc_Ledger/Voucher not available — PO stats only */
+          // Acc_Ledger / Acc_Voucher not available — PO stats only
         }
 
-        // 6-month expenses
         const sixMonthsAgo = new Date();
         sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
         const recentPOs = await PurchaseOrder.find({
@@ -342,7 +333,7 @@ router.get("/", async (req, res) => {
 
         return {
           id: vendor._id,
-          ledgerId: vendorLedger?._id || null, // Acc_Ledger _id for View → Ledger link
+          ledgerId: vendorLedger?._id || null,
           vendorId: `VEN-${(vendorLedger?._id || vendor._id).toString().substring(18, 24).toUpperCase()}`,
           name: vendor.companyName,
           contactPerson: vendor.contactPerson,
@@ -369,22 +360,17 @@ router.get("/", async (req, res) => {
             pincode: "",
             country: "India",
           },
-          totalPOs: totalPOs,
+          totalPOs,
           totalPaid: parseFloat(totalPaid.toFixed(2)),
         };
       }),
     );
 
-    // ── Merge in imported Tally parties (Sundry Creditors) ───────────
+    // ── Merge in imported Tally parties ───────────────────────────────────
     let allVendors = vendorsWithStats;
     try {
       let imported = await importedVendorRows(req.query.companyId);
 
-      // GHOST DETECTION: if an imported party's GSTIN or normalised name
-      // matches an existing CMS vendor, mark it a "ghost" — same real
-      // party, two records. The accountant resolves these on the Data
-      // Cleanup page (merge keeps one, drops the other). Until merged we
-      // still SHOW both, but the ghost is flagged so it's obvious.
       const cmsByGstin = new Map();
       const cmsByName = new Map();
       for (const v of vendorsWithStats) {
@@ -422,14 +408,12 @@ router.get("/", async (req, res) => {
             (v.aliases || []).some((al) => al.toLowerCase().includes(q)),
         );
       }
-      // Drop internal helper keys before sending.
       imported = imported.map(({ _normName, _gstinKey, ...rest }) => rest);
       if (imported.length) allVendors = [...vendorsWithStats, ...imported];
     } catch (impErr) {
       console.error("[vendors] imported-party merge skipped:", impErr.message);
     }
 
-    // Calculate summary stats
     const totalVendors = allVendors.length;
     const totalPayables = allVendors.reduce(
       (sum, v) => sum + v.totalPayables,
@@ -451,28 +435,26 @@ router.get("/", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching vendors:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching vendors",
-    });
+    res
+      .status(500)
+      .json({ success: false, message: "Server error while fetching vendors" });
   }
 });
 
-// ✅ GET vendor by ID with detailed information
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:id — Single vendor details
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {
   try {
     const vendor = await Vendor.findById(req.params.id).select(
       "companyName contactPerson email phone gstNumber panNumber address status rating notes vendorType paymentTerms bankDetails primaryProducts createdBy updatedBy createdAt",
     );
-
     if (!vendor) {
-      return res.status(404).json({
-        success: false,
-        message: "Vendor not found",
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Vendor not found" });
     }
 
-    // Get purchase orders for this vendor
     const purchaseOrders = await PurchaseOrder.find({
       vendor: vendor._id,
       status: { $in: ["ISSUED", "PARTIALLY_RECEIVED", "COMPLETED"] },
@@ -483,22 +465,17 @@ router.get("/:id", async (req, res) => {
       .populate("payments.recordedBy", "name email")
       .sort({ orderDate: -1 });
 
-    // Calculate financial stats
-    let totalPayables = 0;
-    let outstandingPayables = 0;
-    let totalPaid = 0;
+    let totalPayables = 0,
+      outstandingPayables = 0,
+      totalPaid = 0;
     let recentTransactions = [];
 
     purchaseOrders.forEach((po) => {
       totalPayables += po.totalAmount || 0;
-
       const poPaid =
-        po.payments?.reduce((sum, payment) => sum + (payment.amount || 0), 0) ||
-        0;
+        po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
       totalPaid += poPaid;
       outstandingPayables += (po.totalAmount || 0) - poPaid;
-
-      // Add payment transactions
       if (po.payments && po.payments.length > 0) {
         po.payments.forEach((payment) => {
           recentTransactions.push({
@@ -515,8 +492,6 @@ router.get("/:id", async (req, res) => {
           });
         });
       }
-
-      // Add purchase order transactions
       recentTransactions.push({
         id: po._id,
         type: "PURCHASE_ORDER",
@@ -527,26 +502,20 @@ router.get("/:id", async (req, res) => {
         paymentStatus: po.paymentStatus,
       });
     });
-
-    // Sort transactions by date (newest first)
     recentTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    // Calculate 6-month expenses
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-
     const recentPOs = await PurchaseOrder.find({
       vendor: vendor._id,
       orderDate: { $gte: sixMonthsAgo },
       status: { $in: ["PARTIALLY_RECEIVED", "COMPLETED"] },
     });
-
     const totalExpenses6Months = recentPOs.reduce((sum, po) => {
       const poPaid = po.payments?.reduce((s, p) => s + (p.amount || 0), 0) || 0;
       return sum + poPaid;
     }, 0);
 
-    // Find linked Acc_Ledger for consistent vendor code
     let detailLedger = null;
     try {
       detailLedger = await Acc_Ledger.findOne({
@@ -570,99 +539,96 @@ router.get("/:id", async (req, res) => {
       }
     } catch (_) {}
 
-    const vendorData = {
-      id: vendor._id,
-      ledgerId: detailLedger?._id || null,
-      vendorId: `VEN-${(detailLedger?._id || vendor._id).toString().substring(18, 24).toUpperCase()}`,
-      name: vendor.companyName,
-      contactPerson: vendor.contactPerson,
-      email: vendor.email,
-      phone: vendor.phone,
-      company: vendor.companyName,
-      type: vendor.vendorType || "Business",
-      currency: "INR",
-      totalPayables: parseFloat(totalPayables.toFixed(2)),
-      outstandingPayables: parseFloat(outstandingPayables.toFixed(2)),
-      unusedCredits: 0,
-      paymentTerms: vendor.paymentTerms || "Net 30",
-      gstin: vendor.gstNumber || "",
-      pan: vendor.panNumber || "",
-      status: vendor.status || "Active",
-      portalStatus: "Disabled",
-      createdDate: vendor.createdAt.toLocaleDateString("en-GB"),
-      createdBy: vendor.createdBy ? "User" : "System",
-      totalExpenses6Months: parseFloat(totalExpenses6Months.toFixed(2)),
-      billingAddress: vendor.address || {
-        street: "",
-        city: "",
-        state: "",
-        pincode: "",
-        country: "India",
-      },
-      bankDetails: vendor.bankDetails || {},
-      primaryProducts: vendor.primaryProducts || [],
-      rating: vendor.rating || 3,
-      notes: vendor.notes || "",
-      purchaseOrders: purchaseOrders.map((po) => ({
-        id: po._id,
-        poNumber: po.poNumber,
-        orderDate: po.orderDate,
-        expectedDeliveryDate: po.expectedDeliveryDate,
-        totalAmount: po.totalAmount,
-        status: po.status,
-        totalReceived: po.totalReceived,
-        totalPending: po.totalPending,
-        paymentStatus: po.paymentStatus,
-        totalPaid:
-          po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0,
-        remainingAmount:
-          po.totalAmount -
-          (po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0),
-      })),
-      recentTransactions: recentTransactions.slice(0, 50),
-      stats: {
-        totalOrders: purchaseOrders.length,
-        completedOrders: purchaseOrders.filter(
-          (po) => po.status === "COMPLETED",
-        ).length,
-        pendingOrders: purchaseOrders.filter(
-          (po) => po.status === "ISSUED" || po.status === "PARTIALLY_RECEIVED",
-        ).length,
-        totalPaid: parseFloat(totalPaid.toFixed(2)),
-        avgPaymentDays: 30,
-      },
-    };
-
     res.json({
       success: true,
-      vendor: vendorData,
+      vendor: {
+        id: vendor._id,
+        ledgerId: detailLedger?._id || null,
+        vendorId: `VEN-${(detailLedger?._id || vendor._id).toString().substring(18, 24).toUpperCase()}`,
+        name: vendor.companyName,
+        contactPerson: vendor.contactPerson,
+        email: vendor.email,
+        phone: vendor.phone,
+        company: vendor.companyName,
+        type: vendor.vendorType || "Business",
+        currency: "INR",
+        totalPayables: parseFloat(totalPayables.toFixed(2)),
+        outstandingPayables: parseFloat(outstandingPayables.toFixed(2)),
+        unusedCredits: 0,
+        paymentTerms: vendor.paymentTerms || "Net 30",
+        gstin: vendor.gstNumber || "",
+        pan: vendor.panNumber || "",
+        status: vendor.status || "Active",
+        portalStatus: "Disabled",
+        createdDate: vendor.createdAt.toLocaleDateString("en-GB"),
+        createdBy: vendor.createdBy ? "User" : "System",
+        totalExpenses6Months: parseFloat(totalExpenses6Months.toFixed(2)),
+        billingAddress: vendor.address || {
+          street: "",
+          city: "",
+          state: "",
+          pincode: "",
+          country: "India",
+        },
+        bankDetails: vendor.bankDetails || {},
+        primaryProducts: vendor.primaryProducts || [],
+        rating: vendor.rating || 3,
+        notes: vendor.notes || "",
+        purchaseOrders: purchaseOrders.map((po) => ({
+          id: po._id,
+          poNumber: po.poNumber,
+          orderDate: po.orderDate,
+          expectedDeliveryDate: po.expectedDeliveryDate,
+          totalAmount: po.totalAmount,
+          status: po.status,
+          totalReceived: po.totalReceived,
+          totalPending: po.totalPending,
+          paymentStatus: po.paymentStatus,
+          totalPaid:
+            po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0,
+          remainingAmount:
+            po.totalAmount -
+            (po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0),
+        })),
+        recentTransactions: recentTransactions.slice(0, 50),
+        stats: {
+          totalOrders: purchaseOrders.length,
+          completedOrders: purchaseOrders.filter(
+            (po) => po.status === "COMPLETED",
+          ).length,
+          pendingOrders: purchaseOrders.filter(
+            (po) =>
+              po.status === "ISSUED" || po.status === "PARTIALLY_RECEIVED",
+          ).length,
+          totalPaid: parseFloat(totalPaid.toFixed(2)),
+          avgPaymentDays: 30,
+        },
+      },
     });
   } catch (error) {
     console.error("Error fetching vendor details:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching vendor details",
-    });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Server error while fetching vendor details",
+      });
   }
 });
 
-// ✅ GET vendor purchase orders
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:id/purchase-orders
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id/purchase-orders", async (req, res) => {
   try {
     const { status, startDate, endDate } = req.query;
-
     let filter = { vendor: req.params.id };
-
-    if (status && status !== "all") {
-      filter.status = status;
-    }
-
+    if (status && status !== "all") filter.status = status;
     if (startDate || endDate) {
       filter.orderDate = {};
       if (startDate) filter.orderDate.$gte = new Date(startDate);
       if (endDate) filter.orderDate.$lte = new Date(endDate);
     }
-
     const purchaseOrders = await PurchaseOrder.find(filter)
       .select(
         "poNumber orderDate expectedDeliveryDate totalAmount status paymentStatus totalReceived totalPending items payments",
@@ -702,28 +668,28 @@ router.get("/:id/purchase-orders", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching vendor purchase orders:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching purchase orders",
-    });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Server error while fetching purchase orders",
+      });
   }
 });
 
-// ✅ GET vendor transactions (payments + purchase orders)
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:id/transactions
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id/transactions", async (req, res) => {
   try {
     const { type, startDate, endDate } = req.query;
-
-    // Get all purchase orders for vendor
     const purchaseOrders = await PurchaseOrder.find({ vendor: req.params.id })
       .select("poNumber orderDate totalAmount status paymentStatus payments")
       .populate("payments.recordedBy", "name email")
       .sort({ orderDate: -1 });
 
     let transactions = [];
-
     purchaseOrders.forEach((po) => {
-      // Add purchase order transaction
       transactions.push({
         id: po._id,
         type: "PURCHASE_ORDER",
@@ -736,8 +702,6 @@ router.get("/:id/transactions", async (req, res) => {
         category: "PURCHASE",
         reference: po.poNumber,
       });
-
-      // Add payment transactions
       if (po.payments && po.payments.length > 0) {
         po.payments.forEach((payment) => {
           transactions.push({
@@ -761,35 +725,25 @@ router.get("/:id/transactions", async (req, res) => {
       }
     });
 
-    // Apply filters
-    if (type && type !== "all") {
+    if (type && type !== "all")
       transactions = transactions.filter((t) => t.type === type);
-    }
-
     if (startDate) {
-      const start = new Date(startDate);
-      transactions = transactions.filter((t) => new Date(t.date) >= start);
+      const s = new Date(startDate);
+      transactions = transactions.filter((t) => new Date(t.date) >= s);
     }
-
     if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      transactions = transactions.filter((t) => new Date(t.date) <= end);
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
+      transactions = transactions.filter((t) => new Date(t.date) <= e);
     }
-
-    // Sort by date (newest first)
     transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    // Calculate summary
     const totalPurchases = transactions
       .filter((t) => t.type === "PURCHASE_ORDER")
       .reduce((sum, t) => sum + t.amount, 0);
-
     const totalPayments = transactions
       .filter((t) => t.type === "PAYMENT")
       .reduce((sum, t) => sum + Math.abs(t.amount), 0);
-
-    const balance = totalPurchases - totalPayments;
 
     res.json({
       success: true,
@@ -797,20 +751,24 @@ router.get("/:id/transactions", async (req, res) => {
       summary: {
         totalPurchases: parseFloat(totalPurchases.toFixed(2)),
         totalPayments: parseFloat(totalPayments.toFixed(2)),
-        balance: parseFloat(balance.toFixed(2)),
+        balance: parseFloat((totalPurchases - totalPayments).toFixed(2)),
         transactionCount: transactions.length,
       },
     });
   } catch (error) {
     console.error("Error fetching vendor transactions:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching transactions",
-    });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Server error while fetching transactions",
+      });
   }
 });
 
-// ✅ RECORD PAYMENT for vendor purchase order
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /:id/payment
+// ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/payment", async (req, res) => {
   try {
     const {
@@ -821,102 +779,69 @@ router.post("/:id/payment", async (req, res) => {
       paymentDate,
       notes,
     } = req.body;
+    if (!purchaseOrderId)
+      return res
+        .status(400)
+        .json({ success: false, message: "Purchase Order ID is required" });
+    if (!amount || amount <= 0)
+      return res
+        .status(400)
+        .json({ success: false, message: "Valid payment amount is required" });
+    if (!paymentMethod)
+      return res
+        .status(400)
+        .json({ success: false, message: "Payment method is required" });
 
-    // Validation
-    if (!purchaseOrderId) {
-      return res.status(400).json({
-        success: false,
-        message: "Purchase Order ID is required",
-      });
-    }
-
-    if (!amount || amount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid payment amount is required",
-      });
-    }
-
-    if (!paymentMethod) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment method is required",
-      });
-    }
-
-    // Verify purchase order belongs to vendor
     const purchaseOrder = await PurchaseOrder.findOne({
       _id: purchaseOrderId,
       vendor: req.params.id,
     });
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({
+          success: false,
+          message: "Purchase order not found for this vendor",
+        });
 
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found for this vendor",
-      });
-    }
-
-    // Calculate current payment totals
     const totalPaid =
-      purchaseOrder.payments?.reduce(
-        (sum, payment) => sum + (payment.amount || 0),
-        0,
-      ) || 0;
+      purchaseOrder.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
-
-    // Validate payment amount doesn't exceed remaining amount
     if (amount > remainingAmount) {
-      return res.status(400).json({
-        success: false,
-        message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
+        });
     }
 
-    // Create payment record
-    const paymentRecord = {
+    if (!purchaseOrder.payments) purchaseOrder.payments = [];
+    purchaseOrder.payments.unshift({
       amount: parseFloat(amount),
-      paymentMethod: paymentMethod,
+      paymentMethod,
       referenceNumber: referenceNumber || "",
       paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
       notes: notes || "",
       recordedBy: req.user.id,
-    };
-
-    // Initialize payments array if it doesn't exist
-    if (!purchaseOrder.payments) {
-      purchaseOrder.payments = [];
-    }
-
-    // Add payment record
-    purchaseOrder.payments.unshift(paymentRecord);
-
-    // Calculate new total paid
+    });
     const newTotalPaid = totalPaid + amount;
-
-    // Update payment status
-    if (newTotalPaid >= purchaseOrder.totalAmount) {
-      purchaseOrder.paymentStatus = "COMPLETED";
-    } else if (newTotalPaid > 0) {
-      purchaseOrder.paymentStatus = "PARTIAL";
-    } else {
-      purchaseOrder.paymentStatus = "PENDING";
-    }
-
+    purchaseOrder.paymentStatus =
+      newTotalPaid >= purchaseOrder.totalAmount
+        ? "COMPLETED"
+        : newTotalPaid > 0
+          ? "PARTIAL"
+          : "PENDING";
     await purchaseOrder.save();
 
-    // Get updated purchase order with populated data
     const updatedPO = await PurchaseOrder.findById(purchaseOrderId).populate(
       "payments.recordedBy",
       "name email",
     );
-
-    const latestPayment = updatedPO.payments[0];
-
     res.json({
       success: true,
       message: `Payment of ₹${amount} recorded successfully`,
-      payment: latestPayment,
+      payment: updatedPO.payments[0],
       purchaseOrder: {
         id: updatedPO._id,
         poNumber: updatedPO.poNumber,
@@ -928,49 +853,41 @@ router.post("/:id/payment", async (req, res) => {
     });
   } catch (error) {
     console.error("Error recording payment:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while recording payment",
-    });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Server error while recording payment",
+      });
   }
 });
 
-// ✅ UPDATE vendor payment status
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /:id/purchase-orders/:poId/payment-status
+// ─────────────────────────────────────────────────────────────────────────────
 router.patch("/:id/purchase-orders/:poId/payment-status", async (req, res) => {
   try {
     const { status } = req.body;
-
-    if (!status) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment status is required",
-      });
-    }
-
+    if (!status)
+      return res
+        .status(400)
+        .json({ success: false, message: "Payment status is required" });
     const validStatuses = ["PENDING", "PARTIAL", "COMPLETED"];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment status",
-      });
-    }
+    if (!validStatuses.includes(status))
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid payment status" });
 
-    // Verify purchase order belongs to vendor
     const purchaseOrder = await PurchaseOrder.findOne({
       _id: req.params.poId,
       vendor: req.params.id,
     });
-
-    if (!purchaseOrder) {
-      return res.status(404).json({
-        success: false,
-        message: "Purchase order not found",
-      });
-    }
-
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
     purchaseOrder.paymentStatus = status;
     await purchaseOrder.save();
-
     res.json({
       success: true,
       message: `Payment status updated to ${status}`,
@@ -982,18 +899,21 @@ router.patch("/:id/purchase-orders/:poId/payment-status", async (req, res) => {
     });
   } catch (error) {
     console.error("Error updating payment status:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating payment status",
-    });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Server error while updating payment status",
+      });
   }
 });
 
-// ✅ GET vendor payment history
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:id/payments
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id/payments", async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
-
     const purchaseOrders = await PurchaseOrder.find({
       vendor: req.params.id,
       "payments.0": { $exists: true },
@@ -1002,7 +922,6 @@ router.get("/:id/payments", async (req, res) => {
       .populate("payments.recordedBy", "name email");
 
     let allPayments = [];
-
     purchaseOrders.forEach((po) => {
       po.payments.forEach((payment) => {
         allPayments.push({
@@ -1019,25 +938,17 @@ router.get("/:id/payments", async (req, res) => {
         });
       });
     });
-
-    // Apply date filters
     if (startDate) {
-      const start = new Date(startDate);
-      allPayments = allPayments.filter((p) => new Date(p.date) >= start);
+      const s = new Date(startDate);
+      allPayments = allPayments.filter((p) => new Date(p.date) >= s);
     }
-
     if (endDate) {
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      allPayments = allPayments.filter((p) => new Date(p.date) <= end);
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
+      allPayments = allPayments.filter((p) => new Date(p.date) <= e);
     }
-
-    // Sort by date (newest first)
     allPayments.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    // Calculate totals
     const totalPayments = allPayments.reduce((sum, p) => sum + p.amount, 0);
-
     res.json({
       success: true,
       payments: allPayments,
@@ -1052,14 +963,18 @@ router.get("/:id/payments", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching vendor payments:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching payments",
-    });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Server error while fetching payments",
+      });
   }
 });
 
-// ✅ CREATE new vendor
+// ─────────────────────────────────────────────────────────────────────────────
+// POST / — Create new vendor
+// ─────────────────────────────────────────────────────────────────────────────
 router.post("/", async (req, res) => {
   try {
     const {
@@ -1076,38 +991,29 @@ router.post("/", async (req, res) => {
       primaryProducts,
       notes,
     } = req.body;
+    if (!companyName)
+      return res
+        .status(400)
+        .json({ success: false, message: "Company name is required" });
+    if (!email)
+      return res
+        .status(400)
+        .json({ success: false, message: "Email is required" });
 
-    // Basic validation
-    if (!companyName) {
-      return res.status(400).json({
-        success: false,
-        message: "Company name is required",
-      });
-    }
-
-    if (!email) {
-      return res.status(400).json({
-        success: false,
-        message: "Email is required",
-      });
-    }
-
-    // Check if vendor already exists
     const existingVendor = await Vendor.findOne({
       $or: [
         { companyName: { $regex: new RegExp(`^${companyName}$`, "i") } },
         { email: { $regex: new RegExp(`^${email}$`, "i") } },
       ],
     });
+    if (existingVendor)
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "Vendor with this name or email already exists",
+        });
 
-    if (existingVendor) {
-      return res.status(400).json({
-        success: false,
-        message: "Vendor with this name or email already exists",
-      });
-    }
-
-    // Create vendor
     const vendor = new Vendor({
       companyName,
       vendorType: vendorType || "Raw Material Supplier",
@@ -1131,9 +1037,7 @@ router.post("/", async (req, res) => {
       rating: 3,
       createdBy: req.user.id,
     });
-
     await vendor.save();
-
     res.status(201).json({
       success: true,
       message: "Vendor created successfully",
@@ -1148,16 +1052,22 @@ router.post("/", async (req, res) => {
     });
   } catch (error) {
     console.error("Error creating vendor:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while creating vendor",
-    });
+    res
+      .status(500)
+      .json({ success: false, message: "Server error while creating vendor" });
   }
 });
 
-// ✅ UPDATE vendor
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /:id — Update vendor
+// ─────────────────────────────────────────────────────────────────────────────
 router.put("/:id", async (req, res) => {
   try {
+    const vendor = await Vendor.findById(req.params.id);
+    if (!vendor)
+      return res
+        .status(404)
+        .json({ success: false, message: "Vendor not found" });
     const {
       companyName,
       vendorType,
@@ -1173,17 +1083,6 @@ router.put("/:id", async (req, res) => {
       status,
       notes,
     } = req.body;
-
-    const vendor = await Vendor.findById(req.params.id);
-
-    if (!vendor) {
-      return res.status(404).json({
-        success: false,
-        message: "Vendor not found",
-      });
-    }
-
-    // Update fields
     if (companyName) vendor.companyName = companyName;
     if (vendorType) vendor.vendorType = vendorType;
     if (contactPerson !== undefined) vendor.contactPerson = contactPerson;
@@ -1197,11 +1096,8 @@ router.put("/:id", async (req, res) => {
     if (primaryProducts !== undefined) vendor.primaryProducts = primaryProducts;
     if (status) vendor.status = status;
     if (notes !== undefined) vendor.notes = notes;
-
     vendor.updatedBy = req.user.id;
-
     await vendor.save();
-
     res.json({
       success: true,
       message: "Vendor updated successfully",
@@ -1215,23 +1111,15 @@ router.put("/:id", async (req, res) => {
     });
   } catch (error) {
     console.error("Error updating vendor:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating vendor",
-    });
+    res
+      .status(500)
+      .json({ success: false, message: "Server error while updating vendor" });
   }
 });
 
-// ✅ DELETE vendor
-/* ------------------------------------------------------------------ */
-/* POST /:id/merge — Merge a ghost vendor's transactions into keeper   */
-/* ------------------------------------------------------------------ */
-/* Ghost vendors from Tally import are Acc_Ledger records, NOT CMS
- * Vendor documents. The merge handles both cases:
- *   • Ghost is a CMS Vendor → find in Vendor collection
- *   • Ghost is an Acc_Ledger → find in Acc_Ledger collection
- * Moves transactions, deactivates ghost. Does NOT touch keeper details.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /:id/merge — Merge a ghost vendor's transactions into keeper
+// ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/merge", async (req, res) => {
   try {
     const keeperId = req.params.id;
@@ -1245,7 +1133,6 @@ router.post("/:id/merge", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Cannot merge into itself" });
 
-    // Find the KEEPER — always a CMS Vendor
     const keeper = await Vendor.findById(keeperId);
     if (!keeper)
       return res
@@ -1259,18 +1146,15 @@ router.post("/:id/merge", async (req, res) => {
       payments: 0,
     };
 
-    // Try finding ghost as CMS Vendor first, then as Acc_Ledger
     let ghost = await Vendor.findById(mergeFromId).catch(() => null);
     let ghostLedger = null;
 
     if (ghost) {
-      // Ghost is a CMS Vendor — move POs and payments
       const poResult = await PurchaseOrder.updateMany(
         { vendor: ghost._id },
         { $set: { vendor: keeper._id } },
       );
       counts.purchaseOrders = poResult.modifiedCount || 0;
-
       try {
         const Payment = require("mongoose").model("Payment");
         const payResult = await Payment.updateMany(
@@ -1279,11 +1163,8 @@ router.post("/:id/merge", async (req, res) => {
         );
         counts.payments = payResult.modifiedCount || 0;
       } catch (_) {}
-
-      // Find the ghost's linked Acc_Ledger
       ghostLedger = await Acc_Ledger.findOne({ linkedVendorId: ghost._id });
       if (!ghostLedger) {
-        // Try by name match
         ghostLedger = await Acc_Ledger.findOne({
           name: new RegExp(
             "^" +
@@ -1291,69 +1172,25 @@ router.post("/:id/merge", async (req, res) => {
               "$",
             "i",
           ),
-          isActive: true,
+          isActive: { $ne: false },
         });
       }
-
-      // Deactivate the CMS ghost vendor
       ghost.status = "Inactive";
       ghost.notes = `[MERGED] Transactions moved to ${keeper.companyName} on ${new Date().toISOString()}`;
       await ghost.save();
     } else {
-      // Ghost is an Acc_Ledger (Tally import) — not a CMS Vendor directly.
-      // But there may ALSO be a CMS Vendor for the same entity (matched by
-      // GSTIN/name in the ghost detection). Find and transfer its POs too.
       ghostLedger = await Acc_Ledger.findById(mergeFromId);
       if (!ghostLedger)
         return res
           .status(404)
           .json({ success: false, message: "Ghost vendor/ledger not found" });
 
-      // Search for a CMS Vendor that matches the ghost ledger by GSTIN or name
-      let ghostCmsVendor = null;
-      if (ghostLedger.gstin) {
-        ghostCmsVendor = await Vendor.findOne({
-          _id: { $ne: keeper._id },
-          gstNumber: new RegExp(
-            "^" +
-              ghostLedger.gstin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-              "$",
-            "i",
-          ),
-        });
-      }
-      if (!ghostCmsVendor) {
-        ghostCmsVendor = await Vendor.findOne({
-          _id: { $ne: keeper._id },
-          companyName: new RegExp(
-            "^" + ghostLedger.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
-            "i",
-          ),
-        });
-      }
-      if (ghostCmsVendor) {
-        // Transfer POs from ghost CMS Vendor → keeper
-        const poResult = await PurchaseOrder.updateMany(
-          { vendor: ghostCmsVendor._id },
-          { $set: { vendor: keeper._id } },
-        );
-        counts.purchaseOrders = poResult.modifiedCount || 0;
-        try {
-          const Payment = require("mongoose").model("Payment");
-          const payResult = await Payment.updateMany(
-            { vendor: ghostCmsVendor._id },
-            { $set: { vendor: keeper._id } },
-          );
-          counts.payments = payResult.modifiedCount || 0;
-        } catch (_) {}
-        // Deactivate ghost CMS Vendor
-        ghostCmsVendor.status = "Inactive";
-        ghostCmsVendor.notes = `[MERGED] into ${keeper.companyName} on ${new Date().toISOString()}`;
-        await ghostCmsVendor.save();
-      }
+      // NOTE: We intentionally do NOT search for other CMS vendors by GSTIN/name
+      // and deactivate them. That was killing the ORIGINAL vendor which shares a
+      // GSTIN with the Tally-imported ghost. CMS-to-CMS vendor deduplication is
+      // handled separately on the vendors page via the ghost detection feature.
     }
 
-    // Find the keeper's Acc_Ledger
     let keeperLedger = await Acc_Ledger.findOne({
       linkedVendorId: keeper._id,
       isActive: { $ne: false },
@@ -1368,14 +1205,12 @@ router.post("/:id/merge", async (req, res) => {
       });
     }
 
-    // Move accounting data from ghost ledger → keeper ledger
     if (
       ghostLedger &&
       keeperLedger &&
       String(ghostLedger._id) !== String(keeperLedger._id)
     ) {
       try {
-        // Move party-level voucher references
         const vResult = await Acc_Voucher.updateMany(
           { partyLedgerId: ghostLedger._id },
           {
@@ -1387,7 +1222,6 @@ router.post("/:id/merge", async (req, res) => {
         );
         counts.vouchers = vResult.modifiedCount || 0;
 
-        // Move ledger entries inside vouchers (Dr/Cr lines)
         const leResult = await Acc_Voucher.updateMany(
           { "ledgerEntries.ledgerId": ghostLedger._id },
           {
@@ -1400,30 +1234,76 @@ router.post("/:id/merge", async (req, res) => {
         );
         counts.ledgerEntries = leResult.modifiedCount || 0;
 
-        // Transfer balance
-        const ghostBal = ghostLedger.openingBalance || 0;
-        if (ghostBal !== 0) {
-          await Acc_Ledger.updateOne(
-            { _id: keeperLedger._id },
-            { $inc: { openingBalance: ghostBal, currentBalance: ghostBal } },
-          );
-        }
+        // ── Transfer balances — SIGNED arithmetic ─────────────────────────
+        // Acc_Ledger stores balances SIGNED (positive = Dr, negative = Cr).
+        // signedBal() also tolerates the older magnitude+type convention.
+        // We ADD the ghost's signed balance to the keeper and ZERO the ghost's
+        // balance, so the books stay balanced after the merge.
+        const signedBal = (val, type) => {
+          const v = Number(val) || 0;
+          if (v < 0) return v;
+          return (type === "Cr" ? -1 : 1) * v;
+        };
 
-        // Deactivate ghost ledger
-        ghostLedger.isActive = false;
-        ghostLedger.deletedAt = new Date();
-        await ghostLedger.save();
+        const newOpenSigned =
+          signedBal(
+            keeperLedger.openingBalance,
+            keeperLedger.openingBalanceType,
+          ) +
+          signedBal(ghostLedger.openingBalance, ghostLedger.openingBalanceType);
+        const newCurrSigned =
+          signedBal(
+            keeperLedger.currentBalance,
+            keeperLedger.currentBalanceType,
+          ) +
+          signedBal(ghostLedger.currentBalance, ghostLedger.currentBalanceType);
+
+        await Acc_Ledger.updateOne(
+          { _id: keeperLedger._id },
+          {
+            $set: {
+              openingBalance: newOpenSigned, // SIGNED
+              openingBalanceType: newOpenSigned < 0 ? "Cr" : "Dr",
+              currentBalance: newCurrSigned, // SIGNED
+              currentBalanceType: newCurrSigned < 0 ? "Cr" : "Dr",
+              ...(keeperLedger.balanceFromTrialBalance ||
+              ghostLedger.balanceFromTrialBalance
+                ? { balanceFromTrialBalance: true }
+                : {}),
+            },
+          },
+        );
+        // Deactivate ghost ledger AND zero its balance (prevents double-count)
+        await Acc_Ledger.updateOne(
+          { _id: ghostLedger._id },
+          {
+            $set: {
+              isActive: false,
+              openingBalance: 0,
+              currentBalance: 0,
+              balanceFromTrialBalance: false,
+              name: `[MERGED] ${ghostLedger.name}`,
+            },
+          },
+        );
       } catch (e) {
         console.error("[vendor-merge] ledger migration:", e.message);
       }
     } else if (ghostLedger && !keeperLedger) {
-      // Keeper has no ledger yet — relink the ghost ledger to the keeper
-      // instead of deactivating it. This preserves all voucher data.
-      ghostLedger.linkedVendorId = keeper._id;
-      ghostLedger.name = keeper.companyName; // rename to keeper's name
-      if (keeper.gstNumber && !ghostLedger.gstin)
-        ghostLedger.gstin = keeper.gstNumber;
-      await ghostLedger.save();
+      // No keeper ledger — relink ghost ledger to keeper.
+      // FIX: use updateOne/$set so linkedVendorId is saved even if not in Mongoose schema strict definition.
+      await Acc_Ledger.updateOne(
+        { _id: ghostLedger._id },
+        {
+          $set: {
+            linkedVendorId: keeper._id,
+            name: keeper.companyName,
+            ...(keeper.gstNumber && !ghostLedger.gstin
+              ? { gstin: keeper.gstNumber }
+              : {}),
+          },
+        },
+      );
       counts.vouchers = await Acc_Voucher.countDocuments({
         partyLedgerId: ghostLedger._id,
         status: "posted",
@@ -1441,40 +1321,33 @@ router.post("/:id/merge", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /:id
+// ─────────────────────────────────────────────────────────────────────────────
 router.delete("/:id", async (req, res) => {
   try {
     const vendor = await Vendor.findById(req.params.id);
-
-    if (!vendor) {
-      return res.status(404).json({
-        success: false,
-        message: "Vendor not found",
-      });
-    }
-
-    // Check if vendor has any purchase orders
+    if (!vendor)
+      return res
+        .status(404)
+        .json({ success: false, message: "Vendor not found" });
     const purchaseOrders = await PurchaseOrder.find({ vendor: vendor._id });
-
     if (purchaseOrders.length > 0) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Cannot delete vendor with existing purchase orders. Mark as inactive instead.",
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message:
+            "Cannot delete vendor with existing purchase orders. Mark as inactive instead.",
+        });
     }
-
     await vendor.deleteOne();
-
-    res.json({
-      success: true,
-      message: "Vendor deleted successfully",
-    });
+    res.json({ success: true, message: "Vendor deleted successfully" });
   } catch (error) {
     console.error("Error deleting vendor:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while deleting vendor",
-    });
+    res
+      .status(500)
+      .json({ success: false, message: "Server error while deleting vendor" });
   }
 });
 

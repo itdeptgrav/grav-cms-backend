@@ -34,6 +34,7 @@ const {
 } = require("../../models/Accountant_model/Acc_VoucherModels");
 const {
   Acc_Ledger,
+  Acc_Group,
 } = require("../../models/Accountant_model/Acc_MasterModels");
 
 const {
@@ -43,6 +44,46 @@ const {
 } = require("../../Middlewear/AccountantOrgAuthMiddleware");
 
 router.use(orgAuth);
+
+// ─────────────────────────────────────────────────────────────────────────
+// GET /list — unified feed for the Approvals page (history, not just pending)
+// ─────────────────────────────────────────────────────────────────────────
+// ?scope=org|mine  &status=pending|approved|rejected|cancelled|all
+//   scope=org  → approver/owner org-wide view (canApprove required), limited
+//                to editor-originated requests (the only ones that ever
+//                needed approval).
+//   scope=mine → the caller's OWN requests in any status, so an editor can
+//                see whether what they submitted was approved or rejected.
+router.get("/list", async (req, res) => {
+  try {
+    if (!requireOrg(req, res)) return;
+    const scope = req.query.scope === "org" ? "org" : "mine";
+    if (scope === "org" && !requireCanApprove(req, res)) return;
+
+    const q = { organizationId: req.user.organizationId };
+    if (scope === "mine") q.createdBy = req.user.id;
+    else q.createdByRole = "editor";
+    if (req.query.companyId) q.companyId = req.query.companyId;
+
+    const statusMap = {
+      pending: "pending_approval",
+      approved: "approved",
+      rejected: "rejected",
+      cancelled: "void",
+    };
+    const s = req.query.status;
+    if (s && s !== "all" && statusMap[s]) q.status = statusMap[s];
+
+    const rows = await Acc_LedgerReclassRequest.find(q)
+      .sort({ createdAt: -1 })
+      .limit(300)
+      .lean();
+    res.json({ success: true, requests: rows });
+  } catch (e) {
+    console.error("[ledger-reclass/list]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -175,8 +216,222 @@ async function applyApprovedAction(reqDoc, approver) {
     }
   }
 
+  // VOUCHER ── void a voucher (mirror of cancel; status becomes "void")
+  if (kind === "voucher" && action === "void") {
+    if (!target?.id) throw new Error("voucher void: target.id missing");
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const voucher = await Acc_Voucher.findById(target.id).session(session);
+      if (!voucher) throw new Error("Voucher not found");
+      if (voucher.status === "posted") {
+        await applyLedgerBalances(voucher, -1, session);
+      }
+      voucher.status = "void";
+      voucher.updatedBy = approver.id;
+      await voucher.save({ session });
+      await session.commitTransaction();
+      return { entityId: voucher._id };
+    } catch (e) {
+      await session.abortTransaction();
+      throw e;
+    } finally {
+      session.endSession();
+    }
+  }
+
+  // VOUCHER ── apply a held edit to an existing voucher
+  if (kind === "voucher" && action === "update") {
+    if (!target?.id) throw new Error("voucher update: target.id missing");
+    if (!payload) throw new Error("voucher update: payload missing");
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const voucher = await Acc_Voucher.findById(target.id).session(session);
+      if (!voucher) throw new Error("Voucher not found");
+      if (["cancelled", "void"].includes(voucher.status)) {
+        throw new Error(`Cannot edit a ${voucher.status} voucher`);
+      }
+      const wasPosted = voucher.status === "posted";
+
+      // Reverse the old balances first (mirror of the direct edit path).
+      if (wasPosted) {
+        await applyLedgerBalances(voucher, -1, session);
+      }
+
+      // Apply the proposed changes. These were canonicalised when the edit was
+      // submitted; re-strip the protected fields defensively.
+      const body = { ...payload };
+      delete body._id;
+      delete body.companyId;
+      delete body.voucherType;
+      delete body.status;
+      delete body.autoPost;
+      delete body.createdBy;
+      delete body.createdAt;
+      body.updatedBy = approver.id;
+
+      Object.assign(voucher, body);
+      await voucher.save({ session });
+
+      // Re-apply balances if it remains posted.
+      if (wasPosted) {
+        await applyLedgerBalances(voucher, +1, session);
+      }
+
+      await session.commitTransaction();
+      return { entityId: voucher._id };
+    } catch (e) {
+      await session.abortTransaction();
+      throw e;
+    } finally {
+      session.endSession();
+    }
+  }
+
+  // LEDGER ── create a new ledger from payload (mirrors POST /ledgers)
+  if (kind === "ledger" && action === "create") {
+    if (!payload) throw new Error("ledger create: payload missing");
+    const body = payload;
+    if (!body.companyId || !body.name || !body.groupId)
+      throw new Error("ledger create: companyId, name, groupId required");
+    const group = await Acc_Group.findById(body.groupId);
+    if (!group) throw new Error("Group not found");
+    const signedOpen =
+      (body.openingBalanceType === "Cr" ? -1 : 1) *
+      Math.abs(parseFloat(body.openingBalance) || 0);
+    const ledger = await Acc_Ledger.create({
+      ...body,
+      groupName: group.name,
+      nature: body.nature || group.nature,
+      openingBalance: signedOpen,
+      currentBalance: signedOpen,
+      currentBalanceType: body.openingBalanceType || "Dr",
+      createdBy: approver.id,
+    });
+    return { entityId: ledger._id };
+  }
+
+  // LEDGER ── update an existing ledger (mirrors PUT /ledgers/:id)
+  if (kind === "ledger" && action === "update") {
+    if (!target?.id) throw new Error("ledger update: target.id missing");
+    const updates = { ...(payload || {}) };
+    delete updates._id;
+    delete updates.companyId;
+    if (updates.openingBalanceType) {
+      const sign = updates.openingBalanceType === "Cr" ? -1 : 1;
+      updates.openingBalance =
+        sign * Math.abs(parseFloat(updates.openingBalance) || 0);
+    }
+    updates.updatedBy = approver.id;
+    const ledger = await Acc_Ledger.findByIdAndUpdate(target.id, updates, {
+      new: true,
+    });
+    if (!ledger) throw new Error("Ledger not found");
+    return { entityId: ledger._id };
+  }
+
+  // LEDGER ── soft-delete an unused ledger (mirrors DELETE /ledgers/:id, clean case)
+  if (kind === "ledger" && action === "delete") {
+    if (!target?.id) throw new Error("ledger delete: target.id missing");
+    const ledger = await Acc_Ledger.findById(target.id);
+    if (!ledger) throw new Error("Ledger not found");
+    const txnCount = await Acc_Voucher.countDocuments({
+      "ledgerEntries.ledgerId": ledger._id,
+      status: "posted",
+    });
+    const partyCount = await Acc_Voucher.countDocuments({
+      partyLedgerId: ledger._id,
+    });
+    if (txnCount + partyCount > 0)
+      throw new Error(
+        `Ledger is now used in ${txnCount + partyCount} place(s); cannot delete.`,
+      );
+    ledger.isActive = false;
+    ledger.updatedBy = approver.id;
+    await ledger.save();
+    return { entityId: ledger._id };
+  }
+
+  // GROUP ── create a new group from payload (mirrors POST /groups)
+  if (kind === "group" && action === "create") {
+    if (!payload) throw new Error("group create: payload missing");
+    const body = payload;
+    if (!body.companyId || !body.name || !body.nature)
+      throw new Error("group create: companyId, name, nature required");
+    let parentDoc = null;
+    if (body.parent) {
+      parentDoc = await Acc_Group.findById(body.parent);
+      if (!parentDoc) throw new Error("Parent group not found");
+    }
+    const group = await Acc_Group.create({
+      companyId: body.companyId,
+      name: body.name,
+      nature: body.nature,
+      description: body.description,
+      parent: parentDoc?._id || null,
+      parentName: parentDoc?.name || null,
+      level: parentDoc ? (parentDoc.level || 1) + 1 : 1,
+      fullPath: parentDoc ? `${parentDoc.fullPath} > ${body.name}` : body.name,
+      isReserved: false,
+      createdBy: approver.id,
+    });
+    return { entityId: group._id };
+  }
+
+  // GROUP ── update an existing group (mirrors PUT /groups/:id)
+  if (kind === "group" && action === "update") {
+    if (!target?.id) throw new Error("group update: target.id missing");
+    const grp = await Acc_Group.findById(target.id);
+    if (!grp) throw new Error("Group not found");
+    const body = payload || {};
+    if (grp.isReserved && body.name && body.name !== grp.name)
+      throw new Error("Cannot rename a reserved Tally group");
+    Object.assign(grp, body);
+    grp.updatedBy = approver.id;
+    await grp.save();
+    return { entityId: grp._id };
+  }
+
+  // GROUP ── soft-delete an empty group (mirrors DELETE /groups/:id)
+  if (kind === "group" && action === "delete") {
+    if (!target?.id) throw new Error("group delete: target.id missing");
+    const grp = await Acc_Group.findById(target.id);
+    if (!grp) throw new Error("Group not found");
+    if (grp.isReserved) throw new Error("Cannot delete a reserved group");
+    const childCount = await Acc_Group.countDocuments({
+      parent: grp._id,
+      isActive: true,
+    });
+    const ledgerCount = await Acc_Ledger.countDocuments({
+      groupId: grp._id,
+      isActive: true,
+    });
+    if (childCount > 0 || ledgerCount > 0)
+      throw new Error(
+        `Group has ${childCount} sub-group(s) and ${ledgerCount} ledger(s). Move or delete them first.`,
+      );
+    grp.isActive = false;
+    grp.updatedBy = approver.id;
+    await grp.save();
+    return { entityId: grp._id };
+  }
+
+  // PAYROLL ── post a payroll run (replays the chart-of-accounts posting)
+  if (kind === "payroll_post" && action === "post") {
+    if (!target?.id) throw new Error("payroll post: target.id (runId) missing");
+    const companyId = payload?.companyId;
+    if (!companyId) throw new Error("payroll post: companyId missing");
+    const coa = require("./Acc_chartOfAccounts");
+    if (typeof coa.postPayrollRunById !== "function")
+      throw new Error("payroll posting function unavailable");
+    await coa.postPayrollRunById(companyId, target.id, {
+      bankLedgerId: payload?.bankLedgerId || undefined,
+    });
+    return { entityId: target.id };
+  }
+
   // Add more kinds here as you migrate modules to the approval flow.
-  //
   // NOTE: cashflow-adjustments and ledger-reclass have their own
   // approve/reject endpoints under /cashflow-adjustments/:id/approve
   // and /ledger-reclass/:id/approve respectively. They are NOT queued
@@ -211,7 +466,7 @@ router.get("/", async (req, res) => {
       page = 1,
     } = req.query;
     const filter = { ...orgFilter(req) };
-    if (status) filter.status = status;
+    if (status && status !== "all") filter.status = status;
     if (kind) filter.kind = kind;
     if (requestedBy) filter.requestedBy = requestedBy;
 
@@ -223,7 +478,10 @@ router.get("/", async (req, res) => {
         .limit(Number(limit))
         .lean(),
       Acc_ApprovalRequest.countDocuments(filter),
-      Acc_ApprovalRequest.countDocuments({ ...orgFilter(req), status: "pending" }),
+      Acc_ApprovalRequest.countDocuments({
+        ...orgFilter(req),
+        status: "pending",
+      }),
     ]);
 
     res.json({

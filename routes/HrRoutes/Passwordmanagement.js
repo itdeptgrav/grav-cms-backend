@@ -79,6 +79,65 @@ function getModelByType(userType) {
   }
 }
 
+// ─── Shared: the department login models (single source of truth) ────────────
+// Reused by the /users list and the /sync-dept-logins reconcile endpoints.
+const DEPT_TYPES = [
+  { key: "hr", Model: HRDepartment, label: "HR" },
+  { key: "sales", Model: SalesDepartment, label: "Sales" },
+  { key: "accountant", Model: AccountantDepartment, label: "Accountant" },
+  {
+    key: "cutting-master",
+    Model: CuttingMasterDepartment,
+    label: "Cutting Master",
+  },
+  { key: "project_manager", Model: ProjectManager, label: "Project Manager" },
+  { key: "mpc-measurement", Model: MpcMeasurement, label: "MPC Measurement" },
+  {
+    key: "packaging-dispatch",
+    Model: PackagingDispatchDepartment,
+    label: "Packaging & Dispatch",
+  },
+  {
+    key: "production-supervisor",
+    Model: ProductionSupervisorDepartment,
+    label: "Production Supervisor",
+  },
+  { key: "qc", Model: QCDepartment, label: "QC" },
+  { key: "ceo", Model: CEODepartment, label: "CEO" },
+];
+const DEPT_KEY_SET = new Set(DEPT_TYPES.map((d) => d.key));
+
+// Map a free-text employee department / jobTitle to one of the dept-login keys.
+// Returns null if the employee doesn't belong to any dept-login model (they're
+// then a plain Employee-collection user and need no separate dept login).
+function mapEmployeeToDeptKey(emp) {
+  const hay = `${emp.department || ""} ${emp.jobTitle || ""}`
+    .toLowerCase()
+    .trim();
+  if (!hay) return null;
+  // Order matters: check more specific phrases before generic ones.
+  if (/\bceo\b|managing director|founder|chairman/.test(hay)) return "ceo";
+  if (/human resource|\bhr\b/.test(hay)) return "hr";
+  if (/account|finance/.test(hay)) return "accountant";
+  if (/cutting/.test(hay)) return "cutting-master";
+  if (/project\s*manager|\bpm\b/.test(hay)) return "project_manager";
+  if (/mpc|measurement/.test(hay)) return "mpc-measurement";
+  if (/packaging|dispatch/.test(hay)) return "packaging-dispatch";
+  if (/production\s*supervisor|supervisor/.test(hay))
+    return "production-supervisor";
+  if (/quality|\bqc\b/.test(hay)) return "qc";
+  if (/\bsales\b/.test(hay)) return "sales";
+  return null;
+}
+
+// Normalise a phone/bio value for comparison (trim, drop spaces & dashes).
+function normKey(v) {
+  return String(v ?? "")
+    .replace(/[\s-]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
 // Helper to get user name from different models
 function getUserName(user, userType) {
   if (userType === "employee") {
@@ -135,18 +194,28 @@ router.get("/users", EmployeeAuthMiddleware, hrOnly, async (req, res) => {
 
     // Query builder for Employee model (firstName/lastName split)
     const buildEmployeeQuery = () => {
-      const q = { isActive: true };
+      // "Active" must match the rest of the system: an employee counts as
+      // active if EITHER status === "active" OR isActive === true. The old
+      // filter used only { isActive: true }, which silently hid employees that
+      // were marked active via `status` (e.g. GR0080 / LIZARANI BEHERA) — they
+      // never appeared here even though they exist and can log in.
+      const activeCond = { $or: [{ status: "active" }, { isActive: true }] };
+      if (!search && !department) return activeCond;
+      const and = [activeCond];
       if (search) {
-        q.$or = [
-          { firstName: { $regex: search, $options: "i" } },
-          { lastName: { $regex: search, $options: "i" } },
-          { email: { $regex: search, $options: "i" } },
-          { biometricId: { $regex: search, $options: "i" } },
-          { phone: { $regex: search, $options: "i" } },
-        ];
+        and.push({
+          $or: [
+            { firstName: { $regex: search, $options: "i" } },
+            { lastName: { $regex: search, $options: "i" } },
+            { email: { $regex: search, $options: "i" } },
+            { biometricId: { $regex: search, $options: "i" } },
+            { phone: { $regex: search, $options: "i" } },
+          ],
+        });
       }
-      if (department) q.department = { $regex: department, $options: "i" };
-      return q;
+      if (department)
+        and.push({ department: { $regex: department, $options: "i" } });
+      return { $and: and };
     };
 
     let results = [];
@@ -544,5 +613,192 @@ router.post("/bulk-reset", EmployeeAuthMiddleware, hrOnly, async (req, res) => {
       .json({ success: false, message: "Error performing bulk reset" });
   }
 });
+
+/**
+ * Shared reconcile computation (CLEANUP-ONLY).
+ *
+ * Every active employee already has an Employee login (they appear under the
+ * "Employee" type and can sign in via the employee app). So a SEPARATE
+ * department login for that same person is a DUPLICATE — that's what produced
+ * the two ARNOLDIN rows (Employee + Cutting Master). This sync therefore does
+ * NOT create department logins. It only finds department logins that should be
+ * cleaned up, matching on BOTH biometric id and phone:
+ *
+ *   duplicates — a dept login whose (bio, phone) matches an active employee.
+ *                The person already has an Employee login, so this dept login
+ *                is redundant. Recommended for removal by default.
+ *   orphans    — a dept login that matches NO active employee at all.
+ *                Could be a hand-made standalone account, so NOT recommended
+ *                by default (left unchecked for HR to decide).
+ *
+ * Admin department logins are NEVER offered for removal — HR, Accountant, CEO
+ * and Project Manager accounts are protected, since those are real login
+ * accounts that may legitimately have no Employee record.
+ */
+const ADMIN_PROTECTED_DEPT_KEYS = new Set([
+  "hr",
+  "accountant",
+  "ceo",
+  "project_manager",
+]);
+
+async function computeDeptReconcile() {
+  // 1. Active employees — the source of truth for who can already log in.
+  //    "Active" = status "active" OR isActive true (matches the rest of the
+  //    system), so an employee marked active via `status` still counts.
+  const employees = await Employee.find({
+    $or: [{ status: "active" }, { isActive: true }],
+  })
+    .select("firstName lastName email phone biometricId department jobTitle")
+    .lean();
+
+  // Composite (bio|phone) index of active employees.
+  const empByComposite = new Map();
+  for (const e of employees) {
+    const k = `${normKey(e.biometricId)}|${normKey(e.phone)}`;
+    if (normKey(e.biometricId) && normKey(e.phone)) empByComposite.set(k, e);
+  }
+
+  // 2. Walk every department login model. Admin types are skipped entirely so
+  //    they can never be flagged for removal.
+  const duplicates = [];
+  const orphans = [];
+  for (const { key, Model, label } of DEPT_TYPES) {
+    if (ADMIN_PROTECTED_DEPT_KEYS.has(key)) continue; // protected — never touch
+    const rows = await Model.find({})
+      .select("name email phone employeeId department role isActive")
+      .lean();
+    for (const a of rows) {
+      const bio = normKey(a.employeeId);
+      const phone = normKey(a.phone);
+      // Skip accounts that can't be keyed on both fields — we can't safely
+      // judge them, so we leave them alone.
+      if (!bio || !phone) continue;
+      const composite = `${bio}|${phone}`;
+      const matchedEmp = empByComposite.get(composite);
+      const row = {
+        _id: a._id,
+        userType: key,
+        deptLabel: label,
+        name: a.name || a.email,
+        email: a.email,
+        phone: a.phone,
+        employeeId: a.employeeId,
+        department: a.department,
+        role: a.role,
+      };
+      if (matchedEmp) {
+        // Person already has an Employee login → this dept login is a duplicate.
+        row.reason = "Already has an Employee login";
+        duplicates.push(row);
+      } else {
+        // No matching employee → orphaned dept login.
+        row.reason = "No matching employee (biometric ID + mobile)";
+        orphans.push(row);
+      }
+    }
+  }
+
+  return { duplicates, orphans };
+}
+
+/**
+ * GET /api/hr/password-management/sync-dept-logins
+ * Dry-run preview. Returns { duplicates, orphans } — changes nothing.
+ */
+router.get(
+  "/sync-dept-logins",
+  EmployeeAuthMiddleware,
+  hrOnly,
+  async (req, res) => {
+    try {
+      const { duplicates, orphans } = await computeDeptReconcile();
+      res.status(200).json({
+        success: true,
+        data: {
+          duplicates,
+          orphans,
+          counts: {
+            duplicates: duplicates.length,
+            orphans: orphans.length,
+          },
+        },
+      });
+    } catch (err) {
+      console.error("Sync preview error:", err);
+      res
+        .status(500)
+        .json({ success: false, message: "Error computing sync preview" });
+    }
+  },
+);
+
+/**
+ * POST /api/hr/password-management/sync-dept-logins
+ * Removes only the department logins HR KEPT TICKED in the popup.
+ *   body.removeIds — array of dept-login _id (string) to delete
+ * Each id is re-validated against a fresh reconcile so a stale popup can't
+ * delete the wrong record, and admin-protected types can never be deleted.
+ */
+router.post(
+  "/sync-dept-logins",
+  EmployeeAuthMiddleware,
+  hrOnly,
+  async (req, res) => {
+    try {
+      const removeIds = Array.isArray(req.body?.removeIds)
+        ? req.body.removeIds.map(String)
+        : [];
+
+      if (removeIds.length === 0) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Nothing selected to remove." });
+      }
+
+      // Re-validate: only ids that are genuinely a duplicate or orphan right
+      // now (and therefore non-admin) may be deleted.
+      const { duplicates, orphans } = await computeDeptReconcile();
+      const removable = new Map(
+        [...duplicates, ...orphans].map((r) => [String(r._id), r]),
+      );
+
+      const removed = [];
+      const errors = [];
+      for (const id of removeIds) {
+        const target = removable.get(id);
+        if (!target) {
+          errors.push({
+            id,
+            error: "No longer a removable dept login (or protected admin)",
+          });
+          continue;
+        }
+        try {
+          const Model = getModelByType(target.userType);
+          await Model.findByIdAndDelete(id);
+          removed.push({
+            id,
+            name: target.name,
+            deptLabel: target.deptLabel,
+          });
+        } catch (e) {
+          errors.push({ id, error: e.message });
+        }
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `Sync complete: ${removed.length} duplicate/orphan login(s) removed${errors.length ? `, ${errors.length} skipped` : ""}.`,
+        data: { removed, errors },
+      });
+    } catch (err) {
+      console.error("Sync apply error:", err);
+      res
+        .status(500)
+        .json({ success: false, message: "Error applying sync" });
+    }
+  },
+);
 
 module.exports = router;

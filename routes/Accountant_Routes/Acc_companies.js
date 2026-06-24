@@ -11,11 +11,19 @@ const {
   Acc_Group,
   ACC_DEFAULT_GROUPS,
 } = require("../../models/Accountant_model/Acc_MasterModels");
-// GST helpers — used to auto-derive stateCode/state from the company GSTIN
-// when the Settings page saves company GST details (open task #2).
-const gstState = require("../../services/gstState.util");
 
-router.use(accountantAuth);
+router.use((req, res, next) => {
+  if (req.method === "GET") return next();
+  const isOwner =
+    req.user?.role === "owner" || req.user?.isLegacy || req.user?.isDev;
+  if (!isOwner) {
+    return res.status(403).json({
+      success: false,
+      message: "Only the owner can add or manage companies.",
+    });
+  }
+  next();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper — seed Tally's 28 reserved groups for a brand-new company
@@ -207,26 +215,42 @@ router.put("/:id", async (req, res) => {
     // whole sub-doc and wipe the other address fields, so deep-merge it onto
     // the existing record. Also auto-derive stateCode from the GSTIN when the
     // accountant left it blank, so intra/inter-state tax always resolves.
-    if (updates.address && typeof updates.address === "object") {
+    //
+    // Same problem with `contact`: the Organization tab in Settings sends
+    // `{ contact: { phone, email, website } }` and another caller might send
+    // `{ contact: { phone: "..." } }` alone. Without merging, the partial
+    // write would clobber the unspecified fields. Deep-merge contact too.
+    if (
+      (updates.address && typeof updates.address === "object") ||
+      (updates.contact && typeof updates.contact === "object")
+    ) {
       const existing = await Acc_Company.findById(req.params.id)
-        .select("address gstin")
+        .select("address contact gstin")
         .lean();
-      const prevAddr = (existing && existing.address) || {};
-      const mergedAddr = { ...prevAddr, ...updates.address };
 
-      const gstinForDerive =
-        updates.gstin != null ? updates.gstin : existing && existing.gstin;
-      const resolved = gstState.resolveState({
-        gstin: gstinForDerive,
-        state: mergedAddr.state,
-        stateCode: mergedAddr.stateCode,
-      });
-      if (!mergedAddr.stateCode && resolved.stateCode)
-        mergedAddr.stateCode = resolved.stateCode;
-      if (!mergedAddr.state && resolved.state)
-        mergedAddr.state = resolved.state;
+      if (updates.address && typeof updates.address === "object") {
+        const prevAddr = (existing && existing.address) || {};
+        const mergedAddr = { ...prevAddr, ...updates.address };
 
-      updates.address = mergedAddr;
+        const gstinForDerive =
+          updates.gstin != null ? updates.gstin : existing && existing.gstin;
+        const resolved = gstState.resolveState({
+          gstin: gstinForDerive,
+          state: mergedAddr.state,
+          stateCode: mergedAddr.stateCode,
+        });
+        if (!mergedAddr.stateCode && resolved.stateCode)
+          mergedAddr.stateCode = resolved.stateCode;
+        if (!mergedAddr.state && resolved.state)
+          mergedAddr.state = resolved.state;
+
+        updates.address = mergedAddr;
+      }
+
+      if (updates.contact && typeof updates.contact === "object") {
+        const prevContact = (existing && existing.contact) || {};
+        updates.contact = { ...prevContact, ...updates.contact };
+      }
     }
 
     const company = await Acc_Company.findByIdAndUpdate(

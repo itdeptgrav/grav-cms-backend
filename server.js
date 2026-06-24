@@ -574,7 +574,7 @@ const createDefaultAccountant = async () => {
 
     const defaultAccountant = new AccountantDepartment({
       name: "Accountant Admin",
-      email: "accountant@grav.in",
+      email: "accounts@grav.in",
       password: "Account@12345", // will be hashed automatically
       employeeId: "ACC001",
       phone: "9999999999",
@@ -723,8 +723,16 @@ app.use("/api/ceo/overview", ceoOverviewRoutes);
 const ceoVendorRoutes = require("./routes/CEO_Routes/HistoryReport/vendor");
 app.use("/api/ceo/inventory/vendors", ceoVendorRoutes);
 
+const dispatchChallanRoutes = require("./routes/CMS_Routes/Manufacturing/Dispatch/dispatchChallanRoutes");
+app.use("/api/cms/manufacturing/dispatch-challans", dispatchChallanRoutes);
 
-app.use("/api/cms/inventory/stock-ledger", require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"));
+const returnRequestRoutes = require("./routes/CMS_Routes/Manufacturing/Return/returnRequestRoutes");
+app.use("/api/cms/manufacturing/return-requests", returnRequestRoutes);
+
+app.use(
+  "/api/cms/inventory/stock-ledger",
+  require("./routes/CMS_Routes/Inventory/Operations/stockLedgerRoutes"),
+);
 
 /* =====================
     Normal Employees ROUTES
@@ -737,6 +745,8 @@ const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 
 const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
 app.use("/api/hr/overview", hrOverviewRoutes);
+
+app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
 
 app.use("/api/hr", hrProfileRoutes);
 app.use("/api/auth", authRoutes);
@@ -754,17 +764,39 @@ const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 app.use("/api/hr/sop", hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
 
+const salesSettingsRoutes = require("./routes/CMS_Routes/Sales/salesSettings");
+
+app.use("/api/cms/sales/settings", salesSettingsRoutes);
+
+app.use(
+  "/api/cms/crm/call-schedules",
+  require("./routes/CMS_Routes/Sales/callSchedule"),
+);
+app.use(
+  "/api/cms/crm/settings",
+  require("./routes/CMS_Routes/Sales/crmSettings"),
+);
+
 /* =====================
     Customer ROUTES
   ===================== */
-const customerRoutes = require("./routes/Customer_Routes/auth");
-app.use("/api/customer", customerRoutes);
+const customerAuthRoutes = require("./routes/Customer_Routes/auth");
+app.use("/api/customer/auth", customerAuthRoutes);
+
+const salesCustomersRoutes = require("./routes/CMS_Routes/Sales/salesCustomers");
+app.use("/api/cms/sales/customers", salesCustomersRoutes);
 
 const customerRequestsRoutes = require("./routes/Customer_Routes/CustomerRequests.js");
 app.use("/api/customer/requests", customerRequestsRoutes);
 
 const customerProfileRoutes = require("./routes/Customer_Routes/Profile.js");
 app.use("/api/customer/profile", customerProfileRoutes);
+
+const customerReturnsRoutes = require("./routes/Customer_Routes/CustomerReturns");
+app.use("/api/customer/returns", customerReturnsRoutes);
+
+const customerPasswordResetRoutes = require("./routes/Customer_Routes/PasswordResetOTP");
+app.use("/api/customer/password-reset", customerPasswordResetRoutes);
 
 const sopRoutes = require("./routes/soproutes/soproute");
 app.use("/cowork/sop", sopRoutes);
@@ -795,6 +827,14 @@ app.use(
 /* ===================
   CMS ROUTES
 ===================== */
+const crmLeadsRoutes = require("./routes/CMS_Routes/Sales/leads");
+const crmContactsRoutes = require("./routes/CMS_Routes/Sales/contacts");
+const crmAccountsRoutes = require("./routes/CMS_Routes/Sales/accounts");
+
+app.use("/api/cms/crm/leads", crmLeadsRoutes);
+app.use("/api/cms/crm/contacts", crmContactsRoutes);
+app.use("/api/cms/crm/accounts", crmAccountsRoutes);
+
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
@@ -888,13 +928,13 @@ app.use(
   workOrderProgressRoutes,
 );
 
+const mrfRoutes = require("./routes/CMS_Routes/Inventory/Operations/mrfRoutes");
+app.use("/api/cms/inventory/mrf", mrfRoutes);
 
-
-const mrfRoutes = require("./routes/CMS_Routes/Inventory/Operations/mrfRoutes")
-app.use("/api/cms/inventory/mrf", mrfRoutes)
-
-app.use("/api/cowork/mrf", require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"))
-
+app.use(
+  "/api/cowork/mrf",
+  require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
+);
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
@@ -1031,6 +1071,11 @@ app.use(
   require("./routes/Accountant_Routes/Acc_ledgerReclass"),
 );
 
+app.use(
+  "/api/accountant/backup",
+  require("./routes/Accountant_Routes/Acc_backup"),
+);
+
 // ── Operational routes ────────────────────────────────────────────────
 app.use(
   "/api/accountant/dashboard",
@@ -1047,6 +1092,10 @@ app.use(
 app.use(
   "/api/accountant/proforma-invoices",
   require("./routes/Accountant_Routes/Acc_proformaInvoices"),
+);
+app.use(
+  "/api/accountant/eway-bill",
+  require("./routes/Accountant_Routes/Acc_ewayBill"),
 );
 app.use(
   "/api/accountant/vendors",
@@ -1075,6 +1124,13 @@ app.use(
 app.use(
   "/api/accountant/bank-transactions",
   require("./routes/Accountant_Routes/Acc_bankTransactions"),
+);
+const bankReconRoutes = require("./routes/Accountant_Routes/Acc_bankRecon");
+app.use("/api/accountant/bank-recon", bankReconRoutes);
+
+app.use(
+  "/api/accountant/voucher-files",
+  require("./routes/Accountant_Routes/Acc_voucherUploads"),
 );
 
 app.use(
@@ -1126,6 +1182,14 @@ app.use(
   "/api/accountant/import-mapping",
   require("./routes/Accountant_Routes/Acc_importMapping"),
 );
+
+app.use(
+  "/api/accountant/gstr2b",
+  require("./routes/Accountant_Routes/Acc_gstr2b"),
+);
+
+const searchRoute = require("./routes/Accountant_Routes/Acc_search");
+app.use("/api/accountant/search", searchRoute);
 
 // ── Health probe (open in browser to verify mounting) ────────────────
 // http://localhost:5000/api/accountant/_health
@@ -1228,6 +1292,9 @@ app.use("/cowork", askAITest);
 
 const crossOrgRoutes = require("./routes/Customer_Routes/cross-org-assign.js");
 app.use("/api/customer/employees/cross-org", crossOrgRoutes);
+
+const customerOrderTrackingRoutes = require("./routes/Customer_Routes/OrderTracking.js");
+app.use("/api/customer/requests", customerOrderTrackingRoutes);
 
 /* =====================================================================
    INLINE: Barcode Scanner Tracking Routes

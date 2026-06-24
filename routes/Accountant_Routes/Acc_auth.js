@@ -1,19 +1,6 @@
 // routes/Accountant_Routes/Acc_auth.js
 //
 // AUTHENTICATION for the accountant module.
-//
-// Routes:
-//   POST /login            — email + password → cookie + user
-//   POST /logout           — clears cookie
-//   GET  /me               — returns the current user + org (requires auth)
-//   POST /change-password  — current user changes their own password
-//   POST /accept-invite    — invitee sets their password using a token
-//   POST /bootstrap        — FIRST-RUN ONLY. Creates the first organization
-//                            + owner user. Refuses if any org already exists.
-//
-// All mutations log to console for the first round. Email-sending is a
-// no-op stub (the bootstrap and invite flows surface the password/token
-// directly so the owner can pass them on).
 
 const express = require("express");
 const crypto = require("crypto");
@@ -29,9 +16,6 @@ const {
 const orgAuthModule = require("../../Middlewear/AccountantOrgAuthMiddleware");
 const { orgAuth, signOrgToken, extractToken } = orgAuthModule;
 
-// Defensive guard — if AccountantOrgAuthMiddleware.js is missing or out of
-// date, Node would otherwise throw an opaque "argument handler must be a
-// function" deep inside Express. This check surfaces the real problem.
 if (
   typeof orgAuth !== "function" ||
   typeof signOrgToken !== "function" ||
@@ -47,15 +31,14 @@ if (
   );
 }
 
-// Cookie settings. We use a dedicated cookie name `accountant_token` so it
-// doesn't collide with other auth cookies the host CMS might use.
 const COOKIE_NAME = "accountant_token";
+const isProduction = process.env.NODE_ENV === "production";
 const COOKIE_OPTS = {
   httpOnly: true,
-  sameSite: "lax",
-  secure: process.env.NODE_ENV === "production",
+  secure: isProduction,
+  sameSite: isProduction ? "none" : "lax",
+  maxAge: 24 * 60 * 60 * 1000,
   path: "/",
-  maxAge: 12 * 60 * 60 * 1000, // 12h — matches JWT expiry
 };
 
 function setAuthCookie(res, token) {
@@ -82,7 +65,6 @@ router.post("/login", async (req, res) => {
       email: String(email).toLowerCase(),
     });
     if (!user || !user.isActive) {
-      // Same error for missing + inactive to avoid leaking which emails exist
       return res
         .status(401)
         .json({ success: false, message: "Invalid email or password" });
@@ -103,7 +85,7 @@ router.post("/login", async (req, res) => {
 
     res.json({
       success: true,
-      token, // also returned in body for clients that prefer Authorization header
+      token,
       user: {
         id: user._id,
         organizationId: user.organizationId,
@@ -128,25 +110,117 @@ router.post("/logout", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// POST /logout-all  — invalidate this user's sessions on EVERY device
+// ─────────────────────────────────────────────────────────────────────────
+// Bumping tokenVersion makes every JWT previously signed for this user fail
+// the version check in orgAuth — including the token on the current device —
+// so all sessions are forced to re-login.
+router.post("/logout-all", orgAuth, async (req, res) => {
+  try {
+    // Legacy / dev sessions have no Acc_User row to bump — just clear locally.
+    if (req.user?.isLegacy || req.user?.isDev || !req.user?.id) {
+      clearAuthCookie(res);
+      return res.json({ success: true, message: "Logged out." });
+    }
+    await Acc_User.findByIdAndUpdate(req.user.id, {
+      $inc: { tokenVersion: 1 },
+      $set: { sessionsRevokedAt: new Date() },
+    });
+    clearAuthCookie(res);
+    res.json({
+      success: true,
+      message: "Logged out from all devices.",
+    });
+  } catch (e) {
+    console.error("[accountant/auth/logout-all]", e);
+    res.status(500).json({ success: false, message: "Logout failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /push-token — register an FCM web-push device token for the current
+// user. The accountant app calls this after the user grants notification
+// permission. Stored on Acc_User.fcmTokens; the approval-notification service
+// reads it to deliver web push. Idempotent ($addToSet handles re-registration
+// and multiple devices).
+// ─────────────────────────────────────────────────────────────────────────
+router.post("/push-token", orgAuth, async (req, res) => {
+  try {
+    const token = req.body?.token;
+    if (!token || typeof token !== "string") {
+      return res
+        .status(400)
+        .json({ success: false, message: "token is required" });
+    }
+    // A push token identifies a DEVICE, not a person. If another account
+    // previously registered this same token (shared browser, or this device
+    // switching logins), detach it from them first — otherwise it sits stale
+    // on that account and FCM keeps "accepting" sends to it that never arrive.
+    // Then attach it to whoever is logged in on this device now.
+    await Acc_User.updateMany(
+      { _id: { $ne: req.user.id }, fcmTokens: token },
+      { $pull: { fcmTokens: token } },
+    );
+    await Acc_User.updateOne(
+      { _id: req.user.id },
+      { $addToSet: { fcmTokens: token } },
+    );
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[accountant/auth/push-token]", e);
+    res.status(500).json({ success: false, message: "Failed to save token" });
+  }
+});
+
+// DELETE /push-token — drop a token (sign-out on this device / permission revoked)
+router.delete("/push-token", orgAuth, async (req, res) => {
+  try {
+    const token = req.body?.token;
+    if (token) {
+      await Acc_User.updateOne(
+        { _id: req.user.id },
+        { $pull: { fcmTokens: token } },
+      );
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[accountant/auth/push-token delete]", e);
+    res.status(500).json({ success: false, message: "Failed to remove token" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // GET /me  — needs auth
 // ─────────────────────────────────────────────────────────────────────────
 router.get("/me", orgAuth, async (req, res) => {
+  // ── Dev bypass ───────────────────────────────────────────────────────────
+  // FIX: added `return` so execution stops here; moved hiddenNavItems
+  // reference inside a block where it's safely hard-coded to [] for dev mode.
   if (req.user?.isDev) {
     return res.json({
       success: true,
       user: {
         id: req.user.id,
-        name: "Dev Owner",
-        email: "dev@local",
-        role: "owner",
-        isOwner: true,
-        isDev: true,
+        organizationId: req.user.organizationId,
+        name: req.user.name,
+        email: req.user.email,
+        role: req.user.role,
+        isOwner: req.user.role === "owner",
       },
-      organization: null,
+      organization: req.organization
+        ? {
+            id: req.organization._id,
+            name: req.organization.name,
+            tallyCompanyIds: req.organization.tallyCompanyIds,
+            settings: req.organization.settings,
+          }
+        : null,
       permissions: req.user.permissions,
-      hiddenNavItems: [],
+      hiddenNavItems: [], // dev users always see everything
     });
   }
+
+  // ── Legacy token ─────────────────────────────────────────────────────────
   if (req.user?.isLegacy) {
     return res.json({
       success: true,
@@ -165,6 +239,7 @@ router.get("/me", orgAuth, async (req, res) => {
     });
   }
 
+  // ── Regular org user ─────────────────────────────────────────────────────
   // Re-fetch user to read hiddenNavItems (orgAuth only attaches a thin
   // projection). Cheap — single document lookup, indexed.
   let hiddenNavItems = [];
@@ -196,16 +271,12 @@ router.get("/me", orgAuth, async (req, res) => {
         }
       : null,
     permissions: req.user.permissions,
-    hiddenNavItems,
+    // Owners always get an empty list regardless of what's stored in the DB.
+    // The PUT /nav-prefs endpoint already blocks writes for owners, but any
+    // values stored before that guard was added are silently cleared here.
+    hiddenNavItems: req.user?.role === "owner" ? [] : hiddenNavItems,
   });
 });
-
-// ─────────────────────────────────────────────────────────────────────────
-// (Removed) PUT /nav-prefs — self-service sidebar customization
-// ─────────────────────────────────────────────────────────────────────────
-// Sidebar visibility is now controlled by the owner per user, not by users
-// themselves. See PUT /api/accountant/team/:userId/nav-prefs in
-// teamRoutes.js for the admin-only replacement.
 
 // ─────────────────────────────────────────────────────────────────────────
 // POST /change-password — current user changes own password
@@ -286,7 +357,6 @@ router.post("/accept-invite", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Invitation has expired" });
 
-    // Check the email isn't already a user for this org
     const existing = await Acc_User.findOne({
       organizationId: invite.organizationId,
       email: invite.email,
@@ -337,13 +407,6 @@ router.post("/accept-invite", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /bootstrap — create the FIRST organization + owner user
 // ─────────────────────────────────────────────────────────────────────────
-// Only allowed when there are zero existing organizations. Returns the
-// owner login credentials. Subsequent users come in via invite.
-//
-// Curl example for initial setup:
-//   curl -X POST http://localhost:5000/api/accountant/auth/bootstrap \
-//     -H "Content-Type: application/json" \
-//     -d '{"organizationName":"GRAV","ownerName":"Owner Name","email":"owner@grav.in","password":"choose-a-strong-one"}'
 router.post("/bootstrap", async (req, res) => {
   try {
     const existing = await Acc_Organization.countDocuments({});
@@ -409,29 +472,8 @@ router.post("/bootstrap", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /sync-legacy — auto-bootstrap from a legacy CMS login
 // ─────────────────────────────────────────────────────────────────────────
-// Background: the main GRAV CMS has its own login page where the user
-// `accountant@grav.in` (an Employee/Acc_Department record) signs in.
-// That issues a legacy JWT with role:"accountant" but no organizationId.
-//
-// When that user lands on the accountant module's frontend, the
-// AuthProvider sees `isLegacy: true` from `/me` and calls this endpoint
-// to upgrade the session into the new sub-account world WITHOUT making
-// the user log in again.
-//
-// What this does:
-//   1. Verifies the legacy JWT (so we trust the email)
-//   2. If there's already an Acc_User with that email → just sign
-//      a new org token, set cookie, done.
-//   3. Else: create (or reuse) the Acc_Organization, create an
-//      owner Acc_User linked to the legacy email, attach any
-//      existing companies the user has access to, set cookie, done.
-//
-// The user never types a password. The legacy CMS login already
-// authenticated them, and we transitively trust that.
-
 router.post("/sync-legacy", async (req, res) => {
   try {
-    // 1. Verify legacy token
     const token = extractToken(req);
     if (!token) {
       return res
@@ -451,16 +493,10 @@ router.post("/sync-legacy", async (req, res) => {
         .json({ success: false, message: "Invalid legacy token" });
     }
 
-    // The legacy JWT shape varies between login routes — try multiple field
-    // names. We trust the DB record as the source of truth, not the JWT
-    // claims, so we just need to find SOMETHING that identifies the user.
     const legacyUserId =
       decoded.id || decoded._id || decoded.userId || decoded.employeeId;
     const legacyEmail = (decoded.email || "").toLowerCase();
 
-    // Look the user up in the Acc_Department collection. This is
-    // the source of truth — if a record exists and isActive, they are
-    // legitimately a main accountant admin.
     let mongooseRef;
     try {
       mongooseRef = require("mongoose");
@@ -470,7 +506,6 @@ router.post("/sync-legacy", async (req, res) => {
         .json({ success: false, message: "mongoose not available" });
     }
 
-    // Try to find the Acc_Department record by id or email
     let acctDept = null;
     try {
       const Acc_Department =
@@ -482,14 +517,12 @@ router.post("/sync-legacy", async (req, res) => {
         mongooseRef.Types.ObjectId.isValid(String(legacyUserId))
       ) {
         acctDept = await Acc_Department.findById(legacyUserId);
-      } else {
       }
       if (!acctDept && legacyEmail) {
         acctDept = await Acc_Department.findOne({ email: legacyEmail });
       }
 
       if (!acctDept) {
-        // Last-resort dump of what IS in acc_departments
         const allDepts = await Acc_Department.find({})
           .select("_id email name role")
           .lean();
@@ -518,15 +551,9 @@ router.post("/sync-legacy", async (req, res) => {
       });
     }
 
-    // We trust the DB record now — use its fields, not the JWT's.
     const trustedEmail = acctDept.email.toLowerCase();
     const trustedName = acctDept.name || "Accountant Admin";
 
-    // 2. Already promoted? Just refresh the cookie.
-    // Case-insensitive lookup so a stored email like "Accountant@grav.in"
-    // still matches "accountant@grav.in" from the lowercased trustedEmail.
-    // Anchored regex with escaped special chars avoids accidental
-    // substring matches.
     const emailRe = new RegExp(
       "^" + trustedEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
       "i",
@@ -537,6 +564,24 @@ router.post("/sync-legacy", async (req, res) => {
         return res.status(403).json({
           success: false,
           message: "Account is inactive — contact your owner.",
+        });
+      }
+      // ── Reject a re-bootstrap after "log out of all devices" ─────────────
+      // If this owner hit logout-all, sessionsRevokedAt is set. A CMS token
+      // minted BEFORE that moment must not silently re-create an accountant
+      // session, or other devices never actually log out. The owner has to
+      // sign in again at /login (which issues a fresh CMS token, newer iat).
+      if (
+        user.sessionsRevokedAt &&
+        decoded.iat &&
+        decoded.iat * 1000 < new Date(user.sessionsRevokedAt).getTime()
+      ) {
+        clearAuthCookie(res);
+        return res.status(200).json({
+          success: false,
+          code: "SESSION_REVOKED",
+          message:
+            "You logged out of all devices. Please sign in again from the main login page.",
         });
       }
       user.lastLoginAt = new Date();
@@ -558,7 +603,6 @@ router.post("/sync-legacy", async (req, res) => {
       });
     }
 
-    // 3. Not yet in the new system. Promote them.
     let org = await Acc_Organization.findOne({});
     if (!org) {
       const fallbackOrgName = trustedEmail.includes("@")
@@ -574,7 +618,6 @@ router.post("/sync-legacy", async (req, res) => {
       });
     }
 
-    // Auto-attach all existing companies to this org
     try {
       const CompanyModel = mongooseRef.models.Acc_Company;
       if (
@@ -591,12 +634,6 @@ router.post("/sync-legacy", async (req, res) => {
       console.warn("[sync-legacy] auto-attach companies skipped:", e.message);
     }
 
-    // Belt-and-braces: re-check for an existing user within THIS org
-    // before inserting. This catches the case where the earlier
-    // case-insensitive lookup misses for any reason but the unique
-    // index `{organizationId: 1, email: 1}` would still reject the
-    // insert. Querying with the same compound key the index uses
-    // guarantees no false-miss.
     user = await Acc_User.findOne({
       organizationId: org._id,
       email: emailRe,
@@ -627,9 +664,6 @@ router.post("/sync-legacy", async (req, res) => {
       });
     }
 
-    // Truly new — create the Acc_User. Wrap in try/catch so a residual
-    // duplicate-key race (shouldn't happen, but the index is the final
-    // gatekeeper) is caught and we recover by fetching the existing doc.
     try {
       user = new Acc_User({
         organizationId: org._id,
@@ -644,16 +678,12 @@ router.post("/sync-legacy", async (req, res) => {
       user.lastLoginAt = new Date();
       await user.save();
     } catch (insertErr) {
-      // E11000 = duplicate key on the {organizationId, email} index.
-      // Means a concurrent request just created the user, or a stale
-      // doc we missed in lookup is there. Either way, fetch and reuse.
       if (insertErr && insertErr.code === 11000) {
         user = await Acc_User.findOne({
           organizationId: org._id,
           email: emailRe,
         });
         if (!user) {
-          // Should be unreachable, but bail out cleanly if so
           throw insertErr;
         }
         user.lastLoginAt = new Date();
@@ -698,9 +728,7 @@ router.post("/sync-legacy", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// GET /debug-token — returns the decoded contents of whatever JWT cookie
-// the client is sending. NO secret information — just shows the public
-// claims. Used to debug the legacy-token shape during sync-legacy.
+// GET /debug-token
 // ─────────────────────────────────────────────────────────────────────────
 router.get("/debug-token", (req, res) => {
   try {

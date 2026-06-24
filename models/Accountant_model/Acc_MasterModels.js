@@ -83,7 +83,7 @@ tallyCompanySchema.index({ isPrimary: 1 });
 // We pre-seed the 28 default Tally groups; users can add custom sub-groups.
 //
 // Default Tally primary groups:
-//   Capital Account, Loans (Liability), Current Liabilities, Suspense A/c,
+//   Capital Account, Loans & Advances (Liability), Current Liabilities, Suspense A/c,
 //   Branch / Divisions, Misc. Expenses (Asset), Loans & Advances (Asset),
 //   Investments, Current Assets, Fixed Assets, Sales Accounts,
 //   Purchase Accounts, Direct Expenses, Indirect Expenses, Direct Incomes,
@@ -104,7 +104,7 @@ const ACC_DEFAULT_GROUPS = [
     parent: "Capital Account",
   },
   {
-    name: "Loans (Liability)",
+    name: "Loans & Advances (Liability)",
     nature: "liability",
     isReserved: true,
     parent: null,
@@ -114,19 +114,19 @@ const ACC_DEFAULT_GROUPS = [
     name: "Bank OD A/c",
     nature: "liability",
     isReserved: true,
-    parent: "Loans (Liability)",
+    parent: "Loans & Advances (Liability)",
   },
   {
     name: "Secured Loans",
     nature: "liability",
     isReserved: true,
-    parent: "Loans (Liability)",
+    parent: "Loans & Advances (Liability)",
   },
   {
     name: "Unsecured Loans",
     nature: "liability",
     isReserved: true,
-    parent: "Loans (Liability)",
+    parent: "Loans & Advances (Liability)",
   },
   {
     name: "Current Liabilities",
@@ -417,6 +417,20 @@ const tallyLedgerSchema = new mongoose.Schema(
       default: "unknown",
     },
     gstin: { type: String, trim: true },
+    // Additional GSTINs — for a vendor/customer with more than one GST
+    // registration (e.g. branches in different states, or multiple
+    // registrations under the same PAN). The PRIMARY GSTIN stays in `gstin`
+    // above and remains what every report / voucher / e-way-bill reads by
+    // default; these are extra options the user can pick from on a voucher.
+    additionalGstins: [
+      {
+        _id: false,
+        gstin: { type: String, trim: true },
+        label: { type: String, trim: true }, // optional human label e.g. "Mumbai branch"
+        stateCode: { type: String, trim: true },
+        state: { type: String, trim: true },
+      },
+    ],
     hsnCode: { type: String, trim: true },
     taxRate: { type: Number, default: 0 }, // for income/expense ledgers
 
