@@ -67,7 +67,6 @@ const matchExistingVariant = (incoming, existingList) => {
   return null;
 };
 
-// Normalise per-variant vendorNicknames input
 const normaliseVariantNicknames = (incoming) => {
   if (!Array.isArray(incoming)) return null;
   return incoming
@@ -76,7 +75,12 @@ const normaliseVariantNicknames = (incoming) => {
       _id: vn._id && mongoose.Types.ObjectId.isValid(vn._id) ? vn._id : undefined,
       vendor: vn.vendor,
       nickname: vn.nickname.toString().trim(),
-      notes: (vn.notes || "").toString().trim()
+      price: parseFloat(vn.price) || 0,
+      deliveryDays: parseInt(vn.deliveryDays) || 0,
+      notes: (vn.notes || "").toString().trim(),
+      specifications: Array.isArray(vn.specifications)
+        ? vn.specifications.filter(s => s.key && s.key.trim()).map(s => ({ key: s.key.trim(), value: (s.value || "").trim() }))
+        : []
     }));
 };
 
@@ -118,7 +122,8 @@ router.get("/", async (req, res) => {
         { name: { $regex: search, $options: "i" } },
         { sku: { $regex: search, $options: "i" } },
         { category: { $regex: search, $options: "i" } },
-        { customCategory: { $regex: search, $options: "i" } }
+        { customCategory: { $regex: search, $options: "i" } },
+        { "variants.vendorNicknames.nickname": { $regex: search, $options: "i" } }
       ];
     }
 
@@ -134,6 +139,7 @@ router.get("/", async (req, res) => {
       .populate("createdBy", "name email")
       .populate("updatedBy", "name email")
       .populate("primaryVendor", "companyName")
+      .populate({ path: "variants.vendorNicknames.vendor", select: "companyName" })
       .sort({ createdAt: -1 })
       .lean();
 
@@ -288,7 +294,6 @@ router.post("/", async (req, res) => {
       discounts,
       attributes,
       variants,
-      unitConversion,
       description,
       notes
     } = req.body;
@@ -347,7 +352,9 @@ router.post("/", async (req, res) => {
           minStock: parseFloat(variant.minStock) || parseFloat(minStock) || 0,
           maxStock: parseFloat(variant.maxStock) || parseFloat(maxStock) || 0,
           sku: variant.sku || "",
-          image: variant.image || ""
+          image: variant.image || "",
+          unitConversions: (Array.isArray(variant.unitConversions) ? variant.unitConversions : [])
+            .map(uc => normaliseUnitConversion(uc)).filter(Boolean)
         };
         const nks = normaliseVariantNicknames(variant.vendorNicknames);
         if (nks) out.vendorNicknames = nks;
@@ -377,7 +384,6 @@ router.post("/", async (req, res) => {
               price: parseFloat(d.price)
             }))
         : [],
-      unitConversion: normaliseUnitConversion(unitConversion),
       attributes: attributes && Array.isArray(attributes)
         ? attributes
             .filter(attr => attr.name && attr.name.trim() && attr.values && attr.values.length > 0)
@@ -437,7 +443,6 @@ router.put("/:id", async (req, res) => {
       discounts,
       attributes,
       variants,
-      unitConversion,
       description,
       notes
     } = req.body;
@@ -483,10 +488,6 @@ router.put("/:id", async (req, res) => {
         : [];
     }
 
-    if (unitConversion !== undefined) {
-      rawItem.unitConversion = normaliseUnitConversion(unitConversion);
-    }
-
     if (attributes !== undefined) {
       rawItem.attributes = Array.isArray(attributes)
         ? attributes
@@ -519,8 +520,13 @@ router.put("/:id", async (req, res) => {
             nicknames = existing?.vendorNicknames || [];
           }
 
+          const ucs = incoming.unitConversions !== undefined
+            ? (Array.isArray(incoming.unitConversions) ? incoming.unitConversions : [])
+                .map(u => normaliseUnitConversion(u)).filter(Boolean)
+            : (existing?.unitConversions || [])
+
           return {
-            _id: existing?._id, // preserve where possible
+            _id: existing?._id,
             combination: incoming.combination || existing?.combination || [],
             quantity: parseFloat(incoming.quantity ?? existing?.quantity ?? 0) || 0,
             minStock: parseFloat(incoming.minStock ?? existing?.minStock ?? rawItem.minStock) || 0,
@@ -528,6 +534,7 @@ router.put("/:id", async (req, res) => {
             sku: incoming.sku ?? existing?.sku ?? "",
             image,
             vendorNicknames: nicknames,
+            unitConversions: ucs,
             status: incoming.status || existing?.status || "In Stock"
           };
         });
@@ -637,6 +644,57 @@ router.get("/:id/variants/:variantId/vendor-nicknames", async (req, res) => {
   } catch (error) {
     console.error("Error fetching variant vendor nicknames:", error);
     res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// BULK upsert + delete aliases — single MongoDB save instead of N round trips
+router.post("/:id/variants/bulk-vendor-nicknames", async (req, res) => {
+  try {
+    const { operations = [] } = req.body;
+
+    const rawItem = await RawItem.findById(req.params.id);
+    if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
+
+    for (const op of operations) {
+      const variant = rawItem.variants.id(op.variantId);
+      if (!variant) continue;
+
+      if (op.action === "delete" && op.aliasId) {
+        const entry = variant.vendorNicknames.id(op.aliasId);
+        if (entry) entry.deleteOne();
+
+      } else if (op.action === "upsert") {
+        if (op.aliasId) {
+          // Update existing alias
+          const entry = variant.vendorNicknames.id(op.aliasId);
+          if (entry) {
+            if (op.nickname !== undefined) entry.nickname     = op.nickname.toString().trim() || entry.nickname;
+            if (op.price    !== undefined) entry.price        = parseFloat(op.price)           || 0;
+            if (op.deliveryDays !== undefined) entry.deliveryDays = parseInt(op.deliveryDays)  || 0;
+            if (op.notes    !== undefined) entry.notes        = (op.notes || "").trim();
+          }
+        } else if (op.vendor) {
+          // Create — skip if this vendor already has an alias on this variant
+          const exists = (variant.vendorNicknames || []).find(vn => vn.vendor?.toString() === op.vendor);
+          if (!exists) {
+            variant.vendorNicknames.push({
+              vendor:       op.vendor,
+              nickname:     (op.nickname || "").toString().trim(),
+              price:        parseFloat(op.price)        || 0,
+              deliveryDays: parseInt(op.deliveryDays)   || 0,
+              notes:        (op.notes || "").trim()
+            });
+          }
+        }
+      }
+    }
+
+    rawItem.updatedBy = req.user.id;
+    await rawItem.save();
+    res.json({ success: true, message: "Bulk alias update complete" });
+  } catch (error) {
+    console.error("bulk-vendor-nicknames error:", error);
+    res.status(500).json({ success: false, message: "Server error: " + error.message });
   }
 });
 

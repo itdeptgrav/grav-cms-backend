@@ -11,6 +11,26 @@ const {
 } = require("../../services/leaveNotification.service");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 
+// Email service — used to notify HR when a leave reaches final manager approval.
+// Wrapped in try/catch so missing env vars / disabled emails never crash the route.
+let emailService = {};
+try {
+  emailService = require("../../services/emailService");
+} catch (e) {
+  console.warn(
+    "[LEAVE-ROUTES] emailService not found, email features disabled:",
+    e.message,
+  );
+}
+
+// sendExpoPush — used to push notify the primary manager when a quick-apply
+// leave gets classified by the secondary manager. Wrapped so it can't crash.
+let sendExpoPush = async () => {};
+try {
+  sendExpoPush =
+    require("../../utils/sendExpoPush").sendExpoPush || sendExpoPush;
+} catch (_) {}
+
 const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -43,10 +63,10 @@ function countLeaveDays(startStr, endStr) {
   const from = new Date(sy, sm - 1, sd),
     to = new Date(ey, em - 1, ed);
   if (from > to) return 0;
-  // ✅ FIX 1: Removed Saturday blocking — Saturday is a valid leave day
   return Math.round((to - from) / (24 * 60 * 60 * 1000)) + 1;
 }
 
+// Calendar days since joining — Sundays INCLUDED.
 function workingDaysSinceJoining(joiningDate) {
   if (!joiningDate) return 0;
   const join = new Date(joiningDate),
@@ -55,7 +75,7 @@ function workingDaysSinceJoining(joiningDate) {
   const cur = new Date(join.getFullYear(), join.getMonth(), join.getDate()),
     end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
   while (cur <= end) {
-    if (cur.getDay() !== 0) count++;
+    count++;
     cur.setDate(cur.getDate() + 1);
   }
   return count;
@@ -120,6 +140,52 @@ async function countMonthlyUsage(
   return { used, monthStart, monthEnd };
 }
 
+async function resolveLeaveOverlap({
+  employeeId,
+  fromDate,
+  toDate,
+  leaveType,
+  isHalfDay,
+  excludeId,
+}) {
+  const q = {
+    employeeId,
+    status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
+    fromDate: { $lte: toDate },
+    toDate: { $gte: fromDate },
+  };
+  if (excludeId) q._id = { $ne: excludeId };
+  const existing = await LeaveApplication.findOne(q);
+  if (!existing) return { action: "none" };
+  const sameType = String(existing.leaveType) === String(leaveType);
+  const sameRange =
+    existing.fromDate === fromDate && existing.toDate === toDate;
+  const sameHalf = !!existing.isHalfDay === !!isHalfDay;
+  if (sameType && sameRange && sameHalf) return { action: "replace", existing };
+  return { action: "block", existing };
+}
+
+function overlapBlockResponse(res, existing) {
+  return res.status(409).json({
+    success: false,
+    code: "OVERLAP_WITHDRAW_FIRST",
+    message: `You already have a ${existing.leaveType} leave from ${existing.fromDate} to ${existing.toDate}. Please withdraw that leave first, then apply again for these dates.`,
+    existing: {
+      id: existing._id,
+      leaveType: existing.leaveType,
+      fromDate: existing.fromDate,
+      toDate: existing.toDate,
+      status: existing.status,
+    },
+  });
+}
+
+// IST "today" string for quick-apply
+function todayIST() {
+  const istNow = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  return `${istNow.getUTCFullYear()}-${String(istNow.getUTCMonth() + 1).padStart(2, "0")}-${String(istNow.getUTCDate()).padStart(2, "0")}`;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PUBLIC ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -131,6 +197,7 @@ router.get("/config", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 router.get("/holidays", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const y = req.query.year || new Date().getFullYear();
@@ -146,6 +213,7 @@ router.get("/holidays", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const id = req.user.id,
@@ -206,6 +274,7 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 router.get("/", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const { status, leaveType, year } = req.query;
@@ -224,6 +293,7 @@ router.get("/", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 router.get("/calendar", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const y = Number(req.query.year) || new Date().getFullYear(),
@@ -297,18 +367,40 @@ router.get("/manager/my-team", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: e.message });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GET /manager/pending — covers BOTH regular and quick-apply flows
+//
+//  Regular flow:  primary acts on pending, then secondary acts on manager_approved.
+//  Quick flow:    primary classifies pending (via /quick-apply/:id/resolve),
+//                 then secondary approves manager_approved.
+//                 (Same primary→secondary order as the regular flow — consistent.)
+//
+//  Four buckets:
+//    (a) primary  + pending           + isQuickApply !== true   ← regular start
+//    (b) secondary+ manager_approved  + isQuickApply !== true   ← regular finish
+//    (c) primary  + pending           + isQuickApply === true   ← quick start
+//    (d) secondary+ manager_approved  + isQuickApply === true   ← quick finish
+//
+//  Bucket (a) and (c) merge naturally — primary sees ALL pending leaves
+//  where they're the primary. Bucket (b) and (d) merge — secondary sees ALL
+//  manager_approved leaves where they're the secondary. So this collapses to
+//  the same simple query the codebase had BEFORE quick-apply was added.
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     res.json({
       success: true,
       data: await LeaveApplication.find({
         $or: [
+          // Primary acts on pending — regular and quick-apply both
           {
             managersNotified: {
               $elemMatch: { managerId: req.user.id, type: "primary" },
             },
             status: "pending",
           },
+          // Secondary acts on manager_approved — regular and quick-apply both
           {
             managersNotified: {
               $elemMatch: { managerId: req.user.id, type: "secondary" },
@@ -327,7 +419,6 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MANAGER WITHDRAW APPROVE/REJECT
-//  When employee requests withdrawal of an hr_approved leave
 // ═══════════════════════════════════════════════════════════════════════════════
 router.patch(
   "/manager/:id/approve-withdraw",
@@ -346,8 +437,7 @@ router.patch(
           message: "Not found or not a withdrawal request",
         });
 
-      // Refund the paidDays back to balance
-      if (a.leaveType !== "LOP") {
+      if (a.leaveType !== "LOP" && a.leaveType !== "QUICK") {
         const refundDays = a.paidDays != null ? a.paidDays : a.totalDays;
         if (refundDays > 0) {
           const year = new Date(a.fromDate).getFullYear();
@@ -398,7 +488,6 @@ router.patch(
         "Manager approved your withdrawal; balance restored.",
       ).catch((e) => console.warn("[PUSH-WITHDRAW-APPROVE]", e.message));
 
-      // Notify employee
       try {
         const io = req.app.get("io");
         if (io)
@@ -436,7 +525,6 @@ router.patch(
       if (!a)
         return res.status(404).json({ success: false, message: "Not found" });
 
-      // Revert to hr_approved
       a.status = "hr_approved";
       a.hrRemarks = `Withdrawal rejected by manager: ${req.body.remarks || ""}`;
       await a.save();
@@ -493,9 +581,6 @@ router.get(
 router.get("/manager/history", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const myId = req.user.id;
-
-    // Query directly via managersNotified — avoids ObjectId/string type mismatch
-    // on Employee.primaryManager.managerId vs req.user.id
     const history = await LeaveApplication.find({
       "managersNotified.managerId": myId,
       status: { $in: ["hr_approved", "manager_approved"] },
@@ -529,7 +614,6 @@ router.post(
         return res
           .status(400)
           .json({ success: false, message: "All fields required" });
-      // ✅ FIX 2: Added LOP as valid leave type
       if (!["CL", "SL", "PL", "LOP"].includes(leaveType))
         return res
           .status(400)
@@ -570,20 +654,23 @@ router.post(
         return res
           .status(400)
           .json({ success: false, message: "No valid days" });
-      const oc = await LeaveApplication.findOne({
+      const overlap = await resolveLeaveOverlap({
         employeeId,
-        status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
-        fromDate: { $lte: toDate },
-        toDate: { $gte: fromDate },
+        fromDate,
+        toDate,
+        leaveType,
+        isHalfDay,
       });
-      if (oc)
-        return res.status(400).json({
-          success: false,
-          message: `Already has leave ${oc.fromDate}–${oc.toDate}`,
-          code: "OVERLAP",
+      if (overlap.action === "block")
+        return overlapBlockResponse(res, overlap.existing);
+      if (overlap.action === "replace")
+        return res.status(200).json({
+          success: true,
+          data: overlap.existing,
+          replaced: true,
+          message: `This employee already has a ${overlap.existing.leaveType} leave for ${overlap.existing.fromDate}–${overlap.existing.toDate}. No duplicate was created.`,
         });
 
-      // ✅ FIX 3: LOP — all days are LWP, no balance deduction
       let paidDays, lwpDays;
       if (leaveType === "LOP") {
         paidDays = 0;
@@ -699,6 +786,30 @@ router.post(
           console.warn("[MGR]", e.message);
         }
       }
+
+      if (st === "hr_approved") {
+        try {
+          if (emailService?.sendLeaveManagerApprovedToHR) {
+            emailService
+              .sendLeaveManagerApprovedToHR({
+                employeeName: app.employeeName,
+                department: app.department,
+                designation: app.designation,
+                leaveType: app.leaveType,
+                fromDate: app.fromDate,
+                toDate: app.toDate,
+                totalDays: app.totalDays,
+                paidDays: app.paidDays,
+                lwpDays: app.lwpDays,
+                reason: app.reason,
+                approvalChain: app.managerDecisions || [],
+                applicationId: app._id.toString(),
+              })
+              .catch((e) => console.warn("[LEAVE-HR-EMAIL]", e.message));
+          }
+        } catch (_) {}
+      }
+
       res.status(201).json({
         success: true,
         data: app,
@@ -714,6 +825,485 @@ router.post(
   },
 );
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  QUICK-APPLY — shortcut buttons "Full-day today" / "Half-day today"
+//
+//  Flow:
+//    1. Employee taps a button → POST /quick-apply with isHalfDay + reason.
+//       Application is created with leaveType: "QUICK", isQuickApply: true,
+//       status: "pending". Secondary manager is notified.
+//
+//    2. Secondary manager → PATCH /quick-apply/:id/resolve with resolvedType.
+//       Validates CL/SL balance + monthly CL cap. Rewrites leaveType from
+//       "QUICK" to the chosen value, sets paidDays/lwpDays, records the
+//       secondary's decision, status → "manager_approved". Primary is pinged.
+//
+//    3. Primary manager → PATCH /manager/:id/approve (existing endpoint).
+//       Sees isQuickApply: true, routes through quick-apply branch:
+//       deducts balance, syncs attendance, emails HR, status → "hr_approved".
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// 1) Employee creates the quick-apply
+router.post("/quick-apply", AllEmployeeAppMiddleware, async (req, res) => {
+  try {
+    const {
+      isHalfDay = false,
+      halfDaySlot,
+      reason,
+      targetDate = "today", // "today" | "tomorrow"
+    } = req.body || {};
+
+    if (!reason || !String(reason).trim()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Reason is required" });
+    }
+    if (isHalfDay && !["first_half", "second_half"].includes(halfDaySlot)) {
+      return res.status(400).json({
+        success: false,
+        message: "halfDaySlot must be 'first_half' or 'second_half'",
+      });
+    }
+    if (!["today", "tomorrow"].includes(targetDate)) {
+      return res.status(400).json({
+        success: false,
+        message: "targetDate must be 'today' or 'tomorrow'",
+      });
+    }
+
+    const emp = await Employee.findById(req.user.id)
+      .select(
+        "firstName lastName biometricId designation department dateOfJoining primaryManager secondaryManager",
+      )
+      .lean();
+    if (!emp) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Employee not found" });
+    }
+
+    // Waiting-period check still applies
+    const config = await LeaveConfig.getConfig();
+    const wd = workingDaysSinceJoining(emp.dateOfJoining);
+    if (wd < config.initialWaitingDays) {
+      return res.status(400).json({
+        success: false,
+        message: `Complete ${config.initialWaitingDays} days at the company before applying leave. You have ${wd}.`,
+        code: "WAITING_PERIOD",
+      });
+    }
+
+    // FLOW: primary classifies first, then secondary approves. So we need a
+    // primary manager assigned. (Secondary is optional — if missing, primary's
+    // classification finalises directly to hr_approved.)
+    if (!emp.primaryManager?.managerId) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Quick-apply needs a primary manager assigned to classify your leave. Please contact HR.",
+      });
+    }
+
+    // Compute target date in IST
+    const istBase = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    if (targetDate === "tomorrow") istBase.setUTCDate(istBase.getUTCDate() + 1);
+    const targetDateStr = `${istBase.getUTCFullYear()}-${String(
+      istBase.getUTCMonth() + 1,
+    ).padStart(2, "0")}-${String(istBase.getUTCDate()).padStart(2, "0")}`;
+
+    // Block duplicate on the same day
+    const dupe = await LeaveApplication.findOne({
+      employeeId: req.user.id,
+      fromDate: targetDateStr,
+      toDate: targetDateStr,
+      status: { $nin: ["manager_rejected", "hr_rejected", "cancelled"] },
+    });
+    if (dupe) {
+      return res.status(400).json({
+        success: false,
+        message:
+          targetDate === "tomorrow"
+            ? "You already have a leave application for tomorrow"
+            : "You already have a leave application for today",
+        code: "DUPLICATE_DATE",
+      });
+    }
+
+    const managersNotified = [
+      {
+        managerId: emp.primaryManager.managerId,
+        managerName: emp.primaryManager.managerName || "",
+        type: "primary",
+      },
+    ];
+    if (emp.secondaryManager?.managerId) {
+      managersNotified.push({
+        managerId: emp.secondaryManager.managerId,
+        managerName: emp.secondaryManager.managerName || "",
+        type: "secondary",
+      });
+    }
+
+    const totalDays = isHalfDay ? 0.5 : 1;
+
+    const app = await LeaveApplication.create({
+      employeeId: req.user.id,
+      biometricId: emp.biometricId,
+      employeeName: `${emp.firstName} ${emp.lastName}`.trim(),
+      designation: emp.designation,
+      department: emp.department,
+      leaveType: "QUICK",
+      applicationDate: targetDateStr,
+      fromDate: targetDateStr,
+      toDate: targetDateStr,
+      totalDays,
+      paidDays: null,
+      lwpDays: 0,
+      reason: String(reason).trim(),
+      isHalfDay: !!isHalfDay,
+      halfDaySlot: isHalfDay ? halfDaySlot : null,
+      requiresDocument: false,
+      managersNotified,
+      status: "pending",
+      isQuickApply: true,
+      quickApply: {
+        resolvedType: null,
+        resolvedBy: null,
+        resolvedByName: null,
+        resolvedAt: null,
+        forcedLOPReason: null,
+      },
+    });
+
+    // Notify managers — same hook as regular apply
+    notifyManagerOnLeaveApply(emp, app).catch((e) =>
+      console.warn("[QUICK-APPLY-PUSH]", e.message),
+    );
+
+    // Socket event tagged so the primary manager's UI can highlight it
+    try {
+      const io = req.app.get("io");
+      if (io) {
+        io.to(String(emp.primaryManager.managerId)).emit("leave_notification", {
+          type: "quick_apply_pending",
+          leaveId: app._id.toString(),
+          employeeName: app.employeeName,
+          fromDate: targetDateStr,
+          totalDays,
+          isHalfDay,
+          targetDate,
+          message: `${app.employeeName} requested ${isHalfDay ? "half-day" : "full-day"} leave ${targetDate}. Please classify.`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (_) {}
+
+    const dayLabel = targetDate === "tomorrow" ? "tomorrow" : "today";
+    return res.status(201).json({
+      success: true,
+      data: app,
+      message: isHalfDay
+        ? `Half-day leave requested for ${dayLabel} (${halfDaySlot.replace("_", " ")}). Your manager will pick the type.`
+        : `Full-day leave requested for ${dayLabel}. Your manager will pick the type.`,
+    });
+  } catch (err) {
+    console.error("[QUICK-APPLY]", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 2) Primary manager classifies the quick-apply
+router.patch(
+  "/quick-apply/:id/resolve",
+  AllEmployeeAppMiddleware,
+  async (req, res) => {
+    try {
+      const { resolvedType, remarks, forceLOPReason } = req.body || {};
+      if (!["CL", "SL", "LOP"].includes(resolvedType)) {
+        return res.status(400).json({
+          success: false,
+          message: "resolvedType must be CL, SL or LOP",
+        });
+      }
+
+      const app = await LeaveApplication.findOne({
+        _id: req.params.id,
+        isQuickApply: true,
+        leaveType: "QUICK",
+        status: "pending",
+      });
+      if (!app) {
+        return res.status(404).json({
+          success: false,
+          message: "Application not found or already classified",
+        });
+      }
+
+      // Only the PRIMARY manager on the application may classify
+      const pri = (app.managersNotified || []).find(
+        (m) => m.type === "primary",
+      );
+      if (!pri || String(pri.managerId) !== String(req.user.id)) {
+        return res.status(403).json({
+          success: false,
+          message: "Only the primary manager can classify quick-apply leaves",
+        });
+      }
+
+      const config = await LeaveConfig.getConfig();
+      const year = new Date(app.fromDate).getFullYear();
+      const balance = await LeaveBalance.getOrCreate(
+        app.employeeId,
+        year,
+        app.biometricId,
+      );
+      const availableCL = Math.max(
+        0,
+        (config.clPerYear || 0) - (balance.consumed.CL || 0),
+      );
+      const availableSL = Math.max(
+        0,
+        (config.slPerYear || 0) - (balance.consumed.SL || 0),
+      );
+
+      let paidDays = 0;
+      let lwpDays = 0;
+      let forcedLOPReason = null;
+
+      if (resolvedType === "CL") {
+        if (availableCL < app.totalDays) {
+          return res.status(400).json({
+            success: false,
+            code: "CL_NOT_ELIGIBLE",
+            message: `Employee has only ${availableCL} CL day(s) left this year. Please pick LOP instead.`,
+            availableCL,
+            availableSL,
+          });
+        }
+        const { used: clMonthUsed } = await countMonthlyUsage(
+          app.employeeId,
+          app.fromDate,
+          "CL",
+          app._id,
+        );
+        const maxCLMonth = config.maxCLPerMonth || 3;
+        if (clMonthUsed + app.totalDays > maxCLMonth) {
+          return res.status(400).json({
+            success: false,
+            code: "CL_MONTHLY_CAP",
+            message: `Employee already used ${clMonthUsed}/${maxCLMonth} CL this month. Please pick LOP instead.`,
+            clMonthUsed,
+            maxCLMonth,
+          });
+        }
+        paidDays = app.totalDays;
+        lwpDays = 0;
+      } else if (resolvedType === "SL") {
+        if (availableSL >= app.totalDays) {
+          paidDays = app.totalDays;
+          lwpDays = 0;
+        } else {
+          paidDays = availableSL;
+          lwpDays = app.totalDays - availableSL;
+        }
+      } else {
+        paidDays = 0;
+        lwpDays = app.totalDays;
+        const hasPaidOption =
+          availableCL >= app.totalDays || availableSL >= app.totalDays;
+        if (hasPaidOption) {
+          if (!forceLOPReason || !String(forceLOPReason).trim()) {
+            return res.status(400).json({
+              success: false,
+              code: "LOP_REASON_REQUIRED",
+              message:
+                "Employee has CL/SL balance available. Provide a forceLOPReason to override.",
+              availableCL,
+              availableSL,
+            });
+          }
+          forcedLOPReason = String(forceLOPReason).trim();
+        } else {
+          forcedLOPReason = "Insufficient CL/SL balance";
+        }
+      }
+
+      const mgr = await Employee.findById(req.user.id)
+        .select("firstName lastName")
+        .lean();
+      const mgrName = mgr
+        ? `${mgr.firstName || ""} ${mgr.lastName || ""}`.trim() || "Manager"
+        : "Manager";
+
+      // Rewrite the leave with the classified type
+      app.leaveType = resolvedType;
+      app.paidDays = paidDays;
+      app.lwpDays = lwpDays;
+      app.requiresDocument =
+        resolvedType === "SL" && app.totalDays > config.slDocumentThreshold;
+      app.quickApply = {
+        resolvedType,
+        resolvedBy: req.user.id,
+        resolvedByName: mgrName,
+        resolvedAt: new Date(),
+        forcedLOPReason,
+      };
+      app.managerDecisions = app.managerDecisions || [];
+      app.managerDecisions.push({
+        managerId: req.user.id,
+        managerName: mgrName,
+        type: "primary",
+        decision: "approved",
+        remarks: remarks || `Classified as ${resolvedType}`,
+        decidedAt: new Date(),
+      });
+
+      // ── Does this employee have a secondary manager assigned? ──
+      // YES → status moves to manager_approved, secondary will give final approval
+      // NO  → primary's classification IS the final approval; we finalise here
+      //       (deduct balance, sync attendance, email HR)
+      const hasSecondary = (app.managersNotified || []).some(
+        (m) => m.type === "secondary" && m.managerId,
+      );
+
+      if (hasSecondary) {
+        app.status = "manager_approved";
+        await app.save();
+
+        // Push secondary so they know they can give final approval
+        try {
+          const sec = (app.managersNotified || []).find(
+            (m) => m.type === "secondary",
+          );
+          if (sec?.managerId) {
+            await sendExpoPush(sec.managerId, {
+              title: `Leave classified as ${resolvedType}`,
+              body: `${app.employeeName} — ${app.totalDays} day(s) on ${app.fromDate}. Awaiting your approval.`,
+              data: {
+                type: "leave_ready_for_secondary",
+                applicationId: app._id.toString(),
+                screen: "Leave",
+              },
+              channelId: "general",
+            });
+            const io = req.app.get("io");
+            if (io) {
+              io.to(String(sec.managerId)).emit("leave_notification", {
+                type: "quick_apply_classified",
+                leaveId: app._id.toString(),
+                employeeName: app.employeeName,
+                leaveType: resolvedType,
+                fromDate: app.fromDate,
+                totalDays: app.totalDays,
+                classifiedBy: mgrName,
+                message: `${mgrName} classified ${app.employeeName}'s leave as ${resolvedType}. Awaiting your approval.`,
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+        } catch (e) {
+          console.warn("[QUICK-RESOLVE-PUSH]", e.message);
+        }
+
+        return res.json({
+          success: true,
+          data: app,
+          message: `Classified as ${resolvedType}. Awaiting secondary manager's approval.`,
+        });
+      }
+
+      // ── No secondary — primary's classification finalises ──
+      app.status = "hr_approved";
+      app.hrApprovedAt = new Date();
+      app.hrRemarks = `Classified and approved by primary manager ${mgrName}`;
+      await app.save();
+
+      // Deduct balance for paid days (CL/SL only; LOP doesn't touch balance)
+      if (paidDays > 0 && resolvedType !== "LOP") {
+        try {
+          await LeaveBalance.findOneAndUpdate(
+            { employeeId: app.employeeId, year },
+            {
+              $setOnInsert: {
+                employeeId: app.employeeId,
+                biometricId: app.biometricId || "",
+                year,
+                entitlement: {
+                  CL: config.clPerYear,
+                  SL: config.slPerYear,
+                  PL: 0,
+                },
+                consumed: { CL: 0, SL: 0, PL: 0 },
+              },
+            },
+            { upsert: true },
+          );
+          await LeaveBalance.findOneAndUpdate(
+            { employeeId: app.employeeId, year },
+            { $inc: { [`consumed.${resolvedType}`]: paidDays } },
+          );
+        } catch (e) {
+          console.warn("[QUICK-RESOLVE-BALANCE]", e.message);
+        }
+      }
+
+      // Sync to attendance (best-effort)
+      try {
+        const {
+          applyLeaveToAttendance,
+        } = require("../HrRoutes/Attendance_section");
+        if (applyLeaveToAttendance) await applyLeaveToAttendance(app);
+      } catch (e) {
+        console.warn("[QUICK-RESOLVE-ATTENDANCE]", e.message);
+      }
+
+      // Email HR
+      try {
+        if (emailService?.sendLeaveManagerApprovedToHR) {
+          emailService
+            .sendLeaveManagerApprovedToHR({
+              employeeName: app.employeeName,
+              department: app.department,
+              designation: app.designation,
+              leaveType: app.leaveType,
+              fromDate: app.fromDate,
+              toDate: app.toDate,
+              totalDays: app.totalDays,
+              paidDays: app.paidDays,
+              lwpDays: app.lwpDays,
+              reason: app.reason,
+              approvalChain: app.managerDecisions || [],
+              applicationId: app._id.toString(),
+              isQuickApply: true,
+              quickApply: app.quickApply,
+            })
+            .catch((e) => console.warn("[LEAVE-HR-EMAIL]", e.message));
+        }
+      } catch (_) {}
+
+      // Notify employee
+      notifyEmployeeOnLeaveAction(
+        String(app.employeeId),
+        app,
+        "approved",
+        `Approved by ${mgrName}`,
+      ).catch(() => {});
+
+      return res.json({
+        success: true,
+        data: app,
+        message: `Classified as ${resolvedType} and approved (no secondary manager assigned).`,
+      });
+    } catch (err) {
+      console.error("[QUICK-RESOLVE]", err);
+      return res.status(500).json({ success: false, message: err.message });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GET /:id — fetch employee's own application
+// ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id))
@@ -731,10 +1321,7 @@ router.get("/:id", AllEmployeeAppMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  APPLY FOR LEAVE
-//  ✅ FIX 4: Removed Saturday block entirely
-//  ✅ FIX 5: Added SL as proper leave type (separate flow, no split needed)
-//  ✅ FIX 6: Added LOP — all days are Loss of Pay, no balance deduction
+//  POST / — Regular apply for leave (CL / SL / PL / LOP)
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
   try {
@@ -746,7 +1333,6 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       reason,
       isHalfDay,
       halfDaySlot,
-      paidDays: clientPaidDays, // for LOP: client sends paidDays:0
     } = req.body;
 
     if (!leaveType || !applicationDate || !fromDate || !toDate || !reason)
@@ -754,7 +1340,6 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         .status(400)
         .json({ success: false, message: "All fields required" });
 
-    // ✅ FIX 5+6: Accept CL, SL, PL, LOP
     if (!["CL", "SL", "PL", "LOP"].includes(leaveType))
       return res
         .status(400)
@@ -778,7 +1363,6 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
     const config = await LeaveConfig.getConfig();
     const year = new Date(fromDate).getFullYear();
 
-    // Waiting period (hard block — can't apply at all)
     const wd = workingDaysSinceJoining(emp.dateOfJoining);
     if (wd < config.initialWaitingDays)
       return res.status(400).json({
@@ -793,30 +1377,36 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         code: "PL_NOT_ELIGIBLE",
       });
 
-    // ✅ FIX 4: No Saturday block — just calculate days normally
     const totalDays = isHalfDay ? 0.5 : countLeaveDays(fromDate, toDate);
     if (totalDays <= 0)
       return res
         .status(400)
         .json({ success: false, message: "No valid leave days" });
 
-    // Overlap check (hard block)
-    const oc = await LeaveApplication.findOne({
+    const overlap = await resolveLeaveOverlap({
       employeeId: req.user.id,
-      status: { $nin: ["hr_rejected", "manager_rejected", "cancelled"] },
-      fromDate: { $lte: toDate },
-      toDate: { $gte: fromDate },
+      fromDate,
+      toDate,
+      leaveType,
+      isHalfDay,
     });
-    if (oc)
-      return res.status(400).json({
-        success: false,
-        message: `Already have leave ${oc.fromDate}–${oc.toDate}.`,
-        code: "OVERLAP",
+    if (overlap.action === "block")
+      return overlapBlockResponse(res, overlap.existing);
+    if (overlap.action === "replace") {
+      const ex = overlap.existing;
+      if (ex.status === "pending" && reason !== undefined) {
+        ex.reason = reason;
+        await ex.save();
+      }
+      return res.status(200).json({
+        success: true,
+        data: ex,
+        replaced: true,
+        message: `You already have this ${ex.leaveType} leave for ${ex.fromDate}–${ex.toDate}. No duplicate was created.`,
       });
+    }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  LOP — no balance calculation, all days are unpaid
-    // ══════════════════════════════════════════════════════════════════
+    // ── LOP ──
     if (leaveType === "LOP") {
       const mn = [];
       if (emp.primaryManager?.managerId)
@@ -872,9 +1462,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       });
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  SL — direct submission, uses SL balance, excess becomes LWP
-    // ══════════════════════════════════════════════════════════════════
+    // ── SL ──
     if (leaveType === "SL") {
       const bal = await ensureBalance(
         req.user.id,
@@ -947,9 +1535,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       });
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  CL / PL — with LWP breakdown (paid vs unpaid split)
-    // ══════════════════════════════════════════════════════════════════
+    // ── CL / PL ──
     const bal = await ensureBalance(req.user.id, year, emp.biometricId, config);
     if (leaveType === "PL" && !bal.plEligible) {
       bal.plEligible = true;
@@ -967,7 +1553,6 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       le[leaveType] - bal.consumed[leaveType],
     );
 
-    // CL monthly limit check
     let effectiveAvailable = availableBalance;
     if (leaveType === "CL") {
       const maxCLMonth = config.maxCLPerMonth || 3;
@@ -978,12 +1563,8 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       );
       const clRemainingThisMonth = Math.max(0, maxCLMonth - clUsed);
       effectiveAvailable = Math.min(availableBalance, clRemainingThisMonth);
-      console.log(
-        `[LEAVE-LWP] CL: balance=${availableBalance}, monthUsed=${clUsed}, monthMax=${maxCLMonth}, effectiveAvail=${effectiveAvailable}`,
-      );
     }
 
-    // Monthly total cap — state-based (Odisha)
     const empState = (
       emp.address?.current?.state ||
       emp.address?.permanent?.state ||
@@ -1002,17 +1583,11 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
     );
     const monthlyRemaining = Math.max(0, monthlyCap - totalMonthUsed);
     effectiveAvailable = Math.min(effectiveAvailable, monthlyRemaining);
-    console.log(
-      `[LEAVE-LWP] Monthly: used=${totalMonthUsed}, cap=${monthlyCap}, remaining=${monthlyRemaining}, effectiveAvail=${effectiveAvailable}`,
-    );
 
     const paidDays = Math.min(totalDays, effectiveAvailable);
     const lwpDays = Math.max(0, totalDays - paidDays);
-    console.log(
-      `[LEAVE-LWP] BREAKDOWN: total=${totalDays}, paid=${paidDays} (${leaveType}), lwp=${lwpDays}, employee=${emp.firstName} ${emp.lastName}`,
-    );
 
-    const rd = false; // CL/PL don't require documents
+    const rd = false;
     const mn = [];
     if (emp.primaryManager?.managerId)
       mn.push({
@@ -1115,6 +1690,9 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Employee cancel / edit / delete / upload-doc
+// ═══════════════════════════════════════════════════════════════════════════════
 router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const a = await LeaveApplication.findOne({
@@ -1124,7 +1702,6 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
     if (!a)
       return res.status(404).json({ success: false, message: "Not found" });
 
-    // Block only truly terminal statuses
     if (["hr_rejected", "manager_rejected", "cancelled"].includes(a.status))
       return res.status(400).json({
         success: false,
@@ -1134,7 +1711,6 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
     const wasApproved = a.status === "hr_approved";
 
     if (wasApproved) {
-      // ✅ For approved leaves: set to withdraw_pending — requires manager approval
       a.status = "withdraw_pending";
       a.cancelReason = req.body.cancelReason || "Employee withdrawal request";
       await a.save();
@@ -1142,7 +1718,6 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
         console.warn("[PUSH-WITHDRAW-REQ]", e.message),
       );
 
-      // Notify both managers via socket + push
       try {
         const io = req.app.get("io");
         if (io && a.managersNotified?.length > 0) {
@@ -1169,7 +1744,6 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
       });
     }
 
-    // For pending/manager_approved: direct cancel, no manager needed
     a.status = "cancelled";
     a.cancelledBy = req.user.id;
     a.cancelledAt = new Date();
@@ -1185,6 +1759,7 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: e.message });
   }
 });
+
 router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id))
@@ -1199,10 +1774,15 @@ router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: `Cannot edit — ${a.status}` });
+    if (a.isQuickApply)
+      return res.status(400).json({
+        success: false,
+        message:
+          "Quick-apply leaves can't be edited. Withdraw and apply again if needed.",
+      });
     const { fromDate, toDate, reason, isHalfDay, halfDaySlot } = req.body;
     const nF = fromDate || a.fromDate,
       nT = isHalfDay ? nF : toDate || a.toDate;
-    // ✅ FIX 4: Removed Saturday block from employee self-edit too
     const nt = (isHalfDay !== undefined ? isHalfDay : a.isHalfDay)
       ? 0.5
       : countLeaveDays(nF, nT);
@@ -1235,6 +1815,7 @@ router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: e.message });
   }
 });
+
 router.delete("/:id", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id))
@@ -1305,7 +1886,7 @@ router.post(
 );
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MANAGER EDIT
+//  MANAGER EDIT — dates/duration only, never type, no LOP split
 // ═══════════════════════════════════════════════════════════════════════════════
 router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
   try {
@@ -1320,21 +1901,19 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: `Cannot edit — ${a.status}` });
+    if (a.leaveType === "QUICK")
+      return res.status(400).json({
+        success: false,
+        message: "Classify the quick-apply first using the resolve endpoint.",
+      });
 
-    const { fromDate, toDate, leaveType, reason, isHalfDay, halfDaySlot } =
-      req.body;
+    const { fromDate, toDate, reason, isHalfDay, halfDaySlot } = req.body;
+    const nType = a.leaveType;
     const nF = fromDate || a.fromDate;
     const nT =
       isHalfDay || (isHalfDay === undefined && a.isHalfDay)
         ? nF
         : toDate || a.toDate;
-    const nType = leaveType || a.leaveType;
-
-    // ✅ FIX 6: Accept LOP as valid type in manager edit too
-    if (!["CL", "SL", "PL", "LOP"].includes(nType))
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid leave type" });
 
     const totalDays = (isHalfDay !== undefined ? isHalfDay : a.isHalfDay)
       ? 0.5
@@ -1357,75 +1936,15 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       });
 
     let paidDays, lwpDays;
-
     if (nType === "LOP") {
       paidDays = 0;
       lwpDays = totalDays;
     } else {
-      const config = await LeaveConfig.getConfig();
-      const year = new Date(nF).getFullYear();
-      const bal = await ensureBalance(
-        a.employeeId,
-        year,
-        a.biometricId,
-        config,
-      );
-      const le = {
-        CL: config.clPerYear,
-        SL: config.slPerYear,
-        PL: bal.plEligible ? config.plPerYear : 0,
-      };
-      let effectiveAvailable = Math.max(0, le[nType] - bal.consumed[nType]);
-
-      if (nType === "CL") {
-        const maxCLMonth = config.maxCLPerMonth || 3;
-        const { used: clUsed } = await countMonthlyUsage(
-          a.employeeId,
-          nF,
-          "CL",
-          a._id,
-        );
-        effectiveAvailable = Math.min(
-          effectiveAvailable,
-          Math.max(0, maxCLMonth - clUsed),
-        );
-      }
-
-      const emp = await Employee.findById(a.employeeId)
-        .select("address")
-        .lean();
-      const empState = (
-        emp?.address?.current?.state ||
-        emp?.address?.permanent?.state ||
-        ""
-      )
-        .toLowerCase()
-        .trim();
-      const isOdisha = ["odisha", "orissa"].includes(empState);
-      const monthlyCap = isOdisha
-        ? config.maxLeaveDaysPerMonthOdisha || 7
-        : config.maxLeaveDaysPerMonth || 10;
-      const { used: totalMonthUsed } = await countMonthlyUsage(
-        a.employeeId,
-        nF,
-        null,
-        a._id,
-      );
-      effectiveAvailable = Math.min(
-        effectiveAvailable,
-        Math.max(0, monthlyCap - totalMonthUsed),
-      );
-
-      if (req.body.paidDays !== undefined && req.body.paidDays !== null) {
-        paidDays = Math.max(
-          0,
-          Math.min(Number(req.body.paidDays), effectiveAvailable, totalDays),
-        );
-      } else {
-        paidDays = Math.min(totalDays, effectiveAvailable);
-      }
-      lwpDays = Math.max(0, totalDays - paidDays);
+      paidDays = totalDays;
+      lwpDays = 0;
     }
+
+    const config = await LeaveConfig.getConfig();
 
     a.fromDate = nF;
     a.toDate = nT;
@@ -1439,14 +1958,13 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       a.halfDaySlot = isHalfDay ? halfDaySlot || "first_half" : null;
     }
     a.requiresDocument =
-      nType === "SL" &&
-      totalDays > (await LeaveConfig.getConfig()).slDocumentThreshold;
+      nType === "SL" && totalDays > config.slDocumentThreshold;
 
     const mgr = await Employee.findById(myId)
       .select("firstName lastName")
       .lean();
     const mgrName = mgr ? `${mgr.firstName} ${mgr.lastName}`.trim() : "Manager";
-    a.hrRemarks = `Edited by ${mgrName}: ${paidDays} ${nType} paid, ${lwpDays} LOP`;
+    a.hrRemarks = `Dates adjusted by ${mgrName}: ${nType} ${nF}→${nT} (${totalDays} day${totalDays !== 1 ? "s" : ""})`;
 
     await a.save();
 
@@ -1457,14 +1975,10 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       mgrName,
     ).catch((e) => console.warn("[PUSH-EDIT]", e.message));
 
-    console.log(
-      `[MGR-EDIT] ${mgrName} edited leave ${a._id}: ${nType} ${nF}→${nT}, paid=${paidDays}, lwp=${lwpDays}`,
-    );
-
     res.json({
       success: true,
       data: a,
-      message: `Updated: ${paidDays} ${nType} (paid) + ${lwpDays} LOP`,
+      message: `Updated: ${nType} ${nF} → ${nT} (${totalDays} day${totalDays !== 1 ? "s" : ""})`,
     });
   } catch (e) {
     console.error("[MGR-EDIT]", e);
@@ -1473,8 +1987,17 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MANAGER APPROVAL/REJECT
-//  ✅ FIX 7: LOP approvals don't deduct any balance (paidDays is 0)
+//  MANAGER APPROVE
+//
+//  Handles BOTH regular and quick-apply flows.
+//
+//  Regular flow:
+//    pending           → primary acts here, status → manager_approved
+//    manager_approved  → secondary acts here, status → hr_approved (final)
+//
+//  Quick-apply flow (isQuickApply=true):
+//    pending           → BLOCKED here — secondary must use /quick-apply/:id/resolve
+//    manager_approved  → primary acts here, status → hr_approved (final)
 // ═══════════════════════════════════════════════════════════════════════════════
 router.patch(
   "/manager/:id/approve",
@@ -1493,14 +2016,31 @@ router.patch(
         (m) => String(m.managerId) === String(myId),
       );
       const mt = mgr?.type || "primary";
+
+      const isQuick = !!a.isQuickApply;
+
+      // ── Stage-vs-role gate ──────────────────────────────────────────
+      // Quick-apply uses the SAME order as regular: primary first, secondary
+      // second. The only difference is primary must CLASSIFY (via the
+      // /quick-apply/:id/resolve endpoint) instead of just approving.
+      if (isQuick && mt === "primary" && a.status === "pending") {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Quick-apply leaves need to be classified, not just approved. Use the Classify button.",
+        });
+      }
       if (mt === "primary" && a.status !== "pending")
-        return res
-          .status(400)
-          .json({ success: false, message: `Cannot approve — ${a.status}` });
+        return res.status(400).json({
+          success: false,
+          message: `Cannot approve — ${a.status}`,
+        });
       if (mt === "secondary" && a.status !== "manager_approved")
         return res
           .status(400)
           .json({ success: false, message: "Primary must approve first" });
+
+      // Record this manager's decision (idempotent)
       if (!a.managerDecisions.find((d) => String(d.managerId) === String(myId)))
         a.managerDecisions.push({
           managerId: myId,
@@ -1510,8 +2050,14 @@ router.patch(
           remarks: remarks || "",
           decidedAt: new Date(),
         });
+
       const hs = a.managersNotified.some((m) => m.type === "secondary");
-      if (mt === "primary" && hs) {
+
+      // ── Regular flow: primary first → wait for secondary ────────────
+      // (Quick-apply with secondary: primary classifies via /resolve which
+      //  already set status to manager_approved, so primary won't reach
+      //  this branch. We deliberately leave this generic.)
+      if (mt === "primary" && hs && a.status === "pending") {
         a.status = "manager_approved";
         await a.save();
         try {
@@ -1542,7 +2088,7 @@ router.patch(
         });
       }
 
-      // Final approval
+      // ── FINAL APPROVAL — reach hr_approved ──────────────────────────
       const {
         LeaveConfig: LC,
         LeaveBalance: LB,
@@ -1550,14 +2096,76 @@ router.patch(
       const {
         applyLeaveToAttendance,
       } = require("../HrRoutes/Attendance_section");
+
+      const deductDays = a.paidDays != null ? a.paidDays : a.totalDays;
+
+      // ── LIVE RE-CHECK at approval time ──────────────────────────────
+      // Conditions could have changed since the application was created /
+      // classified (other leaves approved in between, HR added a leave on
+      // behalf, etc.). Hard-block the approval if the employee no longer
+      // has the balance OR if approving would push past the monthly CL cap.
+      // The approver must either reject this leave or get it re-classified
+      // as LOP before they can move forward.
+      if (deductDays > 0 && ["CL", "SL", "PL"].includes(a.leaveType)) {
+        const fy = new Date(a.fromDate).getFullYear();
+        const fc = await LC.getConfig();
+        const liveBal = await LB.findOne({
+          employeeId: a.employeeId,
+          year: fy,
+        }).lean();
+        const consumedNow = liveBal?.consumed?.[a.leaveType] || 0;
+        let entitlement;
+        if (a.leaveType === "PL") {
+          entitlement = liveBal?.entitlement?.PL || 0;
+        } else if (a.leaveType === "CL") {
+          entitlement = fc.clPerYear || 0;
+        } else {
+          entitlement = fc.slPerYear || 0;
+        }
+        const liveAvailable = Math.max(0, entitlement - consumedNow);
+
+        // (1) Yearly balance check
+        if (liveAvailable < deductDays) {
+          return res.status(400).json({
+            success: false,
+            code: "INSUFFICIENT_BALANCE_AT_APPROVAL",
+            message: `Cannot approve — ${a.employeeName} now has only ${liveAvailable} ${a.leaveType} day(s) remaining (needs ${deductDays}). Reject this leave, or have it re-classified as LOP.`,
+            leaveType: a.leaveType,
+            liveAvailable,
+            needed: deductDays,
+          });
+        }
+
+        // (2) Monthly CL cap check
+        if (a.leaveType === "CL") {
+          const maxCLMonth = fc.maxCLPerMonth || 3;
+          const { used: clMonthUsed } = await countMonthlyUsage(
+            a.employeeId,
+            a.fromDate,
+            "CL",
+            a._id, // exclude this application from the count
+          );
+          if (clMonthUsed + deductDays > maxCLMonth) {
+            return res.status(400).json({
+              success: false,
+              code: "CL_MONTHLY_CAP_AT_APPROVAL",
+              message: `Cannot approve — ${a.employeeName} has already used ${clMonthUsed}/${maxCLMonth} CL this month. Approving would push them past the monthly limit. Reject this leave, or have it re-classified as LOP.`,
+              leaveType: "CL",
+              clMonthUsed,
+              maxCLMonth,
+              needed: deductDays,
+            });
+          }
+        }
+      }
+
+      // All checks pass — commit the approval
       a.status = "hr_approved";
       a.hrApprovedAt = new Date();
       a.hrRemarks = remarks || `Approved by ${mt} manager`;
       await a.save();
 
-      // ✅ FIX 7: Only deduct if paidDays > 0 (LOP will have paidDays=0)
-      const deductDays = a.paidDays != null ? a.paidDays : a.totalDays;
-      if (deductDays > 0 && a.leaveType !== "LOP") {
+      if (deductDays > 0 && a.leaveType !== "LOP" && a.leaveType !== "QUICK") {
         const fy = new Date(a.fromDate).getFullYear();
         const fc = await LC.getConfig();
         await LB.findOneAndUpdate(
@@ -1592,6 +2200,30 @@ router.patch(
       } catch (e) {
         console.warn("[APPROVE]", e.message);
       }
+
+      try {
+        if (emailService?.sendLeaveManagerApprovedToHR) {
+          emailService
+            .sendLeaveManagerApprovedToHR({
+              employeeName: a.employeeName,
+              department: a.department,
+              designation: a.designation,
+              leaveType: a.leaveType,
+              fromDate: a.fromDate,
+              toDate: a.toDate,
+              totalDays: a.totalDays,
+              paidDays: a.paidDays,
+              lwpDays: a.lwpDays,
+              reason: a.reason,
+              approvalChain: a.managerDecisions || [],
+              applicationId: a._id.toString(),
+              isQuickApply: a.isQuickApply,
+              quickApply: a.quickApply,
+            })
+            .catch((e) => console.warn("[LEAVE-HR-EMAIL]", e.message));
+        }
+      } catch (_) {}
+
       try {
         const io = req.app.get("io");
         if (io)

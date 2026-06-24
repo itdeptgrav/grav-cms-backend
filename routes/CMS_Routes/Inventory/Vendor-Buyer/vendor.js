@@ -103,6 +103,62 @@ router.get("/", async (req, res) => {
   }
 });
 
+// ✅ GET all raw-item variants that have a vendor alias for this vendor
+router.get("/:id/alias-items", async (req, res) => {
+  try {
+    const vendorId = req.params.id
+
+    const vendor = await Vendor.findById(vendorId)
+    if (!vendor) return res.status(404).json({ success: false, message: "Vendor not found" })
+
+    // Find raw items where any variant has a vendorNickname for this vendor
+    const rawItems = await RawItem.find({
+      "variants.vendorNicknames.vendor": vendorId
+    }).select("name sku category customCategory unit customUnit variants")
+
+    const items = rawItems.map(item => {
+      const baseUnit = item.customUnit || item.unit || "Unit"
+
+      const filteredVariants = item.variants
+        .map(v => {
+          const alias = (v.vendorNicknames || []).find(
+            n => n.vendor?.toString() === vendorId.toString()
+          )
+          if (!alias) return null
+          return {
+            variantId:   v._id,
+            combination: v.combination || [],
+            sku:         v.sku || "",
+            quantity:    v.quantity || 0,
+            status:      v.status || "Out of Stock",
+            aliasId:     alias._id,
+            vendorCode:  alias.nickname || "",
+            price:       alias.price || 0,
+            deliveryDays: alias.deliveryDays || 0,
+            notes:       alias.notes || ""
+          }
+        })
+        .filter(Boolean)
+
+      if (!filteredVariants.length) return null
+
+      return {
+        rawItemId: item._id,
+        name:      item.name,
+        sku:       item.sku,
+        category:  item.customCategory || item.category || "Uncategorized",
+        unit:      baseUnit,
+        variants:  filteredVariants
+      }
+    }).filter(Boolean)
+
+    res.json({ success: true, items, total: items.length })
+  } catch (error) {
+    console.error("Error fetching alias items:", error)
+    res.status(500).json({ success: false, message: "Server error while fetching alias items" })
+  }
+})
+
 // ✅ GET vendor types
 router.get("/types", async (req, res) => {
   res.json({

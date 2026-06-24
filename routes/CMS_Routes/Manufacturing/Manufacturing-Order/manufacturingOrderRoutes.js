@@ -6,6 +6,8 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
+const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
@@ -739,7 +741,7 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
         "operations forwardedToVendor productionCompletion variantAttributes rawMaterials " +
         "assignedDeadline"                                              // ← ADDED
       )
-      .populate("stockItemId", "name reference genderCategory images variants.images")
+      .populate("stockItemId", "name reference genderCategory images variants")
       .populate("forwardedToVendor", "name vendorCode")
       .sort({ createdAt: 1 })
       .lean();
@@ -1122,6 +1124,278 @@ router.get("/stats/overview", async (req, res) => {
       success: false,
       message: "Server error while fetching production stats",
     });
+  }
+});
+
+
+
+
+// ─── BULK ORDER TRACKING ROUTES ───────────────────────────────────────────────
+// Add these 3 routes before module.exports = router
+
+// GET /:id/bulk-tracking — WO-wise production + dispatch summary
+router.get("/:id/bulk-tracking", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id))
+      return res.status(400).json({ success: false, message: "Invalid MO ID" });
+
+    const { page = 1, limit = 20, search = "", status = "" } = req.query;
+    const pg = Math.max(1, parseInt(page)), lm = Math.max(1, parseInt(limit));
+
+    const wos = await WorkOrder.find({ customerRequestId: new mongoose.Types.ObjectId(id) })
+      .select("workOrderNumber status quantity variantAttributes stockItemId stockItemName stockItemReference productionCompletion bulkDispatchHistory")
+      .populate("stockItemId", "name reference genderCategory images variants")
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const extractUrl = (e) => { if (!e) return null; if (typeof e === "string") return e; return e?.url || e?.src || e?.imageUrl || null; };
+    const pickImage = (wo) => {
+      const si = wo.stockItemId;
+      if (!si) return null;
+      if (Array.isArray(si.images)) { for (const img of si.images) { const u = extractUrl(img); if (u) return u; } }
+      if (Array.isArray(si.variants)) { for (const v of si.variants) { if (Array.isArray(v?.images)) { for (const img of v.images) { const u = extractUrl(img); if (u) return u; } } } }
+      return null;
+    };
+
+    let enriched = wos.map((wo) => {
+      const history = wo.bulkDispatchHistory || [];
+      const totalDisp = history.reduce((s, r) => s + (r.quantity || 0), 0);
+      const completedQty = wo.productionCompletion?.overallCompletedQuantity || 0;
+      const completionPct = wo.productionCompletion?.overallCompletionPercentage || 0;
+      const available = Math.max(0, completedQty - totalDisp);
+      return {
+        workOrderId: wo._id,
+        workOrderNumber: wo.workOrderNumber,
+        status: wo.status,
+        productName: wo.stockItemId?.name || wo.stockItemName || "—",
+        productRef: wo.stockItemId?.reference || wo.stockItemReference || "",
+        genderCategory: wo.stockItemId?.genderCategory || null,
+        productImage: pickImage(wo),
+        variantAttributes: wo.variantAttributes || [],
+        totalQuantity: wo.quantity || 0,
+        completedQuantity: completedQty,
+        completionPct,
+        dispatchedQuantity: totalDisp,
+        availableForDispatch: available,
+        pendingProduction: Math.max(0, (wo.quantity || 0) - completedQty),
+        isFullyDispatched: totalDisp > 0 && totalDisp >= (wo.quantity || 0),
+      };
+    });
+
+    if (search.trim()) {
+      const re = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      enriched = enriched.filter((w) => re.test(w.productName) || re.test(w.workOrderNumber) || re.test(w.productRef));
+    }
+    if (status) {
+      enriched = enriched.filter((w) => {
+        if (status === "pending") return w.completedQuantity === 0;
+        if (status === "in_production") return w.completedQuantity > 0 && w.completedQuantity < w.totalQuantity;
+        if (status === "ready") return w.availableForDispatch > 0 && !w.isFullyDispatched;
+        if (status === "dispatched") return w.isFullyDispatched;
+        return true;
+      });
+    }
+
+    const total = enriched.length;
+    const paged = enriched.slice((pg - 1) * lm, pg * lm);
+    const totals = wos.reduce((acc, wo) => {
+      const hist = wo.bulkDispatchHistory || [];
+      acc.totalQty += (wo.quantity || 0);
+      acc.completedQty += (wo.productionCompletion?.overallCompletedQuantity || 0);
+      acc.dispatchedQty += hist.reduce((s, r) => s + (r.quantity || 0), 0);
+      return acc;
+    }, { totalWOs: wos.length, totalQty: 0, completedQty: 0, dispatchedQty: 0 });
+    totals.availableQty = Math.max(0, totals.completedQty - totals.dispatchedQty);
+
+    return res.json({
+      success: true, workOrders: paged, totals,
+      pagination: { page: pg, limit: lm, total, totalPages: Math.max(1, Math.ceil(total / lm)) },
+    });
+  } catch (err) {
+    console.error("bulk-tracking error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// GET /:id/bulk-dispatch-history/:woId — dispatch history for one WO
+router.get("/:id/bulk-dispatch-history/:woId", async (req, res) => {
+  try {
+    const { woId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(woId))
+      return res.status(400).json({ success: false, message: "Invalid WO ID" });
+    const wo = await WorkOrder.findById(woId).select("workOrderNumber bulkDispatchHistory").lean();
+    if (!wo) return res.status(404).json({ success: false, message: "WO not found" });
+    const history = [...(wo.bulkDispatchHistory || [])].reverse();
+    return res.json({ success: true, workOrderNumber: wo.workOrderNumber, history });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// POST /:id/dispatch-bulk — record a dispatch for a WO
+router.post("/:id/dispatch-bulk", async (req, res) => {
+  try {
+    const { workOrderId, quantity, notes, dispatchedBy } = req.body;
+    if (!workOrderId || !mongoose.Types.ObjectId.isValid(workOrderId))
+      return res.status(400).json({ success: false, message: "Invalid workOrderId" });
+    const qty = parseInt(quantity, 10);
+    if (!qty || qty < 1)
+      return res.status(400).json({ success: false, message: "Quantity must be >= 1" });
+
+    const wo = await WorkOrder.findById(workOrderId)
+      .select("quantity productionCompletion bulkDispatchHistory stockItemName").lean();
+    if (!wo) return res.status(404).json({ success: false, message: "Work order not found" });
+
+    const completedQty = wo.productionCompletion?.overallCompletedQuantity || 0;
+    const currentDispatched = (wo.bulkDispatchHistory || []).reduce((s, r) => s + (r.quantity || 0), 0);
+    const available = Math.max(0, completedQty - currentDispatched);
+
+    if (qty > available)
+      return res.status(400).json({ success: false, message: `Only ${available} unit(s) available for dispatch` });
+
+    const record = {
+      quantity: qty,
+      notes: notes || "",
+      dispatchedBy: dispatchedBy || req.user?.name || "Admin",
+      dispatchedAt: new Date(),
+    };
+
+    await WorkOrder.findByIdAndUpdate(workOrderId, { $push: { bulkDispatchHistory: record } });
+    return res.json({
+      success: true,
+      message: `${qty} unit(s) dispatched successfully`,
+      totalDispatched: currentDispatched + qty,
+      record,
+    });
+  } catch (err) {
+    console.error("dispatch-bulk error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+
+// ─── DISPATCH HISTORY (from DispatchChallan model) ───────────────────────────
+// Add the require at the TOP of the file (after other requires):
+// const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+//
+// Then add this route before module.exports = router
+
+router.get("/:id/dispatch-history", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id))
+      return res.status(400).json({ success: false, message: "Invalid MO ID" });
+
+    const { page = 1, limit = 15, search = "", type = "" } = req.query;
+    const pg = Math.max(1, parseInt(page)), lm = Math.max(1, parseInt(limit));
+
+    // Pull the MO for customer info (needed for PDF re-generation)
+    const mo = await CustomerRequest.findById(id)
+      .select("requestId customerInfo customerName")
+      .lean();
+
+    const base = { manufacturingOrderId: new mongoose.Types.ObjectId(id) };
+    const filter = { ...base };
+    if (type && ["person_wise", "bulk"].includes(type)) filter.dispatchType = type;
+    if (search && search.trim()) {
+      const re = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { challanNumber: re },
+        { customerName: re },
+        { "persons.employeeName": re },
+        { "persons.employeeUIN": re },
+        { "persons.products.productName": re },
+        { "bulkProducts.productName": re },
+        { dispatchedBy: re },
+      ];
+    }
+
+    const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+
+    const [total, challans] = await Promise.all([
+      DispatchChallan.countDocuments(filter),
+      DispatchChallan.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((pg - 1) * lm)
+        .limit(lm)
+        .lean(),
+    ]);
+
+    // Totals across ALL challans for this MO (ignore search/type filter for stats)
+    const allChallans = await DispatchChallan.find(base).select("totalUnits dispatchType").lean();
+    const totalUnits = allChallans.reduce((s, c) => s + (c.totalUnits || 0), 0);
+    const personWise = allChallans.filter((c) => c.dispatchType === "person_wise").length;
+    const bulkCount = allChallans.filter((c) => c.dispatchType === "bulk").length;
+
+    // ── Enrich: dept/designation from EmployeeMpc + product images from WorkOrder ──
+    const extractUrl = (e) => { if (!e) return null; if (typeof e === "string") return e; return e?.url || e?.src || e?.imageUrl || null; };
+    const pickImage = (wo) => {
+      const si = wo.stockItemId;
+      if (!si) return null;
+      if (Array.isArray(si.images)) { for (const img of si.images) { const u = extractUrl(img); if (u) return u; } }
+      if (Array.isArray(si.variants)) { for (const v of si.variants) { if (Array.isArray(v?.images)) { for (const img of v.images) { const u = extractUrl(img); if (u) return u; } } } }
+      return null;
+    };
+
+    // Collect unique employeeIds + workOrderIds from all challans
+    const empIdSet = new Set(), woIdSet = new Set();
+    for (const c of challans) {
+      for (const p of c.persons || []) {
+        if (p.employeeId && mongoose.Types.ObjectId.isValid(p.employeeId.toString())) empIdSet.add(p.employeeId.toString());
+        for (const pr of p.products || []) { if (pr.workOrderId && mongoose.Types.ObjectId.isValid(pr.workOrderId.toString())) woIdSet.add(pr.workOrderId.toString()); }
+      }
+      for (const pr of c.bulkProducts || []) { if (pr.workOrderId && mongoose.Types.ObjectId.isValid(pr.workOrderId.toString())) woIdSet.add(pr.workOrderId.toString()); }
+    }
+
+    // Batch fetch EmployeeMpc (dept + designation)
+    const empMpcMap = new Map();
+    if (empIdSet.size) {
+      const mpcDocs = await EmployeeMpc.find({ _id: { $in: [...empIdSet] } }).select("_id department designation").lean();
+      for (const e of mpcDocs) empMpcMap.set(e._id.toString(), { department: e.department || "", designation: e.designation || "" });
+    }
+
+    // Batch fetch WorkOrders (for product images)
+    const woImageMap = new Map();
+    if (woIdSet.size) {
+      const woDocs = await WorkOrder.find({ _id: { $in: [...woIdSet] } })
+        .select("_id stockItemId")
+        .populate("stockItemId", "name images variants")
+        .lean();
+      for (const wo of woDocs) { const img = pickImage(wo); if (img) woImageMap.set(wo._id.toString(), img); }
+    }
+
+    // Mutate challans in-place
+    for (const c of challans) {
+      for (const person of c.persons || []) {
+        if (person.employeeId) {
+          const mpc = empMpcMap.get(person.employeeId.toString());
+          if (mpc) { person.department = mpc.department || person.department || ""; person.designation = mpc.designation || person.designation || ""; }
+        }
+        for (const prod of person.products || []) {
+          if (prod.workOrderId) prod.productImage = woImageMap.get(prod.workOrderId.toString()) || null;
+        }
+      }
+      for (const prod of c.bulkProducts || []) {
+        if (prod.workOrderId) prod.productImage = woImageMap.get(prod.workOrderId.toString()) || null;
+      }
+    }
+
+    return res.json({
+      success: true,
+      challans,
+      moInfo: mo || null,
+      totals: {
+        total: allChallans.length,
+        totalUnits,
+        personWise,
+        bulk: bulkCount,
+      },
+      pagination: { page: pg, limit: lm, total, totalPages: Math.max(1, Math.ceil(total / lm)) },
+    });
+  } catch (err) {
+    console.error("dispatch-history error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 

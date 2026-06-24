@@ -22,7 +22,8 @@ const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewe
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
 const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
-const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
+const RawItem        = require("../../../models/CMS_Models/Inventory/Products/RawItem");
+const StockIssuance  = require("../../../models/CMS_Models/Inventory/Operations/StockIssuance");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -145,14 +146,29 @@ router.get("/order-requests/:id/work-orders", async (req, res) => {
     const stockItems = await StockItem.find({
       _id: { $in: stockItemIds.map((id) => new mongoose.Types.ObjectId(id)) },
     })
-      .select("_id genderCategory")
+      .select("_id genderCategory images variants._id variants.images")
       .lean();
-    const genderMap = new Map(stockItems.map((s) => [s._id.toString(), s.genderCategory || ""]));
 
-    const enriched = workOrders.map((wo) => ({
-      ...wo,
-      genderCategory: genderMap.get(wo.stockItemId?.toString()) || "",
-    }));
+    const stockItemMap = new Map(stockItems.map((s) => [s._id.toString(), s]));
+
+    const enriched = workOrders.map((wo) => {
+      const si = stockItemMap.get(wo.stockItemId?.toString())
+      // Variant-matched image first, then any variant with image, then product-level
+      const productImage = (() => {
+        if (si?.variants?.length) {
+          const matched = si.variants.find(v => v._id?.toString() === wo.variantId?.toString())
+          if (matched?.images?.[0]) return matched.images[0]
+          const anyWithImg = si.variants.find(v => v.images?.length > 0)
+          if (anyWithImg?.images?.[0]) return anyWithImg.images[0]
+        }
+        return si?.images?.[0] || null
+      })()
+      return {
+        ...wo,
+        genderCategory: si?.genderCategory || "",
+        productImage,
+      }
+    });
 
     return res.json({ success: true, workOrders: enriched });
   } catch (err) {
@@ -621,6 +637,173 @@ router.get("/order-requests/:id/raw-item-requirement", async (req, res) => {
     });
   } catch (err) {
     console.error("Store order-level raw-item error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ISSUANCE SUMMARY — BOM vs issued comparison for the Raw-Item Issuance tab
+//   GET /api/cms/store/order-requests/:id/issuance-summary
+// ═══════════════════════════════════════════════════════════════════════════
+router.get("/order-requests/:id/issuance-summary", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 1. Aggregate BOM from all WOs
+    // 1. Build BOM directly from CustomerRequest × StockItem
+    //    (avoids inheriting any N×multiplier bug from WO creation)
+    const request = await CustomerRequest.findById(id).select("items").lean();
+    if (!request) return res.status(404).json({ success: false, message: "Order not found" });
+
+    const siIds      = [...new Set((request.items || []).map(i => i.stockItemId?.toString()).filter(Boolean))];
+    const stockItems = siIds.length
+      ? await StockItem.find({ _id: { $in: siIds } }).select("name variants").lean()
+      : [];
+    const siMap = new Map(stockItems.map(s => [s._id.toString(), s]));
+
+    const matchVariant = (crAttrs, siVariants) => {
+      if (!crAttrs?.length) return siVariants?.[0] || null;
+      return siVariants?.find(v =>
+        crAttrs.every(ca => v.attributes?.some(va => va.name === ca.name && va.value === ca.value))
+      ) || siVariants?.[0] || null;
+    };
+
+    const bomMap = {};
+    for (const crItem of (request.items || [])) {
+      const si = siMap.get(crItem.stockItemId?.toString());
+      if (!si) continue;
+      for (const crVariant of (crItem.variants || [])) {
+        const orderedQty = crVariant.quantity || 0;
+        if (!orderedQty) continue;
+        const siVariant = matchVariant(crVariant.attributes || [], si.variants || []);
+        if (!siVariant) continue;
+        for (const ri of (siVariant.rawItems || [])) {
+          if (!ri.rawItemId) continue;
+          const riId = ri.rawItemId.toString();
+          const rvId = ri.variantId?.toString() || "none";
+          const key  = `${riId}|${rvId}`;
+          if (!bomMap[key]) {
+            bomMap[key] = {
+              rawItemId: riId, variantId: rvId !== "none" ? rvId : null,
+              rawItemName: ri.rawItemName || "", rawItemSku: ri.rawItemSku || "",
+              variantCombination: ri.variantCombination || [],
+              unit: ri.unit || ri.baseUnit || "",
+              nativeUnit: "", unitConversions: [],
+              totalRequired: 0, totalIssued: 0, issuanceHistory: [],
+            };
+          }
+          bomMap[key].totalRequired += (ri.quantity || 0) * orderedQty;
+        }
+      }
+    }
+
+    if (!Object.keys(bomMap).length)
+      return res.json({ success: true, items: [], summary: { totalItems: 0, notIssued: 0, partial: 0, met: 0, overIssued: 0 }, issuanceCount: 0 });
+
+    // 2. Enrich with unitConversions + nativeUnit from RawItem docs
+    const uniqueRawIds = [...new Set(Object.values(bomMap).map(b => b.rawItemId).filter(Boolean))];
+    const rawDocs      = await RawItem.find({ _id: { $in: uniqueRawIds } })
+      .select("unit customUnit variants._id variants.unitConversions")
+      .lean();
+    const rawDocMap    = new Map(rawDocs.map(r => [r._id.toString(), r]));
+
+    for (const b of Object.values(bomMap)) {
+      const doc = rawDocMap.get(b.rawItemId);
+      if (!doc) continue;
+      b.nativeUnit = doc.customUnit || doc.unit || "";
+      if (b.variantId) {
+        const v = (doc.variants || []).find(vv => vv._id?.toString() === b.variantId);
+        if (v) b.unitConversions = v.unitConversions || [];
+      }
+    }
+
+    // 3. Aggregate issued qty from StockIssuance (convert nativeQty → BOM unit)
+    const issuances = await StockIssuance.find({ manufacturingOrder: id })
+      .populate("performedBy", "name").lean();
+
+    for (const iso of issuances) {
+      for (const itm of (iso.items || [])) {
+        const riId = itm.rawItem?.toString() || "";
+        const rvId = itm.variantId?.toString() || "";
+        const key  = `${riId}|${rvId}`;
+        if (!bomMap[key]) continue;
+
+        const b          = bomMap[key];
+        const nativeUnit = b.nativeUnit || b.unit;
+        const bomUnit    = b.unit;
+        const nativeQty  = itm.nativeQty || 0;
+        // credit = return → subtract from issued
+        const signedQty  = iso.direction === "debit" ? nativeQty : -nativeQty;
+
+        let inBomUnit;
+        if (!nativeUnit || nativeUnit === bomUnit) {
+          inBomUnit = signedQty;
+        } else {
+          const conv = (b.unitConversions || []).find(uc =>
+            (uc.fromUnit === nativeUnit && uc.toUnit === bomUnit) ||
+            (uc.fromUnit === bomUnit    && uc.toUnit === nativeUnit)
+          );
+          if (conv?.quantity) {
+            inBomUnit = conv.fromUnit === nativeUnit
+              ? signedQty * conv.quantity
+              : signedQty / conv.quantity;
+          } else {
+            inBomUnit = signedQty;
+          }
+        }
+
+        b.totalIssued += inBomUnit;
+        b.issuanceHistory.push({
+          direction: iso.direction, date: iso.createdAt,
+          performedBy: iso.performedBy?.name || "System",
+          reason: iso.reason || "",
+          issuedQty: itm.issuedQty, issuedUnit: itm.issuedUnit,
+          nativeQty: itm.nativeQty, nativeUnit: itm.nativeUnit,
+          convertedBomQty: inBomUnit,
+        });
+      }
+    }
+
+    // 4. Build result array
+    const items = Object.values(bomMap).map(b => {
+      const issued = b.totalIssued;
+      const diff   = b.totalRequired - issued;
+      const pct    = b.totalRequired > 0 ? (issued / b.totalRequired) * 100 : (issued > 0 ? 999 : 0);
+
+      const status = issued <= 0           ? "not_issued"
+                   : diff > 0.001          ? "partial"
+                   : diff < -0.001         ? "over_issued"
+                   :                         "met";
+
+      return {
+        rawItemId: b.rawItemId, variantId: b.variantId,
+        rawItemName: b.rawItemName, rawItemSku: b.rawItemSku,
+        variantCombination: b.variantCombination,
+        unit: b.unit, totalRequired: b.totalRequired,
+        totalIssued: issued,
+        remaining: Math.max(0, diff),
+        excess:    Math.max(0, -diff),
+        pct, status,
+        issuanceHistory: b.issuanceHistory,
+      };
+    });
+
+    const rank = { over_issued: 0, partial: 1, not_issued: 2, met: 3 };
+    items.sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+
+    return res.json({
+      success: true, items,
+      summary: {
+        totalItems:  items.length,
+        notIssued:   items.filter(i => i.status === "not_issued").length,
+        partial:     items.filter(i => i.status === "partial").length,
+        met:         items.filter(i => i.status === "met").length,
+        overIssued:  items.filter(i => i.status === "over_issued").length,
+      },
+      issuanceCount: issuances.length,
+    });
+  } catch (err) {
+    console.error("issuance-summary error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });

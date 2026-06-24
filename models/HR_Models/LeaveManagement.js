@@ -81,7 +81,19 @@ leaveBalanceSchema.statics.getOrCreate = async function (
 const LeaveBalance = mongoose.model("LeaveBalance", leaveBalanceSchema);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  3. LEAVE APPLICATION — with paidDays + lwpDays for LWP breakdown
+//  3. LEAVE APPLICATION — with paidDays + lwpDays + QUICK-APPLY support
+//
+//  QUICK-APPLY FLOW (new):
+//    Employee uses a shortcut button → leaveType: "QUICK", isQuickApply: true
+//    Secondary manager calls /quick-apply/:id/resolve → picks CL/SL/LOP,
+//      writes the chosen type back into leaveType + paidDays/lwpDays,
+//      records itself in managerDecisions, sets status to manager_approved
+//    Primary manager calls /manager/:id/approve → moves to hr_approved with
+//      normal balance deduction + attendance sync + HR email.
+//
+//    NOTE the reverse order vs the regular flow (regular = primary first,
+//    then secondary). The /manager/:id/approve handler checks isQuickApply
+//    and routes accordingly.
 // ─────────────────────────────────────────────────────────────────────────────
 const leaveApplicationSchema = new mongoose.Schema(
   {
@@ -98,7 +110,8 @@ const leaveApplicationSchema = new mongoose.Schema(
 
     leaveType: {
       type: String,
-      enum: ["CL", "SL", "PL", "LOP"],
+      // "QUICK" = pending secondary-manager classification (quick-apply)
+      enum: ["CL", "SL", "PL", "LOP", "QUICK"],
       required: true,
     },
     applicationDate: { type: String, required: true },
@@ -123,6 +136,21 @@ const leaveApplicationSchema = new mongoose.Schema(
 
     addedByHR: { type: Boolean, default: false },
     addedByHRId: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
+
+    // ── QUICK-APPLY tracking ───────────────────────────────────────────
+    isQuickApply: { type: Boolean, default: false, index: true },
+    quickApply: {
+      resolvedType: {
+        type: String,
+        enum: ["CL", "SL", "LOP", null],
+        default: null,
+      },
+      resolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee" },
+      resolvedByName: { type: String, default: null },
+      resolvedAt: { type: Date, default: null },
+      // Set when secondary manager forces LOP despite available CL/SL balance
+      forcedLOPReason: { type: String, default: null },
+    },
 
     status: {
       type: String,

@@ -13,6 +13,16 @@
 
 const mongoose = require("mongoose");
 
+// e.g. Button → fromUnit "Piece", toUnit "Kilogram", quantity 0.4  → 1 pc = 0.4 KG
+const unitConversionSchema = new mongoose.Schema(
+  {
+    fromUnit: { type: String, trim: true, default: "" },
+    toUnit:   { type: String, trim: true, default: "" },
+    quantity: { type: Number, default: 0, min: 0 }
+  },
+  { _id: false }
+);
+
 // ── Per-variant vendor alias ───────────────────────────────────────────────
 const variantVendorNicknameSchema = new mongoose.Schema(
   {
@@ -24,7 +34,8 @@ const variantVendorNicknameSchema = new mongoose.Schema(
     nickname:     { type: String, required: true, trim: true },  // vendor's code/name for this variant
     price:        { type: Number, default: 0, min: 0 },          // vendor's price for this variant
     deliveryDays: { type: Number, default: 0, min: 0 },          // delivery timeline in days
-    notes:        { type: String, default: "", trim: true }
+    notes:          { type: String, default: "", trim: true },
+    specifications: [{ key: { type: String, default: "" }, value: { type: String, default: "" } }]
   },
   { timestamps: true }
 );
@@ -40,6 +51,8 @@ const variantSchema = new mongoose.Schema({
   // ── NEW: per-variant fields ──
   image:           { type: String, default: "" },          // Cloudinary URL
   vendorNicknames: [variantVendorNicknameSchema],          // per-variant aliases
+  unitConversion:  { type: unitConversionSchema, default: null },   // legacy — kept for backward compat
+  unitConversions: [unitConversionSchema],
 
   status: { type: String, default: "In Stock" }
 });
@@ -85,15 +98,7 @@ const attributeSchema = new mongoose.Schema({
   values: [{ type: String, trim: true }]
 });
 
-// e.g. Button → fromUnit "Piece", toUnit "Kilogram", quantity 0.4  → 1 pc = 0.4 KG
-const unitConversionSchema = new mongoose.Schema(
-  {
-    fromUnit: { type: String, trim: true, default: "" },
-    toUnit:   { type: String, trim: true, default: "" },
-    quantity: { type: Number, default: 0, min: 0 }
-  },
-  { _id: false }
-);
+
 
 // ── Helper: derive status from qty vs minStock ──
 const deriveStatus = (qty, minStock) => {
@@ -128,8 +133,6 @@ const rawItemSchema = new mongoose.Schema(
     attributes: [attributeSchema],
     variants:   [variantSchema],
     discounts:  [discountSchema],
-
-    unitConversion: { type: unitConversionSchema, default: null },
 
     stockTransactions: [stockTransactionSchema],
 

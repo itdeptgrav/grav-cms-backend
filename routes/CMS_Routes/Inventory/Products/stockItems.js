@@ -119,6 +119,11 @@ async function processVariantRawItems(rawItemsInput) {
     const chosenUnit = rawItem.unit || registeredUnit;
     const baseUnit = rawItem.baseUnit || registeredUnit;
 
+    // If frontend sent an explicit unitCost (manually edited), honour it over DB-derived price
+    const finalUnitCost = (rawItem.unitCost != null && parseFloat(rawItem.unitCost) > 0)
+      ? parseFloat(rawItem.unitCost)
+      : unitCost;
+
     processedRawItems.push({
       rawItemId: rawItemData._id,
       rawItemName: rawItemData.name,
@@ -128,8 +133,8 @@ async function processVariantRawItems(rawItemsInput) {
       quantity: parseFloat(rawItem.quantity),
       unit: chosenUnit,
       baseUnit,
-      unitCost,
-      totalCost: parseFloat(rawItem.quantity) * unitCost
+      unitCost: finalUnitCost,
+      totalCost: parseFloat(rawItem.quantity) * finalUnitCost
     });
   }
 
@@ -284,6 +289,7 @@ router.get("/data/raw-items", async (req, res) => {
 
     const rawItems = await RawItem.find(filter)
       .select("name sku category unit customUnit variants quantity minStock maxStock sellingPrice stockTransactions")
+      .populate("variants.vendorNicknames.vendor", "companyName")
       .limit(parseInt(limit))
       .sort({ name: 1 });
 
@@ -336,7 +342,17 @@ router.get("/data/raw-items", async (req, res) => {
             unit: baseUnitName,
             cost: latestCost,
             status: variant.status || "Out of Stock",
-            sku: variant.sku || `${baseItem.sku}-var`
+            sku: variant.sku || `${baseItem.sku}-var`,
+            // variant-level unit conversions (fromUnit/toUnit/quantity format from RawItem schema)
+            unitConversions: (variant.unitConversions || []).filter(c => c.fromUnit && c.toUnit && c.quantity),
+            vendorAliases: (variant.vendorNicknames || [])
+              .filter(vn => vn.price > 0)
+              .map(vn => ({
+                vendorId: vn.vendor?._id?.toString() || vn.vendor?.toString(),
+                vendorName: vn.vendor?.companyName || "—",
+                vendorCode: vn.nickname || "",
+                price: vn.price || 0
+              }))
           };
         });
       } else {
@@ -445,6 +461,31 @@ router.get("/:id/tab/:tabName", async (req, res) => {
     if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
 
     const response = { success: true, tab: tabName, data: stockItem };
+
+    // For raw-items tab, build a map of rawItemId|variantId → unitConversions
+    // so the frontend can show correct conversion units without extra fetches
+    if (tabName === "raw-items") {
+      const rawItemIds = [
+        ...new Set(
+          stockItem.variants.flatMap(v =>
+            (v.rawItems || []).map(ri => ri.rawItemId?.toString()).filter(Boolean)
+          )
+        )
+      ];
+      if (rawItemIds.length > 0) {
+        const rawDocs = await RawItem.find({ _id: { $in: rawItemIds } })
+          .select("_id variants._id variants.unitConversions")
+          .lean();
+        const convMap = {};
+        rawDocs.forEach(doc => {
+          (doc.variants || []).forEach(v => {
+            const key = `${doc._id}|${v._id}`;
+            convMap[key] = (v.unitConversions || []).filter(c => c.fromUnit && c.toUnit && c.quantity);
+          });
+        });
+        response.variantUnitConvMap = convMap;
+      }
+    }
 
     if (tabName === "operations") {
       const [registeredOperations, registeredGroups] = await Promise.all([

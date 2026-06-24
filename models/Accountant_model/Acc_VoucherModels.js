@@ -96,15 +96,23 @@ const inventoryEntrySchema = new mongoose.Schema(
 
     // Sales/purchase ledger this line posts against (optional — voucher-level
     // sales ledger is the more common pattern)
+    // Sales/purchase ledger this line posts against (optional — voucher-level
+    // sales ledger is the more common pattern)
     accountingLedgerId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Acc_Ledger",
     },
     accountingLedgerName: { type: String, trim: true },
+
+    // ─── Charge line (courier, freight, packing etc.) ───────────────────────
+    // A charge is a non-stock line: no quantity, posts a Cr to its own ledger
+    // (NOT to Sales). isCharge:true distinguishes it from a product row.
+    isCharge: { type: Boolean, default: false },
+    chargeLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+    chargeDescription: { type: String, trim: true },
   },
   { _id: true },
 );
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SUB-SCHEMA: GST breakup (carried on the voucher header)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,6 +225,40 @@ const tallyVoucherSchema = new mongoose.Schema(
       pincode: { type: String, trim: true },
       country: { type: String, default: "India", trim: true },
       gstin: { type: String, trim: true },
+    },
+
+    // ─── Dispatch details (printed in the invoice header) ───────────────────
+    // The fields that appear in the Tally-style invoice header's right-hand
+    // meta block and the consignee row. All optional. Captured per-invoice on
+    // the sales-voucher form's "Dispatch Details" section so the exported PDF
+    // can show them (previously these cells were hardcoded blank).
+    //
+    // Buyer's-order + delivery-note + dispatch-doc + transport-carrier are the
+    // standard fields a GST tax invoice prints. The invoice PUT route already
+    // referenced several of these as editable; this is their schema home.
+    dispatchDetails: {
+      // "Delivery Note No(s)" — can be several; stored as a free string the
+      // user types (e.g. "DN/12, DN/13") so multiple notes fit one cell.
+      deliveryNoteNumbers: { type: String, trim: true },
+      deliveryNoteDate: { type: Date },
+
+      buyersOrderNumber: { type: String, trim: true },
+      buyersOrderDate: { type: Date },
+
+      dispatchDocNumber: { type: String, trim: true },
+      dispatchedThrough: { type: String, trim: true },
+      destination: { type: String, trim: true },
+
+      // "Other References" — free text printed in the header meta block
+      otherReferences: { type: String, trim: true },
+
+      // Transport / shipping
+      carrierName: { type: String, trim: true }, // Carrier Name / Agent
+      billOfLadingNumber: { type: String, trim: true }, // Bill of Lading / LR-RR No.
+      motorVehicleNumber: { type: String, trim: true },
+      dispatchDate: { type: Date }, // the "Date:" under dispatch details
+
+      termsOfDelivery: { type: String, trim: true },
     },
 
     // ─── Lines ──────────────────────────────────────────────────────────────
@@ -346,6 +388,14 @@ const tallyVoucherSchema = new mongoose.Schema(
     // (planning-only, not posted to the ledger).
     isOptional: { type: Boolean, default: false },
 
+    // Uniqueness gate for the voucher-number index. TRUE for "live" vouchers
+    // (draft / pending_approval / posted), FALSE once cancelled or voided.
+    // The unique index on (companyId, voucherType, voucherNumber) is PARTIAL
+    // on this flag, so a cancelled/void voucher releases its number for reuse
+    // — matching the way an accountant re-issues a number after voiding.
+    // Auto-maintained in the pre-save hook.
+    isLive: { type: Boolean, default: true, index: true },
+
     // ─── e-Acc_Invoice / e-Way Bill (sales) ─────────────────────────────────────
     eInvoiceDetails: {
       irn: { type: String, trim: true },
@@ -361,6 +411,32 @@ const tallyVoucherSchema = new mongoose.Schema(
       transporter: { type: String, trim: true },
       vehicleNo: { type: String, trim: true },
       distance: { type: Number, default: 0 },
+
+      // Full set of e-way bill transport details, auto-saved when the e-Way
+      // Bill JSON is generated so they don't need re-entering next time.
+      // Mirrors the `overrides` object the e-way bill generator uses.
+      transporterId: { type: String, trim: true },
+      transMode: { type: Number },
+      transDistance: { type: Number },
+      transDocNo: { type: String, trim: true },
+      transDocDate: { type: String, trim: true },
+      vehicleType: { type: String, trim: true },
+      subSupplyType: { type: Number },
+      subSupplyDesc: { type: String, trim: true },
+      docType: { type: String, trim: true },
+      transType: { type: Number },
+      supplyType: { type: String, trim: true },
+      // Ship-to overrides (when consignee differs from buyer)
+      shipMatchesBill: { type: Boolean },
+      shipName: { type: String, trim: true },
+      shipGstin: { type: String, trim: true },
+      shipStateCode: { type: String, trim: true },
+      shipPincode: { type: String, trim: true },
+      shipAddr1: { type: String, trim: true },
+      shipAddr2: { type: String, trim: true },
+      shipPlace: { type: String, trim: true },
+      // Timestamp of the last time these were saved via the EWB generator
+      lastGeneratedAt: { type: Date },
     },
 
     // ─── CMS bridge ─────────────────────────────────────────────────────────
@@ -413,6 +489,23 @@ const tallyVoucherSchema = new mongoose.Schema(
     },
     cancelledAt: { type: Date },
     cancellationReason: { type: String, trim: true },
+
+    // ─── Approval workflow ──────────────────────────────────────────────────
+    // When an Editor (a user without canPostDirectly) creates a sales voucher,
+    // it is saved as status "pending_approval" (a draft that is NOT posted to
+    // any ledger). An Owner/Approver then approves it (→ posted, balances
+    // applied) or rejects it (→ cancelled, with a reason). These fields record
+    // who did what, for the audit timeline.
+    submittedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    submittedByName: { type: String, trim: true },
+    submittedAt: { type: Date },
+    approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    approvedByName: { type: String, trim: true },
+    approvedAt: { type: Date },
+    rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+    rejectedByName: { type: String, trim: true },
+    rejectedAt: { type: Date },
+    rejectionReason: { type: String, trim: true },
   },
   { timestamps: true, collection: "acc_vouchers" },
 );
@@ -436,6 +529,10 @@ tallyVoucherSchema.pre("save", function (next) {
     0,
   );
   this.isBalanced = Math.abs(this.totalDebit - this.totalCredit) < 0.01;
+
+  // Live flag drives the partial unique index on voucherNumber. A
+  // cancelled/void voucher is NOT live, so its number is freed for reuse.
+  this.isLive = !["cancelled", "void"].includes(this.status);
 
   // GST aggregate
   if (this.gstBreakup) {
@@ -461,16 +558,18 @@ tallyVoucherSchema.pre("save", function (next) {
 // INDEXES
 // ─────────────────────────────────────────────────────────────────────────────
 tallyVoucherSchema.index({ companyId: 1, voucherDate: -1 });
-tallyVoucherSchema.index(
-  { companyId: 1, voucherType: 1, voucherNumber: 1 },
-  { unique: true },
-);
+// NOTE: the unique (companyId, voucherType, voucherNumber) index is created
+// PROGRAMMATICALLY below as a PARTIAL index on isLive — see ensureVoucherIndexes.
+// It is intentionally NOT declared here so autoIndex doesn't race/conflict with
+// the legacy full-unique index it replaces.
 tallyVoucherSchema.index({ companyId: 1, partyLedgerId: 1 });
 tallyVoucherSchema.index({ companyId: 1, financialYear: 1 });
 tallyVoucherSchema.index({ "ledgerEntries.ledgerId": 1, voucherDate: -1 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATIC: get the next voucher number for a given company + type
+// Skips numbers already held by a LIVE voucher (draft/pending/posted) and
+// ignores cancelled/void ones, so a freshly-suggested number never collides.
 // ─────────────────────────────────────────────────────────────────────────────
 tallyVoucherSchema.statics.nextVoucherNumber = async function (
   companyId,
@@ -496,22 +595,46 @@ tallyVoucherSchema.statics.nextVoucherNumber = async function (
   const fy =
     today.getMonth() >= 3 ? today.getFullYear() : today.getFullYear() - 1;
   const fyShort = `${fy.toString().slice(2)}${(fy + 1).toString().slice(2)}`;
+  const fyTag = `${fy}-${(fy + 1).toString().slice(2)}`;
 
-  const last = await this.findOne({
+  // Highest trailing sequence among LIVE vouchers of this type+FY whose
+  // number was generated with THIS prefix (ignores manually-numbered ones
+  // in other schemes, and ignores cancelled/void).
+  const prefixRx = new RegExp(
+    `^${fmtPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/`,
+    "i",
+  );
+  const live = await this.find({
     companyId,
     voucherType,
-    financialYear: `${fy}-${(fy + 1).toString().slice(2)}`,
+    financialYear: fyTag,
+    voucherNumber: prefixRx,
+    status: { $nin: ["cancelled", "void"] },
   })
-    .sort({ createdAt: -1 })
     .select("voucherNumber")
     .lean();
 
-  let seq = 1;
-  if (last && last.voucherNumber) {
-    const match = last.voucherNumber.match(/(\d+)$/);
-    if (match) seq = parseInt(match[1], 10) + 1;
+  let maxSeq = 0;
+  for (const v of live) {
+    const m = (v.voucherNumber || "").match(/(\d+)\s*$/);
+    if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
   }
-  return `${fmtPrefix}/${fyShort}/${seq.toString().padStart(5, "0")}`;
+
+  // Advance past any LIVE voucher already holding the candidate number
+  // (covers manual entries / odd schemes that share the prefix).
+  let seq = maxSeq + 1;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const candidate = `${fmtPrefix}/${fyShort}/${seq.toString().padStart(5, "0")}`;
+    const taken = await this.exists({
+      companyId,
+      voucherType,
+      voucherNumber: candidate,
+      status: { $nin: ["cancelled", "void"] },
+    });
+    if (!taken) return candidate;
+    seq++;
+  }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -546,6 +669,94 @@ tallyGodownSchema.index({ companyId: 1, name: 1 }, { unique: true });
 // ─────────────────────────────────────────────────────────────────────────────
 const Acc_Voucher = mongoose.model("Acc_Voucher", tallyVoucherSchema);
 const Acc_Godown = mongoose.model("Acc_Godown", tallyGodownSchema);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INDEX RECONCILIATION (one-time, on connection)
+// -----------------------------------------------------------------------------
+// The original unique index on (companyId, voucherType, voucherNumber) was a
+// FULL unique index — it blocked re-using a voucher number even after the old
+// voucher had been cancelled/voided. We replace it with a PARTIAL unique index
+// that only enforces uniqueness among LIVE vouchers (isLive: true), so a
+// cancelled/void voucher releases its number.
+//
+// Mongoose autoIndex can't switch an index's options in place, so we:
+//   1. backfill isLive on any existing docs that lack it,
+//   2. drop the legacy full-unique index if present,
+//   3. create the partial unique index.
+// All steps are idempotent and safe to run on every boot.
+// ─────────────────────────────────────────────────────────────────────────────
+async function ensureVoucherIndexes() {
+  try {
+    const coll = Acc_Voucher.collection;
+
+    // 1) Backfill isLive so the partial index covers pre-existing vouchers.
+    try {
+      await coll.updateMany(
+        { status: { $in: ["cancelled", "void"] }, isLive: { $ne: false } },
+        { $set: { isLive: false } },
+      );
+      await coll.updateMany(
+        {
+          status: { $nin: ["cancelled", "void"] },
+          isLive: { $ne: true },
+        },
+        { $set: { isLive: true } },
+      );
+    } catch (e) {
+      console.warn("[Acc_Voucher] isLive backfill skipped:", e.message);
+    }
+
+    // 2) Drop the legacy FULL unique index if it exists (any non-partial
+    //    unique index on this exact key).
+    let indexes = [];
+    try {
+      indexes = await coll.indexes();
+    } catch (_) {
+      indexes = [];
+    }
+    for (const ix of indexes) {
+      const k = ix.key || {};
+      const sameKey =
+        k.companyId === 1 && k.voucherType === 1 && k.voucherNumber === 1;
+      if (sameKey && ix.unique && !ix.partialFilterExpression) {
+        try {
+          await coll.dropIndex(ix.name);
+          console.log(`[Acc_Voucher] dropped legacy unique index ${ix.name}`);
+        } catch (e) {
+          console.warn(`[Acc_Voucher] could not drop ${ix.name}:`, e.message);
+        }
+      }
+    }
+
+    // 3) Create the partial unique index (live vouchers only).
+    try {
+      await coll.createIndex(
+        { companyId: 1, voucherType: 1, voucherNumber: 1 },
+        {
+          unique: true,
+          partialFilterExpression: { isLive: true },
+          name: "uniq_voucher_number_live",
+        },
+      );
+    } catch (e) {
+      // Most likely an older MongoDB without partial-index support, or a
+      // transient build error. The application-layer duplicate check in the
+      // create/update routes still guards uniqueness, so we just log.
+      console.warn(
+        "[Acc_Voucher] partial unique index not created:",
+        e.message,
+      );
+    }
+  } catch (e) {
+    console.error("[Acc_Voucher] index reconcile failed:", e.message);
+  }
+}
+
+if (mongoose.connection.readyState === 1) {
+  ensureVoucherIndexes();
+} else {
+  mongoose.connection.once("open", ensureVoucherIndexes);
+}
 
 module.exports = {
   Acc_Voucher,

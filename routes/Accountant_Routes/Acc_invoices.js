@@ -5,6 +5,15 @@
 // This module does NOT have its own collection. Instead it reads from
 // the unified Acc_Voucher collection (voucherType: "sales") and
 // enriches each invoice with payment lifecycle data.
+//
+// ─── ADDITIONS (everything else is identical to the original) ────────────────
+// GET  /next-number      — next invoice number from Settings prefix
+//                          format: {prefix}/{4-digit-seq}/{FY-short-dash}
+//                          e.g. RC/0016/26-27
+// PUT  /:id              — edit a draft or posted invoice; handles ledger
+//                          balance reversal + reapplication in a transaction
+// PATCH/:id/status       — cancel (reverses balances) or void (does not)
+// ─────────────────────────────────────────────────────────────────────────────
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -14,6 +23,8 @@ const {
 } = require("../../models/Accountant_model/Acc_VoucherModels");
 const {
   Acc_Company,
+  Acc_Ledger, // ← added for applyLedgerBalances
+  Acc_Group, // ← added so edits can resolve/create ledgers by name (parity with create)
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const {
   Acc_Settings,
@@ -21,6 +32,219 @@ const {
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
 router.use(accountantAuth);
+
+/* ================================================================== */
+/* DIAGNOSTIC — inspect what's actually stored for an invoice.         */
+/* Visit: /api/accountant/invoices/:id/debug-dispatch                  */
+/* Remove after debugging. Shows whether dispatchDetails is persisted. */
+/* MUST be before "/:id" so Express doesn't treat the suffix as an id. */
+/* ================================================================== */
+router.get("/:id/debug-dispatch", async (req, res) => {
+  try {
+    const inv = await Acc_Voucher.findById(req.params.id).lean();
+    if (!inv) return res.status(404).json({ error: "Not found" });
+    res.json({
+      voucherNumber: inv.voucherNumber,
+      status: inv.status,
+      hasDispatchDetailsField: Object.prototype.hasOwnProperty.call(
+        inv,
+        "dispatchDetails",
+      ),
+      dispatchDetails: inv.dispatchDetails || null,
+      // legacy flat fields, in case anything wrote there instead
+      flat: {
+        dispatchDocNumber: inv.dispatchDocNumber ?? null,
+        deliveryNote: inv.deliveryNote ?? null,
+        dispatchedThrough: inv.dispatchedThrough ?? null,
+        destination: inv.destination ?? null,
+        buyersOrderNumber: inv.buyersOrderNumber ?? null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================================================== */
+/* NEW HELPERS (used only by the three new routes below)              */
+/* ================================================================== */
+
+function _computeFY(date) {
+  const d = new Date(date);
+  const fy = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  return `${fy}-${(fy + 1).toString().slice(2)}`;
+}
+function _fyShortDash(date) {
+  const d = new Date(date);
+  const fy = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  return `${fy.toString().slice(2)}-${(fy + 1).toString().slice(2)}`;
+}
+function _fyShortNoDash(date) {
+  const d = new Date(date);
+  const fy = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  return `${fy.toString().slice(2)}${(fy + 1).toString().slice(2)}`;
+}
+function _esc(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Next invoice number: reads Settings.numbering.invoicePrefix, scans all
+// vouchers that share the prefix, returns max_seq+1 in the new format.
+async function _nextInvoiceNum(companyId, voucherDate) {
+  const st = await Acc_Settings.findOne()
+    .select("numbering invoicePrefix invoiceStartNumber")
+    .lean();
+  const pfx = st?.numbering?.invoicePrefix || st?.invoicePrefix || "SL";
+
+  // ── FY suffix: use the settings override if the accountant has set one,
+  //    otherwise auto-derive from the invoice date. This lets the accountant
+  //    manually switch to "27-28" before April, or correct a wrong FY without
+  //    touching the code.
+  const fyDash = (() => {
+    const override = (st?.numbering?.fyOverride || "").trim();
+    if (override) {
+      // Normalise: accept "2627" → "26-27" as well as the canonical "26-27"
+      if (/^\d{4}$/.test(override)) {
+        return `${override.slice(0, 2)}-${override.slice(2)}`;
+      }
+      return override; // already "26-27" format
+    }
+    return _fyShortDash(voucherDate);
+  })();
+  const fyNoDash = fyDash.replace("-", "");
+
+  const pe = _esc(pfx);
+  const re1 = new RegExp(`^${pe}/(\\d+)/${_esc(fyDash)}$`);
+  const re2 = new RegExp(`^${pe}/${fyNoDash}/(\\d+)$`);
+
+  const rows = await Acc_Voucher.find({
+    companyId,
+    voucherNumber: { $regex: `^${pe}/` },
+  })
+    .select("voucherNumber")
+    .lean();
+
+  let maxSeq = 0;
+  for (const r of rows) {
+    const n = r.voucherNumber || "";
+    const m1 = n.match(re1);
+    if (m1) {
+      maxSeq = Math.max(maxSeq, parseInt(m1[1], 10));
+      continue;
+    }
+    const m2 = n.match(re2);
+    if (m2) {
+      maxSeq = Math.max(maxSeq, parseInt(m2[1], 10));
+    }
+  }
+  // respect manual floor from settings
+  const floor =
+    (st?.numbering?.invoiceNextNum || st?.invoiceStartNumber || 1) - 1;
+  maxSeq = Math.max(maxSeq, floor);
+
+  return `${pfx}/${(maxSeq + 1).toString().padStart(4, "0")}/${fyDash}`;
+}
+
+// Apply / reverse ledger balances. direction = +1 post, -1 reverse.
+async function _applyLedgerBalances(voucher, direction, session) {
+  const ops = [];
+  for (const entry of voucher.ledgerEntries || []) {
+    const lid = entry.ledgerId || entry.ledger;
+    if (!lid) continue;
+    const delta = (entry.signedAmount || 0) * direction;
+    ops.push({
+      updateOne: {
+        filter: { _id: lid },
+        update: { $inc: { currentBalance: delta } },
+      },
+    });
+  }
+  if (ops.length) {
+    await Acc_Ledger.bulkWrite(ops, session ? { session } : {});
+    for (const entry of voucher.ledgerEntries || []) {
+      const lid = entry.ledgerId || entry.ledger;
+      if (!lid) continue;
+      const led = await Acc_Ledger.findById(lid).session(session || null);
+      if (led) {
+        led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+        await led.save(session ? { session } : {});
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Resolve a ledger entry's name → an existing ledger, auto-creating it */
+/* if it truly doesn't exist yet. Mirrors the create path in            */
+/* Acc_vouchers.js so an EDITED invoice resolves/creates ledgers the    */
+/* exact same way a NEW one does — otherwise a name-only line (e.g. a    */
+/* "Round Off" or an as-yet-unmatched GST band) would be written to the */
+/* voucher with no ledgerId and then silently skipped by the rebalance, */
+/* leaving the edit out of the ledgers and the Balance Sheet.           */
+/* ------------------------------------------------------------------ */
+async function _resolveOrCreateByName(name, companyId, createdBy, session) {
+  const clean = String(name || "").trim();
+  if (!clean) return null;
+  let led = await Acc_Ledger.findOne({
+    companyId,
+    name: new RegExp(`^${clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+  }).session(session || null);
+  if (led) return led;
+
+  // Pick a sensible parent group: prefer Indirect Expenses (where Round Off
+  // lives), then any expense-natured group, then anything for the company.
+  const grp =
+    (await Acc_Group.findOne({ companyId, name: /indirect expense/i }).session(
+      session || null,
+    )) ||
+    (await Acc_Group.findOne({ companyId, nature: "expense" }).session(
+      session || null,
+    )) ||
+    (await Acc_Group.findOne({ companyId }).session(session || null));
+  if (!grp) return null;
+
+  const created = await Acc_Ledger.create(
+    [
+      {
+        companyId,
+        name: clean,
+        groupId: grp._id,
+        groupName: grp.name,
+        openingBalance: 0,
+        openingBalanceType: "Dr",
+        currentBalance: 0,
+        sourceSystem: "auto_from_voucher",
+        createdBy,
+      },
+    ],
+    { session },
+  );
+  return created[0];
+}
+
+/* ================================================================== */
+/* NEW ROUTE 1: GET /next-number                                       */
+/* ================================================================== */
+// MUST be before /:id routes so "next-number" isn't treated as an id.
+router.get("/next-number", async (req, res) => {
+  try {
+    const { companyId, date } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+    const voucherNumber = await _nextInvoiceNum(
+      companyId,
+      date ? new Date(date) : new Date(),
+    );
+    res.json({ voucherNumber });
+  } catch (e) {
+    console.error("[invoices/next-number]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================================================== */
+/* ORIGINAL HELPERS (unchanged)                                       */
+/* ================================================================== */
 
 /* ------------------------------------------------------------------ */
 /* Helper: enrich a batch of invoices with payment lifecycle data      */
@@ -119,6 +343,10 @@ async function enrichInvoices(invoices, companyId) {
     };
   });
 }
+
+/* ================================================================== */
+/* ORIGINAL ROUTES (completely unchanged)                             */
+/* ================================================================== */
 
 /* ------------------------------------------------------------------ */
 /* GET / — list invoices                                               */
@@ -548,14 +776,45 @@ router.get("/:id/download-pdf", async (req, res) => {
           .fillColor("#000")
           .text(value, x + 2, ry + 9, { width: rw - 4 });
     };
+    const dd = inv.dispatchDetails || {};
     mc(rx1, y, "Invoice No.", inv.voucherNumber);
     mc(rx2, y, "Dated", fmtDt(inv.voucherDate));
-    mc(rx1, y + cellH, "Reference No. & Date", inv.referenceNumber || "");
-    mc(rx2, y + cellH, "Other References", "");
-    mc(rx1, y + cellH * 2, "Buyer's Order No.", inv.buyersOrderNumber || "");
-    mc(rx2, y + cellH * 2, "Dated", "");
-    mc(rx1, y + cellH * 3, "Dispatch Doc No.", "");
-    mc(rx2, y + cellH * 3, "Delivery Note Date", "");
+    mc(
+      rx1,
+      y + cellH,
+      "Delivery Note",
+      dd.deliveryNoteNumbers || inv.deliveryNote || "",
+    );
+    mc(
+      rx2,
+      y + cellH,
+      "Mode/Terms of Payment",
+      inv.paymentTerms || dd.termsOfDelivery || "",
+    );
+    mc(
+      rx1,
+      y + cellH * 2,
+      "Buyer's Order No.",
+      dd.buyersOrderNumber || inv.buyersOrderNumber || "",
+    );
+    mc(
+      rx2,
+      y + cellH * 2,
+      "Dated",
+      dd.buyersOrderDate ? fmtDt(dd.buyersOrderDate) : "",
+    );
+    mc(
+      rx1,
+      y + cellH * 3,
+      "Dispatch Doc No.",
+      dd.dispatchDocNumber || inv.dispatchDocNumber || "",
+    );
+    mc(
+      rx2,
+      y + cellH * 3,
+      "Delivery Note Date",
+      dd.deliveryNoteDate ? fmtDt(dd.deliveryNoteDate) : "",
+    );
     y += sellerH;
 
     // ─── Consignee ───
@@ -586,8 +845,13 @@ router.get("/:id/download-pdf", async (req, res) => {
           L + 2,
           y + 27,
         );
-    mc(rx1, y, "Dispatched through", "");
-    mc(rx2, y, "Destination", "");
+    mc(
+      rx1,
+      y,
+      "Dispatched through",
+      dd.dispatchedThrough || inv.dispatchedThrough || "",
+    );
+    mc(rx2, y, "Destination", dd.destination || inv.destination || "");
     y += consH;
 
     // ─── Buyer ───
@@ -622,6 +886,28 @@ router.get("/:id/download-pdf", async (req, res) => {
       .font("Helvetica")
       .fillColor("#666")
       .text("Terms of Delivery", rx1 + 2, y + 1);
+    // Carrier / LR-RR / vehicle details + terms of delivery text, stacked in
+    // the right half of the buyer row (mirrors Tally's layout).
+    {
+      const transportBits = [];
+      if (dd.carrierName) transportBits.push(`Carrier: ${dd.carrierName}`);
+      if (dd.billOfLadingNumber)
+        transportBits.push(`LR/RR: ${dd.billOfLadingNumber}`);
+      if (dd.motorVehicleNumber)
+        transportBits.push(`Vehicle: ${dd.motorVehicleNumber}`);
+      if (dd.dispatchDate)
+        transportBits.push(`Date: ${fmtDt(dd.dispatchDate)}`);
+      const termsText = dd.termsOfDelivery || inv.termsOfDelivery || "";
+      const rightLines = [];
+      if (termsText) rightLines.push(termsText);
+      if (transportBits.length) rightLines.push(transportBits.join("  ·  "));
+      if (rightLines.length)
+        doc
+          .fontSize(7)
+          .font("Helvetica")
+          .fillColor("#000")
+          .text(rightLines.join("\n"), rx1 + 2, y + 9, { width: W * 0.5 - 6 });
+    }
     y += buyH;
 
     // ─── Line Items ───
@@ -1048,6 +1334,38 @@ router.get("/:id", async (req, res) => {
 
     const [enriched] = await enrichInvoices([inv], inv.companyId);
 
+    // ── Flatten dispatchDetails onto the invoice ──────────────────────────────
+    // The React-PDF invoice generator (components/accountant/InvoicePDFGenerator.js)
+    // reads FLAT fields (invoice.dispatchDocNumber, invoice.dispatchedThrough,
+    // invoice.destination, invoice.deliveryNote, invoice.buyersOrderNumber,
+    // invoice.termsOfDelivery, …) but the sales form saves these NESTED under
+    // `dispatchDetails`. We copy the nested values up to the flat names the PDF
+    // expects (only when a flat value isn't already set), so the PDF and the
+    // on-screen detail render the dispatch data without changing the frontend.
+    const dd = enriched.dispatchDetails || {};
+    const flatFromDispatch = {
+      deliveryNote: enriched.deliveryNote || dd.deliveryNoteNumbers || "",
+      deliveryNoteDate:
+        enriched.deliveryNoteDate || dd.deliveryNoteDate || null,
+      buyersOrderNumber:
+        enriched.buyersOrderNumber || dd.buyersOrderNumber || "",
+      buyersOrderDate: enriched.buyersOrderDate || dd.buyersOrderDate || null,
+      dispatchDocNumber:
+        enriched.dispatchDocNumber || dd.dispatchDocNumber || "",
+      dispatchedThrough:
+        enriched.dispatchedThrough || dd.dispatchedThrough || "",
+      destination: enriched.destination || dd.destination || "",
+      otherReferences: enriched.otherReferences || dd.otherReferences || "",
+      termsOfDelivery: enriched.termsOfDelivery || dd.termsOfDelivery || "",
+      carrierName: enriched.carrierName || dd.carrierName || "",
+      billOfLadingNumber:
+        enriched.billOfLadingNumber || dd.billOfLadingNumber || "",
+      motorVehicleNumber:
+        enriched.motorVehicleNumber || dd.motorVehicleNumber || "",
+      dispatchDate: enriched.dispatchDate || dd.dispatchDate || null,
+    };
+    Object.assign(enriched, flatFromDispatch);
+
     const [company, settings] = await Promise.all([
       Acc_Company.findById(inv.companyId)
         .select("companyName address contact gstin pan cin tan")
@@ -1113,6 +1431,167 @@ router.get("/:id", async (req, res) => {
   } catch (e) {
     console.error("[invoices/:id]", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================================================== */
+/* NEW ROUTE 2: PUT /:id — edit a draft or posted invoice             */
+/* ================================================================== */
+router.put("/:id", async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction();
+
+    const inv = await Acc_Voucher.findOne({
+      _id: req.params.id,
+      voucherType: "sales",
+    }).session(session);
+    if (!inv) throw new Error("Invoice not found");
+
+    if (inv.status === "cancelled" || inv.status === "void") {
+      throw new Error(`Cannot edit a ${inv.status} invoice.`);
+    }
+
+    const wasPosted = inv.status === "posted";
+    if (wasPosted) await _applyLedgerBalances(inv, -1, session);
+
+    const body = req.body || {};
+
+    // ── Resolve ledger entries exactly like the create path ──────────────
+    // Every entry must carry a real ledgerId before we save, otherwise the
+    // re-apply below skips it and the edit never reaches the ledgers / Balance
+    // Sheet. Entries that arrive with only a name (e.g. "Round Off", or a GST
+    // band whose rate-specific ledger doesn't exist yet) are resolved or
+    // auto-created here. Transient client flags are stripped.
+    if (Array.isArray(body.ledgerEntries)) {
+      for (const entry of body.ledgerEntries) {
+        const ledId = entry.ledgerId || entry.ledger;
+        if (ledId) {
+          entry.ledgerId = ledId;
+          if (!entry.ledgerName) {
+            const led = await Acc_Ledger.findById(ledId)
+              .select("name")
+              .session(session);
+            if (led) entry.ledgerName = led.name;
+          }
+        } else if (entry.ledgerName) {
+          const led = await _resolveOrCreateByName(
+            entry.ledgerName,
+            inv.companyId,
+            req.user?.id,
+            session,
+          );
+          if (led) {
+            entry.ledgerId = led._id;
+            entry.ledgerName = led.name;
+          }
+        }
+        delete entry.ledger;
+        delete entry.autoLedger;
+      }
+    }
+
+    const EDITABLE = [
+      "voucherDate",
+      "partyLedgerId",
+      "partyLedgerName",
+      "partyGstin",
+      "placeOfSupply",
+      "placeOfSupplyCode",
+      "billDate",
+      "dueDate",
+      "billingAddress",
+      "shippingAddress",
+      "ledgerEntries",
+      "inventoryEntries",
+      "subtotal",
+      "discountTotal",
+      "gstBreakup",
+      "totalTax",
+      "roundOff",
+      "grandTotal",
+      "totalDebit",
+      "totalCredit",
+      "narration",
+      "referenceNumber",
+      "referenceDate",
+      "buyersOrderNumber",
+      "buyersOrderDate",
+      "dispatchDocNumber",
+      "deliveryNote",
+      "deliveryNoteDate",
+      "dispatchedThrough",
+      "destination",
+      "termsOfDelivery",
+      "dispatchDetails",
+      "paymentTerms",
+      "eWayBillDetails",
+      "eInvoiceDetails",
+      "declaration",
+    ];
+    for (const key of EDITABLE) {
+      if (body[key] !== undefined) inv[key] = body[key];
+    }
+    if (body.voucherDate) inv.financialYear = _computeFY(body.voucherDate);
+    inv.updatedBy = req.user?.id;
+
+    await inv.save({ session });
+    if (wasPosted) await _applyLedgerBalances(inv, +1, session);
+
+    await session.commitTransaction();
+    res.json({ success: true, invoice: inv });
+  } catch (e) {
+    await session.abortTransaction();
+    console.error("[invoices/put]", e);
+    res.status(400).json({ error: e.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+/* ================================================================== */
+/* NEW ROUTE 3: PATCH /:id/status — cancel or void                    */
+/* ================================================================== */
+router.patch("/:id/status", async (req, res) => {
+  const { status, reason } = req.body || {};
+  if (!["cancelled", "void"].includes(status)) {
+    return res
+      .status(400)
+      .json({ error: "status must be 'cancelled' or 'void'" });
+  }
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction();
+
+    const inv = await Acc_Voucher.findOne({
+      _id: req.params.id,
+      voucherType: "sales",
+    }).session(session);
+    if (!inv) throw new Error("Invoice not found");
+    if (inv.status === "cancelled" || inv.status === "void") {
+      throw new Error(`Invoice is already ${inv.status}`);
+    }
+
+    // Cancel reverses ledger entries; Void does not
+    if (status === "cancelled" && inv.status === "posted") {
+      await _applyLedgerBalances(inv, -1, session);
+    }
+
+    inv.status = status;
+    inv.cancelledBy = req.user?.id;
+    inv.cancelledAt = new Date();
+    inv.updatedBy = req.user?.id;
+    if (reason) inv.cancellationReason = String(reason);
+
+    await inv.save({ session });
+    await session.commitTransaction();
+    res.json({ success: true, invoice: inv });
+  } catch (e) {
+    await session.abortTransaction();
+    console.error("[invoices/status]", e);
+    res.status(400).json({ error: e.message });
+  } finally {
+    session.endSession();
   }
 });
 

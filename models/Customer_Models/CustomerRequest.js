@@ -122,6 +122,42 @@ const paymentReceiptSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+ 
+    // ── On-behalf payment audit trail ─────────────────────────────────
+    isOnBehalf: {
+      type: Boolean,
+      default: false,
+    },
+    onBehalfCustomerName: {
+      type: String,
+      trim: true,
+    },
+    recordedByName: {
+      type: String,
+      trim: true,
+    },
+    recordedById: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SalesDepartment",
+    },
+    signatoryName: {
+      type: String,
+      trim: true,
+    },
+    signatoryContact: {
+      type: String,
+      trim: true,
+    },
+    authorizationNote: {
+      type: String,
+      trim: true,
+    },
+    digitalSignature: {
+      type: String,   // base64 PNG of drawn signature
+    },
+    recordedAt: {
+      type: Date,
+    },
   },
   { _id: true, timestamps: true },
 );
@@ -257,7 +293,6 @@ const quotationItemSchema = new mongoose.Schema(
   { _id: true },
 );
 
-// ========== PAYMENT SUBMISSION SCHEMA ==========
 const paymentSubmissionSchema = new mongoose.Schema(
   {
     paymentStepNumber: {
@@ -269,12 +304,10 @@ const paymentSubmissionSchema = new mongoose.Schema(
     },
     submittedAmount: {
       type: Number,
-
       min: 0,
     },
     paymentMethod: {
       type: String,
-
       enum: [
         "bank_transfer",
         "upi",
@@ -293,7 +326,7 @@ const paymentSubmissionSchema = new mongoose.Schema(
       trim: true,
     },
     receiptImage: {
-      type: String, // Cloudinary URL
+      type: String,
     },
     additionalNotes: {
       type: String,
@@ -318,6 +351,48 @@ const paymentSubmissionSchema = new mongoose.Schema(
     verificationNotes: {
       type: String,
       trim: true,
+    },
+ 
+    // ── On-behalf & audit trail fields ───────────────────────────────
+    isOnBehalf: {
+      type: Boolean,
+      default: false,
+    },
+    onBehalfCustomerName: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    recordedByName: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    recordedById: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SalesDepartment",
+    },
+    signatoryName: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    signatoryContact: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    authorizationNote: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    digitalSignature: {
+      type: String,
+      default: "",
+    },
+    recordedAt: {
+      type: Date,
     },
   },
   { _id: true, timestamps: true },
@@ -638,6 +713,14 @@ const customerRequestSchema = new mongoose.Schema(
       type: String,
       enum: ["customer_request", "measurement_conversion"],
       default: "customer_request",
+    },
+    isInternalOrder: {
+      type: Boolean,
+      default: false,
+    },
+    internalOrderMarkedAt: {
+      type: Date,
+      default: null,
     },
     measurementId: {
       type: mongoose.Schema.Types.ObjectId,

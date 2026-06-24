@@ -16,6 +16,17 @@ const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem")
 router.use(EmployeeAuthMiddleware);
 
 // ─── GST RULE ─────────────────────────────────────────────────────────────────
+// Convert qty between units using unitConversions [{fromUnit, toUnit, quantity}]
+// where quantity means: 1 fromUnit = quantity toUnit
+function convertBetweenUnits(qty, fromUnit, toUnit, conversions = []) {
+  if (!fromUnit || !toUnit || fromUnit === toUnit || !qty || !conversions.length) return null;
+  const direct = conversions.find(c => c.fromUnit === fromUnit && c.toUnit === toUnit);
+  if (direct?.quantity) return qty * direct.quantity;
+  const inverse = conversions.find(c => c.fromUnit === toUnit && c.toUnit === fromUnit);
+  if (inverse?.quantity) return qty / inverse.quantity;
+  return null;
+}
+
 const getGSTPercentage = (unitPrice) => {
   const price = parseFloat(unitPrice) || 0;
   return price < 2499 ? 5 : 18;
@@ -180,7 +191,8 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         continue;
       }
  
-      const productRawItems = []; // accumulated for this product
+     const productRawItems = []; // accumulated for this product
+      const variantBreakdowns = []; // per-variant detail for expanded frontend view
  
       for (const reqVariant of item.variants || []) {
         const qtyOrdered = reqVariant.quantity || 0;
@@ -188,6 +200,9 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
  
         const matchedVariant = findStockVariant(stockItem, reqVariant);
         if (!matchedVariant || !Array.isArray(matchedVariant.rawItems)) continue;
+
+        const variantLabel = (reqVariant.attributes || []).map(a => a.value).join(" / ") || "Default";
+        const variantRawItemsForBreakdown = [];
  
         for (const ri of matchedVariant.rawItems) {
           const required = (ri.quantity || 0) * qtyOrdered;
@@ -213,6 +228,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
               variantCombination: ri.variantCombination || [],
               unit: ri.unit,
               baseUnit: ri.baseUnit || ri.unit,
+              perPieceQty: ri.quantity || 0,
               quantityRequired: required,
               unitCost: ri.unitCost || 0,
               totalCost: (ri.unitCost || 0) * required,
@@ -237,14 +253,42 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
           const totalEntry = totalsMap.get(key);
           totalEntry.quantityRequired += required;
           totalEntry.totalCost += (ri.unitCost || 0) * required;
+
+          variantRawItemsForBreakdown.push({
+            rawItemId:     rawItemIdStr,
+            variantId:     variantIdStr,
+            rawItemName:   ri.rawItemName,
+            perPieceQty:   ri.quantity || 0,
+            quantityRequired: required,
+            unit:          ri.unit,
+          });
+        }
+
+        if (variantRawItemsForBreakdown.length > 0) {
+          variantBreakdowns.push({
+            variantLabel,
+            quantity: qtyOrdered,
+            rawItems: variantRawItemsForBreakdown,
+          });
         }
       }
  
+      // Pick best available image — variant-first, then product-level
+      const productImage = (() => {
+        if (stockItem?.variants?.length) {
+          const withImg = stockItem.variants.find(v => v.images?.length > 0)
+          if (withImg) return withImg.images[0]
+        }
+        return stockItem?.images?.[0] || null
+      })()
+
       perProduct.push({
         productName: item.mpcDisplayName || item.stockItemName,
         stockItemReference: item.stockItemReference || "",
         totalQuantity: item.totalQuantity || 0,
         rawItems: productRawItems,
+        variantBreakdowns,
+        image: productImage,
       });
     }
  
@@ -280,19 +324,45 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
           }
         }
         if (available === null) {
-          // Fall back to item-level qty
           available = doc.quantity || 0;
           minStock = doc.minStock || 0;
         }
       }
+
+      // Collect unitConversions — must be before shortfall computation
+      let unitConversions = [];
+      if (doc) {
+        let varDoc = null;
+        if (t.variantId && Array.isArray(doc.variants)) {
+          varDoc = doc.variants.find(vv => vv._id?.toString() === t.variantId);
+        }
+        if (!varDoc && Array.isArray(doc.variants) && doc.variants.length > 0) {
+          varDoc = doc.variants[0];
+        }
+        if (varDoc?.unitConversions?.length) {
+          unitConversions = varDoc.unitConversions;
+        } else if (varDoc?.unitConversion?.toUnit) {
+          unitConversions = [varDoc.unitConversion];
+        }
+      }
+
+      // Convert available from raw item's native baseUnit → BOM unit before comparing.
  
-      const shortfall = available !== null ? Math.max(0, t.quantityRequired - available) : null;
- 
+      // Convert available from raw item's native baseUnit → BOM unit before comparing.
+      // e.g. available=148 Pkt, BOM unit=Pcs, conversion 1 Pkt=300 Pcs → 44,400 Pcs available.
+      let availableInBomUnit = available;
+      if (available !== null && t.baseUnit && t.unit && t.baseUnit !== t.unit) {
+        const converted = convertBetweenUnits(available, t.baseUnit, t.unit, unitConversions);
+        if (converted !== null) availableInBomUnit = converted;
+      }
+
+      const shortfall = availableInBomUnit !== null ? Math.max(0, t.quantityRequired - availableInBomUnit) : null;
+
       let status = "unknown";
-      if (available !== null) {
-        if (available <= 0) status = "out_of_stock";
+      if (availableInBomUnit !== null) {
+        if (availableInBomUnit <= 0) status = "out_of_stock";
         else if (shortfall > 0) status = "shortage";
-        else if (available - t.quantityRequired <= minStock) status = "low";
+        else if (availableInBomUnit - t.quantityRequired <= minStock) status = "low";
         else status = "ok";
       }
  
@@ -306,6 +376,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         shortfall,
         minStock,
         status,
+        unitConversions,
       });
     }
  
@@ -387,13 +458,35 @@ router.post("/work-orders/assign-deadlines-batch", async (req, res) => {
   }
 });
 
+router.get("/requests/:requestId/employee-progress", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const progress = await EmployeeProductionProgress.find({
+      manufacturingOrderId: requestId,
+    })
+      .populate({
+        path: "workOrderId",
+        select: "stockItemName stockItemReference workOrderNumber variantAttributes variantId stockItemId",
+        populate: {
+          path: "stockItemId",
+          select: "images variants.images variants._id variants.attributes",
+        },
+      })
+      .lean();
+    res.json({ success: true, progress });
+  } catch (err) {
+    console.error("Employee progress fetch error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/requests/:requestId/work-orders", async (req, res) => {
   try {
     const { requestId } = req.params;
     const workOrders = await WorkOrder.find({ customerRequestId: requestId })
       .populate({
         path: "stockItemId",
-        select: "name reference genderCategory category",
+        select: "name reference genderCategory category images variants.images variants.attributes variants._id",
       })
       .sort({ createdAt: 1 })
       .lean();
@@ -470,6 +563,116 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     request.taxSummary = { totalGST, sgst: totalGST / 2, cgst: totalGST / 2, igst: 0 };
     request.quotationValidUntil = new Date(quotationData.validUntil);
     request.updatedAt = new Date();
+ 
+    // ── Sync request.items + customerInfo when flagged by frontend ───────────
+    if (quotationData._syncRequestItems) {
+      console.log(`[quotationRoutes] _syncRequestItems triggered — ${itemsWithCalculations.length} item(s) in quotation`);
+ 
+      const attrsMatch = (a = [], b = []) => {
+        if (!a || !b) return false;
+        if (a.length !== b.length) return false;
+        return a.every(qa => b.some(va => va.name === qa.name && va.value === qa.value));
+      };
+ 
+      // ── 1. Sync customer info if provided ──────────────────────────────────
+      if (quotationData.customerInfo) {
+        const ci = quotationData.customerInfo;
+        const fields = ["name", "email", "phone", "address", "city", "postalCode",
+                        "deliveryDeadline", "preferredContactMethod", "description"];
+        fields.forEach(f => {
+          if (ci[f] !== undefined && ci[f] !== null) {
+            request.customerInfo[f] = ci[f];
+          }
+        });
+        request.markModified("customerInfo");
+        console.log(`[quotationRoutes] customerInfo synced — name: ${ci.name}`);
+      }
+ 
+      // ── 2. Build set of stockItemIds still in the quotation ────────────────
+      const qItemSids = new Set(
+        itemsWithCalculations.map(qi => (qi.stockItemId?._id || qi.stockItemId)?.toString()).filter(Boolean)
+      );
+ 
+      // ── 3. Remove request items that were deleted from the quotation ────────
+      //       Only remove non-new items (items that existed before this quotation was created)
+      //       Keep items that have no corresponding quotation item and are NOT _isNew
+      const removedItems = [];
+      request.items = request.items.filter(reqItem => {
+        const iSid = (reqItem.stockItemId?._id || reqItem.stockItemId)?.toString();
+        // Keep if still present in quotation
+        if (qItemSids.has(iSid)) return true;
+        // Keep if it was never part of this quotation flow (e.g. measurement items)
+        // Only remove if this quotation explicitly had items and this one was removed
+        removedItems.push(reqItem.stockItemName || iSid);
+        return false;
+      });
+      if (removedItems.length > 0) {
+        console.log(`[quotationRoutes] Items removed from request: ${removedItems.join(", ")}`);
+      }
+ 
+      // ── 4. Sync qty + price for each quotation item ─────────────────────────
+      for (const qItem of itemsWithCalculations) {
+        const qSid = (qItem.stockItemId?._id || qItem.stockItemId)?.toString();
+        const qAttrs = qItem.attributes || [];
+ 
+        // Find matching request item
+        const reqItem = request.items.find(i => {
+          const iSid = (i.stockItemId?._id || i.stockItemId)?.toString();
+          return iSid === qSid;
+        });
+ 
+        if (reqItem) {
+          // Find matching variant by attributes, fall back to first
+          const variant = qAttrs.length > 0
+            ? (reqItem.variants.find(v => attrsMatch(qAttrs, v.attributes || [])) || reqItem.variants[0])
+            : reqItem.variants[0];
+ 
+          if (variant) {
+            const oldQty   = variant.quantity;
+            const oldPrice = variant.estimatedPrice;
+            const newPrice = parseFloat((qItem.priceIncludingGST || 0).toFixed(2));
+ 
+            if (oldQty !== qItem.quantity || oldPrice !== newPrice) {
+              console.log(
+                `[quotationRoutes] Syncing "${reqItem.stockItemName || reqItem.mpcDisplayName}": ` +
+                `qty ${oldQty}→${qItem.quantity}, price ${oldPrice}→${newPrice}`
+              );
+            }
+            variant.quantity       = qItem.quantity;
+            variant.estimatedPrice = newPrice;
+          }
+ 
+          // Recalc item totals
+          reqItem.totalQuantity      = reqItem.variants.reduce((s, v) => s + (v.quantity || 0), 0);
+          reqItem.totalEstimatedPrice = parseFloat(
+            reqItem.variants.reduce((s, v) => s + (v.estimatedPrice || 0), 0).toFixed(2)
+          );
+ 
+        } else if (qItem._isNew) {
+          // New product added via quotation search — push to request.items
+          console.log(`[quotationRoutes] New item added to request: "${qItem.itemName}"`);
+          request.items.push({
+            stockItemId:         qItem.stockItemId,
+            stockItemName:       qItem.description || qItem.itemName || "",
+            stockItemReference:  qItem.itemCode    || "",
+            mpcDisplayName:      qItem.itemName    || "",
+            genderCategory:      qItem.genderCategory || "",
+            variants: [{
+              attributes:          qItem.attributes || [],
+              quantity:            qItem.quantity,
+              estimatedPrice:      parseFloat((qItem.priceIncludingGST || 0).toFixed(2)),
+              specialInstructions: [],
+            }],
+            totalQuantity:       qItem.quantity,
+            totalEstimatedPrice: parseFloat((qItem.priceIncludingGST || 0).toFixed(2)),
+          });
+        }
+      }
+ 
+      request.markModified("items");
+      console.log(`[quotationRoutes] Sync complete — ${request.items.length} item(s) in request`);
+    }
+ 
     await request.save();
 
     res.json({ success: true, message: existingQuotation ? "Quotation updated successfully" : "Quotation created successfully", quotation: currentQuotation, request });
@@ -983,7 +1186,173 @@ router.get("/requests/:requestId/quotation/:quotationId/payment-submissions", as
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SALES APPROVAL — Creates WOs + EmployeeProductionProgress docs
+// SHARED HELPER — WO + EmployeeProductionProgress creation
+// Used by both sales-approve and mark-internal-order
+// ═══════════════════════════════════════════════════════════════════════════════
+async function createWorkOrdersAndProgress(request, userId) {
+  const isMeasurementOrder = !!(request.requestType === "measurement_conversion" || request.measurementId);
+  const orderType = isMeasurementOrder ? "measurement_conversion" : "customer_request";
+
+  let measurement = null;
+  if (isMeasurementOrder && request.measurementId) {
+    measurement = await Measurement.findById(request.measurementId)
+      .select("_id employeeMeasurements")
+      .lean();
+  }
+
+  const createdWorkOrders = [];
+  const skippedVariants = [];
+  const createdProgressDocs = [];
+
+  for (const item of request.items) {
+    const stockItem = await StockItem.findById(item.stockItemId);
+    if (!stockItem) { console.warn(`StockItem not found: ${item.stockItemId}`); continue; }
+
+    for (const variant of item.variants) {
+      let variantData = null;
+      let usedFallback = false;
+
+      if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
+        variantData = stockItem.variants.find(v => v._id.toString() === variant.variantId);
+      }
+      if (!variantData && variant.attributes?.length > 0) {
+        variantData = stockItem.variants.find(v => {
+          if (!v.attributes || v.attributes.length !== variant.attributes.length) return false;
+          return variant.attributes.every(reqAttr => {
+            const stockAttr = v.attributes.find(a => a.name === reqAttr.name);
+            return stockAttr && stockAttr.value === reqAttr.value;
+          });
+        });
+      }
+      if (!variantData && variant.variantId) {
+        variantData = stockItem.variants.find(v => v.sku === variant.variantId);
+      }
+      if (!variantData && stockItem.variants?.length > 0) {
+        variantData = stockItem.variants[0];
+        usedFallback = true;
+        skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, selectedVariant: { id: variantData._id, sku: variantData.sku } });
+      }
+      if (!variantData) {
+        skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, error: "No variants available" });
+        continue;
+      }
+
+      const operations = stockItem.operations.map(op => ({
+        operationType: op.type || op.name || op.operationType,
+        operationCode: op.operationCode || op.code || "",
+        plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
+        status: "pending",
+      }));
+
+      let rawMaterials = [];
+      if (variantData.rawItems?.length > 0) {
+        rawMaterials = variantData.rawItems.map(rawItem => ({
+          rawItemId: rawItem.rawItemId, name: rawItem.rawItemName, sku: rawItem.rawItemSku,
+          rawItemVariantId: rawItem.variantId || null,
+          rawItemVariantCombination: rawItem.variantCombination || [],
+          quantityRequired: rawItem.quantity * variant.quantity,
+          quantityAllocated: 0, quantityIssued: 0,
+          unit: rawItem.unit, unitCost: rawItem.unitCost,
+          totalCost: rawItem.totalCost * variant.quantity,
+          allocationStatus: "not_allocated",
+        }));
+      }
+
+      const variantAttributes = variant.attributes || [];
+      if (variantAttributes.length === 0 && variantData.attributes) variantAttributes.push(...variantData.attributes);
+
+      const workOrder = new WorkOrder({
+        customerRequestId: request._id, stockItemId: item.stockItemId,
+        stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
+        variantId: variantData._id.toString(), variantAttributes,
+        quantity: variant.quantity, customerId: request.customerId,
+        customerName: request.customerInfo.name, priority: request.priority,
+        status: "pending", operations, rawMaterials,
+        timeline: { plannedStartDate: null, plannedEndDate: null, actualStartDate: null, actualEndDate: null, scheduledStartDate: null, scheduledEndDate: null },
+        specialInstructions: variant.specialInstructions || [],
+        estimatedCost: rawMaterials.reduce((total, rm) => total + (rm.totalCost || 0), 0),
+        actualCost: 0, createdBy: userId,
+      });
+      await workOrder.save();
+
+      createdWorkOrders.push({
+        _id: workOrder._id, workOrderNumber: workOrder.workOrderNumber,
+        stockItemName: workOrder.stockItemName, stockItemId: item.stockItemId,
+        variantId: variantData._id.toString(),
+        quantity: workOrder.quantity, rawMaterialCount: workOrder.rawMaterials.length,
+        autoSelectedVariant: usedFallback,
+      });
+
+      if (isMeasurementOrder && measurement) {
+        const stockIdStr = item.stockItemId.toString();
+        const woVariantIdStr = variantData._id.toString();
+        const employeeEntries = [];
+
+        for (const empM of measurement.employeeMeasurements || []) {
+          const productEntry = (empM.products || []).find(p => {
+            const pIdMatch = p.productId?.toString() === stockIdStr;
+            if (!pIdMatch) {
+              if (p.productId) return false;
+              if (p.productName !== item.stockItemName) return false;
+              if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
+              return true;
+            }
+            if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
+            if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
+            return true;
+          });
+          if (!productEntry) continue;
+          employeeEntries.push({
+            employeeId: empM.employeeId, employeeName: empM.employeeName,
+            employeeUIN: empM.employeeUIN, gender: empM.gender,
+            quantity: productEntry.quantity || variant.quantity,
+          });
+        }
+
+        if (employeeEntries.length > 0) {
+          const woNumber = workOrder.workOrderNumber;
+          let unitCursor = 1;
+          for (const emp of employeeEntries) {
+            const unitStart = unitCursor;
+            const unitEnd = unitCursor + emp.quantity - 1;
+            const assignedBarcodeIds = [];
+            for (let u = unitStart; u <= unitEnd; u++) {
+              assignedBarcodeIds.push(`${woNumber}-${u.toString().padStart(3, "0")}`);
+            }
+            try {
+              await EmployeeProductionProgress.findOneAndUpdate(
+                { workOrderId: workOrder._id, employeeId: emp.employeeId },
+                {
+                  $set: {
+                    measurementId: measurement._id, manufacturingOrderId: request._id,
+                    orderType, employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
+                    gender: emp.gender, unitStart, unitEnd, totalUnits: emp.quantity,
+                    assignedBarcodeIds, completedUnits: 0, completedUnitNumbers: [],
+                    completionPercentage: 0, lastSyncedAt: new Date(),
+                  },
+                },
+                { upsert: true, new: true }
+              );
+              createdProgressDocs.push({
+                employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
+                productName: workOrder.stockItemName, unitStart, unitEnd,
+                totalUnits: emp.quantity, barcodeCount: assignedBarcodeIds.length,
+              });
+            } catch (progressErr) {
+              console.error(`[createWorkOrdersAndProgress] Progress error for ${emp.employeeName}:`, progressErr.message);
+            }
+            unitCursor = unitEnd + 1;
+          }
+        }
+      }
+    }
+  }
+
+  return { createdWorkOrders, skippedVariants, createdProgressDocs };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SALES APPROVAL — now delegates WO creation to shared helper
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => {
   try {
@@ -995,186 +1364,17 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });
 
     const quotation = request.quotations[0];
-    if (quotation.status !== 'customer_approved') return res.status(400).json({ success: false, message: "Quotation is not approved by customer" });
+    if (quotation.status !== "customer_approved") return res.status(400).json({ success: false, message: "Quotation is not approved by customer" });
 
-    quotation.status = 'sales_approved';
-    quotation.salesApproval = { approved: true, approvedAt: new Date(), approvedBy: req.user.id, notes: notes || '' };
+    quotation.status = "sales_approved";
+    quotation.salesApproval = { approved: true, approvedAt: new Date(), approvedBy: req.user.id, notes: notes || "" };
     quotation.updatedAt = new Date();
-    request.status = 'quotation_sales_approved';
+    request.status = "quotation_sales_approved";
     request.finalOrderPrice = quotation.grandTotal;
     request.updatedAt = new Date();
-    request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== 'sales_approval_required');
+    request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== "sales_approval_required");
 
-    const isMeasurementOrder = !!(request.requestType === 'measurement_conversion' || request.measurementId);
-    const orderType = isMeasurementOrder ? 'measurement_conversion' : 'customer_request';
-
-    let measurement = null;
-    if (isMeasurementOrder && request.measurementId) {
-      measurement = await Measurement.findById(request.measurementId)
-        .select('_id employeeMeasurements')
-        .lean();
-    }
-
-    const createdWorkOrders = [];
-    const skippedVariants = [];
-    const createdProgressDocs = [];
-
-    for (const item of request.items) {
-      const stockItem = await StockItem.findById(item.stockItemId);
-      if (!stockItem) { console.warn(`StockItem not found: ${item.stockItemId}`); continue; }
-
-      for (const variant of item.variants) {
-        let variantData = null;
-        let usedFallback = false;
-
-        if (variant.variantId && mongoose.Types.ObjectId.isValid(variant.variantId)) {
-          variantData = stockItem.variants.find(v => v._id.toString() === variant.variantId);
-        }
-        if (!variantData && variant.attributes?.length > 0) {
-          variantData = stockItem.variants.find(v => {
-            if (!v.attributes || v.attributes.length !== variant.attributes.length) return false;
-            return variant.attributes.every(reqAttr => {
-              const stockAttr = v.attributes.find(a => a.name === reqAttr.name);
-              return stockAttr && stockAttr.value === reqAttr.value;
-            });
-          });
-        }
-        if (!variantData && variant.variantId) {
-          variantData = stockItem.variants.find(v => v.sku === variant.variantId);
-        }
-        if (!variantData && stockItem.variants?.length > 0) {
-          variantData = stockItem.variants[0];
-          usedFallback = true;
-          skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, selectedVariant: { id: variantData._id, sku: variantData.sku } });
-        }
-        if (!variantData) {
-          skippedVariants.push({ productName: stockItem.name, originalVariantId: variant.variantId, error: "No variants available" });
-          continue;
-        }
-
-        const operations = stockItem.operations.map(op => ({
-          operationType: op.type || op.name || op.operationType,
-          operationCode: op.operationCode || op.code || "",
-          plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
-          status: "pending",
-        }));
-
-        let rawMaterials = [];
-        if (variantData.rawItems?.length > 0) {
-          rawMaterials = variantData.rawItems.map(rawItem => ({
-            rawItemId: rawItem.rawItemId, name: rawItem.rawItemName, sku: rawItem.rawItemSku,
-            rawItemVariantId: rawItem.variantId || null,
-            rawItemVariantCombination: rawItem.variantCombination || [],
-            quantityRequired: rawItem.quantity * variant.quantity,
-            quantityAllocated: 0, quantityIssued: 0,
-            unit: rawItem.unit, unitCost: rawItem.unitCost,
-            totalCost: rawItem.totalCost * variant.quantity,
-            allocationStatus: "not_allocated"
-          }));
-        }
-
-        const variantAttributes = variant.attributes || [];
-        if (variantAttributes.length === 0 && variantData.attributes) variantAttributes.push(...variantData.attributes);
-
-        const workOrder = new WorkOrder({
-          customerRequestId: request._id, stockItemId: item.stockItemId,
-          stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
-          variantId: variantData._id.toString(), variantAttributes,
-          quantity: variant.quantity, customerId: request.customerId,
-          customerName: request.customerInfo.name, priority: request.priority,
-          status: "pending", operations, rawMaterials,
-          timeline: { plannedStartDate: null, plannedEndDate: null, actualStartDate: null, actualEndDate: null, scheduledStartDate: null, scheduledEndDate: null },
-          specialInstructions: variant.specialInstructions || [],
-          estimatedCost: rawMaterials.reduce((total, rm) => total + (rm.totalCost || 0), 0),
-          actualCost: 0, createdBy: req.user.id
-        });
-        await workOrder.save();
-
-        createdWorkOrders.push({
-          _id: workOrder._id, workOrderNumber: workOrder.workOrderNumber,
-          stockItemName: workOrder.stockItemName, stockItemId: item.stockItemId,
-          variantId: variantData._id.toString(),
-          quantity: workOrder.quantity, rawMaterialCount: workOrder.rawMaterials.length,
-          autoSelectedVariant: usedFallback
-        });
-
-        if (isMeasurementOrder && measurement) {
-          const stockIdStr = item.stockItemId.toString();
-          const woVariantIdStr = variantData._id.toString();
-
-          const employeeEntries = [];
-          for (const empM of measurement.employeeMeasurements || []) {
-            const productEntry = (empM.products || []).find((p) => {
-              const pIdMatch = p.productId?.toString() === stockIdStr;
-              if (!pIdMatch) {
-                if (p.productId) return false;
-                if (p.productName !== item.stockItemName) return false;
-                if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
-                return true;
-              }
-              if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
-              if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
-              return true;
-            });
-            if (!productEntry) continue;
-            employeeEntries.push({
-              employeeId: empM.employeeId,
-              employeeName: empM.employeeName,
-              employeeUIN: empM.employeeUIN,
-              gender: empM.gender,
-              quantity: productEntry.quantity || variant.quantity,
-            });
-          }
-
-          if (employeeEntries.length > 0) {
-            const woNumber = workOrder.workOrderNumber;
-            let unitCursor = 1;
-            for (const emp of employeeEntries) {
-              const unitStart = unitCursor;
-              const unitEnd = unitCursor + emp.quantity - 1;
-
-              const assignedBarcodeIds = [];
-              for (let u = unitStart; u <= unitEnd; u++) {
-                assignedBarcodeIds.push(`${woNumber}-${u.toString().padStart(3, '0')}`);
-              }
-
-              try {
-                await EmployeeProductionProgress.findOneAndUpdate(
-                  { workOrderId: workOrder._id, employeeId: emp.employeeId },
-                  {
-                    $set: {
-                      measurementId: measurement._id,
-                      manufacturingOrderId: request._id,
-                      orderType,
-                      employeeName: emp.employeeName,
-                      employeeUIN: emp.employeeUIN,
-                      gender: emp.gender,
-                      unitStart, unitEnd,
-                      totalUnits: emp.quantity,
-                      assignedBarcodeIds,
-                      completedUnits: 0,
-                      completedUnitNumbers: [],
-                      completionPercentage: 0,
-                      lastSyncedAt: new Date(),
-                    },
-                  },
-                  { upsert: true, new: true }
-                );
-                createdProgressDocs.push({
-                  employeeName: emp.employeeName, employeeUIN: emp.employeeUIN,
-                  productName: workOrder.stockItemName,
-                  unitStart, unitEnd, totalUnits: emp.quantity,
-                  barcodeCount: assignedBarcodeIds.length,
-                });
-              } catch (progressErr) {
-                console.error(`[sales-approve] Progress doc error for ${emp.employeeName}:`, progressErr.message);
-              }
-              unitCursor = unitEnd + 1;
-            }
-          }
-        }
-      }
-    }
+    const { createdWorkOrders, skippedVariants, createdProgressDocs } = await createWorkOrdersAndProgress(request, req.user.id);
 
     await request.save();
 
@@ -1182,6 +1382,12 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
       ? `Quotation approved and ${createdWorkOrders.length} work order(s) created`
       : "Quotation approved but no work orders were created";
     if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
+
+    try {
+      await CustomerEmailService.sendSalesApprovalEmail(request, quotation);
+    } catch (emailErr) {
+      console.error("[sales-approve] Approval notification email failed:", emailErr.message);
+    }
 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
@@ -1191,6 +1397,64 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
   } catch (error) {
     console.error("Error processing sales approval:", error);
     res.status(500).json({ success: false, message: "Server error while processing approval" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERNAL / COMPANY ORDER — bypass PI, go directly to production
+// ═══════════════════════════════════════════════════════════════════════════════
+router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (request.status !== "pending") return res.status(400).json({ success: false, message: "Only pending requests can be marked as internal orders" });
+
+    // Mark as internal
+    request.isInternalOrder = true;
+    request.internalOrderMarkedAt = new Date();
+
+    // Minimal pre-approved quotation — no monetary value
+    request.quotations = [{
+      date: new Date(),
+      validUntil: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      items: [],
+      subtotalBeforeGST: 0, totalDiscount: 0, totalGST: 0, shippingCharges: 0, grandTotal: 0,
+      status: "sales_approved",
+      notes: "Internal / Company Order — no PI or payment required.",
+      customerApproval: { approved: true, approvedAt: new Date() },
+      salesApproval: { approved: true, approvedAt: new Date(), approvedBy: req.user.id },
+    }];
+
+    request.status = "quotation_sales_approved";
+    request.finalOrderPrice = 0;
+    if (!request.salesPersonAssigned) request.salesPersonAssigned = req.user.id;
+
+    // Run the exact same WO + employee progress creation as a normal sales-approve
+    const { createdWorkOrders, skippedVariants, createdProgressDocs } = await createWorkOrdersAndProgress(request, req.user.id);
+
+    request.notes = request.notes || [];
+    request.notes.push({
+      text: `Marked as Internal Order (no PI required). ${createdWorkOrders.length} work order(s) created directly for production.`,
+      addedBy: req.user.id,
+      addedByModel: "SalesDepartment",
+      createdAt: new Date(),
+    });
+    request.updatedAt = new Date();
+    await request.save();
+
+    let msg = `Internal Order approved. ${createdWorkOrders.length} work order(s) sent to production`;
+    if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
+
+    res.json({
+      success: true, message: msg, request, createdWorkOrders,
+      skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
+      employeeTrackingCreated: createdProgressDocs.length,
+    });
+  } catch (error) {
+    console.error("Error marking internal order:", error);
+    res.status(500).json({ success: false, message: "Server error while marking internal order" });
   }
 });
 
@@ -1748,6 +2012,253 @@ router.delete("/requests/:requestId", async (req, res) => {
   }
 });
 
+
+router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { approvalNotes, customerInfoOverride, payment } = req.body;
+ 
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+ 
+    if (request.quotations.length === 0)
+      return res.status(400).json({ success: false, message: "No quotation found for this request" });
+ 
+    const quotation = request.quotations[0];
+ 
+    // Allow on-behalf approval only when the quotation is sent_to_customer
+    if (!["sent_to_customer", "draft"].includes(quotation.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot approve on behalf — quotation is already '${quotation.status}'`,
+      });
+    }
+ 
+    // 1. Mark customer approval
+    quotation.customerApproval = {
+      approved:   true,
+      approvedAt: new Date(),
+      approvedBy: null, // no customer ObjectId since sales is acting on behalf
+      notes:      approvalNotes
+        ? `[On Behalf by Sales] ${approvalNotes}`
+        : `Approved on behalf of customer by ${req.user?.name || "Sales Team"}`,
+    };
+    quotation.status     = "customer_approved";
+    quotation.updatedAt  = new Date();
+ 
+    // 2. Update request status
+    request.status       = "quotation_customer_approved";
+ 
+    // 3. Update customer info if overrides provided
+    if (customerInfoOverride) {
+      if (customerInfoOverride.address)
+        request.customerInfo.address = customerInfoOverride.address;
+      if (customerInfoOverride.city)
+        request.customerInfo.city = customerInfoOverride.city;
+      if (customerInfoOverride.postalCode)
+        request.customerInfo.postalCode = customerInfoOverride.postalCode;
+      if (customerInfoOverride.deliveryDeadline)
+        request.customerInfo.deliveryDeadline = new Date(customerInfoOverride.deliveryDeadline);
+      if (customerInfoOverride.preferredContactMethod)
+        request.customerInfo.preferredContactMethod = customerInfoOverride.preferredContactMethod;
+      if (customerInfoOverride.description !== undefined)
+        request.customerInfo.description = customerInfoOverride.description;
+    }
+ 
+    // 4. Record payment submission
+    let paymentUpdated = false;
+    if (payment && payment.submittedAmount > 0) {
+      const submission = {
+        paymentStepNumber: payment.paymentStepNumber || 1,
+        submissionDate:    new Date(),
+        submittedAmount:   Number(payment.submittedAmount),
+        paymentMethod:     payment.paymentMethod,
+        transactionId:     payment.transactionId || "",
+        utrNumber:         payment.utrNumber || "",
+        receiptImage:      payment.receiptImage || "",
+        additionalNotes:   payment.additionalNotes || "",
+        submittedBy:       null,
+        status:            "verified",
+        verifiedBy:        req.user?.id,
+        verifiedAt:        new Date(),
+        verificationNotes: `Recorded on behalf of customer by ${req.user?.name || "Sales Team"}`,
+        // ── On-behalf audit trail ───────────────────────────────────────
+        isOnBehalf:            true,
+        onBehalfCustomerName:  request.customerInfo?.name || "",
+        recordedByName:        req.user?.name || "Sales Team",
+        recordedById:          req.user?.id || null,
+        signatoryName:         payment.signatoryName  || "",
+        signatoryContact:      payment.signatoryContact || "",
+        authorizationNote:     payment.authorizationNote || "",
+        digitalSignature:      payment.digitalSignature  || "",
+        recordedAt:            payment.recordedAt ? new Date(payment.recordedAt) : new Date(),
+      };
+ 
+      quotation.paymentSubmissions = quotation.paymentSubmissions || [];
+      quotation.paymentSubmissions.push(submission);
+ 
+      // Update the payment schedule step status
+      const step = quotation.paymentSchedule.find(
+        (p) => p.stepNumber === submission.paymentStepNumber
+      );
+      if (step) {
+        step.paidAmount = (step.paidAmount || 0) + submission.submittedAmount;
+        step.paidDate   = new Date();
+        if (step.paidAmount >= step.amount) step.status = "paid";
+        else step.status = "partially_paid";
+        step.paymentMethod = payment.paymentMethod;
+      }
+ 
+      // Update top-level payment tracking
+      request.totalPaidAmount  = (request.totalPaidAmount || 0) + submission.submittedAmount;
+      request.lastPaymentDate  = new Date();
+ 
+      paymentUpdated = true;
+    }
+ 
+    // 5. Add note
+    request.notes = request.notes || [];
+    request.notes.push({
+      text:       `Quotation approved on behalf of customer by ${req.user?.name || "Sales Team"}.${paymentUpdated ? ` Advance payment of ₹${payment.submittedAmount} recorded (${payment.paymentMethod}).` : ""}`,
+      addedBy:    req.user?.id,
+      addedByModel: "SalesDepartment",
+      createdAt:  new Date(),
+    });
+ 
+    request.updatedAt = new Date();
+    await request.save();
+ 
+    // Notify customer about the payment recorded on their behalf
+    if (paymentUpdated) {
+      try {
+        const lastSubmission = quotation.paymentSubmissions[quotation.paymentSubmissions.length - 1];
+        await CustomerEmailService.sendPaymentRecordedEmail(request, quotation, lastSubmission, true);
+      } catch (emailErr) {
+        console.error("[approve-on-behalf] Payment notification email failed:", emailErr.message);
+      }
+    }
+ 
+    res.json({
+      success: true,
+      message: `Quotation approved on behalf of customer.${paymentUpdated ? " Advance payment recorded." : ""}`,
+      request,
+    });
+  } catch (error) {
+    console.error("Error in approve-on-behalf:", error);
+    res.status(500).json({ success: false, message: "Server error while processing on-behalf approval" });
+  }
+});
+ 
+ 
+// ═══════════════════════════════════════════════════════════════════════════════
+// RECORD A PAYMENT STEP (sales-side manual recording)
+//
+// POST /api/cms/sales/requests/:requestId/record-payment
+//
+// Body:
+//   {
+//     paymentStepNumber: number,
+//     submittedAmount:   number,
+//     paymentMethod:     string,
+//     transactionId:     string,
+//     utrNumber:         string,
+//     receiptImage:      string,
+//     additionalNotes:   string,
+//   }
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post("/requests/:requestId/record-payment", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const {
+      paymentStepNumber, submittedAmount, paymentMethod,
+      transactionId, utrNumber, receiptImage, additionalNotes,
+      signatoryName, signatoryContact, authorizationNote,
+      digitalSignature, recordedAt,
+    } = req.body;
+ 
+    if (!submittedAmount || submittedAmount <= 0)
+      return res.status(400).json({ success: false, message: "Amount must be greater than zero" });
+    if (!paymentMethod)
+      return res.status(400).json({ success: false, message: "Payment method is required" });
+ 
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+ 
+    if (request.quotations.length === 0)
+      return res.status(400).json({ success: false, message: "No quotation found for this request" });
+ 
+    const quotation = request.quotations[0];
+ 
+    const submission = {
+      paymentStepNumber: paymentStepNumber || 1,
+      submissionDate:    new Date(),
+      submittedAmount:   Number(submittedAmount),
+      paymentMethod,
+      transactionId:     transactionId || "",
+      utrNumber:         utrNumber || "",
+      receiptImage:      receiptImage || "",
+      additionalNotes:   additionalNotes || "",
+      submittedBy:       null,
+      status:            "verified",
+      verifiedBy:        req.user?.id,
+      verifiedAt:        new Date(),
+      verificationNotes: `Recorded by sales: ${req.user?.name || "Sales Team"}`,
+      // ── Audit trail ──────────────────────────────────────────────────
+      isOnBehalf:            false,
+      onBehalfCustomerName:  request.customerInfo?.name || "",
+      recordedByName:        req.user?.name || "Sales Team",
+      recordedById:          req.user?.id || null,
+      signatoryName:         signatoryName  || "",
+      signatoryContact:      signatoryContact || "",
+      authorizationNote:     authorizationNote || "",
+      digitalSignature:      digitalSignature  || "",
+      recordedAt:            recordedAt ? new Date(recordedAt) : new Date(),
+    };
+ 
+    quotation.paymentSubmissions = quotation.paymentSubmissions || [];
+    quotation.paymentSubmissions.push(submission);
+ 
+    // Update schedule step
+    const step = quotation.paymentSchedule.find(
+      (p) => p.stepNumber === submission.paymentStepNumber
+    );
+    if (step) {
+      step.paidAmount    = (step.paidAmount || 0) + submission.submittedAmount;
+      step.paidDate      = new Date();
+      step.paymentMethod = paymentMethod;
+      if (step.paidAmount >= step.amount) step.status = "paid";
+      else if (step.paidAmount > 0) step.status = "partially_paid";
+    }
+ 
+    // Top-level totals
+    request.totalPaidAmount = (request.totalPaidAmount || 0) + submission.submittedAmount;
+    request.lastPaymentDate = new Date();
+ 
+    request.notes = request.notes || [];
+    request.notes.push({
+      text:         `Payment of ₹${submittedAmount} recorded for Step ${paymentStepNumber} by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
+      addedBy:      req.user?.id,
+      addedByModel: "SalesDepartment",
+      createdAt:    new Date(),
+    });
+ 
+    request.updatedAt = new Date();
+    await request.save();
+ 
+    // Notify customer about the payment recorded
+    try {
+      const lastSubmission = quotation.paymentSubmissions[quotation.paymentSubmissions.length - 1];
+      await CustomerEmailService.sendPaymentRecordedEmail(request, quotation, lastSubmission, false);
+    } catch (emailErr) {
+      console.error("[record-payment] Payment notification email failed:", emailErr.message);
+    }
+ 
+    res.json({ success: true, message: "Payment recorded successfully", request });
+  } catch (error) {
+    console.error("Error in record-payment:", error);
+    res.status(500).json({ success: false, message: "Server error while recording payment" });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET /requests/:requestId/po-breakdown

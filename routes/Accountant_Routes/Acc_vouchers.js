@@ -54,6 +54,90 @@ function computeFY(dateInput) {
 }
 
 /**
+ * Resolve a ledger by NAME, auto-creating it if it doesn't exist yet.
+ * Used by both create and edit so a Dr/Cr line that arrives with only a
+ * ledgerName (e.g. "Round Off") still posts against a real ledger instead
+ * of being silently dropped. Module-scoped so the create AND update routes
+ * share one implementation.
+ */
+async function resolveOrCreateByName(name, companyId) {
+  const clean = String(name || "").trim();
+  if (!clean) return null;
+  let led = await Acc_Ledger.findOne({
+    companyId,
+    name: new RegExp(`^${clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+  });
+  if (led) return led;
+  // Find a sensible parent group; fall back to any expense-nature group.
+  let grp =
+    (await Acc_Group.findOne({ companyId, name: /indirect expense/i })) ||
+    (await Acc_Group.findOne({ companyId, nature: "expense" })) ||
+    (await Acc_Group.findOne({ companyId }));
+  if (!grp) return null;
+  led = await Acc_Ledger.create({
+    companyId,
+    name: clean,
+    groupId: grp._id,
+    groupName: grp.name,
+    openingBalance: 0,
+    openingBalanceType: "Dr",
+    sourceSystem: "auto_from_voucher",
+  });
+  return led;
+}
+
+/**
+ * Canonicalise a voucher's ledgerEntries in place: accept legacy `ledger`
+ * or current `ledgerId`, fill `ledgerName`, auto-create name-only ledgers,
+ * and strip transient client-only fields. Shared by create + update.
+ */
+async function resolveLedgerEntries(entries, companyId) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    const ledId = entry.ledgerId || entry.ledger;
+    if (ledId) {
+      entry.ledgerId = ledId;
+      if (!entry.ledgerName) {
+        const led = await Acc_Ledger.findById(ledId).select("name");
+        if (led) entry.ledgerName = led.name;
+      }
+    } else if (entry.ledgerName) {
+      const led = await resolveOrCreateByName(entry.ledgerName, companyId);
+      if (led) {
+        entry.ledgerId = led._id;
+        entry.ledgerName = led.name;
+      }
+    }
+    delete entry.ledger;
+    delete entry.autoLedger;
+  }
+}
+
+/**
+ * Is this voucher number already taken by a LIVE (non-cancelled/void)
+ * voucher for this company+type? Cancelled/void numbers are free to reuse.
+ * `excludeId` skips a specific voucher (used on edit so a voucher doesn't
+ * clash with itself).
+ */
+async function liveNumberClash(
+  companyId,
+  voucherType,
+  voucherNumber,
+  excludeId,
+) {
+  if (!voucherNumber) return false;
+  const filter = {
+    companyId,
+    voucherType,
+    voucherNumber,
+    status: { $nin: ["cancelled", "void"] },
+  };
+  if (excludeId) filter._id = { $ne: excludeId };
+  const hit = await Acc_Voucher.findOne(filter).select("_id").lean();
+  return !!hit;
+}
+
+/**
  * Apply ledger balance updates from a voucher's ledger entries.
  * direction = +1 for posting, -1 for cancelling/voiding.
  *
@@ -94,56 +178,9 @@ async function applyLedgerBalances(voucher, direction = 1, session = null) {
 /* Returns every ledger whose group descends from the reserved
  * "Bank Accounts" or "Cash-in-Hand" Tally groups. Used by the
  * Contra Voucher form to populate its From/To dropdowns.
- *
- * Handles arbitrarily-deep user-created sub-groups: if the user nested
- * "HDFC Current A/c" under Bank Accounts → that ledger is included.
- *
- * Returns:
- *   {
- *     ledgers: [...],      // sorted by groupName, then ledger name
- *     _diagnostic: {       // surfaces WHY the result is empty if it is
- *       rootGroupsFound,   // the reserved groups that matched
- *       descendantGroupCount,
- *       ledgerCount,
- *     }
- *   }
  */
-// ─────────────────────────────────────────────────────────────────────────
-// GET /stock-items — list stock items for the form pickers
-// ─────────────────────────────────────────────────────────────────────────
-// Pulls from TWO collections and merges:
-//
-//   1. CMS `StockItem` (models/CMS_Models/Inventory/Products/StockItem.js)
-//      — the real product catalog the user manages in their inventory UI.
-//      Not scoped by companyId (CMS catalog is org-wide).
-//
-//   2. Accounting `Acc_StockItem` — items created via Tally import or
-//      the accountant module itself. Scoped by companyId.
-//
-// Merge convention: CMS items take priority when names collide. The
-// "source" field on the response tells the form where the row came from
-// (useful for the picker's tertiary text).
-//
-// Field mapping for CMS StockItem → picker shape:
-//   name → name
-//   hsnCode → hsnCode
-//   unit (default unit string) → baseUnit
-//   baseSalesPrice → standardSellingPrice
-//   baseCost → standardCost
-//   salesTax (string like "18%" or "GST 18") → taxRate (parsed)
-//   additionalNames → aliases (used for fuzzy search)
-//   totalQuantityOnHand → closingQuantity
-//
-// Query params:
-//   companyId — required (only filters Acc_StockItem; CMS items returned anyway)
-//   q         — optional substring search on name / aliases / HSN
-//   limit     — default 500 per source
-// ─────────────────────────────────────────────────────────────────────────
 
 // Parse "salesTax" strings ("18%", "GST 18%", "18", "0") into a number.
-// Returns 0 if unparseable — the form's GST-rate dropdown will let the
-// user fix it. This keeps the picker resilient to whatever the CMS
-// inventory UI puts in that field.
 function parseTaxRate(raw) {
   if (raw === null || raw === undefined || raw === "") return 0;
   if (typeof raw === "number") return raw;
@@ -151,10 +188,8 @@ function parseTaxRate(raw) {
   return m ? parseFloat(m[1]) : 0;
 }
 
-// Lazy-require the CMS StockItem model. Doing this inside the handler
-// keeps tallyVouchers.js loadable even on deployments that don't have
-// the CMS inventory module installed yet. If require fails, we just
-// skip the CMS source and fall back to Acc_StockItem only.
+// Lazy-require the CMS StockItem model so this file loads even where the
+// CMS inventory module isn't installed.
 function loadCMSStockItem() {
   try {
     return require("../../models/CMS_Models/Inventory/Products/StockItem");
@@ -208,7 +243,6 @@ router.get("/stock-items", auth, async (req, res) => {
         closingQuantity: s.totalQuantityOnHand || 0,
         gstApplicable: !!s.salesTax,
         source: "cms",
-        // Extras the picker UI can show as tertiary text
         reference: s.reference,
         category: s.category,
       }));
@@ -252,10 +286,6 @@ router.get("/cash-bank-ledgers", auth, async (req, res) => {
         .json({ success: false, message: "companyId required" });
     }
 
-    // 1) Find the canonical reserved groups for cash and bank. Match by
-    //    name case-insensitively to survive minor variants. Both the
-    //    seeded chart and Tally XML imports use these exact names, so
-    //    a strict regex with anchors is safe.
     const RESERVED_NAMES = [/^bank\s*accounts$/i, /^cash[-\s]?in[-\s]?hand$/i];
     const rootGroups = await Acc_Group.find({
       companyId,
@@ -276,9 +306,6 @@ router.get("/cash-bank-ledgers", auth, async (req, res) => {
       });
     }
 
-    // 2) Walk down to find every descendant group (sub-groups,
-    //    sub-sub-groups, etc.) under those roots. BFS — start with the
-    //    roots themselves and expand outward.
     const targetGroupIds = new Set(rootGroups.map((g) => String(g._id)));
     let frontier = rootGroups.map((g) => g._id);
     let safetyCounter = 0;
@@ -302,7 +329,6 @@ router.get("/cash-bank-ledgers", auth, async (req, res) => {
       frontier = newFrontier;
     }
 
-    // 3) Find all active ledgers under those groups
     const ledgers = await Acc_Ledger.find({
       companyId,
       isActive: true,
@@ -380,8 +406,6 @@ router.get("/", auth, async (req, res) => {
       Acc_Voucher.countDocuments(filter),
     ]);
 
-    // For vouchers without a party name (common in Tally-imported payments),
-    // derive a display name from the first Dr ledger entry.
     for (const v of items) {
       if (!v.partyLedgerName && (!v.partyLedgerId || !v.partyLedgerId.name)) {
         const firstDr = (v.ledgerEntries || []).find(
@@ -407,22 +431,9 @@ router.get("/", auth, async (req, res) => {
 
 /* ------------------------------------------------------------------ */
 /* Credit / Debit Note helpers + routes                                */
+/* MUST be declared BEFORE router.get("/:id")                          */
 /* ------------------------------------------------------------------ */
-/* MUST be declared BEFORE router.get("/:id") below — Express matches
- * routes in declaration order, and any single-segment GET would
- * otherwise be intercepted by /:id and trigger an ObjectId cast error.
- */
 
-/**
- * Resolve (or auto-create) the "Sales Returns" ledger under "Sales
- * Accounts". This is the standard Tally convention for the debit leg of
- * a credit note — keeping it separate from "Sales" lets the P&L show
- * Gross Sales vs Net Sales cleanly.
- *
- * Idempotent: if the ledger already exists for this company, returns it.
- * If not, creates a fresh one and returns the new doc. Either way the
- * caller can rely on the returned ledger being ready to use.
- */
 async function resolveSalesReturnsLedger(companyId) {
   const existing = await Acc_Ledger.findOne({
     companyId,
@@ -431,8 +442,6 @@ async function resolveSalesReturnsLedger(companyId) {
   });
   if (existing) return existing;
 
-  // Find Sales Accounts group to nest under. If it doesn't exist (e.g.
-  // user wiped the seed), fall back to ANY revenue-nature group.
   let group = await Acc_Group.findOne({
     companyId,
     isActive: true,
@@ -460,7 +469,7 @@ async function resolveSalesReturnsLedger(companyId) {
     openingBalance: 0,
     currentBalance: 0,
     balanceType: "Cr",
-    isReserved: false, // user can rename/delete if they have their own
+    isReserved: false,
     isActive: true,
     description:
       "Auto-created on first credit note. Contra to Sales — shown as deduction from Gross Sales on the P&L.",
@@ -502,7 +511,6 @@ router.get("/invoice-lookup", auth, async (req, res) => {
       return res.json({ invoices: [] });
     }
 
-    // For each invoice, sum any prior CN amounts that link back to it
     const invoiceIds = invoices.map((i) => i._id);
     const priorCNs = await Acc_Voucher.aggregate([
       {
@@ -625,23 +633,9 @@ router.get("/gst-output-ledgers", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* GET /sales-ledgers — resolve / auto-create Sales — Local + Interstate */
+/* GET /sales-ledgers — Sales — Local + Interstate                     */
 /* ------------------------------------------------------------------ */
-/* Returns the two sales ledgers the Sales Voucher form needs:
- *   • Sales — Local       (used when CGST+SGST applies)
- *   • Sales — Interstate  (used when IGST applies)
- *
- * If either is missing, auto-creates them under the "Sales Accounts"
- * group. Same idempotent pattern as resolveSalesReturnsLedger.
- *
- * Why two ledgers? Indian tax filing convention: GSTR-1 reports
- * intra-state and inter-state sales separately, and most accountants
- * want the running totals split on the P&L.
- */
-async function resolveSalesLedger(
-  companyId,
-  kind /* "local" | "interstate" */,
-) {
+async function resolveSalesLedger(companyId, kind) {
   const name = kind === "interstate" ? "Sales — Interstate" : "Sales — Local";
   const nameRx =
     kind === "interstate"
@@ -706,21 +700,9 @@ router.get("/sales-ledgers", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* GET /purchase-ledgers — Purchase — Local + Interstate (AP mirror)   */
+/* GET /purchase-ledgers — Purchase — Local + Interstate               */
 /* ------------------------------------------------------------------ */
-/* Mirror of resolveSalesLedger but for the AP side. Returns the two
- * purchase ledgers the Purchase Voucher form needs:
- *   • Purchase — Local       (used when CGST+SGST applies)
- *   • Purchase — Interstate  (used when IGST applies)
- *
- * Auto-creates them under "Purchase Accounts" group if missing.
- * Same split rationale as sales: GSTR-2/3B treats local vs interstate
- * differently, and accountants want the P&L COGS line split for review.
- */
-async function resolvePurchaseLedger(
-  companyId,
-  kind /* "local" | "interstate" */,
-) {
+async function resolvePurchaseLedger(companyId, kind) {
   const name =
     kind === "interstate" ? "Purchase — Interstate" : "Purchase — Local";
   const nameRx =
@@ -735,11 +717,6 @@ async function resolvePurchaseLedger(
   });
   if (existing) return existing;
 
-  // Resolve the purchase group. We try the standard name first, then
-  // fall back to any group with nature "expense" since Purchase Accounts
-  // typically sits under expenses in Indian COA. (Some schools of
-  // thought put it under "Direct Expenses" or "Cost of Goods Sold" —
-  // we pick whichever group the user has named.)
   let group = await Acc_Group.findOne({
     companyId,
     isActive: true,
@@ -798,13 +775,8 @@ router.get("/purchase-ledgers", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* GET /gst-input-ledgers — CGST/SGST/IGST INPUT ledgers (claimable)   */
+/* GET /gst-input-ledgers — CGST/SGST/IGST INPUT ledgers               */
 /* ------------------------------------------------------------------ */
-/* The AP-side counterpart to /gst-output-ledgers. Used by the Purchase
- * Voucher form (and any other "we paid GST that we can claim back"
- * voucher). Returns whichever input ledgers exist; doesn't auto-create
- * since input ledger setup is part of CoA seeding.
- */
 router.get("/gst-input-ledgers", auth, async (req, res) => {
   try {
     const { companyId } = req.query;
@@ -829,15 +801,8 @@ router.get("/gst-input-ledgers", auth, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* DEBIT NOTE SUPPORT — AP-side mirror of credit-note endpoints        */
+/* DEBIT NOTE SUPPORT — AP-side mirror                                  */
 /* ------------------------------------------------------------------ */
-/* Indian GST treats debit notes from the buyer's side: when we return
- * goods to a vendor (or get a price correction), we issue a DN that
- * reduces our payable and reverses the input GST we'd claimed. The
- * mirror of CN's Sales Returns ledger is a "Purchase Returns" ledger,
- * which sits as a contra to Purchase on the P&L (Cr balance reducing
- * net purchases). Same idempotent auto-create pattern as CN.
- */
 async function resolvePurchaseReturnsLedger(companyId) {
   const existing = await Acc_Ledger.findOne({
     companyId,
@@ -846,8 +811,6 @@ async function resolvePurchaseReturnsLedger(companyId) {
   });
   if (existing) return existing;
 
-  // Resolve the parent group. Try Purchase Accounts first (most CoA
-  // setups have it), then Direct Expenses, then any expense group.
   let group = await Acc_Group.findOne({
     companyId,
     isActive: true,
@@ -903,9 +866,6 @@ router.get("/purchase-returns-ledger", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* GET /dn-reason-codes — debit-note reason codes for the form picker  */
-/* ------------------------------------------------------------------ */
 router.get("/dn-reason-codes", auth, (req, res) => {
   res.json({
     reasons: [
@@ -919,19 +879,7 @@ router.get("/dn-reason-codes", auth, (req, res) => {
   });
 });
 
-/* ------------------------------------------------------------------ */
 /* GET /bill-lookup — list posted purchase bills to debit against      */
-/* ------------------------------------------------------------------ */
-/* AP mirror of /invoice-lookup. Returns posted purchase vouchers for
- * a given vendor that haven't been fully reversed, so the DN form can
- * pick which bill the debit note applies to.
- *
- * Query: companyId, partyLedgerId (vendor), q (optional voucher # /
- *        supplier invoice # search), limit
- *
- * "Outstanding for debit" = grandTotal MINUS (sum of prior DN amounts
- * linked to this bill via originalBill.voucherId).
- */
 router.get("/bill-lookup", auth, async (req, res) => {
   try {
     const { companyId, partyLedgerId, q, limit = 50 } = req.query;
@@ -962,7 +910,6 @@ router.get("/bill-lookup", auth, async (req, res) => {
       )
       .lean();
 
-    // For each bill, compute already-debited amount from prior DNs
     const billIds = bills.map((b) => b._id);
     const priorDNs = await Acc_Voucher.aggregate([
       {
@@ -1004,35 +951,7 @@ router.get("/bill-lookup", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* Returns pending sales invoices for a customer with the outstanding
- * amount per invoice. Used by the Receipt form's bill-wise allocation
- * picker so the accountant can apply incoming money to specific bills.
- *
- * "Outstanding" here = grandTotal MINUS (sum of receipts already applied
- * to this bill via billAllocations.agst_ref) MINUS (sum of CN amounts
- * linked to this invoice).
- *
- * Query params:
- *   companyId      — required
- *   partyLedgerId  — required (customer)
- *   dateFrom       — optional, defaults to one year ago
- *   dateTo         — optional, defaults to today
- *   includeCleared — "1" to include fully-settled invoices (default off)
- *
- * Response:
- *   {
- *     invoices: [
- *       {
- *         _id, voucherNumber, voucherDate, grandTotal,
- *         alreadyReceived,           // from prior receipts
- *         alreadyCredited,           // from CNs
- *         outstanding,               // grandTotal - alreadyReceived - alreadyCredited
- *         ageInDays,                 // days since invoice date
- *       }
- *     ]
- *   }
- */
+/* GET /unpaid-invoices                                                 */
 router.get("/unpaid-invoices", auth, async (req, res) => {
   try {
     const { companyId, partyLedgerId, dateFrom, dateTo, includeCleared } =
@@ -1055,7 +974,7 @@ router.get("/unpaid-invoices", auth, async (req, res) => {
       partyLedgerId,
       voucherDate: { $gte: from, $lte: to },
     })
-      .sort({ voucherDate: 1 }) // oldest first — natural FIFO order
+      .sort({ voucherDate: 1 })
       .select(
         "voucherNumber voucherDate grandTotal placeOfSupplyCode placeOfSupply",
       )
@@ -1066,7 +985,6 @@ router.get("/unpaid-invoices", auth, async (req, res) => {
       return res.json({ invoices: [] });
     }
 
-    // ── Tally prior CN amounts (same logic as CN invoice-lookup) ──
     const invoiceIds = invoices.map((i) => i._id);
     const priorCNs = await Acc_Voucher.aggregate([
       {
@@ -1088,10 +1006,6 @@ router.get("/unpaid-invoices", auth, async (req, res) => {
       priorCNs.map((c) => [String(c._id), c.totalCredited]),
     );
 
-    // ── Tally prior receipt allocations against each invoice ──
-    // Look at receipt vouchers for this party, scan their ledgerEntries
-    // for billAllocations with billType "agst_ref" and a billName that
-    // matches one of these invoice numbers. Sum those.
     const invoiceNumbers = invoices.map((i) => i.voucherNumber);
     const priorReceipts = await Acc_Voucher.find({
       companyId,
@@ -1108,7 +1022,6 @@ router.get("/unpaid-invoices", auth, async (req, res) => {
       for (const entry of rcpt.ledgerEntries || []) {
         for (const alloc of entry.billAllocations || []) {
           if (alloc.billType === "agst_ref" && alloc.billName) {
-            // Match by invoice number; sum the allocated amount
             const inv = invoices.find(
               (i) => i.voucherNumber === alloc.billName,
             );
@@ -1156,28 +1069,7 @@ router.get("/unpaid-invoices", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* GET /unpaid-bills — AP mirror of /unpaid-invoices                    */
-/* ------------------------------------------------------------------ */
-/* Returns pending purchase bills for a vendor with the outstanding
- * amount per bill. Used by the Payment form's bill-wise allocation
- * picker so the accountant can apply outgoing money to specific bills.
- *
- * "Outstanding" = grandTotal MINUS (sum of payments already applied to
- *                 this bill via billAllocations.agst_ref) MINUS (sum
- *                 of DNs linked to this bill via originalBill.voucherId).
- *
- * Match nuance: payments may have been allocated using EITHER our
- * internal voucher # OR the supplier's invoice # as the billName, since
- * accountants type whichever they have in hand. We search by both.
- *
- * Query params:
- *   companyId      — required
- *   partyLedgerId  — required (vendor)
- *   dateFrom       — optional, defaults to one year ago
- *   dateTo         — optional, defaults to today
- *   includeCleared — "1" to include fully-settled bills (default off)
- */
+/* GET /unpaid-bills                                                    */
 router.get("/unpaid-bills", auth, async (req, res) => {
   try {
     const { companyId, partyLedgerId, dateFrom, dateTo, includeCleared } =
@@ -1211,7 +1103,6 @@ router.get("/unpaid-bills", auth, async (req, res) => {
       return res.json({ bills: [] });
     }
 
-    // ── Prior DN amounts against each bill ──
     const billIds = bills.map((b) => b._id);
     const priorDNs = await Acc_Voucher.aggregate([
       {
@@ -1233,9 +1124,6 @@ router.get("/unpaid-bills", auth, async (req, res) => {
       priorDNs.map((d) => [String(d._id), d.totalDebited]),
     );
 
-    // ── Prior payment allocations against each bill ──
-    // Match by either our voucher # OR supplier ref, since the
-    // allocating accountant types whichever they have on the bill.
     const billNumbers = bills.map((b) => b.voucherNumber).filter(Boolean);
     const supplierNumbers = bills.map((b) => b.referenceNumber).filter(Boolean);
     const lookupNames = [...new Set([...billNumbers, ...supplierNumbers])];
@@ -1255,7 +1143,6 @@ router.get("/unpaid-bills", auth, async (req, res) => {
       for (const entry of pay.ledgerEntries || []) {
         for (const alloc of entry.billAllocations || []) {
           if (alloc.billType === "agst_ref" && alloc.billName) {
-            // Match against either voucher # or supplier ref
             const bill = bills.find(
               (b) =>
                 b.voucherNumber === alloc.billName ||
@@ -1301,9 +1188,7 @@ router.get("/unpaid-bills", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* GET /dispatch-lookup — Customer orders/dispatches for sales invoice  */
-/* ------------------------------------------------------------------ */
+/* GET /dispatch-lookup                                                 */
 router.get("/dispatch-lookup", auth, async (req, res) => {
   try {
     const { q, customerId, limit = 30 } = req.query;
@@ -1318,7 +1203,6 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
     }
 
     const filter = {};
-    // Show orders that need invoicing — not yet fully invoiced
     if (!q) {
       filter.status = { $nin: ["cancelled", "rejected"] };
     }
@@ -1390,9 +1274,7 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* GET /po-lookup — Search POs for purchase voucher auto-fill          */
-/* ------------------------------------------------------------------ */
+/* GET /po-lookup                                                       */
 router.get("/po-lookup", auth, async (req, res) => {
   try {
     const { q, vendorId, limit = 20 } = req.query;
@@ -1464,9 +1346,7 @@ router.get("/po-lookup", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* GET /raw-materials — Raw material items for purchase voucher        */
-/* ------------------------------------------------------------------ */
+/* GET /raw-materials                                                   */
 router.get("/raw-materials", auth, async (req, res) => {
   try {
     const { companyId, q, limit = 500 } = req.query;
@@ -1542,9 +1422,7 @@ router.get("/raw-materials", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* GET /roundoff-ledger — auto-find or create the Round Off ledger     */
-/* ------------------------------------------------------------------ */
+/* GET /roundoff-ledger                                                 */
 router.get("/roundoff-ledger", auth, async (req, res) => {
   try {
     const { companyId } = req.query;
@@ -1592,12 +1470,6 @@ router.get("/roundoff-ledger", auth, async (req, res) => {
 
 router.get("/:id", auth, async (req, res) => {
   try {
-    // Populate paths must match the schema field names exactly:
-    //   ledgerEntries[].ledgerId   (NOT ledger — renamed in the unified schema)
-    //   inventoryEntries[].stockItemId  (NOT stockItem)
-    // Wrap the populate in try/catch so a single bad ref doesn't 500 the
-    // whole voucher view — the denormalised name fields are already on
-    // the entries themselves.
     let voucher;
     try {
       voucher = await Acc_Voucher.findById(req.params.id)
@@ -1665,12 +1537,25 @@ router.post("/", auth, async (req, res) => {
       );
     }
 
+    // Reject only if a LIVE voucher already holds this number. A number left
+    // behind by a cancelled/void voucher is free to reuse (matches Tally).
+    if (
+      await liveNumberClash(
+        body.companyId,
+        body.voucherType,
+        body.voucherNumber,
+      )
+    ) {
+      return res.status(409).json({
+        error: `Voucher number "${body.voucherNumber}" is already in use by an active voucher. Pick a different number.`,
+      });
+    }
+
     body.financialYear = computeFY(body.voucherDate);
     body.createdBy = req.user?.id;
 
     // Resolve partyLedgerName if missing. Accept both legacy `partyLedger`
-    // and current `partyLedgerId` field names from clients to avoid
-    // breaking existing voucher-create payloads.
+    // and current `partyLedgerId` field names.
     const partyId = body.partyLedgerId || body.partyLedger;
     if (partyId) {
       body.partyLedgerId = partyId;
@@ -1681,106 +1566,276 @@ router.post("/", auth, async (req, res) => {
     }
     delete body.partyLedger; // canonicalise — only partyLedgerId is saved
 
-    // Resolve ledger names. Accept both legacy `ledger` and current
-    // `ledgerId` from clients; canonicalise to `ledgerId`.
-    //
-    // If an entry has a NAME but no ID (e.g. the "Round Off" line the
-    // sales form now emits), resolve it — and auto-create it if it truly
-    // doesn't exist yet — so the voucher posts balanced instead of
-    // silently dropping the rounding paise. This mirrors the idempotent
-    // auto-create pattern already used for Sales/Purchase Returns ledgers.
-    async function resolveOrCreateByName(name, companyId) {
-      const clean = String(name || "").trim();
-      if (!clean) return null;
-      let led = await Acc_Ledger.findOne({
-        companyId,
-        name: new RegExp(
-          `^${clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-          "i",
-        ),
-      });
-      if (led) return led;
-      // Round Off is an indirect-expense-natured nominal ledger. Find a
-      // sensible parent group; fall back to any expense-nature group.
-      let grp =
-        (await Acc_Group.findOne({
-          companyId,
-          name: /indirect expense/i,
-        })) ||
-        (await Acc_Group.findOne({ companyId, nature: "expense" })) ||
-        (await Acc_Group.findOne({ companyId }));
-      if (!grp) return null;
-      led = await Acc_Ledger.create({
-        companyId,
-        name: clean,
-        groupId: grp._id,
-        groupName: grp.name,
-        openingBalance: 0,
-        openingBalanceType: "Dr",
-        sourceSystem: "auto_from_voucher",
-      });
-      return led;
-    }
-
-    for (const entry of body.ledgerEntries) {
-      const ledId = entry.ledgerId || entry.ledger;
-      if (ledId) {
-        entry.ledgerId = ledId;
-        if (!entry.ledgerName) {
-          const led = await Acc_Ledger.findById(ledId).select("name");
-          if (led) entry.ledgerName = led.name;
-        }
-      } else if (entry.ledgerName) {
-        const led = await resolveOrCreateByName(
-          entry.ledgerName,
-          body.companyId,
-        );
-        if (led) {
-          entry.ledgerId = led._id;
-          entry.ledgerName = led.name;
-        }
-      }
-      delete entry.ledger;
-      delete entry.autoLedger;
-    }
+    // Resolve / canonicalise ledger entries (ids, names, auto-create by name).
+    await resolveLedgerEntries(body.ledgerEntries, body.companyId);
 
     const voucher = new Acc_Voucher(body);
+
+    // Persist debit note classification fields even if not in schema (strict bypass)
+    if (body.debitNoteType) {
+      try {
+        voucher.set("debitNoteType", body.debitNoteType, { strict: false });
+      } catch {}
+    }
+    if (body.originalBill && typeof body.originalBill === "object") {
+      try {
+        voucher.set("originalBill", body.originalBill, { strict: false });
+      } catch {}
+    }
+
+    // ── Approval workflow (sales vouchers only) ──────────────────────────────
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    const fullAccessRole =
+      role === "owner" ||
+      role === "approver" ||
+      role === "admin" ||
+      role === "accountant";
+    const canPostDirectly = !!perms.canPostDirectly || fullAccessRole;
+    // Editors (no direct-post privilege) can't post these voucher types
+    // straight away — they go to an admin for approval, which fires the
+    // owner/approver notification (post-save hook on Acc_ApprovalRequest).
+    // Owners / approvers / accountants post directly.
+    const APPROVAL_REQUIRED_TYPES = new Set([
+      "sales",
+      "purchase",
+      "receipt",
+      "payment",
+      "credit_note",
+      "debit_note",
+      "journal",
+      "contra",
+    ]);
+    const needsApprovalFinal =
+      APPROVAL_REQUIRED_TYPES.has(body.voucherType) && !canPostDirectly;
+
+    if (needsApprovalFinal) {
+      voucher.status = "pending_approval";
+      voucher.submittedBy = req.user?.id;
+      voucher.submittedByName = req.user?.name || "";
+      voucher.submittedAt = new Date();
+      await voucher.save();
+
+      try {
+        const {
+          Acc_ApprovalRequest,
+        } = require("../../models/Accountant_model/Acc_OrgModels");
+        if (req.user?.organizationId) {
+          await Acc_ApprovalRequest.create({
+            organizationId: req.user.organizationId,
+            companyId: voucher.companyId,
+            kind: "voucher",
+            action: "post",
+            title: `Post ${voucher.voucherType} ${voucher.voucherNumber} · ${
+              voucher.partyLedgerName || "—"
+            } · ₹${Number(voucher.grandTotal || 0).toLocaleString("en-IN")}`,
+            target: { collection: "Acc_Voucher", id: voucher._id },
+            payload: { voucherId: voucher._id },
+            requestedBy: req.user.id,
+            requestedByName: req.user.name || "",
+            status: "pending",
+          });
+        }
+      } catch (approvalErr) {
+        console.error(
+          "[vouchers] approval-request create failed:",
+          approvalErr.message,
+        );
+      }
+
+      return res
+        .status(201)
+        .json({ ...voucher.toObject(), _pendingApproval: true });
+    }
+
     await voucher.save();
 
-    // Auto-post if requested and balanced
+    // Auto-post if requested and balanced (owners / approvers only reach here)
     if (body.autoPost && voucher.isBalanced) {
       voucher.status = "posted";
+      voucher.postedBy = req.user?.id;
+      voucher.postedAt = new Date();
       await voucher.save();
       await applyLedgerBalances(voucher, +1);
     }
 
     res.status(201).json(voucher);
   } catch (e) {
+    // Friendly message for the unique-index race (should be rare now that we
+    // pre-check, and only fires on a genuine LIVE collision).
+    if (e && e.code === 11000) {
+      return res.status(409).json({
+        error:
+          "That voucher number is already in use by an active voucher. Pick a different number.",
+      });
+    }
     res.status(400).json({ error: e.message });
   }
 });
 
 /* ------------------------------------------------------------------ */
-/* Update (only if draft)                                              */
+/* Update / Edit                                                        */
 /* ------------------------------------------------------------------ */
-
+/* Edits draft, pending_approval, OR posted vouchers. For a POSTED voucher
+ * the old ledger balances are reversed first, the new entries applied, and
+ * the balances re-applied — so editing a posted credit note (or any posted
+ * voucher) keeps every ledger correct. Cancelled/void vouchers can't be
+ * edited (re-create instead).
+ */
 router.put("/:id", auth, async (req, res) => {
   try {
     const existing = await Acc_Voucher.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: "Voucher not found" });
-    if (existing.status !== "draft")
+    if (["cancelled", "void"].includes(existing.status)) {
       return res.status(400).json({
-        error: `Cannot edit voucher in '${existing.status}' status. Cancel and create new.`,
+        error: `Cannot edit a ${existing.status} voucher. Create a new one instead.`,
       });
+    }
 
     const body = req.body || {};
-    body.updatedBy = req.user?.id;
-    if (body.voucherDate) body.financialYear = computeFY(body.voucherDate);
+    const wasPosted = existing.status === "posted";
 
+    // Strip fields the client must not be able to overwrite directly.
+    delete body._id;
+    delete body.companyId;
+    delete body.voucherType;
+    delete body.status;
+    delete body.autoPost;
+    delete body.createdBy;
+    delete body.createdAt;
+
+    // Canonicalise party (accept legacy field name).
+    if ("partyLedger" in body || "partyLedgerId" in body) {
+      const partyId = body.partyLedgerId || body.partyLedger;
+      body.partyLedgerId = partyId || undefined;
+      if (partyId && !body.partyLedgerName) {
+        const led = await Acc_Ledger.findById(partyId).select("name");
+        if (led) body.partyLedgerName = led.name;
+      }
+      delete body.partyLedger;
+    }
+
+    // Resolve / canonicalise ledger entries when provided.
+    if (Array.isArray(body.ledgerEntries)) {
+      await resolveLedgerEntries(body.ledgerEntries, existing.companyId);
+    }
+
+    // Voucher-number change: only allow if no LIVE voucher (other than this
+    // one) already holds the new number.
+    if (body.voucherNumber && body.voucherNumber !== existing.voucherNumber) {
+      if (
+        await liveNumberClash(
+          existing.companyId,
+          existing.voucherType,
+          body.voucherNumber,
+          existing._id,
+        )
+      ) {
+        return res.status(409).json({
+          error: `Voucher number "${body.voucherNumber}" is already in use by an active voucher.`,
+        });
+      }
+    }
+    if (body.voucherDate) body.financialYear = computeFY(body.voucherDate);
+    body.updatedBy = req.user?.id;
+
+    // ── Approval workflow for EDITS ──────────────────────────────────────────
+    // Editors (no direct-post privilege) cannot change a POSTED voucher in
+    // place — that would move the ledger without review. Their edit is held as
+    // an approval request carrying the proposed body; the posted voucher is
+    // left untouched until an admin approves, at which point the SAME
+    // reverse → apply → re-apply runs server-side (see Acc_approvals.js, the
+    // "update" executor). Editing a draft or a still-pending voucher (no ledger
+    // impact yet) stays direct.
+    {
+      const editorPerms = req.user?.permissions || {};
+      const editorRole = req.user?.role;
+      const canEditDirectly =
+        editorPerms.canPostDirectly ||
+        ["owner", "approver", "admin", "accountant"].includes(editorRole);
+
+      if (!canEditDirectly && wasPosted) {
+        if (!req.user?.organizationId) {
+          return res
+            .status(403)
+            .json({ error: "Your role can't edit posted vouchers." });
+        }
+        const {
+          Acc_ApprovalRequest,
+        } = require("../../models/Accountant_model/Acc_OrgModels");
+
+        const dup = await Acc_ApprovalRequest.findOne({
+          organizationId: req.user.organizationId,
+          kind: "voucher",
+          action: "update",
+          "target.id": existing._id,
+          status: "pending",
+        });
+        if (dup) {
+          return res.status(200).json({
+            ...existing.toObject(),
+            _pendingApproval: true,
+            message: "An edit request is already pending for this voucher.",
+          });
+        }
+
+        await Acc_ApprovalRequest.create({
+          organizationId: req.user.organizationId,
+          companyId: existing.companyId,
+          kind: "voucher",
+          action: "update",
+          title: `Edit ${existing.voucherType} ${existing.voucherNumber} · ${
+            existing.partyLedgerName || "—"
+          } · ₹${Number(existing.grandTotal || 0).toLocaleString("en-IN")}`,
+          target: { collection: "Acc_Voucher", id: existing._id },
+          payload: body,
+          diff: {
+            before: {
+              voucherNumber: existing.voucherNumber,
+              partyLedgerName: existing.partyLedgerName || "",
+              grandTotal: Number(existing.grandTotal || 0),
+            },
+            after: {
+              voucherNumber: body.voucherNumber ?? existing.voucherNumber,
+              partyLedgerName:
+                body.partyLedgerName ?? existing.partyLedgerName ?? "",
+              grandTotal: Number(body.grandTotal ?? existing.grandTotal ?? 0),
+            },
+          },
+          requestedBy: req.user.id,
+          requestedByName: req.user.name || "",
+          status: "pending",
+        });
+
+        return res.status(202).json({
+          ...existing.toObject(),
+          _pendingApproval: true,
+          message: "Edit request sent to an admin for approval.",
+        });
+      }
+    }
+
+    // For a posted voucher, reverse the OLD balances before mutating entries.
+    if (wasPosted) {
+      await applyLedgerBalances(existing, -1);
+    }
+
+    // Apply the incoming changes and recompute totals via the pre-save hook.
     Object.assign(existing, body);
     await existing.save();
+
+    // Re-apply balances if it remains posted.
+    if (wasPosted) {
+      await applyLedgerBalances(existing, +1);
+    }
+
     res.json(existing);
   } catch (e) {
+    if (e && e.code === 11000) {
+      return res.status(409).json({
+        error: "That voucher number is already in use by an active voucher.",
+      });
+    }
     res.status(400).json({ error: e.message });
   }
 });
@@ -1816,28 +1871,86 @@ router.post("/:id/post", auth, async (req, res) => {
 });
 
 router.post("/:id/cancel", auth, async (req, res) => {
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
-    const voucher = await Acc_Voucher.findById(req.params.id).session(session);
-    if (!voucher) throw new Error("Voucher not found");
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    if (!voucher) return res.status(404).json({ error: "Voucher not found" });
     if (!["posted", "draft"].includes(voucher.status))
-      throw new Error(`Cannot cancel voucher in '${voucher.status}' status`);
+      return res
+        .status(400)
+        .json({ error: `Cannot cancel voucher in '${voucher.status}' status` });
 
-    if (voucher.status === "posted") {
-      await applyLedgerBalances(voucher, -1, session);
+    // Editors (no direct-post privilege) route the cancel through approval.
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    const canActDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    if (!canActDirectly) {
+      if (!req.user?.organizationId) {
+        return res
+          .status(403)
+          .json({ error: "Your role can't cancel vouchers." });
+      }
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "cancel",
+        "target.id": voucher._id,
+        status: "pending",
+      });
+      if (dup) {
+        return res.status(200).json({
+          ...voucher.toObject(),
+          _pendingApproval: true,
+          message: "A cancel request is already pending for this voucher.",
+        });
+      }
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: voucher.companyId,
+        kind: "voucher",
+        action: "cancel",
+        title: `Cancel ${voucher.voucherType} ${voucher.voucherNumber} · ${
+          voucher.partyLedgerName || "—"
+        } · ₹${Number(voucher.grandTotal || 0).toLocaleString("en-IN")}`,
+        target: { collection: "Acc_Voucher", id: voucher._id },
+        payload: { voucherId: voucher._id },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+      return res.status(202).json({
+        ...voucher.toObject(),
+        _pendingApproval: true,
+        message: "Cancel request sent to an admin for approval.",
+      });
     }
-    voucher.status = "cancelled";
-    voucher.updatedBy = req.user?.id;
-    await voucher.save({ session });
 
-    await session.commitTransaction();
-    res.json(voucher);
+    // Owners / approvers / accountants cancel directly (balances reversed).
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const v = await Acc_Voucher.findById(req.params.id).session(session);
+      if (v.status === "posted") {
+        await applyLedgerBalances(v, -1, session);
+      }
+      v.status = "cancelled";
+      v.updatedBy = req.user?.id;
+      await v.save({ session });
+      await session.commitTransaction();
+      res.json(v);
+    } catch (e) {
+      await session.abortTransaction();
+      throw e;
+    } finally {
+      session.endSession();
+    }
   } catch (e) {
-    await session.abortTransaction();
     res.status(400).json({ error: e.message });
-  } finally {
-    session.endSession();
   }
 });
 
@@ -1845,10 +1958,141 @@ router.post("/:id/void", auth, async (req, res) => {
   try {
     const voucher = await Acc_Voucher.findById(req.params.id);
     if (!voucher) return res.status(404).json({ error: "Voucher not found" });
+
+    // Editors (no direct-post privilege) route the void through approval.
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    const canActDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    if (!canActDirectly) {
+      if (!req.user?.organizationId) {
+        return res
+          .status(403)
+          .json({ error: "Your role can't void vouchers." });
+      }
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "void",
+        "target.id": voucher._id,
+        status: "pending",
+      });
+      if (dup) {
+        return res.status(200).json({
+          ...voucher.toObject(),
+          _pendingApproval: true,
+          message: "A void request is already pending for this voucher.",
+        });
+      }
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: voucher.companyId,
+        kind: "voucher",
+        action: "void",
+        title: `Void ${voucher.voucherType} ${voucher.voucherNumber} · ${
+          voucher.partyLedgerName || "—"
+        } · ₹${Number(voucher.grandTotal || 0).toLocaleString("en-IN")}`,
+        target: { collection: "Acc_Voucher", id: voucher._id },
+        payload: { voucherId: voucher._id },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+      return res.status(202).json({
+        ...voucher.toObject(),
+        _pendingApproval: true,
+        message: "Void request sent to an admin for approval.",
+      });
+    }
+
+    // Owners / approvers / accountants void directly (balances reversed).
     if (voucher.status === "posted") {
       await applyLedgerBalances(voucher, -1);
     }
     voucher.status = "void";
+    voucher.updatedBy = req.user?.id;
+    await voucher.save();
+    res.json(voucher);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Approval workflow — approve / reject a pending_approval voucher     */
+/* ------------------------------------------------------------------ */
+
+router.post("/:id/approve", auth, async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const perms = req.user?.permissions || {};
+    if (!perms.canApprove) {
+      session.endSession();
+      return res
+        .status(403)
+        .json({ error: "Only an approver or owner can approve vouchers." });
+    }
+
+    session.startTransaction();
+    const voucher = await Acc_Voucher.findById(req.params.id).session(session);
+    if (!voucher) throw new Error("Voucher not found");
+    if (voucher.status !== "pending_approval")
+      throw new Error(
+        `Only vouchers awaiting approval can be approved (this one is '${voucher.status}').`,
+      );
+    if (!voucher.isBalanced)
+      throw new Error("Voucher Dr/Cr totals do not balance — cannot approve.");
+
+    voucher.status = "posted";
+    voucher.approvedBy = req.user?.id;
+    voucher.approvedByName = req.user?.name || "";
+    voucher.approvedAt = new Date();
+    voucher.postedBy = req.user?.id;
+    voucher.postedAt = new Date();
+    voucher.updatedBy = req.user?.id;
+    await voucher.save({ session });
+    await applyLedgerBalances(voucher, +1, session);
+
+    await session.commitTransaction();
+    res.json(voucher);
+  } catch (e) {
+    try {
+      await session.abortTransaction();
+    } catch (_) {}
+    res.status(400).json({ error: e.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+router.post("/:id/reject", auth, async (req, res) => {
+  try {
+    const perms = req.user?.permissions || {};
+    if (!perms.canApprove) {
+      return res
+        .status(403)
+        .json({ error: "Only an approver or owner can reject vouchers." });
+    }
+
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    if (!voucher) return res.status(404).json({ error: "Voucher not found" });
+    if (voucher.status !== "pending_approval")
+      return res.status(400).json({
+        error: `Only vouchers awaiting approval can be rejected (this one is '${voucher.status}').`,
+      });
+
+    voucher.status = "cancelled";
+    voucher.rejectedBy = req.user?.id;
+    voucher.rejectedByName = req.user?.name || "";
+    voucher.rejectedAt = new Date();
+    voucher.rejectionReason =
+      (req.body && req.body.reason) || "Rejected by approver";
+    voucher.cancellationReason = voucher.rejectionReason;
     voucher.updatedBy = req.user?.id;
     await voucher.save();
     res.json(voucher);

@@ -2,6 +2,17 @@
 //
 // Sub-account / role-aware auth middleware for the accountant module.
 //
+// ─── FIX (v2) ─────────────────────────────────────────────────────────────────
+// PROBLEM: When `accountant_token` cookie JWT is EXPIRED (after 24 h / or old
+//   12 h tokens), `tryVerify()` returns null and the old code immediately 401'd
+//   WITHOUT trying the `auth_token` cookie that the main CMS login issued.
+//
+// FIX: `orgAuth` now iterates through ALL present token sources in priority
+//   order.  If a source fails verification (expired or invalid), we clear the
+//   cookie if it's one we own (`accountant_token`) and continue to the next
+//   source.  Only when every source has been exhausted do we return 401.
+// ──────────────────────────────────────────────────────────────────────────────
+//
 // Entry point for routes that need:
 //   • the authenticated Acc_User loaded
 //   • the organization scope attached to the request
@@ -23,17 +34,14 @@
 //     // NO organizationId, NO email
 //   }
 //
-// COOKIE PRIORITY:
+// TOKEN PRIORITY:
 //   1. accountant_token  — issued by accountant module's own login / sync-legacy
 //   2. auth_token        — issued by main CMS login
-//   3. token / Bearer    — older variants
+//   3. token             — older variant
+//   4. Bearer header     — cross-origin / mobile fallback (localStorage → api.js)
 //
-// FALLBACK BEHAVIOR (important):
-//   If the accountant_token JWT references an Acc_User that no longer
-//   exists or is inactive (typical after a DB reset), we DON'T just
-//   reject — we transparently clear that stale cookie and fall through
-//   to the auth_token (legacy CMS token), which usually IS still valid
-//   because the CMS user record in acc_departments is the seeded one.
+// If any source fails verification we try the next rather than bailing.
+// Stale accountant_token cookies are proactively cleared on the response.
 //
 // MODEL REFERENCES (post-Acc_ rename):
 //   • Acc_User          — `acc_users` collection
@@ -46,17 +54,15 @@
 //   - requirePermission(p) → 403 if user lacks named permission
 //   - requireCompanyAccess → 403 if companyId not owned by the org
 //   - signOrgToken         → mint JWTs from the new shape
+//   - extractToken         → backwards-compat for older routes
 
 const jwt = require("jsonwebtoken");
-const mongoose = require("mongoose");
 
 const SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
 const DEV_BYPASS = process.env.ACCOUNTANT_AUTH_BYPASS === "true";
 
-// The cookie name minted by the accountant module's own login flow.
-// When we detect a stale token in this cookie, we must clear it so
-// the browser doesn't keep re-sending it on every request.
 const ACCOUNTANT_COOKIE = "accountant_token";
+const isProduction = process.env.NODE_ENV === "production";
 
 // Cached references — lazily required so model registration order
 // doesn't matter.
@@ -90,8 +96,35 @@ function getAllCookies(req) {
   return merged;
 }
 
-// Backwards-compat: many routes import extractToken directly. Keep
-// returning JUST the token string for them.
+// ─── Get all token sources in priority order ─────────────────────────────────
+// Returns an array of { token, source } objects so orgAuth can try each one.
+function getAllTokenSources(req) {
+  const c = getAllCookies(req);
+  const sources = [];
+
+  // 1. Dedicated accountant cookie (most specific, highest priority)
+  if (c.accountant_token) {
+    sources.push({ token: c.accountant_token, source: "accountant_token" });
+  }
+  // 2. Main CMS cookie (legacy path — triggers sync-legacy on /me)
+  if (c.auth_token) {
+    sources.push({ token: c.auth_token, source: "auth_token" });
+  }
+  // 3. Older cookie name
+  if (c.token) {
+    sources.push({ token: c.token, source: "token" });
+  }
+  // 4. Bearer header — injected by lib/api.js from localStorage (Chrome fix)
+  const authHeader = req.headers?.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    sources.push({ token: authHeader.slice(7), source: "bearer" });
+  }
+
+  return sources;
+}
+
+// Backwards-compat: many routes import extractToken directly.
+// Returns just the first present token string (doesn't validate).
 function extractToken(req) {
   const c = getAllCookies(req);
   if (c.accountant_token) return c.accountant_token;
@@ -105,27 +138,14 @@ function extractToken(req) {
   return null;
 }
 
-// Internal version used by orgAuth — also tells us WHICH cookie/header
-// the token came from. Helps decide whether to clear it on failure.
-function extractTokenWithSource(req) {
-  const c = getAllCookies(req);
-  if (c.accountant_token)
-    return { token: c.accountant_token, source: "accountant_token" };
-  if (c.auth_token) return { token: c.auth_token, source: "auth_token" };
-  if (c.token) return { token: c.token, source: "token" };
-
-  const authHeader = req.headers?.authorization;
-  if (authHeader && authHeader.startsWith("Bearer "))
-    return { token: authHeader.slice(7), source: "bearer" };
-
-  return { token: null, source: null };
-}
-
 /* ------------------------------------------------------------------ */
 /* signOrgToken — used by the login route to mint JWTs                */
 /* ------------------------------------------------------------------ */
 
-function signOrgToken(user, expiresIn = "12h") {
+// NOTE: expiresIn is now "24h" (was "12h") to match the cookie maxAge.
+// Having the JWT expire before the cookie causes the browser to keep
+// sending a cookie whose JWT is already dead → 401 on every request.
+function signOrgToken(user, expiresIn = "24h") {
   return jwt.sign(
     {
       id: String(user._id),
@@ -133,6 +153,7 @@ function signOrgToken(user, expiresIn = "12h") {
       role: user.role,
       email: user.email,
       name: user.name,
+      tokenVersion: user.tokenVersion || 0,
     },
     SECRET,
     { expiresIn },
@@ -149,10 +170,20 @@ function tryVerify(token) {
 }
 
 /* ------------------------------------------------------------------ */
+/* clearAccountantCookie — helper to remove our cookie from response  */
+/* ------------------------------------------------------------------ */
+function clearAccountantCookie(res) {
+  res.clearCookie(ACCOUNTANT_COOKIE, {
+    httpOnly: true,
+    sameSite: isProduction ? "none" : "lax",
+    secure: isProduction,
+    path: "/",
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* setLegacyUser — populate req.user from a legacy CMS token          */
 /* ------------------------------------------------------------------ */
-// Used by both the direct legacy path and the fallback-from-stale path.
-
 function setLegacyUser(req, decoded) {
   req.user = {
     id: decoded.id || decoded._id || decoded.userId,
@@ -173,7 +204,7 @@ function setLegacyUser(req, decoded) {
 }
 
 /* ------------------------------------------------------------------ */
-/* orgAuth — the main middleware                                      */
+/* orgAuth — the main middleware                                       */
 /* ------------------------------------------------------------------ */
 
 async function orgAuth(req, res, next) {
@@ -199,8 +230,10 @@ async function orgAuth(req, res, next) {
     return next();
   }
 
-  const { token, source } = extractTokenWithSource(req);
-  if (!token) {
+  // ── Gather all available token sources ──────────────────────────────────
+  const tokenSources = getAllTokenSources(req);
+
+  if (tokenSources.length === 0) {
     return res.status(401).json({
       success: false,
       message: "Authentication required",
@@ -208,8 +241,31 @@ async function orgAuth(req, res, next) {
     });
   }
 
-  const decoded = tryVerify(token);
+  // ── Try each source in priority order ───────────────────────────────────
+  // Key fix: when accountant_token is expired/invalid we DON'T bail — we
+  // clear that stale cookie and fall through to the next source (auth_token).
+  let decoded = null;
+  let usedSource = null;
+
+  for (const { token, source } of tokenSources) {
+    const d = tryVerify(token);
+    if (!d) {
+      // This token is expired or malformed.
+      // If it's our accountant_token cookie, clear it so the browser stops
+      // sending it and the user isn't stuck in a redirect loop.
+      if (source === "accountant_token") {
+        clearAccountantCookie(res);
+      }
+      // Try the next source.
+      continue;
+    }
+    decoded = d;
+    usedSource = source;
+    break;
+  }
+
   if (!decoded) {
+    // Every source failed — truly no valid session.
     return res.status(401).json({
       success: false,
       message: "Session expired — please log in again.",
@@ -217,17 +273,16 @@ async function orgAuth(req, res, next) {
     });
   }
 
-  // ── Legacy-token path ────────────────────────────────────────────
+  // ── Legacy-token path ────────────────────────────────────────────────────
   // No organizationId in the token → it's a CMS-issued legacy JWT.
-  // Set req.user.isLegacy = true and let the route handle the rest
-  // (typically /me returns isLegacy:true and the frontend then calls
-  // /sync-legacy to upgrade the session).
+  // Set req.user.isLegacy = true; the /me endpoint returns isLegacy:true and
+  // the frontend calls /sync-legacy to upgrade the session transparently.
   if (!decoded.organizationId) {
     setLegacyUser(req, decoded);
     return next();
   }
 
-  // ── New-shape token path ─────────────────────────────────────────
+  // ── New-shape token path ─────────────────────────────────────────────────
   try {
     const { Acc_User, Acc_Organization } = getModels();
     if (!Acc_User || !Acc_Organization) {
@@ -242,33 +297,39 @@ async function orgAuth(req, res, next) {
     }
 
     const user = await Acc_User.findById(decoded.id).lean();
-    const userOk = user && user.isActive;
+    const userOk =
+      user &&
+      user.isActive &&
+      (decoded.tokenVersion || 0) === (user.tokenVersion || 0);
     const orgMatches =
       userOk && String(user.organizationId) === String(decoded.organizationId);
 
     if (!userOk || !orgMatches) {
-      // ── STALE-COOKIE FALLBACK ──────────────────────────────────
-      // The accountant_token cookie points to an Acc_User that no
-      // longer exists (or is inactive, or the org doesn't match).
-      // This happens commonly after a DB reset — the cookie outlives
-      // the data it referenced. Clear the stale cookie and look for
-      // a legacy CMS token in OTHER cookies. If one exists, fall
-      // through into legacy mode so the user keeps working.
-      if (source === "accountant_token") {
-        res.clearCookie(ACCOUNTANT_COOKIE, {
-          httpOnly: true,
-          sameSite: "lax",
-          secure: process.env.NODE_ENV === "production",
-          path: "/",
-        });
+      // ── STALE-USER FALLBACK ────────────────────────────────────────────
+      // The JWT is cryptographically valid but points to an Acc_User that
+      // no longer exists or is inactive (e.g. after a DB reset). Clear the
+      // stale accountant_token and try the next cookie (auth_token).
+      if (usedSource === "accountant_token") {
+        clearAccountantCookie(res);
       }
 
+      // Try auth_token as legacy fallback
       const cookies = getAllCookies(req);
       const legacyToken = cookies.auth_token || cookies.token || null;
       const legacyDecoded = tryVerify(legacyToken);
       if (legacyDecoded && !legacyDecoded.organizationId) {
         setLegacyUser(req, legacyDecoded);
         return next();
+      }
+
+      // Also accept a Bearer token that looks like a legacy CMS token
+      const authHeader = req.headers?.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        const bearerDecoded = tryVerify(authHeader.slice(7));
+        if (bearerDecoded && !bearerDecoded.organizationId) {
+          setLegacyUser(req, bearerDecoded);
+          return next();
+        }
       }
 
       return res.status(401).json({
@@ -328,7 +389,7 @@ async function orgAuth(req, res, next) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Role / permission gates                                            */
+/* Role / permission gates                                             */
 /* ------------------------------------------------------------------ */
 
 function requireRole(...allowed) {
