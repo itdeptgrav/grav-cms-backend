@@ -257,10 +257,11 @@ async function updateCoworkGroup(groupId, requestingEmployeeId, { name, descript
 }
 
 // ── ADD MEMBER ─────────────────────────────────────────────
-async function addGroupMember(groupId, requestingEmployeeId, employeeIdToAdd) {
+async function addGroupMember(groupId, requestingEmployeeId, requestingRole, employeeIdToAdd) {
   const snap = await db.collection("cowork_groups").doc(groupId).get();
   if (!snap.exists) throw new Error("Group not found.");
-  if (snap.data().createdBy !== requestingEmployeeId) throw new Error("Only the creator can add members.");
+  const isAllowed = requestingRole === "ceo" || snap.data().createdBy === requestingEmployeeId;
+  if (!isAllowed) throw new Error("Only the group creator or admin can add members.");
   const memberIds = snap.data().memberIds || [];
   if (memberIds.includes(employeeIdToAdd)) throw new Error("Employee is already a member.");
   const updated = [...memberIds, employeeIdToAdd];
@@ -270,15 +271,15 @@ async function addGroupMember(groupId, requestingEmployeeId, employeeIdToAdd) {
 }
 
 // ── REMOVE MEMBER ─────────────────────────────────────────
-async function removeGroupMember(groupId, requestingEmployeeId, employeeIdToRemove) {
+async function removeGroupMember(groupId, requestingEmployeeId, requestingRole, employeeIdToRemove) {
   const snap = await db.collection("cowork_groups").doc(groupId).get();
   if (!snap.exists) throw new Error("Group not found.");
-  if (snap.data().createdBy !== requestingEmployeeId) throw new Error("Only the creator can remove members.");
+  const isAllowed = requestingRole === "ceo" || snap.data().createdBy === requestingEmployeeId;
+  if (!isAllowed) throw new Error("Only the group creator or admin can remove members.");
   if (employeeIdToRemove === requestingEmployeeId) throw new Error("Creator cannot be removed.");
   const memberIds = (snap.data().memberIds || []).filter(id => id !== employeeIdToRemove);
   await db.collection("cowork_groups").doc(groupId).update({ memberIds, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
-  // Notify the removed person
   await _notifyMany({
     recipientIds: [employeeIdToRemove],
     type: "group_removed",
@@ -291,8 +292,6 @@ async function removeGroupMember(groupId, requestingEmployeeId, employeeIdToRemo
 
   return { memberIds };
 }
-
-
 
 async function listCoworkGroups(employeeId, role) {
   try {

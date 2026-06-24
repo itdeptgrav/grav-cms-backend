@@ -13,6 +13,7 @@
  */
 
 const { admin, db, messaging } = require("../config/firebaseAdmin");
+const c1Svc = require("./c1Service");
 const socket = require("../config/socketInstance");
 const { v4: uuidv4 } = require("uuid");
 
@@ -193,7 +194,12 @@ async function _buildPath(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
-async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0 }) {
+async function createTask({ title, description, notes, assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
+  isGoldTask = false,
+  c2Config = null,
+  etcHours = 0 }) {
+
+
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
   const path = await _buildPath(parentTaskId);
@@ -231,6 +237,20 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     lastUpdateAt: null,
     isGoal: isGoal || false,
     goalConfig: isGoal && goalConfig ? goalConfig : null,
+    isGoldTask: isGoldTask || false,
+    c2Config: (isGoldTask && c2Config) ? c2Config : null,
+    etcHours: Number(etcHours) || 0,
+    c1: {
+      deadlinesMissed: 0,
+      extensionsFiled: 0,
+      reworksReceived: 0,
+      taskScore: null,
+      c1Status: "open",
+      isExcluded: false,
+      isRejected: false,
+      officialDeadline: null,
+      scoreCalculatedAt: null,
+    },
     goalAchieved: isGoal ? 0 : null,
     goalUpdates: [],
     hasTimer: isRepeat || isThirdParty || isGoal ? null : (hasTimer !== false),
@@ -268,9 +288,12 @@ async function createTask({ title, description, notes, assignedBy, assignedByNam
     tlReview: null,
     ceoReview: null,
     deadlineHistory: [],
-    // Meta
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     createdAtISO: now,
+    // ── PMP quarter tracking ──────────────────────────────────────────────────
+    quarter: Math.ceil((new Date().getMonth() + 1) / 3), // 1 | 2 | 3 | 4
+    year: new Date().getFullYear(),                        // e.g. 2026
+    // ─────────────────────────────────────────────────────────────────────────
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
@@ -1080,10 +1103,116 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
     }
   }
 
+  // ── C1 Score calculation ──────────────────────────────────────────────────
+  const c1FinalStatus = approved
+    ? (flow === "tl_final" ? "tl_final_approved" : flow === "ceo_direct" ? "ceo_approved" : "tl_approved")
+    : "tl_rejected";
+  const isFullyApproved = ["tl_final_approved", "ceo_approved"].includes(c1FinalStatus);
+  const isRejected = c1FinalStatus === "tl_rejected";
+
+  // ── C1 score — fires on full approval OR rejection ────────────────────
+  if (isFullyApproved || isRejected) {
+    const submittedAt = task.completionSubmission?.submittedAt || null;
+    const primaryEmployee = (task.assigneeIds || [])[0] || null;
+    setImmediate(() => {
+      c1Svc.computeAndStoreTaskScore({
+        taskId,
+        taskData: task,
+        employeeId: primaryEmployee,
+        isRejected,
+        submittedAt,
+      }).catch(e => console.error("[C1 score on review]", e.message));
+    });
+  }
+  // ─────────────────────────────────────────────────────────────────────
+
+  // ── C2 score write — fires when gold task fully approved ─────────────
+  if (isFullyApproved && task.isGoldTask) {
+    const primaryEmployee = (task.assigneeIds || [])[0] || null;
+    setImmediate(async () => {
+      try {
+        const pmpSvc = require("./pmpService");
+        await pmpSvc.writeC2ScoreOnComplete({
+          taskId,
+          task,
+          employeeId: primaryEmployee,
+        });
+      } catch (e) {
+        console.error("[C2 score on complete]", e.message);
+      }
+    });
+  }
+  // ─────────────────────────────────────────────────────────────────────
+
   const finalStatus = approved
     ? (flow === "tl_final" ? "tl_final_approved" : flow === "ceo_direct" ? "ceo_approved" : "tl_approved")
     : "tl_rejected";
   return { success: true, taskId, approved, completionStatus: finalStatus, reviewFlow: flow };
+}
+
+
+// ═════════════════════════════════════════════════════════
+
+// ═════════════════════════════════════════════════════════
+//  C1 REWORK — TL sends task back for rework (-0.2 per occurrence)
+// ═════════════════════════════════════════════════════════
+async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiveDeduction = false }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+  if (task.completionStatus !== "submitted") throw new Error("Task has not been submitted yet.");
+
+  const currentReworks = Number(task.c1?.reworksReceived) || 0;
+
+  await ref.update({
+    completionStatus: null,
+    status: "in_progress",
+    "c1.reworksReceived": currentReworks + 1,
+    reworkHistory: admin.firestore.FieldValue.arrayUnion({
+      reworkNumber: currentReworks + 1,
+      reason: reworkReason || "",
+      sentBackBy: reviewerId,
+      sentBackByName: reviewerName,
+      sentBackAt: new Date().toISOString(),
+    }),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await sendTaskChat({
+    taskId, senderId: reviewerId, senderName: reviewerName,
+    text: `🔄 ${reviewerName} sent this task back for rework (rework #${currentReworks + 1}).\n📝 Reason: ${reworkReason || "No reason given"}`,
+    messageType: "system",
+  });
+
+  const submitterId = task.completionSubmission?.submittedBy;
+  if (submitterId) {
+    await _notifyMany({
+      recipientIds: [submitterId],
+      type: "task_rework",
+      title: `🔄 Rework Required · ${task.title}`,
+      body: `Reason: ${reworkReason || "Check task for details"}`,
+      data: { taskId, taskTitle: task.title, reason: reworkReason },
+      senderId: reviewerId, senderName: reviewerName,
+    });
+  }
+
+  // ── Write -0.2 deduction to SOP history (only if not waived) ────────────
+  const primaryEmployee = (task.assigneeIds || [])[0] || null;
+  if (primaryEmployee && !waiveDeduction) {
+    setImmediate(() => {
+      c1Svc.writeReworkDeduction({
+        employeeId: primaryEmployee,
+        taskId,
+        taskTitle: task.title || taskId,
+        reviewerId,
+        reviewerName,
+        reworkNumber: currentReworks + 1,
+      }).catch(e => console.error("[rework bleach]", e.message));
+    });
+  }
+
+  return { success: true, taskId, reworkNumber: currentReworks + 1 };
 }
 
 // ═════════════════════════════════════════════════════════
@@ -1126,6 +1255,20 @@ async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved,
     await _notifyMany({ recipientIds: allIds, type: "completion_ceo_rejected", title: `❌ Rejected: ${task.title}`, body: `CEO: ${rejectionReason.trim()}`, data: { taskId, taskTitle: task.title, reason: rejectionReason.trim() }, senderId: reviewerId, senderName: reviewerName });
     socket.emitToMany(allIds, "task_completion_rejected", { taskId });
   }
+  // ── C1 score on CEO final review ─────────────────────────────────────
+  if (approved) {
+    const primaryEmployee = (task.assigneeIds || [])[0] || null;
+    setImmediate(() => {
+      c1Svc.computeAndStoreTaskScore({
+        taskId,
+        taskData: task,
+        employeeId: primaryEmployee,
+        isRejected: false,
+        submittedAt: task.completionSubmission?.submittedAt || null,
+      }).catch(e => console.error("[C1 score on CEO review]", e.message));
+    });
+  }
+  // ─────────────────────────────────────────────────────────────────────
   return { success: true, taskId, approved, completionStatus: approved ? "ceo_approved" : "ceo_rejected" };
 }
 
@@ -1640,6 +1783,7 @@ module.exports = {
   deleteTask,
   submitCompletionRequest,
   reviewCompletion,
+  reworkTask,
   ceoReviewCompletion,
   updateParentTaskProgress,
   deadlineStatus,
