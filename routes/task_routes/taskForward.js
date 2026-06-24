@@ -94,7 +94,7 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs } = req.body;
+    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs, isGoldTask, c2Config, etcHours } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
@@ -157,6 +157,9 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       thirdPartyConfig: (thirdPartyFlag && thirdPartyConfig) ? thirdPartyConfig : null,
       isGoal: goalFlag,
       goalConfig: (goalFlag && goalConfig) ? goalConfig : null,
+      isGoldTask: (isGoldTask === true || isGoldTask === "true") || false,
+      c2Config: c2Config || null,
+      etcHours: Number(etcHours) || 0,
       hasTimer: hasTimer !== false && hasTimer !== "false",
       fixedDeadline: fixedDeadline || null,
       isSelfAssigned: isSelfAssigned === true || isSelfAssigned === "true",
@@ -948,7 +951,83 @@ router.post("/task/:taskId/submit-completion", verifyCoworkToken, verifyEmployee
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ── 16. TL REVIEW ─────────────────────────────────────────────────────────────
+// ── POST /task/:taskId/rework — TL sends task back for rework ────────────────
+router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { reworkReason } = req.body;
+    const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
+    if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can rework tasks." });
+    const result = await svc.reworkTask({
+      taskId: req.params.taskId,
+      reviewerId, reviewerName,
+      reworkReason: reworkReason || "",
+    });
+    res.json(result);
+  } catch (e) {
+    console.error("[task/rework]", e.message);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ── POST /task/:taskId/extension-waive — TL waives extension deduction ────────
+// When TL approves extension and chooses "Waive Deduction",
+// the new deadline becomes the official deadline (no extensionsFiled+1).
+// When TL chooses "Confirm Deduction", extensionsFiled is incremented.
+router.post("/task/:taskId/extension-deduction", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    let { waiveDeduction, newDeadline } = req.body; // ← const → let
+    const { role } = req.coworkUser;
+    if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can set deduction." });
+
+    const { db: _db, admin: _admin } = require("../../config/firebaseAdmin");
+    const ref = _db.collection("cowork_tasks").doc(req.params.taskId);
+
+    // ── Auto-determine waive from stored elapsedPercent if TL didn't manually set ─
+    if (waiveDeduction === undefined || waiveDeduction === null) {
+      const _autoDoc = await ref.get();
+      const _autoTask = _autoDoc.data() || {};
+      const storedWaive = _autoTask.deadlineExtRequest?.isPenaltyWaived;
+      if (typeof storedWaive === "boolean") waiveDeduction = storedWaive;
+    }
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    if (waiveDeduction) {
+      // New deadline is official — no points cut for this extension
+      await ref.update({
+        "c1.officialDeadline": newDeadline || null,
+        updatedAt: _admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } else {
+      // Confirm deduction — extensionsFiled +1
+      // Also set officialDeadline so original deadline no longer used for scoring
+      const doc = await ref.get();
+      const taskData = doc.data() || {};
+      const current = Number(taskData?.c1?.extensionsFiled) || 0;
+      await ref.update({
+        "c1.extensionsFiled": current + 1,
+        "c1.officialDeadline": newDeadline || null,
+        updatedAt: _admin.firestore.FieldValue.serverTimestamp(),
+      });
+      // Write deduction to SOP history immediately
+      const primaryEmp = (taskData.assigneeIds || [])[0] || null;
+      if (primaryEmp) {
+        const c1Svc = require("../../services/c1Service");
+        setImmediate(() => c1Svc.writeExtensionDeduction({
+          employeeId: primaryEmp,
+          taskId: req.params.taskId,
+          taskTitle: taskData.title || req.params.taskId,
+          reviewerId: req.coworkUser?.employeeId || "",
+          reviewerName: req.coworkUser?.name || "TL",
+        }).catch(e => console.error("[ext deduction write]", e.message)));
+      }
+    }
+    res.json({ success: true, waiveDeduction });
+  } catch (e) {
+    console.error("[task/extension-deduction]", e.message);
+    res.status(400).json({ error: e.message });
+  }
+});
+
 router.post("/task/:taskId/review-completion", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { approved, rejectionReason } = req.body;
@@ -1231,6 +1310,59 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     if (!task.assigneeIds?.includes(req.coworkUser.employeeId))
       return res.status(403).json({ error: "Only assigned employees can request an extension" });
 
+    // ── ETC elapsed % — determines penalty zone (replaces 48hr rule) ─────
+    const extensionFiledAt = new Date().toISOString();
+    let elapsedPercent = 0;
+    let isPenaltyWaived = true; // default: no penalty
+
+    const etcHours = Number(task.etcHours) || 0;
+    if (etcHours > 0 && task.createdAtISO) {
+      try {
+        const { db: _db } = require("../../config/firebaseAdmin");
+        const schedSnap = await _db.collection("cowork_settings").doc("office").get();
+        const schedule = schedSnap.exists ? schedSnap.data().schedule : null;
+
+        if (schedule) {
+          const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+          const parseMins = t => { if (!t) return 0; const [h, m] = t.split(":").map(Number); return h * 60 + (m || 0); };
+          const start = new Date(task.createdAtISO);
+          const end = new Date();
+          let totalMins = 0;
+          const cursor = new Date(start);
+
+          while (cursor < end) {
+            const day = schedule[DAY_KEYS[cursor.getDay()]];
+            if (day && !day.isOff) {
+              const inMins = parseMins(day.inTime);
+              const outMins = parseMins(day.outTime);
+              const ds = new Date(cursor); ds.setHours(Math.floor(inMins / 60), inMins % 60, 0, 0);
+              const de = new Date(cursor); de.setHours(Math.floor(outMins / 60), outMins % 60, 0, 0);
+              const ws = new Date(Math.max(start.getTime(), ds.getTime()));
+              const we = new Date(Math.min(end.getTime(), de.getTime()));
+              if (we > ws) totalMins += (we - ws) / 60000;
+            }
+            cursor.setDate(cursor.getDate() + 1);
+            cursor.setHours(0, 0, 0, 0);
+          }
+          elapsedPercent = Math.min(100, +((totalMins / 60 / etcHours) * 100).toFixed(1));
+        } else {
+          // fallback: clock time
+          const msElapsed = Date.now() - new Date(task.createdAtISO).getTime();
+          elapsedPercent = Math.min(100, +((msElapsed / (etcHours * 3600000)) * 100).toFixed(1));
+        }
+      } catch (schedErr) {
+        console.error("[extension elapsed calc]", schedErr.message);
+        const msElapsed = Date.now() - new Date(task.createdAtISO).getTime();
+        elapsedPercent = Math.min(100, +((msElapsed / (etcHours * 3600000)) * 100).toFixed(1));
+      }
+    }
+
+    // Zone 1 (0–50%)  : button disabled on frontend — if somehow submitted, no penalty
+    // Zone 2 (50–70%) : no penalty
+    // Zone 3 (70%+)   : penalty applies (−0.2 C1 deduction)
+    isPenaltyWaived = elapsedPercent < 70;
+    // ─────────────────────────────────────────────────────────────────────
+
     await taskRef.update({
       deadlineExtRequest: {
         proposedDate,
@@ -1238,7 +1370,10 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
         requestedBy: req.coworkUser.employeeId,
         requestedByName: req.coworkUser.name,
         requestedAt: admin.firestore.FieldValue.serverTimestamp(),
+        extensionFiledAt,
+        elapsedPercent,
         status: "pending",
+        isPenaltyWaived,
       },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
