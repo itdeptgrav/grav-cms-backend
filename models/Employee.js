@@ -258,6 +258,23 @@ const employeeSchema = new mongoose.Schema({
       bleaches: [
         {
           sopId: { type: mongoose.Schema.Types.ObjectId, ref: "Sop" },
+
+          // ── Policy reference ───────────────────────────────────────────────
+          // Set when this bleach was created from a Compliance Policy violation
+          // (e.g. an attendance C4 deduction). Used to de-duplicate attendance
+          // suggestions so the same violation is never recorded twice.
+          policyId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Policy",
+            default: null,
+          },
+
+          // ── Category tag ───────────────────────────────────────────────────
+          // The SOP category this bleach belongs to — "C1", "C2", "C3", "C4".
+          // Replaces folderName for policy-driven entries that have no SOP
+          // folder. Folder-based SOP bleaches may leave this empty.
+          type: { type: String, default: "" },
+
           sopName: { type: String },
           folderName: { type: String, default: "Uncategorized" },
           points: { type: Number },
