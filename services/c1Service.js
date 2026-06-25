@@ -113,59 +113,49 @@ async function _writeC1BleachEntries({ employeeId, taskId, taskTitle, reviewerNa
         const year = new Date().getFullYear();
         const entries = [];
 
-        // One entry per deduction type (only if > 0)
-        // NOTE: rework deductions are written IMMEDIATELY at rework time (writeReworkDeduction)
-        // so we do NOT write them again here on approval to avoid double-deduction.
-        if (deadlinesMissed > 0) {
-            entries.push({
-                sopName: "C1 — Deadline Missed",
-                folderName: taskTitle || taskId,
-                points: +(deadlinesMissed * cfg.c1DeadlineDeduction).toFixed(2),
-                description: `Deadline missed (${deadlinesMissed}×) on task: ${taskTitle || taskId}`,
-                isC1: true, bleachType: "credit", isCredit: false,
-                date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
-                taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
-            });
-        }
-        // ── Rejection deduction — uses admin-set c1RejectScore ───────────────────
-        // If admin sets c1RejectScore > 0, write that amount as a deduction to SOP history
-        // If c1RejectScore = 0 → nothing written (no penalty)
-        if (isRejected && Number(cfg.c1RejectScore) > 0) {
-            entries.push({
-                sopName: "C1 — Task Rejected",
-                folderName: taskTitle || taskId,
-                points: +Number(cfg.c1RejectScore).toFixed(2),
-                description: `Task rejected · Deduction: ${cfg.c1RejectScore} pts · ${taskTitle || taskId}`,
-                isC1: true, bleachType: "credit", isCredit: false,
-                date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
-                taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
-            });
-        }
+        // ── Single entry — final task score ──────────────────────────────────────
+        // taskScore already includes ALL deductions (rework + extension + deadline)
+        // We write ONE entry only — the net earned score.
+        // Rework/extension are NOT written separately (they are included in taskScore)
+        // Deadline is NOT written separately (included in taskScore)
+        // reworksReceived already written to SOP immediately via writeReworkDeduction
+        // exclude here to avoid double-counting
+        const taskScore = calculateTaskScore(cfg, {
+            deadlinesMissed, extensionsFiled, reworksReceived: 0, isRejected
+        });
 
-        // ── Task completion reward (positive entry) ──────────────────────────────
-        // Always written when task is approved with a positive score
-        // This shows the "credit side" in SOP history balancing the deductions
-        if (!isRejected) {
-            const taskScore = calculateTaskScore(cfg, {
-                deadlinesMissed, extensionsFiled, reworksReceived, isRejected
-            });
-            if (taskScore > 0) {
-                entries.unshift({
-                    sopName: "C1 — Task Completed",
+        if (isRejected) {
+            // Rejection — write as penalty if rejectScore > 0
+            if (Number(cfg.c1RejectScore) > 0) {
+                entries.push({
+                    sopName: "C1 — Task Rejected",
+                    type: "C1",
                     folderName: taskTitle || taskId,
-                    points: +Number(cfg.c1BaseScore).toFixed(2),
-                    description: `Task approved · Score: ${taskScore.toFixed(2)} · ${taskTitle || taskId}`,
-                    isC1: true,
-                    bleachType: "debit",   // ← REWARD (positive, green in SOP history)
-                    isCredit: true,
-                    date: today,
-                    cutBy: reviewerId,
-                    cutByName: reviewerName,
-                    cutByRole: "tl",
-                    taskId,
-                    recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+                    points: +Number(cfg.c1RejectScore).toFixed(2),
+                    description: `Task rejected · Penalty: ${cfg.c1RejectScore} pts · ${taskTitle || taskId}`,
+                    isC1: true, bleachType: "credit", isCredit: false,
+                    date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
+                    taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
                 });
             }
+        } else if (taskScore > 0) {
+            // Approved — write final earned score as single reward entry
+            const events = [];
+            if (deadlinesMissed > 0) events.push(`${deadlinesMissed} deadline`);
+            if (extensionsFiled > 0) events.push(`${extensionsFiled} ext`);
+            if (reworksReceived > 0) events.push(`${reworksReceived} rework`);
+            const eventStr = events.length > 0 ? ` · ${events.join(", ")}` : "";
+
+            entries.push({
+                sopName: "C1 — Task Completed",
+                type: "C1",
+                folderName: taskTitle || taskId,
+                points: +taskScore.toFixed(2),
+                description: `Task approved · Score: ${taskScore.toFixed(2)}${eventStr} · ${taskTitle || taskId}`,
+                isC1: true, bleachType: "debit", isCredit: true,
+                date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
+                taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+            });
         }
 
         if (entries.length === 0) return;
@@ -329,32 +319,24 @@ async function markTaskCancelled(taskId) {
 // writeReworkDeduction — called IMMEDIATELY when TL confirms rework
 // Writes −0.2 (or whatever admin set) to SOP history right away
 // ─────────────────────────────────────────────────────────────────────────────
-async function writeReworkDeduction({ employeeId, taskId, taskTitle, reviewerId, reviewerName, reworkNumber }) {
+async function writeReworkDeduction({ employeeId, taskId, taskTitle, reviewerId = "", reviewerName = "", reworkNumber }) {
     try {
         const cfg = await getC1Config();
+        const pts = +Number(cfg.c1ReworkDeduction).toFixed(2);
         const employee = await Employee.findOne({ biometricId: employeeId });
         if (!employee) return;
-
         const today = new Date().toISOString().split("T")[0];
         const year = new Date().getFullYear();
-        const pts = +cfg.c1ReworkDeduction.toFixed(2);
-
         const entry = {
-            sopName: "C1 — Rework Deduction",
+            sopName: "C1 — Rework",
+            type: "C1",
             folderName: taskTitle || taskId,
             points: pts,
-            description: `Rework #${reworkNumber} on task: ${taskTitle || taskId}`,
-            isC1: true,
-            bleachType: "credit",
-            isCredit: false,
-            date: today,
-            cutBy: reviewerId,
-            cutByName: reviewerName,
-            cutByRole: "tl",
-            taskId,
-            recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+            description: `Rework #${reworkNumber} · −${pts} pts · ${taskTitle || taskId}`,
+            isC1: true, bleachType: "debit", isCredit: false,
+            date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
+            taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
         };
-
         if (!employee.sopPoints) employee.sopPoints = [];
         const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);
         if (yearIndex >= 0) {
@@ -363,9 +345,8 @@ async function writeReworkDeduction({ employeeId, taskId, taskTitle, reviewerId,
         } else {
             employee.sopPoints.push({ year, totalDeducted: pts, bleaches: [entry] });
         }
-
         await employee.save();
-        console.log(`[C1 rework] −${pts} written for ${employeeId} on task ${taskId} (rework #${reworkNumber})`);
+        console.log(`[C1 rework] Wrote −${pts} pts for ${employeeId} on task ${taskId}`);
     } catch (e) {
         console.error("[writeReworkDeduction]", e.message);
     }
@@ -376,37 +357,12 @@ async function writeReworkDeduction({ employeeId, taskId, taskTitle, reviewerId,
 // writeExtensionDeduction — called IMMEDIATELY when TL confirms extension deduction
 // ─────────────────────────────────────────────────────────────────────────────
 async function writeExtensionDeduction({ employeeId, taskId, taskTitle, reviewerId, reviewerName }) {
+    // Extension deduction is included in final taskScore at approval time.
+    // No separate SOP entry written here to avoid double-counting.
     try {
         const cfg = await getC1Config();
-        const employee = await Employee.findOne({ biometricId: employeeId });
-        if (!employee) return;
-
-        const today = new Date().toISOString().split("T")[0];
-        const year = new Date().getFullYear();
         const pts = +Number(cfg.c1ExtensionDeduction).toFixed(2);
-
-        const entry = {
-            sopName: "C1 — Extension Filed",
-            folderName: taskTitle || taskId,
-            points: pts,
-            description: `Extension approved with deduction: ${taskTitle || taskId}`,
-            isC1: true, bleachType: "credit", isCredit: false,
-            date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
-            taskId,
-            recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
-        };
-
-        if (!employee.sopPoints) employee.sopPoints = [];
-        const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);
-        if (yearIndex >= 0) {
-            employee.sopPoints[yearIndex].bleaches.push(entry);
-            employee.sopPoints[yearIndex].totalDeducted = +(employee.sopPoints[yearIndex].totalDeducted + pts).toFixed(2);
-        } else {
-            employee.sopPoints.push({ year, totalDeducted: pts, bleaches: [entry] });
-        }
-
-        await employee.save();
-        console.log(`[C1 extension] −${pts} written for ${employeeId} on task ${taskId}`);
+        console.log(`[C1 extension] Extension recorded on ${taskId} for ${employeeId} (−${pts} pts — applied at approval)`);
     } catch (e) {
         console.error("[writeExtensionDeduction]", e.message);
     }

@@ -20,7 +20,7 @@ const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "frida
 async function getOfficeSchedule() {
     const snap = await db.collection("cowork_settings").doc("office").get();
     if (!snap.exists || !snap.data().schedule) {
-        throw new Error("Office schedule not set. Configure it in Task Settings first.");
+        return null; // no schedule configured — hours will show as 0
     }
     return snap.data().schedule;
 }
@@ -85,23 +85,29 @@ function getTaskHours(task, now, schedule) {
     else if (Number(task.etcHours) > 0)
         timerHours = +Number(task.etcHours).toFixed(1);
 
-    // Task is overdue (dueDate in past)
-    if (task.dueDate && new Date(task.dueDate) <= now) {
+    const deadline = task.dueDate || task.fixedDeadline || null;
+
+    // No schedule configured — fall back to timer/etc hours only
+    if (!schedule) {
+        const overdue = deadline ? new Date(deadline) <= now : false;
+        return { hours: timerHours, overdue };
+    }
+
+    // Task is overdue (deadline in past)
+    if (deadline && new Date(deadline) <= now) {
         if (timerHours > 0) {
-            // Has timer — show timer hours + overdue
             return { hours: timerHours, overdue: true };
         }
-        // No timer — calculate office hrs from createdAt → dueDate
         const createdAt = task.createdAt
             ? new Date(task.createdAt)
-            : new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // fallback 7 days ago
-        const { hours } = calcOfficeHours(createdAt, task.dueDate, schedule);
+            : new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const { hours } = calcOfficeHours(createdAt, deadline, schedule);
         return { hours, overdue: true };
     }
 
     // Not overdue
     if (timerHours > 0) return { hours: timerHours, overdue: false };
-    if (task.dueDate) return calcOfficeHours(now, task.dueDate, schedule);
+    if (deadline) return calcOfficeHours(now, deadline, schedule);
 
     return { hours: 0, overdue: false };
 }
@@ -112,8 +118,9 @@ router.get("/workload/summary", verifyCoworkToken, verifyCeoOrTL, async (req, re
         const { role, employeeData } = req.coworkUser;
         const tlDepartment = employeeData?.department || null;
 
-        // Fetch office schedule — throws if not configured
+        // Fetch office schedule — null if not configured (hours default to 0)
         const schedule = await getOfficeSchedule();
+        if (!schedule) return res.json({ success: true, employees: [], scheduleNotSet: true });
         const now = new Date();
 
         // 1. Fetch employees
@@ -128,12 +135,16 @@ router.get("/workload/summary", verifyCoworkToken, verifyCeoOrTL, async (req, re
 
         if (employees.length === 0) return res.json({ success: true, employees: [] });
 
-        // 2. Fetch all active tasks
+        // 2. Fetch all active + pending-review tasks
         const tasksSnap = await db.collection("cowork_tasks")
-            .where("status", "in", ["open", "in_progress"])
+            .where("status", "in", ["open", "in_progress", "done"])
             .get();
 
-        const allTasks = tasksSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        // Hide only when fully approved — everything else stays visible
+        const APPROVED = ["tl_final_approved", "ceo_approved"];
+        const allTasks = tasksSnap.docs
+            .map(d => ({ id: d.id, ...d.data() }))
+            .filter(t => !APPROVED.includes(t.completionStatus));
 
         // 3. Group by assignee only (exclude created-by)
         const employeeIdSet = new Set(employees.map(e => e.employeeId));

@@ -94,7 +94,7 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs, isGoldTask, c2Config, etcHours } = req.body;
+    const { title, description, notes, requirements, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs, isGoldTask, c2Config, etcHours } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
@@ -160,6 +160,7 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       isGoldTask: (isGoldTask === true || isGoldTask === "true") || false,
       c2Config: c2Config || null,
       etcHours: Number(etcHours) || 0,
+      requirements: Array.isArray(requirements) ? requirements : [],
       hasTimer: hasTimer !== false && hasTimer !== "false",
       fixedDeadline: fixedDeadline || null,
       isSelfAssigned: isSelfAssigned === true || isSelfAssigned === "true",
@@ -954,13 +955,14 @@ router.post("/task/:taskId/submit-completion", verifyCoworkToken, verifyEmployee
 // ── POST /task/:taskId/rework — TL sends task back for rework ────────────────
 router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { reworkReason } = req.body;
+    const { reworkReason, waiveDeduction } = req.body;
     const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
     if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can rework tasks." });
     const result = await svc.reworkTask({
       taskId: req.params.taskId,
       reviewerId, reviewerName,
       reworkReason: reworkReason || "",
+      waiveDeduction: waiveDeduction === true || waiveDeduction === "true",
     });
     res.json(result);
   } catch (e) {
