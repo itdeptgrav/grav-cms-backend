@@ -14,6 +14,7 @@ const c1Svc = require("./c1Service");
 const Employee = require("../models/Employee");
 
 
+
 // ── Quarter weights (PDF Section 03) ─────────────────────────────────────────
 const QUARTER_WEIGHTS = { 1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40 };
 
@@ -266,6 +267,167 @@ async function computeC2ForEmployee(employeeId) {
 //           Using C2_net causes pace > 100% when hit rate is high. (PDF bug note)
 // Returns null if nothing is measurable yet.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// computeC3ForEmployee — reads C3 conduct breach deductions from MongoDB
+// ─────────────────────────────────────────────────────────────────────────────
+async function computeC3ForEmployee(employeeId, quarter, year) {
+    const emp = await Employee.findOne({ biometricId: employeeId }).lean();
+    if (!emp) return { c3Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+
+    const yearData = emp.sopPoints?.find(sp => sp.year === year);
+    if (!yearData) return { c3Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+
+    const qStartMonth = (quarter - 1) * 3 + 1;
+    const qEndMonth = qStartMonth + 2;
+
+    let totalDeductions = 0;
+    let breachCount = 0;
+    const breaches = [];
+
+    yearData.bleaches.forEach(b => {
+        if (b.type !== "C3") return; // only conduct breaches
+        if (b.bleachType !== "credit") return; // only penalties
+        if (b.recheck?.status === "confirmed") return; // skip reversed entries
+        if (!b.date) return;
+
+        const month = parseInt(b.date.slice(5, 7), 10);
+        if (month < qStartMonth || month > qEndMonth) return;
+
+        totalDeductions = +(totalDeductions + Number(b.points)).toFixed(2);
+        breachCount++;
+        breaches.push({
+            sopName: b.sopName,
+            points: b.points,
+            date: b.date,
+            cutByName: b.cutByName,
+        });
+    });
+
+    return {
+        c3Net: +(0 - totalDeductions).toFixed(2),
+        totalDeductions,
+        breachCount,
+        breaches,
+    };
+}
+
+async function computeC4ForEmployee(employeeId, quarter, year) {
+    const emp = await Employee.findOne({ biometricId: employeeId }).lean();
+    if (!emp) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+
+    const yearData = emp.sopPoints?.find(sp => sp.year === year);
+    if (!yearData) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+
+    const qStartMonth = (quarter - 1) * 3 + 1;
+    const qEndMonth = qStartMonth + 2;
+
+    let totalDeductions = 0;
+    let breachCount = 0;
+    const breaches = [];
+
+    yearData.bleaches.forEach(b => {
+        if (b.type !== "C4") return; // only attendance deductions
+        if (b.bleachType !== "credit") return; // only penalties
+        if (b.recheck?.status === "confirmed") return; // skip reversed entries
+        if (!b.date) return;
+
+        const month = parseInt(b.date.slice(5, 7), 10);
+        if (month < qStartMonth || month > qEndMonth) return;
+
+        totalDeductions = +(totalDeductions + Number(b.points)).toFixed(2);
+        breachCount++;
+        breaches.push({
+            sopName: b.sopName,
+            points: b.points,
+            date: b.date,
+            cutByName: b.cutByName,
+        });
+    });
+
+    return {
+        c4Net: +(0 - totalDeductions).toFixed(2),
+        totalDeductions,
+        breachCount,
+        breaches,
+    };
+}
+async function computeC4ForEmployee(employeeId, quarter, year) {
+    const emp = await Employee.findOne({ biometricId: employeeId }).lean();
+    if (!emp) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+
+    const yearData = emp.sopPoints?.find(sp => sp.year === year);
+    if (!yearData) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+
+    const qStartMonth = (quarter - 1) * 3 + 1;
+    const qEndMonth = qStartMonth + 2;
+
+    let totalDeductions = 0;
+    let breachCount = 0;
+    const breaches = [];
+
+    yearData.bleaches.forEach(b => {
+        if (b.type !== "C4") return; // only attendance deductions
+        if (b.bleachType !== "credit") return; // only penalties
+        if (b.recheck?.status === "confirmed") return; // skip reversed entries
+        if (!b.date) return;
+
+        const month = parseInt(b.date.slice(5, 7), 10);
+        if (month < qStartMonth || month > qEndMonth) return;
+
+        totalDeductions = +(totalDeductions + Number(b.points)).toFixed(2);
+        breachCount++;
+        breaches.push({
+            sopName: b.sopName,
+            points: b.points,
+            date: b.date,
+            cutByName: b.cutByName,
+        });
+    });
+
+    return {
+        c4Net: +(0 - totalDeductions).toFixed(2),
+        totalDeductions,
+        breachCount,
+        breaches,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getSOPBreakdown — sums SOP bleach pts by band type for a specific quarter
+// ─────────────────────────────────────────────────────────────────────────────
+async function getSOPBreakdown(employeeId, quarter, year) {
+    const emp = await Employee.findOne({ biometricId: employeeId }).lean();
+    const yearData = emp?.sopPoints?.find(sp => sp.year === year);
+    if (!yearData) return { c1: 0, c2: 0, c3: 0, c4: 0 };
+
+    const qStartMonth = (quarter - 1) * 3 + 1;
+    const qEndMonth = qStartMonth + 2;
+
+    const totals = { c1: 0, c2: 0, c3: 0, c4: 0 };
+
+    yearData.bleaches.forEach(b => {
+        if (b.recheck?.status === "confirmed") return;
+        if (!b.date) return;
+
+        // Filter by quarter
+        const entryYear = parseInt(b.date.slice(0, 4), 10);
+        const entryMonth = parseInt(b.date.slice(5, 7), 10);
+        if (entryYear !== year) return;
+        if (entryMonth < qStartMonth || entryMonth > qEndMonth) return;
+
+        const pts = Number(b.points) || 0;
+        const delta = b.bleachType === "debit" ? +pts : -pts;
+        const key = (b.type || "").toLowerCase();
+
+        if (key === "c1") totals.c1 = +(totals.c1 + delta).toFixed(2);
+        else if (key === "c2") totals.c2 = +(totals.c2 + delta).toFixed(2);
+        else if (key === "c3") totals.c3 = +(totals.c3 + delta).toFixed(2);
+        else if (key === "c4") totals.c4 = +(totals.c4 + delta).toFixed(2);
+    });
+
+    return totals;
+}
+
 function computePaceScore({ c1Net, c1Max, c2PtsEarned, c2PtsPastDeadline, c3 = 0, c4 = 0 }) {
     if (c1Net === null && c2PtsEarned === 0 && c2PtsPastDeadline === 0) return null;
 
@@ -419,6 +581,7 @@ async function writeC2ScoreOnComplete({ taskId, task, employeeId }) {
         return;
     }
 
+
     // ── Calculate earned pts from components ─────────────────────────────────
     const activities = task.goalActivities || [];
     let earnedPts;
@@ -488,14 +651,17 @@ async function getDashboardData(employeeId, quarter, year) {
     quarter = Number(quarter) || getQuarterFromDate();
     year = Number(year) || getCurrentYear();
 
-    // Parallel fetch C1 + C2
-    const [c1Data, c2Data] = await Promise.all([
+    const [c1Data, c2Data, c3Data, c4Data, sopBreakdown] = await Promise.all([
         computeC1ForQuarter(employeeId, quarter, year),
         computeC2ForEmployee(employeeId),
+        computeC3ForEmployee(employeeId, quarter, year),
+        computeC4ForEmployee(employeeId, quarter, year),
+        getSOPBreakdown(employeeId, quarter, year),
     ]);
 
-    const c3 = 0; // not yet implemented
-    const c4 = 0; // not yet implemented
+    const c3 = c3Data.c3Net;
+    const c4 = c4Data.c4Net;
+
 
     const pace = computePaceScore({
         c1Net: c1Data.c1Net,
@@ -504,6 +670,12 @@ async function getDashboardData(employeeId, quarter, year) {
         c2PtsPastDeadline: c2Data.ptsPastDeadline,
         c3, c4,
     });
+
+    // ── SOP-based pace (raw pts earned ÷ raw pts possible) ───────────────────
+    const sopAchieved = +(sopBreakdown.c1 + sopBreakdown.c2 + sopBreakdown.c3 + sopBreakdown.c4).toFixed(2);
+    const sopAchievable = +((c1Data.taskCount || 0) * 1.0 + (c2Data.ptsPastDeadline || 0)).toFixed(2);
+    const sopPaceScore = sopAchievable > 0 ? +(sopAchieved / sopAchievable * 100).toFixed(2) : 0;
+
 
     const rawQuarterScore = computeQuarterScore({
         c1Net: c1Data.c1Net,
@@ -535,6 +707,7 @@ async function getDashboardData(employeeId, quarter, year) {
             qualityRate: c1Data.qualityRate,
             taskCount: c1Data.taskCount,
             tasks: c1Data.tasks,
+            sopPts: sopBreakdown.c1,
         },
 
         // ── C2 ────────────────────────────────────────────────────────────────────
@@ -546,20 +719,30 @@ async function getDashboardData(employeeId, quarter, year) {
             score: c2Data.c2Score,
             taskCount: c2Data.taskCount,
             tasks: c2Data.tasks,
+            sopPts: sopBreakdown.c2,
         },
-
-        // ── C3 / C4 — hardcoded 0 ─────────────────────────────────────────────────
-        c3: { net: 0 },
-        c4: { net: 0 },
+        c3: {
+            net: c3Data.c3Net,
+            totalDeductions: c3Data.totalDeductions,
+            breachCount: c3Data.breachCount,
+            breaches: c3Data.breaches,
+            sopPts: sopBreakdown.c3,
+        },
+        c4: {
+            net: c4Data.c4Net,
+            totalDeductions: c4Data.totalDeductions,
+            breachCount: c4Data.breachCount,
+            breaches: c4Data.breaches,
+            sopPts: sopBreakdown.c4,
+        },
 
         // ── Pace ──────────────────────────────────────────────────────────────────
         pace: {
-            score: pace,
-            rating: getRating(pace),
-            numerator: +((c1Data.c1Net || 0) + c2Data.ptsEarned + c3 + c4).toFixed(2),
-            denominator: +(c1Data.c1Max + c2Data.ptsPastDeadline).toFixed(2),
-            // Live formula string for dashboard display
-            formula: `(${(c1Data.c1Net || 0).toFixed(1)} C1 + ${c2Data.ptsEarned.toFixed(1)} C2 earned + ${c3} C3 + ${c4} C4) ÷ (${c1Data.c1Max} + ${c2Data.ptsPastDeadline.toFixed(1)})`,
+            score: sopPaceScore,
+            rating: getRating(sopPaceScore),
+            numerator: sopAchieved,
+            denominator: sopAchievable,
+            formula: `(${sopBreakdown.c1} C1 + ${sopBreakdown.c2} C2 + ${sopBreakdown.c3} C3 + ${sopBreakdown.c4} C4) ÷ (${c1Data.taskCount || 0} tasks + ${c2Data.ptsPastDeadline.toFixed(1)} C2)`,
         },
 
         // ── Quarter raw score ─────────────────────────────────────────────────────

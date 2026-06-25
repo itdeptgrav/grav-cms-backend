@@ -35,6 +35,14 @@ router.post("/band-config", verifyCoworkToken, verifyCeoToken, async (req, res) 
         if (!bands || typeof bands !== "object") {
             return res.status(400).json({ error: "bands object required" });
         }
+        for (const [bandName, b] of Object.entries(bands)) {
+            const total = (Number(b.c1Max) || 0) + (Number(b.c2Max) || 0);
+            if (total > 100) {
+                return res.status(400).json({
+                    error: `${bandName}: C1 (${b.c1Max}) + C2 (${b.c2Max}) = ${total} — cannot exceed 100 pts.`
+                });
+            }
+        }
         await BandConfig.findOneAndUpdate(
             {},
             { bands, updatedAt: new Date(), updatedBy: req.coworkUser?.employeeId || "" },

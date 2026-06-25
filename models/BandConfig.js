@@ -9,8 +9,21 @@ const mongoose = require("mongoose");
 
 const BandSchema = new mongoose.Schema({
     bands: {
-        type: Object, // { "execution-led": { c1Max, c2Max, c3Max, c4Max, designations[] } }
+        type: Object,
         default: {},
+    },
+    globalSettings: {
+        c1: {
+            maxPoints: { award: { type: Number, default: 35 }, desc: { type: String, default: "" } },
+            baseScore: { award: { type: Number, default: 1.0 }, desc: { type: String, default: "" } },
+            deadline: { deduction: { type: Number, default: 0.2 }, desc: { type: String, default: "" } },
+            extension: { deduction: { type: Number, default: 0.1 }, desc: { type: String, default: "" } },
+            rework: { deduction: { type: Number, default: 0.2 }, desc: { type: String, default: "" } },
+            reject: { deduction: { type: Number, default: 0.3 }, desc: { type: String, default: "" } },
+        },
+        c2: {
+            globalMaxPoints: { award: { type: Number, default: 30 }, desc: { type: String, default: "" } },
+        },
     },
     updatedAt: { type: Date, default: Date.now },
     updatedBy: { type: String, default: "" },
