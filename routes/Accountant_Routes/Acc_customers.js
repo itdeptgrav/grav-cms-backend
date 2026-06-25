@@ -240,52 +240,22 @@ function parseSortParam(raw) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth middleware
 // ─────────────────────────────────────────────────────────────────────────────
-const verifyAccountantToken = async (req, res, next) => {
-  try {
-    const token = req.cookies.auth_token;
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required. Please sign in.",
-      });
-    }
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET || "grav_clothing_secret_key",
-    );
-    if (decoded.role !== "accountant" || decoded.userType !== "accountant") {
-      return res.status(403).json({
-        success: false,
-        message: "Access denied. Accountant privileges required.",
-      });
-    }
-    req.accountantId = decoded.id;
-    req.user = {
-      id: decoded.id,
-      role: decoded.role,
-      employeeId: decoded.employeeId,
-      userType: decoded.userType,
-    };
+// Delegate to the org-aware middleware so the owner AND sub-accounts
+// (approver/editor/viewer) authenticate the same way as the rest of the
+// accountant module. The old version read only the legacy `auth_token` cookie,
+// so sub-accounts — who carry an `accountant_token` and no `auth_token` — always
+// got 401 here. orgAuth accepts accountant_token / auth_token / Bearer, both token
+// shapes, and also enforces isActive + "log out of all devices" on these routes.
+const {
+  orgAuth: _orgAuthForCustomers,
+} = require("../../Middlewear/AccountantOrgAuthMiddleware");
+const verifyAccountantToken = (req, res, next) => {
+  _orgAuthForCustomers(req, res, () => {
+    // Some customer routes read req.accountantId — keep it populated.
+    if (req.user && req.user.id) req.accountantId = req.user.id;
     next();
-  } catch (error) {
-    console.error("Accountant auth middleware error:", error);
-    if (error.name === "TokenExpiredError") {
-      return res.status(401).json({
-        success: false,
-        message: "Session expired. Please login again.",
-      });
-    }
-    if (error.name === "JsonWebTokenError") {
-      return res
-        .status(401)
-        .json({ success: false, message: "Invalid authentication token" });
-    }
-    return res
-      .status(401)
-      .json({ success: false, message: "Authentication failed" });
-  }
+  });
 };
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SHARED HELPER: getAllCustomersForExport
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1838,6 +1808,65 @@ router.get(
         return { ...rest, appliedToBills: bills };
       });
 
+      // ── Ledger-true statement + outstanding ──────────────────────────────
+      // The document totals above (sales/receipt/credit-note grandTotal) do NOT
+      // match the ledger: they skip journal/payment/contra vouchers that hit
+      // this party, and they use the gross invoice value instead of the rounded
+      // amount actually posted to the party line (sales vouchers carry a
+      // "Rounding Off" line). So we rebuild the statement and the outstanding
+      // straight from ledgerEntries across EVERY posted voucher touching this
+      // ledger — identical to how the ledger page computes them.
+      const stmtVouchers = await Acc_Voucher.find({
+        companyId,
+        status: "posted",
+        "ledgerEntries.ledgerId": ledger._id,
+      })
+        .select(
+          "voucherType voucherTypeName voucherNumber voucherDate partyLedgerName narration ledgerEntries grandTotal",
+        )
+        .sort({ voucherDate: 1, createdAt: 1 })
+        .lean();
+
+      // Opening balance for this ledger (fetched explicitly — the `ledger`
+      // object resolved earlier may not have selected the opening fields).
+      const openingLed = await Acc_Ledger.findById(ledger._id)
+        .select("openingBalance openingBalanceType")
+        .lean();
+      const openSigned =
+        (openingLed && openingLed.openingBalanceType === "Cr" ? -1 : 1) *
+        Math.abs((openingLed && openingLed.openingBalance) || 0);
+
+      let stmtRunning = openSigned;
+      let ledgerDr = 0;
+      let ledgerCr = 0;
+      const statement = [];
+      for (const v of stmtVouchers) {
+        let dr = 0;
+        let cr = 0;
+        for (const e of v.ledgerEntries || []) {
+          if (String(e.ledgerId) !== String(ledger._id)) continue;
+          if (e.type === "Dr") dr += e.amount || 0;
+          else cr += e.amount || 0;
+        }
+        ledgerDr += dr;
+        ledgerCr += cr;
+        stmtRunning += dr - cr;
+        statement.push({
+          voucherId: v._id,
+          date: v.voucherDate,
+          voucherType: v.voucherType,
+          voucherTypeName: v.voucherTypeName || v.voucherType,
+          voucherNumber: v.voucherNumber || null,
+          counterParty: v.partyLedgerName || null,
+          narration: v.narration || null,
+          debit: dr,
+          credit: cr,
+          runningBalance: Math.abs(stmtRunning),
+          runningType: stmtRunning < 0 ? "Cr" : "Dr",
+        });
+      }
+      const closingSigned = stmtRunning;
+
       res.status(200).json({
         success: true,
         ledger,
@@ -1845,14 +1874,24 @@ router.get(
           totalInvoiced,
           totalReceived,
           totalCredited,
-          outstanding: Math.max(
-            0,
-            totalInvoiced - totalReceived - totalCredited,
-          ),
+          // Outstanding now equals the ledger's closing balance (Dr = they owe us).
+          outstanding:
+            closingSigned > 0 ? parseFloat(closingSigned.toFixed(2)) : 0,
+          advance:
+            closingSigned < 0
+              ? parseFloat(Math.abs(closingSigned).toFixed(2))
+              : 0,
+          ledgerDebit: parseFloat(ledgerDr.toFixed(2)),
+          ledgerCredit: parseFloat(ledgerCr.toFixed(2)),
+          openingBalance: parseFloat(Math.abs(openSigned).toFixed(2)),
+          openingType: openSigned < 0 ? "Cr" : "Dr",
+          closingBalance: parseFloat(Math.abs(closingSigned).toFixed(2)),
+          closingType: closingSigned < 0 ? "Cr" : "Dr",
           invoiceCount: invoices.length,
           receiptCount: receipts.length,
           cnCount: creditNotes.length,
         },
+        statement,
         recentInvoices: invoices.slice(0, 10),
         recentReceipts: slimReceipts.slice(0, 10),
         recentCreditNotes: creditNotes.slice(0, 10),

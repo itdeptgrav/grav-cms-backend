@@ -1414,6 +1414,15 @@ router.get("/dashboard-overview", auth, async (req, res) => {
       },
       { $unwind: { path: "$_led", preserveNullAndEmptyArrays: true } },
       {
+        $lookup: {
+          from: "acc_groups",
+          localField: "_led.groupId",
+          foreignField: "_id",
+          as: "_grp",
+        },
+      },
+      { $unwind: { path: "$_grp", preserveNullAndEmptyArrays: true } },
+      {
         $project: {
           voucherType: 1,
           voucherDate: 1,
@@ -1424,6 +1433,12 @@ router.get("/dashboard-overview", auth, async (req, res) => {
             $ifNull: ["$_led.groupName", "$ledgerEntries.groupName"],
           },
           nature: "$_led.nature",
+          // GROUP's nature is the authoritative revenue/expense flag (the
+          // P&L report uses exactly this). Active flags let us mirror the
+          // P&L, which only walks active ledgers/groups.
+          groupNature: "$_grp.nature",
+          ledgerActive: "$_led.isActive",
+          groupActive: "$_grp.isActive",
           type: "$ledgerEntries.type",
           amount: "$ledgerEntries.amount",
           signedAmount: {
@@ -1461,11 +1476,11 @@ router.get("/dashboard-overview", auth, async (req, res) => {
     const monthlyMap = {}; // "YYYY-MM" → { revenue, expenses }
     const dailyMap = {}; // "YYYY-MM-DD" → { revenue, expenses }
 
-    // Group names that indicate revenue / expense
-    const revenueGroups =
-      /sales\s*account|direct\s*income|indirect\s*income|revenue/i;
-    const expenseGroups =
-      /direct\s*expense|indirect\s*expense|purchase\s*account|manufacturing\s*expense/i;
+    // Receivables / payables stay keyed by group NAME — those Tally group
+    // names ("Sundry Debtors"/"Sundry Creditors") are stable. Revenue and
+    // expense are now classified by the GROUP's nature and NETTED (signed),
+    // exactly like the /profit-loss report, so the dashboard KPI cards and
+    // the P&L report can never drift apart again.
     const receivableGroups = /sundry\s*debtor/i;
     const payableGroups = /sundry\s*creditor/i;
 
@@ -1473,14 +1488,18 @@ router.get("/dashboard-overview", auth, async (req, res) => {
       const gn = e.groupName || "";
       const sa = e.signedAmount || 0;
 
-      // Revenue (Cr to revenue accounts = negative signed, so negate)
-      if (revenueGroups.test(gn)) {
-        totalRevenue += Math.abs(sa);
-      }
-      // Expenses (Dr to expense accounts = positive signed)
-      if (expenseGroups.test(gn)) {
-        totalExpenses += Math.abs(sa);
-      }
+      // Revenue / expense — by GROUP nature, netted. A revenue ledger is
+      // credit-natured (income = -signed); an expense ledger is debit-
+      // natured (cost = +signed). Inactive ledgers/groups are skipped to
+      // match the P&L, which only walks active ones.
+      const liveRow = e.ledgerActive !== false && e.groupActive !== false;
+      let revAmt = 0;
+      let expAmt = 0;
+      if (liveRow && e.groupNature === "revenue") revAmt = -sa;
+      else if (liveRow && e.groupNature === "expense") expAmt = sa;
+      totalRevenue += revAmt;
+      totalExpenses += expAmt;
+
       // Receivables (Dr balance in Sundry Debtors)
       if (receivableGroups.test(gn) && sa > 0) {
         totalReceivables += sa;
@@ -1501,18 +1520,19 @@ router.get("/dashboard-overview", auth, async (req, res) => {
         else if (e.voucherType === "journal") journalCount++;
       }
 
-      // Monthly trend (by voucherDate)
+      // Monthly trend (by voucherDate) — uses the same signed, nature-based
+      // amounts so the trend reconciles to the KPI cards.
       const d = new Date(e.voucherDate);
       const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
       if (!monthlyMap[mk]) monthlyMap[mk] = { revenue: 0, expenses: 0 };
-      if (revenueGroups.test(gn)) monthlyMap[mk].revenue += Math.abs(sa);
-      if (expenseGroups.test(gn)) monthlyMap[mk].expenses += Math.abs(sa);
+      monthlyMap[mk].revenue += revAmt;
+      monthlyMap[mk].expenses += expAmt;
 
       // Daily trend
       const dk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
       if (!dailyMap[dk]) dailyMap[dk] = { revenue: 0, expenses: 0 };
-      if (revenueGroups.test(gn)) dailyMap[dk].revenue += Math.abs(sa);
-      if (expenseGroups.test(gn)) dailyMap[dk].expenses += Math.abs(sa);
+      dailyMap[dk].revenue += revAmt;
+      dailyMap[dk].expenses += expAmt;
     }
 
     // Build sorted monthly trend array
