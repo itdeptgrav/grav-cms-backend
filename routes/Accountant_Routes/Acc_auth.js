@@ -7,7 +7,6 @@ const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const router = express.Router();
 
-
 const {
   Acc_Organization,
   Acc_User,
@@ -108,6 +107,86 @@ router.post("/login", async (req, res) => {
 router.post("/logout", (req, res) => {
   clearAuthCookie(res);
   res.json({ success: true });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /logout-all  — invalidate this user's sessions on EVERY device
+// ─────────────────────────────────────────────────────────────────────────
+// Bumping tokenVersion makes every JWT previously signed for this user fail
+// the version check in orgAuth — including the token on the current device —
+// so all sessions are forced to re-login.
+router.post("/logout-all", orgAuth, async (req, res) => {
+  try {
+    // Legacy / dev sessions have no Acc_User row to bump — just clear locally.
+    if (req.user?.isLegacy || req.user?.isDev || !req.user?.id) {
+      clearAuthCookie(res);
+      return res.json({ success: true, message: "Logged out." });
+    }
+    await Acc_User.findByIdAndUpdate(req.user.id, {
+      $inc: { tokenVersion: 1 },
+      $set: { sessionsRevokedAt: new Date() },
+    });
+    clearAuthCookie(res);
+    res.json({
+      success: true,
+      message: "Logged out from all devices.",
+    });
+  } catch (e) {
+    console.error("[accountant/auth/logout-all]", e);
+    res.status(500).json({ success: false, message: "Logout failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /push-token — register an FCM web-push device token for the current
+// user. The accountant app calls this after the user grants notification
+// permission. Stored on Acc_User.fcmTokens; the approval-notification service
+// reads it to deliver web push. Idempotent ($addToSet handles re-registration
+// and multiple devices).
+// ─────────────────────────────────────────────────────────────────────────
+router.post("/push-token", orgAuth, async (req, res) => {
+  try {
+    const token = req.body?.token;
+    if (!token || typeof token !== "string") {
+      return res
+        .status(400)
+        .json({ success: false, message: "token is required" });
+    }
+    // A push token identifies a DEVICE, not a person. If another account
+    // previously registered this same token (shared browser, or this device
+    // switching logins), detach it from them first — otherwise it sits stale
+    // on that account and FCM keeps "accepting" sends to it that never arrive.
+    // Then attach it to whoever is logged in on this device now.
+    await Acc_User.updateMany(
+      { _id: { $ne: req.user.id }, fcmTokens: token },
+      { $pull: { fcmTokens: token } },
+    );
+    await Acc_User.updateOne(
+      { _id: req.user.id },
+      { $addToSet: { fcmTokens: token } },
+    );
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[accountant/auth/push-token]", e);
+    res.status(500).json({ success: false, message: "Failed to save token" });
+  }
+});
+
+// DELETE /push-token — drop a token (sign-out on this device / permission revoked)
+router.delete("/push-token", orgAuth, async (req, res) => {
+  try {
+    const token = req.body?.token;
+    if (token) {
+      await Acc_User.updateOne(
+        { _id: req.user.id },
+        { $pull: { fcmTokens: token } },
+      );
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error("[accountant/auth/push-token delete]", e);
+    res.status(500).json({ success: false, message: "Failed to remove token" });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -485,6 +564,24 @@ router.post("/sync-legacy", async (req, res) => {
         return res.status(403).json({
           success: false,
           message: "Account is inactive — contact your owner.",
+        });
+      }
+      // ── Reject a re-bootstrap after "log out of all devices" ─────────────
+      // If this owner hit logout-all, sessionsRevokedAt is set. A CMS token
+      // minted BEFORE that moment must not silently re-create an accountant
+      // session, or other devices never actually log out. The owner has to
+      // sign in again at /login (which issues a fresh CMS token, newer iat).
+      if (
+        user.sessionsRevokedAt &&
+        decoded.iat &&
+        decoded.iat * 1000 < new Date(user.sessionsRevokedAt).getTime()
+      ) {
+        clearAuthCookie(res);
+        return res.status(200).json({
+          success: false,
+          code: "SESSION_REVOKED",
+          message:
+            "You logged out of all devices. Please sign in again from the main login page.",
         });
       }
       user.lastLoginAt = new Date();

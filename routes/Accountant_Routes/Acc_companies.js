@@ -11,11 +11,19 @@ const {
   Acc_Group,
   ACC_DEFAULT_GROUPS,
 } = require("../../models/Accountant_model/Acc_MasterModels");
-// GST helpers — used to auto-derive stateCode/state from the company GSTIN
-// when the Settings page saves company GST details (open task #2).
-const gstState = require("../../services/gstState.util");
 
-router.use(accountantAuth);
+router.use((req, res, next) => {
+  if (req.method === "GET") return next();
+  const isOwner =
+    req.user?.role === "owner" || req.user?.isLegacy || req.user?.isDev;
+  if (!isOwner) {
+    return res.status(403).json({
+      success: false,
+      message: "Only the owner can add or manage companies.",
+    });
+  }
+  next();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper — seed Tally's 28 reserved groups for a brand-new company
@@ -162,12 +170,10 @@ router.post("/", async (req, res) => {
     });
   } catch (err) {
     console.error("POST tally company:", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: err.message || "Error creating company",
-      });
+    res.status(500).json({
+      success: false,
+      message: err.message || "Error creating company",
+    });
   }
 });
 

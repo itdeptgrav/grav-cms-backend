@@ -7,12 +7,19 @@ require("dotenv").config();
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
-const MONGO_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing";
+const MONGO_URI =
+  process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing";
 
 // Schema (mirrors your existing AccountantDepartment model)
 const accountantSchema = new mongoose.Schema(
   {
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
     password: { type: String, required: true },
     name: { type: String, required: true },
     employeeId: { type: String, required: true, unique: true },
@@ -21,7 +28,7 @@ const accountantSchema = new mongoose.Schema(
     role: { type: String, default: "accountant" },
     isActive: { type: Boolean, default: true },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
 accountantSchema.pre("save", async function () {
@@ -30,7 +37,10 @@ accountantSchema.pre("save", async function () {
   this.password = await bcrypt.hash(this.password, salt);
 });
 
-const AccountantDepartment = mongoose.model("AccountantDepartment", accountantSchema);
+const AccountantDepartment = mongoose.model(
+  "AccountantDepartment",
+  accountantSchema,
+);
 
 async function seedAccountant() {
   try {
@@ -38,13 +48,17 @@ async function seedAccountant() {
     console.log("✅ Connected to MongoDB");
 
     // Check if accountant already exists
-    const existing = await AccountantDepartment.findOne({ email: "accountant@grav.in" });
+    const existing = await AccountantDepartment.findOne({
+      email: "accounts@grav.in",
+    });
     if (existing) {
       console.log("✅ Accountant user already exists:");
-      console.log(`   Email: accountant@grav.in`);
+      console.log(`   Email: accounts@grav.in`);
       console.log(`   Name: ${existing.name}`);
       console.log(`   EmployeeId: ${existing.employeeId}`);
-      console.log("\n   Password is already hashed. If you forgot it, run this script with --reset flag.");
+      console.log(
+        "\n   Password is already hashed. If you forgot it, run this script with --reset flag.",
+      );
 
       if (process.argv.includes("--reset")) {
         existing.password = "Account@12345";
@@ -54,7 +68,7 @@ async function seedAccountant() {
     } else {
       const accountant = new AccountantDepartment({
         name: "Accountant Admin",
-        email: "accountant@grav.in",
+        email: "accounts@grav.in",
         password: "Account@12345", // will be hashed by pre-save hook
         employeeId: "ACC001",
         phone: "9999999999",
@@ -69,7 +83,7 @@ async function seedAccountant() {
       console.log("╔══════════════════════════════════════╗");
       console.log("║  ACCOUNTANT LOGIN CREDENTIALS        ║");
       console.log("╠══════════════════════════════════════╣");
-      console.log("║  Email:    accountant@grav.in        ║");
+      console.log("║  Email:    accounts@grav.in        ║");
       console.log("║  Password: Account@12345             ║");
       console.log("╚══════════════════════════════════════╝");
     }
