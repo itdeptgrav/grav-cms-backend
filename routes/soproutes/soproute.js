@@ -299,6 +299,7 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
             cutBy: appliedById,
             cutByName: appliedByName,
             cutByRole: role === "ceo" ? "ceo" : "tl",
+            type: "C3",
             bleachType: "credit", // SOP violation — adds to penalty score
             isCredit: false,
             recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
@@ -804,6 +805,7 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
 
         // Build the credit entry — bleachType:"debit" = reward (reduces penalty score)
         const creditEntry = {
+            type: "C2",
             sopId: null,
             sopName: componentName || "Goal Component",
             folderName: taskTitle || "Goal Task",
@@ -871,7 +873,7 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
                 ).toFixed(2);
 
                 const totalEarned = +Object.values(breakdown)
-                    .reduce((s, t) => s + (t.earned || 0), 0)
+                    .reduce((s, t) => s + (t.earnedPoints || 0), 0)
                     .toFixed(2);
 
                 await scoreRef.set({
@@ -895,6 +897,54 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
         });
     } catch (e) {
         console.error("[goal-credit]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// POST /cowork/sop/settings/sync — sync Firestore SOP settings to MongoDB
+router.post("/settings/sync", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+    try {
+        const {
+            c1MaxPoints, c1MaxPointsDesc,
+            c1BaseScore, c1BaseScoreDesc,
+            c1DeadlineDeduction, c1DeadlineDesc,
+            c1ExtensionDeduction, c1ExtensionDesc,
+            c1ReworkDeduction, c1ReworkDesc,
+            c1RejectScore, c1RejectDesc,
+            c2GlobalMaxPoints, c2GlobalMaxPointsDesc,
+        } = req.body;
+        const { employeeId } = req.coworkUser;
+        const { BandConfig } = require("../../models/BandConfig");
+
+        await BandConfig.findOneAndUpdate(
+            {},
+            {
+                $set: {
+                    "globalSettings.c1.maxPoints.award": Number(c1MaxPoints) || 35,
+                    "globalSettings.c1.maxPoints.desc": c1MaxPointsDesc || "",
+                    "globalSettings.c1.baseScore.award": Number(c1BaseScore) ?? 1.0,
+                    "globalSettings.c1.baseScore.desc": c1BaseScoreDesc || "",
+                    "globalSettings.c1.deadline.deduction": Number(c1DeadlineDeduction) ?? 0.2,
+                    "globalSettings.c1.deadline.desc": c1DeadlineDesc || "",
+                    "globalSettings.c1.extension.deduction": Number(c1ExtensionDeduction) ?? 0.1,
+                    "globalSettings.c1.extension.desc": c1ExtensionDesc || "",
+                    "globalSettings.c1.rework.deduction": Number(c1ReworkDeduction) ?? 0.2,
+                    "globalSettings.c1.rework.desc": c1ReworkDesc || "",
+                    "globalSettings.c1.reject.deduction": Number(c1RejectScore) ?? 0.3,
+                    "globalSettings.c1.reject.desc": c1RejectDesc || "",
+                    "globalSettings.c2.globalMaxPoints.award": Number(c2GlobalMaxPoints) || 30,
+                    "globalSettings.c2.globalMaxPoints.desc": c2GlobalMaxPointsDesc || "",
+                    updatedAt: new Date(),
+                    updatedBy: employeeId,
+                },
+
+            },
+            { upsert: true, new: true }
+        );
+
+        res.json({ success: true, message: "Settings synced to MongoDB." });
+    } catch (e) {
+        console.error("[settings/sync]", e.message);
         res.status(500).json({ error: e.message });
     }
 });
