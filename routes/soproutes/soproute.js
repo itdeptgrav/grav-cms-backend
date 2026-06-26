@@ -290,17 +290,18 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
         const year = new Date().getFullYear();
 
         const bleachEntry = {
-            sopId:        sop?._id || null,
-            sopName:      finalSopName,
-            folderName:   finalFolderName,
-            points:       finalPoints,
-            description:  description?.trim() || sop?.description || "",
-            date:         today,
-            cutBy:        appliedById,
-            cutByName:    appliedByName,
-            cutByRole:    role === "ceo" ? "ceo" : "tl",
-            bleachType:   "credit", // SOP violation — adds to penalty score
-            isCredit:     false,
+            sopId: sop?._id || null,
+            sopName: finalSopName,
+            folderName: finalFolderName,
+            points: finalPoints,
+            description: description?.trim() || sop?.description || "",
+            date: today,
+            cutBy: appliedById,
+            cutByName: appliedByName,
+            cutByRole: role === "ceo" ? "ceo" : "tl",
+            type: "C3",
+            bleachType: "credit", // SOP violation — adds to penalty score
+            isCredit: false,
             recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
         };
 
@@ -536,9 +537,7 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
                     employee.sopPoints[i].totalDeducted = +(
                         employee.sopPoints[i].totalDeducted - bleachPoints
                     ).toFixed(2);
-                    if (employee.sopPoints[i].totalDeducted < 0) employee.sopPoints[i].totalDeducted = 0;
                 }
-
                 found = true;
                 break;
             }
@@ -782,7 +781,7 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
         // If deadline is not set, credit unconditionally.
         let isOnTime = true;
         if (deadline && submittedAt) {
-            const deadlineDate  = new Date(deadline);
+            const deadlineDate = new Date(deadline);
             const submittedDate = new Date(submittedAt);
             isOnTime = submittedDate <= deadlineDate;
         }
@@ -800,23 +799,24 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
         const employee = await Employee.findOne({ biometricId: targetEmployeeId });
         if (!employee) return res.status(404).json({ error: "Employee not found." });
 
-        const year       = new Date().getFullYear();
-        const today      = new Date().toISOString().split("T")[0];
-        const absPoints  = Math.abs(Number(points));
+        const year = new Date().getFullYear();
+        const today = new Date().toISOString().split("T")[0];
+        const absPoints = Math.abs(Number(points));
 
         // Build the credit entry — bleachType:"debit" = reward (reduces penalty score)
         const creditEntry = {
-            sopId:        null,
-            sopName:      componentName || "Goal Component",
-            folderName:   taskTitle     || "Goal Task",
-            points:       absPoints,
-            description:  `On-time goal node approved: ${componentName || ""}`,
-            date:         today,
-            cutBy:        awardedById,
-            cutByName:    awardedByName,
-            cutByRole:    role === "ceo" ? "ceo" : "tl",
-            bleachType:   "debit",  // REWARD — subtracts from penalty score, shown GREEN
-            isCredit:     true,     // legacy boolean kept for compat
+            type: "C2",
+            sopId: null,
+            sopName: componentName || "Goal Component",
+            folderName: taskTitle || "Goal Task",
+            points: absPoints,
+            description: `On-time goal node approved: ${componentName || ""}`,
+            date: today,
+            cutBy: awardedById,
+            cutByName: awardedByName,
+            cutByRole: role === "ceo" ? "ceo" : "tl",
+            bleachType: "debit",  // REWARD — subtracts from penalty score, shown GREEN
+            isCredit: true,     // legacy boolean kept for compat
             taskId,
             componentId,
             recheck: {
@@ -842,15 +842,164 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
             });
         }
 
+
         await employee.save();
 
+        // ── Update cowork_c2_scores cache if this is a Gold Task component ───
+        const { isC2Band, c2TaskMaxPoints } = req.body;
+        if (isC2Band && absPoints > 0) {
+            try {
+                const { db, admin } = require("../../config/firebaseAdmin");
+                const scoreRef = db.collection("cowork_c2_scores").doc(targetEmployeeId);
+                const scoreSnap = await scoreRef.get();
+                const existing = scoreSnap.exists
+                    ? scoreSnap.data()
+                    : { employeeId: targetEmployeeId, totalEarned: 0, taskBreakdown: {} };
+                const breakdown = existing.taskBreakdown || {};
+
+                // Accumulate per-task earned pts
+                if (!breakdown[taskId]) {
+                    breakdown[taskId] = {
+                        taskId,
+                        taskTitle: taskTitle || "",
+                        taskMaxPoints: Number(c2TaskMaxPoints) || 0,
+                        earnedPoints: 0,
+                        weightagePercent: Number(req.body.c2WeightagePercent) || 0,
+                        completedAt: null,
+                    };
+                }
+                breakdown[taskId].earnedPoints = +(
+                    (breakdown[taskId].earnedPoints || 0) + absPoints
+                ).toFixed(2);
+
+                const totalEarned = +Object.values(breakdown)
+                    .reduce((s, t) => s + (t.earnedPoints || 0), 0)
+                    .toFixed(2);
+
+                await scoreRef.set({
+                    employeeId: targetEmployeeId,
+                    totalEarned,
+                    taskBreakdown: breakdown,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                }, { merge: true });
+
+                console.log(`[C2 cache] +${absPoints}pts for ${targetEmployeeId} comp=${componentName}. Total: ${totalEarned}`);
+            } catch (c2Err) {
+                console.error("[C2 cache update]", c2Err.message);
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         res.json({
-            success:  true,
+            success: true,
             credited: true,
-            message:  `−${absPoints} pts applied to ${employee.firstName}'s record for on-time completion of "${componentName}".`,
+            message: `−${absPoints} pts applied to ${employee.firstName}'s record for on-time completion of "${componentName}".`,
         });
     } catch (e) {
         console.error("[goal-credit]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// POST /cowork/sop/settings/sync — sync Firestore SOP settings to MongoDB
+router.post("/settings/sync", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+    try {
+        const {
+            c1MaxPoints, c1MaxPointsDesc,
+            c1BaseScore, c1BaseScoreDesc,
+            c1DeadlineDeduction, c1DeadlineDesc,
+            c1ExtensionDeduction, c1ExtensionDesc,
+            c1ReworkDeduction, c1ReworkDesc,
+            c1RejectScore, c1RejectDesc,
+            c2GlobalMaxPoints, c2GlobalMaxPointsDesc,
+        } = req.body;
+        const { employeeId } = req.coworkUser;
+        const { BandConfig } = require("../../models/BandConfig");
+
+        await BandConfig.findOneAndUpdate(
+            {},
+            {
+                $set: {
+                    "globalSettings.c1.maxPoints.award": Number(c1MaxPoints) || 35,
+                    "globalSettings.c1.maxPoints.desc": c1MaxPointsDesc || "",
+                    "globalSettings.c1.baseScore.award": Number(c1BaseScore) ?? 1.0,
+                    "globalSettings.c1.baseScore.desc": c1BaseScoreDesc || "",
+                    "globalSettings.c1.deadline.deduction": Number(c1DeadlineDeduction) ?? 0.2,
+                    "globalSettings.c1.deadline.desc": c1DeadlineDesc || "",
+                    "globalSettings.c1.extension.deduction": Number(c1ExtensionDeduction) ?? 0.1,
+                    "globalSettings.c1.extension.desc": c1ExtensionDesc || "",
+                    "globalSettings.c1.rework.deduction": Number(c1ReworkDeduction) ?? 0.2,
+                    "globalSettings.c1.rework.desc": c1ReworkDesc || "",
+                    "globalSettings.c1.reject.deduction": Number(c1RejectScore) ?? 0.3,
+                    "globalSettings.c1.reject.desc": c1RejectDesc || "",
+                    "globalSettings.c2.globalMaxPoints.award": Number(c2GlobalMaxPoints) || 30,
+                    "globalSettings.c2.globalMaxPoints.desc": c2GlobalMaxPointsDesc || "",
+                    updatedAt: new Date(),
+                    updatedBy: employeeId,
+                },
+
+            },
+            { upsert: true, new: true }
+        );
+
+        res.json({ success: true, message: "Settings synced to MongoDB." });
+    } catch (e) {
+        console.error("[settings/sync]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// GET /cowork/sop/performance-summary — CEO only
+router.get("/performance-summary", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+    try {
+        const { db } = require("../../config/firebaseAdmin");
+
+        const [coworkSnap, employees] = await Promise.all([
+            db.collection("cowork_employees").get(),
+            Employee.find(
+                { biometricId: { $exists: true, $ne: "" } },
+                { biometricId: 1, sopPoints: 1 }
+            ).lean(),
+        ]);
+
+        const coworkMap = {};
+        coworkSnap.docs.forEach(d => {
+            const data = d.data();
+            if (data.employeeId) coworkMap[data.employeeId] = {
+                name: data.name || "",
+                department: data.department || "",
+            };
+        });
+
+        const results = employees
+            .filter(emp => emp.biometricId && coworkMap[emp.biometricId])
+            .map(emp => {
+                const sopPoints = emp.sopPoints || [];
+                let rewards = 0, deductions = 0;
+                sopPoints.forEach(yp => {
+                    (yp.bleaches || []).forEach(b => {
+                        if (b.recheck?.status === "confirmed") return;
+                        const pts = Number(b.points) || 0;
+                        if (b.bleachType === "debit") rewards += pts;
+                        else deductions += pts;
+                    });
+                });
+                const netScore = +(rewards - deductions).toFixed(2);
+                const cowork = coworkMap[emp.biometricId];
+                return {
+                    employeeId: emp.biometricId,
+                    name: cowork.name,
+                    department: cowork.department,
+                    netScore,
+                    rewards: +rewards.toFixed(2),
+                    deductions: +deductions.toFixed(2),
+                };
+            })
+            .sort((a, b) => b.netScore - a.netScore);
+
+        res.json({ success: true, employees: results });
+    } catch (e) {
+        console.error("[sop/performance-summary]", e.message);
         res.status(500).json({ error: e.message });
     }
 });
