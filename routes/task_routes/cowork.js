@@ -821,7 +821,11 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
       });
     } catch (e) { console.error("[role_changed email]", e.message); }
 
-    console.log(`[ChangeRole] ${employeeId} → ${role} | session revoked`);
+    // Invalidate auth cache so new role takes effect immediately
+    const { invalidateEmployeeCache } = require("../../Middlewear/coworkAuth");
+    invalidateEmployeeCache(authUid);
+
+    console.log(`[ChangeRole] ${employeeId} → ${role} | session revoked | cache cleared`);
     res.json({ success: true, employeeId, role });
   } catch (e) {
     res.status(500).json({ error: e.message });
