@@ -714,6 +714,9 @@ app.use("/api/ceo/cutting", ceoCuttingRoutes);
 const ceoInventoryRoutes = require("./routes/CEO_Routes/inventory");
 app.use("/api/ceo/inventory", ceoInventoryRoutes);
 
+const ceoAccountingReports = require("./routes/CEO_Routes/ceoAccountingReports");
+app.use("/api/ceo/accounting", ceoAccountingReports);
+
 const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
 app.use("/api/ceo/merchandiser", merchandiserRoutes);
 
