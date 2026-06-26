@@ -20,6 +20,7 @@
 
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 
 const Policy = require("../../models/HR_Models/Policy");
 const Department = require("../../models/HR_Models/Departments");
@@ -85,6 +86,305 @@ router.get("/employees", verifyHRToken, async (req, res) => {
           `${e.firstName || ""} ${e.lastName || ""}`.trim() || e.biometricId,
         department: e.department || "",
       })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POINTS SUMMARY (read-only dashboard data)
+// GET /api/hr/policy/points-summary?year=&from=&to=&type=
+//
+// Aggregates EVERY active employee's sopPoints bleaches — across all sources
+// (C1/C2/C3 from the cowork/admin side, C4 from this module). Each bleach is
+// self-describing, so no cowork-side models are needed here.
+//
+// Sign convention (backend): credit/penalty raises the net (worse), debit/
+// reward lowers it (better). Each employee/type also gets `score = -net`, the
+// "higher = better" number to show on screen.
+// ═════════════════════════════════════════════════════════════════════════════
+router.get("/points-summary", verifyHRToken, async (req, res) => {
+  try {
+    const year = req.query.year
+      ? Number(req.query.year)
+      : new Date().getFullYear();
+    const from = req.query.from ? String(req.query.from).slice(0, 10) : null;
+    const to = req.query.to ? String(req.query.to).slice(0, 10) : null;
+    const typeFilter = req.query.type || null;
+
+    const emps = await Employee.find({
+      $or: [{ status: "active" }, { isActive: true }],
+    })
+      .select("biometricId firstName lastName department sopPoints")
+      .lean();
+
+    const KNOWN = ["C1", "C2", "C3", "C4"];
+    const byType = {};
+    const ensure = (t) =>
+      (byType[t] = byType[t] || {
+        type: t,
+        count: 0,
+        penaltyPts: 0,
+        rewardPts: 0,
+        net: 0,
+      });
+    KNOWN.forEach(ensure);
+
+    const employees = [];
+    const recent = [];
+    const catalogByType = {}; // type -> Map(sopName -> {count, source})
+
+    for (const e of emps) {
+      const yp = (e.sopPoints || []).find((y) => y.year === year);
+      if (!yp) continue;
+      let empNet = 0;
+      const empByType = {};
+
+      for (const b of yp.bleaches || []) {
+        if (from && (!b.date || b.date < from)) continue;
+        if (to && (!b.date || b.date > to)) continue;
+        const t = KNOWN.includes(b.type) ? b.type : "Other";
+        if (typeFilter && t !== typeFilter) continue;
+
+        const pts = Number(b.points) || 0;
+        // Reward if explicitly debit OR the legacy isCredit flag is set.
+        const isReward = b.bleachType === "debit" || b.isCredit === true;
+        const bucket = ensure(t);
+        bucket.count += 1;
+        if (isReward) {
+          bucket.rewardPts += pts;
+          bucket.net -= pts;
+          empNet -= pts;
+          empByType[t] = (empByType[t] || 0) - pts;
+        } else {
+          bucket.penaltyPts += pts;
+          bucket.net += pts;
+          empNet += pts;
+          empByType[t] = (empByType[t] || 0) + pts;
+        }
+
+        const name = b.sopName || "—";
+        catalogByType[t] = catalogByType[t] || new Map();
+        const ex = catalogByType[t].get(name) || {
+          name,
+          type: t,
+          count: 0,
+          source: b.policyId ? "policy" : b.sopId ? "sop" : "task",
+        };
+        ex.count += 1;
+        catalogByType[t].set(name, ex);
+
+        recent.push({
+          biometricId: e.biometricId,
+          employeeName: `${e.firstName || ""} ${e.lastName || ""}`.trim(),
+          type: t,
+          name,
+          points: pts,
+          bleachType: isReward ? "debit" : "credit",
+          date: b.date || "",
+          by: b.cutByName || "",
+        });
+      }
+
+      if (Object.keys(empByType).length) {
+        employees.push({
+          biometricId: e.biometricId,
+          name:
+            `${e.firstName || ""} ${e.lastName || ""}`.trim() || e.biometricId,
+          department: e.department || "",
+          net: +empNet.toFixed(2),
+          score: +(-empNet).toFixed(2), // higher = better, for display
+          byType: empByType,
+        });
+      }
+    }
+
+    recent.sort((a, b) => (a.date < b.date ? 1 : -1));
+
+    const types = Object.values(byType).map((x) => ({
+      type: x.type,
+      count: x.count,
+      penaltyPts: +x.penaltyPts.toFixed(2),
+      rewardPts: +x.rewardPts.toFixed(2),
+      net: +x.net.toFixed(2),
+      score: +(-x.net).toFixed(2),
+    }));
+
+    const catalog = Object.entries(catalogByType).map(([t, map]) => ({
+      type: t,
+      policies: [...map.values()].sort((a, b) => b.count - a.count),
+    }));
+
+    const grandNet = types.reduce((s, t) => s + t.net, 0);
+
+    res.json({
+      success: true,
+      year,
+      from,
+      to,
+      types,
+      employees: employees.sort((a, b) => a.net - b.net), // best (lowest net) first
+      recent: recent.slice(0, 150),
+      catalog,
+      grandNet: +grandNet.toFixed(2),
+      grandScore: +(-grandNet).toFixed(2),
+      employeeCount: employees.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EMPLOYEE HISTORY (detail sidebar) — one employee, entry-by-entry, paginated
+// GET /api/hr/policy/employee-history/:biometricId?year=&type=&page=&limit=
+// `counts` powers the category tabs; `items` is the paginated list for `type`.
+// ═════════════════════════════════════════════════════════════════════════════
+router.get(
+  "/employee-history/:biometricId",
+  verifyHRToken,
+  async (req, res) => {
+    try {
+      const { biometricId } = req.params;
+      const year = req.query.year
+        ? Number(req.query.year)
+        : new Date().getFullYear();
+      const typeFilter =
+        req.query.type && req.query.type !== "all" ? req.query.type : null;
+      const page = Math.max(1, Number(req.query.page) || 1);
+      const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+
+      const emp = await Employee.findOne({ biometricId })
+        .select("biometricId firstName lastName department sopPoints")
+        .lean();
+      if (!emp) return res.status(404).json({ error: "Employee not found." });
+
+      const yp = (emp.sopPoints || []).find((y) => y.year === year);
+      const bleaches = yp ? yp.bleaches || [] : [];
+
+      const KNOWN = ["C1", "C2", "C3", "C4"];
+      const normType = (b) => (KNOWN.includes(b.type) ? b.type : "Other");
+
+      const counts = {
+        C1: 0,
+        C2: 0,
+        C3: 0,
+        C4: 0,
+        Other: 0,
+        all: bleaches.length,
+      };
+      let net = 0;
+      for (const b of bleaches) {
+        counts[normType(b)] += 1;
+        const pts = Number(b.points) || 0;
+        const isReward = b.bleachType === "debit" || b.isCredit === true;
+        net += isReward ? -pts : pts;
+      }
+
+      const items = bleaches
+        .filter((b) => !typeFilter || normType(b) === typeFilter)
+        .map((b) => {
+          const pts = Number(b.points) || 0;
+          const isReward = b.bleachType === "debit" || b.isCredit === true;
+          return {
+            type: normType(b),
+            name: b.sopName || "—",
+            description: b.description || "",
+            points: pts,
+            bleachType: isReward ? "debit" : "credit",
+            date: b.date || "",
+            by: b.cutByName || "",
+            recheckStatus: (b.recheck && b.recheck.status) || "none",
+          };
+        })
+        .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+
+      const total = items.length;
+      const totalPages = Math.max(1, Math.ceil(total / limit));
+      const start = (page - 1) * limit;
+
+      res.json({
+        success: true,
+        employee: {
+          biometricId: emp.biometricId,
+          name:
+            `${emp.firstName || ""} ${emp.lastName || ""}`.trim() ||
+            emp.biometricId,
+          department: emp.department || "",
+        },
+        year,
+        counts,
+        net: +net.toFixed(2),
+        score: +(-net).toFixed(2),
+        type: typeFilter || "all",
+        page,
+        limit,
+        total,
+        totalPages,
+        items: items.slice(start, start + limit),
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EXTERNAL RULES (read-only) — C1/C2/… scoring rules defined on the cowork side.
+// Source: bandconfigs.globalSettings. Each category (c1, c2, …) holds named
+// rules; a rule carries either `award` (points increase) or `deduction`
+// (penalty) plus a `desc`. Flattened here for display only — HR cannot edit.
+// GET /api/hr/policy/external-rules
+// ═════════════════════════════════════════════════════════════════════════════
+router.get("/external-rules", verifyHRToken, async (req, res) => {
+  try {
+    const doc = await mongoose.connection.db
+      .collection("bandconfigs")
+      .findOne({}, { sort: { updatedAt: -1 } });
+
+    if (!doc || !doc.globalSettings)
+      return res.json({
+        success: true,
+        rules: [],
+        updatedBy: doc ? doc.updatedBy || null : null,
+        updatedAt: doc ? doc.updatedAt || null : null,
+      });
+
+    const rules = [];
+    for (const [catKey, catRules] of Object.entries(doc.globalSettings)) {
+      if (!catRules || typeof catRules !== "object") continue;
+      const category = String(catKey).toUpperCase(); // c1 → C1
+      for (const [ruleKey, def] of Object.entries(catRules)) {
+        if (!def || typeof def !== "object") continue;
+        const hasAward = def.award !== undefined && def.award !== null;
+        const hasDeduction =
+          def.deduction !== undefined && def.deduction !== null;
+        if (!hasAward && !hasDeduction) continue;
+        rules.push({
+          category,
+          key: ruleKey,
+          name: def.desc || ruleKey,
+          points: Number(hasAward ? def.award : def.deduction) || 0,
+          // "award" = increases the employee's score (reward)
+          // "deduction" = penalty
+          type: hasAward ? "award" : "deduction",
+        });
+      }
+    }
+
+    // Group order: by category then by name, so display is stable.
+    rules.sort((a, b) =>
+      a.category === b.category
+        ? a.name.localeCompare(b.name)
+        : a.category.localeCompare(b.category),
+    );
+
+    res.json({
+      success: true,
+      rules,
+      updatedBy: doc.updatedBy || null,
+      updatedAt: doc.updatedAt || null,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
