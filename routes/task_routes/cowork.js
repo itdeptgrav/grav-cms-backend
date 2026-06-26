@@ -410,14 +410,14 @@ router.post("/group/:groupId/members", verifyCoworkToken, verifyCeoToken, async 
   try {
     const { employeeId } = req.body;
     if (!employeeId) return res.status(400).json({ error: "employeeId required" });
-    const result = await svc.addGroupMember(req.params.groupId, req.coworkUser.employeeId, employeeId);
+    const result = await svc.addGroupMember(req.params.groupId, req.coworkUser.employeeId, req.coworkUser.role, employeeId);
     res.json({ success: true, ...result });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 // ── REMOVE MEMBER ─────────────────────────────────────────
 router.delete("/group/:groupId/members/:employeeId", verifyCoworkToken, verifyCeoToken, async (req, res) => {
   try {
-    const result = await svc.removeGroupMember(req.params.groupId, req.coworkUser.employeeId, req.params.employeeId);
+    const result = await svc.removeGroupMember(req.params.groupId, req.coworkUser.employeeId, req.coworkUser.role, req.params.employeeId);
     res.json({ success: true, ...result });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -821,7 +821,11 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
       });
     } catch (e) { console.error("[role_changed email]", e.message); }
 
-    console.log(`[ChangeRole] ${employeeId} → ${role} | session revoked`);
+    // Invalidate auth cache so new role takes effect immediately
+    const { invalidateEmployeeCache } = require("../../Middlewear/coworkAuth");
+    invalidateEmployeeCache(authUid);
+
+    console.log(`[ChangeRole] ${employeeId} → ${role} | session revoked | cache cleared`);
     res.json({ success: true, employeeId, role });
   } catch (e) {
     res.status(500).json({ error: e.message });

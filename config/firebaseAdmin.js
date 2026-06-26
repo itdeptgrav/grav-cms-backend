@@ -21,6 +21,8 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
+db.settings({ ignoreUndefinedProperties: true });
+
 const auth = admin.auth();
 const messaging = admin.messaging();
 const rtdb = admin.database(); // Add this for Realtime Database

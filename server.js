@@ -714,6 +714,9 @@ app.use("/api/ceo/cutting", ceoCuttingRoutes);
 const ceoInventoryRoutes = require("./routes/CEO_Routes/inventory");
 app.use("/api/ceo/inventory", ceoInventoryRoutes);
 
+const ceoAccountingReports = require("./routes/CEO_Routes/ceoAccountingReports");
+app.use("/api/ceo/accounting", ceoAccountingReports);
+
 const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
 app.use("/api/ceo/merchandiser", merchandiserRoutes);
 
@@ -758,10 +761,8 @@ app.use("/api/employee", pushTokenRoutes);
 const barcodeRoutes = require("./routes/CMS_Routes/Inventory/Operations/barcodes");
 app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 
-const hrSopRoutes = require("./routes/HrRoutes/hrSopRoutes");
 const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 
-app.use("/api/hr/sop", hrSopRoutes);
 app.use("/api/ceo/sop", ceoSopRoutes);
 
 const salesSettingsRoutes = require("./routes/CMS_Routes/Sales/salesSettings");
@@ -800,7 +801,7 @@ app.use("/api/customer/password-reset", customerPasswordResetRoutes);
 
 const sopRoutes = require("./routes/soproutes/soproute");
 app.use("/cowork/sop", sopRoutes);
-
+app.use("/cowork", require("./routes/soproutes/bandConfig.routes"));
 // Add this to your server.js in the CMS ROUTES section
 const customerStockItemsRoutes = require("./routes/Customer_Routes/StockItems");
 app.use("/api/customer/stock-items", customerStockItemsRoutes);
@@ -999,6 +1000,9 @@ app.use("/hr/attendance", attendanceRouter);
 
 const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
 app.use("/api/hr/leaves", hrLeaveRoutes);
+
+app.use("/api/hr/policy", require("./routes/HrRoutes/policyRoutes"));
+app.use("/api/hr/sop", require("./routes/HrRoutes/hrSopRoutes"));
 
 app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
 
@@ -1271,6 +1275,12 @@ app.use("/cowork", taskTreeModule); // ✅ Fix: use .router
 
 const coworkRoutes = require("./routes/task_routes/cowork");
 app.use("/cowork", coworkRoutes);
+
+app.use("/cowork", require("./routes/task_routes/c2Band.routes"));
+app.use("/cowork", require("./routes/task_routes/c1Routes"));
+
+app.use("/cowork", require("./routes/task_routes/workloadroutes"));
+app.use("/cowork", require("./routes/task_routes/pmpRoutes"));
 
 app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 
