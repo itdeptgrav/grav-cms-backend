@@ -1,9 +1,9 @@
 // routes/HrRoutes/hrSopRoutes.js
-const express   = require("express");
-const router    = express.Router();
-const Sop       = require("../../models/sopmodel/sop_model");
+const express = require("express");
+const router = express.Router();
+const Sop = require("../../models/sopmodel/sop_model");
 const SopFolder = require("../../models/sopmodel/sop_folder_model");
-const Employee  = require("../../models/Employee");
+const Employee = require("../../models/Employee");
 const verifyHRToken = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 const HR_DEPT = "hr";
@@ -118,11 +118,11 @@ router.get("/employees", verifyHRToken, async (req, res) => {
             .sort({ firstName: 1 })
             .lean();
         const list = employees.map(e => ({
-            _id:        e._id,
+            _id: e._id,
             employeeId: e.biometricId,
-            name:       `${e.firstName || ""} ${e.lastName || ""}`.trim(),
+            name: `${e.firstName || ""} ${e.lastName || ""}`.trim(),
             department: e.department || "",
-            sopPoints:  e.sopPoints || [],
+            sopPoints: e.sopPoints || [],
         }));
         res.json({ success: true, employees: list });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -160,30 +160,31 @@ router.post("/bleach", verifyHRToken, async (req, res) => {
             const sop = await Sop.findById(sopId).lean();
             if (!sop) return res.status(404).json({ error: "SOP not found." });
             if (sop.status !== "approved") return res.status(400).json({ error: "Only approved SOPs can be applied." });
-            finalPoints    = sop.points;
-            finalSopName   = sop.name;
+            finalPoints = sop.points;
+            finalSopName = sop.name;
             finalFolderName = sop.folderName || "Uncategorized";
         } else {
-            finalPoints    = Number(manualPoints);
-            finalSopName   = manualSopName || "Manual Deduction";
+            finalPoints = Number(manualPoints);
+            finalSopName = manualSopName || "Manual Deduction";
             finalFolderName = "HR";
         }
 
-        const year  = new Date().getFullYear();
+        const year = new Date().getFullYear();
         const today = new Date().toISOString().split("T")[0];
 
         const bleachEntry = {
-            sopId:       sopId || null,
-            sopName:     finalSopName,
-            folderName:  finalFolderName,
-            points:      finalPoints,
+            sopId: sopId || null,
+            sopName: finalSopName,
+            folderName: finalFolderName,
+            points: finalPoints,
             description: description?.trim() || "",
-            date:        today,
-            isCredit:    false,
-            cutBy:       req.user?.employeeId || "",
-            cutByName:   cutByName || "HR Manager",
-            cutByRole:   cutByRole || "hr_manager",
-            recheck:     { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+            date: today,
+            isCredit: false,
+            type: "",
+            cutBy: req.user?.employeeId || "",
+            cutByName: cutByName || "HR Manager",
+            cutByRole: cutByRole || "hr_manager",
+            recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
         };
 
         const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);

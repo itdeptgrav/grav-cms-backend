@@ -274,6 +274,52 @@ router.delete("/:id/operations/:operationIndex", async (req, res) => {
 // IMPORTANT: Specific /data/* routes MUST be defined BEFORE /:id routes
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ✅ GET avg salary by department / designation for operations auto-fill
+router.get("/data/salary-lookup", async (req, res) => {
+  try {
+    const { department, designation } = req.query;
+
+    if (!department && !designation) {
+      const [depts, desigs] = await Promise.all([
+        Employee.distinct("department", { isActive: true }),
+        Employee.distinct("designation", { isActive: true }),
+      ]);
+      return res.json({
+        success: true,
+        departments: depts.filter(Boolean).sort(),
+        designations: desigs.filter(Boolean).sort(),
+      });
+    }
+
+    const filter = { isActive: true };
+    if (department) filter.department = department;
+    if (designation) filter.designation = designation;
+
+    const employees = await Employee.find(filter).select("salary").lean();
+    if (!employees.length) return res.json({ success: true, averageSalary: 0, count: 0 });
+
+    const { decryptSalaryFields } = require("../../../../utils/salaryEncryption");
+    let totalNet = 0, decryptedCount = 0;
+    for (const emp of employees) {
+      try {
+        const s = decryptSalaryFields(emp.salary || {});
+        const net = parseFloat(s.netSalary) || 0;
+        if (net > 0) { totalNet += net; decryptedCount++; }
+      } catch { /* skip undecryptable records */ }
+    }
+
+    return res.json({
+      success: true,
+      averageSalary: decryptedCount > 0 ? Math.round(totalNet / decryptedCount) : 0,
+      count: employees.length,
+      decryptedCount,
+    });
+  } catch (err) {
+    console.error("salary-lookup error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ✅ GET raw items with their variants + unit conversions for stock item form
 router.get("/data/raw-items", async (req, res) => {
   try {

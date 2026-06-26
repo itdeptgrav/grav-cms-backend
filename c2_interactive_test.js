@@ -132,6 +132,7 @@ async function simulateGoalCredit({ comp, taskId, taskTitle, taskMaxPts, weighta
     if (!emp) throw new Error(`Employee ${employeeId} not found`);
 
     const creditEntry = {
+        type: "C2",
         sopName: comp.heading || "Goal Component",
         folderName: taskTitle || taskId,
         points: absPoints,
