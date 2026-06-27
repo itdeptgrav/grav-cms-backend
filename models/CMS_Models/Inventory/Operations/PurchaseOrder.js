@@ -109,33 +109,34 @@ const paymentSchema = new mongoose.Schema({
     }
 }, { timestamps: true });
 
-const purchaseOrderSchema = new mongoose.Schema({
+const purchaseOrderSchema = new mongoose.Schema(
+  {
     // Basic Information
     poNumber: {
-        type: String,
-        trim: true,
-        unique: true,
-        required: [true, "PO number is required"]
+      type: String,
+      trim: true,
+      unique: true,
+      required: [true, "PO number is required"],
     },
     vendor: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "Vendor",
-        required: [true, "Vendor is required"]
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Vendor",
+      required: [true, "Vendor is required"],
     },
     vendorName: {
-        type: String,
-        trim: true,
-        default: ""
+      type: String,
+      trim: true,
+      default: "",
     },
 
     // Order Details
     orderDate: {
-        type: Date,
-        default: Date.now
+      type: Date,
+      default: Date.now,
     },
     expectedDeliveryDate: {
-        type: Date,
-        default: null
+      type: Date,
+      default: null,
     },
 
     // Items
@@ -143,100 +144,108 @@ const purchaseOrderSchema = new mongoose.Schema({
 
     // Pricing
     subtotal: {
-        type: Number,
-        min: 0,
-        default: 0
+      type: Number,
+      min: 0,
+      default: 0,
     },
     taxRate: {
-        type: Number,
-        min: 0,
-        max: 100,
-        default: 0
+      type: Number,
+      min: 0,
+      max: 100,
+      default: 0,
     },
     taxAmount: {
-        type: Number,
-        min: 0,
-        default: 0
+      type: Number,
+      min: 0,
+      default: 0,
     },
     shippingCharges: {
-        type: Number,
-        min: 0,
-        default: 0
+      type: Number,
+      min: 0,
+      default: 0,
     },
     discount: {
-        type: Number,
-        min: 0,
-        default: 0
+      type: Number,
+      min: 0,
+      default: 0,
     },
+    customCharges: [
+      {
+        label: { type: String, trim: true, default: "" },
+        amount: { type: Number, min: 0, default: 0 },
+      },
+    ],
     totalAmount: {
-        type: Number,
-        min: 0,
-        default: 0
+      type: Number,
+      min: 0,
+      default: 0,
     },
 
     // Delivery Tracking
     deliveries: [deliverySchema],
-    
+
     returnRequests: [returnRequestSchema],
 
     totalReceived: {
-        type: Number,
-        min: 0,
-        default: 0
+      type: Number,
+      min: 0,
+      default: 0,
     },
     totalPending: {
-        type: Number,
-        min: 0,
-        default: 0
+      type: Number,
+      min: 0,
+      default: 0,
     },
 
     // Status
     status: {
-        type: String,
-        enum: ["DRAFT", "ISSUED", "PARTIALLY_RECEIVED", "COMPLETED", "CANCELLED"],
-        default: "DRAFT"
+      type: String,
+      enum: ["DRAFT", "ISSUED", "PARTIALLY_RECEIVED", "COMPLETED", "CANCELLED"],
+      default: "DRAFT",
     },
 
     // Payment Information
     paymentStatus: {
-        type: String,
-        enum: ["PENDING", "PARTIAL", "COMPLETED"],
-        default: "PENDING"
+      type: String,
+      enum: ["PENDING", "PARTIAL", "COMPLETED"],
+      default: "PENDING",
     },
     payments: [paymentSchema],
     paymentTerms: {
-        type: String,
-        trim: true,
-        default: ""
+      type: String,
+      trim: true,
+      default: "",
     },
 
     // Additional Info
     notes: {
-        type: String,
-        trim: true,
-        default: ""
+      type: String,
+      trim: true,
+      default: "",
     },
     termsConditions: {
-        type: String,
-        trim: true,
-        default: ""
+      type: String,
+      trim: true,
+      default: "",
     },
 
     // References
     createdBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "ProjectManager",
-        required: [true, "Created by is required"]
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ProjectManager",
+      required: [true, "Created by is required"],
     },
     approvedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "ProjectManager"
-    }
-}, {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ProjectManager",
+    },
+  },
+  {
     timestamps: true,
     // Disable strict mode to allow additional fields
-    strict: false
-});
+    strict: false,
+  },
+);
 
 
 
