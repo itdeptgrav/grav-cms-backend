@@ -875,6 +875,8 @@ app.use("/api/cms/store", StoreRoutes);
 
 const workerWorkOrderRoutes = require("./routes/CMS_Routes/Store/workerWorkOrderRoutes");
 app.use("/api/cms/store/work-orders-worker", workerWorkOrderRoutes);
+const storepurchaseOrderRoutes = require("./routes/CMS_Routes/Store/purchaseOrderRoutes");
+app.use("/api/cms/store/purchase-orders", storepurchaseOrderRoutes);
 
 // Operations Category
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
