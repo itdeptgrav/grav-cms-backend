@@ -6,12 +6,15 @@ const purchaseOrderItemSchema = new mongoose.Schema({
     rawItem:    { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
     itemName:   { type: String, trim: true, required: true },
     sku:        { type: String, trim: true, default: "" },
-    unit:       { type: String, trim: true, default: "unit" },     // PO line unit
-    baseUnit:   { type: String, trim: true, default: "" },         // ← NEW: raw-item registered unit at PO time
+    unit:       { type: String, trim: true, default: "unit" },
+    baseUnit:   { type: String, trim: true, default: "" },
     quantity:   { type: Number, min: 0, required: true },
     unitPrice:  { type: Number, min: 0, required: true },
     totalPrice: { type: Number, min: 0, default: 0 },
-    receivedQuantity: { type: Number, min: 0, default: 0 },        // (only one — remove the duplicate)
+    // ── Per-item GST (replaces global taxRate) ──
+    gstRate:    { type: Number, min: 0, max: 100, default: 0 },
+    gstAmount:  { type: Number, min: 0, default: 0 },
+    receivedQuantity: { type: Number, min: 0, default: 0 },
     pendingQuantity:  { type: Number, min: 0, default: 0 },
     status: {
         type: String,
@@ -22,35 +25,18 @@ const purchaseOrderItemSchema = new mongoose.Schema({
     variantCombination:  [{ type: String, trim: true }],
     variantName:         { type: String, trim: true, default: "" },
     variantSku:          { type: String, trim: true, default: "" },
-    vendorNickname: { type: String, trim: true, default: "" },
+    vendorNickname:      { type: String, trim: true, default: "" },
     expectedDeliveryDate: { type: Date, default: null }
 }, { _id: true });
 
 const deliverySchema = new mongoose.Schema({
-    deliveryDate: {
-        type: Date,
-        default: Date.now
-    },
-    quantityReceived: {
-        type: Number,
-        min: 0
-    },
-    invoiceNumber: {
-        type: String,
-        trim: true
-    },
-    notes: {
-        type: String,
-        trim: true
-    },
-    receivedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "ProjectManager"
-    }
+    deliveryDate:     { type: Date, default: Date.now },
+    quantityReceived: { type: Number, min: 0 },
+    invoiceNumber:    { type: String, trim: true },
+    notes:            { type: String, trim: true },
+    receivedBy:       { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager" }
 }, { timestamps: true });
 
-
-// ── Return request receipt sub-doc ───────────────────────────────────────
 const returnReceiptSchema = new mongoose.Schema({
     quantityReceived: { type: Number, required: true, min: 0 },
     receivedDate:     { type: Date, default: Date.now },
@@ -58,7 +44,6 @@ const returnReceiptSchema = new mongoose.Schema({
     receivedBy:       { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
 }, { timestamps: true });
 
-// ── Return request sub-doc ───────────────────────────────────────────────
 const returnRequestSchema = new mongoose.Schema({
     poItemId:           { type: mongoose.Schema.Types.ObjectId, required: true },
     rawItem:            { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
@@ -82,162 +67,75 @@ const returnRequestSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const paymentSchema = new mongoose.Schema({
-    date: {
-        type: Date,
-        default: Date.now
-    },
-    amount: {
-        type: Number,
-        min: 0
-    },
+    date:            { type: Date, default: Date.now },
+    amount:          { type: Number, min: 0 },
     paymentMethod: {
         type: String,
         enum: ["CASH", "BANK_TRANSFER", "CHEQUE", "ONLINE", "OTHER"],
         default: "BANK_TRANSFER"
     },
-    referenceNumber: {
-        type: String,
-        trim: true
-    },
-    notes: {
-        type: String,
-        trim: true
-    },
-    recordedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "ProjectManager"
-    }
+    referenceNumber: { type: String, trim: true },
+    notes:           { type: String, trim: true },
+    recordedBy:      { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager" }
 }, { timestamps: true });
 
 const purchaseOrderSchema = new mongoose.Schema({
-    // Basic Information
     poNumber: {
-        type: String,
-        trim: true,
-        unique: true,
+        type: String, trim: true, unique: true,
         required: [true, "PO number is required"]
     },
     vendor: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "Vendor",
+        type: mongoose.Schema.Types.ObjectId, ref: "Vendor",
         required: [true, "Vendor is required"]
     },
-    vendorName: {
-        type: String,
-        trim: true,
-        default: ""
-    },
+    vendorName: { type: String, trim: true, default: "" },
 
-    // Order Details
-    orderDate: {
-        type: Date,
-        default: Date.now
-    },
-    expectedDeliveryDate: {
-        type: Date,
-        default: null
-    },
+    orderDate:            { type: Date, default: Date.now },
+    expectedDeliveryDate: { type: Date, default: null },
 
-    // Items
+    // ── PI Invoice ──────────────────────────────────────────────────────────
+    piInvoiceNumber: { type: String, trim: true, default: "" },
+    piInvoicePhoto:  { type: String, trim: true, default: "" }, // Cloudinary URL
+
     items: [purchaseOrderItemSchema],
 
-    // Pricing
-    subtotal: {
-        type: Number,
-        min: 0,
-        default: 0
-    },
-    taxRate: {
-        type: Number,
-        min: 0,
-        max: 100,
-        default: 0
-    },
-    taxAmount: {
-        type: Number,
-        min: 0,
-        default: 0
-    },
-    shippingCharges: {
-        type: Number,
-        min: 0,
-        default: 0
-    },
-    discount: {
-        type: Number,
-        min: 0,
-        default: 0
-    },
-    totalAmount: {
-        type: Number,
-        min: 0,
-        default: 0
-    },
+    // Pricing — taxAmount is now sum of per-item gstAmounts
+    subtotal:        { type: Number, min: 0, default: 0 },
+    taxRate:         { type: Number, min: 0, max: 100, default: 0 }, // kept for backward compat, not used in UI
+    taxAmount:       { type: Number, min: 0, default: 0 },           // = sum of items[].gstAmount
+    shippingCharges: { type: Number, min: 0, default: 0 },
+    discount:        { type: Number, min: 0, default: 0 },
+    totalAmount:     { type: Number, min: 0, default: 0 },
 
-    // Delivery Tracking
-    deliveries: [deliverySchema],
-    
-    returnRequests: [returnRequestSchema],
+    deliveries:    [deliverySchema],
+    returnRequests:[returnRequestSchema],
 
-    totalReceived: {
-        type: Number,
-        min: 0,
-        default: 0
-    },
-    totalPending: {
-        type: Number,
-        min: 0,
-        default: 0
-    },
+    totalReceived: { type: Number, min: 0, default: 0 },
+    totalPending:  { type: Number, min: 0, default: 0 },
 
-    // Status
     status: {
         type: String,
         enum: ["DRAFT", "ISSUED", "PARTIALLY_RECEIVED", "COMPLETED", "CANCELLED"],
         default: "DRAFT"
     },
-
-    // Payment Information
     paymentStatus: {
         type: String,
         enum: ["PENDING", "PARTIAL", "COMPLETED"],
         default: "PENDING"
     },
-    payments: [paymentSchema],
-    paymentTerms: {
-        type: String,
-        trim: true,
-        default: ""
-    },
+    payments:     [paymentSchema],
+    paymentTerms: { type: String, trim: true, default: "" },
+    notes:            { type: String, trim: true, default: "" },
+    termsConditions:  { type: String, trim: true, default: "" },
 
-    // Additional Info
-    notes: {
-        type: String,
-        trim: true,
-        default: ""
-    },
-    termsConditions: {
-        type: String,
-        trim: true,
-        default: ""
-    },
-
-    // References
     createdBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "ProjectManager",
+        type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager",
         required: [true, "Created by is required"]
     },
-    approvedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "ProjectManager"
-    }
+    approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager" }
 }, {
     timestamps: true,
-    // Disable strict mode to allow additional fields
     strict: false
 });
-
-
 
 module.exports = mongoose.model("PurchaseOrder", purchaseOrderSchema);
