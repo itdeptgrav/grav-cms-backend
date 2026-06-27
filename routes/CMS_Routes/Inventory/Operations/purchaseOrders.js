@@ -1,14 +1,4 @@
 // routes/CMS_Routes/Inventory/Operations/purchaseOrders.js
-//
-// CHANGES VS YOUR EXISTING FILE:
-//   - Helper `findVariantNickname` added: looks up a variant-specific
-//     vendor nickname from RawItem.variants[].vendorNicknames[]
-//   - POST / and PUT /:id now call findVariantNickname(rawItem, variantId, vendor)
-//     instead of looking at item-level rawItem.vendorNicknames (which is gone).
-//   - The .select() query for the RawItem now pulls "variants" so the lookup
-//     has the data it needs.
-//
-// EVERYTHING ELSE (auth, helpers, /receive, /payment, /status, etc.) is identical.
 
 const express = require("express");
 const router = express.Router();
@@ -18,16 +8,15 @@ const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Ven
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const VendorEmailService = require("../../../../services/VendorEmailService");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
+const StockIssuance = require("../../../../models/CMS_Models/Inventory/Operations/StockIssuance");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const generatePONumber = () => {
   const prefix = "PO";
-  const year = new Date().getFullYear().toString().slice(-2);
+  const year  = new Date().getFullYear().toString().slice(-2);
   const month = (new Date().getMonth() + 1).toString().padStart(2, "0");
   const randomNum = Math.floor(Math.random() * 10000)
     .toString()
@@ -35,7 +24,6 @@ const generatePONumber = () => {
   return `${prefix}${year}${month}${randomNum}`;
 };
 
-// ── Convert quantity using Unit conversions ────────────────────────────────
 async function convertQuantity(quantity, fromUnit, toUnit) {
   if (!fromUnit || !toUnit || fromUnit === toUnit) return quantity;
   if (!quantity || isNaN(quantity)) return quantity;
@@ -58,7 +46,6 @@ async function convertQuantity(quantity, fromUnit, toUnit) {
       );
       if (reverse?.quantity) return quantity / reverse.quantity;
     }
-    console.warn(`[PO convertQuantity] No path "${fromUnit}"→"${toUnit}".`);
     return quantity;
   } catch (err) {
     console.error("[PO convertQuantity]", err.message);
@@ -66,11 +53,6 @@ async function convertQuantity(quantity, fromUnit, toUnit) {
   }
 }
 
-// ── NEW: Find a variant's nickname for a specific vendor ────────────────────
-// rawItemDoc: lean object with .variants[].vendorNicknames[]
-// variantId: ObjectId or string of the variant on the PO line (optional)
-// vendorId: vendor ObjectId or string
-// Returns: nickname string or "" if not found
 const findVariantNickname = (rawItemDoc, variantId, vendorId) => {
   if (!rawItemDoc || !vendorId || !Array.isArray(rawItemDoc.variants))
     return "";
@@ -88,8 +70,6 @@ const findVariantNickname = (rawItemDoc, variantId, vendorId) => {
     }
     return "";
   }
-
-  // No variant selected → fall back to first nickname this vendor has on any variant
   for (const variant of rawItemDoc.variants) {
     const nks = variant?.vendorNicknames || [];
     const vn = nks.find((n) => n.vendor?.toString() === vendorId.toString());
@@ -98,18 +78,53 @@ const findVariantNickname = (rawItemDoc, variantId, vendorId) => {
   return "";
 };
 
+// ─── Build a single PO item (shared by POST + PUT) ───────────────────────────
+async function buildPoItem(item, vendorId) {
+  const ri = await RawItem.findById(item.rawItem)
+    .select("unit customUnit name sku variants").lean();
+  const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
+  const poUnit         = item.unit || registeredUnit;
+  const vendorNickname = findVariantNickname(ri, item.variantId, vendorId);
+  const qty            = Number(item.quantity)  || 0;
+  const price          = Number(item.unitPrice) || 0;
+  const totalPrice     = qty * price;
+  const gstRate        = Number(item.gstRate)   || 0;
+  const gstAmount      = totalPrice * gstRate / 100;
+
+  return {
+    rawItem:          item.rawItem,
+    itemName:         item.itemName || ri?.name || "Unknown Item",
+    sku:              item.sku      || ri?.sku  || "",
+    unit:             poUnit,
+    baseUnit:         registeredUnit,
+    vendorNickname,
+    quantity:         qty,
+    unitPrice:        price,
+    totalPrice,
+    gstRate,
+    gstAmount,
+    receivedQuantity: 0,
+    pendingQuantity:  qty,
+    status:           "PENDING",
+    variantId:        item.variantId          || null,
+    variantCombination: item.variantCombination || [],
+    variantName:      (item.variantCombination || []).join(" • ") || "",
+    variantSku:       item.variantSku          || "",
+    expectedDeliveryDate: item.expectedDeliveryDate ? new Date(item.expectedDeliveryDate) : null
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// GET all purchase orders
+// GET all
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
     const { search = "", status, vendor, startDate, endDate } = req.query;
-    let filter = {};
-
+    const filter = {};
     if (search) {
       filter.$or = [
-        { poNumber: { $regex: search, $options: "i" } },
-        { vendorName: { $regex: search, $options: "i" } },
+        { poNumber:     { $regex: search, $options: "i" } },
+        { vendorName:   { $regex: search, $options: "i" } },
         { "items.itemName": { $regex: search, $options: "i" } },
       ];
     }
@@ -118,13 +133,13 @@ router.get("/", async (req, res) => {
     if (startDate || endDate) {
       filter.orderDate = {};
       if (startDate) filter.orderDate.$gte = new Date(startDate);
-      if (endDate) filter.orderDate.$lte = new Date(endDate);
+      if (endDate)   filter.orderDate.$lte = new Date(endDate);
     }
 
     const purchaseOrders = await PurchaseOrder.find(filter)
       .populate("vendor", "companyName contactPerson phone email")
       .populate("items.rawItem", "name sku unit")
-      .populate("createdBy", "name email")
+      .populate("createdBy",  "name email")
       .populate("approvedBy", "name email")
       .populate("payments.recordedBy", "name email")
       .sort({ createdAt: -1 });
@@ -207,8 +222,7 @@ router.get("/data/vendor-items/:vendorId", async (req, res) => {
       .lean()
       .sort({ name: 1 });
 
-    const formatted = items.map((item) => {
-      // Keep only variants that have an alias for THIS vendor
+    const formatted = items.map(item => {
       const matchingVariants = (item.variants || [])
         .map((v) => {
           const alias = (v.vendorNicknames || []).find(
@@ -216,33 +230,21 @@ router.get("/data/vendor-items/:vendorId", async (req, res) => {
           );
           if (!alias) return null;
           return {
-            _id: v._id.toString(),
-            combination: v.combination || [],
-            sku: v.sku || "",
-            quantity: v.quantity || 0,
-            minStock: v.minStock || 0,
-            maxStock: v.maxStock || 0,
-            // vendor-specific alias data
-            aliasId: alias._id.toString(),
-            vendorCode: alias.nickname || "",
-            price: alias.price || 0,
-            deliveryDays: alias.deliveryDays || 0,
+            _id: v._id.toString(), combination: v.combination || [],
+            sku: v.sku || "", quantity: v.quantity || 0,
+            minStock: v.minStock || 0, maxStock: v.maxStock || 0,
+            aliasId: alias._id.toString(), vendorCode: alias.nickname || "",
+            price: alias.price || 0, deliveryDays: alias.deliveryDays || 0,
           };
-        })
-        .filter(Boolean);
+        }).filter(Boolean);
 
       return {
-        id: item._id.toString(),
-        name: item.name,
-        sku: item.sku,
+        id: item._id.toString(), name: item.name, sku: item.sku,
         category: item.customCategory || item.category || "Uncategorized",
         unit: item.customUnit || item.unit || "unit",
-        description: item.description || "",
-        currentStock: item.quantity || 0,
-        minStock: item.minStock || 0,
-        maxStock: item.maxStock || 0,
-        status: item.status || "In Stock",
-        unitConversion: item.unitConversion || null,
+        description: item.description || "", currentStock: item.quantity || 0,
+        minStock: item.minStock || 0, maxStock: item.maxStock || 0,
+        status: item.status || "In Stock", unitConversion: item.unitConversion || null,
         variants: matchingVariants,
       };
     });
@@ -250,10 +252,7 @@ router.get("/data/vendor-items/:vendorId", async (req, res) => {
     res.json({ success: true, rawItems: formatted });
   } catch (error) {
     console.error("Error fetching vendor items:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching vendor items",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching vendor items" });
   }
 });
 
@@ -266,16 +265,12 @@ router.get("/data/raw-items-with-variants", async (req, res) => {
       .lean()
       .sort({ name: 1 });
 
-    const formatted = rawItems.map((item) => ({
-      id: item._id.toString(),
-      name: item.name,
-      sku: item.sku,
+    const formatted = rawItems.map(item => ({
+      id: item._id.toString(), name: item.name, sku: item.sku,
       category: item.customCategory || item.category || "Uncategorized",
       unit: item.customUnit || item.unit || "unit",
-      description: item.description || "",
-      currentStock: item.quantity || 0,
-      minStock: item.minStock || 0,
-      maxStock: item.maxStock || 0,
+      description: item.description || "", currentStock: item.quantity || 0,
+      minStock: item.minStock || 0, maxStock: item.maxStock || 0,
       status: item.status || "In Stock",
       variants: (item.variants || []).map((v) => ({
         _id: v._id.toString(),
@@ -295,15 +290,12 @@ router.get("/data/raw-items-with-variants", async (req, res) => {
     res.json({ success: true, rawItems: formatted });
   } catch (error) {
     console.error("Error fetching raw items with variants:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while fetching raw items with variants",
-    });
+    res.status(500).json({ success: false, message: "Server error while fetching raw items" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET available units for a raw item
+// GET units for a raw item
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items/:id/units", async (req, res) => {
   try {
@@ -342,7 +334,6 @@ router.get("/data/raw-items/:id/units", async (req, res) => {
         }
       }
     }
-
     if (baseDoc?._id) {
       const reverseUnits = await Unit.find({
         "conversions.toUnit": baseDoc._id,
@@ -381,7 +372,7 @@ router.get("/:id", async (req, res) => {
         "companyName contactPerson phone email address gstNumber",
       )
       .populate("items.rawItem", "name sku unit description sellingPrice")
-      .populate("createdBy", "name email")
+      .populate("createdBy",  "name email")
       .populate("approvedBy", "name email")
       .populate("deliveries.receivedBy", "name email");
 
@@ -400,7 +391,7 @@ router.get("/:id", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET available raw items for PO
+// GET raw items (search)
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items", async (req, res) => {
   try {
@@ -447,7 +438,7 @@ router.get("/data/raw-items", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET available vendors for PO
+// GET vendors
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/vendors", async (req, res) => {
   try {
@@ -456,7 +447,6 @@ router.get("/data/vendors", async (req, res) => {
         "companyName contactPerson phone email address gstNumber vendorType paymentTerms",
       )
       .sort({ companyName: 1 });
-
     res.json({
       success: true,
       vendors: vendors.map((v) => ({
@@ -480,7 +470,7 @@ router.get("/data/vendors", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CREATE new PO  (now uses findVariantNickname)
+// CREATE PO
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/", async (req, res) => {
   try {
@@ -514,8 +504,8 @@ router.post("/", async (req, res) => {
       attempts = 0;
     while (!isUnique && attempts < 10) {
       poNumber = generatePONumber();
-      const existingPO = await PurchaseOrder.findOne({ poNumber });
-      if (!existingPO) isUnique = true;
+      const existing = await PurchaseOrder.findOne({ poNumber });
+      if (!existing) isUnique = true;
       attempts++;
     }
     if (!isUnique) {
@@ -615,24 +605,17 @@ router.post("/", async (req, res) => {
       await purchaseOrder.save();
     } catch (saveError) {
       console.error("Save error:", saveError);
-      try {
-        purchaseOrder = new PurchaseOrder(purchaseOrderData);
-        await purchaseOrder.save({ validateBeforeSave: false });
-      } catch (secondError) {
-        throw secondError;
-      }
+      purchaseOrder = new PurchaseOrder(purchaseOrderData);
+      await purchaseOrder.save({ validateBeforeSave: false });
     }
 
     let populatedPO;
     try {
       populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
-        .populate("vendor", "companyName contactPerson email phone address")
+        .populate("vendor",     "companyName contactPerson email phone address")
         .populate("items.rawItem", "name sku unit")
-        .populate("createdBy", "name email");
-    } catch (populateError) {
-      console.error("Populate error (non-critical):", populateError);
-      populatedPO = purchaseOrder;
-    }
+        .populate("createdBy",  "name email");
+    } catch (e) { populatedPO = purchaseOrder; }
 
     if (status === "ISSUED") {
       try {
@@ -648,10 +631,7 @@ router.post("/", async (req, res) => {
               email: req.user.email || "admin@example.com",
             },
           );
-        }
-      } catch (emailError) {
-        console.error("Failed to send PO email (non-critical):", emailError);
-      }
+      } catch (emailErr) { console.error("PO email failed (non-critical):", emailErr); }
     }
 
     return res.status(201).json({
@@ -669,7 +649,7 @@ router.post("/", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UPDATE PO  (now uses findVariantNickname)
+// UPDATE PO
 // ─────────────────────────────────────────────────────────────────────────────
 router.put("/:id", async (req, res) => {
   try {
@@ -883,7 +863,12 @@ router.post("/:id/payment", async (req, res) => {
     };
 
     if (!purchaseOrder.payments) purchaseOrder.payments = [];
-    purchaseOrder.payments.unshift(paymentRecord);
+    purchaseOrder.payments.unshift({
+      amount: parseFloat(amount), paymentMethod,
+      referenceNumber: referenceNumber || "",
+      paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
+      notes: notes || "", recordedBy: req.user.id
+    });
 
     const newTotalPaid = totalPaid + amount;
     if (newTotalPaid >= purchaseOrder.totalAmount)
@@ -921,9 +906,8 @@ router.post("/:id/payment", async (req, res) => {
 router.get("/vendor/:vendorId", async (req, res) => {
   try {
     const { status } = req.query;
-    let filter = { vendor: req.params.vendorId };
+    const filter = { vendor: req.params.vendorId };
     if (status && status !== "all") filter.status = status;
-
     const purchaseOrders = await PurchaseOrder.find(filter)
       .select(
         "poNumber orderDate expectedDeliveryDate totalAmount status totalReceived totalPending",
@@ -960,9 +944,8 @@ router.get("/vendor/:vendorId", async (req, res) => {
 router.get("/raw-item/:itemId", async (req, res) => {
   try {
     const { status } = req.query;
-    let filter = { "items.rawItem": req.params.itemId };
+    const filter = { "items.rawItem": req.params.itemId };
     if (status && status !== "all") filter.status = status;
-
     const purchaseOrders = await PurchaseOrder.find(filter)
       .select("poNumber orderDate expectedDeliveryDate vendorName status")
       .populate("vendor", "companyName")
@@ -991,8 +974,6 @@ router.get("/raw-item/:itemId", async (req, res) => {
           : null,
       };
     });
-
-    res.json({ success: true, purchaseOrders: itemOrders });
   } catch (error) {
     console.error("Error fetching raw item purchase orders:", error);
     res.status(500).json({
@@ -1036,12 +1017,9 @@ router.patch("/:id/status", async (req, res) => {
 
     purchaseOrder.status = status;
     if (status === "ISSUED") purchaseOrder.approvedBy = req.user.id;
-
-    if (notes) {
-      purchaseOrder.notes = purchaseOrder.notes
-        ? `${purchaseOrder.notes}\nStatus changed to ${status}: ${notes}`
-        : `Status changed to ${status}: ${notes}`;
-    }
+    if (notes) purchaseOrder.notes = purchaseOrder.notes
+      ? `${purchaseOrder.notes}\nStatus changed to ${status}: ${notes}`
+      : `Status changed to ${status}: ${notes}`;
 
     await purchaseOrder.save();
     res.json({
@@ -1059,7 +1037,7 @@ router.patch("/:id/status", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RECEIVE delivery (unchanged from your version — handles unit conversion)
+// RECEIVE delivery
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/receive", async (req, res) => {
   try {
@@ -1125,6 +1103,7 @@ router.post("/:id/receive", async (req, res) => {
           ? ri.variantCombination
           : poItem.variantCombination || [],
         qtyInPoUnit: qty,
+        pendingBefore,
         poUnit: poItem.unit,
         unitPrice: poItem.unitPrice,
       });
@@ -1157,8 +1136,7 @@ router.post("/:id/receive", async (req, res) => {
       }
 
       const registeredUnit = rawItem.customUnit || rawItem.unit;
-      const fromUnit = poUnit || registeredUnit;
-
+      const fromUnit       = poUnit || registeredUnit;
       let qtyInRegisteredUnit = qtyInPoUnit;
       if (fromUnit !== registeredUnit) {
         qtyInRegisteredUnit = await convertQuantity(
@@ -1183,9 +1161,7 @@ router.post("/:id/receive", async (req, res) => {
       const previousBaseQty = rawItem.quantity;
 
       if (variantId) {
-        let variant = null;
-        let variantIdx = -1;
-
+        let variant = null, variantIdx = -1;
         for (let i = 0; i < rawItem.variants.length; i++) {
           const v = rawItem.variants[i];
           if (v._id?.toString() === variantId.toString()) {
@@ -1194,7 +1170,6 @@ router.post("/:id/receive", async (req, res) => {
             break;
           }
         }
-
         if (!variant && variantCombination?.length) {
           for (let i = 0; i < rawItem.variants.length; i++) {
             const v = rawItem.variants[i];
@@ -1208,7 +1183,6 @@ router.post("/:id/receive", async (req, res) => {
             }
           }
         }
-
         if (variant) {
           variant.quantity = (variant.quantity || 0) + qtyInRegisteredUnit;
           variant.status =
@@ -1222,12 +1196,9 @@ router.post("/:id/receive", async (req, res) => {
           rawItem.variants[variantIdx] = variant;
         } else {
           rawItem.variants.push({
-            combination: variantCombination || [],
-            quantity: qtyInRegisteredUnit,
-            minStock: rawItem.minStock || 0,
-            maxStock: rawItem.maxStock || 0,
-            sku: poItem.variantSku || `${rawItem.sku}-var-${Date.now()}`,
-            status: "In Stock",
+            combination: variantCombination || [], quantity: qtyInRegisteredUnit,
+            minStock: rawItem.minStock || 0, maxStock: rawItem.maxStock || 0,
+            sku: poItem.variantSku || `${rawItem.sku}-var-${Date.now()}`, status: "In Stock",
           });
         }
 
@@ -1252,25 +1223,17 @@ router.post("/:id/receive", async (req, res) => {
           : "";
 
       rawItem.stockTransactions.unshift({
-        type: variantId ? "VARIANT_ADD" : "ADD",
-        quantity: qtyInRegisteredUnit,
-        variantId,
-        variantCombination,
-        previousQuantity: previousBaseQty,
-        newQuantity: rawItem.quantity,
-        reason: "Purchase Order Delivery",
-        supplier: purchaseOrder.vendorName,
-        supplierId: purchaseOrder.vendor,
-        unitPrice,
-        purchaseOrder: purchaseOrder.poNumber,
-        purchaseOrderId: purchaseOrder._id,
-        invoiceNumber,
+        type: variantId ? "VARIANT_ADD" : "ADD", quantity: qtyInRegisteredUnit,
+        variantId, variantCombination,
+        previousQuantity: previousBaseQty, newQuantity: rawItem.quantity,
+        reason: "Purchase Order Delivery", supplier: purchaseOrder.vendorName,
+        supplierId: purchaseOrder.vendor, unitPrice, purchaseOrder: purchaseOrder.poNumber,
+        purchaseOrderId: purchaseOrder._id, invoiceNumber,
         notes: `Received from PO: ${purchaseOrder.poNumber}${conversionNote}`,
         performedBy: req.user.id,
       });
 
       await rawItem.save();
-
       processed.push({
         itemName: poItem.itemName,
         variant: variantCombination?.join(" • ") || null,
@@ -1280,15 +1243,13 @@ router.post("/:id/receive", async (req, res) => {
         registeredUnit,
         converted: fromUnit !== registeredUnit,
       });
-
       totalReceivedInPoUnits += qtyInPoUnit;
     }
 
     purchaseOrder.deliveries.unshift({
       deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
       quantityReceived: totalReceivedInPoUnits,
-      invoiceNumber: invoiceNumber || "",
-      notes: notes || "",
+      invoiceNumber: invoiceNumber || "", notes: notes || "",
       receivedBy: req.user.id,
     });
 
@@ -1307,6 +1268,46 @@ router.post("/:id/receive", async (req, res) => {
 
     await purchaseOrder.save();
 
+    // ── Auto-credit over-delivered qty → StockIssuance ────────────────────────
+    const overDeliveryItems = []
+    for (const u of updates) {
+      const overQtyInPoUnit = +Math.max(0, u.qtyInPoUnit - u.pendingBefore).toFixed(4)
+      if (overQtyInPoUnit <= 0.0001) continue
+      const riDoc = await RawItem.findById(u.rawItemId).select("unit customUnit name sku").lean()
+      if (!riDoc) continue
+      const nativeUnit  = riDoc.customUnit || riDoc.unit
+      const poUnit      = u.poUnit || nativeUnit
+      let overQtyNative = overQtyInPoUnit
+      if (poUnit !== nativeUnit)
+        overQtyNative = await convertQuantity(overQtyInPoUnit, poUnit, nativeUnit)
+      overDeliveryItems.push({
+        rawItem:            u.rawItemId,
+        rawItemName:        riDoc.name,
+        rawItemSku:         riDoc.sku,
+        variantId:          u.variantId || null,
+        variantCombination: u.variantCombination || [],
+        issuedQty:  overQtyInPoUnit,
+        issuedUnit: poUnit,
+        nativeQty:  overQtyNative,
+        nativeUnit,
+        notes: `Over-delivery — ${overQtyInPoUnit} ${poUnit} above PO ordered qty`,
+      })
+    }
+    if (overDeliveryItems.length > 0) {
+      try {
+        await StockIssuance.create({
+          direction: "credit",
+          manufacturingOrder: null, moNumber: "", customerName: "",
+          items: overDeliveryItems,
+          reason: `Over-delivery from PO ${purchaseOrder.poNumber}`,
+          notes: `Vendor delivered excess qty. Auto-credited to stock.`,
+          performedBy: req.user?.id || null,
+        })
+      } catch (issuanceErr) {
+        console.error("Over-delivery StockIssuance (non-fatal):", issuanceErr.message)
+      }
+    }
+
     const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
       .populate("vendor", "companyName contactPerson")
       .populate("items.rawItem", "name sku unit customUnit")
@@ -1314,9 +1315,11 @@ router.post("/:id/receive", async (req, res) => {
 
     res.json({
       success: true,
-      message: `Delivery received. ${totalReceivedInPoUnits} unit(s) recorded.`,
-      purchaseOrder: populatedPO,
-      processed,
+      message: `Delivery received. ${totalReceivedInPoUnits} unit(s) recorded.${overDeliveryItems.length > 0 ? ` ${overDeliveryItems.length} over-delivery item(s) auto-credited.` : ""}`,
+      purchaseOrder: populatedPO, processed,
+      overDeliveries: overDeliveryItems.length > 0
+        ? overDeliveryItems.map(o => ({ rawItemName: o.rawItemName, overQty: o.issuedQty, unit: o.issuedUnit }))
+        : undefined,
     });
   } catch (err) {
     console.error("Error receiving delivery:", err);
@@ -1385,7 +1388,6 @@ router.get("/:id/payments", async (req, res) => {
         0,
       ) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
-
     res.json({
       success: true,
       payments: purchaseOrder.payments || [],

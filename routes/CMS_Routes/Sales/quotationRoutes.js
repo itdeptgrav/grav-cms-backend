@@ -12,6 +12,7 @@ const EmployeeProductionProgress = require("../../../models/CMS_Models/Manufactu
 const mongoose = require("mongoose");
 const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
+const StockIssuance = require("../../../models/CMS_Models/Inventory/Operations/StockIssuance");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -373,6 +374,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
       totals.push({
         ...t,
         available,
+        availableInBomUnit,
         shortfall,
         minStock,
         status,
@@ -380,6 +382,177 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
       });
     }
  
+    // ── Committed stock: remaining balance owed to other active orders ────────
+    // committed per order = max(0, total WO needed − already issued to it)
+    // This is what still needs to leave stock, so must be reserved for them.
+    try {
+      // Only consider orders created BEFORE this one — they have stock priority
+        const currentRequest = await CustomerRequest.findById(requestId).select("createdAt").lean();
+        const activeMOs = await CustomerRequest.find({
+          status: { $in: ["quotation_sales_approved", "in_progress", "production"] },
+          _id: { $ne: new mongoose.Types.ObjectId(requestId) },
+          createdAt: { $lt: currentRequest?.createdAt || new Date() },
+        }).select("_id requestId customerInfo items createdAt").lean();
+
+      if (activeMOs.length > 0) {
+        const activeMOIds = activeMOs.map(m => m._id);
+        const activeMOMap = new Map(activeMOs.map(m => [m._id.toString(), m]));
+
+        // 1. Derive needed raw items from CustomerRequest → StockItem BOM
+        //    Same source of truth as the current order's computation — avoids WO stale data.
+        const activeCRs = await CustomerRequest.find({ _id: { $in: activeMOIds } })
+          .select("_id requestId customerInfo items").lean();
+
+        // Batch-fetch all StockItems referenced by active CRs
+        const activeSidSet = new Set();
+        for (const cr of activeCRs) {
+          for (const it of (cr.items || [])) {
+            if (it.stockItemId) activeSidSet.add(it.stockItemId.toString());
+          }
+        }
+        const activeSIs = activeSidSet.size
+          ? await StockItem.find({ _id: { $in: [...activeSidSet] } }).lean()
+          : [];
+        const activeSIMap = new Map(activeSIs.map(s => [s._id.toString(), s]));
+
+        const neededMap = {}; // key → { [moId]: { moNumber, customerName, needed, unit } }
+        const norm = s => String(s || "").trim().toLowerCase();
+
+        for (const cr of activeCRs) {
+          const moId = cr._id.toString();
+          for (const crItem of (cr.items || [])) {
+            const si = activeSIMap.get(crItem.stockItemId?.toString());
+            if (!si) continue;
+
+            for (const crVariant of (crItem.variants || [])) {
+              const qtyOrdered = crVariant.quantity || 0;
+              if (!qtyOrdered) continue;
+
+              // Match StockItem variant by attributes, fall back to first
+              const reqAttrs = crVariant.attributes || [];
+              let siVariant = null;
+              if (reqAttrs.length > 0) {
+                siVariant = (si.variants || []).find(v => {
+                  const vAttrs = v.attributes || [];
+                  return vAttrs.length === reqAttrs.length &&
+                    reqAttrs.every(ra => vAttrs.some(va =>
+                      norm(va.name) === norm(ra.name) && norm(va.value) === norm(ra.value)
+                    ));
+                });
+              }
+              if (!siVariant) siVariant = si.variants?.[0];
+              if (!siVariant) continue;
+
+              for (const ri of (siVariant.rawItems || [])) {
+                if (!ri.rawItemId) continue;
+                const riId   = ri.rawItemId.toString();
+                const rvId   = ri.variantId?.toString() || "none";
+                const key    = `${riId}|${rvId}`;
+                const needed = (ri.quantity || 0) * qtyOrdered;
+                if (!needed) continue;
+
+                if (!neededMap[key])       neededMap[key]       = {};
+                if (!neededMap[key][moId]) neededMap[key][moId] = {
+                  moNumber:     cr.requestId          || "—",
+                  customerName: cr.customerInfo?.name || "—",
+                  needed: 0,
+                  unit:   ri.unit || "",
+                };
+                neededMap[key][moId].needed += needed;
+              }
+            }
+          }
+        }
+
+        // 2. How much has already been issued to those orders (native unit)
+        const otherIssuances = await StockIssuance.find({
+          manufacturingOrder: { $in: activeMOIds },
+        }).lean();
+
+        const issuedMap = {}; // key → { [moId]: { issuedNative, nativeUnit } }
+        for (const iso of otherIssuances) {
+          const moId = iso.manufacturingOrder?.toString();
+          for (const itm of (iso.items || [])) {
+            const riId = itm.rawItem?.toString();
+            const rvId = itm.variantId?.toString() || "none";
+            const key  = `${riId}|${rvId}`;
+            if (!issuedMap[key])       issuedMap[key]       = {};
+            if (!issuedMap[key][moId]) issuedMap[key][moId] = { issuedNative: 0, nativeUnit: itm.nativeUnit || "" };
+            const signed = iso.direction === "debit" ? (itm.nativeQty || 0) : -(itm.nativeQty || 0);
+            issuedMap[key][moId].issuedNative += signed;
+          }
+        }
+
+        // 3. Second pass: remaining = needed(BOM unit) − issued(converted to BOM unit)
+        for (const item of totals) {
+          const key        = `${item.rawItemId}|${item.variantId || "none"}`;
+          const neededByMO = neededMap[key] || {};
+          const issuedByMO = issuedMap[key] || {};
+          const bomUnit    = item.unit;
+          const convs      = item.unitConversions || [];
+
+          const orders = [];
+          let totalRemainingBom = 0;
+
+          for (const [moId, needData] of Object.entries(neededByMO)) {
+            const neededBom = needData.needed; // already in BOM unit from WO
+
+            // Convert issued native → BOM unit
+            const issuedData  = issuedByMO[moId] || { issuedNative: 0, nativeUnit: "" };
+            let   issuedBom   = issuedData.issuedNative;
+            const iNativeUnit = issuedData.nativeUnit || bomUnit;
+
+            if (iNativeUnit && bomUnit && iNativeUnit !== bomUnit && issuedBom > 0) {
+              const conv = convs.find(uc =>
+                (uc.fromUnit === iNativeUnit && uc.toUnit === bomUnit) ||
+                (uc.fromUnit === bomUnit     && uc.toUnit === iNativeUnit)
+              );
+              if (conv?.quantity) {
+                issuedBom = conv.fromUnit === iNativeUnit
+                  ? issuedBom * conv.quantity
+                  : issuedBom / conv.quantity;
+              }
+            }
+
+            const remaining = Math.max(0, neededBom - issuedBom);
+            if (remaining > 0.0001) {
+              orders.push({
+                moNumber:     needData.moNumber,
+                customerName: needData.customerName,
+                needed:       neededBom,
+                issued:       issuedBom,
+                remaining,
+                unit:         bomUnit,
+              });
+              totalRemainingBom += remaining;
+            }
+          }
+
+          item.committedInBomUnit    = totalRemainingBom;
+          item.committedOrders       = orders;
+          item.netAvailableInBomUnit = Math.max(0, (item.availableInBomUnit || 0) - totalRemainingBom);
+
+          const net      = item.netAvailableInBomUnit;
+          item.shortfall = Math.max(0, item.quantityRequired - net);
+          if      (net <= 0)                                    item.status = "out_of_stock";
+          else if (item.shortfall > 0.001)                      item.status = "shortage";
+          else if (net - item.quantityRequired <= item.minStock) item.status = "low";
+          else                                                   item.status = "ok";
+        }
+
+        shortfallCount = totals.filter(t => (t.shortfall || 0) > 0).length;
+      }
+    } catch (committedErr) {
+      console.error("Committed stock lookup (non-fatal):", committedErr.message);
+    }
+
+    // Defaults for entries not touched above
+    for (const item of totals) {
+      if (item.committedInBomUnit    === undefined) item.committedInBomUnit    = 0;
+      if (!item.committedOrders)                   item.committedOrders       = [];
+      if (item.netAvailableInBomUnit === undefined) item.netAvailableInBomUnit = item.availableInBomUnit;
+    }
+
     // Sort totals: shortages first, then low, then ok
     const statusRank = { out_of_stock: 0, shortage: 1, low: 2, ok: 3, unknown: 4 };
     totals.sort((a, b) => {
