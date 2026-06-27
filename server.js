@@ -873,6 +873,9 @@ app.use("/api/cms/stock-items", stockItemsRoutes);
 const StoreRoutes = require("./routes/CMS_Routes/Store/storeRoutes.js");
 app.use("/api/cms/store", StoreRoutes);
 
+const workerWorkOrderRoutes = require("./routes/CMS_Routes/Store/workerWorkOrderRoutes");
+app.use("/api/cms/store/work-orders-worker", workerWorkOrderRoutes);
+
 // Operations Category
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
