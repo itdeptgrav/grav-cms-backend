@@ -78,6 +78,14 @@ router.get("/", async (req, res) => {
                       1, 0
                     ]
                   }
+                },
+                scheduledCount: {
+                  $sum: {
+                    $cond: [
+                      { $in: ["$status", ["scheduled", "planned", "ready_to_start"]] },
+                      1, 0
+                    ]
+                  }
                 }
               }
             }
@@ -94,7 +102,8 @@ router.get("/", async (req, res) => {
           _totalWoQty: { $ifNull: ["$_stats.totalWoQty", 0] },
           _totalCompleted: { $ifNull: ["$_stats.totalCompleted", 0] },
           _cancelledCount: { $ifNull: ["$_stats.cancelledCount", 0] },
-          _anyInProgress: { $ifNull: ["$_stats.anyInProgress", 0] }
+          _anyInProgress:  { $ifNull: ["$_stats.anyInProgress",  0] },
+          _scheduledCount: { $ifNull: ["$_stats.scheduledCount", 0] }
         }
       },
       {
@@ -131,7 +140,7 @@ router.get("/", async (req, res) => {
                   then: "cancelled"
                 },
                 { case: { $gte: ["$completionPercentage", 100] }, then: "completed" },
-                { case: { $gte: ["$completionPercentage", 70] }, then: "about_to_finish" },
+                { case: { $gte: ["$completionPercentage", 70] },  then: "about_to_finish" },
                 {
                   case: {
                     $or: [
@@ -140,6 +149,10 @@ router.get("/", async (req, res) => {
                     ]
                   },
                   then: "in_progress"
+                },
+                {
+                  case: { $gt: ["$_scheduledCount", 0] },
+                  then: "on_production"
                 }
               ],
               default: "pending"
