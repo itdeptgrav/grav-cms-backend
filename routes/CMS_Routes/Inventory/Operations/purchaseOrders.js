@@ -499,10 +499,9 @@ router.post("/", async (req, res) => {
       status = "DRAFT",
     } = req.body;
 
-    if (!vendor)
-      return res
-        .status(400)
-        .json({ success: false, message: "Vendor is required" });
+    const isEmergency = req.body.isEmergencyOrder === true || req.body.isEmergencyOrder === "true"
+    if (!vendor && !isEmergency)
+      return res.status(400).json({ success: false, message: "Vendor is required" });
     if (!items?.length)
       return res
         .status(400)
@@ -606,6 +605,7 @@ router.post("/", async (req, res) => {
       paymentTerms: paymentTerms || "",
       notes: notes || "",
       termsConditions: termsConditions || "",
+      isEmergencyOrder: isEmergency,
       createdBy: req.user.id,
     };
 
@@ -724,25 +724,14 @@ router.put("/:id", async (req, res) => {
     if (status) purchaseOrder.status = status;
 
     if (items && Array.isArray(items)) {
+      const isEmergencyPut = purchaseOrder.isEmergencyOrder || req.body.isEmergencyOrder === true
       for (const item of items) {
-        if (!item.rawItem) {
-          return res.status(400).json({
-            success: false,
-            message: "Raw item is required for all items",
-          });
-        }
-        if (!item.quantity || item.quantity <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Valid quantity is required for all items",
-          });
-        }
-        if (!item.unitPrice || item.unitPrice <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Valid unit price is required for all items",
-          });
-        }
+        if (!item.rawItem)
+          return res.status(400).json({ success: false, message: "Raw item is required for all items" });
+        if (!isEmergencyPut && (!item.quantity || item.quantity <= 0))
+          return res.status(400).json({ success: false, message: "Valid quantity is required for all items" });
+        if (!isEmergencyPut && (!item.unitPrice || item.unitPrice <= 0))
+          return res.status(400).json({ success: false, message: "Valid unit price is required for all items" });
       }
 
       const itemsWithDetails = await Promise.all(
