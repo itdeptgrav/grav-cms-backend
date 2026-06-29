@@ -28,6 +28,13 @@ const purchaseOrderItemSchema = new mongoose.Schema(
     variantSku: { type: String, trim: true, default: "" },
     vendorNickname: { type: String, trim: true, default: "" },
     expectedDeliveryDate: { type: Date, default: null },
+    itemCharges: [{
+      label: { type: String, trim: true, default: "" },
+      value: { type: String, default: "" },
+      type: { type: String, enum: ["amount", "percent"], default: "amount" },
+      amount: { type: Number, default: 0 },
+    }],
+    itemChargesTotal: { type: Number, min: 0, default: 0 },
   },
   { _id: true },
 );
