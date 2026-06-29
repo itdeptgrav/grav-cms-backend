@@ -265,6 +265,16 @@ const purchaseOrderSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    piInvoiceNumber: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    piInvoicePhoto: {
+      type: String,
+      trim: true,
+      default: "",
+    },
 
     // References
     createdBy: {

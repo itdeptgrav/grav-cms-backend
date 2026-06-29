@@ -742,6 +742,10 @@ router.put("/:id", async (req, res) => {
       purchaseOrder.termsConditions = termsConditions;
     if (paymentTerms !== undefined) purchaseOrder.paymentTerms = paymentTerms;
     if (status) purchaseOrder.status = status;
+    if (req.body.piInvoiceNumber !== undefined)
+      purchaseOrder.piInvoiceNumber = req.body.piInvoiceNumber || "";
+    if (req.body.piInvoicePhoto !== undefined)
+      purchaseOrder.piInvoicePhoto = req.body.piInvoicePhoto || "";
 
     if (items && Array.isArray(items)) {
       const isEmergencyPut = purchaseOrder.isEmergencyOrder || req.body.isEmergencyOrder === true
