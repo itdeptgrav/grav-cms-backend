@@ -96,8 +96,6 @@ function fmtDuration(secs) {
     return days === 1 ? "1 day" : `${days} days`;
 }
 
-
-
 // One-time repair script — run once, then delete
 const { db } = require("./config/firebaseAdmin");
 
@@ -185,7 +183,7 @@ const PATTERNS = [
     },
 ];
 
-// ─── Scan + rewrite a single subcollection ────────────────────────────────────
+// ─── scan + rewrite a single subcollection ────────────────────────────────────
 async function processSubcollection(taskDoc, subName) {
     const task = taskDoc.data();
     const snap = await taskDoc.ref.collection(subName).get();
