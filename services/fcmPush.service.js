@@ -34,6 +34,7 @@ async function sendIOSWebPush(subscriptionJSON, title, body, data = {}) {
 }
 
 async function sendPushToEmployees(recipientIds, title, body, data = {}) {
+
     if (!recipientIds?.length) return;
     const db = admin.firestore();
 
