@@ -499,10 +499,9 @@ router.post("/", async (req, res) => {
       status = "DRAFT",
     } = req.body;
 
-    if (!vendor)
-      return res
-        .status(400)
-        .json({ success: false, message: "Vendor is required" });
+    const isEmergency = req.body.isEmergencyOrder === true || req.body.isEmergencyOrder === "true"
+    if (!vendor && !isEmergency)
+      return res.status(400).json({ success: false, message: "Vendor is required" });
     if (!items?.length)
       return res
         .status(400)
@@ -540,6 +539,25 @@ router.post("/", async (req, res) => {
         // ── per-variant nickname lookup ──
         const vendorNickname = findVariantNickname(ri, item.variantId, vendor);
 
+        const qty = Number(item.quantity) || 0;
+        const price = Number(item.unitPrice) || 0;
+        const baseTotal = qty * price;
+        const validCharges = (item.itemCharges || []).filter((c) => c.label?.trim() && parseFloat(c.value) > 0);
+        const itemChargesTotal = validCharges.reduce((s, c) => {
+          const v = parseFloat(c.value) || 0;
+          return s + (c.type === "percent" ? (baseTotal * v) / 100 : v);
+        }, 0);
+        const resolvedCharges = validCharges.map((c) => ({
+          label: c.label,
+          value: c.value,
+          type: c.type || "amount",
+          amount: c.type === "percent"
+            ? (baseTotal * (parseFloat(c.value) || 0)) / 100
+            : parseFloat(c.value) || 0,
+        }));
+        const totalPrice = baseTotal + itemChargesTotal;
+        const itemGstRate = Number(item.gstRate) || 0;
+        const itemGstAmount = totalPrice * itemGstRate / 100;
         return {
           rawItem: item.rawItem,
           itemName: item.itemName || ri?.name || "Unknown Item",
@@ -547,11 +565,15 @@ router.post("/", async (req, res) => {
           unit: poUnit,
           baseUnit: registeredUnit,
           vendorNickname,
-          quantity: Number(item.quantity),
-          unitPrice: Number(item.unitPrice),
-          totalPrice: Number(item.quantity) * Number(item.unitPrice),
+          quantity: qty,
+          unitPrice: price,
+          totalPrice,
+          gstRate: itemGstRate,
+          gstAmount: itemGstAmount,
+          itemCharges: resolvedCharges,
+          itemChargesTotal,
           receivedQuantity: 0,
-          pendingQuantity: Number(item.quantity),
+          pendingQuantity: qty,
           status: "PENDING",
           variantId: item.variantId || null,
           variantCombination: item.variantCombination || [],
@@ -564,11 +586,8 @@ router.post("/", async (req, res) => {
       }),
     );
 
-    const subtotal = itemsWithDetails.reduce(
-      (sum, i) => sum + (i.totalPrice || 0),
-      0,
-    );
-    const taxAmount = (subtotal * (Number(taxRate) || 0)) / 100;
+    const subtotal = itemsWithDetails.reduce((sum, i) => sum + (i.totalPrice || 0), 0);
+    const taxAmount = itemsWithDetails.reduce((sum, i) => sum + (i.gstAmount || 0), 0);
     const customChargesArr = Array.isArray(req.body.customCharges)
       ? req.body.customCharges
       : [];
@@ -606,6 +625,7 @@ router.post("/", async (req, res) => {
       paymentTerms: paymentTerms || "",
       notes: notes || "",
       termsConditions: termsConditions || "",
+      isEmergencyOrder: isEmergency,
       createdBy: req.user.id,
     };
 
@@ -722,27 +742,20 @@ router.put("/:id", async (req, res) => {
       purchaseOrder.termsConditions = termsConditions;
     if (paymentTerms !== undefined) purchaseOrder.paymentTerms = paymentTerms;
     if (status) purchaseOrder.status = status;
+    if (req.body.piInvoiceNumber !== undefined)
+      purchaseOrder.piInvoiceNumber = req.body.piInvoiceNumber || "";
+    if (req.body.piInvoicePhoto !== undefined)
+      purchaseOrder.piInvoicePhoto = req.body.piInvoicePhoto || "";
 
     if (items && Array.isArray(items)) {
+      const isEmergencyPut = purchaseOrder.isEmergencyOrder || req.body.isEmergencyOrder === true
       for (const item of items) {
-        if (!item.rawItem) {
-          return res.status(400).json({
-            success: false,
-            message: "Raw item is required for all items",
-          });
-        }
-        if (!item.quantity || item.quantity <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Valid quantity is required for all items",
-          });
-        }
-        if (!item.unitPrice || item.unitPrice <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Valid unit price is required for all items",
-          });
-        }
+        if (!item.rawItem)
+          return res.status(400).json({ success: false, message: "Raw item is required for all items" });
+        if (!isEmergencyPut && (!item.quantity || item.quantity <= 0))
+          return res.status(400).json({ success: false, message: "Valid quantity is required for all items" });
+        if (!isEmergencyPut && (!item.unitPrice || item.unitPrice <= 0))
+          return res.status(400).json({ success: false, message: "Valid unit price is required for all items" });
       }
 
       const itemsWithDetails = await Promise.all(
@@ -763,6 +776,25 @@ router.put("/:id", async (req, res) => {
             purchaseOrder.vendor,
           );
 
+          const qty_put = Number(item.quantity) || 0;
+          const price_put = Number(item.unitPrice) || 0;
+          const baseTotal_put = qty_put * price_put;
+          const validCharges_put = (item.itemCharges || []).filter((c) => c.label?.trim() && parseFloat(c.value) > 0);
+          const itemChargesTotal_put = validCharges_put.reduce((s, c) => {
+            const v = parseFloat(c.value) || 0;
+            return s + (c.type === "percent" ? (baseTotal_put * v) / 100 : v);
+          }, 0);
+          const resolvedCharges_put = validCharges_put.map((c) => ({
+            label: c.label,
+            value: c.value,
+            type: c.type || "amount",
+            amount: c.type === "percent"
+              ? (baseTotal_put * (parseFloat(c.value) || 0)) / 100
+              : parseFloat(c.value) || 0,
+          }));
+          const totalPrice_put = baseTotal_put + itemChargesTotal_put;
+          const itemGstRate_put = Number(item.gstRate) || 0;
+          const itemGstAmount_put = totalPrice_put * itemGstRate_put / 100;
           return {
             rawItem: item.rawItem,
             itemName: item.itemName || ri?.name || "Unknown Item",
@@ -770,11 +802,15 @@ router.put("/:id", async (req, res) => {
             unit: poUnit,
             baseUnit: registeredUnit,
             vendorNickname,
-            quantity: Number(item.quantity),
-            unitPrice: Number(item.unitPrice),
-            totalPrice: Number(item.quantity) * Number(item.unitPrice),
+            quantity: qty_put,
+            unitPrice: price_put,
+            totalPrice: totalPrice_put,
+            gstRate: itemGstRate_put,
+            gstAmount: itemGstAmount_put,
+            itemCharges: resolvedCharges_put,
+            itemChargesTotal: itemChargesTotal_put,
             receivedQuantity: 0,
-            pendingQuantity: Number(item.quantity),
+            pendingQuantity: qty_put,
             status: "PENDING",
             variantId: item.variantId || null,
             variantCombination: item.variantCombination || [],
@@ -789,12 +825,8 @@ router.put("/:id", async (req, res) => {
 
       purchaseOrder.items = itemsWithDetails;
 
-      const updatedSubtotal = itemsWithDetails.reduce(
-        (s, i) => s + (i.totalPrice || 0),
-        0,
-      );
-      const updatedTaxAmount =
-        (updatedSubtotal * (purchaseOrder.taxRate || 0)) / 100;
+      const updatedSubtotal = itemsWithDetails.reduce((s, i) => s + (i.totalPrice || 0), 0);
+      const updatedTaxAmount = itemsWithDetails.reduce((s, i) => s + (i.gstAmount || 0), 0);
       const updatedCustomTotal = (purchaseOrder.customCharges || []).reduce(
         (s, c) => s + (parseFloat(c.amount) || 0),
         0,
