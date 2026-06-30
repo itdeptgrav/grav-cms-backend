@@ -3,24 +3,12 @@
 // Mount in server.js:
 //   const purchaseOrderRoutes = require("./routes/CMS_Routes/Store/purchaseOrderRoutes");
 //   app.use("/api/cms/store/purchase-orders", purchaseOrderRoutes);
-//
-// Endpoints (under /api/cms/store/purchase-orders):
-//   GET    /                      — list (+ stats)
-//   GET    /next-number           — peek next PO number (no consume)
-//   GET    /settings              — get prefix/suffix/padding
-//   PUT    /settings              — update numbering
-//   GET    /vendor-suggestions    — distinct vendor names (autocomplete)
-//   GET    /:id                   — single PO
-//   POST   /                      — create
-//   PUT    /:id                   — update
-//   PATCH  /:id/status            — change status (Draft → Ordered → Received)
-//   DELETE /:id                   — delete
 
 const express = require("express");
 const router = express.Router();
 
 const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewear");
-const PurchaseOrder = require("../../../models/CMS_Models/Store/PurchaseOrder");  
+const PurchaseOrder = require("../../../models/CMS_Models/Store/PurchaseOrder");
 const PurchaseOrderSettings = require("../../../models/CMS_Models/Store/PurchaseOrderSettings");
 
 router.use(EmployeeAuthMiddleware);
@@ -129,7 +117,9 @@ router.get("/vendor-suggestions", async (req, res) => {
     if (q) match.vendorName = { $regex: q, $options: "i" };
 
     const docs = await PurchaseOrder.find(match)
-      .select("vendorName vendorPhone vendorAddress vendorGstin")
+      .select(
+        "vendorName vendorPhone vendorAddress vendorGstin shipToAddress billToAddress",
+      )
       .sort({ updatedAt: -1 })
       .lean();
 
@@ -144,6 +134,8 @@ router.get("/vendor-suggestions", async (req, res) => {
         phone: d.vendorPhone || "",
         address: d.vendorAddress || "",
         gstin: d.vendorGstin || "",
+        shipTo: d.shipToAddress || "",
+        billTo: d.billToAddress || "",
       });
     }
 
@@ -189,11 +181,17 @@ router.post("/", async (req, res) => {
 
     const po = new PurchaseOrder({
       poNumber,
+      orderType: body.orderType || "",
       vendorName: body.vendorName || "",
       vendorPhone: body.vendorPhone || "",
       vendorAddress: body.vendorAddress || "",
       vendorGstin: body.vendorGstin || "",
+      shipToAddress: body.shipToAddress || "",
+      billToAddress: body.billToAddress || "",
       reasonForPurchase: body.reasonForPurchase || "",
+      paymentTerms: body.paymentTerms || "",
+      deliveryTerms: body.deliveryTerms || "",
+      invoiceNumber: body.invoiceNumber || "",
       lineSectionLabel: body.lineSectionLabel || "Items",
       items: Array.isArray(body.items) ? body.items : [],
       customHeaderFields: Array.isArray(body.customHeaderFields)
@@ -247,12 +245,18 @@ router.put("/:id", async (req, res) => {
       }
     }
 
+    if (body.orderType !== undefined) po.orderType = body.orderType;
     if (body.vendorName !== undefined) po.vendorName = body.vendorName;
     if (body.vendorPhone !== undefined) po.vendorPhone = body.vendorPhone;
     if (body.vendorAddress !== undefined) po.vendorAddress = body.vendorAddress;
     if (body.vendorGstin !== undefined) po.vendorGstin = body.vendorGstin;
+    if (body.shipToAddress !== undefined) po.shipToAddress = body.shipToAddress;
+    if (body.billToAddress !== undefined) po.billToAddress = body.billToAddress;
     if (body.reasonForPurchase !== undefined)
       po.reasonForPurchase = body.reasonForPurchase;
+    if (body.paymentTerms !== undefined) po.paymentTerms = body.paymentTerms;
+    if (body.deliveryTerms !== undefined) po.deliveryTerms = body.deliveryTerms;
+    if (body.invoiceNumber !== undefined) po.invoiceNumber = body.invoiceNumber;
     if (body.lineSectionLabel !== undefined)
       po.lineSectionLabel = body.lineSectionLabel || "Items";
     if (body.items !== undefined)
