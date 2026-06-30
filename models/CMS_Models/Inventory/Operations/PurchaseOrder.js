@@ -7,14 +7,13 @@ const purchaseOrderItemSchema = new mongoose.Schema(
     rawItem: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "RawItem",
-      required: true,
     },
-    itemName: { type: String, trim: true, required: true },
+    itemName: { type: String, trim: true},
     sku: { type: String, trim: true, default: "" },
     unit: { type: String, trim: true, default: "unit" }, // PO line unit
     baseUnit: { type: String, trim: true, default: "" }, // ← NEW: raw-item registered unit at PO time
-    quantity: { type: Number, min: 0, required: true },
-    unitPrice: { type: Number, min: 0, required: true },
+    quantity: { type: Number, min: 0},
+    unitPrice: { type: Number, min: 0 },
     totalPrice: { type: Number, min: 0, default: 0 },
     receivedQuantity: { type: Number, min: 0, default: 0 }, // (only one — remove the duplicate)
     pendingQuantity: { type: Number, min: 0, default: 0 },
@@ -29,6 +28,13 @@ const purchaseOrderItemSchema = new mongoose.Schema(
     variantSku: { type: String, trim: true, default: "" },
     vendorNickname: { type: String, trim: true, default: "" },
     expectedDeliveryDate: { type: Date, default: null },
+    itemCharges: [{
+      label: { type: String, trim: true, default: "" },
+      value: { type: String, default: "" },
+      type: { type: String, enum: ["amount", "percent"], default: "amount" },
+      amount: { type: Number, default: 0 },
+    }],
+    itemChargesTotal: { type: Number, min: 0, default: 0 },
   },
   { _id: true },
 );
@@ -62,7 +68,7 @@ const deliverySchema = new mongoose.Schema(
 // ── Return request receipt sub-doc ───────────────────────────────────────
 const returnReceiptSchema = new mongoose.Schema(
   {
-    quantityReceived: { type: Number, required: true, min: 0 },
+    quantityReceived: { type: Number,  min: 0 },
     receivedDate: { type: Date, default: Date.now },
     notes: { type: String, trim: true, default: "" },
     receivedBy: {
@@ -77,18 +83,17 @@ const returnReceiptSchema = new mongoose.Schema(
 // ── Return request sub-doc ───────────────────────────────────────────────
 const returnRequestSchema = new mongoose.Schema(
   {
-    poItemId: { type: mongoose.Schema.Types.ObjectId, required: true },
+    poItemId: { type: mongoose.Schema.Types.ObjectId },
     rawItem: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "RawItem",
-      required: true,
     },
-    itemName: { type: String, trim: true, required: true },
+    itemName: { type: String, trim: true},
     sku: { type: String, trim: true, default: "" },
     unit: { type: String, trim: true, default: "unit" },
     variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     variantCombination: [{ type: String, trim: true }],
-    damagedQuantity: { type: Number, required: true, min: 0 },
+    damagedQuantity: { type: Number,  min: 0 },
     returnedQuantity: { type: Number, default: 0, min: 0 },
     pendingReturnQty: { type: Number, default: 0, min: 0 },
     status: {
@@ -151,8 +156,10 @@ const purchaseOrderSchema = new mongoose.Schema(
     vendor: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Vendor",
-      required: [true, "Vendor is required"],
+      required: false,
+      default: null,
     },
+    isEmergencyOrder: { type: Boolean, default: false },
     vendorName: {
       type: String,
       trim: true,
@@ -254,6 +261,16 @@ const purchaseOrderSchema = new mongoose.Schema(
       default: "",
     },
     termsConditions: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    piInvoiceNumber: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    piInvoicePhoto: {
       type: String,
       trim: true,
       default: "",
