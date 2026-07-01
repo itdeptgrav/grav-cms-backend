@@ -1717,10 +1717,12 @@ router.post("/task/p1-conflict-check", verifyCoworkToken, verifyEmployeeToken, a
     const result = await svc.checkAndExtendForP1({
       newP1TaskId,
       employeeId,
-      conflictTaskId: req.body.conflictTaskId || null,
       assignedBy: req.body.assignedBy || req.coworkUser?.employeeId,
       newP1Priority: req.body.newP1Priority != null ? Number(req.body.newP1Priority) : null,
-      conflictTaskPriority: req.body.conflictTaskPriority != null ? Number(req.body.conflictTaskPriority) : null,
+      assignedByName: req.body.assignedByName || null,
+      reason: req.body.reason || null,
+      oldPriorities: req.body.oldPriorities || null,
+      newPriorities: req.body.newPriorities || null,
     });
     console.log("[P1-ROUTE] result:", result);
     res.json({ ok: true, extended: result || null });

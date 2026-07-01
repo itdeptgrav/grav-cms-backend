@@ -324,88 +324,20 @@ async function createTask({ title, description, notes, requirements = [], assign
     });
   }
 
-  // ── P1 FIXED DEADLINE CONFLICT DETECTION ─────────────────────────────────
-  // If this is a P1 fixed deadline task, check if any assignee is currently
-  // working on another fixed deadline task. If so, auto-extend that task's
-  // deadline by this task's ETC hours and notify CEO/TL.
-  if (Number(priority) === 1 && hasTimer === false && fixedDeadline && etcHours > 0 && assigneeIds?.length) {
-    try {
-      const shiftMs = Math.round(Number(etcHours) * 3600 * 1000);
-
+  // ── P1 CONFLICT CHECK — same function used by play-button and drag triggers ──
+  if (Number(priority) === 1 && hasTimer === false && fixedDeadline && assigneeIds?.length) {
+    setImmediate(() => {
       for (const empId of assigneeIds) {
-        // Get all timer sessions for this employee
-        const sessionsSnap = await db.collection("cowork_task_timers").doc(empId)
-          .collection("sessions").get();
-
-        // Find active session
-        const activeSess = sessionsSnap.docs.find(d => d.data().isActive);
-        if (!activeSess) continue;
-
-        const conflictTaskId = activeSess.id;
-        if (conflictTaskId === taskId) continue;
-
-        // Get the conflicting task
-        const conflictRef = db.collection("cowork_tasks").doc(conflictTaskId);
-        const conflictSnap = await conflictRef.get();
-        if (!conflictSnap.exists) continue;
-
-        const conflictTask = conflictSnap.data();
-
-        // Only extend fixed deadline tasks
-        if (conflictTask.hasTimer !== false || !conflictTask.fixedDeadline) continue;
-
-        // Calculate new deadline
-        const oldDeadlineMs = new Date(conflictTask.fixedDeadline).getTime();
-        const newDeadlineMs = oldDeadlineMs + shiftMs;
-        const newDeadline = new Date(newDeadlineMs).toISOString();
-
-        const fmtHrs = h => h >= 1 ? `${Math.round(h * 10) / 10}h` : `${Math.round(h * 60)}m`;
-
-        // Auto-extend the conflicting task's deadline
-        await conflictRef.update({
-          fixedDeadline: newDeadline,
-          autoExtendedDueToP1: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          deadlineAutoExtendedHistory: admin.firestore.FieldValue.arrayUnion({
-            extendedByHrs: etcHours,
-            shiftedByTaskId: taskId,
-            shiftedByTaskTitle: title,
-            oldDeadline: conflictTask.fixedDeadline,
-            newDeadline,
-            at: now,
-          }),
-        });
-
-        // Get employee name for notification
-        const empSnap = await db.collection("cowork_employees").doc(empId).get();
-        const empName = empSnap.exists ? (empSnap.data().name || empId) : empId;
-
-        // Notify CEO/TL (assignedBy)
-        await _notifyMany({
-          recipientIds: [assignedBy],
-          type: "deadline_auto_extended",
-          title: `⚠️ Deadline Auto-Extended · ${conflictTask.title}`,
-          body: `"${conflictTask.title}" deadline shifted +${fmtHrs(Number(etcHours))} because P1 task "${title}" was assigned to ${empName}. New deadline: ${new Date(newDeadline).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}.`,
-          data: {
-            taskId: conflictTaskId,
-            taskTitle: conflictTask.title,
-            newDeadline,
-            shiftedByTaskId: taskId,
-            shiftedByTaskTitle: title,
-            employeeId: empId,
-            employeeName: empName,
-          },
-          senderId: "system",
-          senderName: "CoWork",
-        });
-
-        console.log(`[P1 Conflict] Task "${conflictTask.title}" deadline auto-extended by ${etcHours}h for ${empName} due to P1 task "${title}"`);
+        checkAndExtendForP1({
+          newP1TaskId: taskId,
+          employeeId: empId,
+          assignedBy,
+          newP1Priority: Number(priority),
+        }).catch(e => console.error("[P1 Conflict Detection — createTask]", e.message));
       }
-    } catch (e) {
-      console.error("[P1 Conflict Detection]", e.message);
-    }
+    });
   }
-  // ── END P1 CONFLICT DETECTION ─────────────────────────────────────────────
+  // ──────────────────────────────────────────────────────────────────────────
 
   return { ...task, createdAt: now };
 }
@@ -1869,7 +1801,7 @@ async function getDraftChat(taskId, limit = 100) {
 }
 
 // ── P1 CONFLICT CHECK — called from frontend timer start ──────────────────────
-async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, conflictTaskId, newP1Priority, conflictTaskPriority }) {
+async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assignedByName, newP1Priority, reason, oldPriorities, newPriorities }) {
   try {
     const p1Snap = await db.collection("cowork_tasks").doc(newP1TaskId).get();
     if (!p1Snap.exists) return null;
@@ -1880,6 +1812,7 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, confli
 
     const p1DeadlineStr = p1Task.fixedDeadline || p1Task.dueDate || null;
     if (!p1DeadlineStr) { console.log("[P1-SVC] no deadline on p1 task → return null"); return null; }
+
     const p1RemainingMs = Math.max(0, new Date(p1DeadlineStr).getTime() - Date.now());
     if (p1RemainingMs <= 0) { console.log("[P1-SVC] p1 already expired → return null"); return null; }
 
@@ -1887,73 +1820,124 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, confli
     const fmtHrs = h => h >= 1 ? `${Math.round(h * 10) / 10}h` : `${Math.round(h * 60)}m`;
     const now = new Date().toISOString();
 
-    let conflictDocId = conflictTaskId || null;
-    console.log("[P1-SVC] conflictTaskId passed:", conflictTaskId, "employeeId:", employeeId);
+    const empTasksSnap = await db.collection("cowork_tasks")
+      .where("assigneeIds", "array-contains", employeeId)
+      .get();
+    console.log("[P1-SVC] employee tasks scanned:", empTasksSnap.size);
 
-    if (!conflictDocId) {
-      const sessionsSnap = await db.collection("cowork_task_timers")
-        .doc(employeeId).collection("sessions").get();
-      console.log("[P1-SVC] sessions found:", sessionsSnap.docs.map(d => ({ id: d.id, isActive: d.data().isActive, totalSeconds: d.data().totalSeconds })));
-      // Prefer actively running session first, then paused with worked time
-      const sess = sessionsSnap.docs.find(d => d.data().isActive && d.id !== newP1TaskId)
-        || sessionsSnap.docs.find(d => !d.data().isActive && (d.data().totalSeconds || 0) > 0 && d.id !== newP1TaskId);
-      if (!sess) { console.log("[P1-SVC] no conflict session found → return null"); return null; }
-      conflictDocId = sess.id;
-    }
-    console.log("[P1-SVC] conflictDocId:", conflictDocId);
+    const extendedResults = [];
 
-    const conflictRef = db.collection("cowork_tasks").doc(conflictDocId);
-    const conflictSnap = await conflictRef.get();
-    if (!conflictSnap.exists) return null;
-    const conflictTask = conflictSnap.data();
+    for (const doc of empTasksSnap.docs) {
+      if (doc.id === newP1TaskId) continue;
+      const conflictTask = doc.data();
 
-    const conflictPriority = (conflictTaskPriority != null) ? Number(conflictTaskPriority) : (Number(conflictTask.priority) || 99);
-    if (newPriority >= conflictPriority) return null;
+      const TERMINAL_STATUSES = ["done", "cancelled", "tl_final_approved", "ceo_approved"];
+      if (TERMINAL_STATUSES.includes(conflictTask.status)) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — terminal status: ${conflictTask.status}`);
+        continue;
+      }
 
-    const _history = conflictTask.deadlineAutoExtendedHistory || [];
-    const _alreadyFired = _history.find(h =>
-      h.shiftedByTaskId === newP1TaskId &&
-      (Date.now() - new Date(h.at).getTime()) < 2 * 60 * 1000
-    );
-    if (_alreadyFired) { console.log(`[P1-conflict] dedup skip`); return null; }
+      // Use frontend-supplied new priority when available — avoids Firestore race condition
+      // (priority swap write from executeDrop may not have committed when this fires at 500ms)
+      const conflictPriority = (newPriorities && newPriorities[doc.id] != null)
+        ? Number(newPriorities[doc.id])
+        : (Number(conflictTask.priority) || 99);
+      if (newPriority >= conflictPriority) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — not lower priority: new=${newPriority} conflict=${conflictPriority}`);
+        continue;
+      }
 
-    const conflictDeadlineStr = conflictTask.fixedDeadline || conflictTask.dueDate || null;
-    if (!conflictDeadlineStr) return null;
+      const conflictDeadlineStr = conflictTask.fixedDeadline || conflictTask.dueDate || null;
+      if (!conflictDeadlineStr) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — no deadline set`);
+        continue;
+      }
 
-    const oldDeadline = conflictDeadlineStr;
-    const newDeadline = new Date(new Date(oldDeadline).getTime() + p1RemainingMs).toISOString();
-    const deadlineField = conflictTask.fixedDeadline ? "fixedDeadline" : "dueDate";
+      const _history = conflictTask.deadlineAutoExtendedHistory || [];
+      const _alreadyFired = _history.find(h =>
+        h.shiftedByTaskId === newP1TaskId &&
+        (Date.now() - new Date(h.at).getTime()) < 2 * 60 * 1000
+      );
+      if (_alreadyFired) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — dedup, already extended in last 2min`);
+        continue;
+      }
 
-    await conflictRef.update({
-      [deadlineField]: newDeadline,
-      autoExtendedDueToP1: true,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      deadlineAutoExtendedHistory: admin.firestore.FieldValue.arrayUnion({
-        extendedByHrs: p1RemainingHrs,
-        shiftedByTaskId: newP1TaskId,
-        shiftedByTaskTitle: p1Task.title,
+      console.log(`[P1-SVC] EXTENDING ${doc.id} (${conflictTask.title}) — priority ${conflictPriority}, deadline ${conflictDeadlineStr}`);
+
+      const oldDeadline = conflictDeadlineStr;
+
+      // ── Read how much time this employee already worked on this conflict task ──
+      // Subtract that from the extended deadline — she already banked those minutes,
+      // so she doesn't need them protected again by the extension.
+      let workedMs = 0;
+      try {
+        const timerSnap = await db.collection("cowork_task_timers")
+          .doc(employeeId).collection("sessions").doc(doc.id).get();
+        if (timerSnap.exists) {
+          const totalSeconds = Number(timerSnap.data().totalSeconds) || 0;
+          workedMs = totalSeconds * 1000;
+        }
+      } catch (e) {
+        console.warn(`[P1-SVC] could not read timer for ${doc.id}:`, e.message);
+      }
+
+      const rawNewDeadline = new Date(new Date(oldDeadline).getTime() + p1RemainingMs);
+      const adjustedDeadlineMs = Math.max(rawNewDeadline.getTime() - workedMs, new Date(oldDeadline).getTime());
+      const newDeadline = new Date(adjustedDeadlineMs).toISOString();
+
+      const deadlineField = conflictTask.fixedDeadline ? "fixedDeadline" : "dueDate";
+      const taskOldPriority = (oldPriorities && oldPriorities[doc.id] != null) ? Number(oldPriorities[doc.id]) : conflictPriority;
+
+      await doc.ref.update({
+        [deadlineField]: newDeadline,
+        autoExtendedDueToP1: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        deadlineAutoExtendedHistory: admin.firestore.FieldValue.arrayUnion({
+          extendedByHrs: p1RemainingHrs,
+          shiftedByTaskId: newP1TaskId,
+          shiftedByTaskTitle: p1Task.title,
+          oldDeadline,
+          newDeadline,
+          at: now,
+          trigger: "p1_conflict_check",
+          reason: reason || null,
+          changedByName: assignedByName || null,
+          acknowledgedByEmployee: false,
+          oldPriority: taskOldPriority,
+          newPriority: conflictPriority,
+        }),
+      });
+
+      extendedResults.push({
+        conflictTaskId: doc.id,
+        conflictTaskTitle: conflictTask.title,
         oldDeadline,
         newDeadline,
-        at: now,
-        trigger: "timer_start",
-      }),
-    });
+        extendedByHrs: p1RemainingHrs,
+        oldPriority: taskOldPriority,
+        newPriority: conflictPriority,
+      });
+    }
+
+    if (!extendedResults.length) { console.log("[P1-conflict] no tasks needed extension"); return null; }
 
     const empSnap = await db.collection("cowork_employees").doc(employeeId).get();
     const empName = empSnap.exists ? (empSnap.data().name || employeeId) : employeeId;
 
+    const titleList = extendedResults.map(r => r.conflictTaskTitle).join(", ");
     await _notifyMany({
       recipientIds: [assignedBy || p1Task.assignedBy].filter(Boolean),
       type: "deadline_auto_extended",
-      title: `Deadline Auto-Extended - ${conflictTask.title}`,
-      body: `"${conflictTask.title}" shifted +${fmtHrs(p1RemainingHrs)} because ${empName} started higher-priority task "${p1Task.title}". New deadline: ${new Date(newDeadline).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}.`,
-      data: { taskId: conflictDocId, taskTitle: conflictTask.title, newDeadline, shiftedByTaskId: newP1TaskId, employeeId, employeeName: empName },
+      title: `Deadline Auto-Extended - ${extendedResults.length} task${extendedResults.length > 1 ? "s" : ""}`,
+      body: `${titleList} shifted +${fmtHrs(p1RemainingHrs)} because ${empName} started higher-priority task "${p1Task.title}".`,
+      data: { extendedTaskIds: extendedResults.map(r => r.conflictTaskId), shiftedByTaskId: newP1TaskId, employeeId, employeeName: empName },
       senderId: "system",
       senderName: "CoWork",
     });
 
-    console.log(`[P1-conflict] "${conflictTask.title}" extended +${fmtHrs(p1RemainingHrs)} for ${empName}`);
-    return { conflictTaskId: conflictDocId, oldDeadline, newDeadline, extendedByHrs: p1RemainingHrs };
+    console.log(`[P1-conflict] ${extendedResults.length} task(s) extended +${fmtHrs(p1RemainingHrs)} for ${empName}: ${titleList}`);
+    return { extendedTasks: extendedResults, count: extendedResults.length };
   } catch (e) {
     console.error("[checkAndExtendForP1]", e.message);
     return null;
