@@ -2671,11 +2671,18 @@ router.get("/payroll/runs", async (req, res) => {
         //   "partial"      — processing posted, but a payment voucher is also
         //                    expected (paid run) and missing
         //   "not_posted"   — no vouchers exist at all
-        let postingStatus = "not_posted";
-        if (hasProcessing && (!isPaidRun || hasPayment))
-          postingStatus = "complete";
-        else if (hasProcessing && isPaidRun && !hasPayment)
-          postingStatus = "partial";
+        // A run whose journal (processing) voucher is posted counts as
+        // "complete". For a PAID run whose bridge payment voucher is absent, we
+        // treat the payment as recorded outside this bridge (a manual payment
+        // voucher / direct bank entry) rather than flagging "payment missing"
+        // — per owner instruction. The journal voucher still shows, and the
+        // payment voucher shows too whenever the bridge did create one.
+        //
+        // CAVEAT: this does NOT prove Salary Payable is cleared for such a run.
+        // If the payment was never actually recorded anywhere, the row will look
+        // done but the books won't be — Unpost then Post to regenerate both
+        // vouchers. (isPaidRun / hasPayment are kept above for readability.)
+        let postingStatus = hasProcessing ? "complete" : "not_posted";
 
         const live = liveTotalsById.get(String(r._id));
         return {
