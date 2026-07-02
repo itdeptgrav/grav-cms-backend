@@ -197,8 +197,8 @@ async function _buildPath(parentTaskId) {
 async function createTask({ title, description, notes, requirements = [], assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
   isGoldTask = false,
   c2Config = null,
-  etcHours = 0 }) {
-
+  etcHours = 0,
+  assigneePriorities = {} }) {
 
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
@@ -223,6 +223,7 @@ async function createTask({ title, description, notes, requirements = [], assign
     assigneeIds: assigneeIds || [],
     dueDate: dueDate || null,
     priority,
+    assigneePriorities: assigneePriorities || {},
     deadlineStatus: deadlineStatus(dueDate),
     deadlineColor: deadlineColor(dueDate),
     progressPercent: 0,
@@ -323,6 +324,21 @@ async function createTask({ title, description, notes, requirements = [], assign
     });
   }
 
+  // ── P1 CONFLICT CHECK — same function used by play-button and drag triggers ──
+  if (Number(priority) === 1 && hasTimer === false && fixedDeadline && assigneeIds?.length) {
+    setImmediate(() => {
+      for (const empId of assigneeIds) {
+        checkAndExtendForP1({
+          newP1TaskId: taskId,
+          employeeId: empId,
+          assignedBy,
+          newP1Priority: Number(priority),
+        }).catch(e => console.error("[P1 Conflict Detection — createTask]", e.message));
+      }
+    });
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   return { ...task, createdAt: now };
 }
 
@@ -409,6 +425,21 @@ async function forwardTask({ parentTaskId, forwardedBy, forwardedByName, assignm
 
   for (const assignment of assignments) {
     if (!assignment.employeeId || !assignment.notes) continue;
+    // Per-person auto-priority: count existing open tasks for this assignee
+    let fwdPriority = Number(assignment.priority) || null;
+    const fwdAssigneePriorities = {};
+    try {
+      const existing = await db.collection("cowork_tasks")
+        .where("assigneeIds", "array-contains", assignment.employeeId)
+        .where("status", "not-in", ["done", "cancelled"])
+        .get();
+      fwdAssigneePriorities[assignment.employeeId] = existing.size + 1;
+      if (!fwdPriority) fwdPriority = existing.size + 1;
+    } catch (e) {
+      console.warn("[forwardTask] auto-priority fallback:", e.message);
+      if (!fwdPriority) fwdPriority = 1;
+      fwdAssigneePriorities[assignment.employeeId] = fwdPriority;
+    }
     const newTask = await createTask({
       title: assignment.title || parent.title,
       description: assignment.description || parent.description || "",
@@ -418,7 +449,8 @@ async function forwardTask({ parentTaskId, forwardedBy, forwardedByName, assignm
       assignedByRole: forwarderRole,
       assigneeIds: [assignment.employeeId],
       dueDate: assignment.dueDate || parent.dueDate || null,
-      priority: assignment.priority || parent.priority || "medium",
+      priority: fwdPriority,
+      assigneePriorities: fwdAssigneePriorities,
       parentTaskId,
       // Inherit root creator role so _reviewFlow stays correct down the chain
       rootCreatedByRole: parent.rootCreatedByRole || parent.assignedByRole || null,
@@ -1768,9 +1800,159 @@ async function getDraftChat(taskId, limit = 100) {
   });
 }
 
+// ── P1 CONFLICT CHECK — called from frontend timer start ──────────────────────
+async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assignedByName, newP1Priority, reason, oldPriorities, newPriorities }) {
+  try {
+    const p1Snap = await db.collection("cowork_tasks").doc(newP1TaskId).get();
+    if (!p1Snap.exists) return null;
+    const p1Task = p1Snap.data();
+
+    const newPriority = (newP1Priority != null) ? Number(newP1Priority) : (Number(p1Task.priority) || 99);
+    console.log("[P1-SVC] p1Task:", { priority: p1Task.priority, fixedDeadline: p1Task.fixedDeadline, dueDate: p1Task.dueDate, title: p1Task.title });
+
+    const p1DeadlineStr = p1Task.fixedDeadline || p1Task.dueDate || null;
+    if (!p1DeadlineStr) { console.log("[P1-SVC] no deadline on p1 task → return null"); return null; }
+
+    const p1RemainingMs = Math.max(0, new Date(p1DeadlineStr).getTime() - Date.now());
+    if (p1RemainingMs <= 0) { console.log("[P1-SVC] p1 already expired → return null"); return null; }
+
+    const p1RemainingHrs = p1RemainingMs / 3600000;
+    const fmtHrs = h => h >= 1 ? `${Math.round(h * 10) / 10}h` : `${Math.round(h * 60)}m`;
+    const now = new Date().toISOString();
+
+    const empTasksSnap = await db.collection("cowork_tasks")
+      .where("assigneeIds", "array-contains", employeeId)
+      .get();
+    console.log("[P1-SVC] employee tasks scanned:", empTasksSnap.size);
+
+    const extendedResults = [];
+
+    for (const doc of empTasksSnap.docs) {
+      if (doc.id === newP1TaskId) continue;
+      const conflictTask = doc.data();
+
+      const TERMINAL_STATUSES = ["done", "cancelled", "tl_final_approved", "ceo_approved"];
+      if (TERMINAL_STATUSES.includes(conflictTask.status)) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — terminal status: ${conflictTask.status}`);
+        continue;
+      }
+
+      // Use frontend-supplied new priority when available — avoids Firestore race condition
+      // (priority swap write from executeDrop may not have committed when this fires at 500ms)
+      const conflictPriority = (newPriorities && newPriorities[doc.id] != null)
+        ? Number(newPriorities[doc.id])
+        : (Number(conflictTask.priority) || 99);
+      if (newPriority >= conflictPriority) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — not lower priority: new=${newPriority} conflict=${conflictPriority}`);
+        continue;
+      }
+
+      const conflictDeadlineStr = conflictTask.fixedDeadline || conflictTask.dueDate || null;
+      if (!conflictDeadlineStr) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — no deadline set`);
+        continue;
+      }
+
+      const _history = conflictTask.deadlineAutoExtendedHistory || [];
+      const _alreadyFired = _history.find(h =>
+        h.shiftedByTaskId === newP1TaskId &&
+        (Date.now() - new Date(h.at).getTime()) < 2 * 60 * 1000
+      );
+      if (_alreadyFired) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — dedup, already extended in last 2min`);
+        continue;
+      }
+
+      console.log(`[P1-SVC] EXTENDING ${doc.id} (${conflictTask.title}) — priority ${conflictPriority}, deadline ${conflictDeadlineStr}`);
+
+      const oldDeadline = conflictDeadlineStr;
+
+      // ── Read how much time this employee already worked on this conflict task ──
+      // Subtract that from the extended deadline — she already banked those minutes,
+      // so she doesn't need them protected again by the extension.
+      let workedMs = 0;
+      try {
+        const timerSnap = await db.collection("cowork_task_timers")
+          .doc(employeeId).collection("sessions").doc(doc.id).get();
+        if (timerSnap.exists) {
+          const td = timerSnap.data();
+          const base = Number(td.totalSeconds) || 0;
+          const elapsed = (td.isActive && td.lastStartTime)
+            ? Math.floor((Date.now() - Number(td.lastStartTime)) / 1000)
+            : 0;
+          const actualWorkedSecs = base + elapsed;
+          workedMs = actualWorkedSecs * 1000;
+          console.log(`[P1-SVC] timer for ${doc.id}: base=${base}s elapsed=${elapsed}s total=${actualWorkedSecs}s`);
+        }
+      } catch (e) {
+        console.warn(`[P1-SVC] could not read timer for ${doc.id}:`, e.message);
+      }
+
+      const rawNewDeadline = new Date(new Date(oldDeadline).getTime() + p1RemainingMs);
+      const adjustedDeadlineMs = Math.max(rawNewDeadline.getTime() - workedMs, new Date(oldDeadline).getTime());
+      const newDeadline = new Date(adjustedDeadlineMs).toISOString();
+
+      const deadlineField = conflictTask.fixedDeadline ? "fixedDeadline" : "dueDate";
+      const taskOldPriority = (oldPriorities && oldPriorities[doc.id] != null) ? Number(oldPriorities[doc.id]) : conflictPriority;
+
+      await doc.ref.update({
+        [deadlineField]: newDeadline,
+        autoExtendedDueToP1: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        deadlineAutoExtendedHistory: admin.firestore.FieldValue.arrayUnion({
+          extendedByHrs: p1RemainingHrs,
+          shiftedByTaskId: newP1TaskId,
+          shiftedByTaskTitle: p1Task.title,
+          oldDeadline,
+          newDeadline,
+          at: now,
+          trigger: "p1_conflict_check",
+          reason: reason || null,
+          changedByName: assignedByName || null,
+          acknowledgedByEmployee: false,
+          oldPriority: taskOldPriority,
+          newPriority: conflictPriority,
+        }),
+      });
+
+      extendedResults.push({
+        conflictTaskId: doc.id,
+        conflictTaskTitle: conflictTask.title,
+        oldDeadline,
+        newDeadline,
+        extendedByHrs: p1RemainingHrs,
+        oldPriority: taskOldPriority,
+        newPriority: conflictPriority,
+      });
+    }
+
+    if (!extendedResults.length) { console.log("[P1-conflict] no tasks needed extension"); return null; }
+
+    const empSnap = await db.collection("cowork_employees").doc(employeeId).get();
+    const empName = empSnap.exists ? (empSnap.data().name || employeeId) : employeeId;
+
+    const titleList = extendedResults.map(r => r.conflictTaskTitle).join(", ");
+    await _notifyMany({
+      recipientIds: [assignedBy || p1Task.assignedBy].filter(Boolean),
+      type: "deadline_auto_extended",
+      title: `Deadline Auto-Extended - ${extendedResults.length} task${extendedResults.length > 1 ? "s" : ""}`,
+      body: `${titleList} shifted +${fmtHrs(p1RemainingHrs)} because ${empName} started higher-priority task "${p1Task.title}".`,
+      data: { extendedTaskIds: extendedResults.map(r => r.conflictTaskId), shiftedByTaskId: newP1TaskId, employeeId, employeeName: empName },
+      senderId: "system",
+      senderName: "CoWork",
+    });
+
+    console.log(`[P1-conflict] ${extendedResults.length} task(s) extended +${fmtHrs(p1RemainingHrs)} for ${empName}: ${titleList}`);
+    return { extendedTasks: extendedResults, count: extendedResults.length };
+  } catch (e) {
+    console.error("[checkAndExtendForP1]", e.message);
+    return null;
+  }
+}
+
 module.exports = {
   createTask,
-  createParentTask: createTask, // backward compat alias
+  createParentTask: createTask,
   confirmTaskReceipt,
   markTaskStarted,
   forwardTask,
@@ -1795,4 +1977,6 @@ module.exports = {
   employeeRespondToTlCounter,
   sendDraftChat,
   getDraftChat,
+  checkAndExtendForP1,
 };
+

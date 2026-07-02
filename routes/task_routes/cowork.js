@@ -9,6 +9,7 @@ const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken, verifyCeoOrTL } = require("../../Middlewear/coworkAuth");
 
 const svc = require("../../services/cowork.service");
+const { invalidateEmpListCache } = require("../../services/cowork.service");
 const { auth, db, admin } = require("../../config/firebaseAdmin");
 const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
 
@@ -256,6 +257,7 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, re
       result.tempPassword
     ).catch(err => console.error("[cowork/create-employee] Email error:", err.message));
 
+    invalidateEmpListCache();
     res.status(201).json({
       success: true,
       employeeId: result.employeeId,
@@ -744,6 +746,7 @@ router.delete("/employee/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res
     await db.collection("cowork_employees").doc(employeeId).delete();
     console.log(`[DeleteEmployee] Firestore deleted: ${employeeId} (${empData.email})`);
 
+    invalidateEmpListCache();
     return res.json({
       success: true,
       message: `${empData.name} has been deleted. Email ${empData.email} can now be re-used.`,

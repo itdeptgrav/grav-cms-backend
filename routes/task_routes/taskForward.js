@@ -121,19 +121,27 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     const thirdPartyFlag = isThirdParty === true || isThirdParty === "true";
     const goalFlag = isGoal === true || isGoal === "true";
 
-    // Auto-priority: count existing open tasks for the first assignee → assign next priority
+    // Per-person auto-priority: build assigneePriorities map for EVERY assignee
+    // Each person gets their own priority = their open task count + 1
     let autoPriority = (typeof priority === "number" ? priority : Number(priority)) || null;
-    if (!autoPriority && assigneeIds?.length > 0) {
+    const assigneePrioritiesMap = {};
+    if (assigneeIds?.length > 0) {
       try {
-        const { db } = require("../../config/firebaseAdmin");
-        const existing = await db.collection("cowork_tasks")
-          .where("assigneeIds", "array-contains", assigneeIds[0])
-          .where("status", "not-in", ["done", "cancelled"])
-          .get();
-        autoPriority = existing.size + 1;
+        const { db: _db } = require("../../config/firebaseAdmin");
+        for (const aid of assigneeIds) {
+          const existing = await _db.collection("cowork_tasks")
+            .where("assigneeIds", "array-contains", aid)
+            .where("status", "not-in", ["done", "cancelled"])
+            .get();
+          assigneePrioritiesMap[aid] = existing.size + 1;
+        }
+        if (!autoPriority) autoPriority = assigneePrioritiesMap[assigneeIds[0]] || 1;
       } catch (e) {
         console.warn("[task/create] auto-priority fallback:", e.message);
-        autoPriority = 1;
+        if (!autoPriority) autoPriority = 1;
+        assigneeIds.forEach(aid => {
+          if (!assigneePrioritiesMap[aid]) assigneePrioritiesMap[aid] = autoPriority;
+        });
       }
     }
     if (!autoPriority) autoPriority = 1;
@@ -146,6 +154,7 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       assigneeIds: assigneeIds || [],
       dueDate: null,
       priority: autoPriority,
+      assigneePriorities: assigneePrioritiesMap,
       parentTaskId: parentTaskId || null,
       groupId: groupId || null,
       createdByTl: createdByTl || false,
@@ -802,6 +811,26 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       || parent.assignedBy === employeeId;
     if (!canCreate) return res.status(403).json({ error: "Not authorized to create subtasks here." });
 
+    // Per-person auto-priority for subtask
+    const subtaskAssigneePriorities = {};
+    let subtaskPriority = (typeof priority === "number" ? priority : Number(priority)) || null;
+    try {
+      for (const aid of assigneeIds) {
+        const existing = await db.collection("cowork_tasks")
+          .where("assigneeIds", "array-contains", aid)
+          .where("status", "not-in", ["done", "cancelled"])
+          .get();
+        subtaskAssigneePriorities[aid] = existing.size + 1;
+      }
+      if (!subtaskPriority) subtaskPriority = subtaskAssigneePriorities[assigneeIds[0]] || 1;
+    } catch (e) {
+      console.warn("[subtask/create] auto-priority fallback:", e.message);
+      if (!subtaskPriority) subtaskPriority = 1;
+      assigneeIds.forEach(aid => {
+        if (!subtaskAssigneePriorities[aid]) subtaskAssigneePriorities[aid] = subtaskPriority;
+      });
+    }
+
     const subtask = await svc.createTask({
       title: title.trim(), description, notes,
       assignedBy: employeeId,
@@ -809,7 +838,8 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       assignedByRole: requesterRole,
       assigneeIds,
       dueDate: null,
-      priority: (typeof priority === "number" ? priority : Number(priority)) || 5,
+      priority: subtaskPriority,
+      assigneePriorities: subtaskAssigneePriorities,
       parentTaskId: req.params.taskId,
       // TL subtasks should NOT show in CEO tree
       createdByTl: requesterRole === "tl",
@@ -1675,6 +1705,31 @@ router.post("/task/:taskId/goal-activity/:activityId/request-report", verifyCowo
 
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── P1 CONFLICT CHECK — called from frontend when employee starts a P1 task ──
+router.post("/task/p1-conflict-check", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { newP1TaskId, employeeId } = req.body;
+    if (!newP1TaskId || !employeeId) return res.status(400).json({ error: "Missing newP1TaskId or employeeId" });
+
+    console.log("[P1-ROUTE] received:", { newP1TaskId, employeeId, conflictTaskId: req.body.conflictTaskId });
+    const result = await svc.checkAndExtendForP1({
+      newP1TaskId,
+      employeeId,
+      assignedBy: req.body.assignedBy || req.coworkUser?.employeeId,
+      newP1Priority: req.body.newP1Priority != null ? Number(req.body.newP1Priority) : null,
+      assignedByName: req.body.assignedByName || null,
+      reason: req.body.reason || null,
+      oldPriorities: req.body.oldPriorities || null,
+      newPriorities: req.body.newPriorities || null,
+    });
+    console.log("[P1-ROUTE] result:", result);
+    res.json({ ok: true, extended: result || null });
+  } catch (e) {
+    console.error("[p1-conflict-check route]", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── GOAL ACTIVITY: SUBMIT REPORT for a specific component ────────────────────
