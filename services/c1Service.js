@@ -54,15 +54,19 @@ async function getC1Config() {
 // ─────────────────────────────────────────────────────────────────────────────
 // calculateTaskScore — single task score
 // ─────────────────────────────────────────────────────────────────────────────
-function calculateTaskScore(cfg, { deadlinesMissed = 0, extensionsFiled = 0, reworksReceived = 0, isRejected = false }) {
+
+function calculateTaskScore(cfg, { deadlinesMissed = 0, extensionsFiled = 0, reworksReceived = 0, rejectionsReceived = 0, isRejected = false }) {
     if (isRejected) return +Number(cfg.c1RejectScore).toFixed(2);
-    return +(
+    return +Math.max(0,
         Number(cfg.c1BaseScore) -
         (Number(cfg.c1DeadlineDeduction) * deadlinesMissed) -
         (Number(cfg.c1ExtensionDeduction) * extensionsFiled) -
-        (Number(cfg.c1ReworkDeduction) * reworksReceived)
+        (Number(cfg.c1ReworkDeduction) * reworksReceived) -
+        (Number(cfg.c1RejectScore) * rejectionsReceived)
     ).toFixed(2);
 }
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // calculateQualityRate — ETC-weighted average across all closed tasks
 // Cancelled tasks excluded. Returns null if no eligible tasks.
@@ -209,7 +213,7 @@ async function computeAndStoreTaskScore({ taskId, taskData, employeeId, isReject
         const etcHours = Number(taskData.etcHours) || 0;
         const rejectionsReceived = Number(c1.rejectionsReceived) || 0;
 
-        const taskScore = calculateTaskScore(cfg, { deadlinesMissed, extensionsFiled, reworksReceived, isRejected });
+        const taskScore = calculateTaskScore(cfg, { deadlinesMissed, extensionsFiled, reworksReceived, rejectionsReceived, isRejected });
 
         // ── Store score on task document ─────────────────────────────────────────
         const taskRef = db.collection("cowork_tasks").doc(taskId);

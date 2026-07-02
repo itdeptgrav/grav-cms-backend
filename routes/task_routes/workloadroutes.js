@@ -16,6 +16,16 @@ const { verifyCoworkToken, verifyCeoOrTL } = require("../../Middlewear/coworkAut
 const MS_PER_MONTH = 1000 * 60 * 60 * 24 * 30.44;
 const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 
+// ── 2-min cache for workload summary ─────────────────────────────────────────
+const _wlCache = new Map();
+const WL_TTL = 2 * 60 * 1000;
+function _getWL(key) {
+    const e = _wlCache.get(key);
+    if (!e || Date.now() > e.exp) { _wlCache.delete(key); return null; }
+    return e.data;
+}
+function _setWL(key, data) { _wlCache.set(key, { data, exp: Date.now() + WL_TTL }); }
+
 // ── Always fetch from Firestore — never hardcode ──────────────────────────────
 async function getOfficeSchedule() {
     const snap = await db.collection("cowork_settings").doc("office").get();
@@ -112,11 +122,51 @@ function getTaskHours(task, now, schedule) {
     return { hours: 0, overdue: false };
 }
 
+// Reverse of calcOfficeHours — given start + hours, returns end datetime
+function addOfficeHours(startDate, hoursToAdd, schedule) {
+    if (!hoursToAdd || hoursToAdd <= 0) return new Date(startDate);
+    let minsLeft = hoursToAdd * 60;
+    const cursor = new Date(startDate);
+
+    while (minsLeft > 0) {
+        const dayKey = DAY_KEYS[cursor.getDay()];
+        const day = schedule[dayKey];
+
+        if (day && !day.isOff) {
+            const inMins = parseMins(day.inTime);
+            const outMins = parseMins(day.outTime);
+
+            const dayStart = new Date(cursor);
+            dayStart.setHours(Math.floor(inMins / 60), inMins % 60, 0, 0);
+
+            const dayEnd = new Date(cursor);
+            dayEnd.setHours(Math.floor(outMins / 60), outMins % 60, 0, 0);
+
+            const pos = new Date(Math.max(cursor.getTime(), dayStart.getTime()));
+            if (pos < dayEnd) {
+                const availMins = (dayEnd.getTime() - pos.getTime()) / 60000;
+                if (availMins >= minsLeft) {
+                    return new Date(pos.getTime() + minsLeft * 60000);
+                }
+                minsLeft -= availMins;
+            }
+        }
+        cursor.setDate(cursor.getDate() + 1);
+        cursor.setHours(0, 0, 0, 0);
+    }
+    return cursor;
+}
+
 // ── Main route ────────────────────────────────────────────────────────────────
 router.get("/workload/summary", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeData } = req.coworkUser;
         const tlDepartment = employeeData?.department || null;
+
+        // ── Cache check ───────────────────────────────────────────────────────
+        const cacheKey = `${role}_${tlDepartment || "all"}`;
+        const cached = _getWL(cacheKey);
+        if (cached) return res.json(cached);
 
         // Fetch office schedule — null if not configured (hours default to 0)
         const schedule = await getOfficeSchedule();
@@ -208,10 +258,116 @@ router.get("/workload/summary", verifyCoworkToken, verifyCeoOrTL, async (req, re
         });
 
         result.sort((a, b) => b.totalHours - a.totalHours);
-        res.json({ success: true, employees: result });
+        const response = { success: true, employees: result };
+        _setWL(cacheKey, response);
+        res.json(response);
 
     } catch (e) {
         console.error("[workload/summary]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ── Per-employee calendar route ───────────────────────────────────────────────
+router.get("/workload/employee/:employeeId/calendar", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+    try {
+        const { employeeId } = req.params;
+
+        const empSnap = await db.collection("cowork_employees")
+            .where("employeeId", "==", employeeId).limit(1).get();
+        if (empSnap.empty) return res.status(404).json({ error: "Employee not found" });
+        const empData = empSnap.docs[0].data();
+
+        const schedule = await getOfficeSchedule();
+
+        const tasksSnap = await db.collection("cowork_tasks")
+            .where("assigneeIds", "array-contains", employeeId)
+            .where("status", "in", ["open", "in_progress", "done"])
+            .get();
+
+        const APPROVED = ["tl_final_approved", "ceo_approved"];
+        const tasks = tasksSnap.docs
+            .map(d => d.data())
+            .filter(t => !APPROVED.includes(t.completionStatus))
+            .sort((a, b) => new Date(a.createdAtISO || a.createdAt || 0) - new Date(b.createdAtISO || b.createdAt || 0));
+
+        let chainEnd = null;
+        const scheduled = tasks.map(t => {
+            const createdAt = t.createdAtISO
+                ? new Date(t.createdAtISO)
+                : t.createdAt?.toDate
+                    ? t.createdAt.toDate()
+                    : t.createdAt?._seconds
+                        ? new Date(t.createdAt._seconds * 1000)
+                        : new Date();
+            const startTime = (chainEnd && chainEnd > createdAt) ? new Date(chainEnd) : createdAt;
+
+            // Fixed deadline task → end time IS the fixedDeadline
+            // Timer task → calculate end from deadlineWindowSecs / senderTimerWindowSecs / etcHours
+            let etcHours = 0;
+            let endTime;
+
+            if (t.hasTimer === false && t.fixedDeadline) {
+                // Fixed deadline — use deadline directly as end time
+                endTime = new Date(t.fixedDeadline);
+                etcHours = schedule
+                    ? calcOfficeHours(startTime, t.fixedDeadline, schedule).hours
+                    : +((endTime - startTime) / 3600000).toFixed(1);
+            } else {
+                if (Number(t.deadlineWindowSecs) > 0)
+                    etcHours = +(Number(t.deadlineWindowSecs) / 3600).toFixed(1);
+                else if (Number(t.senderTimerWindowSecs) > 0)
+                    etcHours = +(Number(t.senderTimerWindowSecs) / 3600).toFixed(1);
+                else if (Number(t.etcHours) > 0)
+                    etcHours = +Number(t.etcHours).toFixed(1);
+
+                endTime = (schedule && etcHours > 0)
+                    ? addOfficeHours(startTime, etcHours, schedule)
+                    : new Date(startTime.getTime() + etcHours * 3600000);
+            }
+
+            const overlap = !!(chainEnd && chainEnd > createdAt);
+            chainEnd = endTime;
+            return {
+                taskId: t.taskId,
+                title: t.title || "",
+                isGoldTask: t.isGoldTask === true,
+                etcHours,
+                startTime: startTime.toISOString(),
+                endTime: endTime.toISOString(),
+                createdAt: createdAt.toISOString(),
+                status: t.status,
+                overlap,
+                overlapsWith: [],
+            };
+        });
+
+        // Mark overlapping pairs
+        for (let i = 0; i < scheduled.length; i++) {
+            for (let j = i + 1; j < scheduled.length; j++) {
+                const a = scheduled[i], b = scheduled[j];
+                if (new Date(a.startTime) < new Date(b.endTime) &&
+                    new Date(a.endTime) > new Date(b.startTime)) {
+                    a.overlap = true; b.overlap = true;
+                    if (!a.overlapsWith.includes(b.taskId)) a.overlapsWith.push(b.taskId);
+                    if (!b.overlapsWith.includes(a.taskId)) b.overlapsWith.push(a.taskId);
+                }
+            }
+        }
+
+        res.json({
+            success: true,
+            employee: {
+                employeeId: empData.employeeId,
+                name: empData.name || "",
+                department: empData.department || "—",
+                role: empData.role || "employee",
+            },
+            tasks: scheduled,
+            scheduleConfigured: !!schedule,
+        });
+    } catch (e) {
+        console.error("[workload/employee/calendar]", e.message);
         res.status(500).json({ error: e.message });
     }
 });
