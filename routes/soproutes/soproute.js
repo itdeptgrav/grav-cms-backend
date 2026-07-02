@@ -803,6 +803,24 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
         const today = new Date().toISOString().split("T")[0];
         const absPoints = Math.abs(Number(points));
 
+        // ── Duplicate guard — prevent double-credit for same component ─────────
+        // If this taskId + componentId was already credited this year, skip.
+        const yearData = (employee.sopPoints || []).find(sp => sp.year === year);
+        if (yearData) {
+            const alreadyCredited = (yearData.bleaches || []).some(
+                b => b.taskId === taskId && b.componentId === componentId && b.bleachType === "debit"
+            );
+            if (alreadyCredited) {
+                console.warn(`[goal-credit] DUPLICATE blocked: ${targetEmployeeId} task=${taskId} comp=${componentId}`);
+                return res.json({
+                    success: false,
+                    skipped: true,
+                    message: `Component "${componentName}" already credited. Duplicate blocked.`,
+                });
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         // Build the credit entry — bleachType:"debit" = reward (reduces penalty score)
         const creditEntry = {
             type: "C2",

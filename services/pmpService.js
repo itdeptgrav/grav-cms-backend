@@ -416,7 +416,8 @@ async function getSOPBreakdown(employeeId, quarter, year) {
         if (entryMonth < qStartMonth || entryMonth > qEndMonth) return;
 
         const pts = Number(b.points) || 0;
-        const delta = b.bleachType === "debit" ? +pts : -pts;
+        const delta = b.isCredit ? +pts : -pts;
+
         const key = (b.type || "").toLowerCase();
 
         if (key === "c1") totals.c1 = +(totals.c1 + delta).toFixed(2);

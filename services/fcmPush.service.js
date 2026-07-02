@@ -34,6 +34,8 @@ async function sendIOSWebPush(subscriptionJSON, title, body, data = {}) {
 }
 
 async function sendPushToEmployees(recipientIds, title, body, data = {}) {
+    console.log("[FCM DISABLED] would have sent to:", recipientIds, "—", title);
+    return;
     if (!recipientIds?.length) return;
     const db = admin.firestore();
 
