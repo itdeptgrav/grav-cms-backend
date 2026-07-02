@@ -231,6 +231,25 @@ router.get("/workload/summary", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 .reduce((s, t) => s + t.hours, 0)
                 .toFixed(1);
 
+            // Pending = total hours of incomplete tasks not yet overdue
+            const pendingHours = +c1Details
+                .filter(t => !t.overdue && t.status !== "done")
+                .reduce((s, t) => s + t.hours, 0)
+                .toFixed(1);
+
+            const overdueCount = c1Details.filter(t => t.overdue && t.status !== "done").length;
+            // For overdue tasks, calculate hours PAST the deadline (not remaining)
+            const overdueHours = +c1Details
+                .filter(t => t.overdue && t.status !== "done")
+                .reduce((s, t) => {
+                    const deadline = allTasks.find(at => at.taskId === t.taskId);
+                    const deadlineStr = deadline?.dueDate || deadline?.fixedDeadline || null;
+                    if (!deadlineStr) return s;
+                    const hoursLate = Math.max(0, (now.getTime() - new Date(deadlineStr).getTime()) / 3600000);
+                    return s + hoursLate;
+                }, 0)
+                .toFixed(1);
+
             const c2Details = c2Tasks.map(t => {
                 const msLeft = t.dueDate ? (new Date(t.dueDate).getTime() - now) : 0;
                 return {
@@ -249,6 +268,9 @@ router.get("/workload/summary", verifyCoworkToken, verifyCeoOrTL, async (req, re
                 role: emp.role || "employee",
                 profilePicUrl: emp.profilePicUrl || null,
                 totalHours,
+                pendingHours,
+                overdueCount,
+                overdueHours,
                 c1Count: c1Tasks.length,
                 c2Count: c2Tasks.length,
                 totalC2Months: c2Details.reduce((s, t) => s + t.monthsLeft, 0),
