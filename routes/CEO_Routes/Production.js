@@ -1351,4 +1351,274 @@ router.get("/floor-data", ceoAuth, async (req, res) => {
   }
 });
 
+
+router.get("/product-efficiency", ceoAuth, async (req, res) => {
+  try {
+    const dateStr = req.query.date || getTodayIST();
+    const { ProductionTracking, Employee, WorkOrder } = getModels();
+    const StockItem       = require("../../models/CMS_Models/Inventory/Products/StockItem");
+    const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
+ 
+    // 1. Parallel load
+    const [trackingDoc, attendanceDoc, allEmps] = await Promise.all([
+      ProductionTracking.findOne({ date: utcRange(dateStr) }).lean(),
+      DailyAttendance.findOne({ dateStr }).lean(),
+      Employee.find({ isActive: true })
+        .select("firstName lastName identityId biometricId profilePhoto department").lean(),
+    ]);
+ 
+    // Enhanced emp lookup (includes GR0 prefix fix)
+    const empRawMap = buildEmpMap(allEmps);
+    const getEmp = (id) => {
+      if (!id) return null;
+      return empRawMap.get(id)
+        || (/^GR\d+$/i.test(id) ? empRawMap.get("GR0" + id.slice(2)) : null)
+        || null;
+    };
+ 
+    // 2. Break-window map: operatorId → [{ start, end }]
+    const breakMap = new Map();
+    for (const e of attendanceDoc?.employees || []) {
+      const windows = [];
+      if (e.lunchOut && e.lunchIn && new Date(e.lunchIn) > new Date(e.lunchOut))
+        windows.push({ start: new Date(e.lunchOut), end: new Date(e.lunchIn) });
+      if (e.teaOut && e.teaIn && new Date(e.teaIn) > new Date(e.teaOut))
+        windows.push({ start: new Date(e.teaOut), end: new Date(e.teaIn) });
+      const val = { windows };
+      if (e.biometricId) breakMap.set(e.biometricId, val);
+      if (e.identityId && e.identityId !== e.biometricId) breakMap.set(e.identityId, val);
+    }
+ 
+    // 3. Flatten all valid scans
+    const allScans = [];
+    for (const machine of (trackingDoc?.machines || [])) {
+      const mId = machine.machineId?.toString();
+      for (const op of machine.operators || []) {
+        const opId = op.operatorIdentityId;
+        const siDateStr = op.signInTime
+          ? new Date(op.signInTime).toISOString().split("T")[0] : null;
+        if (siDateStr && siDateStr !== dateStr) continue; // skip stale sessions
+ 
+        for (const scan of op.barcodeScans || []) {
+          const p = scan.barcodeId?.split("-");
+          if (!p || p[0] !== "WO" || p.length < 3) continue;
+          const unitNum = parseInt(p[2], 10);
+          if (isNaN(unitNum)) continue;
+          allScans.push({
+            barcodeId: scan.barcodeId,
+            timeStamp: new Date(scan.timeStamp),
+            activeOps: Array.isArray(scan.activeOps) ? scan.activeOps : [],
+            operatorId: opId, machineId: mId,
+            woShortId: p[1], unitNum,
+          });
+        }
+      }
+    }
+ 
+    if (!allScans.length) {
+      return res.json({
+        success: true, date: dateStr, products: [],
+        summary: { totalProducts: 0, totalPiecesScanned: 0, totalScans: 0, uniqueOps: 0 },
+      });
+    }
+ 
+    // 4. Load WOs
+    const scannedShortIds = new Set(allScans.map(s => s.woShortId));
+    const allWOs = await WorkOrder.find({})
+      .select("_id workOrderNumber stockItemId stockItemName variantAttributes quantity status").lean();
+    const woByShortId = new Map(allWOs.map(wo => [wo._id.toString().slice(-8), wo]));
+ 
+    // 5. Load StockItems
+    const stockItemIds = new Set();
+    for (const sid of scannedShortIds) {
+      const wo = woByShortId.get(sid);
+      if (wo?.stockItemId) stockItemIds.add(wo.stockItemId.toString());
+    }
+    const stockItems = stockItemIds.size
+      ? await StockItem.find({ _id: { $in: [...stockItemIds] } })
+          .select("name genderCategory category images operations variants").lean()
+      : [];
+    const stockItemMap = new Map(stockItems.map(si => [si._id.toString(), si]));
+ 
+    // 6. pieceOps: woShortId → unitNum → Set<opCode>
+    const pieceOps = new Map();
+    for (const scan of allScans) {
+      if (!pieceOps.has(scan.woShortId)) pieceOps.set(scan.woShortId, new Map());
+      const pMap = pieceOps.get(scan.woShortId);
+      if (!pMap.has(scan.unitNum)) pMap.set(scan.unitNum, new Set());
+      for (const code of scan.activeOps) pMap.get(scan.unitNum).add(code);
+    }
+ 
+    // 7. opTimings: opCode → operatorId → timestamps[]
+    const opTimings = new Map();
+    for (const scan of allScans) {
+      for (const code of scan.activeOps) {
+        if (!opTimings.has(code)) opTimings.set(code, new Map());
+        const byOp = opTimings.get(code);
+        if (!byOp.has(scan.operatorId)) byOp.set(scan.operatorId, []);
+        byOp.get(scan.operatorId).push(scan.timeStamp);
+      }
+    }
+ 
+    // 8. Break-adjusted gaps helper
+    const safeAvg = arr => arr.length
+      ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null;
+ 
+    const computeGaps = (timestamps, operatorId) => {
+      if (timestamps.length < 2) return [];
+      const sorted = [...timestamps].sort((a, b) => a - b);
+      const windows = breakMap.get(operatorId)?.windows || [];
+      return sorted.slice(1).reduce((acc, ts, i) => {
+        let gapMs = ts - sorted[i];
+        for (const w of windows) {
+          const oS = Math.max(sorted[i].getTime(), w.start.getTime());
+          const oE = Math.min(ts.getTime(), w.end.getTime());
+          if (oE > oS) gapMs -= (oE - oS);
+        }
+        const secs = gapMs / 1000;
+        if (secs >= 5 && secs < 7200) acc.push(secs);
+        return acc;
+      }, []);
+    };
+ 
+    // opStats: opCode → { avgSecs, sampleCount, operatorBreakdown[] }
+    const opStats = new Map();
+    for (const [code, byOp] of opTimings) {
+      const breakdown = [], allGaps = [];
+      for (const [opId, ts] of byOp) {
+        const gaps   = computeGaps(ts, opId);
+        const opAvg  = safeAvg(gaps);
+        const emp    = getEmp(opId);
+        breakdown.push({
+          operatorId: opId, name: emp?.name || opId,
+          profilePhoto: emp?.profilePhoto || null,
+          department: emp?.department || null,
+          piecesHandled: ts.length, avgSecs: opAvg, sampleCount: gaps.length,
+        });
+        allGaps.push(...gaps);
+      }
+      opStats.set(code, {
+        avgSecs: safeAvg(allGaps), sampleCount: allGaps.length,
+        operatorBreakdown: breakdown.sort((a, b) => b.piecesHandled - a.piecesHandled),
+      });
+    }
+ 
+    // 9. Build product groups
+    const productGroups = new Map();
+    for (const woShortId of scannedShortIds) {
+      const wo   = woByShortId.get(woShortId);
+      const siId = wo?.stockItemId?.toString() || null;
+      const si   = siId ? stockItemMap.get(siId) : null;
+ 
+      let image = si?.images?.[0] || null;
+      if (!image) { const v = si?.variants?.find(vv => vv.images?.length > 0); if (v) image = v.images[0]; }
+ 
+      const key = siId || `__nosI__${woShortId}`;
+      if (!productGroups.has(key)) {
+        productGroups.set(key, {
+          stockItemId: siId,
+          productName: si?.name || wo?.stockItemName || `WO-${woShortId}`,
+          genderCategory: si?.genderCategory || null,
+          category: si?.category || null,
+          image,
+          siOps: (si?.operations || []).filter(op => !!op.operationCode),
+          variants: [],
+        });
+      }
+ 
+      const pg   = productGroups.get(key);
+      const pMap = pieceOps.get(woShortId) || new Map();
+ 
+      // Expected ops from StockItem
+      // StockItem.operations fields: type(name), operationCode, totalSeconds(SAM secs)
+      const expectedOps = pg.siOps.map(op => ({
+        opCode: op.operationCode, opName: op.type || op.operationCode,
+        samSeconds: op.totalSeconds || 0,
+        samMins: op.totalSeconds ? +(op.totalSeconds / 60).toFixed(1) : null,
+        machineType: op.machineType || op.machine || null,
+      }));
+      const expectedSet = new Set(expectedOps.map(o => o.opCode));
+ 
+      // Operations efficiency
+      const operationsData = expectedOps.map(({ opCode, opName, samSeconds, samMins, machineType }) => {
+        const piecesWithOp = [...pMap.values()].filter(ops => ops.has(opCode)).length;
+        const stats        = opStats.get(opCode);
+        const avgActual    = stats?.avgSecs || null;
+        const effPct       = samSeconds && avgActual && avgActual > 0
+          ? Math.round((samSeconds / avgActual) * 100) : null;
+        return {
+          opCode, opName, samSeconds, samMins, machineType,
+          piecesWithOp,
+          totalScansForOp: stats?.operatorBreakdown?.reduce((s, b) => s + b.piecesHandled, 0) || 0,
+          avgActualSecs: avgActual, efficiencyPct: effPct,
+          operatorBreakdown: (stats?.operatorBreakdown || []).map(br => ({
+            ...br,
+            efficiencyPct: samSeconds && br.avgSecs
+              ? Math.round((samSeconds / br.avgSecs) * 100) : null,
+          })),
+        };
+      });
+ 
+      // Extra ops (scanned but not expected by StockItem)
+      const allScannedCodes = new Set();
+      for (const ops of pMap.values()) for (const c of ops) allScannedCodes.add(c);
+      const extraOps = [...allScannedCodes].filter(c => !expectedSet.has(c)).map(code => {
+        const st = opStats.get(code);
+        return {
+          opCode: code, opName: code, samSeconds: null, samMins: null, machineType: null,
+          piecesWithOp: [...pMap.values()].filter(ops => ops.has(code)).length,
+          avgActualSecs: st?.avgSecs || null, efficiencyPct: null, isExtra: true,
+          operatorBreakdown: (st?.operatorBreakdown || []).map(br => ({ ...br, efficiencyPct: null })),
+        };
+      });
+ 
+      // Piece completion status
+      const pieceStatus = [...pMap.entries()].map(([unitNum, scannedOps]) => {
+        const doneOps    = [...scannedOps].filter(c => expectedSet.has(c));
+        const missingOps = [...expectedSet].filter(c => !scannedOps.has(c));
+        return {
+          unitNum, scannedOps: [...scannedOps], doneOps, missingOps,
+          isComplete: missingOps.length === 0,
+          completionPct: expectedSet.size > 0
+            ? Math.round((doneOps.length / expectedSet.size) * 100) : 100,
+        };
+      }).sort((a, b) => a.unitNum - b.unitNum);
+ 
+      pg.variants.push({
+        woShortId,
+        workOrderNumber:  wo?.workOrderNumber || `WO-${woShortId}`,
+        workOrderStatus:  wo?.status || "unknown",
+        variantAttributes: wo?.variantAttributes || [],
+        totalQuantity:    wo?.quantity || 0,
+        piecesScanned:    pMap.size,
+        completePieces:   pieceStatus.filter(p => p.isComplete).length,
+        incompletePieces: pieceStatus.filter(p => !p.isComplete).length,
+        expectedOpsCount: expectedSet.size,
+        operations:       operationsData,
+        extraOps,
+        pieceStatus:      pieceStatus.slice(0, 300),
+        pieceStatusTotal: pieceStatus.length,
+      });
+    }
+ 
+    const products = Array.from(productGroups.values()).map(pg => ({
+      stockItemId: pg.stockItemId, productName: pg.productName,
+      genderCategory: pg.genderCategory, category: pg.category, image: pg.image,
+      variants: pg.variants.sort((a, b) => b.piecesScanned - a.piecesScanned),
+      totalPieces: pg.variants.reduce((s, v) => s + v.piecesScanned, 0),
+    })).sort((a, b) => b.totalPieces - a.totalPieces);
+ 
+    const uniquePieces = new Set(allScans.map(s => `${s.woShortId}-${s.unitNum}`)).size;
+    res.json({
+      success: true, date: dateStr, products,
+      summary: { totalProducts: products.length, totalPiecesScanned: uniquePieces,
+        totalScans: allScans.length, uniqueOps: opTimings.size },
+    });
+  } catch (err) {
+    console.error("[CEO] /product-efficiency:", err.message);
+    res.status(500).json({ success: false, message: "Server error: " + err.message });
+  }
+});
+
+
 module.exports = router;

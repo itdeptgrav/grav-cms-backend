@@ -1746,6 +1746,63 @@ router.get("/logs", async (req, res) => {
   }
 });
 
+
+// GET /api/cms/manufacturing/packaging/mo-employees/:moId
+router.get("/mo-employees/:moId", async (req, res) => {
+  try {
+    const { moId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(moId)) {
+      return res.status(400).json({ success: false, message: "Invalid MO id" });
+    }
+
+    const records = await EmployeeProductionProgress.find({
+      manufacturingOrderId: moId,
+    })
+      .select("employeeUIN employeeName gender employeeId")
+      .lean();
+
+    // Enrich with department/designation from EmployeeMpc
+    const mpcMap = await buildMpcEnrichmentMap({
+      employeeIds: records.map((r) => r.employeeId),
+      uins: records.map((r) => r.employeeUIN),
+    });
+
+    const seen = new Set();
+    const employees = [];
+    for (const r of records) {
+      if (!r.employeeUIN || seen.has(r.employeeUIN)) continue;
+      seen.add(r.employeeUIN);
+      const mpc = lookupMpc(mpcMap, r);
+      employees.push({
+        uin:         r.employeeUIN,
+        name:        r.employeeName  || "",
+        department:  mpc?.department  || "",
+        designation: mpc?.designation || "",
+        gender:      r.gender         || "",
+      });
+    }
+
+    employees.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    res.json({ success: true, employees });
+  } catch (err) {
+    console.error("mo-employees error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+router.get("/remaining-units/:woId", async (req, res) => {
+  try {
+    const wo = await WorkOrder.findById(req.params.woId)
+      .select("quantity packagingRecords workOrderNumber").lean();
+    if (!wo) return res.status(404).json({ success: false, message: "WO not found" });
+    const packaged = new Set((wo.packagingRecords || []).flatMap(r => r.unitNumbers || []));
+    const remaining = Array.from({ length: wo.quantity }, (_, i) => i + 1).filter(u => !packaged.has(u));
+    res.json({ success: true, remaining, packedCount: packaged.size, totalCount: wo.quantity });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
 module.exports = router;
 
 

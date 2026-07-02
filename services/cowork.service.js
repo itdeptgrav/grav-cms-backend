@@ -126,14 +126,26 @@ async function changeEmployeePassword({ employeeId, authUid, newPassword }) {
   return { success: true };
 }
 
+let _empListCache = null;
+let _empListCacheExp = 0;
+const EMP_LIST_TTL = 5 * 60 * 1000; // 5 minutes
+
+function invalidateEmpListCache() {
+  _empListCache = null;
+  _empListCacheExp = 0;
+}
+
 async function listCoworkEmployees() {
+  if (_empListCache && Date.now() < _empListCacheExp) return _empListCache;
   const snap = await db.collection("cowork_employees").orderBy("createdAt", "desc").get();
-  return snap.docs.map(d => {
+  const result = snap.docs.map(d => {
     const data = { id: d.id, ...d.data() };
-    // Never send the stored password to list endpoint
     delete data.tempPassword;
     return data;
   });
+  _empListCache = result;
+  _empListCacheExp = Date.now() + EMP_LIST_TTL;
+  return result;
 }
 
 async function getCoworkEmployee(employeeId) {
@@ -1053,6 +1065,7 @@ module.exports = {
   createCoworkEmployee,
   changeEmployeePassword,
   listCoworkEmployees,
+  invalidateEmpListCache,
   getCoworkEmployee,
   saveFCMToken,
 
