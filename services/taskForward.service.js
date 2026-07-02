@@ -1875,8 +1875,14 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
         const timerSnap = await db.collection("cowork_task_timers")
           .doc(employeeId).collection("sessions").doc(doc.id).get();
         if (timerSnap.exists) {
-          const totalSeconds = Number(timerSnap.data().totalSeconds) || 0;
-          workedMs = totalSeconds * 1000;
+          const td = timerSnap.data();
+          const base = Number(td.totalSeconds) || 0;
+          const elapsed = (td.isActive && td.lastStartTime)
+            ? Math.floor((Date.now() - Number(td.lastStartTime)) / 1000)
+            : 0;
+          const actualWorkedSecs = base + elapsed;
+          workedMs = actualWorkedSecs * 1000;
+          console.log(`[P1-SVC] timer for ${doc.id}: base=${base}s elapsed=${elapsed}s total=${actualWorkedSecs}s`);
         }
       } catch (e) {
         console.warn(`[P1-SVC] could not read timer for ${doc.id}:`, e.message);
