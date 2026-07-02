@@ -2601,7 +2601,11 @@ router.get("/payroll/runs", async (req, res) => {
 
     const filter = {};
     if (year) filter.year = parseInt(year);
+    // Only runs finalised enough to post. Draft runs are still being built in
+    // HR and must NOT appear here; cancelled runs are dead. An explicit
+    // ?status= override still wins for callers that ask for a specific status.
     if (status) filter.status = status;
+    else filter.status = { $nin: ["draft", "cancelled"] };
 
     const runs = await Payroll.find(filter)
       .sort({ year: -1, month: -1 })
@@ -2609,6 +2613,30 @@ router.get("/payroll/runs", async (req, res) => {
 
     // Pull every active voucher for these runs, then bucket by runId + kind
     const runIds = runs.map((r) => r._id);
+
+    // Live per-run totals from PayrollItems. The stored totals on the Payroll
+    // doc (r.totalGross, etc.) are written once and drift when items are edited
+    // afterward, so the modal list disagreed with the Post preview (which
+    // re-sums items). Recompute here — the same reduce the HR Details view uses
+    // — so the list, the preview, and HR all show one number.
+    const liveAgg = await PayrollItem.aggregate([
+      { $match: { payrollId: { $in: runIds } } },
+      {
+        $group: {
+          _id: "$payrollId",
+          totalEmployees: { $sum: 1 },
+          totalGross: { $sum: { $ifNull: ["$earnings.grossEarnings", 0] } },
+          totalDeductions: {
+            $sum: { $ifNull: ["$deductions.totalDeductions", 0] },
+          },
+          totalNetPay: { $sum: { $ifNull: ["$netPay", 0] } },
+          totalPF: { $sum: { $ifNull: ["$deductions.providentFund", 0] } },
+          totalESIC: { $sum: { $ifNull: ["$deductions.esic", 0] } },
+        },
+      },
+    ]);
+    const liveTotalsById = new Map(liveAgg.map((a) => [String(a._id), a]));
+
     const existingVouchers = await Acc_Voucher.find({
       companyId,
       sourceSystem: "auto_from_payroll",
@@ -2649,6 +2677,7 @@ router.get("/payroll/runs", async (req, res) => {
         else if (hasProcessing && isPaidRun && !hasPayment)
           postingStatus = "partial";
 
+        const live = liveTotalsById.get(String(r._id));
         return {
           _id: r._id,
           year: r.year,
@@ -2656,12 +2685,12 @@ router.get("/payroll/runs", async (req, res) => {
           payPeriod: r.payPeriod,
           status: r.status,
           paidAt: r.paidAt || null,
-          totalEmployees: r.totalEmployees,
-          totalGross: r.totalGross || 0,
-          totalDeductions: r.totalDeductions || 0,
-          totalNetPay: r.totalNetPay || 0,
-          totalPF: r.totalPF || 0,
-          totalESIC: r.totalESIC || 0,
+          totalEmployees: live ? live.totalEmployees : r.totalEmployees,
+          totalGross: live ? live.totalGross : r.totalGross || 0,
+          totalDeductions: live ? live.totalDeductions : r.totalDeductions || 0,
+          totalNetPay: live ? live.totalNetPay : r.totalNetPay || 0,
+          totalPF: live ? live.totalPF : r.totalPF || 0,
+          totalESIC: live ? live.totalESIC : r.totalESIC || 0,
           createdAt: r.createdAt,
           postingStatus,
           // Backwards-compat for existing callers — reflects "has any voucher"
@@ -2832,13 +2861,9 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   }
 
   // ── Advance salary ledger mapping ─────────────────────────────────────
-  // Advance salary deductions must post to the employee's individual
-  // "Advance Salary <Name> A/c" ledger under Current Assets — NOT to
-  // Other Deductions Payable and NOT to any Expense ledger.
-  //
-  // Only look at ASSET-nature ledgers (Cr here reduces the outstanding
-  // advance balance, which is an asset). Expense-named ledgers that
-  // accidentally match are intentionally skipped.
+  // Advance salary recovery posts to the employee's "Advance Salary <Name> A/c"
+  // (or a single shared "Advance Salary A/c") under Current Assets — an ASSET,
+  // NOT Other Deductions Payable and NOT an Expense.
   const allAdvanceLedgers = await Acc_Ledger.find({
     companyId,
     isActive: true,
@@ -2846,7 +2871,6 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     name: /advance.*salary|salary.*advance/i,
   }).lean();
 
-  // Find Current Assets group — correct home for employee advance accounts.
   const advanceGroup =
     (await Acc_Group.findOne({
       companyId,
@@ -2865,7 +2889,6 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       nature: "asset",
     }).lean());
 
-  // Name-based match against pre-fetched asset ledgers only.
   function findAdvanceLedger(empName) {
     if (!empName || !allAdvanceLedgers.length) return null;
     const lower = empName.toLowerCase();
@@ -2882,13 +2905,17 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     );
   }
 
-  // Find or AUTO-CREATE the advance salary ledger for an employee.
-  // Also MIGRATES wrongly-grouped advance ledgers (e.g. Expenses → Current Assets).
   async function findOrCreateAdvanceLedger(empName) {
     const existing = findAdvanceLedger(empName);
     if (existing) return existing;
 
-    // Check if there's a non-asset advance ledger for this employee and migrate it
+    // Shared-ledger fallback: a single generic "Advance Salary A/c" (asset).
+    const genericAdvance = allAdvanceLedgers.find((l) =>
+      /^advance\s*salary(\s*a\/?c\.?)?$/i.test((l.name || "").trim()),
+    );
+    if (genericAdvance) return genericAdvance;
+
+    // Migrate a wrongly-grouped advance ledger for this employee to an asset.
     if (empName && advanceGroup) {
       const lower = empName.toLowerCase();
       const parts = lower.split(/\s+/).filter((p) => p.length > 2);
@@ -2943,7 +2970,7 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
         importSource: "auto_payroll",
         notes: `Auto-created during payroll posting for ${empName}`,
       });
-      allAdvanceLedgers.push(newLedger); // cache so later employees in same run find it
+      allAdvanceLedgers.push(newLedger);
       return newLedger;
     } catch (e) {
       console.warn(
@@ -2953,41 +2980,17 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     }
   }
 
-  // Build ledgerId → { ledger, amount } for all employees with advance deductions.
-  //
-  // Two-pass detection:
-  //   Pass A — direct field lookup via getItemAdvance() (fast, exact)
-  //   Pass B — fallback for employees whose HR field name isn't in our list:
-  //            if the employee already has an advance ledger with a positive
-  //            Dr balance AND has non-PF/ESI deductions this month, infer
-  //            the advance as min(ledgerBalance, itemOther).
+  // REAL advances only — the amount HR entered in the Advance Deduction field
+  // (deductions.advanceDeduction). Nothing is inferred from a ledger's existing
+  // balance (that produced phantom advances), and Other Deductions is NOT an
+  // advance: it stays in totals.tdsOther and posts to Other Deductions Payable.
   const advanceLedgerMap = new Map();
   let totalMappedAdvance = 0;
 
   for (const item of items) {
-    let adv = getItemAdvance(item);
-
-    // ── Fallback: infer from ledger balance ──────────────────────────────
-    if ((!adv || adv <= 0) && item.employeeName) {
-      const existingLed = findAdvanceLedger(item.employeeName);
-      if (existingLed) {
-        // Only infer if the employee actually has other deductions this run
-        const itemOther = Math.max(
-          0,
-          (item.deductions?.totalDeductions || 0) -
-            (item.deductions?.providentFund || 0) -
-            (item.deductions?.esic || 0),
-        );
-        if (itemOther > 0) {
-          // Cap at whichever is smaller: ledger Dr balance or itemOther
-          const ledBal = Math.abs(existingLed.currentBalance || 0);
-          adv = ledBal > 0 ? Math.min(ledBal, itemOther) : itemOther;
-        }
-      }
-    }
-    // ────────────────────────────────────────────────────────────────────
-
+    const adv = Number(item.deductions?.advanceDeduction || 0);
     if (!adv || adv <= 0) continue;
+
     const ledger = await findOrCreateAdvanceLedger(item.employeeName);
     if (ledger) {
       const lid = ledger._id.toString();
@@ -3000,15 +3003,13 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     }
   }
 
-  // Remaining deductions after extracting all mapped advances.
-  // Math invariant: pf + esi + tdsOtherRemaining + Σadvances + net = gross ✓
+  // Everything that is NOT PF, ESI, or a real advance stays in Other Deductions
+  // Payable. Math invariant: pf + esi + tdsOtherRemaining + Σadvances + net = gross.
   const tdsOtherRemaining = parseFloat(
     Math.max(0, totals.tdsOther - totalMappedAdvance).toFixed(2),
   );
+
   // ── Voucher 1: PROCESSING (always created) ────────────────────────────
-  // Dr Salaries A/c (gross) / Cr PF + ESI + Other Deductions + Salary Payable
-  // This is the journal entry recognising the salary expense and accruing
-  // the liability. Always created regardless of payment status.
   const processingDate = new Date(run.year, run.month, 0); // last day of the pay-period month
   const processingEntries = [
     {
@@ -3043,8 +3044,8 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       type: "Cr",
       amount: tdsOtherRemaining,
     });
-  // Per-employee advance salary entries — Cr reduces the outstanding
-  // advance balance on each employee's "Advance Salary <Name> A/c" ledger.
+  // Per-employee advance salary entries — Cr reduces the outstanding advance
+  // balance on each employee's advance ledger.
   for (const { ledger, amount } of advanceLedgerMap.values()) {
     if (amount > 0)
       processingEntries.push({
@@ -3077,9 +3078,6 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
   ];
 
   // ── Voucher 2: PAYMENT (only if run.status === "paid") ────────────────
-  // Dr Salary Payable (net) / Cr Bank A/c
-  // This clears the liability accrued in Voucher 1 and records the bank
-  // outflow. After both vouchers, Salary Payable nets to zero for this run.
   if (run.status === "paid" && totals.net > 0) {
     const bankLedger = await resolveBankLedgerForPayroll(
       companyId,
@@ -3125,8 +3123,6 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     },
   };
 }
-
-// Backwards-compatible: old code imports buildPayrollVoucher (singular) — keep it
 // returning the FIRST voucher only, so anything that hasn't been migrated still
 // produces a sensible journal even if it doesn't know about payments.
 async function buildPayrollVoucher(companyId, run, items, opts = {}) {
