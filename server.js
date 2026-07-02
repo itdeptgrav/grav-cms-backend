@@ -610,7 +610,7 @@ const createDefaultPackagingDispatch = async () => {
     const defaultPackagingDispatch = new PackagingDispatchDepartment({
       name: "Dispatch Admin",
       email: "dispatch@grav.in",
-      password: "Dispatch@12345", // will be hashed automatically
+      password: "Dispatch@12345",
       employeeId: "PKG001",
       phone: "9999999999",
       department: "Packaging & Dispatch",
