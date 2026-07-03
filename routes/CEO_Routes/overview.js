@@ -40,6 +40,140 @@ const istToday = () => {
   return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, "0")}-${String(ist.getUTCDate()).padStart(2, "0")}`;
 };
 
+// Finance period → date range. Revenue is a period flow (from..to); payables
+// is a cumulative closing balance, so it only uses the period END.
+function financeRange(period) {
+  const now = new Date();
+  let fyStart = new Date(now.getFullYear(), 3, 1); // Apr 1
+  if (now.getMonth() < 3) fyStart.setFullYear(now.getFullYear() - 1);
+  if (period === "this_fy") return { from: fyStart, to: now, label: "This FY" };
+  if (period === "prev_fy") {
+    const from = new Date(fyStart);
+    from.setFullYear(fyStart.getFullYear() - 1);
+    const to = new Date(fyStart.getTime() - 1); // 31 Mar (prev FY end)
+    return { from, to, label: "Previous FY" };
+  }
+  return { from: null, to: now, label: "All Time" }; // all_time (default)
+}
+
+// Revenue + payables straight from the posted accounting vouchers (the books),
+// scoped to the selected period. Single-company OPC → resolve the only company.
+async function computeFinance(period) {
+  const {
+    Acc_Voucher,
+  } = require("../../models/Accountant_model/Acc_VoucherModels");
+  const {
+    Acc_Company,
+  } = require("../../models/Accountant_model/Acc_MasterModels");
+
+  const range = financeRange(period);
+  const base = {
+    period: period || "all_time",
+    label: range.label,
+    periodFrom: range.from,
+    periodTo: range.to,
+  };
+
+  const company = await Acc_Company.findOne({}).select("_id").lean();
+  if (!company)
+    return { totalRevenue: 0, payables: 0, companyId: null, ...base };
+  const cId = company._id;
+
+  // Dr +, Cr - (falls back to type/amount if signedAmount absent)
+  const signedAmount = {
+    $cond: {
+      if: { $ne: [{ $ifNull: ["$ledgerEntries.signedAmount", null] }, null] },
+      then: "$ledgerEntries.signedAmount",
+      else: {
+        $cond: {
+          if: { $eq: ["$ledgerEntries.type", "Dr"] },
+          then: { $ifNull: ["$ledgerEntries.amount", 0] },
+          else: { $multiply: [{ $ifNull: ["$ledgerEntries.amount", 0] }, -1] },
+        },
+      },
+    },
+  };
+
+  // ── Revenue: period flow, revenue-nature ledgers, netted ───────────────
+  const revMatch = { companyId: cId, status: "posted" };
+  revMatch.voucherDate = range.from
+    ? { $gte: range.from, $lte: range.to }
+    : { $lte: range.to };
+  const revRows = await Acc_Voucher.aggregate([
+    { $match: revMatch },
+    { $unwind: "$ledgerEntries" },
+    {
+      $lookup: {
+        from: "acc_ledgers",
+        localField: "ledgerEntries.ledgerId",
+        foreignField: "_id",
+        as: "_led",
+      },
+    },
+    { $unwind: { path: "$_led", preserveNullAndEmptyArrays: true } },
+    {
+      $project: {
+        nature: "$_led.nature",
+        ledgerActive: "$_led.isActive",
+        signedAmount,
+      },
+    },
+  ]);
+  let totalRevenue = 0;
+  for (const e of revRows) {
+    if (e.nature === "revenue" && e.ledgerActive !== false)
+      totalRevenue += -(e.signedAmount || 0);
+  }
+
+  // ── Payables: closing Cr balance per Sundry-Creditor ledger as of end ──
+  const payableGroups = /sundry\s*creditor/i;
+  const credRows = await Acc_Voucher.aggregate([
+    {
+      $match: {
+        companyId: cId,
+        status: "posted",
+        voucherDate: { $lte: range.to },
+      },
+    },
+    { $unwind: "$ledgerEntries" },
+    {
+      $lookup: {
+        from: "acc_ledgers",
+        localField: "ledgerEntries.ledgerId",
+        foreignField: "_id",
+        as: "_led",
+      },
+    },
+    { $unwind: { path: "$_led", preserveNullAndEmptyArrays: true } },
+    {
+      $project: {
+        ledgerId: "$ledgerEntries.ledgerId",
+        groupName: { $ifNull: ["$_led.groupName", "$ledgerEntries.groupName"] },
+        signedAmount,
+      },
+    },
+    {
+      $group: {
+        _id: "$ledgerId",
+        groupName: { $first: "$groupName" },
+        net: { $sum: "$signedAmount" },
+      },
+    },
+  ]);
+  let payables = 0;
+  for (const l of credRows) {
+    if (payableGroups.test(l.groupName || "") && (l.net || 0) < 0)
+      payables += Math.abs(l.net);
+  }
+
+  return {
+    totalRevenue: Math.round(totalRevenue * 100) / 100,
+    payables: Math.round(payables * 100) / 100,
+    companyId: String(cId),
+    ...base,
+  };
+}
+
 router.get("/", ceoAuth, async (req, res) => {
   const todayStr = istToday();
   const results = await Promise.allSettled([
@@ -381,12 +515,24 @@ router.get("/", ceoAuth, async (req, res) => {
         })),
       };
     })(),
-  ]);
 
-  const [hr, rawMat, stockItems, pos, qc, piData, buyers, vendors, machines] =
-    results.map((r) =>
-      r.status === "fulfilled" ? r.value : { error: r.reason?.message },
-    );
+    // ── 10. Finance (from the books) — period-aware, default All Time ──────
+    (async () => computeFinance(req.query.financePeriod || "all_time"))(),
+  ]);
+  const [
+    hr,
+    rawMat,
+    stockItems,
+    pos,
+    qc,
+    piData,
+    buyers,
+    vendors,
+    machines,
+    finance,
+  ] = results.map((r) =>
+    r.status === "fulfilled" ? r.value : { error: r.reason?.message },
+  );
   res.json({
     success: true,
     data: {
@@ -399,10 +545,21 @@ router.get("/", ceoAuth, async (req, res) => {
       buyers,
       vendors,
       machines,
+      finance,
       generatedAt: new Date(),
       today: todayStr,
     },
   });
+});
+// Finance-only refresh for the dashboard period filter — skips the heavy
+// HR / inventory aggregations. period = all_time | this_fy | prev_fy
+router.get("/finance", ceoAuth, async (req, res) => {
+  try {
+    const finance = await computeFinance(req.query.period || "all_time");
+    res.json({ success: true, finance });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
 });
 
 

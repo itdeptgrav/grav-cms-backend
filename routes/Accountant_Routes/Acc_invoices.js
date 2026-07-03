@@ -1438,6 +1438,121 @@ router.get("/:id", async (req, res) => {
 /* NEW ROUTE 2: PUT /:id — edit a draft or posted invoice             */
 /* ================================================================== */
 router.put("/:id", async (req, res) => {
+  // ── Approval gate ─────────────────────────────────────────────────────────
+  // An editor (no direct-post privilege) editing a POSTED invoice must NOT
+  // change the ledger in place. Hold the edit as an approval request — the SAME
+  // queue + executor the generic voucher edit uses — and leave the invoice
+  // untouched until an admin approves. Runs BEFORE any transaction so nothing is
+  // half-applied. Owners/approvers/admins/accountants, and edits to a draft or a
+  // still-pending invoice, fall straight through to the direct-edit path below.
+  try {
+    const inv0 = await Acc_Voucher.findOne({
+      _id: req.params.id,
+      voucherType: "sales",
+    })
+      .select(
+        "status companyId voucherType voucherNumber partyLedgerName grandTotal",
+      )
+      .lean();
+    if (!inv0) return res.status(404).json({ error: "Invoice not found" });
+
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    const canEditDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    if (!canEditDirectly && inv0.status === "posted") {
+      if (!req.user?.organizationId) {
+        return res
+          .status(403)
+          .json({ error: "Your role can't edit posted invoices." });
+      }
+      const body = req.body || {};
+
+      // Canonicalise ledger entries so the held payload applies cleanly on
+      // approval (same resolution the direct edit does). No session here — any
+      // auto-created ledger commits immediately and is harmless if rejected.
+      if (Array.isArray(body.ledgerEntries)) {
+        for (const entry of body.ledgerEntries) {
+          const ledId = entry.ledgerId || entry.ledger;
+          if (ledId) {
+            entry.ledgerId = ledId;
+            if (!entry.ledgerName) {
+              const led = await Acc_Ledger.findById(ledId).select("name");
+              if (led) entry.ledgerName = led.name;
+            }
+          } else if (entry.ledgerName) {
+            const led = await _resolveOrCreateByName(
+              entry.ledgerName,
+              inv0.companyId,
+              req.user?.id,
+            );
+            if (led) {
+              entry.ledgerId = led._id;
+              entry.ledgerName = led.name;
+            }
+          }
+          delete entry.ledger;
+          delete entry.autoLedger;
+        }
+      }
+
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "update",
+        "target.id": inv0._id,
+        status: "pending",
+      });
+      if (dup) {
+        return res.status(200).json({
+          _pendingApproval: true,
+          message: "An edit request is already pending for this invoice.",
+        });
+      }
+
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: inv0.companyId,
+        kind: "voucher",
+        action: "update",
+        title: `Edit ${inv0.voucherType} ${inv0.voucherNumber} · ${
+          inv0.partyLedgerName || "—"
+        } · ₹${Number(inv0.grandTotal || 0).toLocaleString("en-IN")}`,
+        target: { collection: "Acc_Voucher", id: inv0._id },
+        payload: body,
+        diff: {
+          before: {
+            voucherNumber: inv0.voucherNumber,
+            partyLedgerName: inv0.partyLedgerName || "",
+            grandTotal: Number(inv0.grandTotal || 0),
+          },
+          after: {
+            voucherNumber: body.voucherNumber ?? inv0.voucherNumber,
+            partyLedgerName: body.partyLedgerName ?? inv0.partyLedgerName ?? "",
+            grandTotal: Number(body.grandTotal ?? inv0.grandTotal ?? 0),
+          },
+        },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+
+      return res.status(202).json({
+        _pendingApproval: true,
+        message: "Edit request sent to an admin for approval.",
+      });
+    }
+  } catch (gateErr) {
+    console.error("[invoices/put approval-gate]", gateErr.message);
+    return res.status(400).json({ error: gateErr.message });
+  }
+
   const session = await mongoose.startSession();
   try {
     session.startTransaction();

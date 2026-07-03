@@ -420,6 +420,27 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MANAGER WITHDRAW APPROVE/REJECT
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// Decides whether this manager owns the withdrawal action for this leave.
+// Rule: SECONDARY manager owns withdrawals (they gave the final approval, so
+// they own the un-approval). PRIMARY only sees them as a fallback when the
+// leave was approved without a secondary in the chain.
+function isMyTurnForWithdraw(leave, myId) {
+  const myIdStr = String(myId);
+  const mine = (leave.managersNotified || []).find(
+    (m) => String(m.managerId || "") === myIdStr,
+  );
+  if (!mine) return false;
+  if (mine.type === "secondary") return true;
+  // Only count a "real" secondary — one with a populated managerId. A stale
+  // {type:"secondary"} entry with no managerId would otherwise block the
+  // primary from acting, and nobody would be able to approve the withdrawal.
+  const hasRealSecondary = (leave.managersNotified || []).some(
+    (m) => m.type === "secondary" && m.managerId,
+  );
+  return mine.type === "primary" && !hasRealSecondary;
+}
+
 router.patch(
   "/manager/:id/approve-withdraw",
   AllEmployeeAppMiddleware,
@@ -436,6 +457,18 @@ router.patch(
           success: false,
           message: "Not found or not a withdrawal request",
         });
+
+      // Only the SECONDARY manager handles withdrawals — they gave the
+      // original final approval, so they own the un-approval too. If a
+      // leave has no secondary, the primary handles it as a fallback.
+      if (!isMyTurnForWithdraw(a, myId)) {
+        return res.status(403).json({
+          success: false,
+          code: "WITHDRAW_NOT_AUTHORIZED",
+          message:
+            "Only the secondary manager can act on this withdrawal request.",
+        });
+      }
 
       if (a.leaveType !== "LOP" && a.leaveType !== "QUICK") {
         const refundDays = a.paidDays != null ? a.paidDays : a.totalDays;
@@ -525,6 +558,16 @@ router.patch(
       if (!a)
         return res.status(404).json({ success: false, message: "Not found" });
 
+      // Secondary-only gate (with primary fallback when no secondary exists).
+      if (!isMyTurnForWithdraw(a, myId)) {
+        return res.status(403).json({
+          success: false,
+          code: "WITHDRAW_NOT_AUTHORIZED",
+          message:
+            "Only the secondary manager can act on this withdrawal request.",
+        });
+      }
+
       a.status = "hr_approved";
       a.hrRemarks = `Withdrawal rejected by manager: ${req.body.remarks || ""}`;
       await a.save();
@@ -565,13 +608,47 @@ router.get(
   AllEmployeeAppMiddleware,
   async (req, res) => {
     try {
-      const res2 = await LeaveApplication.find({
+      const myId = req.user.id;
+      const all = await LeaveApplication.find({
         status: "withdraw_pending",
-        "managersNotified.managerId": req.user.id,
+        "managersNotified.managerId": myId,
       })
         .sort({ updatedAt: -1 })
         .lean();
-      res.json({ success: true, data: res2 });
+      const filtered = all.filter((leave) => isMyTurnForWithdraw(leave, myId));
+      // Diagnostic — also pull ALL withdraw_pending leaves (no manager filter)
+      // so we can see whether any exist in the system at all. If the global
+      // count > 0 but matched=0 for this manager, it means the leave's
+      // managersNotified snapshot doesn't include this manager — usually
+      // because the employee's manager was changed AFTER the leave was created.
+      const globalCount = await LeaveApplication.countDocuments({
+        status: "withdraw_pending",
+      });
+      const globalSamples = await LeaveApplication.find({
+        status: "withdraw_pending",
+      })
+        .select("_id employeeId employeeName managersNotified")
+        .limit(3)
+        .lean();
+      console.log(
+        `[WITHDRAW-PENDING] mgr=${myId} matched=${all.length} afterFilter=${filtered.length} globalWithdrawPending=${globalCount}`,
+      );
+      if (globalCount > 0 && all.length === 0) {
+        console.log(
+          `[WITHDRAW-PENDING-DIAG] global rows exist but mgr=${myId} is not in any managersNotified. Sample rows:`,
+        );
+        for (const g of globalSamples) {
+          console.log(
+            `  leave=${g._id} emp=${g.employeeName} managers=${JSON.stringify(
+              (g.managersNotified || []).map((m) => ({
+                id: String(m.managerId || "(none)"),
+                type: m.type,
+              })),
+            )}`,
+          );
+        }
+      }
+      res.json({ success: true, data: filtered });
     } catch (e) {
       res.status(500).json({ success: false, message: e.message });
     }
@@ -1711,9 +1788,61 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
     const wasApproved = a.status === "hr_approved";
 
     if (wasApproved) {
+      // Backfill managersNotified if the leave doesn't have one. Older
+      // leaves (HR-added, pre-quick-apply era, or with stale snapshots)
+      // sometimes have an empty array. Without managers in here, the
+      // withdraw-pending query has nothing to match against and the
+      // withdrawal disappears into the void. Look up the employee's
+      // current managers live and write them in before saving.
+      const validManagers = (a.managersNotified || []).filter(
+        (m) => m && m.managerId,
+      );
+      if (validManagers.length === 0) {
+        const emp = await Employee.findById(a.employeeId)
+          .select("primaryManager secondaryManager")
+          .lean();
+        const rebuilt = [];
+        if (emp?.primaryManager?.managerId) {
+          rebuilt.push({
+            managerId: emp.primaryManager.managerId,
+            managerName: emp.primaryManager.managerName || "",
+            type: "primary",
+          });
+        }
+        if (emp?.secondaryManager?.managerId) {
+          rebuilt.push({
+            managerId: emp.secondaryManager.managerId,
+            managerName: emp.secondaryManager.managerName || "",
+            type: "secondary",
+          });
+        }
+        if (rebuilt.length === 0) {
+          return res.status(400).json({
+            success: false,
+            code: "NO_MANAGERS_ASSIGNED",
+            message:
+              "Cannot send withdrawal request — no managers are assigned to you in HR. Please contact HR.",
+          });
+        }
+        a.managersNotified = rebuilt;
+        console.log(
+          `[CANCEL→WITHDRAW-BACKFILL] leave=${a._id} populated ${rebuilt.length} manager(s) from live employee record`,
+        );
+      }
+
       a.status = "withdraw_pending";
       a.cancelReason = req.body.cancelReason || "Employee withdrawal request";
       await a.save();
+      console.log(
+        `[CANCEL→WITHDRAW] leave=${a._id} emp=${a.employeeId} status=${a.status} ` +
+          `managersNotified=${JSON.stringify(
+            (a.managersNotified || []).map((m) => ({
+              id: String(m.managerId || "(none)"),
+              type: m.type,
+              name: m.managerName,
+            })),
+          )}`,
+      );
       notifyManagerOnWithdrawRequest(a).catch((e) =>
         console.warn("[PUSH-WITHDRAW-REQ]", e.message),
       );
@@ -1759,6 +1888,63 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
     res.status(500).json({ success: false, message: e.message });
   }
 });
+
+// Employee cancels their own withdrawal request (changed their mind).
+// Only valid while status === "withdraw_pending". Flips the leave back to
+// hr_approved with no balance change (balance was never restored — the
+// secondary manager hadn't acted yet).
+router.patch(
+  "/:id/cancel-withdraw",
+  AllEmployeeAppMiddleware,
+  async (req, res) => {
+    try {
+      const a = await LeaveApplication.findOne({
+        _id: req.params.id,
+        employeeId: req.user.id,
+      });
+      if (!a)
+        return res.status(404).json({ success: false, message: "Not found" });
+      if (a.status !== "withdraw_pending")
+        return res.status(400).json({
+          success: false,
+          code: "NOT_WITHDRAW_PENDING",
+          message: `Cannot cancel withdrawal — leave is currently ${a.status}, not a pending withdrawal.`,
+        });
+
+      a.status = "hr_approved";
+      a.cancelReason = "";
+      await a.save();
+
+      // Notify the manager(s) who were waiting on this — clears it from
+      // their queue. Same notification fan-out pattern as the original
+      // withdraw request, just reversed.
+      try {
+        const io = req.app.get("io");
+        if (io && a.managersNotified?.length > 0) {
+          for (const mgr of a.managersNotified) {
+            if (mgr?.managerId)
+              io.to(String(mgr.managerId)).emit("leave_notification", {
+                type: "withdraw_request_cancelled",
+                leaveId: a._id.toString(),
+                employeeName: a.employeeName,
+                leaveType: a.leaveType,
+                message: `${a.employeeName} cancelled their withdrawal request for ${a.leaveType} (${a.fromDate}–${a.toDate}).`,
+                timestamp: new Date().toISOString(),
+              });
+          }
+        }
+      } catch (_) {}
+
+      res.json({
+        success: true,
+        data: a,
+        message: "Withdrawal request cancelled. Your leave is active again.",
+      });
+    } catch (e) {
+      res.status(500).json({ success: false, message: e.message });
+    }
+  },
+);
 
 router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
   try {
