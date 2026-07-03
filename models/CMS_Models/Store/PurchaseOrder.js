@@ -1,9 +1,12 @@
 // models/CMS_Models/Store/PurchaseOrder.js
 //
 // Purchase Order — a document recording what we PURCHASED and why.
-// Mirrors the Work Order engine (items, GST, totals, dynamic columns) but:
+// Mirrors the Work Order line engine (items, GST, totals, dynamic columns) but
+// is a distinct purchasing document:
 //   - party is a VENDOR/SUPPLIER (not a worker)
-//   - carries a free-text "Reason for Purchase" (why we bought it)
+//   - free-text "Reason for Purchase" (why we bought it)
+//   - PO-specific commercial fields: payment terms, delivery terms,
+//     invoice/bill number, order type, ship-to + bill-to addresses
 //   - status workflow is Draft → Ordered → Received
 //   - its own PO- number sequence (separate counter)
 //
@@ -50,14 +53,26 @@ const purchaseOrderSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Order Type — PO vocabulary (e.g. "Release Order", "Proactive").
+    orderType: { type: String, trim: true, default: "" },
+
     // ── Vendor / Supplier (who we bought FROM) ──
     vendorName: { type: String, trim: true, default: "" },
     vendorPhone: { type: String, trim: true, default: "" },
     vendorAddress: { type: String, trim: true, default: "" },
     vendorGstin: { type: String, trim: true, default: "" },
 
+    // ── Addresses (where goods ship / who is billed) ──
+    shipToAddress: { type: String, trim: true, default: "" },
+    billToAddress: { type: String, trim: true, default: "" },
+
     // Why we purchased (free text) — the key PO-specific context.
     reasonForPurchase: { type: String, trim: true, default: "" },
+
+    // ── Commercial terms (PO-specific) ──
+    paymentTerms: { type: String, trim: true, default: "" },
+    deliveryTerms: { type: String, trim: true, default: "" },
+    invoiceNumber: { type: String, trim: true, default: "" },
 
     // Editable label for the line section (e.g. "Items", "Materials").
     lineSectionLabel: { type: String, trim: true, default: "Items" },
@@ -95,9 +110,9 @@ const purchaseOrderSchema = new mongoose.Schema(
     },
 
     // Dates
-    poDate: { type: Date, default: null }, // when the PO was placed
-    expectedDate: { type: Date, default: null }, // expected delivery/receipt
-    receivedDate: { type: Date, default: null }, // stamped when marked Received
+    poDate: { type: Date, default: null },
+    expectedDate: { type: Date, default: null },
+    receivedDate: { type: Date, default: null },
 
     // ── Audit ──
     createdBy: {

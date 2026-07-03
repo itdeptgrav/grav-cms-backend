@@ -1074,6 +1074,92 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
       });
     }
 
+    // ── DRAFT PROMOTION ────────────────────────────────────────────────────
+    // If HR saved a draft and then clicks Process Payroll, we MUST NOT
+    // recompute from scratch — that would wipe every edit, removal, and
+    // balance adjustment they made in draft mode.
+    //
+    // Instead: promote the existing draft items as-is, consume any pending
+    // CL balance adjustments that were deferred at save-draft time, update
+    // the run header to "processed", and return immediately.
+    //
+    // The full recompute below only runs when there is NO draft at all
+    // (e.g. HR skipped straight from Preview → Process without saving draft).
+    if (existing && existing.status === "draft") {
+      const draftItems = await PayrollItem.find({ month, year }).lean();
+
+      // Consume CL leave balances — deferred from save-draft so edits in
+      // draft don't double-consume before HR finalises.
+      const settings = await PayrollSettings.getConfig();
+      if (
+        settings.clAutoAdjust?.enabled &&
+        settings.clAutoAdjust?.consumeFromBalance
+      ) {
+        for (const it of draftItems) {
+          if ((it.autoAdjustedCL || 0) > 0) {
+            await LeaveBalance.updateOne(
+              { employeeId: it.employeeId, year },
+              { $inc: { "consumed.CL": it.autoAdjustedCL } },
+            );
+          }
+        }
+      }
+
+      // Promote all pending items to processed.
+      // Items HR removed from the draft are already deleted from DB —
+      // this only touches the surviving items.
+      await PayrollItem.updateMany(
+        { month, year, status: "pending" },
+        { $set: { status: "processed" } },
+      );
+
+      // Recompute run-level totals from the surviving (possibly edited) items.
+      // We do this from the items themselves — not from the draft header —
+      // because HR may have edited individual items since the draft was saved.
+      const totals = draftItems.reduce(
+        (acc, i) => ({
+          g: acc.g + (i.earnings?.grossEarnings || 0),
+          d: acc.d + (i.deductions?.totalDeductions || 0),
+          n: acc.n + (i.roundedNetPay || 0),
+          pf: acc.pf + (i.deductions?.providentFund || 0),
+          esi: acc.esi + (i.deductions?.esic || 0),
+          b: acc.b + (i.earnings?.bonus || 0),
+        }),
+        { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0 },
+      );
+
+      existing.status = "processed";
+      existing.totalEmployees = draftItems.length;
+      existing.totalGross = totals.g;
+      existing.totalDeductions = totals.d;
+      existing.totalNetPay = totals.n;
+      existing.totalPF = totals.pf;
+      existing.totalESIC = totals.esi;
+      existing.totalBonus = totals.b;
+      existing.processedAt = new Date();
+      await existing.save();
+
+      return res.json({
+        success: true,
+        message: `Payroll processed for ${draftItems.length} employees`,
+        data: {
+          runId: existing._id,
+          summary: {
+            totalEmployees: draftItems.length,
+            totalGross: totals.g,
+            totalDeductions: totals.d,
+            totalNetPay: totals.n,
+            totalPF: totals.pf,
+            totalESIC: totals.esi,
+            clAdjustmentsApplied: 0,
+          },
+        },
+      });
+    }
+    // ── END DRAFT PROMOTION ────────────────────────────────────────────────
+    // No draft exists → fall through to full recompute (first-time processing
+    // straight from Preview without going through Save Draft).
+
     const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
       await loadMonthContext(month, year);
 
@@ -1246,9 +1332,6 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
     payrollRun.status = "processed";
     payrollRun.processedAt = new Date();
     await payrollRun.save();
-
-    // *** FIXED: Use the extracted helper with corrected query ***
-    // No push notification on /run — only sent when marked as paid
 
     res.json({
       success: true,
@@ -2480,6 +2563,454 @@ router.delete("/run", EmployeeAuthMiddlewear, async (req, res) => {
     });
   } catch (err) {
     console.error("[PAYROLL-DELETE-RUN]", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { user } = req;
+    if (user.role !== "hr_manager") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Only HR managers can save payroll" });
+    }
+
+    const month = parseInt(req.body.month) || new Date().getMonth() + 1;
+    const year = parseInt(req.body.year) || new Date().getFullYear();
+
+    const existing = await Payroll.findOne({ month, year });
+    if (
+      existing &&
+      ["processed", "paid", "approved"].includes(existing.status)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `Payroll for ${MONTH_NAMES[month]} ${year} is already ${existing.status}. Remove it first if you need to re-draft.`,
+      });
+    }
+
+    const { settings, salaryCfg, holidayMap, attendanceByEmp, leaveConfig } =
+      await loadMonthContext(month, year);
+
+    const employees = await Employee.find({
+      $or: [{ status: "active" }, { isActive: true }],
+    })
+      .select("-password -temporaryPassword -__v")
+      .lean();
+
+    const decryptedEmployees = employees.map(decryptEmployeeDoc);
+
+    const leaveBalances = await LeaveBalance.find({
+      employeeId: { $in: employees.map((e) => e._id) },
+      year,
+    });
+    const balanceByEmpId = new Map(
+      leaveBalances.map((b) => [String(b.employeeId), b]),
+    );
+
+    // Create or reuse the Payroll run header at "draft" status
+    let payrollRun = existing;
+    if (!payrollRun) {
+      payrollRun = new Payroll({
+        month,
+        year,
+        payPeriod: `${MONTH_NAMES[month]} ${year}`,
+        status: "draft",
+        createdBy: user.id,
+      });
+      await payrollRun.save();
+    } else {
+      // Already a draft — keep it as draft, items will be upserted below
+      if (payrollRun.status !== "draft") payrollRun.status = "draft";
+      await payrollRun.save();
+    }
+
+    let totalGross = 0,
+      totalDed = 0,
+      totalNet = 0,
+      totalPF = 0,
+      totalESIC = 0,
+      totalBonus = 0;
+
+    for (const employee of decryptedEmployees) {
+      const bid = (employee.biometricId || "").toUpperCase();
+      const balance = balanceByEmpId.get(String(employee._id)) || null;
+      const ctx = {
+        month,
+        year,
+        settings,
+        salaryCfg,
+        holidayMap,
+        leaveConfig,
+        attendanceByDate: attendanceByEmp.get(bid) || new Map(),
+        leaveBalance: balance,
+      };
+      const computed = computeEmployeePayroll(employee, ctx);
+
+      // $setOnInsert: only on first creation — don't clobber existing manual edits
+      // $set: always refresh computed attendance/salary numbers
+      await PayrollItem.findOneAndUpdate(
+        { employeeId: employee._id, month, year },
+        {
+          $setOnInsert: {
+            payrollId: payrollRun._id,
+            employeeName:
+              `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
+            biometricId: employee.biometricId,
+            department: employee.department,
+            designation: employee.designation || employee.jobTitle,
+            jobTitle: employee.jobTitle,
+            employmentType: employee.employmentType,
+            month,
+            year,
+            payPeriod: `${MONTH_NAMES[month]} ${year}`,
+          },
+          $set: {
+            rateBasic: computed.rateBasic ?? 0,
+            rateHra: computed.rateHra ?? 0,
+            rateGross: computed.rateGross ?? 0,
+            workingDays: computed.workingDays,
+            daysInMonth: computed.daysInMonth,
+            presentDays: computed.presentDays,
+            absentDays: computed.absentDays,
+            halfDays: computed.halfDays,
+            missPunchDays: computed.missPunchDays,
+            lopDays: computed.lopDays,
+            paidLeaveDays: computed.paidLeaveDays,
+            weekOffDays: computed.weekOffDays,
+            holidayDays: computed.holidayDays,
+            holidayWorkedDays: computed.holidayWorkedDays,
+            sundayWorkedDays: computed.sundayWorkedDays,
+            lwpDays: computed.lwpDays,
+            clUsedDays: computed.clUsedDays,
+            slUsedDays: computed.slUsedDays,
+            plUsedDays: computed.plUsedDays,
+            autoAdjustedCL: computed.autoAdjustedCL,
+            sundayOffsetApplied: computed.sundayOffsetApplied,
+            unsyncedDays: computed.unsyncedDays,
+            payableDays: computed.payableDays,
+            effectivePayableDays: computed.effectivePayableDays,
+            perDayRate: computed.perDayRate,
+            preJoiningDays: computed.preJoiningDays,
+            activeDaysInMonth: computed.activeDaysInMonth,
+            firstActiveDayInMonth: computed.firstActiveDayInMonth,
+            dateOfJoining: computed.dateOfJoining,
+            daysSinceDOJ: computed.daysSinceDOJ,
+            clEligible: computed.clEligible,
+            earnings: computed.earnings,
+            deductions: computed.deductions,
+            netPay: computed.netPay,
+            roundedNetPay: computed.roundedNetPay,
+            status: "pending",
+            bankDetails: computed.bankDetails,
+            dayBreakdown: computed.dayBreakdown,
+            processedBy: user.id,
+            processedAt: new Date(),
+            flagNote:
+              computed.autoAdjustedCL > 0
+                ? `Auto-adjusted ${computed.autoAdjustedCL} day(s) from AB to CL`
+                : computed.sundayOffsetApplied > 0
+                  ? `${computed.sundayOffsetApplied} AB offset by Sunday worked`
+                  : computed.preJoiningDays > 0
+                    ? `Mid-month joiner — ${computed.preJoiningDays} pre-joining day(s) excluded`
+                    : null,
+          },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      );
+
+      totalGross += computed.earnings.grossEarnings;
+      totalDed += computed.deductions.totalDeductions;
+      totalNet += computed.roundedNetPay;
+      totalPF += computed.deductions.providentFund;
+      totalESIC += computed.deductions.esic;
+      totalBonus += computed.earnings.bonus || 0;
+    }
+
+    payrollRun.totalEmployees = employees.length;
+    payrollRun.totalGross = totalGross;
+    payrollRun.totalDeductions = totalDed;
+    payrollRun.totalNetPay = totalNet;
+    payrollRun.totalPF = totalPF;
+    payrollRun.totalESIC = totalESIC;
+    payrollRun.totalBonus = totalBonus;
+    await payrollRun.save();
+
+    res.json({
+      success: true,
+      message: `Draft saved for ${employees.length} employees — review and edit before processing`,
+      data: {
+        runId: payrollRun._id,
+        status: "draft",
+        summary: {
+          totalEmployees: employees.length,
+          totalGross,
+          totalDeductions: totalDed,
+          totalNetPay: totalNet,
+          totalPF,
+          totalESIC,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("[PAYROLL-SAVE-DRAFT]", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── PATCH /items/bulk-override ────────────────────────────────────────────────
+// Apply earnings/deduction patch to multiple PayrollItems at once.
+// Body: { itemIds: string[], patch: { overtime?, bonus?, incentives?,
+//   otherEarnings?, loanDeduction?, advanceDeduction?, otherDeductions?,
+//   remarks? } }
+// Only touches fields present in patch. Paid items are skipped.
+// The PayrollItem pre-save hook recalculates grossEarnings, totalDeductions,
+// netPay, roundedNetPay automatically.
+router.patch(
+  "/items/bulk-override",
+  EmployeeAuthMiddlewear,
+  async (req, res) => {
+    try {
+      const { user } = req;
+      if (user.role !== "hr_manager") {
+        return res.status(403).json({
+          success: false,
+          message: "Only HR managers can edit payroll",
+        });
+      }
+
+      const { itemIds, patch } = req.body;
+      if (!Array.isArray(itemIds) || itemIds.length === 0) {
+        return res
+          .status(400)
+          .json({ success: false, message: "itemIds array is required" });
+      }
+      if (!patch || typeof patch !== "object") {
+        return res
+          .status(400)
+          .json({ success: false, message: "patch object is required" });
+      }
+
+      const settings = await PayrollSettings.getConfig();
+      const results = { updated: [], skipped: [], errors: [] };
+
+      const items = await PayrollItem.find({ _id: { $in: itemIds } });
+
+      for (const item of items) {
+        try {
+          if (item.status === "paid" && settings.lockAfterPaid) {
+            results.skipped.push({
+              id: String(item._id),
+              name: item.employeeName,
+              reason: "paid and locked",
+            });
+            continue;
+          }
+
+          if (patch.overtime !== undefined)
+            item.earnings.overtime = Math.max(0, Number(patch.overtime));
+          if (patch.bonus !== undefined)
+            item.earnings.bonus = Math.max(0, Number(patch.bonus));
+          if (patch.incentives !== undefined)
+            item.earnings.incentives = Math.max(0, Number(patch.incentives));
+          if (patch.otherEarnings !== undefined)
+            item.earnings.otherEarnings = Math.max(
+              0,
+              Number(patch.otherEarnings),
+            );
+          if (patch.loanDeduction !== undefined)
+            item.deductions.loanDeduction = Math.max(
+              0,
+              Number(patch.loanDeduction),
+            );
+          if (patch.advanceDeduction !== undefined)
+            item.deductions.advanceDeduction = Math.max(
+              0,
+              Number(patch.advanceDeduction),
+            );
+          if (patch.otherDeductions !== undefined)
+            item.deductions.otherDeductions = Math.max(
+              0,
+              Number(patch.otherDeductions),
+            );
+
+          // Append remarks, don't replace
+          if (patch.remarks !== undefined) {
+            const existing = item.remarks ? item.remarks.trim() : "";
+            const incoming = String(patch.remarks).trim();
+            item.remarks = incoming
+              ? existing
+                ? `${existing}; ${incoming}`
+                : incoming
+              : existing;
+          }
+
+          item.isManuallyOverridden = true;
+          item.lastEditedBy = user.id;
+          item.lastEditedAt = new Date();
+          item.markModified("earnings");
+          item.markModified("deductions");
+          await item.save();
+
+          results.updated.push({
+            id: String(item._id),
+            name: item.employeeName,
+            roundedNetPay: item.roundedNetPay,
+          });
+        } catch (itemErr) {
+          results.errors.push({
+            id: String(item._id),
+            name: item.employeeName,
+            error: itemErr.message,
+          });
+        }
+      }
+
+      res.json({
+        success: true,
+        message: `Bulk override: ${results.updated.length} updated, ${results.skipped.length} skipped, ${results.errors.length} errors`,
+        data: results,
+      });
+    } catch (err) {
+      console.error("[PAYROLL-BULK-OVERRIDE]", err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  },
+);
+
+router.patch(
+  "/run/revert-to-draft",
+  EmployeeAuthMiddlewear,
+  async (req, res) => {
+    try {
+      const { user } = req;
+      if (user.role !== "hr_manager") {
+        return res.status(403).json({
+          success: false,
+          message: "Only HR managers can revert payroll",
+        });
+      }
+
+      const month = parseInt(req.body.month) || new Date().getMonth() + 1;
+      const year = parseInt(req.body.year) || new Date().getFullYear();
+
+      const run = await Payroll.findOne({ month, year });
+      if (!run) {
+        return res.status(404).json({
+          success: false,
+          message: "No payroll run found for this period",
+        });
+      }
+
+      if (["paid", "approved"].includes(run.status)) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot revert a ${run.status} payroll run. Only processed runs can be reverted.`,
+        });
+      }
+
+      if (run.status === "draft") {
+        return res.status(400).json({
+          success: false,
+          message: "Payroll is already in draft status.",
+        });
+      }
+
+      // Revert items: processed → pending (paid items stay paid — shouldn't exist
+      // in a processed run that hasn't been mark-paid yet, but guard anyway)
+      await PayrollItem.updateMany(
+        { month, year, status: "processed" },
+        { $set: { status: "pending" } },
+      );
+
+      run.status = "draft";
+      await run.save();
+
+      res.json({
+        success: true,
+        message: `Payroll for ${MONTH_NAMES[month]} ${year} reverted to draft. You can now edit individual items.`,
+        data: { runId: run._id, status: "draft" },
+      });
+    } catch (err) {
+      console.error("[PAYROLL-REVERT-DRAFT]", err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  },
+);
+
+// ── DELETE /item/:id ──────────────────────────────────────────────────────────
+// Remove ONE employee's payroll entry from a draft or processed run.
+// Blocked for paid items. After deletion, updates the run-level totals.
+// Use case: a contractor, resigned employee, or data-entry mistake that
+// shouldn't be in this month's payroll.
+router.delete("/item/:id", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { user } = req;
+    if (user.role !== "hr_manager") {
+      return res.status(403).json({
+        success: false,
+        message: "Only HR managers can remove payroll items",
+      });
+    }
+
+    const item = await PayrollItem.findById(req.params.id);
+    if (!item) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Payroll item not found" });
+    }
+
+    const settings = await PayrollSettings.getConfig();
+    if (item.status === "paid" && settings.lockAfterPaid) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Paid payroll items cannot be removed. Contact admin to unlock.",
+      });
+    }
+
+    const { month, year, payrollId } = item;
+    const employeeName = item.employeeName;
+
+    await PayrollItem.deleteOne({ _id: item._id });
+
+    // Recompute run-level totals from remaining items
+    const remaining = await PayrollItem.find({ payrollId }).lean();
+    const totals = remaining.reduce(
+      (acc, i) => ({
+        g: acc.g + (i.earnings?.grossEarnings || 0),
+        d: acc.d + (i.deductions?.totalDeductions || 0),
+        n: acc.n + (i.roundedNetPay || 0),
+        pf: acc.pf + (i.deductions?.providentFund || 0),
+        esi: acc.esi + (i.deductions?.esic || 0),
+        b: acc.b + (i.earnings?.bonus || 0),
+      }),
+      { g: 0, d: 0, n: 0, pf: 0, esi: 0, b: 0 },
+    );
+
+    await Payroll.updateOne(
+      { _id: payrollId },
+      {
+        $set: {
+          totalEmployees: remaining.length,
+          totalGross: totals.g,
+          totalDeductions: totals.d,
+          totalNetPay: totals.n,
+          totalPF: totals.pf,
+          totalESIC: totals.esi,
+          totalBonus: totals.b,
+        },
+      },
+    );
+
+    res.json({
+      success: true,
+      message: `${employeeName} removed from ${MONTH_NAMES[month]} ${year} payroll`,
+      data: { remaining: remaining.length },
+    });
+  } catch (err) {
+    console.error("[PAYROLL-REMOVE-ITEM]", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
