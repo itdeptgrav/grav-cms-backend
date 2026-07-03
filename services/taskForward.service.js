@@ -325,7 +325,8 @@ async function createTask({ title, description, notes, requirements = [], assign
   }
 
   // ── P1 CONFLICT CHECK — same function used by play-button and drag triggers ──
-  if (Number(priority) === 1 && hasTimer === false && fixedDeadline && assigneeIds?.length) {
+  const _p1HasTimeBudget = fixedDeadline || Number(senderTimerWindowSecs) > 0 || Number(etcHours) > 0;
+  if (Number(priority) === 1 && _p1HasTimeBudget && assigneeIds?.length) {
     setImmediate(() => {
       for (const empId of assigneeIds) {
         checkAndExtendForP1({
@@ -1811,14 +1812,59 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
     console.log("[P1-SVC] p1Task:", { priority: p1Task.priority, fixedDeadline: p1Task.fixedDeadline, dueDate: p1Task.dueDate, title: p1Task.title });
 
     const p1DeadlineStr = p1Task.fixedDeadline || p1Task.dueDate || null;
-    if (!p1DeadlineStr) { console.log("[P1-SVC] no deadline on p1 task → return null"); return null; }
-
-    const p1RemainingMs = Math.max(0, new Date(p1DeadlineStr).getTime() - Date.now());
+    let p1RemainingMs;
+    if (p1DeadlineStr) {
+      p1RemainingMs = Math.max(0, new Date(p1DeadlineStr).getTime() - Date.now());
+    } else if (p1Task.hasTimer !== false) {
+      // Use whichever time budget exists — approved window, sender preset, or ETC estimate
+      const p1WindowSecs = Number(p1Task.deadlineWindowSecs)
+        || Number(p1Task.senderTimerWindowSecs)
+        || (Number(p1Task.etcHours) * 3600)
+        || 0;
+      if (p1WindowSecs > 0) {
+        try {
+          const p1TimerSnap = await db.collection("cowork_task_timers")
+            .doc(employeeId).collection("sessions").doc(newP1TaskId).get();
+          let p1WorkedSecs = 0;
+          if (p1TimerSnap.exists) {
+            const td = p1TimerSnap.data();
+            const base = Number(td.totalSeconds) || 0;
+            const elapsed = (td.isActive && td.lastStartTime)
+              ? Math.floor((Date.now() - Number(td.lastStartTime)) / 1000) : 0;
+            p1WorkedSecs = base + elapsed;
+          }
+          p1RemainingMs = Math.max(0, (p1WindowSecs - p1WorkedSecs) * 1000);
+          console.log(`[P1-SVC] p1 timer task window=${p1WindowSecs}s worked=${p1WorkedSecs}s remaining=${p1RemainingMs}ms`);
+        } catch (e) {
+          console.warn("[P1-SVC] could not read p1 timer session:", e.message);
+          p1RemainingMs = p1WindowSecs * 1000;
+        }
+      } else {
+        console.log("[P1-SVC] no deadline or timer window on p1 task → return null"); return null;
+      }
+    } else {
+      console.log("[P1-SVC] no deadline or timer window on p1 task → return null"); return null;
+    }
     if (p1RemainingMs <= 0) { console.log("[P1-SVC] p1 already expired → return null"); return null; }
 
     const p1RemainingHrs = p1RemainingMs / 3600000;
     const fmtHrs = h => h >= 1 ? `${Math.round(h * 10) / 10}h` : `${Math.round(h * 60)}m`;
     const now = new Date().toISOString();
+
+    // ── DELTA CORRECTION: store the estimated P1 finish time at cascade-fire moment ──
+    // When P1 first-play fires later, it compares actual dueDate vs this estimate.
+    // The difference (delta) is then added to all lower-priority tasks' deadlines.
+    const _cascadeEstimatedDueDateMs = Date.now() + p1RemainingMs;
+    const _cascadeEstimatedDueDateISO = new Date(_cascadeEstimatedDueDateMs).toISOString();
+    try {
+      await db.collection("cowork_tasks").doc(newP1TaskId).update({
+        cascadeEstimatedDueDate: _cascadeEstimatedDueDateISO,
+        cascadeEstimatedAtMs: _cascadeEstimatedDueDateMs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.warn("[P1-SVC] could not write cascadeEstimatedDueDate:", e.message);
+    }
 
     const empTasksSnap = await db.collection("cowork_tasks")
       .where("assigneeIds", "array-contains", employeeId)
@@ -1827,6 +1873,8 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
 
     const extendedResults = [];
 
+    // ── PHASE 1: collect + filter qualifying tasks ────────────────────────
+    const qualifyingTasks = [];
     for (const doc of empTasksSnap.docs) {
       if (doc.id === newP1TaskId) continue;
       const conflictTask = doc.data();
@@ -1848,8 +1896,16 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
       }
 
       const conflictDeadlineStr = conflictTask.fixedDeadline || conflictTask.dueDate || null;
-      if (!conflictDeadlineStr) {
-        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — no deadline set`);
+      const conflictWindowSecs = Number(conflictTask.deadlineWindowSecs)
+        || Number(conflictTask.senderTimerWindowSecs)
+        || (Number(conflictTask.etcHours) * 3600)
+        || 0;
+      const isTimerConflict = !conflictDeadlineStr
+        && conflictTask.hasTimer !== false
+        && conflictWindowSecs > 0;
+
+      if (!conflictDeadlineStr && !isTimerConflict) {
+        console.log(`[P1-SVC] skip ${doc.id} (${conflictTask.title}) — no deadline or timer window`);
         continue;
       }
 
@@ -1863,14 +1919,8 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
         continue;
       }
 
-      console.log(`[P1-SVC] EXTENDING ${doc.id} (${conflictTask.title}) — priority ${conflictPriority}, deadline ${conflictDeadlineStr}`);
-
-      const oldDeadline = conflictDeadlineStr;
-
-      // ── Read how much time this employee already worked on this conflict task ──
-      // Subtract that from the extended deadline — she already banked those minutes,
-      // so she doesn't need them protected again by the extension.
-      let workedMs = 0;
+      // Read actual worked time from Firestore timer session
+      let workedSecs = 0;
       try {
         const timerSnap = await db.collection("cowork_task_timers")
           .doc(employeeId).collection("sessions").doc(doc.id).get();
@@ -1878,49 +1928,110 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
           const td = timerSnap.data();
           const base = Number(td.totalSeconds) || 0;
           const elapsed = (td.isActive && td.lastStartTime)
-            ? Math.floor((Date.now() - Number(td.lastStartTime)) / 1000)
-            : 0;
-          const actualWorkedSecs = base + elapsed;
-          workedMs = actualWorkedSecs * 1000;
-          console.log(`[P1-SVC] timer for ${doc.id}: base=${base}s elapsed=${elapsed}s total=${actualWorkedSecs}s`);
+            ? Math.floor((Date.now() - Number(td.lastStartTime)) / 1000) : 0;
+          workedSecs = base + elapsed;
+          console.log(`[P1-SVC] timer for ${doc.id}: base=${base}s elapsed=${elapsed}s total=${workedSecs}s`);
         }
       } catch (e) {
         console.warn(`[P1-SVC] could not read timer for ${doc.id}:`, e.message);
       }
 
-      const rawNewDeadline = new Date(new Date(oldDeadline).getTime() + p1RemainingMs);
-      const adjustedDeadlineMs = Math.max(rawNewDeadline.getTime() - workedMs, new Date(oldDeadline).getTime());
-      const newDeadline = new Date(adjustedDeadlineMs).toISOString();
-
-      const deadlineField = conflictTask.fixedDeadline ? "fixedDeadline" : "dueDate";
       const taskOldPriority = (oldPriorities && oldPriorities[doc.id] != null) ? Number(oldPriorities[doc.id]) : conflictPriority;
 
-      await doc.ref.update({
-        [deadlineField]: newDeadline,
-        autoExtendedDueToP1: true,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        deadlineAutoExtendedHistory: admin.firestore.FieldValue.arrayUnion({
-          extendedByHrs: p1RemainingHrs,
-          shiftedByTaskId: newP1TaskId,
-          shiftedByTaskTitle: p1Task.title,
-          oldDeadline,
-          newDeadline,
-          at: now,
-          trigger: "p1_conflict_check",
-          reason: reason || null,
-          changedByName: assignedByName || null,
-          acknowledgedByEmployee: false,
-          oldPriority: taskOldPriority,
-          newPriority: conflictPriority,
-        }),
+      qualifyingTasks.push({
+        doc, conflictTask, conflictPriority, conflictDeadlineStr,
+        conflictWindowSecs, isTimerConflict, workedSecs, taskOldPriority,
       });
+    }
+
+
+    qualifyingTasks.sort((a, b) => a.conflictPriority - b.conflictPriority);
+    let cumulativeWaitMs = p1RemainingMs;
+    for (const qt of qualifyingTasks) {
+      const { doc, conflictTask, conflictPriority, conflictDeadlineStr,
+        conflictWindowSecs, isTimerConflict, workedSecs, taskOldPriority } = qt;
+
+      const cumulativeWaitSecs = Math.round(cumulativeWaitMs / 1000);
+      const cumulativeWaitHrs = cumulativeWaitMs / 3600000;
+      let oldDeadline, newDeadline, updatePayload;
+
+      if (isTimerConflict) {
+        const oldWindowSecs = conflictWindowSecs;
+        const newWindowSecs = Math.max(oldWindowSecs, oldWindowSecs + cumulativeWaitSecs - workedSecs);
+        oldDeadline = `${(oldWindowSecs / 3600).toFixed(2)}h budget`;
+        newDeadline = `${(newWindowSecs / 3600).toFixed(2)}h budget`;
+        console.log(`[P1-SVC] EXTENDING timer task ${doc.id} (${conflictTask.title}): cumulative=${cumulativeWaitSecs}s → ${oldWindowSecs}s → ${newWindowSecs}s`);
+        updatePayload = {
+          deadlineWindowSecs: newWindowSecs,
+          autoExtendedDueToP1: true,
+          cascadeAssumedP1FinishMs: _cascadeEstimatedDueDateMs,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          deadlineAutoExtendedHistory: admin.firestore.FieldValue.arrayUnion({
+            extendedByHrs: cumulativeWaitHrs,
+            workedHrsAtExtension: +(workedSecs / 3600).toFixed(2),
+            netExtendedHrs: +((cumulativeWaitSecs - workedSecs) / 3600).toFixed(2),
+            oldWindowSecs,
+            newWindowSecs,
+            shiftedByTaskId: newP1TaskId,
+            shiftedByTaskTitle: p1Task.title,
+            oldDeadline,
+            newDeadline,
+            at: now,
+            trigger: "p1_conflict_check",
+            reason: reason || null,
+            changedByName: assignedByName || null,
+            acknowledgedByEmployee: false,
+            oldPriority: taskOldPriority,
+            newPriority: conflictPriority,
+          }),
+        };
+        cumulativeWaitMs += Math.max(0, (oldWindowSecs - workedSecs) * 1000);
+      } else {
+        oldDeadline = conflictDeadlineStr;
+        // P2 new due = moment P1 finishes + P2's remaining unworked time
+        // cumulativeWaitMs = time until P1 (and all tasks above P2) finish
+        // workedSecs = work P2 already did — subtract so employee gets credit
+        const _p1FinishMs = Date.now() + cumulativeWaitMs;
+        const _p2RemainingMs = Math.max(0, (conflictWindowSecs - workedSecs) * 1000);
+        const _computedMs = _p1FinishMs + _p2RemainingMs;
+        // Never push deadline BEFORE the old one (safety floor)
+        const finalMs = Math.max(_computedMs, new Date(oldDeadline).getTime());
+        newDeadline = new Date(finalMs).toISOString();
+        const deadlineField = conflictTask.fixedDeadline ? "fixedDeadline" : "dueDate";
+        console.log(`[P1-SVC] EXTENDING deadline task ${doc.id} (${conflictTask.title}): cumulative=${cumulativeWaitMs}ms → ${oldDeadline} → ${newDeadline}`);
+        updatePayload = {
+          [deadlineField]: newDeadline,
+          autoExtendedDueToP1: true,
+          cascadeAssumedP1FinishMs: _cascadeEstimatedDueDateMs,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          deadlineAutoExtendedHistory: admin.firestore.FieldValue.arrayUnion({
+            extendedByHrs: cumulativeWaitHrs,
+            shiftedByTaskId: newP1TaskId,
+            shiftedByTaskTitle: p1Task.title,
+            oldDeadline,
+            newDeadline,
+            at: now,
+            trigger: "p1_conflict_check",
+            reason: reason || null,
+            changedByName: assignedByName || null,
+            acknowledgedByEmployee: false,
+            oldPriority: taskOldPriority,
+            newPriority: conflictPriority,
+          }),
+        };
+        // Accumulator for next task = P2's remaining unworked time
+        // (already computed above as _p2RemainingMs)
+        cumulativeWaitMs += _p2RemainingMs;
+      }
+
+      await doc.ref.update(updatePayload);
 
       extendedResults.push({
         conflictTaskId: doc.id,
         conflictTaskTitle: conflictTask.title,
         oldDeadline,
         newDeadline,
-        extendedByHrs: p1RemainingHrs,
+        extendedByHrs: cumulativeWaitHrs,
         oldPriority: taskOldPriority,
         newPriority: conflictPriority,
       });
