@@ -610,7 +610,7 @@ const createDefaultPackagingDispatch = async () => {
     const defaultPackagingDispatch = new PackagingDispatchDepartment({
       name: "Dispatch Admin",
       email: "dispatch@grav.in",
-      password: "Dispatch@12345", // will be hashed automatically
+      password: "Dispatch@12345",
       employeeId: "PKG001",
       phone: "9999999999",
       department: "Packaging & Dispatch",
@@ -713,6 +713,9 @@ app.use("/api/ceo/cutting", ceoCuttingRoutes);
 
 const ceoInventoryRoutes = require("./routes/CEO_Routes/inventory");
 app.use("/api/ceo/inventory", ceoInventoryRoutes);
+
+const ceoAccountingReports = require("./routes/CEO_Routes/ceoAccountingReports");
+app.use("/api/ceo/accounting", ceoAccountingReports);
 
 const merchandiserRoutes = require("./routes/CEO_Routes/merchandiser");
 app.use("/api/ceo/merchandiser", merchandiserRoutes);
@@ -869,6 +872,11 @@ app.use("/api/cms/stock-items", stockItemsRoutes);
 
 const StoreRoutes = require("./routes/CMS_Routes/Store/storeRoutes.js");
 app.use("/api/cms/store", StoreRoutes);
+
+const workerWorkOrderRoutes = require("./routes/CMS_Routes/Store/workerWorkOrderRoutes");
+app.use("/api/cms/store/work-orders-worker", workerWorkOrderRoutes);
+const storepurchaseOrderRoutes = require("./routes/CMS_Routes/Store/purchaseOrderRoutes");
+app.use("/api/cms/store/purchase-orders", storepurchaseOrderRoutes);
 
 // Operations Category
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");

@@ -29,7 +29,9 @@ const generatePONumber = () => {
   const prefix = "PO";
   const year = new Date().getFullYear().toString().slice(-2);
   const month = (new Date().getMonth() + 1).toString().padStart(2, "0");
-  const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, "0");
+  const randomNum = Math.floor(Math.random() * 10000)
+    .toString()
+    .padStart(4, "0");
   return `${prefix}${year}${month}${randomNum}`;
 };
 
@@ -39,18 +41,20 @@ async function convertQuantity(quantity, fromUnit, toUnit) {
   if (!quantity || isNaN(quantity)) return quantity;
   try {
     const fromDoc = await Unit.findOne({ name: fromUnit })
-      .populate("conversions.toUnit", "name").lean();
+      .populate("conversions.toUnit", "name")
+      .lean();
     if (fromDoc) {
       const direct = (fromDoc.conversions || []).find(
-        c => (c.toUnit?.name || c.toUnit) === toUnit
+        (c) => (c.toUnit?.name || c.toUnit) === toUnit,
       );
       if (direct?.quantity) return quantity * direct.quantity;
     }
     const toDoc = await Unit.findOne({ name: toUnit })
-      .populate("conversions.toUnit", "name").lean();
+      .populate("conversions.toUnit", "name")
+      .lean();
     if (toDoc) {
       const reverse = (toDoc.conversions || []).find(
-        c => (c.toUnit?.name || c.toUnit) === fromUnit
+        (c) => (c.toUnit?.name || c.toUnit) === fromUnit,
       );
       if (reverse?.quantity) return quantity / reverse.quantity;
     }
@@ -68,16 +72,17 @@ async function convertQuantity(quantity, fromUnit, toUnit) {
 // vendorId: vendor ObjectId or string
 // Returns: nickname string or "" if not found
 const findVariantNickname = (rawItemDoc, variantId, vendorId) => {
-  if (!rawItemDoc || !vendorId || !Array.isArray(rawItemDoc.variants)) return "";
+  if (!rawItemDoc || !vendorId || !Array.isArray(rawItemDoc.variants))
+    return "";
 
   // If a specific variant was chosen, look only in that variant's nicknames
   if (variantId) {
     const variant = rawItemDoc.variants.find(
-      v => v._id?.toString() === variantId.toString()
+      (v) => v._id?.toString() === variantId.toString(),
     );
     if (variant?.vendorNicknames?.length) {
       const vn = variant.vendorNicknames.find(
-        n => n.vendor?.toString() === vendorId.toString()
+        (n) => n.vendor?.toString() === vendorId.toString(),
       );
       if (vn?.nickname) return vn.nickname;
     }
@@ -87,7 +92,7 @@ const findVariantNickname = (rawItemDoc, variantId, vendorId) => {
   // No variant selected → fall back to first nickname this vendor has on any variant
   for (const variant of rawItemDoc.variants) {
     const nks = variant?.vendorNicknames || [];
-    const vn = nks.find(n => n.vendor?.toString() === vendorId.toString());
+    const vn = nks.find((n) => n.vendor?.toString() === vendorId.toString());
     if (vn?.nickname) return vn.nickname;
   }
   return "";
@@ -127,36 +132,60 @@ router.get("/", async (req, res) => {
     const total = await PurchaseOrder.countDocuments();
     const draft = await PurchaseOrder.countDocuments({ status: "DRAFT" });
     const issued = await PurchaseOrder.countDocuments({ status: "ISSUED" });
-    const partiallyReceived = await PurchaseOrder.countDocuments({ status: "PARTIALLY_RECEIVED" });
-    const completed = await PurchaseOrder.countDocuments({ status: "COMPLETED" });
+    const partiallyReceived = await PurchaseOrder.countDocuments({
+      status: "PARTIALLY_RECEIVED",
+    });
+    const completed = await PurchaseOrder.countDocuments({
+      status: "COMPLETED",
+    });
 
-    let totalAmount = 0, totalPaid = 0, pendingAmount = 0;
+    let totalAmount = 0,
+      totalPaid = 0,
+      pendingAmount = 0;
     purchaseOrders.forEach((po) => {
       totalAmount += po.totalAmount || 0;
-      const poPaid = po.payments?.reduce((sum, payment) => sum + (payment.amount || 0), 0) || 0;
+      const poPaid =
+        po.payments?.reduce((sum, payment) => sum + (payment.amount || 0), 0) ||
+        0;
       totalPaid += poPaid;
       pendingAmount += (po.totalAmount || 0) - poPaid;
     });
 
-    const paymentPending = await PurchaseOrder.countDocuments({ paymentStatus: "PENDING" });
-    const paymentPartial = await PurchaseOrder.countDocuments({ paymentStatus: "PARTIAL" });
-    const paymentCompleted = await PurchaseOrder.countDocuments({ paymentStatus: "COMPLETED" });
+    const paymentPending = await PurchaseOrder.countDocuments({
+      paymentStatus: "PENDING",
+    });
+    const paymentPartial = await PurchaseOrder.countDocuments({
+      paymentStatus: "PARTIAL",
+    });
+    const paymentCompleted = await PurchaseOrder.countDocuments({
+      paymentStatus: "COMPLETED",
+    });
 
     res.json({
       success: true,
       purchaseOrders,
       stats: {
-        total, draft, issued, partiallyReceived, completed,
-        totalAmount, totalPaid, pendingAmount,
-        paymentPending, paymentPartial, paymentCompleted
-      }
+        total,
+        draft,
+        issued,
+        partiallyReceived,
+        completed,
+        totalAmount,
+        totalPaid,
+        pendingAmount,
+        paymentPending,
+        paymentPartial,
+        paymentCompleted,
+      },
     });
   } catch (error) {
     console.error("Error fetching purchase orders:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching purchase orders" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching purchase orders",
+    });
   }
 });
-
 
 //    vendor's price + deliveryDays + the alias _id (needed for price write-back).
 router.get("/data/vendor-items/:vendorId", async (req, res) => {
@@ -164,12 +193,16 @@ router.get("/data/vendor-items/:vendorId", async (req, res) => {
     const { vendorId } = req.params;
 
     if (!mongoose.Types.ObjectId.isValid(vendorId)) {
-      return res.status(400).json({ success: false, message: "Invalid vendor id" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid vendor id" });
     }
 
-    const items = await RawItem.find({ "variants.vendorNicknames.vendor": vendorId })
+    const items = await RawItem.find({
+      "variants.vendorNicknames.vendor": vendorId,
+    })
       .select(
-        "name sku category customCategory unit customUnit description quantity minStock maxStock status variants unitConversion"
+        "name sku category customCategory unit customUnit description quantity minStock maxStock status variants unitConversion",
       )
       .lean()
       .sort({ name: 1 });
@@ -179,7 +212,7 @@ router.get("/data/vendor-items/:vendorId", async (req, res) => {
       const matchingVariants = (item.variants || [])
         .map((v) => {
           const alias = (v.vendorNicknames || []).find(
-            (vn) => vn.vendor?.toString() === vendorId
+            (vn) => vn.vendor?.toString() === vendorId,
           );
           if (!alias) return null;
           return {
@@ -224,11 +257,12 @@ router.get("/data/vendor-items/:vendorId", async (req, res) => {
   }
 });
 
-
 router.get("/data/raw-items-with-variants", async (req, res) => {
   try {
     const rawItems = await RawItem.find({})
-      .select("name sku category customCategory unit customUnit description quantity minStock maxStock status variants")
+      .select(
+        "name sku category customCategory unit customUnit description quantity minStock maxStock status variants",
+      )
       .lean()
       .sort({ name: 1 });
 
@@ -243,7 +277,7 @@ router.get("/data/raw-items-with-variants", async (req, res) => {
       minStock: item.minStock || 0,
       maxStock: item.maxStock || 0,
       status: item.status || "In Stock",
-      variants: (item.variants || []).map(v => ({
+      variants: (item.variants || []).map((v) => ({
         _id: v._id.toString(),
         combination: v.combination || [],
         sku: v.sku || "",
@@ -274,41 +308,56 @@ router.get("/data/raw-items-with-variants", async (req, res) => {
 router.get("/data/raw-items/:id/units", async (req, res) => {
   try {
     const rawItem = await RawItem.findById(req.params.id)
-      .select("unit customUnit name").lean();
-    if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
+      .select("unit customUnit name")
+      .lean();
+    if (!rawItem)
+      return res
+        .status(404)
+        .json({ success: false, message: "Raw item not found" });
 
     const baseUnit = rawItem.customUnit || rawItem.unit;
-    const available = [{
-      name: baseUnit, isBase: true, factor: 1,
-      label: `${baseUnit} (registered)`
-    }];
+    const available = [
+      {
+        name: baseUnit,
+        isBase: true,
+        factor: 1,
+        label: `${baseUnit} (registered)`,
+      },
+    ];
 
     const baseDoc = await Unit.findOne({ name: baseUnit })
-      .populate("conversions.toUnit", "name").lean();
+      .populate("conversions.toUnit", "name")
+      .lean();
 
     if (baseDoc?.conversions?.length) {
       for (const c of baseDoc.conversions) {
         const toName = c.toUnit?.name || c.toUnit;
-        if (toName && !available.find(u => u.name === toName)) {
+        if (toName && !available.find((u) => u.name === toName)) {
           available.push({
-            name: toName, isBase: false, factor: c.quantity,
-            label: `${toName} (1 ${baseUnit} = ${c.quantity} ${toName})`
+            name: toName,
+            isBase: false,
+            factor: c.quantity,
+            label: `${toName} (1 ${baseUnit} = ${c.quantity} ${toName})`,
           });
         }
       }
     }
 
     if (baseDoc?._id) {
-      const reverseUnits = await Unit.find({ "conversions.toUnit": baseDoc._id }).lean();
+      const reverseUnits = await Unit.find({
+        "conversions.toUnit": baseDoc._id,
+      }).lean();
       for (const u of reverseUnits) {
-        if (available.find(au => au.name === u.name)) continue;
+        if (available.find((au) => au.name === u.name)) continue;
         const conv = (u.conversions || []).find(
-          c => c.toUnit?.toString() === baseDoc._id.toString()
+          (c) => c.toUnit?.toString() === baseDoc._id.toString(),
         );
         if (conv?.quantity) {
           available.push({
-            name: u.name, isBase: false, factor: 1 / conv.quantity,
-            label: `${u.name} (1 ${u.name} = ${conv.quantity} ${baseUnit})`
+            name: u.name,
+            isBase: false,
+            factor: 1 / conv.quantity,
+            label: `${u.name} (1 ${u.name} = ${conv.quantity} ${baseUnit})`,
           });
         }
       }
@@ -327,17 +376,26 @@ router.get("/data/raw-items/:id/units", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const purchaseOrder = await PurchaseOrder.findById(req.params.id)
-      .populate("vendor", "companyName contactPerson phone email address gstNumber")
+      .populate(
+        "vendor",
+        "companyName contactPerson phone email address gstNumber",
+      )
       .populate("items.rawItem", "name sku unit description sellingPrice")
       .populate("createdBy", "name email")
       .populate("approvedBy", "name email")
       .populate("deliveries.receivedBy", "name email");
 
-    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
     res.json({ success: true, purchaseOrder });
   } catch (error) {
     console.error("Error fetching purchase order:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching purchase order" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching purchase order",
+    });
   }
 });
 
@@ -346,15 +404,21 @@ router.get("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items", async (req, res) => {
   try {
-    const { search = "", limit = 50 } = req.query
+    const { search = "", limit = 50 } = req.query;
     const filter = search
-      ? { $or: [
-          { name: { $regex: search, $options: "i" } },
-          { sku:  { $regex: search, $options: "i" } }
-        ]}
-      : {}
-    const rawItems = await RawItem.find(filter).limit(parseInt(limit)).sort({ name: 1 })
-      .select("name sku category customCategory unit customUnit description sellingPrice minStock maxStock quantity status")
+      ? {
+          $or: [
+            { name: { $regex: search, $options: "i" } },
+            { sku: { $regex: search, $options: "i" } },
+          ],
+        }
+      : {};
+    const rawItems = await RawItem.find(filter)
+      .limit(parseInt(limit))
+      .sort({ name: 1 })
+      .select(
+        "name sku category customCategory unit customUnit description sellingPrice minStock maxStock quantity status",
+      )
       .lean()
       .sort({ name: 1 });
 
@@ -369,13 +433,16 @@ router.get("/data/raw-items", async (req, res) => {
       currentStock: item.quantity || 0,
       minStock: item.minStock || 0,
       maxStock: item.maxStock || 0,
-      status: item.status || "In Stock"
+      status: item.status || "In Stock",
     }));
 
     res.json({ success: true, rawItems: formattedItems });
   } catch (error) {
     console.error("Error fetching raw items:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching raw items" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching raw items",
+    });
   }
 });
 
@@ -385,7 +452,9 @@ router.get("/data/raw-items", async (req, res) => {
 router.get("/data/vendors", async (req, res) => {
   try {
     const vendors = await Vendor.find({ status: "Active" })
-      .select("companyName contactPerson phone email address gstNumber vendorType paymentTerms")
+      .select(
+        "companyName contactPerson phone email address gstNumber vendorType paymentTerms",
+      )
       .sort({ companyName: 1 });
 
     res.json({
@@ -399,12 +468,14 @@ router.get("/data/vendors", async (req, res) => {
         address: v.address,
         gstNumber: v.gstNumber,
         vendorType: v.vendorType,
-        paymentTerms: v.paymentTerms
-      }))
+        paymentTerms: v.paymentTerms,
+      })),
     });
   } catch (error) {
     console.error("Error fetching vendors:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching vendors" });
+    res
+      .status(500)
+      .json({ success: false, message: "Server error while fetching vendors" });
   }
 });
 
@@ -414,16 +485,32 @@ router.get("/data/vendors", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
     const {
-      vendor, vendorName, orderDate, expectedDeliveryDate,
-      items, taxRate, shippingCharges, discount,
-      notes, termsConditions, paymentTerms, status = "DRAFT"
+      vendor,
+      vendorName,
+      orderDate,
+      expectedDeliveryDate,
+      items,
+      taxRate,
+      shippingCharges,
+      discount,
+      notes,
+      termsConditions,
+      paymentTerms,
+      status = "DRAFT",
     } = req.body;
 
-    if (!vendor) return res.status(400).json({ success: false, message: "Vendor is required" });
-    if (!items?.length) return res.status(400).json({ success: false, message: "At least one item is required" });
+    const isEmergency = req.body.isEmergencyOrder === true || req.body.isEmergencyOrder === "true"
+    if (!vendor && !isEmergency)
+      return res.status(400).json({ success: false, message: "Vendor is required" });
+    if (!items?.length)
+      return res
+        .status(400)
+        .json({ success: false, message: "At least one item is required" });
 
     // Generate unique PO number
-    let poNumber, isUnique = false, attempts = 0;
+    let poNumber,
+      isUnique = false,
+      attempts = 0;
     while (!isUnique && attempts < 10) {
       poNumber = generatePONumber();
       const existingPO = await PurchaseOrder.findOne({ poNumber });
@@ -431,63 +518,115 @@ router.post("/", async (req, res) => {
       attempts++;
     }
     if (!isUnique) {
-      return res.status(500).json({ success: false, message: "Failed to generate unique PO number" });
+      return res.status(500).json({
+        success: false,
+        message: "Failed to generate unique PO number",
+      });
     }
 
     // Build items — looks up baseUnit + per-variant vendor nickname
-    const itemsWithDetails = await Promise.all(items.map(async (item) => {
-      const ri = await RawItem.findById(item.rawItem)
-        .select("unit customUnit name sku variants")
-        .lean();
+    const itemsWithDetails = await Promise.all(
+      items.map(async (item) => {
+        const ri = await RawItem.findById(item.rawItem)
+          .select("unit customUnit name sku variants")
+          .lean();
 
-      const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
-      const poUnit = item.unit || registeredUnit;
+        const registeredUnit = ri
+          ? ri.customUnit || ri.unit
+          : item.unit || "unit";
+        const poUnit = item.unit || registeredUnit;
 
-      // ── per-variant nickname lookup ──
-      const vendorNickname = findVariantNickname(ri, item.variantId, vendor);
+        // ── per-variant nickname lookup ──
+        const vendorNickname = findVariantNickname(ri, item.variantId, vendor);
 
-      return {
-        rawItem: item.rawItem,
-        itemName: item.itemName || ri?.name || "Unknown Item",
-        sku: item.sku || ri?.sku || "",
-        unit: poUnit,
-        baseUnit: registeredUnit,
-        vendorNickname,
-        quantity: Number(item.quantity),
-        unitPrice: Number(item.unitPrice),
-        totalPrice: Number(item.quantity) * Number(item.unitPrice),
-        receivedQuantity: 0,
-        pendingQuantity: Number(item.quantity),
-        status: "PENDING",
-        variantId: item.variantId || null,
-        variantCombination: item.variantCombination || [],
-        variantName: item.variantCombination?.join(" • ") || "",
-        variantSku: item.variantSku || "",
-        expectedDeliveryDate: item.expectedDeliveryDate ? new Date(item.expectedDeliveryDate) : null
-      };
-
-
-    }));
+        const qty = Number(item.quantity) || 0;
+        const price = Number(item.unitPrice) || 0;
+        const baseTotal = qty * price;
+        const validCharges = (item.itemCharges || []).filter((c) => c.label?.trim() && parseFloat(c.value) > 0);
+        const itemChargesTotal = validCharges.reduce((s, c) => {
+          const v = parseFloat(c.value) || 0;
+          return s + (c.type === "percent" ? (baseTotal * v) / 100 : v);
+        }, 0);
+        const resolvedCharges = validCharges.map((c) => ({
+          label: c.label,
+          value: c.value,
+          type: c.type || "amount",
+          amount: c.type === "percent"
+            ? (baseTotal * (parseFloat(c.value) || 0)) / 100
+            : parseFloat(c.value) || 0,
+        }));
+        const totalPrice = baseTotal + itemChargesTotal;
+        const itemGstRate = Number(item.gstRate) || 0;
+        const itemGstAmount = totalPrice * itemGstRate / 100;
+        return {
+          rawItem: item.rawItem,
+          itemName: item.itemName || ri?.name || "Unknown Item",
+          sku: item.sku || ri?.sku || "",
+          unit: poUnit,
+          baseUnit: registeredUnit,
+          vendorNickname,
+          quantity: qty,
+          unitPrice: price,
+          totalPrice,
+          gstRate: itemGstRate,
+          gstAmount: itemGstAmount,
+          itemCharges: resolvedCharges,
+          itemChargesTotal,
+          receivedQuantity: 0,
+          pendingQuantity: qty,
+          status: "PENDING",
+          variantId: item.variantId || null,
+          variantCombination: item.variantCombination || [],
+          variantName: item.variantCombination?.join(" • ") || "",
+          variantSku: item.variantSku || "",
+          expectedDeliveryDate: item.expectedDeliveryDate
+            ? new Date(item.expectedDeliveryDate)
+            : null,
+        };
+      }),
+    );
 
     const subtotal = itemsWithDetails.reduce((sum, i) => sum + (i.totalPrice || 0), 0);
-    const taxAmount = (subtotal * (Number(taxRate) || 0)) / 100;
-    const totalAmount = subtotal + taxAmount + (Number(shippingCharges) || 0) - (Number(discount) || 0);
+    const taxAmount = itemsWithDetails.reduce((sum, i) => sum + (i.gstAmount || 0), 0);
+    const customChargesArr = Array.isArray(req.body.customCharges)
+      ? req.body.customCharges
+      : [];
+    const customChargesTotal = customChargesArr.reduce(
+      (s, c) => s + (parseFloat(c.amount) || 0),
+      0,
+    );
+    const totalAmount =
+      subtotal +
+      taxAmount +
+      (Number(shippingCharges) || 0) -
+      (Number(discount) || 0) +
+      customChargesTotal;
 
     const purchaseOrderData = {
-      poNumber, vendor, vendorName: vendorName || "",
+      poNumber,
+      vendor,
+      vendorName: vendorName || "",
       orderDate: orderDate ? new Date(orderDate) : new Date(),
-      expectedDeliveryDate: expectedDeliveryDate ? new Date(expectedDeliveryDate) : null,
+      expectedDeliveryDate: expectedDeliveryDate
+        ? new Date(expectedDeliveryDate)
+        : null,
       items: itemsWithDetails,
-      subtotal, taxRate: Number(taxRate) || 0, taxAmount,
+      subtotal,
+      taxRate: Number(taxRate) || 0,
+      taxAmount,
       shippingCharges: Number(shippingCharges) || 0,
-      discount: Number(discount) || 0, totalAmount,
+      discount: Number(discount) || 0,
+      customCharges: customChargesArr.filter((c) => c.label?.trim()),
+      totalAmount,
       totalReceived: 0,
       totalPending: itemsWithDetails.reduce((sum, i) => sum + i.quantity, 0),
-      status, paymentStatus: "PENDING",
+      status,
+      paymentStatus: "PENDING",
       paymentTerms: paymentTerms || "",
       notes: notes || "",
       termsConditions: termsConditions || "",
-      createdBy: req.user.id
+      isEmergencyOrder: isEmergency,
+      createdBy: req.user.id,
     };
 
     let purchaseOrder;
@@ -517,13 +656,17 @@ router.post("/", async (req, res) => {
 
     if (status === "ISSUED") {
       try {
-        const vendorData = await Vendor.findById(vendor)
-          .select("companyName contactPerson email phone address");
+        const vendorData = await Vendor.findById(vendor).select(
+          "companyName contactPerson email phone address",
+        );
         if (vendorData?.email) {
           await VendorEmailService.sendPurchaseOrderEmail(
             populatedPO.toObject(),
             vendorData.toObject(),
-            { name: req.user.name || "Project Manager", email: req.user.email || "admin@example.com" }
+            {
+              name: req.user.name || "Project Manager",
+              email: req.user.email || "admin@example.com",
+            },
           );
         }
       } catch (emailError) {
@@ -534,13 +677,13 @@ router.post("/", async (req, res) => {
     return res.status(201).json({
       success: true,
       message: "Purchase order created successfully",
-      purchaseOrder: populatedPO || purchaseOrder
+      purchaseOrder: populatedPO || purchaseOrder,
     });
   } catch (error) {
     console.error("Error creating purchase order:", error);
     return res.status(500).json({
       success: false,
-      message: `Server error while creating purchase order: ${error.message}`
+      message: `Server error while creating purchase order: ${error.message}`,
     });
   }
 });
@@ -551,80 +694,155 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
     const {
-      vendor, vendorName, orderDate, expectedDeliveryDate,
-      items, taxRate, shippingCharges, discount,
-      notes, termsConditions, paymentTerms, status
+      vendor,
+      vendorName,
+      orderDate,
+      expectedDeliveryDate,
+      items,
+      taxRate,
+      shippingCharges,
+      discount,
+      notes,
+      termsConditions,
+      paymentTerms,
+      status,
     } = req.body;
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
 
-    if (purchaseOrder.status === "PARTIALLY_RECEIVED" || purchaseOrder.status === "COMPLETED") {
+    if (
+      purchaseOrder.status === "PARTIALLY_RECEIVED" ||
+      purchaseOrder.status === "COMPLETED"
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Cannot edit purchase order that has already been received"
+        message: "Cannot edit purchase order that has already been received",
       });
     }
 
     if (vendor) purchaseOrder.vendor = vendor;
     if (vendorName) purchaseOrder.vendorName = vendorName;
     if (orderDate) purchaseOrder.orderDate = new Date(orderDate);
-    if (expectedDeliveryDate) purchaseOrder.expectedDeliveryDate = new Date(expectedDeliveryDate);
+    if (expectedDeliveryDate)
+      purchaseOrder.expectedDeliveryDate = new Date(expectedDeliveryDate);
     if (taxRate !== undefined) purchaseOrder.taxRate = parseFloat(taxRate);
-    if (shippingCharges !== undefined) purchaseOrder.shippingCharges = parseFloat(shippingCharges);
+    if (shippingCharges !== undefined)
+      purchaseOrder.shippingCharges = parseFloat(shippingCharges);
     if (discount !== undefined) purchaseOrder.discount = parseFloat(discount);
+    if (req.body.customCharges !== undefined)
+      purchaseOrder.customCharges = Array.isArray(req.body.customCharges)
+        ? req.body.customCharges.filter((c) => c.label?.trim())
+        : [];
     if (notes !== undefined) purchaseOrder.notes = notes;
-    if (termsConditions !== undefined) purchaseOrder.termsConditions = termsConditions;
+    if (termsConditions !== undefined)
+      purchaseOrder.termsConditions = termsConditions;
     if (paymentTerms !== undefined) purchaseOrder.paymentTerms = paymentTerms;
     if (status) purchaseOrder.status = status;
+    if (req.body.piInvoiceNumber !== undefined)
+      purchaseOrder.piInvoiceNumber = req.body.piInvoiceNumber || "";
+    if (req.body.piInvoicePhoto !== undefined)
+      purchaseOrder.piInvoicePhoto = req.body.piInvoicePhoto || "";
 
     if (items && Array.isArray(items)) {
+      const isEmergencyPut = purchaseOrder.isEmergencyOrder || req.body.isEmergencyOrder === true
       for (const item of items) {
-        if (!item.rawItem) {
+        if (!item.rawItem)
           return res.status(400).json({ success: false, message: "Raw item is required for all items" });
-        }
-        if (!item.quantity || item.quantity <= 0) {
+        if (!isEmergencyPut && (!item.quantity || item.quantity <= 0))
           return res.status(400).json({ success: false, message: "Valid quantity is required for all items" });
-        }
-        if (!item.unitPrice || item.unitPrice <= 0) {
+        if (!isEmergencyPut && (!item.unitPrice || item.unitPrice <= 0))
           return res.status(400).json({ success: false, message: "Valid unit price is required for all items" });
-        }
       }
 
-      const itemsWithDetails = await Promise.all(items.map(async (item) => {
-        const ri = await RawItem.findById(item.rawItem)
-          .select("unit customUnit name sku variants")
-          .lean();
+      const itemsWithDetails = await Promise.all(
+        items.map(async (item) => {
+          const ri = await RawItem.findById(item.rawItem)
+            .select("unit customUnit name sku variants")
+            .lean();
 
-        const registeredUnit = ri ? (ri.customUnit || ri.unit) : (item.unit || "unit");
-        const poUnit = item.unit || registeredUnit;
+          const registeredUnit = ri
+            ? ri.customUnit || ri.unit
+            : item.unit || "unit";
+          const poUnit = item.unit || registeredUnit;
 
-        // ── per-variant nickname lookup against the (possibly updated) vendor ──
-        const vendorNickname = findVariantNickname(ri, item.variantId, purchaseOrder.vendor);
+          // ── per-variant nickname lookup against the (possibly updated) vendor ──
+          const vendorNickname = findVariantNickname(
+            ri,
+            item.variantId,
+            purchaseOrder.vendor,
+          );
 
-        return {
-          rawItem: item.rawItem,
-          itemName: item.itemName || ri?.name || "Unknown Item",
-          sku: item.sku || ri?.sku || "",
-          unit: poUnit,
-          baseUnit: registeredUnit,
-          vendorNickname,
-          quantity: Number(item.quantity),
-          unitPrice: Number(item.unitPrice),
-          totalPrice: Number(item.quantity) * Number(item.unitPrice),
-          receivedQuantity: 0,
-          pendingQuantity: Number(item.quantity),
-          status: "PENDING",
-          variantId: item.variantId || null,
-          variantCombination: item.variantCombination || [],
-          variantName: (item.variantCombination || []).join(" • ") || "",
-          variantSku: item.variantSku || "",
-          expectedDeliveryDate: item.expectedDeliveryDate ? new Date(item.expectedDeliveryDate) : null
-        };
-
-      }));
+          const qty_put = Number(item.quantity) || 0;
+          const price_put = Number(item.unitPrice) || 0;
+          const baseTotal_put = qty_put * price_put;
+          const validCharges_put = (item.itemCharges || []).filter((c) => c.label?.trim() && parseFloat(c.value) > 0);
+          const itemChargesTotal_put = validCharges_put.reduce((s, c) => {
+            const v = parseFloat(c.value) || 0;
+            return s + (c.type === "percent" ? (baseTotal_put * v) / 100 : v);
+          }, 0);
+          const resolvedCharges_put = validCharges_put.map((c) => ({
+            label: c.label,
+            value: c.value,
+            type: c.type || "amount",
+            amount: c.type === "percent"
+              ? (baseTotal_put * (parseFloat(c.value) || 0)) / 100
+              : parseFloat(c.value) || 0,
+          }));
+          const totalPrice_put = baseTotal_put + itemChargesTotal_put;
+          const itemGstRate_put = Number(item.gstRate) || 0;
+          const itemGstAmount_put = totalPrice_put * itemGstRate_put / 100;
+          return {
+            rawItem: item.rawItem,
+            itemName: item.itemName || ri?.name || "Unknown Item",
+            sku: item.sku || ri?.sku || "",
+            unit: poUnit,
+            baseUnit: registeredUnit,
+            vendorNickname,
+            quantity: qty_put,
+            unitPrice: price_put,
+            totalPrice: totalPrice_put,
+            gstRate: itemGstRate_put,
+            gstAmount: itemGstAmount_put,
+            itemCharges: resolvedCharges_put,
+            itemChargesTotal: itemChargesTotal_put,
+            receivedQuantity: 0,
+            pendingQuantity: qty_put,
+            status: "PENDING",
+            variantId: item.variantId || null,
+            variantCombination: item.variantCombination || [],
+            variantName: (item.variantCombination || []).join(" • ") || "",
+            variantSku: item.variantSku || "",
+            expectedDeliveryDate: item.expectedDeliveryDate
+              ? new Date(item.expectedDeliveryDate)
+              : null,
+          };
+        }),
+      );
 
       purchaseOrder.items = itemsWithDetails;
+
+      const updatedSubtotal = itemsWithDetails.reduce((s, i) => s + (i.totalPrice || 0), 0);
+      const updatedTaxAmount = itemsWithDetails.reduce((s, i) => s + (i.gstAmount || 0), 0);
+      const updatedCustomTotal = (purchaseOrder.customCharges || []).reduce(
+        (s, c) => s + (parseFloat(c.amount) || 0),
+        0,
+      );
+      purchaseOrder.subtotal = updatedSubtotal;
+      purchaseOrder.taxAmount = updatedTaxAmount;
+      purchaseOrder.totalAmount =
+        updatedSubtotal +
+        updatedTaxAmount +
+        (purchaseOrder.shippingCharges || 0) -
+        (purchaseOrder.discount || 0) +
+        updatedCustomTotal;
+      purchaseOrder.totalPending = itemsWithDetails.reduce(
+        (s, i) => s + i.quantity,
+        0,
+      );
     }
 
     await purchaseOrder.save();
@@ -637,11 +855,14 @@ router.put("/:id", async (req, res) => {
     res.json({
       success: true,
       message: "Purchase order updated successfully",
-      purchaseOrder: populatedPO
+      purchaseOrder: populatedPO,
     });
   } catch (error) {
     console.error("Error updating purchase order:", error);
-    res.status(500).json({ success: false, message: "Server error while updating purchase order" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while updating purchase order",
+    });
   }
 });
 
@@ -650,25 +871,37 @@ router.put("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/payment", async (req, res) => {
   try {
-    const { amount, paymentMethod, referenceNumber, paymentDate, notes } = req.body;
+    const { amount, paymentMethod, referenceNumber, paymentDate, notes } =
+      req.body;
 
     if (!amount || amount <= 0) {
-      return res.status(400).json({ success: false, message: "Valid payment amount is required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Valid payment amount is required" });
     }
     if (!paymentMethod) {
-      return res.status(400).json({ success: false, message: "Payment method is required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Payment method is required" });
     }
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
 
-    const totalPaid = purchaseOrder.payments?.reduce((sum, payment) => sum + (payment.amount || 0), 0) || 0;
+    const totalPaid =
+      purchaseOrder.payments?.reduce(
+        (sum, payment) => sum + (payment.amount || 0),
+        0,
+      ) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
 
     if (amount > remainingAmount) {
       return res.status(400).json({
         success: false,
-        message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`
+        message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
       });
     }
 
@@ -678,21 +911,23 @@ router.post("/:id/payment", async (req, res) => {
       referenceNumber: referenceNumber || "",
       paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
       notes: notes || "",
-      recordedBy: req.user.id
+      recordedBy: req.user.id,
     };
 
     if (!purchaseOrder.payments) purchaseOrder.payments = [];
     purchaseOrder.payments.unshift(paymentRecord);
 
     const newTotalPaid = totalPaid + amount;
-    if (newTotalPaid >= purchaseOrder.totalAmount) purchaseOrder.paymentStatus = "COMPLETED";
+    if (newTotalPaid >= purchaseOrder.totalAmount)
+      purchaseOrder.paymentStatus = "COMPLETED";
     else if (newTotalPaid > 0) purchaseOrder.paymentStatus = "PARTIAL";
     else purchaseOrder.paymentStatus = "PENDING";
 
     await purchaseOrder.save();
 
-    const populatedPO = await PurchaseOrder.findById(purchaseOrder._id)
-      .populate("payments.recordedBy", "name email");
+    const populatedPO = await PurchaseOrder.findById(
+      purchaseOrder._id,
+    ).populate("payments.recordedBy", "name email");
     const latestPayment = populatedPO.payments[0];
 
     res.json({
@@ -701,11 +936,14 @@ router.post("/:id/payment", async (req, res) => {
       payment: latestPayment,
       paymentStatus: purchaseOrder.paymentStatus,
       totalPaid: newTotalPaid,
-      remainingAmount: purchaseOrder.totalAmount - newTotalPaid
+      remainingAmount: purchaseOrder.totalAmount - newTotalPaid,
     });
   } catch (error) {
     console.error("Error recording payment:", error);
-    res.status(500).json({ success: false, message: "Server error while recording payment" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while recording payment",
+    });
   }
 });
 
@@ -719,12 +957,17 @@ router.get("/vendor/:vendorId", async (req, res) => {
     if (status && status !== "all") filter.status = status;
 
     const purchaseOrders = await PurchaseOrder.find(filter)
-      .select("poNumber orderDate expectedDeliveryDate totalAmount status totalReceived totalPending")
+      .select(
+        "poNumber orderDate expectedDeliveryDate totalAmount status totalReceived totalPending",
+      )
       .populate("items.rawItem", "name sku")
       .sort({ createdAt: -1 });
 
     const totalOrders = purchaseOrders.length;
-    const totalAmount = purchaseOrders.reduce((sum, po) => sum + (po.totalAmount || 0), 0);
+    const totalAmount = purchaseOrders.reduce(
+      (sum, po) => sum + (po.totalAmount || 0),
+      0,
+    );
     const pendingAmount = purchaseOrders
       .filter((po) => po.status !== "COMPLETED" && po.status !== "CANCELLED")
       .reduce((sum, po) => sum + (po.totalAmount || 0), 0);
@@ -732,11 +975,14 @@ router.get("/vendor/:vendorId", async (req, res) => {
     res.json({
       success: true,
       purchaseOrders,
-      stats: { totalOrders, totalAmount, pendingAmount }
+      stats: { totalOrders, totalAmount, pendingAmount },
     });
   } catch (error) {
     console.error("Error fetching vendor purchase orders:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching vendor purchase orders" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching vendor purchase orders",
+    });
   }
 });
 
@@ -755,7 +1001,9 @@ router.get("/raw-item/:itemId", async (req, res) => {
       .sort({ createdAt: -1 });
 
     const itemOrders = purchaseOrders.map((po) => {
-      const item = po.items.find((i) => i.rawItem.toString() === req.params.itemId);
+      const item = po.items.find(
+        (i) => i.rawItem.toString() === req.params.itemId,
+      );
       return {
         _id: po._id,
         poNumber: po.poNumber,
@@ -763,21 +1011,26 @@ router.get("/raw-item/:itemId", async (req, res) => {
         expectedDeliveryDate: po.expectedDeliveryDate,
         vendorName: po.vendorName,
         status: po.status,
-        itemDetails: item ? {
-          quantity: item.quantity,
-          receivedQuantity: item.receivedQuantity,
-          pendingQuantity: item.pendingQuantity,
-          unitPrice: item.unitPrice,
-          totalPrice: item.totalPrice,
-          status: item.status
-        } : null
+        itemDetails: item
+          ? {
+              quantity: item.quantity,
+              receivedQuantity: item.receivedQuantity,
+              pendingQuantity: item.pendingQuantity,
+              unitPrice: item.unitPrice,
+              totalPrice: item.totalPrice,
+              status: item.status,
+            }
+          : null,
       };
     });
 
     res.json({ success: true, purchaseOrders: itemOrders });
   } catch (error) {
     console.error("Error fetching raw item purchase orders:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching raw item purchase orders" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching raw item purchase orders",
+    });
   }
 });
 
@@ -787,18 +1040,30 @@ router.get("/raw-item/:itemId", async (req, res) => {
 router.patch("/:id/status", async (req, res) => {
   try {
     const { status, notes } = req.body;
-    if (!status) return res.status(400).json({ success: false, message: "Status is required" });
+    if (!status)
+      return res
+        .status(400)
+        .json({ success: false, message: "Status is required" });
 
     const validStatuses = ["DRAFT", "ISSUED", "CANCELLED"];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({ success: false, message: "Invalid status. Use DRAFT, ISSUED, or CANCELLED" });
+      return res.status(400).json({
+        success: false,
+        message: "Invalid status. Use DRAFT, ISSUED, or CANCELLED",
+      });
     }
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
 
     if (purchaseOrder.totalReceived > 0 && status === "CANCELLED") {
-      return res.status(400).json({ success: false, message: "Cannot cancel purchase order that has already been received" });
+      return res.status(400).json({
+        success: false,
+        message: "Cannot cancel purchase order that has already been received",
+      });
     }
 
     purchaseOrder.status = status;
@@ -811,10 +1076,17 @@ router.patch("/:id/status", async (req, res) => {
     }
 
     await purchaseOrder.save();
-    res.json({ success: true, message: `Purchase order status updated to ${status}`, purchaseOrder });
+    res.json({
+      success: true,
+      message: `Purchase order status updated to ${status}`,
+      purchaseOrder,
+    });
   } catch (error) {
     console.error("Error updating purchase order status:", error);
-    res.status(500).json({ success: false, message: "Server error while updating purchase order status" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while updating purchase order status",
+    });
   }
 });
 
@@ -826,29 +1098,50 @@ router.post("/:id/receive", async (req, res) => {
     const { deliveryDate, items, invoiceNumber, notes } = req.body;
 
     if (!items?.length) {
-      return res.status(400).json({ success: false, message: "At least one item is required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "At least one item is required" });
     }
 
-    const purchaseOrder = await PurchaseOrder.findById(req.params.id)
-      .populate("items.rawItem", "name sku unit customUnit variants quantity status minStock maxStock");
+    const purchaseOrder = await PurchaseOrder.findById(req.params.id).populate(
+      "items.rawItem",
+      "name sku unit customUnit variants quantity status minStock maxStock",
+    );
 
-    if (!purchaseOrder) return res.status(404).json({ success: false, message: "PO not found" });
-    if (purchaseOrder.status === "DRAFT") return res.status(400).json({ success: false, message: "Cannot receive against a draft PO" });
-    if (purchaseOrder.status === "CANCELLED") return res.status(400).json({ success: false, message: "Cannot receive against a cancelled PO" });
+    if (!purchaseOrder)
+      return res.status(404).json({ success: false, message: "PO not found" });
+    if (purchaseOrder.status === "DRAFT")
+      return res
+        .status(400)
+        .json({ success: false, message: "Cannot receive against a draft PO" });
+    if (purchaseOrder.status === "CANCELLED")
+      return res.status(400).json({
+        success: false,
+        message: "Cannot receive against a cancelled PO",
+      });
 
     const updates = [];
     for (const ri of items) {
       const poItem = purchaseOrder.items.find(
-        it => it._id.toString() === ri.itemId?.toString()
+        (it) => it._id.toString() === ri.itemId?.toString(),
       );
       if (!poItem) {
-        console.error(`[receive] itemId ${ri.itemId} not matched in PO items:`, purchaseOrder.items.map(it => it._id.toString()));
-        return res.status(400).json({ success: false, message: `Item not found in PO: ${ri.itemId}` });
+        console.error(
+          `[receive] itemId ${ri.itemId} not matched in PO items:`,
+          purchaseOrder.items.map((it) => it._id.toString()),
+        );
+        return res.status(400).json({
+          success: false,
+          message: `Item not found in PO: ${ri.itemId}`,
+        });
       }
       const qty = parseFloat(ri.quantity) || 0;
       if (qty <= 0) continue;
 
-      const pending = Math.max(0, +(poItem.quantity - poItem.receivedQuantity).toFixed(4));
+      const pending = Math.max(
+        0,
+        +(poItem.quantity - poItem.receivedQuantity).toFixed(4),
+      );
       if (qty > pending + 0.001) {
         return res.status(400).json({
           success: false,
@@ -862,7 +1155,7 @@ router.post("/:id/receive", async (req, res) => {
         variantId: ri.variantId || poItem.variantId,
         variantCombination: ri.variantCombination?.length
           ? ri.variantCombination
-          : (poItem.variantCombination || []),
+          : poItem.variantCombination || [],
         qtyInPoUnit: qty,
         poUnit: poItem.unit,
         unitPrice: poItem.unitPrice,
@@ -870,31 +1163,54 @@ router.post("/:id/receive", async (req, res) => {
     }
 
     if (!updates.length) {
-      return res.status(400).json({ success: false, message: "No valid quantities to receive" });
+      return res
+        .status(400)
+        .json({ success: false, message: "No valid quantities to receive" });
     }
 
     let totalReceivedInPoUnits = 0;
     const processed = [];
 
     for (const u of updates) {
-      const { poItem, rawItemId, variantId, variantCombination, qtyInPoUnit, poUnit, unitPrice } = u;
+      const {
+        poItem,
+        rawItemId,
+        variantId,
+        variantCombination,
+        qtyInPoUnit,
+        poUnit,
+        unitPrice,
+      } = u;
 
       const rawItem = await RawItem.findById(rawItemId);
-      if (!rawItem) { console.warn(`RawItem not found: ${rawItemId}`); continue; }
+      if (!rawItem) {
+        console.warn(`RawItem not found: ${rawItemId}`);
+        continue;
+      }
 
       const registeredUnit = rawItem.customUnit || rawItem.unit;
       const fromUnit = poUnit || registeredUnit;
 
       let qtyInRegisteredUnit = qtyInPoUnit;
       if (fromUnit !== registeredUnit) {
-        qtyInRegisteredUnit = await convertQuantity(qtyInPoUnit, fromUnit, registeredUnit);
+        qtyInRegisteredUnit = await convertQuantity(
+          qtyInPoUnit,
+          fromUnit,
+          registeredUnit,
+        );
       }
 
       poItem.receivedQuantity += qtyInPoUnit;
-      poItem.pendingQuantity = Math.max(0, poItem.quantity - poItem.receivedQuantity);
+      poItem.pendingQuantity = Math.max(
+        0,
+        poItem.quantity - poItem.receivedQuantity,
+      );
       poItem.status =
-        poItem.receivedQuantity >= poItem.quantity ? "COMPLETED" :
-          poItem.receivedQuantity > 0 ? "PARTIALLY_RECEIVED" : "PENDING";
+        poItem.receivedQuantity >= poItem.quantity
+          ? "COMPLETED"
+          : poItem.receivedQuantity > 0
+            ? "PARTIALLY_RECEIVED"
+            : "PENDING";
 
       const previousBaseQty = rawItem.quantity;
 
@@ -904,15 +1220,23 @@ router.post("/:id/receive", async (req, res) => {
 
         for (let i = 0; i < rawItem.variants.length; i++) {
           const v = rawItem.variants[i];
-          if (v._id?.toString() === variantId.toString()) { variant = v; variantIdx = i; break; }
+          if (v._id?.toString() === variantId.toString()) {
+            variant = v;
+            variantIdx = i;
+            break;
+          }
         }
 
         if (!variant && variantCombination?.length) {
           for (let i = 0; i < rawItem.variants.length; i++) {
             const v = rawItem.variants[i];
-            if (v.combination?.length === variantCombination.length &&
-              v.combination.every((val, idx) => val === variantCombination[idx])) {
-              variant = v; variantIdx = i; break;
+            if (
+              v.combination?.length === variantCombination.length &&
+              v.combination.every((val, idx) => val === variantCombination[idx])
+            ) {
+              variant = v;
+              variantIdx = i;
+              break;
             }
           }
         }
@@ -920,9 +1244,13 @@ router.post("/:id/receive", async (req, res) => {
         if (variant) {
           variant.quantity = (variant.quantity || 0) + qtyInRegisteredUnit;
           variant.status =
-            variant.quantity === 0 ? "Out of Stock" :
-              variant.quantity <= (variant.minStock || rawItem.minStock || 0) ? "Low Stock" : "In Stock";
-          if (!variant.sku) variant.sku = poItem.variantSku || `${rawItem.sku}-var`;
+            variant.quantity === 0
+              ? "Out of Stock"
+              : variant.quantity <= (variant.minStock || rawItem.minStock || 0)
+                ? "Low Stock"
+                : "In Stock";
+          if (!variant.sku)
+            variant.sku = poItem.variantSku || `${rawItem.sku}-var`;
           rawItem.variants[variantIdx] = variant;
         } else {
           rawItem.variants.push({
@@ -935,18 +1263,25 @@ router.post("/:id/receive", async (req, res) => {
           });
         }
 
-        rawItem.quantity = rawItem.variants.reduce((s, v) => s + (v.quantity || 0), 0);
+        rawItem.quantity = rawItem.variants.reduce(
+          (s, v) => s + (v.quantity || 0),
+          0,
+        );
       } else {
         rawItem.quantity = (rawItem.quantity || 0) + qtyInRegisteredUnit;
       }
 
       rawItem.status =
-        rawItem.quantity === 0 ? "Out of Stock" :
-          rawItem.quantity <= (rawItem.minStock || 0) ? "Low Stock" : "In Stock";
+        rawItem.quantity === 0
+          ? "Out of Stock"
+          : rawItem.quantity <= (rawItem.minStock || 0)
+            ? "Low Stock"
+            : "In Stock";
 
-      const conversionNote = fromUnit !== registeredUnit
-        ? ` (received ${qtyInPoUnit} ${fromUnit} = ${qtyInRegisteredUnit.toFixed(4)} ${registeredUnit})`
-        : "";
+      const conversionNote =
+        fromUnit !== registeredUnit
+          ? ` (received ${qtyInPoUnit} ${fromUnit} = ${qtyInRegisteredUnit.toFixed(4)} ${registeredUnit})`
+          : "";
 
       rawItem.stockTransactions.unshift({
         type: variantId ? "VARIANT_ADD" : "ADD",
@@ -971,8 +1306,10 @@ router.post("/:id/receive", async (req, res) => {
       processed.push({
         itemName: poItem.itemName,
         variant: variantCombination?.join(" • ") || null,
-        qtyInPoUnit, poUnit: fromUnit,
-        qtyInRegisteredUnit, registeredUnit,
+        qtyInPoUnit,
+        poUnit: fromUnit,
+        qtyInRegisteredUnit,
+        registeredUnit,
         converted: fromUnit !== registeredUnit,
       });
 
@@ -988,11 +1325,17 @@ router.post("/:id/receive", async (req, res) => {
     });
 
     purchaseOrder.totalReceived += totalReceivedInPoUnits;
-    purchaseOrder.totalPending = purchaseOrder.items.reduce((s, it) => s + (it.pendingQuantity || 0), 0);
+    purchaseOrder.totalPending = purchaseOrder.items.reduce(
+      (s, it) => s + (it.pendingQuantity || 0),
+      0,
+    );
 
     purchaseOrder.status =
-      purchaseOrder.totalPending === 0 ? "COMPLETED" :
-        purchaseOrder.totalReceived > 0 ? "PARTIALLY_RECEIVED" : purchaseOrder.status;
+      purchaseOrder.totalPending === 0
+        ? "COMPLETED"
+        : purchaseOrder.totalReceived > 0
+          ? "PARTIALLY_RECEIVED"
+          : purchaseOrder.status;
 
     await purchaseOrder.save();
 
@@ -1019,23 +1362,38 @@ router.post("/:id/receive", async (req, res) => {
 router.patch("/:id/payment-status", async (req, res) => {
   try {
     const { status } = req.body;
-    if (!status) return res.status(400).json({ success: false, message: "Payment status is required" });
+    if (!status)
+      return res
+        .status(400)
+        .json({ success: false, message: "Payment status is required" });
 
     const validStatuses = ["PENDING", "PARTIAL", "COMPLETED"];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({ success: false, message: "Invalid payment status" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid payment status" });
     }
 
     const purchaseOrder = await PurchaseOrder.findById(req.params.id);
-    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
 
     purchaseOrder.paymentStatus = status;
     await purchaseOrder.save();
 
-    res.json({ success: true, message: `Payment status updated to ${status}`, purchaseOrder });
+    res.json({
+      success: true,
+      message: `Payment status updated to ${status}`,
+      purchaseOrder,
+    });
   } catch (error) {
     console.error("Error updating payment status:", error);
-    res.status(500).json({ success: false, message: "Server error while updating payment status" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while updating payment status",
+    });
   }
 });
 
@@ -1048,9 +1406,16 @@ router.get("/:id/payments", async (req, res) => {
       .select("payments poNumber totalAmount")
       .populate("payments.recordedBy", "name email");
 
-    if (!purchaseOrder) return res.status(404).json({ success: false, message: "Purchase order not found" });
+    if (!purchaseOrder)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
 
-    const totalPaid = purchaseOrder.payments?.reduce((sum, payment) => sum + payment.amount, 0) || 0;
+    const totalPaid =
+      purchaseOrder.payments?.reduce(
+        (sum, payment) => sum + payment.amount,
+        0,
+      ) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
 
     res.json({
@@ -1059,11 +1424,14 @@ router.get("/:id/payments", async (req, res) => {
       totalPaid,
       remainingAmount,
       poNumber: purchaseOrder.poNumber,
-      totalAmount: purchaseOrder.totalAmount
+      totalAmount: purchaseOrder.totalAmount,
     });
   } catch (error) {
     console.error("Error fetching payments:", error);
-    res.status(500).json({ success: false, message: "Server error while fetching payments" });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching payments",
+    });
   }
 });
 

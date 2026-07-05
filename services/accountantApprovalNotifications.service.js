@@ -26,23 +26,15 @@
 //   fire-and-forget, so a mail/push failure can never break a voucher
 //   submission or an approval.
 
-const axios = require("axios");
 const { Acc_User } = require("../models/Accountant_model/Acc_OrgModels");
 
 // ── Config ──────────────────────────────────────────────────────────────────
-const BREVO_URL = "https://api.brevo.com/v3/smtp/email";
-const FROM_EMAIL = process.env.CUSTOMER_SENDER_EMAIL || "noreply@grav.in";
-const FROM_NAME = "GRAV Accounts";
 const APP_URL = (
   process.env.ACCOUNTANT_APP_URL ||
   process.env.FRONTEND_URL ||
   "https://cms.grav.in"
 ).replace(/\/+$/, "");
 const APPROVALS_URL = `${APP_URL}/accountant/approvals`;
-
-function emailsEnabled() {
-  return process.env.ENABLE_EMAILS === "true" && !!process.env.BREVO_API_KEY;
-}
 
 // ── Firebase Admin (lazy; may be unconfigured) ──────────────────────────────
 let _messaging = null; // null = untried, false = unavailable
@@ -59,47 +51,6 @@ function getMessaging() {
     _messaging = false;
   }
   return _messaging || null;
-}
-
-// ── Brevo send (single recipient) ───────────────────────────────────────────
-async function sendEmail({ toEmail, toName, subject, html, text }) {
-  if (!toEmail) return;
-  if (!emailsEnabled()) {
-    console.log(
-      `[acc-notif] email skipped (ENABLE_EMAILS!=true or BREVO_API_KEY unset): "${subject}" -> ${toEmail}`,
-    );
-    return;
-  }
-  try {
-    await axios.post(
-      BREVO_URL,
-      {
-        sender: { name: FROM_NAME, email: FROM_EMAIL },
-        to: [{ email: toEmail, name: toName || toEmail.split("@")[0] }],
-        subject,
-        htmlContent: html,
-        textContent: text,
-        headers: {
-          "X-Mailer": "GRAV-Accounts-Notifications",
-          "X-Priority": "3",
-        },
-      },
-      {
-        headers: {
-          "api-key": process.env.BREVO_API_KEY,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        timeout: 10000,
-      },
-    );
-    console.log(`[acc-notif] email sent: "${subject}" -> ${toEmail}`);
-  } catch (e) {
-    console.error(
-      `[acc-notif] email FAILED "${subject}" -> ${toEmail}:`,
-      e.response?.data?.message || e.message,
-    );
-  }
 }
 
 // ── FCM push to one user's device tokens (no-op until tokens exist) ─────────
@@ -207,26 +158,6 @@ async function getUser(userId) {
   if (!userId) return null;
   return Acc_User.findById(userId).select("name email role fcmTokens").lean();
 }
-
-// ── HTML helpers ────────────────────────────────────────────────────────────
-function wrap(heading, inner) {
-  return `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1a1a1a">
-  <div style="background:#4f46e5;padding:16px 24px"><span style="color:#fff;font-size:18px;font-weight:700">GRAV Accounts</span></div>
-  <div style="padding:24px">
-    <h2 style="font-size:16px;margin:0 0 16px">${heading}</h2>
-    ${inner}
-    <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
-    <p style="font-size:12px;color:#888">Automated notification from the GRAV accounting workspace.</p>
-  </div>
-</div>`;
-}
-function btn(label, url) {
-  return `<p><a href="${url}" style="display:inline-block;background:#4f46e5;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600">${label}</a></p>`;
-}
-function callout(text) {
-  return `<p style="font-size:15px;background:#f5f5ff;border-left:3px solid #4f46e5;padding:10px 12px;border-radius:0 6px 6px 0;margin:12px 0">${text}</p>`;
-}
-
 // ── Main entry — called by the Acc_ApprovalRequest model hook ────────────────
 async function notifyApprovalEvent(doc, event) {
   try {
@@ -240,23 +171,7 @@ async function notifyApprovalEvent(doc, event) {
         console.log("[acc-notif] no approvers/owner to notify for new request");
         return;
       }
-      const subject = `Approval needed: ${title}`;
       for (const u of approvers) {
-        const html = wrap(
-          "A request needs your approval",
-          `<p>Dear ${u.name || "there"},</p>
-           <p><strong>${requesterName}</strong> submitted a change that needs an approver's review:</p>
-           ${callout(title)}
-           ${btn("Review in Approvals", APPROVALS_URL)}`,
-        );
-        const text = `${requesterName} submitted a change that needs approval:\n${title}\n\nReview: ${APPROVALS_URL}`;
-        await sendEmail({
-          toEmail: u.email,
-          toName: u.name,
-          subject,
-          html,
-          text,
-        });
         await sendPush(u, {
           title: "Approval needed",
           body: `${requesterName}: ${title}`,
@@ -274,42 +189,15 @@ async function notifyApprovalEvent(doc, event) {
     }
     const decidedBy = doc.reviewedByName || "An approver";
 
-    let subject;
-    let heading;
-    let line;
     let pushTitle;
     if (event === "approved") {
-      subject = `Approved: ${title}`;
-      heading = "Your request was approved";
-      line = `<strong>${decidedBy}</strong> approved your request. It has been applied.`;
       pushTitle = "Request approved";
     } else if (event === "rejected") {
-      subject = `Rejected: ${title}`;
-      heading = "Your request was rejected";
-      const note = doc.reviewNote
-        ? `<br><span style="color:#b91c1c">Reason: ${doc.reviewNote}</span>`
-        : "";
-      line = `<strong>${decidedBy}</strong> rejected your request. No change was applied.${note}`;
       pushTitle = "Request rejected";
     } else {
-      return; // other statuses (e.g. withdrawn) are not notified
+      return;
     }
 
-    const html = wrap(
-      heading,
-      `<p>Dear ${requester.name || "there"},</p>
-       <p>${line}</p>
-       ${callout(title)}
-       ${btn("Open Approvals", APPROVALS_URL)}`,
-    );
-    const text = `${heading}\n${title}\n\nOpen: ${APPROVALS_URL}`;
-    await sendEmail({
-      toEmail: requester.email,
-      toName: requester.name,
-      subject,
-      html,
-      text,
-    });
     await sendPush(requester, {
       title: pushTitle,
       body: title,

@@ -642,6 +642,14 @@ async function resolveSalesLedger(companyId, kind) {
       ? /^sales\s*[—\-–]?\s*interstate$/i
       : /^sales\s*[—\-–]?\s*local$/i;
 
+  // Prefer "Sales Account" if it exists (generic, works for both local and interstate)
+  const salesAccount = await Acc_Ledger.findOne({
+    companyId,
+    isActive: true,
+    name: /^sales\s*account$/i,
+  });
+  if (salesAccount) return salesAccount;
+
   const existing = await Acc_Ledger.findOne({
     companyId,
     isActive: true,
@@ -1227,45 +1235,98 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
       .limit(parseInt(limit))
       .lean();
 
-    const result = requests.map((r) => {
-      const q0 = r.quotations?.[0];
-      const items = q0?.items || q0?.lineItems || q0?.products || [];
-      const grandTotal = q0?.grandTotal || r.finalOrderPrice || 0;
-      const paid = r.totalPaidAmount || 0;
-      return {
-        _id: r._id,
-        requestId: r.requestId,
-        orderDate: r.createdAt,
-        status: r.status,
-        grandTotal,
-        paid,
-        outstanding: Math.max(0, grandTotal - paid),
-        customer: r.customerId
-          ? {
-              _id: r.customerId._id,
-              name: r.customerId.name || r.customerId.companyName,
-              companyName: r.customerId.companyName,
-              email: r.customerId.email,
-              phone: r.customerId.phone,
-              gstin: r.customerId.gstin,
-            }
-          : null,
-        items: items.map((item) => ({
-          name: item.productName || item.name || item.description || "",
-          variant: item.variant || item.variantName || "",
-          sku: item.sku || "",
-          hsnCode: item.hsnCode || item.hsn || "",
-          quantity: item.quantity || item.qty || 0,
-          unit: item.unit || "Nos",
-          rate: item.rate || item.unitPrice || item.price || 0,
-          gstRate: item.gstRate || item.taxRate || 18,
-          amount: item.amount || item.total || 0,
-          discount: item.discount || 0,
-        })),
-        measurements: r.measurements || null,
-        itemCount: items.length,
-      };
-    });
+    // Pull WorkOrders to get actual dispatched quantities per request
+    let WorkOrder;
+    try {
+      WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
+    } catch {
+      WorkOrder = null;
+    }
+
+    const result = await Promise.all(
+      requests.map(async (r) => {
+        const q0 = r.quotations?.[0];
+        const quotationItems = q0?.items || q0?.lineItems || q0?.products || [];
+        const grandTotal = q0?.grandTotal || r.finalOrderPrice || 0;
+        const paid = r.totalPaidAmount || 0;
+
+        // Build a map of stockItemId/name → dispatched quantity from WorkOrders
+        let woDispatchMap = new Map(); // key: stockItemName, value: { dispatchedQty, totalQty }
+        if (WorkOrder) {
+          const wos = await WorkOrder.find({ customerRequestId: r._id })
+            .select(
+              "stockItemId stockItemName variantAttributes quantity dispatchedQuantity",
+            )
+            .lean();
+          for (const wo of wos) {
+            // Key by stockItemName + variant combo for matching
+            const varKey = (wo.variantAttributes || [])
+              .map((v) => v.value || "")
+              .join("|");
+            const mapKey = `${wo.stockItemName || ""}::${varKey}`;
+            const existing = woDispatchMap.get(mapKey) || {
+              dispatchedQty: 0,
+              totalQty: 0,
+            };
+            existing.dispatchedQty += wo.dispatchedQuantity || 0;
+            existing.totalQty += wo.quantity || 0;
+            woDispatchMap.set(mapKey, existing);
+          }
+        }
+
+        const items = quotationItems.map((item) => {
+          const itemName =
+            item.productName || item.name || item.description || "";
+          const variant = item.variant || item.variantName || "";
+          // Try to match dispatch quantity from WorkOrders
+          const mapKey = `${itemName}::${variant}`;
+          const woEntry =
+            woDispatchMap.get(mapKey) ||
+            woDispatchMap.get(`${itemName}::`) ||
+            null;
+          // Use dispatched qty if available, else fall back to ordered qty
+          const orderedQty = item.quantity || item.qty || 0;
+          const dispatchedQty = woEntry ? woEntry.dispatchedQty : null;
+          return {
+            name: itemName,
+            variant,
+            sku: item.sku || "",
+            hsnCode: item.hsnCode || item.hsn || "",
+            quantity: dispatchedQty !== null ? dispatchedQty : orderedQty,
+            orderedQuantity: orderedQty,
+            dispatchedQuantity: dispatchedQty,
+            unit: item.unit || "Nos",
+            rate: item.rate || item.unitPrice || item.price || 0,
+            gstRate: item.gstRate || item.taxRate || 18,
+            amount: item.amount || item.total || 0,
+            discount: item.discount || 0,
+          };
+        });
+
+        return {
+          _id: r._id,
+          requestId: r.requestId,
+          orderDate: r.createdAt,
+          status: r.status,
+          grandTotal,
+          paid,
+          outstanding: Math.max(0, grandTotal - paid),
+          customer: r.customerId
+            ? {
+                _id: r.customerId._id,
+                name: r.customerId.name || r.customerId.companyName,
+                companyName: r.customerId.companyName,
+                email: r.customerId.email,
+                phone: r.customerId.phone,
+                gstin: r.customerId.gstin,
+              }
+            : null,
+          items,
+          measurements: r.measurements || null,
+          itemCount: items.length,
+        };
+      }),
+    );
 
     res.json({ orders: result, count: result.length });
   } catch (e) {
