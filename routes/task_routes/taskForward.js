@@ -1392,6 +1392,13 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     // Zone 1 (0–50%)  : button disabled on frontend — if somehow submitted, no penalty
     // Zone 2 (50–70%) : no penalty
     // Zone 3 (70%+)   : penalty applies (−0.2 C1 deduction)
+    // If etcHours not set, fall back to deadlineWindowSecs elapsed %
+    if (elapsedPercent === 0 && task.deadlineWindowSecs > 0) {
+      const _workedMs = task.startedAt
+        ? Date.now() - new Date(task.startedAt).getTime()
+        : 0;
+      elapsedPercent = Math.min(100, +(((_workedMs / 1000) / task.deadlineWindowSecs) * 100).toFixed(1));
+    }
     isPenaltyWaived = elapsedPercent < 70;
     // ─────────────────────────────────────────────────────────────────────
 
