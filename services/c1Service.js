@@ -264,10 +264,15 @@ async function _updateC1ScoreCache(employeeId, cfg) {
     if (bandMax?.c1Max) cfg = { ...cfg, c1MaxPoints: bandMax.c1Max };
 
     // Fetch all tasks assigned to this employee that have a c1 score
+    const quarter = Math.ceil((new Date().getMonth() + 1) / 3);
+    const year = new Date().getFullYear();
     const snap = await db.collection("cowork_tasks")
         .where("assigneeIds", "array-contains", employeeId)
         .where("c1.c1Status", "in", ["completed", "rejected"])
+        .where("quarter", "==", quarter)
+        .where("year", "==", year)
         .get();
+
 
     const tasks = snap.docs.map(d => d.data());
     const qualityRate = calculateQualityRate(tasks);
