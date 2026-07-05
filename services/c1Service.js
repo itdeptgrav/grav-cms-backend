@@ -366,12 +366,33 @@ async function writeReworkDeduction({ employeeId, taskId, taskTitle, reviewerId 
 // writeExtensionDeduction — called IMMEDIATELY when TL confirms extension deduction
 // ─────────────────────────────────────────────────────────────────────────────
 async function writeExtensionDeduction({ employeeId, taskId, taskTitle, reviewerId, reviewerName }) {
-    // Extension deduction is included in final taskScore at approval time.
-    // No separate SOP entry written here to avoid double-counting.
     try {
         const cfg = await getC1Config();
         const pts = +Number(cfg.c1ExtensionDeduction).toFixed(2);
-        console.log(`[C1 extension] Extension recorded on ${taskId} for ${employeeId} (−${pts} pts — applied at approval)`);
+        const employee = await Employee.findOne({ biometricId: employeeId });
+        if (!employee) return;
+        const today = new Date().toISOString().split("T")[0];
+        const year = new Date().getFullYear();
+        const entry = {
+            sopName: "C1 — Deadline Extension",
+            type: "C1",
+            folderName: taskTitle || taskId,
+            points: pts,
+            description: `Extension filed · −${pts} pts · ${taskTitle || taskId}`,
+            isC1: true, bleachType: "debit", isCredit: false,
+            date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
+            taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+        };
+        if (!employee.sopPoints) employee.sopPoints = [];
+        const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);
+        if (yearIndex >= 0) {
+            employee.sopPoints[yearIndex].bleaches.push(entry);
+            employee.sopPoints[yearIndex].totalDeducted = +(employee.sopPoints[yearIndex].totalDeducted + pts).toFixed(2);
+        } else {
+            employee.sopPoints.push({ year, totalDeducted: pts, bleaches: [entry] });
+        }
+        await employee.save();
+        console.log(`[C1 extension] Wrote −${pts} pts for ${employeeId} on task ${taskId}`);
     } catch (e) {
         console.error("[writeExtensionDeduction]", e.message);
     }
