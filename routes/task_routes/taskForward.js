@@ -1394,11 +1394,19 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     // Zone 3 (70%+)   : penalty applies (−0.2 C1 deduction)
     // If etcHours not set, fall back to deadlineWindowSecs elapsed %
     if (elapsedPercent === 0 && task.deadlineWindowSecs > 0) {
-      const _workedMs = task.startedAt
-        ? Date.now() - new Date(task.startedAt).getTime()
-        : 0;
+      let _startMs = 0;
+      if (task.startedAt) {
+        // Handle both Firestore Timestamp object and ISO string
+        _startMs = task.startedAt._seconds
+          ? task.startedAt._seconds * 1000
+          : task.startedAt.seconds
+            ? task.startedAt.seconds * 1000
+            : new Date(task.startedAt).getTime();
+      }
+      const _workedMs = _startMs > 0 ? Date.now() - _startMs : 0;
       elapsedPercent = Math.min(100, +(((_workedMs / 1000) / task.deadlineWindowSecs) * 100).toFixed(1));
     }
+    if (isNaN(elapsedPercent)) elapsedPercent = 0;
     isPenaltyWaived = elapsedPercent < 70;
     // ─────────────────────────────────────────────────────────────────────
 
