@@ -60,7 +60,7 @@ function calculateTaskScore(cfg, { deadlinesMissed = 0, extensionsFiled = 0, rew
     return +Math.max(0,
         Number(cfg.c1BaseScore) -
         (Number(cfg.c1DeadlineDeduction) * deadlinesMissed) -
-        (Number(cfg.c1ExtensionDeduction) * extensionsFiled) -
+        0 * extensionsFiled -
         (Number(cfg.c1ReworkDeduction) * reworksReceived) -
         (Number(cfg.c1RejectScore) * rejectionsReceived)
     ).toFixed(2);
