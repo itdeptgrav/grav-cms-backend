@@ -497,7 +497,7 @@ router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, as
 
 router.post("/group/:groupId/message", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const msg = await svc.sendGroupMessage({ groupId: req.params.groupId, senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, text: req.body.text, attachments: req.body.attachments || [] });
+    const msg = await svc.sendGroupMessage({ groupId: req.params.groupId, senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, text: req.body.text, attachments: req.body.attachments || [], replyTo: req.body.replyTo || null, clientMessageId: req.body.clientMessageId || null });
     res.status(201).json({ message: msg });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
