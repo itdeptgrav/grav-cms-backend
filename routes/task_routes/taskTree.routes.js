@@ -888,7 +888,10 @@ router.get("/task/:taskId/details", verifyCoworkToken, verifyEmployeeToken, asyn
 router.get("/task/list-hierarchy", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
         const { employeeId, role } = req.coworkUser;
-        const allTasks = await svc.listTasksWithHierarchy(employeeId, role);
+        const { cursor, pageSize } = req.query;
+        const { tasks: allTasks, nextCursor, hasMore } = await svc.listTasksWithHierarchy(
+            employeeId, role, cursor || null, Number(pageSize) || 100
+        );
 
         let filtered = allTasks;
 
@@ -911,7 +914,7 @@ router.get("/task/list-hierarchy", verifyCoworkToken, verifyEmployeeToken, async
         }
         // Employee: sees their own assigned tasks only (handled in svc.listTasksWithHierarchy)
 
-        res.json({ tasks: filtered });
+        res.json({ tasks: filtered, nextCursor, hasMore });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
