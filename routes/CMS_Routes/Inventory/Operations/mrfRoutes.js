@@ -542,4 +542,98 @@ router.post("/:id/items/:itemId/return", async (req, res) => {
   } catch (e) { console.error("[MRF return]", e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+
+router.get("/:id/stock-check", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id)
+      .populate(
+        "requestedFor",
+        "firstName middleName lastName name biometricId identityId department designation email phone"
+      )
+      .populate("approvedBy", "firstName lastName name")
+      .lean();
+ 
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
+ 
+    // Attach resolved full name
+    if (mrf.requestedFor && typeof mrf.requestedFor === "object") {
+      mrf.requestedFor._fullName = buildFullName(mrf.requestedFor);
+    }
+ 
+    // Mark overdue flag (reuse existing helper)
+    markOverdue([mrf]);
+ 
+    // ── Live stock lookup for each item ──────────────────────────────────
+    const rawItemIds = [
+      ...new Set(mrf.items.map(i => i.rawItem?.toString()).filter(Boolean)),
+    ];
+ 
+    const rawDocs = rawItemIds.length
+      ? await RawItem.find({ _id: { $in: rawItemIds } })
+          .select("name quantity unit customUnit variants minStock")
+          .lean()
+      : [];
+ 
+    const rawDocMap = new Map(rawDocs.map(r => [r._id.toString(), r]));
+ 
+    const itemsWithStock = mrf.items.map(item => {
+      const doc = rawDocMap.get(item.rawItem?.toString());
+      let available = null;
+      let minStock  = 0;
+ 
+      if (doc) {
+        // Variant-level stock first
+        if (item.variantId && Array.isArray(doc.variants)) {
+          const v = doc.variants.find(
+            vv => vv._id?.toString() === item.variantId?.toString()
+          );
+          if (v) {
+            available = v.quantity ?? 0;
+            minStock  = v.minStock ?? doc.minStock ?? 0;
+          }
+        }
+        // Fall back to product-level stock
+        if (available === null) {
+          available = doc.quantity ?? 0;
+          minStock  = doc.minStock ?? 0;
+        }
+      }
+ 
+      const requestedQty     = item.requestedQty || 0;
+      const issuedQty        = item.issuedQty    || 0;
+      const returnedQty      = item.returnedQty  || 0;
+      const shortfall        = available !== null ? Math.max(0, requestedQty - available) : null;
+      const remainingToIssue = Math.max(0, requestedQty - issuedQty);
+ 
+      let stockStatus = "unknown";
+      if (available !== null) {
+        if (available <= 0)              stockStatus = "out_of_stock";
+        else if (shortfall > 0)          stockStatus = "shortage";
+        else if (available - requestedQty <= minStock) stockStatus = "low";
+        else                             stockStatus = "ok";
+      }
+ 
+      return {
+        ...item,
+        // Live stock fields appended
+        available,
+        shortfall,
+        minStock,
+        stockStatus,
+        remainingToIssue,
+        returnedQty,
+      };
+    });
+ 
+    return res.json({
+      success: true,
+      mrf,
+      itemsWithStock,
+    });
+  } catch (err) {
+    console.error("MRF stock-check error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;
