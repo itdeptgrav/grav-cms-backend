@@ -701,7 +701,7 @@ async function getTaskDailyReports(taskId) {
 // ═════════════════════════════════════════════════════════
 //  9. LIST TASKS WITH HIERARCHY (for task list page)
 // ═════════════════════════════════════════════════════════
-async function listTasksWithHierarchy(employeeId, role) {
+async function listTasksWithHierarchy(employeeId, role, cursorMs = null, pageSize = 100) {
   // ── VISIBILITY RULES ──────────────────────────────────────────────────────
   // CEO    : sees tasks they created (assignedBy === CEO) + tasks assigned TO them by TL/others.
   //          TL-created subtasks under CEO's tasks are visible when CEO is an assignee.
@@ -709,9 +709,10 @@ async function listTasksWithHierarchy(employeeId, role) {
   // Employee: sees ONLY tasks directly assigned to them (assigneeIds contains them).
   //           No walkUp — employees must not see parent tasks they weren't assigned to.
   // ─────────────────────────────────────────────────────────────────────────
+  // NOTE: CEO and TL branches were identical (same two queries) — merged below.
 
   const seen = new Set();
-  const tasks = [];
+  let tasks = [];
 
   const addDoc = (d) => {
     if (!seen.has(d.id)) {
@@ -720,29 +721,34 @@ async function listTasksWithHierarchy(employeeId, role) {
     }
   };
 
-  if (role === "ceo") {
-    // CEO: tasks they created (assignedBy === CEO) + tasks assigned TO them by TL/others
+  // Bounded, cursor-aware — this is the query that scales with an employee's
+  // TOTAL historical task count if left unbounded. Each source is capped at
+  // pageSize, merged, re-sorted by updatedAt desc, then truncated to one page.
+  const cursorDate = cursorMs ? new Date(Number(cursorMs)) : null;
+  const roleQuery = (field, op, value) => {
+    let q = db.collection("cowork_tasks").where(field, op, value)
+      .orderBy("updatedAt", "desc").limit(pageSize);
+    if (cursorDate) q = q.startAfter(cursorDate);
+    return q;
+  };
+
+  if (role === "ceo" || role === "tl") {
     const [snap1, snap2] = await Promise.all([
-      db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get(),
-      db.collection("cowork_tasks").where("assigneeIds", "array-contains", employeeId).get(),
+      roleQuery("assignedBy", "==", employeeId).get(),
+      roleQuery("assigneeIds", "array-contains", employeeId).get(),
     ]);
     [...snap1.docs, ...snap2.docs].forEach(addDoc);
-
-  } else if (role === "tl") {
-    // TL: tasks they created + tasks assigned to them
-    const [snap1, snap2] = await Promise.all([
-      db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get(),
-      db.collection("cowork_tasks").where("assigneeIds", "array-contains", employeeId).get(),
-    ]);
-    [...snap1.docs, ...snap2.docs].forEach(addDoc);
-
   } else {
     // Employee: ONLY tasks directly assigned to them
-    const snap = await db.collection("cowork_tasks")
-      .where("assigneeIds", "array-contains", employeeId)
-      .get();
+    const snap = await roleQuery("assigneeIds", "array-contains", employeeId).get();
     snap.docs.forEach(addDoc);
   }
+
+  const updatedMs = (t) => t.updatedAt?.toMillis ? t.updatedAt.toMillis() : new Date(t.updatedAt || 0).getTime();
+  tasks.sort((a, b) => updatedMs(b) - updatedMs(a));
+  const hasMore = tasks.length > pageSize;
+  tasks = tasks.slice(0, pageSize);
+  const nextCursor = tasks.length ? updatedMs(tasks[tasks.length - 1]) : null;
 
   // ── Self-assigned tasks: approver visibility ──────────────────────────────
   // NO try/catch — let errors surface so we can see what's failing
@@ -830,7 +836,7 @@ async function listTasksWithHierarchy(employeeId, role) {
   }
   // Employee: no walks — they only see exactly what was assigned to them
 
-  return tasks.map(t => ({
+  const mappedTasks = tasks.map(t => ({
     ...t,
     taskId: t.taskId || t.id,
     isFolder: t.isFolder || false,
@@ -847,6 +853,8 @@ async function listTasksWithHierarchy(employeeId, role) {
     const order = { overdue: 0, near: 1, safe: 2, none: 3 };
     return (order[a.deadlineStatus] ?? 3) - (order[b.deadlineStatus] ?? 3);
   });
+
+  return { tasks: mappedTasks, nextCursor, hasMore };
 }
 
 // ═════════════════════════════════════════════════════════

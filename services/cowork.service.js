@@ -767,8 +767,8 @@ async function listTasks(employeeId, role) {
 
   if (role === "ceo") {
     // CEO sees tasks they created OR tasks assigned to them (by TL etc.)
-    const ceoSnap1 = await db.collection("cowork_tasks").where("assignedBy", "==", employeeId).get();
-    const ceoSnap2 = await db.collection("cowork_tasks").where("assigneeIds", "array-contains", employeeId).get();
+    const ceoSnap1 = await db.collection("cowork_tasks").where("assignedBy", "==", employeeId).orderBy("updatedAt", "desc").limit(100).get();
+    const ceoSnap2 = await db.collection("cowork_tasks").where("assigneeIds", "array-contains", employeeId).orderBy("updatedAt", "desc").limit(100).get();
     const ceoSeen = new Set();
     [...ceoSnap1.docs, ...ceoSnap2.docs].forEach(d => {
       if (!ceoSeen.has(d.id)) { ceoSeen.add(d.id); tasks.push({ id: d.id, ...d.data() }); }
@@ -776,10 +776,9 @@ async function listTasks(employeeId, role) {
   } else if (role === "tl") {
     // TL: tasks they created
     const snap1 = await db.collection("cowork_tasks")
-      .where("assignedBy", "==", employeeId).get();
-    // TL: tasks assigned to them
+      .where("assignedBy", "==", employeeId).orderBy("updatedAt", "desc").limit(100).get();
     const snap2 = await db.collection("cowork_tasks")
-      .where("assigneeIds", "array-contains", employeeId).get();
+      .where("assigneeIds", "array-contains", employeeId).orderBy("updatedAt", "desc").limit(100).get();
     const seen = new Set();
     [...snap1.docs, ...snap2.docs].forEach(d => {
       if (!seen.has(d.id)) { seen.add(d.id); tasks.push({ id: d.id, ...d.data() }); }
@@ -788,7 +787,7 @@ async function listTasks(employeeId, role) {
   } else {
     // Employee: ONLY tasks directly assigned to them
     const directSnap = await db.collection("cowork_tasks")
-      .where("assigneeIds", "array-contains", employeeId).get();
+      .where("assigneeIds", "array-contains", employeeId).orderBy("updatedAt", "desc").limit(100).get();
     tasks = directSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
     // Group tasks: tasks scoped to a group the employee is a member of
