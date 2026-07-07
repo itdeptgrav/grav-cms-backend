@@ -1081,6 +1081,11 @@ app.use(
 );
 
 app.use(
+  "/api/accountant/audit-notes",
+  require("./routes/Accountant_Routes/Acc_auditNotes"),
+);
+
+app.use(
   "/api/accountant/backup",
   require("./routes/Accountant_Routes/Acc_backup"),
 );
