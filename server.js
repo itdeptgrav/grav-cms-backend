@@ -30,6 +30,11 @@ const allowedOrigins = [
   "https://grav-cms-dncs.vercel.app",
   "https://crm.grav.in",
 ];
+const transcriptModule = require("./routes/task_routes/transcript.routes");
+
+const { instrumentFirestore, bandwidthMiddleware, bandwidthStatsHandler } = require("./middleware/firestoreBandwidth");
+const { db, admin } = require("./config/firebaseAdmin");
+instrumentFirestore(admin, db);
 
 app.use(
   cors({
@@ -411,7 +416,8 @@ io.on("connection", (socket) => {
 });
 
 // 1. At the top with your other requires:
-const transcriptModule = require("./routes/task_routes/transcript.routes");
+app.use(bandwidthMiddleware);
+app.get("/cowork/admin/bandwidth-stats", bandwidthStatsHandler);
 
 // 2. With your other app.use() route registrations:
 app.use("/cowork", transcriptModule.router);
