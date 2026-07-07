@@ -22,6 +22,22 @@ const { applyGstAutoState } = require("../../services/gstState.util");
 
 router.use(accountantAuth);
 
+// ── Viewer = strictly read-only across the whole chart-of-accounts surface ──
+// No create / edit / delete / reorder / seed / sync / post / transfer — nothing.
+// Only GET/HEAD pass. A viewer's one write path (adding an audit comment) lives
+// on its own route, so it is unaffected by this gate.
+router.use((req, res, next) => {
+  if (req.method === "GET" || req.method === "HEAD") return next();
+  if (req.user?.role === "viewer") {
+    return res.status(403).json({
+      success: false,
+      message:
+        "Viewers have read-only access. Add an audit comment if you need something changed.",
+    });
+  }
+  next();
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 // Helper — ensure the 28 default Tally groups exist for a company.
 //
