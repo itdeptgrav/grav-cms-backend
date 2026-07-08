@@ -223,9 +223,9 @@ function buildOperationsBreakdown(scans, opMasterMap) {
       ? scan.activeOps
       : typeof scan.activeOps === "string"
         ? scan.activeOps
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
         : [];
     for (const code of ops) {
       if (!buckets[code]) buckets[code] = [];
@@ -308,7 +308,7 @@ async function loadOpMaster() {
       const c = op.operationCode || "";
       if (c) map.set(c, op);
     });
-  } catch (_) {}
+  } catch (_) { }
   return map;
 }
 
@@ -556,9 +556,9 @@ router.get("/live", ceoAuth, async (req, res) => {
             ? Date.now() - new Date(op.signInTime).getTime()
             : effectiveSignOut
               ? Math.min(
-                  new Date(effectiveSignOut) - new Date(op.signInTime),
-                  14 * 3600 * 1000,
-                )
+                new Date(effectiveSignOut) - new Date(op.signInTime),
+                14 * 3600 * 1000,
+              )
               : 0;
 
         opsData.push({
@@ -1119,8 +1119,8 @@ router.get("/operator-detail/:operatorId", ceoAuth, async (req, res) => {
       const stockItems2 =
         siIds2.size > 0
           ? await StockItem.find({ _id: { $in: [...siIds2] } })
-              .select("name genderCategory category images operations variants")
-              .lean()
+            .select("name genderCategory category images operations variants")
+            .lean()
           : [];
       const siMap2 = new Map(stockItems2.map((si) => [si._id.toString(), si]));
 
@@ -1241,15 +1241,15 @@ router.get("/operator-detail/:operatorId", ceoAuth, async (req, res) => {
       productBreakdown,
       attendance: attEntry
         ? {
-            inTime: attEntry.inTime,
-            finalOut: attEntry.finalOut,
-            lunchOut: attEntry.lunchOut,
-            lunchIn: attEntry.lunchIn,
-            teaOut: attEntry.teaOut,
-            teaIn: attEntry.teaIn,
-            netWorkMins: attEntry.netWorkMins,
-            status: attEntry.hrFinalStatus || attEntry.systemPrediction || null,
-          }
+          inTime: attEntry.inTime,
+          finalOut: attEntry.finalOut,
+          lunchOut: attEntry.lunchOut,
+          lunchIn: attEntry.lunchIn,
+          teaOut: attEntry.teaOut,
+          teaIn: attEntry.teaIn,
+          netWorkMins: attEntry.netWorkMins,
+          status: attEntry.hrFinalStatus || attEntry.systemPrediction || null,
+        }
         : null,
       previousDate,
     });
@@ -1303,10 +1303,10 @@ router.get("/compare-operators", ceoAuth, async (req, res) => {
         const raw = await resolveEmployeeThreeStep(opId, Employee);
         empData = raw
           ? {
-              name: `${raw.firstName || ""} ${raw.lastName || ""}`.trim(),
-              profilePhoto: raw.profilePhoto,
-              department: raw.department,
-            }
+            name: `${raw.firstName || ""} ${raw.lastName || ""}`.trim(),
+            profilePhoto: raw.profilePhoto,
+            department: raw.department,
+          }
           : { name: opId };
       }
 
@@ -1552,10 +1552,10 @@ router.get("/work-orders", ceoAuth, async (req, res) => {
         ? {}
         : status === "active"
           ? {
-              status: {
-                $in: ["in_progress", "scheduled", "ready_to_start", "planned"],
-              },
-            }
+            status: {
+              $in: ["in_progress", "scheduled", "ready_to_start", "planned"],
+            },
+          }
           : { status };
     const wos = await WorkOrder.find(q)
       .select(
@@ -1572,10 +1572,10 @@ router.get("/work-orders", ceoAuth, async (req, res) => {
         completionPct:
           w.quantity > 0
             ? Math.round(
-                ((w.productionCompletion?.overallCompletedQuantity || 0) /
-                  w.quantity) *
-                  100,
-              )
+              ((w.productionCompletion?.overallCompletedQuantity || 0) /
+                w.quantity) *
+              100,
+            )
             : 0,
         completedUnits: w.productionCompletion?.overallCompletedQuantity || 0,
         operationsCount: w.operations?.length || 0,
@@ -1686,13 +1686,13 @@ router.get("/products", ceoAuth, async (req, res) => {
     const [stockItems, mos] = await Promise.all([
       siIds.size > 0
         ? StockItem.find({ _id: { $in: [...siIds] } })
-            .select("name genderCategory category images variants")
-            .lean()
+          .select("name genderCategory category images variants")
+          .lean()
         : [],
       moIds.size > 0
         ? CustomerRequest.find({ _id: { $in: [...moIds] } })
-            .select("requestId customerInfo requestType status")
-            .lean()
+          .select("requestId customerInfo requestType status")
+          .lean()
         : [],
     ]);
     const siMap = new Map(stockItems.map((si) => [si._id.toString(), si]));
@@ -1795,12 +1795,12 @@ router.get("/machine-detail/:machineId", ceoAuth, async (req, res) => {
 
     const machRef = machInfo
       ? {
-          id: machineId,
-          name: machInfo.name,
-          serial: machInfo.serialNumber,
-          type: machInfo.type,
-          location: machInfo.location,
-        }
+        id: machineId,
+        name: machInfo.name,
+        serial: machInfo.serialNumber,
+        type: machInfo.type,
+        location: machInfo.location,
+      }
       : { id: machineId, name: "Unknown" };
 
     if (!trackingDoc)
@@ -1839,10 +1839,10 @@ router.get("/machine-detail/:machineId", ceoAuth, async (req, res) => {
     const allWOs =
       allWoIds.size > 0
         ? await WorkOrder.find({})
-            .select(
-              "_id workOrderNumber stockItemId stockItemName variantAttributes customerRequestId quantity status",
-            )
-            .lean()
+          .select(
+            "_id workOrderNumber stockItemId stockItemName variantAttributes customerRequestId quantity status",
+          )
+          .lean()
         : [];
     const woShortMap = new Map();
     allWOs.forEach((wo) => woShortMap.set(wo._id.toString().slice(-8), wo));
@@ -1859,13 +1859,13 @@ router.get("/machine-detail/:machineId", ceoAuth, async (req, res) => {
     const [stockItems2, mos2] = await Promise.all([
       siIds2.size > 0
         ? StockItem.find({ _id: { $in: [...siIds2] } })
-            .select("name genderCategory category images variants")
-            .lean()
+          .select("name genderCategory category images variants")
+          .lean()
         : [],
       moIds2.size > 0
         ? CustomerRequest.find({ _id: { $in: [...moIds2] } })
-            .select("requestId customerInfo requestType")
-            .lean()
+          .select("requestId customerInfo requestType")
+          .lean()
         : [],
     ]);
     const siMap2 = new Map(stockItems2.map((si) => [si._id.toString(), si]));
@@ -1880,7 +1880,7 @@ router.get("/machine-detail/:machineId", ceoAuth, async (req, res) => {
               (wa) =>
                 wa.name?.toLowerCase() === a.name?.toLowerCase() &&
                 String(wa.value).toLowerCase() ===
-                  String(a.value).toLowerCase(),
+                String(a.value).toLowerCase(),
             ),
           ),
         );
@@ -2013,14 +2013,14 @@ router.get("/machine-detail/:machineId", ceoAuth, async (req, res) => {
         ? 0
         : isSignedIn
           ? Math.min(
-              Date.now() - new Date(op.signInTime).getTime(),
-              14 * 3600 * 1000,
-            )
+            Date.now() - new Date(op.signInTime).getTime(),
+            14 * 3600 * 1000,
+          )
           : effectiveSignOut
             ? Math.min(
-                new Date(effectiveSignOut) - new Date(op.signInTime),
-                14 * 3600 * 1000,
-              )
+              new Date(effectiveSignOut) - new Date(op.signInTime),
+              14 * 3600 * 1000,
+            )
             : 0;
       const { status: attStatus, breakInfo } = getAttStatus(opId);
 
@@ -2061,7 +2061,7 @@ router.get("/machine-detail/:machineId", ceoAuth, async (req, res) => {
           opMM,
         );
       }
-    } catch (_) {}
+    } catch (_) { }
 
     res.json({
       success: true,
@@ -2108,7 +2108,7 @@ router.get("/floor-data", ceoAuth, async (req, res) => {
           canvasState: layout.canvasState || { zoom: 1, panX: 0, panY: 0 },
         };
       }
-    } catch (_) {}
+    } catch (_) { }
 
     // Load tracking data (same logic as /live, but lightweight)
     const [doc, allMachines, attendanceDoc, allEmps] = await Promise.all([
@@ -2224,11 +2224,11 @@ router.get("/floor-data", ceoAuth, async (req, res) => {
         status: currOpId ? "busy" : machScans > 0 ? "used_today" : "free",
         currentOperator: currOpId
           ? {
-              identityId: currOpId,
-              name: currActive?.name || currEmp?.name || currOpId,
-              profilePhoto:
-                currActive?.profilePhoto || currEmp?.profilePhoto || null,
-            }
+            identityId: currOpId,
+            name: currActive?.name || currEmp?.name || currOpId,
+            profilePhoto:
+              currActive?.profilePhoto || currEmp?.profilePhoto || null,
+          }
           : null,
         operatorSummaries: Array.from(opSummaryMap.values()).sort(
           (a, b) => (a.isActiveNow ? -1 : 1) - (b.isActiveNow ? -1 : 1),
@@ -2311,7 +2311,7 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
           .lean(),
         WorkOrder.find({})
           .select(
-            "_id workOrderNumber stockItemId stockItemName variantAttributes quantity status",
+            "_id workOrderNumber stockItemId stockItemName variantAttributes quantity status customerName customerId",
           )
           .lean(),
       ]);
@@ -2336,9 +2336,32 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
     };
 
     const machMap = new Map(allMachinesRaw.map((m) => [m._id.toString(), m]));
-    const woByShortId = new Map(
-      allWOs.map((wo) => [wo._id.toString().slice(-8), wo]),
-    );
+    const woByShortId = new Map(allWOs.map(wo => [wo._id.toString().slice(-8), wo]));
+
+    // ── Customer name: live Customer → WO snapshot → CustomerRequest → null ──
+    const woList = [...woByShortId.values()];
+    const custIds = [...new Set(woList.map(w => w.customerId?.toString()).filter(Boolean))];
+    const crIds = [...new Set(woList.map(w => w.customerRequestId?.toString()).filter(Boolean))];
+    let custNameById = new Map(), crNameById = new Map();
+    try {
+      if (custIds.length) {
+        const Customer = require("mongoose").model("Customer");
+        const custs = await Customer.find({ _id: { $in: custIds } }).select("name").lean();
+        custNameById = new Map(custs.map(c => [c._id.toString(), c.name]));
+      }
+      if (crIds.length) {
+        const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+        const crs = await CustomerRequest.find({ _id: { $in: crIds } })
+          .select("customerInfo.name requestId").lean();
+        crNameById = new Map(crs.map(c => [c._id.toString(), c.customerInfo?.name || null]));
+      }
+    } catch (e) { console.error("[CEO] customer resolve:", e.message); }
+    const resolveCustomerName = (wo) =>
+      (wo?.customerId && custNameById.get(wo.customerId.toString()))
+      || wo?.customerName
+      || (wo?.customerRequestId && crNameById.get(wo.customerRequestId.toString()))
+      || null;
+
 
     // ── 3.  Attendance ─────────────────────────────────────────────────────
     const breakWindowMap = new Map(); // opId → [{ start, end, type }]
@@ -2380,8 +2403,8 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
     );
     const stockItems = siIds.size
       ? await StockItem.find({ _id: { $in: [...siIds] } })
-          .select("name genderCategory category images operations variants")
-          .lean()
+        .select("name genderCategory category images operations variants")
+        .lean()
       : [];
     const siMap = new Map(stockItems.map((si) => [si._id.toString(), si]));
 
@@ -2699,7 +2722,7 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
           const avgActual = stats?.avgSecs || null;
           const effPct =
             samSeconds && avgActual && avgActual > 0
-              ? Math.round((samSeconds / avgActual) * 100)
+              ? +((samSeconds / avgActual) * 100).toFixed(2)
               : null;
           return {
             opCode,
@@ -2727,7 +2750,7 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
               ...br,
               efficiencyPct:
                 samSeconds && br.avgSecs
-                  ? Math.round((samSeconds / br.avgSecs) * 100)
+                  ? +((samSeconds / br.avgSecs) * 100).toFixed(2)
                   : null,
             })),
           };
@@ -2826,6 +2849,7 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
       pg.wos.push({
         woShortId: shortId,
         workOrderNumber: wo.workOrderNumber || `WO-${shortId}`,
+        customerName: resolveCustomerName(wo),
         workOrderStatus: wo.status || "unknown",
         variantAttributes: wo.variantAttributes || [],
         totalQuantity: wo.quantity || 0,
@@ -3247,8 +3271,8 @@ router.get("/product-efficiency", ceoAuth, async (req, res) => {
     }
     const stockItems = stockItemIds.size
       ? await StockItem.find({ _id: { $in: [...stockItemIds] } })
-          .select("name genderCategory category images operations variants")
-          .lean()
+        .select("name genderCategory category images operations variants")
+        .lean()
       : [];
     const stockItemMap = new Map(
       stockItems.map((si) => [si._id.toString(), si]),
@@ -3377,7 +3401,7 @@ router.get("/product-efficiency", ceoAuth, async (req, res) => {
           const avgActual = stats?.avgSecs || null;
           const effPct =
             samSeconds && avgActual && avgActual > 0
-              ? Math.round((samSeconds / avgActual) * 100)
+              ? +((samSeconds / avgActual) * 100).toFixed(2)
               : null;
           return {
             opCode,
@@ -3397,7 +3421,7 @@ router.get("/product-efficiency", ceoAuth, async (req, res) => {
               ...br,
               efficiencyPct:
                 samSeconds && br.avgSecs
-                  ? Math.round((samSeconds / br.avgSecs) * 100)
+                  ? +((samSeconds / br.avgSecs) * 100).toFixed(2)
                   : null,
             })),
           };
@@ -3553,9 +3577,9 @@ router.get("/live-products", ceoAuth, async (req, res) => {
             const codes = Array.isArray(scan.activeOps)
               ? scan.activeOps
               : (scan.activeOps || "")
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean);
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean);
             best = {
               ts,
               operatorName: op.operatorName || "",
@@ -3590,8 +3614,8 @@ router.get("/live-products", ceoAuth, async (req, res) => {
     // WorkOrderNumber isn't the short id; the short id is the tail of the _id.
     // Match on the last 8 hex chars of _id (that's what your barcodes encode).
     const wos = await WorkOrder.find({})
-      .select("_id workOrderNumber stockItemId stockItemName variantAttributes")
-      .lean();
+      .select("_id workOrderNumber stockItemId stockItemName variantAttributes quantity status customerName customerId").lean();
+
 
     const woByShortId = new Map();
     for (const wo of wos) {
@@ -3610,8 +3634,8 @@ router.get("/live-products", ceoAuth, async (req, res) => {
 
     const stockItems = stockItemIds.length
       ? await StockItem.find({ _id: { $in: stockItemIds } })
-          .select("_id name images variants")
-          .lean()
+        .select("_id name images variants")
+        .lean()
       : [];
 
     const stockById = new Map(stockItems.map((s) => [s._id.toString(), s]));
@@ -3642,7 +3666,7 @@ router.get("/live-products", ceoAuth, async (req, res) => {
                 (wa) =>
                   wa.name?.toLowerCase() === a.name?.toLowerCase() &&
                   String(wa.value).toLowerCase() ===
-                    String(a.value).toLowerCase(),
+                  String(a.value).toLowerCase(),
               ),
             ),
           );

@@ -301,6 +301,61 @@ router.post("/save-inspection", async (req, res) => {
   }
 });
 
+// ─── GET /piece-operators ──────────────────────────────────────────────────────
+// On-demand: given a barcode, returns every operator + machine + scan time
+// from ProductionTracking. Used by the QC overview "Fetch Operator" button.
+router.get("/piece-operators", async (req, res) => {
+  try {
+    const { barcode } = req.query;
+    if (!barcode) return res.status(400).json({ success: false, message: "barcode required" });
+
+    const scans = await ProductionTracking.aggregate([
+      { $match: { "machines.operators.barcodeScans.barcodeId": barcode.trim() } },
+      { $unwind: "$machines" },
+      { $unwind: "$machines.operators" },
+      { $unwind: "$machines.operators.barcodeScans" },
+      { $match: { "machines.operators.barcodeScans.barcodeId": barcode.trim() } },
+      { $lookup: { from: "machines", localField: "machines.machineId", foreignField: "_id", as: "_m" } },
+      { $project: {
+        _id:          0,
+        operatorId:   "$machines.operators.operatorIdentityId",
+        operatorName: "$machines.operators.operatorName",
+        activeOps:    "$machines.operators.barcodeScans.activeOps",
+        timeStamp:    "$machines.operators.barcodeScans.timeStamp",
+        machineName:  { $arrayElemAt: ["$_m.name", 0] },
+      }},
+      { $sort: { timeStamp: 1 } },
+    ]);
+
+    // Resolve names from Employee if operatorName is blank in the tracking doc
+    const missingIds = [...new Set(
+      scans.filter(s => !s.operatorName && s.operatorId).map(s => s.operatorId)
+    )];
+    let empNameMap = new Map();
+    if (missingIds.length) {
+      const emps = await Employee.find({ identityId: { $in: missingIds } })
+        .select("identityId firstName middleName lastName").lean();
+      empNameMap = new Map(emps.map(e => [
+        e.identityId,
+        [e.firstName, e.middleName, e.lastName].filter(Boolean).join(" ").trim() || e.identityId,
+      ]));
+    }
+
+    const operators = scans.map(s => ({
+      operatorId:   s.operatorId,
+      operatorName: s.operatorName || empNameMap.get(s.operatorId) || s.operatorId || "Unknown",
+      activeOps:    Array.isArray(s.activeOps) ? s.activeOps : [],
+      timeStamp:    s.timeStamp,
+      machineName:  s.machineName || "—",
+    }));
+
+    res.json({ success: true, barcode, operators });
+  } catch (err) {
+    console.error("[QC piece-operators]", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ─── GET /trend  ───────────────────────────────────────────────────────────────
 // Returns per-day DPH stats for the past N days (used by the overview trend chart)
 // Must be defined BEFORE /inspections to avoid any path conflicts

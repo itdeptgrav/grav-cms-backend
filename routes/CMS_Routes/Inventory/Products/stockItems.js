@@ -61,83 +61,75 @@ async function buildUnitConversionsMap() {
   }
 }
 
-// REPLACE the entire processVariantRawItems function with this:
 async function processVariantRawItems(rawItemsInput) {
   const processedRawItems = [];
-  if (!rawItemsInput || !Array.isArray(rawItemsInput)) return processedRawItems;
+  if (!rawItemsInput || !Array.isArray(rawItemsInput) || !rawItemsInput.length) return processedRawItems;
 
-  for (const rawItem of rawItemsInput) {
-    if (!rawItem.rawItemId || !rawItem.quantity || rawItem.quantity <= 0) continue;
+  const validInputs = rawItemsInput.filter(ri => ri.rawItemId && parseFloat(ri.quantity) > 0);
+  if (!validInputs.length) return processedRawItems;
 
-    const rawItemData = await RawItem.findById(rawItem.rawItemId)
-      .select("name sku unit customUnit variants stockTransactions sellingPrice");
+  // ── ONE batch query instead of N sequential findById calls ───────────────
+  const uniqueIds = [...new Set(validInputs.map(ri => ri.rawItemId.toString()))];
+  const rawDocs = await RawItem.find({ _id: { $in: uniqueIds } })
+    .select("name sku unit customUnit variants sellingPrice stockTransactions")
+    .lean();
+  const rawDocMap = new Map(rawDocs.map(d => [d._id.toString(), d]));
+
+  for (const rawItem of validInputs) {
+    const rawItemData = rawDocMap.get(rawItem.rawItemId.toString());
     if (!rawItemData) continue;
 
-    let unitCost = 0;
-    let variantCombination = [];
-    let variantId = rawItemData._id;
+    const registeredUnit = rawItemData.customUnit || rawItemData.unit || "Unit";
+    const chosenUnit  = rawItem.unit     || registeredUnit;
+    const baseUnit    = rawItem.baseUnit || registeredUnit;
 
-    if (rawItem.variantId) {
-      const rawItemVariant = rawItemData.variants.id(rawItem.variantId);
-      if (rawItemVariant) {
-        variantCombination = rawItemVariant.combination || [];
-        variantId = rawItem.variantId;
+    // ── Honour frontend-provided unitCost — user already confirmed the price
+    const frontendCost = rawItem.unitCost != null ? parseFloat(rawItem.unitCost) : 0;
+    let finalUnitCost = frontendCost > 0 ? frontendCost : 0;
 
-        // ── 1. Try vendor alias prices on this variant ──────────────────
-        const aliasPrices = (rawItemVariant.vendorNicknames || [])
-          .map(vn => vn.price || 0)
-          .filter(p => p > 0);
-        if (aliasPrices.length > 0) {
-          unitCost = aliasPrices.reduce((s, p) => s + p, 0) / aliasPrices.length;
-        }
-
-        // ── 2. Fall back to variant stock transactions ───────────────────
-        if (unitCost === 0 && rawItemData.stockTransactions?.length > 0) {
-          const variantTxs = rawItemData.stockTransactions
-            .filter(tx =>
-              tx.variantId?.toString() === rawItem.variantId &&
-              (tx.type === "ADD" || tx.type === "PURCHASE_ORDER" || tx.type === "VARIANT_ADD")
-            )
-            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-          if (variantTxs.length > 0) unitCost = variantTxs[0].unitPrice || 0;
+    // ── Only derive from DB when frontend sent nothing / zero ─────────────
+    if (finalUnitCost === 0) {
+      if (rawItem.variantId) {
+        const v = (rawItemData.variants || []).find(vv => vv._id?.toString() === rawItem.variantId.toString());
+        if (v) {
+          const aliasPrices = (v.vendorNicknames || []).map(vn => vn.price || 0).filter(p => p > 0);
+          if (aliasPrices.length) finalUnitCost = aliasPrices.reduce((s, p) => s + p, 0) / aliasPrices.length;
+          if (finalUnitCost === 0) {
+            const tx = (rawItemData.stockTransactions || [])
+              .filter(t => t.variantId?.toString() === rawItem.variantId.toString() && ["ADD","PURCHASE_ORDER","VARIANT_ADD"].includes(t.type))
+              .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+            if (tx) finalUnitCost = tx.unitPrice || 0;
+          }
         }
       }
+      if (finalUnitCost === 0) {
+        const tx = (rawItemData.stockTransactions || [])
+          .filter(t => ["ADD","PURCHASE_ORDER"].includes(t.type))
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+        if (tx) finalUnitCost = tx.unitPrice || 0;
+      }
+      if (finalUnitCost === 0 && rawItemData.sellingPrice) finalUnitCost = rawItemData.sellingPrice * 0.8;
     }
 
-    // ── 3. Fall back to item-level stock transactions ──────────────────
-    if (unitCost === 0 && rawItemData.stockTransactions?.length > 0) {
-      const purchaseTxs = rawItemData.stockTransactions
-        .filter(tx => tx.type === "ADD" || tx.type === "PURCHASE_ORDER")
-        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-      if (purchaseTxs.length > 0) unitCost = purchaseTxs[0].unitPrice || 0;
+    let variantCombination = rawItem.variantCombination || [];
+    if (!variantCombination.length && rawItem.variantId) {
+      const v = (rawItemData.variants || []).find(vv => vv._id?.toString() === rawItem.variantId.toString());
+      if (v) variantCombination = v.combination || [];
     }
-
-    // ── 4. Last resort: selling price haircut ────────────────────────────
-    if (unitCost === 0 && rawItemData.sellingPrice) unitCost = rawItemData.sellingPrice * 0.8;
-
-    const registeredUnit = rawItemData.customUnit || rawItemData.unit || "Unit";
-    const chosenUnit = rawItem.unit || registeredUnit;
-    const baseUnit = rawItem.baseUnit || registeredUnit;
-
-    // If frontend sent an explicit unitCost (manually edited), honour it over DB-derived price
-    const finalUnitCost = (rawItem.unitCost != null && parseFloat(rawItem.unitCost) > 0)
-      ? parseFloat(rawItem.unitCost)
-      : unitCost;
 
     processedRawItems.push({
-      rawItemId: rawItemData._id,
-      rawItemName: rawItemData.name,
-      rawItemSku: rawItemData.sku,
-      variantId,
+      rawItemId:          rawItemData._id,
+      rawItemName:        rawItemData.name,
+      rawItemSku:         rawItemData.sku,
+      variantId:          rawItem.variantId || rawItemData._id,
       variantCombination,
-      quantity: parseFloat(rawItem.quantity),
-      unit: chosenUnit,
+      quantity:           parseFloat(rawItem.quantity),
+      unit:               chosenUnit,
       baseUnit,
-      unitCost: finalUnitCost,
-      totalCost: parseFloat(rawItem.quantity) * finalUnitCost
+      unitCost:           finalUnitCost,
+      totalCost:          parseFloat(rawItem.quantity) * finalUnitCost,
     });
   }
-
   return processedRawItems;
 }
 
