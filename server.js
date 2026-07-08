@@ -907,6 +907,10 @@ app.use(
   RegisteredDepartments,
 );
 
+// server.js
+const sizeConfigRoutes = require("./routes/CMS_Routes/Inventory/Configurations/sizeConfigRoutes")
+app.use("/api/cms/size-configs", sizeConfigRoutes)
+
 // Measurement Routes
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
 app.use("/api/cms/measurements", measurementRoutes);
