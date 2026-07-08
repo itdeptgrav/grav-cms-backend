@@ -47,10 +47,17 @@ async function notifyAuditNote(note, action, actor) {
     try {
       const fb = require("../../config/firebaseAdmin");
       messaging = fb.messaging || null;
-    } catch {
+    } catch (fbErr) {
+      console.warn(
+        "[audit-notes] Firebase Admin unavailable — push disabled:",
+        fbErr.message,
+      );
       return;
     }
-    if (!messaging) return;
+    if (!messaging) {
+      console.warn("[audit-notes] Firebase messaging is null — push disabled");
+      return;
+    }
 
     // Decide who to notify based on the action
     // Notify EVERY active user in the org EXCEPT the person who just acted.
@@ -66,6 +73,17 @@ async function notifyAuditNote(note, action, actor) {
     const recipients = allUsers.filter(
       (u) => String(u._id) !== String(actor.userId),
     );
+    console.log(
+      `[audit-notes] ${action} by ${actor.userName} — ${allUsers.length} total users, ${recipients.length} recipients`,
+    );
+    recipients.forEach((u) => {
+      const tkCount = Array.isArray(u.fcmTokens)
+        ? u.fcmTokens.filter(Boolean).length
+        : 0;
+      console.log(
+        `[audit-notes]   → ${u.name} (${u.email}): ${tkCount} token(s)`,
+      );
+    });
 
     const ACTION_LABELS = {
       created: "New audit note",
@@ -106,8 +124,12 @@ async function notifyAuditNote(note, action, actor) {
               fcmOptions: { link: url },
             },
           });
-        } catch {
-          /* stale token — non-fatal */
+          console.log(`[audit-notes]   ✓ push sent to ${user.name}`);
+        } catch (pushErr) {
+          console.warn(
+            `[audit-notes]   ✗ push failed for ${user.name}:`,
+            pushErr.message,
+          );
         }
       }
     }
