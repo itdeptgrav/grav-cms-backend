@@ -612,6 +612,8 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
                 existing.salesPrice = parseFloat(variant.salesPrice) || stockItem.baseSalesPrice || 0;
                 existing.barcode = variant.barcode || existing.barcode || "";
                 existing.images = variant.images || existing.images || [];
+                // ✅ FIX: NEVER overwrite rawItems from variants tab — raw-items tab owns this field
+                // existing.rawItems is intentionally left untouched
                 return existing;
               }
 
@@ -625,7 +627,7 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
                 salesPrice: parseFloat(variant.salesPrice) || stockItem.baseSalesPrice || 0,
                 barcode: variant.barcode || "",
                 images: variant.images || [],
-                rawItems: []
+                rawItems: [] // new variants have no raw items yet — correct
               };
             })
           );
@@ -940,7 +942,11 @@ router.put("/:id", async (req, res) => {
             existing.salesPrice = parseFloat(variant.salesPrice) || stockItem.baseSalesPrice || 0;
             existing.barcode = variant.barcode || existing.barcode || "";
             existing.images = variant.images || stockItem.images || existing.images || [];
-            existing.rawItems = processedRawItems;
+            // ✅ FIX: Only overwrite rawItems if the caller explicitly sent them
+            if (Array.isArray(variant.rawItems) && variant.rawItems.length > 0) {
+              existing.rawItems = processedRawItems;
+            }
+            // else: preserve existing rawItems from DB untouched
             return existing;
           }
 
