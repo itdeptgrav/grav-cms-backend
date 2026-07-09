@@ -73,11 +73,11 @@ router.post("/fetch-order", async (req, res) => {
       },
       manufacturingOrder: cr
         ? {
-            _id: cr._id,
-            moNumber: `MO-${cr.requestId}`,
-            customerName: cr.customerInfo?.name,
-            requestType: cr.requestType,
-          }
+          _id: cr._id,
+          moNumber: `MO-${cr.requestId}`,
+          customerName: cr.customerInfo?.name,
+          requestType: cr.requestType,
+        }
         : null,
       isMeasurement: cr?.requestType === "measurement_conversion",
     });
@@ -116,27 +116,46 @@ router.post("/mark-done", async (req, res) => {
       });
     }
 
+
+    // ── Reject barcodes already recorded on any previous day/session ──
+    const validSet = new Set(validBarcodes);
+    const dupDocs = await ProductionCompletionScanRecord.find(
+      { "scans.barcodeId": { $in: validBarcodes } }
+    ).select("scans.barcodeId").lean();
+    const alreadySet = new Set();
+    for (const d of dupDocs)
+      for (const s of d.scans || [])
+        if (validSet.has(s.barcodeId)) alreadySet.add(s.barcodeId);
+
+    const alreadyScannedBarcodes = [...alreadySet];
+    const newBarcodes = validBarcodes.filter((bc) => !alreadySet.has(bc));
+
     const now = new Date();
     const dateBucket = getISTMidnight(now);
 
-    const scanEntries = validBarcodes.map((bc) => ({
-      barcodeId: bc,
-      scannedAt: now,
-      scannedBy: scannedBy || "",
-    }));
-
-    await ProductionCompletionScanRecord.findOneAndUpdate(
-      { date: dateBucket },
-      { $push: { scans: { $each: scanEntries } }, $setOnInsert: { date: dateBucket } },
-      { upsert: true, new: true }
-    );
+    if (newBarcodes.length > 0) {
+      const scanEntries = newBarcodes.map((bc) => ({
+        barcodeId: bc,
+        scannedAt: now,
+        scannedBy: scannedBy || "",
+      }));
+      await ProductionCompletionScanRecord.findOneAndUpdate(
+        { date: dateBucket },
+        { $push: { scans: { $each: scanEntries } }, $setOnInsert: { date: dateBucket } },
+        { upsert: true, new: true }
+      );
+    }
 
     return res.json({
       success: true,
-      message: `${validBarcodes.length} scan${validBarcodes.length !== 1 ? "s" : ""} recorded`,
-      totalScansSaved: validBarcodes.length,
+      message: newBarcodes.length > 0
+        ? `${newBarcodes.length} scan${newBarcodes.length !== 1 ? "s" : ""} recorded${alreadyScannedBarcodes.length ? `, ${alreadyScannedBarcodes.length} skipped (already scanned earlier)` : ""}`
+        : `All ${alreadyScannedBarcodes.length} barcode${alreadyScannedBarcodes.length !== 1 ? "s were" : " was"} already scanned earlier — nothing new recorded`,
+      totalScansSaved: newBarcodes.length,
+      alreadyScannedBarcodes,
       invalidBarcodes,
     });
+
   } catch (err) {
     console.error("mark-done error:", err);
     res.status(500).json({ success: false, message: "Server error", error: err.message });
@@ -222,9 +241,13 @@ router.get("/overview", async (req, res) => {
           stockItemName: wo.stockItemName || "—",
           variantAttributes: wo.variantAttributes || [],
           totalUnits: 0,
+          unitBarcodes: [],
         });
       }
-      entry.products.get(productKey).totalUnits += unitSet.size;
+      const prodEntry = entry.products.get(productKey);
+      prodEntry.totalUnits += unitSet.size;
+      for (const u of [...unitSet].sort((a, b) => a - b))
+        prodEntry.unitBarcodes.push(`WO-${shortId}-${String(u).padStart(3, "0")}`);
     }
 
     const stockItems = await StockItem.find({
@@ -268,6 +291,7 @@ router.get("/overview", async (req, res) => {
               image,
               variantAttributes: p.variantAttributes,
               totalUnits: p.totalUnits,
+              unitBarcodes: p.unitBarcodes || [],
             };
           })
           .sort((a, b) => b.totalUnits - a.totalUnits);
