@@ -208,4 +208,4 @@ async function notifyApprovalEvent(doc, event) {
   }
 }
 
-module.exports = { notifyApprovalEvent };
+module.exports = { notifyApprovalEvent, sendPush, getMessaging };
