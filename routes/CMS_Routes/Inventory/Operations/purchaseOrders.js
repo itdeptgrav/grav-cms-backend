@@ -1198,7 +1198,12 @@ router.post("/:id/receive", async (req, res) => {
         qtyInPoUnit,
         poUnit,
         unitPrice,
+        surplusQty,
+        isSurplus,
       } = u;
+
+      // Effective qty hitting stock = PO portion + any surplus
+      const effectiveQtyInPoUnit = qtyInPoUnit + (surplusQty || 0);
 
       const rawItem = await RawItem.findById(rawItemId);
       if (!rawItem) {
@@ -1233,8 +1238,7 @@ router.post("/:id/receive", async (req, res) => {
               : "PENDING";
       }
 
-      // Effective qty to add to stock = normal received + surplus
-      const effectiveQtyInPoUnit = qtyInPoUnit + (u.surplusQty || 0);
+      
 
       const previousBaseQty = rawItem.quantity;
 
