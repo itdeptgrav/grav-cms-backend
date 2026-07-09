@@ -34,6 +34,22 @@ const {
 const router = express.Router();
 router.use(accountantAuth);
 
+// ─── Viewer write-gate ────────────────────────────────────────────────────────
+// Viewers (role "viewer" / no canEdit) get full read + export, but must NOT be
+// able to upload statements, match/unmatch, reconcile, clear, change ledger or
+// delete. Applied to every mutating route below.
+function blockViewerWrite(req, res, next) {
+  const canEdit = req.user?.permissions?.canEdit;
+  if (!canEdit) {
+    return res.status(403).json({
+      success: false,
+      message:
+        "Read-only access. You don't have permission to modify bank reconciliation.",
+    });
+  }
+  next();
+}
+
 // ─── Multer ──────────────────────────────────────────────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -584,168 +600,173 @@ async function buildLedgerSide(session) {
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /upload
 // ═════════════════════════════════════════════════════════════════════════════
-router.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file)
-      return res
-        .status(400)
-        .json({ success: false, message: "No file uploaded" });
-    const { companyId, bankLedgerId, periodMonth, periodYear } = req.body;
-    if (!companyId)
-      return res
-        .status(400)
-        .json({ success: false, message: "companyId required" });
-
-    const month = parseInt(periodMonth, 10);
-    const year = parseInt(periodYear, 10);
-    if (!month || !year || month < 1 || month > 12)
-      return res.status(400).json({
-        success: false,
-        message: "periodMonth (1-12) and periodYear are required",
-      });
-
-    let parsed;
+router.post(
+  "/upload",
+  upload.single("file"),
+  blockViewerWrite,
+  async (req, res) => {
     try {
-      parsed = parseBankStatement(req.file.buffer, req.file.originalname);
-    } catch (e) {
-      return res.status(400).json({ success: false, message: e.message });
-    }
+      if (!req.file)
+        return res
+          .status(400)
+          .json({ success: false, message: "No file uploaded" });
+      const { companyId, bankLedgerId, periodMonth, periodYear } = req.body;
+      if (!companyId)
+        return res
+          .status(400)
+          .json({ success: false, message: "companyId required" });
 
-    // Filter transactions to the selected IST period
-    const periodStart = istStartOfMonth(year, month);
-    const periodEnd = istEndOfMonth(year, month);
-    const periodTxns = parsed.transactions.filter((t) => {
-      const d = t.valueDate || t.postDate;
-      return d && d >= periodStart && d <= periodEnd;
-    });
+      const month = parseInt(periodMonth, 10);
+      const year = parseInt(periodYear, 10);
+      if (!month || !year || month < 1 || month > 12)
+        return res.status(400).json({
+          success: false,
+          message: "periodMonth (1-12) and periodYear are required",
+        });
 
-    if (periodTxns.length === 0)
-      return res.status(400).json({
-        success: false,
-        message: `No transactions found for ${MONTH_NAMES[month - 1]} ${year} in the uploaded file. The file has ${parsed.transactions.length} total transactions — check that the correct month is selected.`,
+      let parsed;
+      try {
+        parsed = parseBankStatement(req.file.buffer, req.file.originalname);
+      } catch (e) {
+        return res.status(400).json({ success: false, message: e.message });
+      }
+
+      // Filter transactions to the selected IST period
+      const periodStart = istStartOfMonth(year, month);
+      const periodEnd = istEndOfMonth(year, month);
+      const periodTxns = parsed.transactions.filter((t) => {
+        const d = t.valueDate || t.postDate;
+        return d && d >= periodStart && d <= periodEnd;
       });
 
-    const ledgerName = bankLedgerId
-      ? (await Acc_Ledger.findById(bankLedgerId).select("name").lean())?.name ||
-        ""
-      : "";
-    let matchedTxns = await autoMatch(companyId, bankLedgerId, periodTxns);
+      if (periodTxns.length === 0)
+        return res.status(400).json({
+          success: false,
+          message: `No transactions found for ${MONTH_NAMES[month - 1]} ${year} in the uploaded file. The file has ${parsed.transactions.length} total transactions — check that the correct month is selected.`,
+        });
 
-    // ── Preserve prior reconciliation work ────────────────────────────────
-    // If a session already exists for this exact bank ledger + month + year,
-    // carry over its manual matches / reconciled ticks / notes by line key,
-    // and UPDATE that session in place instead of creating a duplicate. So
-    // re-uploading the same statement never makes you redo work — only new
-    // lines come in unmatched; everything already reconciled stays as-is.
-    const existing = await Acc_BankReconSession.findOne({
-      companyId,
-      periodMonth: month,
-      periodYear: year,
-      ...(bankLedgerId ? { bankLedgerId } : {}),
-    });
-    if (existing && existing.transactions && existing.transactions.length) {
-      const prior = new Map();
-      for (const t of existing.transactions) prior.set(txnKey(t), t);
-      matchedTxns = matchedTxns.map((t) => {
-        const p = prior.get(txnKey(t));
-        if (!p) return t;
-        const carried = { ...t };
-        // A match already on record for this exact line wins over auto-match.
-        if (p.matched && p.matchedVoucherId) {
-          carried.matched = true;
-          carried.matchedVoucherId = p.matchedVoucherId;
-          carried.matchedVoucherNumber = p.matchedVoucherNumber;
-          carried.matchedVoucherType = p.matchedVoucherType;
-        }
-        if (p.reconciled) carried.reconciled = true;
-        if (p.note) carried.note = p.note;
-        return carried;
-      });
-    }
+      const ledgerName = bankLedgerId
+        ? (await Acc_Ledger.findById(bankLedgerId).select("name").lean())
+            ?.name || ""
+        : "";
+      let matchedTxns = await autoMatch(companyId, bankLedgerId, periodTxns);
 
-    const totalCredits = matchedTxns.reduce((s, t) => s + t.credit, 0);
-    const totalDebits = matchedTxns.reduce((s, t) => s + t.debit, 0);
-    const matchedCount = matchedTxns.filter((t) => t.matched).length;
-    const unmatchedCount = matchedTxns.length - matchedCount;
-    const periodLabel = `${MONTH_NAMES[month - 1]} ${year}`;
-
-    let session;
-    if (existing) {
-      // Update the existing month in place — keeps the same row in the
-      // sidebar with all carried-over matches, no duplicate session.
-      existing.bankLedgerId = bankLedgerId || existing.bankLedgerId;
-      existing.bankLedgerName = ledgerName || existing.bankLedgerName;
-      existing.accountNumber = parsed.accountNumber || existing.accountNumber;
-      existing.bankName = parsed.bankName || existing.bankName;
-      existing.ifscCode = parsed.ifscCode || existing.ifscCode;
-      existing.branch = parsed.branch || existing.branch;
-      existing.periodLabel = periodLabel;
-      existing.periodFrom = periodStart;
-      existing.periodTo = periodEnd;
-      if (parsed.openingBalance != null)
-        existing.openingBalance = parsed.openingBalance;
-      if (parsed.closingBalance != null)
-        existing.closingBalance = parsed.closingBalance;
-      existing.totalCredits = totalCredits;
-      existing.totalDebits = totalDebits;
-      existing.txnCount = matchedTxns.length;
-      existing.matchedCount = matchedCount;
-      existing.unmatchedCount = unmatchedCount;
-      existing.filename = req.file.originalname;
-      existing.filesize = req.file.size;
-      existing.transactions = matchedTxns;
-      existing.status = matchedTxns.every((t) => t.reconciled)
-        ? "reconciled"
-        : matchedCount > 0
-          ? "in_progress"
-          : "pending";
-      await existing.save();
-      session = existing;
-    } else {
-      session = await Acc_BankReconSession.create({
+      // ── Preserve prior reconciliation work ────────────────────────────────
+      // If a session already exists for this exact bank ledger + month + year,
+      // carry over its manual matches / reconciled ticks / notes by line key,
+      // and UPDATE that session in place instead of creating a duplicate. So
+      // re-uploading the same statement never makes you redo work — only new
+      // lines come in unmatched; everything already reconciled stays as-is.
+      const existing = await Acc_BankReconSession.findOne({
         companyId,
-        bankLedgerId: bankLedgerId || undefined,
-        bankLedgerName: ledgerName,
-        accountNumber: parsed.accountNumber,
-        bankName: parsed.bankName,
-        ifscCode: parsed.ifscCode,
-        branch: parsed.branch,
         periodMonth: month,
         periodYear: year,
-        periodLabel,
-        periodFrom: periodStart,
-        periodTo: periodEnd,
-        openingBalance: parsed.openingBalance,
-        closingBalance: parsed.closingBalance,
-        totalCredits,
-        totalDebits,
-        txnCount: matchedTxns.length,
-        matchedCount,
-        unmatchedCount,
-        filename: req.file.originalname,
-        filesize: req.file.size,
-        transactions: matchedTxns,
+        ...(bankLedgerId ? { bankLedgerId } : {}),
       });
-    }
+      if (existing && existing.transactions && existing.transactions.length) {
+        const prior = new Map();
+        for (const t of existing.transactions) prior.set(txnKey(t), t);
+        matchedTxns = matchedTxns.map((t) => {
+          const p = prior.get(txnKey(t));
+          if (!p) return t;
+          const carried = { ...t };
+          // A match already on record for this exact line wins over auto-match.
+          if (p.matched && p.matchedVoucherId) {
+            carried.matched = true;
+            carried.matchedVoucherId = p.matchedVoucherId;
+            carried.matchedVoucherNumber = p.matchedVoucherNumber;
+            carried.matchedVoucherType = p.matchedVoucherType;
+          }
+          if (p.reconciled) carried.reconciled = true;
+          if (p.note) carried.note = p.note;
+          return carried;
+        });
+      }
 
-    res.json({
-      success: true,
-      sessionId: session._id,
-      merged: !!existing,
-      summary: {
-        txnCount: session.txnCount,
-        totalCredits,
-        totalDebits,
-        matchedCount,
-        unmatchedCount,
-        periodLabel,
-      },
-    });
-  } catch (e) {
-    console.error("[bank-recon/upload]", e);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
+      const totalCredits = matchedTxns.reduce((s, t) => s + t.credit, 0);
+      const totalDebits = matchedTxns.reduce((s, t) => s + t.debit, 0);
+      const matchedCount = matchedTxns.filter((t) => t.matched).length;
+      const unmatchedCount = matchedTxns.length - matchedCount;
+      const periodLabel = `${MONTH_NAMES[month - 1]} ${year}`;
+
+      let session;
+      if (existing) {
+        // Update the existing month in place — keeps the same row in the
+        // sidebar with all carried-over matches, no duplicate session.
+        existing.bankLedgerId = bankLedgerId || existing.bankLedgerId;
+        existing.bankLedgerName = ledgerName || existing.bankLedgerName;
+        existing.accountNumber = parsed.accountNumber || existing.accountNumber;
+        existing.bankName = parsed.bankName || existing.bankName;
+        existing.ifscCode = parsed.ifscCode || existing.ifscCode;
+        existing.branch = parsed.branch || existing.branch;
+        existing.periodLabel = periodLabel;
+        existing.periodFrom = periodStart;
+        existing.periodTo = periodEnd;
+        if (parsed.openingBalance != null)
+          existing.openingBalance = parsed.openingBalance;
+        if (parsed.closingBalance != null)
+          existing.closingBalance = parsed.closingBalance;
+        existing.totalCredits = totalCredits;
+        existing.totalDebits = totalDebits;
+        existing.txnCount = matchedTxns.length;
+        existing.matchedCount = matchedCount;
+        existing.unmatchedCount = unmatchedCount;
+        existing.filename = req.file.originalname;
+        existing.filesize = req.file.size;
+        existing.transactions = matchedTxns;
+        existing.status = matchedTxns.every((t) => t.reconciled)
+          ? "reconciled"
+          : matchedCount > 0
+            ? "in_progress"
+            : "pending";
+        await existing.save();
+        session = existing;
+      } else {
+        session = await Acc_BankReconSession.create({
+          companyId,
+          bankLedgerId: bankLedgerId || undefined,
+          bankLedgerName: ledgerName,
+          accountNumber: parsed.accountNumber,
+          bankName: parsed.bankName,
+          ifscCode: parsed.ifscCode,
+          branch: parsed.branch,
+          periodMonth: month,
+          periodYear: year,
+          periodLabel,
+          periodFrom: periodStart,
+          periodTo: periodEnd,
+          openingBalance: parsed.openingBalance,
+          closingBalance: parsed.closingBalance,
+          totalCredits,
+          totalDebits,
+          txnCount: matchedTxns.length,
+          matchedCount,
+          unmatchedCount,
+          filename: req.file.originalname,
+          filesize: req.file.size,
+          transactions: matchedTxns,
+        });
+      }
+
+      res.json({
+        success: true,
+        sessionId: session._id,
+        merged: !!existing,
+        summary: {
+          txnCount: session.txnCount,
+          totalCredits,
+          totalDebits,
+          matchedCount,
+          unmatchedCount,
+          periodLabel,
+        },
+      });
+    } catch (e) {
+      console.error("[bank-recon/upload]", e);
+      res.status(500).json({ success: false, message: e.message });
+    }
+  },
+);
 
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /sessions
@@ -900,7 +921,7 @@ router.get("/sessions/:id/match-candidates", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // PUT /sessions/:id/match
 // ═════════════════════════════════════════════════════════════════════════════
-router.put("/sessions/:id/match", async (req, res) => {
+router.put("/sessions/:id/match", blockViewerWrite, async (req, res) => {
   try {
     const { txnId, voucherId, amount } = req.body;
     const session = await Acc_BankReconSession.findById(req.params.id);
@@ -991,7 +1012,7 @@ router.put("/sessions/:id/match", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // PUT /sessions/:id/unmatch
 // ═════════════════════════════════════════════════════════════════════════════
-router.put("/sessions/:id/unmatch", async (req, res) => {
+router.put("/sessions/:id/unmatch", blockViewerWrite, async (req, res) => {
   try {
     const { txnId, voucherId } = req.body;
     const session = await Acc_BankReconSession.findById(req.params.id);
@@ -1099,7 +1120,7 @@ router.put("/sessions/:id/clear-ledger", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // PUT /sessions/:id/reconcile
 // ═════════════════════════════════════════════════════════════════════════════
-router.put("/sessions/:id/reconcile", async (req, res) => {
+router.put("/sessions/:id/reconcile", blockViewerWrite, async (req, res) => {
   try {
     const { txnId, reconciled, note } = req.body;
     const session = await Acc_BankReconSession.findById(req.params.id);
@@ -1127,7 +1148,7 @@ router.put("/sessions/:id/reconcile", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // PUT /sessions/:id/ledger
 // ═════════════════════════════════════════════════════════════════════════════
-router.put("/sessions/:id/ledger", async (req, res) => {
+router.put("/sessions/:id/ledger", blockViewerWrite, async (req, res) => {
   try {
     const { bankLedgerId } = req.body;
     const session = await Acc_BankReconSession.findById(req.params.id);
@@ -1160,7 +1181,7 @@ router.put("/sessions/:id/ledger", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // DELETE /sessions/:id
 // ═════════════════════════════════════════════════════════════════════════════
-router.delete("/sessions/:id", async (req, res) => {
+router.delete("/sessions/:id", blockViewerWrite, async (req, res) => {
   try {
     await Acc_BankReconSession.findByIdAndDelete(req.params.id);
     res.json({ success: true });
