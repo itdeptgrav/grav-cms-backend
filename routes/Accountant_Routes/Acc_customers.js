@@ -2246,6 +2246,13 @@ router.get("/pending-approvals", verifyAccountantToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/:id/merge", verifyAccountantToken, async (req, res) => {
   try {
+    if (!req.user?.permissions?.canEdit) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Read-only access. You don't have permission to merge customers.",
+      });
+    }
     const keeperId = req.params.id;
     const { mergeFromId } = req.body || {};
 
