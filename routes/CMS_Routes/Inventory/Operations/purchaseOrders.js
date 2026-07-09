@@ -1142,24 +1142,42 @@ router.post("/:id/receive", async (req, res) => {
         0,
         +(poItem.quantity - poItem.receivedQuantity).toFixed(4),
       );
-      if (qty > pending + 0.001) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot receive ${qty} of ${poItem.itemName}. Only ${pending.toFixed(4)} pending.`,
+
+      // Extra delivery: cap received at ordered qty, record surplus separately in stock
+      const qtyToReceiveAgainstPO = Math.min(qty, pending);
+      const surplusQty = +(qty - qtyToReceiveAgainstPO).toFixed(4);
+
+      if (qtyToReceiveAgainstPO > 0) {
+        updates.push({
+          poItem,
+          rawItemId: poItem.rawItem?._id || poItem.rawItem,
+          variantId: ri.variantId || poItem.variantId,
+          variantCombination: ri.variantCombination?.length
+            ? ri.variantCombination
+            : poItem.variantCombination || [],
+          qtyInPoUnit: qtyToReceiveAgainstPO,
+          poUnit: poItem.unit,
+          unitPrice: poItem.unitPrice,
+          surplusQty: 0,
         });
       }
 
-      updates.push({
-        poItem,
-        rawItemId: poItem.rawItem?._id || poItem.rawItem,
-        variantId: ri.variantId || poItem.variantId,
-        variantCombination: ri.variantCombination?.length
-          ? ri.variantCombination
-          : poItem.variantCombination || [],
-        qtyInPoUnit: qty,
-        poUnit: poItem.unit,
-        unitPrice: poItem.unitPrice,
-      });
+      // Push any surplus as a stock-in-only entry (not counted against PO received qty)
+      if (surplusQty > 0.001) {
+        updates.push({
+          poItem,
+          rawItemId: poItem.rawItem?._id || poItem.rawItem,
+          variantId: ri.variantId || poItem.variantId,
+          variantCombination: ri.variantCombination?.length
+            ? ri.variantCombination
+            : poItem.variantCombination || [],
+          qtyInPoUnit: 0,         // not counted against PO
+          poUnit: poItem.unit,
+          unitPrice: poItem.unitPrice,
+          surplusQty,             // only added to stock
+          isSurplus: true,
+        });
+      }
     }
 
     if (!updates.length) {
@@ -1191,26 +1209,32 @@ router.post("/:id/receive", async (req, res) => {
       const registeredUnit = rawItem.customUnit || rawItem.unit;
       const fromUnit = poUnit || registeredUnit;
 
-      let qtyInRegisteredUnit = qtyInPoUnit;
+      let qtyInRegisteredUnit = effectiveQtyInPoUnit;
       if (fromUnit !== registeredUnit) {
         qtyInRegisteredUnit = await convertQuantity(
-          qtyInPoUnit,
+          effectiveQtyInPoUnit,
           fromUnit,
           registeredUnit,
         );
       }
 
-      poItem.receivedQuantity += qtyInPoUnit;
-      poItem.pendingQuantity = Math.max(
-        0,
-        poItem.quantity - poItem.receivedQuantity,
-      );
-      poItem.status =
-        poItem.receivedQuantity >= poItem.quantity
-          ? "COMPLETED"
-          : poItem.receivedQuantity > 0
-            ? "PARTIALLY_RECEIVED"
-            : "PENDING";
+      // Only advance PO received counter for non-surplus entries
+      if (!u.isSurplus) {
+        poItem.receivedQuantity += qtyInPoUnit;
+        poItem.pendingQuantity = Math.max(
+          0,
+          poItem.quantity - poItem.receivedQuantity,
+        );
+        poItem.status =
+          poItem.receivedQuantity >= poItem.quantity
+            ? "COMPLETED"
+            : poItem.receivedQuantity > 0
+              ? "PARTIALLY_RECEIVED"
+              : "PENDING";
+      }
+
+      // Effective qty to add to stock = normal received + surplus
+      const effectiveQtyInPoUnit = qtyInPoUnit + (u.surplusQty || 0);
 
       const previousBaseQty = rawItem.quantity;
 
@@ -1313,7 +1337,12 @@ router.post("/:id/receive", async (req, res) => {
         converted: fromUnit !== registeredUnit,
       });
 
-      totalReceivedInPoUnits += qtyInPoUnit;
+      totalReceivedInPoUnits += u.isSurplus ? 0 : qtyInPoUnit;
+      if (u.isSurplus) {
+        console.log(
+          `[receive] Surplus of ${u.surplusQty} ${poItem.unit} for ${poItem.itemName} — added to stock only, not counted against PO.`
+        );
+      }
     }
 
     purchaseOrder.deliveries.unshift({
