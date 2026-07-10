@@ -262,6 +262,11 @@ async function createTask({ title, description, notes, requirements = [], assign
     // being asked to propose their own time from scratch.
     senderTimerWindowSecs: (!isRepeat && !isThirdParty && !isGoal && hasTimer !== false)
       ? (Number(senderTimerWindowSecs) || 0) : 0,
+    // Self-assigned tasks: creator === assignee, so the sender/receiver
+    // negotiate-and-approve step is meaningless. The requested duration
+    // becomes the real, binding window immediately. Regular tasks unaffected.
+    deadlineWindowSecs: (isSelfAssigned && !isRepeat && !isThirdParty && !isGoal && hasTimer !== false)
+      ? (Number(senderTimerWindowSecs) || 0) : null,
     // Hierarchy
     parentTaskId: parentTaskId || null,
     isRoot: !parentTaskId,
