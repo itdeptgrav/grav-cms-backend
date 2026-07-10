@@ -929,7 +929,6 @@ router.put("/:id", async (req, res) => {
       const processedVariants = await Promise.all(
         variants.map(async (variant, index) => {
           const variantSku = variant.sku || `${stockItem.reference}-V${(index + 1).toString().padStart(3, "0")}`;
-          const processedRawItems = await processVariantRawItems(variant.rawItems);
 
           if (variant._id && existingVariantsById[variant._id.toString()]) {
             const existing = existingVariantsById[variant._id.toString()];
@@ -942,13 +941,18 @@ router.put("/:id", async (req, res) => {
             existing.salesPrice = parseFloat(variant.salesPrice) || stockItem.baseSalesPrice || 0;
             existing.barcode = variant.barcode || existing.barcode || "";
             existing.images = variant.images || stockItem.images || existing.images || [];
-            // ✅ FIX: Only overwrite rawItems if the caller explicitly sent them
+            // NEVER overwrite rawItems unless caller explicitly sent non-empty rawItems
+            // raw-items tab is the sole owner of this field
             if (Array.isArray(variant.rawItems) && variant.rawItems.length > 0) {
-              existing.rawItems = processedRawItems;
+              existing.rawItems = await processVariantRawItems(variant.rawItems);
             }
-            // else: preserve existing rawItems from DB untouched
             return existing;
           }
+
+          // Genuinely new variant — only process rawItems if provided
+          const newRawItems = (Array.isArray(variant.rawItems) && variant.rawItems.length > 0)
+            ? await processVariantRawItems(variant.rawItems)
+            : [];
 
           return {
             sku: variantSku, attributes: variant.attributes || [],
@@ -957,7 +961,7 @@ router.put("/:id", async (req, res) => {
             cost: parseFloat(variant.cost) || stockItem.baseCost || 0,
             salesPrice: parseFloat(variant.salesPrice) || stockItem.baseSalesPrice || 0,
             barcode: variant.barcode || "", images: variant.images || stockItem.images || [],
-            rawItems: processedRawItems
+            rawItems: newRawItems
           };
         })
       );
