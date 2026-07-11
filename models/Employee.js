@@ -322,6 +322,10 @@ const employeeSchema = new mongoose.Schema({
       ],
     },
   ],
+  // ─── TIMER SOP ACCUMULATORS ───────────────────────────────────────────────────
+  timerDeficitAccumHrs: { type: Number, default: 0 },
+  timerOvertimeAccumHrs: { type: Number, default: 0 },
+  lastFinalizedDate: { type: String, default: null }, // "YYYY-MM-DD", IST
 
   // ─── PUSH NOTIFICATIONS ──────────────────────────────────────────────────────
   // Expo push token for the native mobile app (Android/iOS)
