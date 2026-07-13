@@ -122,12 +122,12 @@ router.get("/", async (req, res) => {
     }
 
     const purchaseOrders = await PurchaseOrder.find(filter)
-      .populate("vendor", "companyName contactPerson phone email")
-      .populate("items.rawItem", "name sku unit")
-      .populate("createdBy", "name email")
-      .populate("approvedBy", "name email")
-      .populate("payments.recordedBy", "name email")
-      .sort({ createdAt: -1 });
+  .populate("vendor", "companyName contactPerson phone email bankDetails")
+  .populate("items.rawItem", "name sku unit")
+  .populate("createdBy", "name email")
+  .populate("approvedBy", "name email")
+  .populate("payments.recordedBy", "name email")
+  .sort({ createdAt: -1 });
 
     const total = await PurchaseOrder.countDocuments();
     const draft = await PurchaseOrder.countDocuments({ status: "DRAFT" });
@@ -378,7 +378,7 @@ router.get("/:id", async (req, res) => {
     const purchaseOrder = await PurchaseOrder.findById(req.params.id)
       .populate(
         "vendor",
-        "companyName contactPerson phone email address gstNumber",
+        "companyName contactPerson phone email address gstNumber bankDetails",
       )
       .populate("items.rawItem", "name sku unit description sellingPrice")
       .populate("createdBy", "name email")
@@ -404,7 +404,9 @@ router.get("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items", async (req, res) => {
   try {
-    const { search = "", limit = 50 } = req.query;
+    const { search = "", limit = 0 } = req.query;
+    // limit=0 (default) → NO limit: return the full catalog.
+    // Callers that want truncation must pass an explicit limit.
     const filter = search
       ? {
           $or: [
@@ -413,14 +415,14 @@ router.get("/data/raw-items", async (req, res) => {
           ],
         }
       : {};
-    const rawItems = await RawItem.find(filter)
-      .limit(parseInt(limit))
-      .sort({ name: 1 })
+    let query = RawItem.find(filter).sort({ name: 1 });
+    const lim = parseInt(limit);
+    if (lim > 0) query = query.limit(lim);
+    const rawItems = await query
       .select(
         "name sku category customCategory unit customUnit description sellingPrice minStock maxStock quantity status",
       )
-      .lean()
-      .sort({ name: 1 });
+      .lean();
 
     const formattedItems = rawItems.map((item) => ({
       id: item._id.toString(),
