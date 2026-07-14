@@ -880,6 +880,16 @@ const customerRequestSchema = new mongoose.Schema(
     // Notifications
     quotationNotifications: [quotationNotificationSchema],
 
+
+    // ── PM approval layer ──────────────────────────────────────────────
+    pmApproved:      { type: Boolean, default: false },
+    pmApprovedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    pmApprovedAt:    { type: Date, default: null },
+    pmRejected:      { type: Boolean, default: false },
+    pmRejectedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    pmRejectedAt:    { type: Date, default: null },
+    pmRejectionNote: { type: String, default: "" },
+
     // Audit Fields
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,

@@ -27,6 +27,10 @@ const StockIssuance  = require("../../../models/CMS_Models/Inventory/Operations/
 
 router.use(EmployeeAuthMiddleware);
 
+// ── PM approval gate (backend env only) ────────────────────────────────
+const PM_APPROVAL_FOR_MRF =
+  String(process.env.PM_APPROVAL_FOR_MRF || "false").toLowerCase() === "true";
+
 // Statuses where WOs have been created and the PO becomes visible to store
 const STORE_VISIBLE_STATUSES = [
   "quotation_sales_approved",
@@ -46,7 +50,7 @@ router.get("/order-requests", async (req, res) => {
     const requests = await CustomerRequest.find({
       status: { $in: STORE_VISIBLE_STATUSES },
     })
-      .select("requestId customerInfo status priority requestType createdAt updatedAt items")
+      .select("requestId customerInfo status priority requestType createdAt updatedAt items pmApproved pmApprovedAt pmRejected pmRejectionNote")
       .sort({ createdAt: -1 })
       .lean();
 
@@ -91,6 +95,9 @@ router.get("/order-requests", async (req, res) => {
         verificationProgress:
           s.totalWOs > 0 ? Math.round((s.verifiedWOs / s.totalWOs) * 100) : 0,
         isFullyVerified,
+        pmApproved: !!r.pmApproved,
+        pmRejected: !!r.pmRejected,
+        pmRejectionNote: r.pmRejectionNote || "",
       };
     });
 
@@ -553,6 +560,84 @@ router.get("/order-requests/:id/raw-item-requirement", async (req, res) => {
       });
     }
  
+    // ── FALLBACK: WOs carry no rawMaterials → build BOM from StockItem variants ──
+    if (totalsMap.size === 0) {
+      const fullStockItems = stockItemIds.length
+        ? await StockItem.find({
+            _id: { $in: stockItemIds.map((sid) => new mongoose.Types.ObjectId(sid)) },
+          }).select("name variants").lean()
+        : [];
+      const fullSiMap = new Map(fullStockItems.map((s) => [s._id.toString(), s]));
+
+      const matchVariant = (wo, siVariants) => {
+        if (!siVariants?.length) return null;
+        if (wo.variantId) {
+          const byId = siVariants.find((v) => v._id?.toString() === wo.variantId?.toString());
+          if (byId) return byId;
+        }
+        if (wo.variantAttributes?.length) {
+          const byAttrs = siVariants.find((v) =>
+            wo.variantAttributes.every((wa) =>
+              v.attributes?.some((va) => va.name === wa.name && va.value === wa.value)
+            )
+          );
+          if (byAttrs) return byAttrs;
+        }
+        return siVariants[0];
+      };
+
+      for (let wIdx = 0; wIdx < workOrders.length; wIdx++) {
+        const wo = workOrders[wIdx];
+        const si = fullSiMap.get(wo.stockItemId?.toString());
+        if (!si) continue;
+        const variant = matchVariant(wo, si.variants || []);
+        if (!variant) continue;
+        const woQty = wo.quantity || 0;
+        const woRawItems = [];
+
+        for (const ri of (variant.rawItems || [])) {
+          if (!ri.rawItemId) continue;
+          const rawItemIdStr = ri.rawItemId.toString();
+          const variantIdStr = ri.variantId?.toString() || "";
+          const key = `${rawItemIdStr}|${variantIdStr}`;
+          const required = (ri.quantity || 0) * woQty;
+          const unitCost = ri.unitCost || ri.cost || 0;
+          const cost = required * unitCost;
+
+          woRawItems.push({
+            rawItemId: rawItemIdStr, rawItemVariantId: variantIdStr || null,
+            rawItemName: ri.rawItemName || "", rawItemSku: ri.rawItemSku || "",
+            variantCombination: ri.variantCombination || [],
+            unit: ri.unit || ri.baseUnit || "",
+            quantityRequired: required, unitCost, totalCost: cost,
+          });
+
+          if (!totalsMap.has(key)) {
+            totalsMap.set(key, {
+              rawItemId: rawItemIdStr, variantId: variantIdStr || null,
+              rawItemName: ri.rawItemName || "", rawItemSku: ri.rawItemSku || "",
+              variantCombination: ri.variantCombination || [],
+              unit: ri.unit || ri.baseUnit || "",
+              quantityRequired: 0, totalCost: 0, unitCost, contributingWOs: [],
+            });
+          }
+          const te = totalsMap.get(key);
+          te.quantityRequired += required;
+          te.totalCost += cost;
+          te.contributingWOs.push({
+            workOrderId: wo._id.toString(),
+            workOrderNumber: wo.workOrderNumber || wo._id.toString().slice(-8),
+            productName: wo.stockItemName || "—",
+            quantityNeeded: required,
+          });
+        }
+
+        perWorkOrder[wIdx].rawItems = woRawItems;
+        perWorkOrder[wIdx].rawItemCount = woRawItems.length;
+        perWorkOrder[wIdx].totalRequiredQty = woRawItems.reduce((s, r) => s + r.quantityRequired, 0);
+      }
+    }
+
     // ── Live stock lookup for each unique raw-item ─────────────────────────
     const uniqueRawItemIds = [
       ...new Set([...totalsMap.values()].map((t) => t.rawItemId).filter(Boolean)),
