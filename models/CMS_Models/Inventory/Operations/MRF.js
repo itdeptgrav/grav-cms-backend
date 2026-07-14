@@ -37,6 +37,12 @@ const mrfItemSchema = new mongoose.Schema(
     },
 
     returnHistory: [returnEntrySchema],
+    issueHistory: [{
+      issuedQty:  { type: Number, required: true },
+      notes:      { type: String, default: "" },
+      recordedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+      recordedAt: { type: Date, default: Date.now },
+    }],
     storeNotes:    { type: String, trim: true, default: "" },
   },
   { _id: true }
@@ -103,6 +109,17 @@ const mrfSchema = new mongoose.Schema(
     },
 
     items: [mrfItemSchema],
+
+    //pm action 
+
+    // ── PM approval layer ──────────────────────────────────────────────
+    pmApproved:      { type: Boolean, default: false },
+    pmApprovedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    pmApprovedAt:    { type: Date, default: null },
+    pmRejected:      { type: Boolean, default: false },
+    pmRejectedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    pmRejectedAt:    { type: Date, default: null },
+    pmRejectionNote: { type: String, default: "" },
 
     // Store actions audit
     approvedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },

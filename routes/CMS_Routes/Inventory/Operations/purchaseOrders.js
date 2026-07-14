@@ -121,7 +121,7 @@ router.get("/", async (req, res) => {
       if (endDate) filter.orderDate.$lte = new Date(endDate);
     }
 
-    const purchaseOrders = await PurchaseOrder.find(filter)
+  const purchaseOrders = await PurchaseOrder.find(filter)
   .populate("vendor", "companyName contactPerson phone email bankDetails")
   .populate("items.rawItem", "name sku unit")
   .populate("createdBy", "name email")

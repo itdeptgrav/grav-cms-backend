@@ -952,6 +952,9 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
 );
 
+const pmRequestsRoutes = require("./routes/CMS_Routes/PM/pmRequestsRoutes");
+app.use("/api/cms/pm/requests", pmRequestsRoutes);
+
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 
@@ -973,6 +976,8 @@ app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
 
 const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
 app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
+
+app.use("/api/cms/notifications", require("./routes/CMS_Routes/notificationRoutes"));
 
 // Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
