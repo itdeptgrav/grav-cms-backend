@@ -296,6 +296,24 @@ router.get("/task/dump/:taskId", async (req, res) => {
         res.json(snap.data());
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
+router.get("/task/dump/:taskId", async (req, res) => {
+    try {
+        const { db } = require("../../config/firebaseAdmin");
+        const snap = await db.collection("cowork_tasks").doc(req.params.taskId).get();
+        if (!snap.exists) return res.status(404).json({ error: "Not found" });
+        res.json(snap.data());
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEBUG: dump one employee's raw fields ──────────────────────────────────
+router.get("/employee/dump/:employeeId", async (req, res) => {
+    try {
+        const { db } = require("../../config/firebaseAdmin");
+        const snap = await db.collection("cowork_employees").doc(req.params.employeeId).get();
+        if (!snap.exists) return res.status(404).json({ error: "Not found" });
+        res.json(snap.data());
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── Self-assign repair: fix old tasks missing approverId/visibleTo ───────────
 // Call: POST /cowork/task/self-assign-repair { taskId, approverId, approverName }
