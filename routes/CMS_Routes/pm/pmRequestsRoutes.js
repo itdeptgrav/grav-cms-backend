@@ -184,7 +184,7 @@ router.patch("/mrf/:id/approve", async (req, res) => {
     }
 
     await mrf.save();
-    NotificationService.sendToRole(["store", "admin"], {
+    NotificationService.sendToRole(["store_manager", "admin"], {
       title: "MRF Approved by PM",
       body: `${mrf.mrfNumber} — ${mrf.requestedForName}. Issue the materials now.`,
       url: `/store/dashboard/order-requests/mrf/${mrf._id}`,
@@ -217,12 +217,23 @@ router.patch("/mrf/:id/reject", async (req, res) => {
     mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED"; });
 
     await mrf.save();
-    NotificationService.sendToRole(["store", "admin"], {
+    NotificationService.sendToRole(["store_manager", "admin"], {
       title: "MRF Rejected by PM",
       body: `${mrf.mrfNumber} — ${mrf.requestedForName}.${req.body.note ? ` Reason: ${req.body.note}` : ""}`,
       url: `/store/dashboard/order-requests/mrf/${mrf._id}`,
       tag: `mrf-${mrf._id}`,
     }).catch(() => {});
+
+    if (mrf.requestedFor) {
+      NotificationService.sendToUser(mrf.requestedFor, {
+        title: "Request Rejected",
+        body: `Your material request ${mrf.mrfNumber} was rejected.${req.body.note ? ` Reason: ${req.body.note}` : ""}`,
+        type: "request",
+        url: "/coworking",
+        tag: `mrf-${mrf._id}`,
+      }).catch(() => {});
+    }
+
     res.json({ success: true, message: "MRF rejected", mrf });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });

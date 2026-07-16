@@ -17,6 +17,7 @@ const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawIte
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const VendorEmailService = require("../../../../services/VendorEmailService");
+const NotificationService = require("../../../../services/NotificationService");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const mongoose = require("mongoose");
 
@@ -674,6 +675,14 @@ router.post("/", async (req, res) => {
       } catch (emailError) {
         console.error("Failed to send PO email (non-critical):", emailError);
       }
+
+      NotificationService.sendToRole("ceo", {
+        title: "New Purchase Order Issued",
+        body: `${poNumber} — ₹${totalAmount.toLocaleString("en-IN")} to ${vendorName || "vendor"}`,
+        type: "request",
+        url: `/ceo/dashboard/purchase-orders/${purchaseOrder._id}`,
+        tag: `po-${purchaseOrder._id}`,
+      }).catch(() => {});
     }
 
     return res.status(201).json({
@@ -1068,8 +1077,19 @@ router.patch("/:id/status", async (req, res) => {
       });
     }
 
+    const wasIssuedBefore = purchaseOrder.status === "ISSUED";
     purchaseOrder.status = status;
     if (status === "ISSUED") purchaseOrder.approvedBy = req.user.id;
+
+    if (status === "ISSUED" && !wasIssuedBefore) {
+      NotificationService.sendToRole("ceo", {
+        title: "New Purchase Order Issued",
+        body: `${purchaseOrder.poNumber} — ₹${(purchaseOrder.totalAmount || 0).toLocaleString("en-IN")} to ${purchaseOrder.vendorName || "vendor"}`,
+        type: "request",
+        url: `/ceo/dashboard/purchase-orders/${purchaseOrder._id}`,
+        tag: `po-${purchaseOrder._id}`,
+      }).catch(() => {});
+    }
 
     if (notes) {
       purchaseOrder.notes = purchaseOrder.notes
