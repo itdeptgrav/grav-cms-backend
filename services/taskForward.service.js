@@ -195,10 +195,12 @@ async function _buildPath(parentTaskId) {
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
 async function createTask({ title, description, notes, requirements = [], assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
+  pendingAssigneeId = null, pendingAssigneeName = null, departmentApprovals = null,
   isGoldTask = false,
   c2Config = null,
   etcHours = 0,
-  assigneePriorities = {} }) {
+  assigneePriorities = {},
+  isForwardedTask = false }) {
 
   const taskId = await _generateTaskId();
   const now = new Date().toISOString();
@@ -258,7 +260,12 @@ async function createTask({ title, description, notes, requirements = [], assign
     goalUpdates: [],
     hasTimer: isRepeat || isThirdParty || isGoal ? null : (hasTimer !== false),
     fixedDeadline: (!isRepeat && !isThirdParty && !isGoal && !hasTimer) ? fixedDeadline || null : null,
-    // ── Sender-preset timer: CEO/TL can set a suggested duration at task creation
+    // Cross-department approval tracking — pendingAssigneeId is who actually
+    // gets added to assigneeIds once every entry in departmentApprovals is
+    // approved (see /task/create and /task/:taskId/department-approve).
+    pendingAssigneeId: pendingAssigneeId || null,
+    pendingAssigneeName: pendingAssigneeName || null,
+    departmentApprovals: departmentApprovals || null,    // ── Sender-preset timer: CEO/TL can set a suggested duration at task creation
     // When > 0, receiver sees "Time set: X hrs — Approve or suggest different" instead of
     // being asked to propose their own time from scratch.
     senderTimerWindowSecs: (!isRepeat && !isThirdParty && !isGoal && hasTimer !== false)
@@ -278,6 +285,10 @@ async function createTask({ title, description, notes, requirements = [], assign
     confirmedBy: [],
     forwardedBy: null,
     forwardedByName: null,
+    // Separate from forwardedBy/forwardedByName above (those feed _reviewFlow's
+    // approval routing — left untouched). This only marks the doc as
+    // forward-created, so the employee task list can hide its parent chain.
+    isForwardedTask: isForwardedTask || false,
     originalAssignedBy: assignedBy,
     createdByTl: createdByTl || assignedByRole === "tl",
     createdByCeo: createdByCeo || assignedByRole === "ceo",
@@ -415,6 +426,36 @@ async function markTaskStarted({ taskId, employeeId, employeeName }) {
 //  4. FORWARD TASK (any assigned person, any time)
 //     Creates new tasks as children of the forwarded task
 // ═════════════════════════════════════════════════════════
+// Read-only preview of remaining forward-duration budget on a parent task.
+// Deliberately a separate calculation from forwardTask()'s own validation —
+// kept duplicated on purpose so a bug in this preview endpoint can never
+// silently change what forwardTask() actually enforces at submit time.
+async function getForwardBudget({ parentTaskId }) {
+  const parentDoc = await db.collection("cowork_tasks").doc(parentTaskId).get();
+  if (!parentDoc.exists) throw new Error("Task not found.");
+  const parent = parentDoc.data();
+  const totalSecs = Number(parent.deadlineWindowSecs) || Number(parent.senderTimerWindowSecs) || 0;
+  let alreadyForwardedSecs = 0;
+  const existingSubtaskIds = parent.subtaskIds || [];
+  if (existingSubtaskIds.length) {
+    const childDocs = await Promise.all(
+      existingSubtaskIds.map(id => db.collection("cowork_tasks").doc(id).get())
+    );
+    childDocs.forEach(doc => {
+      if (!doc.exists) return;
+      const c = doc.data();
+      if (c.isForwardedTask) {
+        alreadyForwardedSecs += Number(c.deadlineWindowSecs) || Number(c.senderTimerWindowSecs) || 0;
+      }
+    });
+  }
+  // hasBudget=false means the parent has no timer concept (hasTimer:false,
+  // fixed-deadline, folder, etc.) — nothing to preview or enforce for it.
+  const hasBudget = totalSecs > 0;
+  const remainingSecs = hasBudget ? Math.max(0, totalSecs - alreadyForwardedSecs) : null;
+  return { hasBudget, totalSecs, alreadyForwardedSecs, remainingSecs };
+}
+
 async function forwardTask({ parentTaskId, forwardedBy, forwardedByName, assignments }) {
   const parentRef = db.collection("cowork_tasks").doc(parentTaskId);
   const parentDoc = await parentRef.get();
@@ -427,6 +468,44 @@ async function forwardTask({ parentTaskId, forwardedBy, forwardedByName, assignm
   const canForward = forwarderRole === "ceo" || forwarderRole === "tl" ||
     parent.assigneeIds.includes(forwardedBy) || parent.assignedBy === forwardedBy;
   if (!canForward) throw new Error("Not authorized to forward this task.");
+
+  // ── Duration is mandatory for every forwarded assignment ────────────────
+  const validAssignments = assignments.filter(a => a.employeeId && a.notes);
+  if (validAssignments.some(a => !(Number(a.senderTimerWindowSecs) > 0))) {
+    throw new Error("Duration is required for every assignment.");
+  }
+
+  // ── Forwarded-duration budget check ──────────────────────────────────────
+  // Only applies when the parent itself has a timer window to budget against.
+  // A parent with no timer concept (hasTimer: false, fixed-deadline, folder,
+  // etc.) has nothing to check against, so this is skipped for it — this rule
+  // is specifically about forwarded tasks, not normal parent tasks.
+  const parentTotalSecs = Number(parent.deadlineWindowSecs) || Number(parent.senderTimerWindowSecs) || 0;
+  if (parentTotalSecs > 0) {
+    let alreadyForwardedSecs = 0;
+    const existingSubtaskIds = parent.subtaskIds || [];
+    if (existingSubtaskIds.length) {
+      const childDocs = await Promise.all(
+        existingSubtaskIds.map(id => db.collection("cowork_tasks").doc(id).get())
+      );
+      childDocs.forEach(doc => {
+        if (!doc.exists) return;
+        const c = doc.data();
+        if (c.isForwardedTask) {
+          alreadyForwardedSecs += Number(c.deadlineWindowSecs) || Number(c.senderTimerWindowSecs) || 0;
+        }
+      });
+    }
+    const thisBatchSecs = validAssignments.reduce((sum, a) => sum + (Number(a.senderTimerWindowSecs) || 0), 0);
+    const remainingSecs = parentTotalSecs - alreadyForwardedSecs;
+    if (thisBatchSecs > remainingSecs) {
+      throw new Error(
+        remainingSecs > 0
+          ? `Only ${_fmtSecs(remainingSecs)} remaining in the parent task. Please enter a duration less than or equal to the remaining time.`
+          : `No time remaining in the parent task — it has already been fully forwarded.`
+      );
+    }
+  }
 
   const newTaskIds = [];
 
@@ -455,12 +534,16 @@ async function forwardTask({ parentTaskId, forwardedBy, forwardedByName, assignm
       assignedByName: forwardedByName,
       assignedByRole: forwarderRole,
       assigneeIds: [assignment.employeeId],
-      dueDate: assignment.dueDate || parent.dueDate || null,
+      dueDate: null,
+      hasTimer: true,
+      senderTimerWindowSecs: Number(assignment.senderTimerWindowSecs) || 0,
       priority: fwdPriority,
       assigneePriorities: fwdAssigneePriorities,
       parentTaskId,
       // Inherit root creator role so _reviewFlow stays correct down the chain
       rootCreatedByRole: parent.rootCreatedByRole || parent.assignedByRole || null,
+      isForwardedTask: true,
+      requirements: assignment.requirements || [],
     });
     newTaskIds.push(newTask.taskId);
   }
@@ -839,8 +922,25 @@ async function listTasksWithHierarchy(employeeId, role, cursorMs = null, pageSiz
       ...initialTasks.map(t => walkUp(t.parentTaskId)),
       ...initialTasks.map(t => walkDownForAll(t)),
     ]);
+  } else {
+    // Employee: walkUp ONLY for regular subtasks — parent chain for context.
+    // Tasks that are themselves forward-created skip walkUp entirely: once work
+    // is forwarded, the employee sees only the forwarded task, never the original.
+    const walkUpForEmployee = async (startParentId) => {
+      let parentId = startParentId;
+      while (parentId && !seen.has(parentId)) {
+        const doc = await db.collection("cowork_tasks").doc(parentId).get();
+        if (!doc.exists) return;
+        addDoc(doc);
+        const data = doc.data();
+        if (data.isForwardedTask) return; // don't climb past a forwarded task's own origin
+        parentId = data.parentTaskId;
+      }
+    };
+    await Promise.all(
+      initialTasks.filter(t => !t.isForwardedTask).map(t => walkUpForEmployee(t.parentTaskId))
+    );
   }
-  // Employee: no walks — they only see exactly what was assigned to them
 
   const mappedTasks = tasks.map(t => ({
     ...t,
@@ -2081,6 +2181,7 @@ module.exports = {
   confirmTaskReceipt,
   markTaskStarted,
   forwardTask,
+  getForwardBudget,
   submitDailyReport,
   sendTaskChat,
   getTaskChat,
