@@ -56,6 +56,50 @@ router.get("/employee/list-members", verifyCoworkToken, verifyEmployeeToken, asy
   }
 });
 
+// GET /cowork/scheduling/blocked-dates?employeeId=E014&from=2026-07-16&to=2026-07-30
+router.get("/scheduling/blocked-dates", verifyCoworkToken, async (req, res) => {
+  try {
+    const { employeeId, from, to } = req.query;
+    if (!employeeId || !from || !to) {
+      return res.status(400).json({ error: "employeeId, from, and to (YYYY-MM-DD) are required." });
+    }
+
+    const mongoose = require("mongoose");
+    const CompanyHoliday = mongoose.model("CompanyHoliday");
+    const LeaveApplication = mongoose.model("LeaveApplication");
+
+    const [holidays, leaves] = await Promise.all([
+      CompanyHoliday.find({ date: { $gte: from, $lte: to } }).lean(),
+      LeaveApplication.find({
+        biometricId: employeeId,
+        status: { $in: ["hr_approved", "withdraw_pending"] },
+        fromDate: { $lte: to },
+        toDate: { $gte: from },
+      }).lean(),
+    ]);
+
+    const blocked = {};
+    for (const h of holidays) blocked[h.date] = { type: "holiday", name: h.name };
+
+    for (const lv of leaves) {
+      let cur = new Date(lv.fromDate + "T00:00:00Z");
+      const end = new Date(lv.toDate + "T00:00:00Z");
+      while (cur <= end) {
+        const ds = cur.toISOString().slice(0, 10);
+        if (ds >= from && ds <= to && !blocked[ds]) {
+          blocked[ds] = { type: "leave", leaveType: lv.leaveType };
+        }
+        cur.setUTCDate(cur.getUTCDate() + 1);
+      }
+    }
+
+    res.json({ success: true, blockedDates: blocked });
+  } catch (e) {
+    console.error("[blocked-dates]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Change Password ──────────────────────────────
 router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
