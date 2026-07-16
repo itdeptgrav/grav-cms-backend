@@ -242,6 +242,7 @@ async function createTask({ title, description, notes, requirements = [], assign
     isGoldTask: isGoldTask || false,
     c2Config: (isGoldTask && c2Config) ? c2Config : null,
     etcHours: Number(etcHours) || 0,
+    hoursCompleted: 0,
     c1: {
       deadlinesMissed: 0,
       extensionsFiled: 0,

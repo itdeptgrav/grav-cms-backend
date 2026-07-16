@@ -1294,6 +1294,8 @@ app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
 app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
 
+app.use("/api/cowork/notifications", require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"));
+
 //new tree substack routes
 const taskTreeModule = require("./routes/task_routes/taskTree.routes.js");
 app.use("/cowork", taskTreeModule); // ✅ Fix: use .router
