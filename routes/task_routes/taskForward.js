@@ -10,6 +10,7 @@
  * 6. TL display name includes department: "Name (Dept TL)"
  */
 
+
 const express = require("express");
 const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
@@ -61,6 +62,45 @@ async function getEmployeeInfo(employeeId) {
   const snap = await db.collection("cowork_employees").doc(employeeId).get();
   if (!snap.exists) return null;
   return snap.data();
+}
+
+async function _getPrimaryManagerApprover(employeeId) {
+  try {
+    const Employee = require("../../models/Employee");
+    const hrEmp = await Employee.findOne({ biometricId: employeeId })
+      .populate("primaryManager.managerId", "firstName middleName lastName biometricId")
+      .lean();
+    const mgr = hrEmp?.primaryManager?.managerId;
+    const mgrBiometricId = mgr?.biometricId;
+    if (!mgrBiometricId) return null;
+    const cwSnap = await db.collection("cowork_employees").doc(mgrBiometricId).get();
+    if (!cwSnap.exists) return null;
+    const cw = cwSnap.data();
+    return { approverId: cw.employeeId, approverName: cw.name, source: "primary_manager" };
+  } catch (e) {
+    console.warn("[_getPrimaryManagerApprover]", e.message);
+    return null;
+  }
+}
+
+async function resolveDepartmentApprover(employeeId) {
+  const person = await getEmployeeInfo(employeeId);
+  if (!person) return null;
+  if (person.role === "tl") {
+    return await _getPrimaryManagerApprover(employeeId);
+  }
+  if (person.department) {
+    const tlSnap = await db.collection("cowork_employees")
+      .where("department", "==", person.department)
+      .where("role", "==", "tl")
+      .limit(1)
+      .get();
+    if (!tlSnap.empty) {
+      const tl = tlSnap.docs[0].data();
+      return { approverId: tl.employeeId, approverName: tl.name, source: "dept_tl" };
+    }
+  }
+  return await _getPrimaryManagerApprover(employeeId);
 }
 
 // ── Helper: post system message to task chat ──────────────────────────────────
@@ -121,6 +161,85 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     const thirdPartyFlag = isThirdParty === true || isThirdParty === "true";
     const goalFlag = isGoal === true || isGoal === "true";
 
+    // ── CROSS-DEPARTMENT APPROVAL GATE ──────────────────────────────────────
+    let departmentApprovalGate = null;
+    if (requesterRole !== "ceo" && !folderFlag && !repeatFlag && !thirdPartyFlag && !goalFlag
+      && !parentTaskId && assigneeIds?.length === 1) {
+      const assignerInfo = await getEmployeeInfo(req.coworkUser.employeeId);
+      const assignerDept = assignerInfo?.department || "";
+      const targetId = assigneeIds[0];
+      const targetInfo = await getEmployeeInfo(targetId);
+      const targetDept = targetInfo?.department || "";
+
+      if (assignerDept && targetDept && assignerDept !== targetDept) {
+        const [senderApprover, receiverApprover] = await Promise.all([
+          resolveDepartmentApprover(req.coworkUser.employeeId),
+          resolveDepartmentApprover(targetId),
+        ]);
+        if (!senderApprover) {
+          return res.status(400).json({ error: "Cannot assign — you have no manager on file to approve this cross-department task." });
+        }
+        if (!receiverApprover) {
+          return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this cross-department task.` });
+        }
+        departmentApprovalGate = {
+          pendingAssigneeId: targetId,
+          pendingAssigneeName: targetInfo?.name || "",
+          approvals: [
+            { approverId: senderApprover.approverId, approverName: senderApprover.approverName, side: "sender", source: senderApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+            { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+          ],
+        };
+        initialStatus = "pending_department_approval";
+      }
+    }
+
+    // ── CEO-ASSIGNMENT APPROVAL GATE ─────────────────────────────────────────
+    if (requesterRole === "ceo" && !folderFlag && !repeatFlag && !thirdPartyFlag && !goalFlag
+      && !parentTaskId && assigneeIds?.length === 1) {
+      const targetId = assigneeIds[0];
+      const targetInfo = await getEmployeeInfo(targetId);
+      const receiverApprover = await resolveDepartmentApprover(targetId);
+      if (!receiverApprover) {
+        return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this assignment.` });
+      }
+      departmentApprovalGate = {
+        pendingAssigneeId: targetId,
+        pendingAssigneeName: targetInfo?.name || "",
+        approvals: [
+          { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+        ],
+      };
+      initialStatus = "pending_department_approval";
+    }
+
+    // ── DEADLINE-MODE TASKS: B's own department TL sets real hours ──────────
+
+    const deadlineModeFlag = hasTimer === false || hasTimer === "false";
+    let draftTlApprover = null;
+    if (deadlineModeFlag && !folderFlag && !repeatFlag && !thirdPartyFlag && !goalFlag
+      && !departmentApprovalGate && assigneeIds?.length === 1 && initialStatus === "open") {
+      const targetInfo2 = await getEmployeeInfo(assigneeIds[0]);
+      const assignerInfo2 = await getEmployeeInfo(req.coworkUser.employeeId);
+      const assignerDept2 = assignerInfo2?.department || "";
+      const targetDept2 = targetInfo2?.department || "";
+      const isCrossDept2 = requesterRole !== "ceo" && assignerDept2 && targetDept2 && assignerDept2 !== targetDept2;
+      if (isCrossDept2 && targetInfo2 && targetInfo2.role !== "tl" && targetInfo2.department) {
+        const tlSnap2 = await db.collection("cowork_employees")
+          .where("department", "==", targetInfo2.department)
+          .where("role", "==", "tl")
+          .limit(1)
+          .get();
+        if (!tlSnap2.empty) {
+          const tl2 = tlSnap2.docs[0].data();
+          draftTlApprover = { approverId: tl2.employeeId, approverName: tl2.name };
+          initialStatus = "pending_tl_hours";
+        }
+      }
+    }
+
+    // Per-person auto-priority
+
     // Per-person auto-priority: build assigneePriorities map for EVERY assignee
     // Each person gets their own priority = their open task count + 1
     let autoPriority = (typeof priority === "number" ? priority : Number(priority)) || null;
@@ -151,7 +270,7 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       assignedBy: req.coworkUser.employeeId,
       assignedByName: req.coworkUser.name,
       assignedByRole: requesterRole,
-      assigneeIds: assigneeIds || [],
+      assigneeIds: departmentApprovalGate ? [] : (assigneeIds || []),
       dueDate: null,
       priority: autoPriority,
       assigneePriorities: assigneePrioritiesMap,
@@ -159,6 +278,9 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       groupId: groupId || null,
       createdByTl: createdByTl || false,
       status: initialStatus,
+      pendingAssigneeId: departmentApprovalGate?.pendingAssigneeId || null,
+      pendingAssigneeName: departmentApprovalGate?.pendingAssigneeName || null,
+      departmentApprovals: departmentApprovalGate?.approvals || null,
       isFolder: folderFlag,
       isRepeat: repeatFlag,
       repeatConfig: (repeatFlag && repeatConfig) ? repeatConfig : null,
@@ -192,6 +314,33 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       );
     }
 
+    if (departmentApprovalGate) {
+      const uniqueApproverIds = [...new Set(departmentApprovalGate.approvals.map(a => a.approverId))];
+      const isCeoAssignment = requesterRole === "ceo";
+      await _notify({
+        recipientIds: uniqueApproverIds,
+        type: "department_approval_request",
+        title: isCeoAssignment ? "🔔 Approval Needed" : "🔔 Cross-Department Approval Needed",
+        body: isCeoAssignment
+          ? `${req.coworkUser.name} (CEO) has assigned a task to ${departmentApprovalGate.pendingAssigneeName}. Please approve or reject this request.`
+          : `${req.coworkUser.name} wants to assign a task to ${departmentApprovalGate.pendingAssigneeName} from another department. Please approve or reject this request.`,
+        data: { taskId: task.taskId, taskTitle: title.trim() },
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.name,
+      });
+    }
+
+    if (draftTlApprover) {
+      await _notify({
+        recipientIds: [draftTlApprover.approverId],
+        type: "department_draft_needs_hours",
+        title: "📝 Draft Task Needs Your Hours Estimate",
+        body: `${req.coworkUser.name} assigned a deadline-based task to your team. Set the real ETC hours before it goes to your team member.`,
+        data: { taskId: task.taskId, taskTitle: title.trim() },
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.name,
+      });
+    }
     res.status(201).json({ success: true, task });
     // Email is now handled inside svc.createTask() via _notifyMany → sendNotificationEmail
 
@@ -777,6 +926,117 @@ router.post("/task/:taskId/approve", verifyCoworkToken, verifyEmployeeToken, asy
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+router.post("/task/:taskId/department-approve", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { decision, rejectionReason = "" } = req.body;
+    const { employeeId, name } = req.coworkUser;
+    if (!["approve", "reject"].includes(decision)) {
+      return res.status(400).json({ error: "decision must be 'approve' or 'reject'." });
+    }
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(taskRef);
+      if (!snap.exists) return { httpStatus: 404, body: { error: "Task not found." } };
+      const task = snap.data();
+      if (task.status !== "pending_department_approval") {
+        return { httpStatus: 400, body: { error: "This task is not waiting on a department approval." } };
+      }
+      const approvals = task.departmentApprovals || [];
+      const idx = approvals.findIndex(a => a.approverId === employeeId && a.status === "pending");
+      if (idx === -1) {
+        return { httpStatus: 403, body: { error: "You have no pending approval on this task." } };
+      }
+      const updatedApprovals = approvals.map((a, i) => i === idx ? { ...a } : a);
+      if (decision === "reject") {
+        updatedApprovals[idx].status = "rejected";
+        updatedApprovals[idx].respondedAt = admin.firestore.Timestamp.now();
+        updatedApprovals[idx].rejectionReason = rejectionReason || "";
+        return { httpStatus: 200, body: { success: true, status: "rejected" }, outcome: "rejected", task };
+      }
+
+      updatedApprovals[idx].status = "approved";
+      updatedApprovals[idx].respondedAt = admin.firestore.Timestamp.now();
+      updatedApprovals[idx].rejectionReason = null;
+      const allApproved = updatedApprovals.every(a => a.status === "approved");
+
+      if (!allApproved) {
+        tx.update(taskRef, { departmentApprovals: updatedApprovals, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        return { httpStatus: 200, body: { success: true, status: "pending_department_approval", message: "Your approval is recorded. Waiting on the other approver." }, outcome: "waiting" };
+      }
+      const finalAssigneeId = task.pendingAssigneeId;
+      const finalStatus = (task.hasTimer === false) ? "pending_tl_hours" : "open";
+      tx.update(taskRef, { departmentApprovals: updatedApprovals, status: finalStatus, assigneeIds: admin.firestore.FieldValue.arrayUnion(finalAssigneeId), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      return { httpStatus: 200, body: { success: true, status: finalStatus }, outcome: "completed", task, finalAssigneeId, finalStatus };
+    });
+    if (result.outcome === "rejected") {
+      await postSystemChatMessage(taskId, `❌ Cross-department assignment rejected by ${name}${rejectionReason ? `: "${rejectionReason}"` : ""}`, employeeId, name);
+      await _notify({ recipientIds: [result.task.assignedBy].filter(Boolean), type: "department_approval_rejected", title: "❌ Assignment Rejected", body: `${name} rejected your cross-department task "${result.task.title}"${rejectionReason ? `: ${rejectionReason}` : ""}`, data: { taskId }, senderId: employeeId, senderName: name });
+    } else if (result.outcome === "completed" && result.finalStatus === "pending_tl_hours") {
+      await postSystemChatMessage(taskId, "✅ Both HODs approved — waiting on the assignee's TL to set estimated hours.", employeeId, name);
+      const draftTargetInfo = await getEmployeeInfo(result.finalAssigneeId);
+      if (draftTargetInfo?.department) {
+        const tlSnap3 = await db.collection("cowork_employees").where("department", "==", draftTargetInfo.department).where("role", "==", "tl").limit(1).get();
+        if (!tlSnap3.empty) {
+          await _notify({ recipientIds: [tlSnap3.docs[0].data().employeeId], type: "department_draft_needs_hours", title: "📝 Draft Task Needs Your Hours Estimate", body: `Both HODs approved "${result.task.title}" — set the real ETC hours before it goes to your team member.`, data: { taskId }, senderId: employeeId, senderName: name });
+        }
+      }
+    } else if (result.outcome === "completed") {
+      await postSystemChatMessage(taskId, "✅ Cross-department assignment approved by both sides — task is now assigned.", employeeId, name);
+      await _notify({ recipientIds: [result.task.assignedBy, result.finalAssigneeId].filter(Boolean), type: "department_approval_completed", title: "✅ Cross-Department Task Approved", body: `Both approvals are in — "${result.task.title}" is now assigned.`, data: { taskId }, senderId: employeeId, senderName: name });
+    }
+    res.status(result.httpStatus).json(result.body);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post("/task/:taskId/department-tl-set-hours", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { hoursValue, hoursUnit } = req.body;
+    const { employeeId, role, name } = req.coworkUser;
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found." });
+    const task = snap.data();
+    if (task.status !== "pending_tl_hours") {
+      return res.status(400).json({ error: "This task is not waiting on TL hours — it may already be active." });
+    }
+    if (!task.assigneeIds?.length) {
+      return res.status(400).json({ error: "This task has no assignee yet." });
+    }
+    const targetId = task.assigneeIds[0];
+    const targetInfo = await getEmployeeInfo(targetId);
+    const callerDept = req.coworkUser.employeeData?.department || "";
+    if (role !== "tl" || !targetInfo || targetInfo.department !== callerDept) {
+      return res.status(403).json({ error: "Only the assignee's own department TL can set hours for this task." });
+    }
+
+    const val = Number(hoursValue) || 0;
+    if (val <= 0) return res.status(400).json({ error: "Enter a valid number of hours." });
+    const unit = hoursUnit || "hours";
+    const secs = val * (unit === "minutes" ? 60 : unit === "days" ? 86400 : 3600);
+
+    // Becomes a normal hasTimer:true task with a manager-preset duration —
+    // same senderTimerWindowSecs mechanism as any other task. Lands in the
+    // EXISTING "Draft" section and negotiates via the EXISTING
+    // approve-sender-timer flow — no custom logic needed for that part.
+    await taskRef.update({
+      status: "open",
+      hasTimer: true,
+      senderTimerWindowSecs: secs,
+      etcHours: secs / 3600,
+      tlHoursSetBy: employeeId,
+      tlHoursSetByName: name,
+      tlHoursSetAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await postSystemChatMessage(taskId, `⏱ ${name} (TL) set the estimated hours — task is now active.`, employeeId, name);
+    await _notify({ recipientIds: [targetId, task.assignedBy].filter(Boolean), type: "department_draft_activated", title: "✅ Task Now Active", body: `${name} set the hours — "${task.title}" is ready.`, data: { taskId }, senderId: employeeId, senderName: name });
+    res.json({ success: true, status: "open" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── 5. FORWARD ────────────────────────────────────────────────────────────────
 router.post("/task/:taskId/forward", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
@@ -791,6 +1051,20 @@ router.post("/task/:taskId/forward", verifyCoworkToken, verifyEmployeeToken, asy
     res.status(201).json({ success: true, ...result });
     // Email handled inside svc.forwardTask() via _notifyMany → sendNotificationEmail
 
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/task/:taskId/forward-budget", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const result = await svc.getForwardBudget({ parentTaskId: req.params.taskId });
+    res.json({ success: true, ...result });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.get("/task/:taskId/forward-budget", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const result = await svc.getForwardBudget({ parentTaskId: req.params.taskId });
+    res.json({ success: true, ...result });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
