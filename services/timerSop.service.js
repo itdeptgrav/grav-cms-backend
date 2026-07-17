@@ -102,6 +102,12 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
         if (!sopSnap.exists) return { ok: false, reason: "sop_config_missing" };
         const sopCfg = sopSnap.data();
 
+        // ── Admin kill-switch — checked first, before anything else runs.
+        // Every trigger path (timer pause, task auto-stop, the daily cron,
+        // the CEO test tool) goes through this one function, so this one
+        // check is enough to pause point cutting/adding for everyone.
+        if (sopCfg.timerSopEnabled === false) return { ok: false, reason: "disabled" };
+
         const dailyMinHrs = parseFloat(sopCfg.timerMinDailyHrs) || 0;
         const deficitThresholdHrs = parseFloat(sopCfg.timerDeficitThresholdHrs) || 0;
         const deficitPoints = parseFloat(sopCfg.timerDeficitPoints) || 0;
@@ -217,14 +223,14 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
             // target on a day the office is closed).
             if (!dayCfg.isOff && dailyMinHrs > 0 && deficitThresholdHrs > 0 && deficitPoints > 0 && workedHrs < dailyMinHrs) {
                 deficitAccum += (dailyMinHrs - workedHrs);
-                if (deficitAccum >= deficitThresholdHrs) {
+                while (deficitAccum >= deficitThresholdHrs) {
                     bleachesToAdd.push({
-                        type: "C4",
-                        sopName: "Timer Deficit Penalty",
+                        type: "C3",
+                        sopName: "Idle Pool Deduction",
                         folderName: "Time Tracking",
                         points: deficitPoints,
                         bleachType: "credit", // penalty — increases totalDeducted
-                        description: `Accumulated timer deficit reached ${deficitThresholdHrs}h threshold as of ${dateStr}. Worked ${Math.round(workedHrs * 60)}min / required ${Math.round(dailyMinHrs * 60)}min that day.`,
+                        description: `Idle/deficit pool reached ${deficitThresholdHrs}h threshold as of ${dateStr}. Worked ${Math.round(workedHrs * 60)}min / required ${Math.round(dailyMinHrs * 60)}min that day.`,
                         date: dateStr,
                         cutBy: "system",
                         cutByName: "System (Timer Engine)",
@@ -241,7 +247,7 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
             // deficit AND 1h overtime).
             if (overtimeThresholdHrs > 0 && overtimePoints > 0 && afterHrs > 0) {
                 overtimeAccum += afterHrs;
-                if (overtimeAccum >= overtimeThresholdHrs) {
+                while (overtimeAccum >= overtimeThresholdHrs) {
                     bleachesToAdd.push({
                         type: "C4",
                         sopName: "Overtime Reward",
@@ -303,4 +309,25 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
     }
 }
 
-module.exports = { evaluateTimerSop };
+async function evaluateTimerSopForAllEmployees() {
+    const employees = await Employee.find({
+        isActive: true,
+        biometricId: { $exists: true, $nin: [null, ""] },
+    }).select("biometricId firstName lastName").lean();
+    const results = [];
+    for (const emp of employees) {
+        const name = [emp.firstName, emp.lastName].filter(Boolean).join(" ") || emp.biometricId;
+        try {
+            const result = await evaluateTimerSop(emp.biometricId, name);
+            results.push({ employeeId: emp.biometricId, ...result });
+        } catch (e) {
+            console.error(`[timerSop] daily run failed for ${emp.biometricId}:`, e.message);
+            results.push({ employeeId: emp.biometricId, ok: false, reason: "error", message: e.message });
+        }
+    }
+    const totalBleaches = results.reduce((s, r) => s + (r.bleachesApplied?.length || 0), 0);
+    console.log(`[timerSop] daily run complete: ${employees.length} employees checked, ${totalBleaches} bleach entries applied.`);
+    return { employeeCount: employees.length, totalBleaches, results };
+}
+
+module.exports = { evaluateTimerSop, evaluateTimerSopForAllEmployees };
