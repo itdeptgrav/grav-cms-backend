@@ -206,6 +206,37 @@ async function createTask({ title, description, notes, requirements = [], assign
   const now = new Date().toISOString();
   const path = await _buildPath(parentTaskId);
 
+  // ── "On behalf of" delegation for self-assigned subtasks ──────────────────
+  // If the real requester (assignedBy, from the verified auth token) is
+  // assigning THIS subtask to THEMSELVES, and they are an assignee of the
+  // parent task (not its creator), treat this subtask as authored by the
+  // PARENT's original creator instead. Verified against real Firestore data
+  // (parent.assigneeIds / parent.assignedBy), never trusted from client
+  // input — so this can only continue a delegation chain that's already
+  // provably real, not spoof an arbitrary name.
+  let actualCreatedBy = null;
+  let actualCreatedByName = null;
+  const _requesterSelfAssigning = (assigneeIds || []).includes(assignedBy);
+  if (parentTaskId && _requesterSelfAssigning) {
+    try {
+      const parentSnap = await db.collection("cowork_tasks").doc(parentTaskId).get();
+      if (parentSnap.exists) {
+        const parent = parentSnap.data();
+        const requesterIsParentAssignee = (parent.assigneeIds || []).includes(assignedBy);
+        const requesterIsParentCreator = parent.assignedBy === assignedBy;
+        if (requesterIsParentAssignee && !requesterIsParentCreator && parent.assignedBy) {
+          actualCreatedBy = assignedBy;
+          actualCreatedByName = assignedByName || assignedBy;
+          assignedBy = parent.assignedBy;
+          assignedByName = parent.assignedByName || parent.assignedBy;
+          assignedByRole = parent.assignedByRole || assignedByRole;
+        }
+      }
+    } catch (e) {
+      console.warn("[createTask] on-behalf-of check failed, using real requester:", e.message);
+    }
+  }
+
   // rootCreatedByRole = who is the root creator for the completion review flow.
   // RULE: use what's explicitly passed (forwardTask passes parent's root role),
   //       OR the immediate creator's own role. NEVER inherit from parent automatically —
@@ -221,6 +252,8 @@ async function createTask({ title, description, notes, requirements = [], assign
     assignedBy,
     assignedByName: assignedByName || "",
     assignedByRole: assignedByRole || null,
+    actualCreatedBy,
+    actualCreatedByName,
     rootCreatedByRole: resolvedRootRole,
     assigneeIds: assigneeIds || [],
     dueDate: dueDate || null,
