@@ -16,7 +16,6 @@ const C4Config = require("../models/HR_Models/C4Config");
 const DailyAttendance = require("../models/HR_Models/Dailyattendance");
 
 
-
 // ── Quarter weights (PDF Section 03) ─────────────────────────────────────────
 const QUARTER_WEIGHTS = { 1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40 };
 
