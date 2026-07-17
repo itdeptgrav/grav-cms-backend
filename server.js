@@ -901,11 +901,6 @@ app.use(
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
-const RegisteredDepartments = require("./routes/CMS_Routes/Sales/Configuration/OrganizationDepartment/organizationDepartmentRoutes");
-app.use(
-  "/api/cms/configuration/organization-departments",
-  RegisteredDepartments,
-);
 
 // server.js
 const sizeConfigRoutes = require("./routes/CMS_Routes/Inventory/Configurations/sizeConfigRoutes")
@@ -917,6 +912,8 @@ app.use("/api/cms/measurements", measurementRoutes);
 
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
+
+app.use("/api/cms/measurement-categories", require("./routes/CMS_Routes/Configurations/measurementCategoryRoutes"));
 
 // Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
