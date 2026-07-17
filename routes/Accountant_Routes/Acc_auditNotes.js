@@ -13,6 +13,9 @@
 //   POST   /:id/resolve         — editor/admin marks "fixed"
 //   POST   /:id/verify          — viewer confirms the fix
 //   POST   /:id/reject          — viewer says "not fixed" (with reason)
+//   POST   /:id/archive         — move a resolved/verified note to the archive
+//   POST   /:id/unarchive       — restore an archived note
+//   DELETE /:id                 — permanent delete (owner only, archived only)
 //   GET    /stats               — counts by status (for badges)
 //
 // Auth: accountantAuth (all roles can read; write permissions vary by action).
@@ -45,12 +48,36 @@ async function notifyAuditNote(note, action, actor) {
     const { Acc_User } = require("../../models/Accountant_model/Acc_OrgModels");
     let messaging = null;
     try {
-      const fb = require("../../config/firebaseAdmin");
-      messaging = fb.messaging || null;
-    } catch {
+      // config/firebaseAdmin exports { db, admin } — there is NO `messaging`
+      // property on it. The old code read `fb.messaging`, got undefined, and
+      // bailed out at the null check below without ever sending a push. That
+      // is why approval notifications worked (they call admin.messaging())
+      // and audit-note notifications silently did nothing.
+      const { admin } = require("../../config/firebaseAdmin");
+      if (!admin || typeof admin.messaging !== "function") {
+        console.warn(
+          "[audit-notes] firebaseAdmin did not export a usable `admin` — push disabled",
+        );
+        return;
+      }
+      messaging = admin.messaging();
+    } catch (fbErr) {
+      console.warn(
+        "[audit-notes] Firebase Admin unavailable — push disabled:",
+        fbErr.message,
+      );
       return;
     }
-    if (!messaging) return;
+    if (!messaging) {
+      console.warn("[audit-notes] Firebase messaging is null — push disabled");
+      return;
+    }
+    if (!messaging) {
+      console.warn(
+        "[audit-notes] ✗ BAIL 2: Firebase messaging is null — push disabled",
+      );
+      return;
+    }
 
     // Decide who to notify based on the action
     // Notify EVERY active user in the org EXCEPT the person who just acted.
@@ -66,6 +93,17 @@ async function notifyAuditNote(note, action, actor) {
     const recipients = allUsers.filter(
       (u) => String(u._id) !== String(actor.userId),
     );
+    console.log(
+      `[audit-notes] ${action} by ${actor.userName} — ${allUsers.length} total users, ${recipients.length} recipients`,
+    );
+    recipients.forEach((u) => {
+      const tkCount = Array.isArray(u.fcmTokens)
+        ? u.fcmTokens.filter(Boolean).length
+        : 0;
+      console.log(
+        `[audit-notes]   → ${u.name} (${u.email}): ${tkCount} token(s)`,
+      );
+    });
 
     const ACTION_LABELS = {
       created: "New audit note",
@@ -74,6 +112,8 @@ async function notifyAuditNote(note, action, actor) {
       resolved: "Audit note marked resolved",
       verified: "Audit note verified ✓",
       rejected: "Audit note rejected — needs more work",
+      archived: "Audit note archived",
+      unarchived: "Audit note restored from archive",
     };
 
     const title = ACTION_LABELS[action] || "Audit note updated";
@@ -106,10 +146,87 @@ async function notifyAuditNote(note, action, actor) {
               fcmOptions: { link: url },
             },
           });
-        } catch {
-          /* stale token — non-fatal */
+          console.log(`[audit-notes]   ✓ push sent to ${user.name}`);
+        } catch (pushErr) {
+          console.warn(
+            `[audit-notes]   ✗ push failed for ${user.name}:`,
+            pushErr.message,
+          );
         }
       }
+    }
+  } catch (e) {
+    console.warn("[audit-notes] notification error:", e.message);
+  }
+}
+
+// Fire-and-forget push notification.
+//
+// This delegates to the SAME sender the approval workflow uses
+// (services/accountantApprovalNotifications.service.js → sendPush). That
+// function already handles: lazy Firebase acquisition, the full multi-platform
+// payload (webpush + apns + android), and pruning of stale FCM tokens.
+//
+// The earlier hand-rolled copy here sent a webpush-only, data-only message
+// tagged `type: "audit_note"`. The service worker draws notifications from
+// these data payloads, and it only recognises the approval type — so FCM
+// accepted every send and the browser rendered nothing. Reusing sendPush
+// means the payload shape can never drift from the one that works.
+async function notifyAuditNote(note, action, actor) {
+  try {
+    const { Acc_User } = require("../../models/Accountant_model/Acc_OrgModels");
+    const {
+      sendPush,
+    } = require("../../services/accountantApprovalNotifications.service");
+
+    // Everyone active in the org EXCEPT the person who just acted. Nobody
+    // needs a push telling them about their own comment.
+    const allUsers = await Acc_User.find({
+      organizationId: note.organizationId,
+      isActive: true,
+    })
+      .select("name email fcmTokens")
+      .lean();
+
+    const recipients = allUsers.filter(
+      (u) => String(u._id) !== String(actor.userId),
+    );
+
+    console.log(
+      `[audit-notes] ${action} by ${actor.userName} — ${allUsers.length} users, ${recipients.length} recipients`,
+    );
+    for (const u of recipients) {
+      const n = Array.isArray(u.fcmTokens)
+        ? u.fcmTokens.filter(Boolean).length
+        : 0;
+      console.log(`[audit-notes]   → ${u.name} (${u.email}): ${n} token(s)`);
+    }
+
+    const ACTION_LABELS = {
+      created: "New audit note",
+      commented: "New comment on audit note",
+      acknowledged: "Audit note acknowledged",
+      resolved: "Audit note marked resolved",
+      verified: "Audit note verified",
+      rejected: "Audit note rejected — needs more work",
+      archived: "Audit note archived",
+      unarchived: "Audit note restored from archive",
+    };
+
+    const APP_URL = (
+      process.env.ACCOUNTANT_APP_URL ||
+      process.env.FRONTEND_URL ||
+      "https://cms.grav.in"
+    ).replace(/\/+$/, "");
+
+    const payload = {
+      title: ACTION_LABELS[action] || "Audit note updated",
+      body: `${actor.userName}: ${note.title}`,
+      url: `${APP_URL}/accountant/audit-notes`,
+    };
+
+    for (const user of recipients) {
+      await sendPush(user, payload);
     }
   } catch (e) {
     console.warn("[audit-notes] notification error:", e.message);
@@ -126,6 +243,7 @@ router.get("/", async (req, res) => {
       targetType,
       targetId,
       companyId,
+      archived,
       page = 1,
       limit = 50,
     } = req.query;
@@ -134,6 +252,14 @@ router.get("/", async (req, res) => {
     if (companyId) filter.companyId = companyId;
     if (targetType) filter["target.type"] = targetType;
     if (targetId) filter["target.id"] = targetId;
+
+    // Archived notes are hidden unless explicitly requested. `$ne: true`
+    // rather than `false` so documents written before this field existed
+    // (which have no `archived` key at all) still show up in the active list.
+    if (archived === "true") filter.archived = true;
+    else if (archived === "all") {
+      /* no archive filter */
+    } else filter.archived = { $ne: true };
 
     const skip = (Number(page) - 1) * Number(limit);
     const [notes, total] = await Promise.all([
@@ -156,14 +282,40 @@ router.get("/stats", async (req, res) => {
   try {
     if (!orgId(req)) return res.status(401).json({ error: "No org context" });
     const { companyId } = req.query;
-    const match = { organizationId: orgId(req) };
-    if (companyId)
-      match.companyId = new (require("mongoose").Types.ObjectId)(companyId);
+    const mongoose = require("mongoose");
 
+    // aggregate() runs a RAW pipeline — unlike find(), it does NOT cast
+    // strings to ObjectId via the schema. orgId() returns a string from the
+    // JWT, so `$match: { organizationId: "6a3..." }` compares a string
+    // against an ObjectId and matches nothing. Every count came back 0.
+    const toId = (v) => {
+      if (!v) return null;
+      if (v instanceof mongoose.Types.ObjectId) return v;
+      try {
+        return new mongoose.Types.ObjectId(String(v));
+      } catch {
+        return null;
+      }
+    };
+
+    const oid = toId(orgId(req));
+    if (!oid) return res.status(400).json({ error: "Bad organization id" });
+
+    const match = { organizationId: oid };
+    const cid = toId(companyId);
+    if (cid) match.companyId = cid;
+
+    // Status counts cover ACTIVE notes only — an archived note shouldn't
+    // inflate the "3 open" badge.
     const agg = await AuditNote.aggregate([
-      { $match: match },
+      { $match: { ...match, archived: { $ne: true } } },
       { $group: { _id: "$status", count: { $sum: 1 } } },
     ]);
+
+    const archivedCount = await AuditNote.countDocuments({
+      ...match,
+      archived: true,
+    });
 
     const stats = {
       open: 0,
@@ -171,6 +323,7 @@ router.get("/stats", async (req, res) => {
       resolved: 0,
       verified: 0,
       rejected: 0,
+      archived: archivedCount,
       total: 0,
     };
     for (const r of agg) {
@@ -418,6 +571,123 @@ router.post("/:id/reject", async (req, res) => {
 
     notifyAuditNote(note, "rejected", snap);
     res.json({ note });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ── POST /:id/archive — move a settled note out of the active list ──────────
+// Only resolved or verified notes can be archived. Archiving an `open` note
+// would let someone silently bury an unresolved complaint, which defeats the
+// point of an audit trail.
+router.post("/:id/archive", async (req, res) => {
+  try {
+    if (!req.user?.permissions?.canEdit && req.user?.role !== "owner") {
+      return res
+        .status(403)
+        .json({ error: "Only editors and above can archive notes." });
+    }
+    const note = await AuditNote.findOne({
+      _id: req.params.id,
+      organizationId: orgId(req),
+    });
+    if (!note) return res.status(404).json({ error: "Note not found" });
+    if (note.archived)
+      return res.status(400).json({ error: "Note is already archived." });
+    if (!["resolved", "verified"].includes(note.status)) {
+      return res.status(400).json({
+        error: `Only resolved or verified notes can be archived. This note is '${note.status}'.`,
+      });
+    }
+
+    const snap = userSnap(req);
+    note.archived = true;
+    note.archivedByName = snap.userName;
+    note.archivedAt = new Date();
+    note.thread.push({
+      action: "archived",
+      body: req.body?.body || "",
+      ...snap,
+    });
+    note.lastActedByName = snap.userName;
+    note.lastActedAt = new Date();
+    await note.save();
+
+    notifyAuditNote(note, "archived", snap);
+    res.json({ note });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ── POST /:id/unarchive — restore to the active list ────────────────────────
+// The note keeps whatever status it had (resolved / verified) — archiving
+// never overwrote it.
+router.post("/:id/unarchive", async (req, res) => {
+  try {
+    if (!req.user?.permissions?.canEdit && req.user?.role !== "owner") {
+      return res
+        .status(403)
+        .json({ error: "Only editors and above can restore notes." });
+    }
+    const note = await AuditNote.findOne({
+      _id: req.params.id,
+      organizationId: orgId(req),
+    });
+    if (!note) return res.status(404).json({ error: "Note not found" });
+    if (!note.archived)
+      return res.status(400).json({ error: "Note is not archived." });
+
+    const snap = userSnap(req);
+    note.archived = false;
+    note.archivedByName = "";
+    note.archivedAt = undefined;
+    note.thread.push({
+      action: "unarchived",
+      body: req.body?.body || "",
+      ...snap,
+    });
+    note.lastActedByName = snap.userName;
+    note.lastActedAt = new Date();
+    await note.save();
+
+    notifyAuditNote(note, "unarchived", snap);
+    res.json({ note });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ── DELETE /:id — permanent, irreversible ───────────────────────────────────
+// OWNER ONLY. An audit note is an evidence trail: someone flagged a problem,
+// someone fixed it, someone verified it. If an editor could delete notes,
+// an editor could erase the note complaining about their own mistake.
+//
+// Requires the note be archived first — nothing gets destroyed straight from
+// the active list by a misclick.
+router.delete("/:id", async (req, res) => {
+  try {
+    if (req.user?.role !== "owner") {
+      return res
+        .status(403)
+        .json({ error: "Only the owner can permanently delete a note." });
+    }
+    const note = await AuditNote.findOne({
+      _id: req.params.id,
+      organizationId: orgId(req),
+    });
+    if (!note) return res.status(404).json({ error: "Note not found" });
+    if (!note.archived) {
+      return res.status(400).json({
+        error: "Archive the note before deleting it permanently.",
+      });
+    }
+
+    await AuditNote.deleteOne({
+      _id: note._id,
+      organizationId: orgId(req),
+    });
+    res.json({ success: true, deletedId: String(note._id) });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

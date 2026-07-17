@@ -901,11 +901,10 @@ app.use(
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
-const RegisteredDepartments = require("./routes/CMS_Routes/Sales/Configuration/OrganizationDepartment/organizationDepartmentRoutes");
-app.use(
-  "/api/cms/configuration/organization-departments",
-  RegisteredDepartments,
-);
+
+// server.js
+const sizeConfigRoutes = require("./routes/CMS_Routes/Inventory/Configurations/sizeConfigRoutes")
+app.use("/api/cms/size-configs", sizeConfigRoutes)
 
 // Measurement Routes
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
@@ -913,6 +912,8 @@ app.use("/api/cms/measurements", measurementRoutes);
 
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
+
+app.use("/api/cms/measurement-categories", require("./routes/CMS_Routes/Configurations/measurementCategoryRoutes"));
 
 // Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
@@ -947,6 +948,9 @@ app.use(
   "/api/cowork/mrf",
   require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
 );
+ 
+const pmRequestsRoutes = require("./routes/CMS_Routes/pm/pmRequestsRoutes");
+app.use("/api/cms/pm/requests", pmRequestsRoutes);
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
@@ -969,6 +973,8 @@ app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
 
 const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
 app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
+
+app.use("/api/cms/notifications", require("./routes/CMS_Routes/notificationRoutes"));
 
 // Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
@@ -1284,6 +1290,8 @@ app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
 // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
 app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
+
+app.use("/api/cowork/notifications", require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"));
 
 //new tree substack routes
 const taskTreeModule = require("./routes/task_routes/taskTree.routes.js");

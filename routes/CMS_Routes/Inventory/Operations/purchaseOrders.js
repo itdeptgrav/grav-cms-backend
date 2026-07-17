@@ -17,6 +17,7 @@ const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawIte
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const VendorEmailService = require("../../../../services/VendorEmailService");
+const NotificationService = require("../../../../services/NotificationService");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const mongoose = require("mongoose");
 
@@ -121,13 +122,13 @@ router.get("/", async (req, res) => {
       if (endDate) filter.orderDate.$lte = new Date(endDate);
     }
 
-    const purchaseOrders = await PurchaseOrder.find(filter)
-      .populate("vendor", "companyName contactPerson phone email")
-      .populate("items.rawItem", "name sku unit")
-      .populate("createdBy", "name email")
-      .populate("approvedBy", "name email")
-      .populate("payments.recordedBy", "name email")
-      .sort({ createdAt: -1 });
+  const purchaseOrders = await PurchaseOrder.find(filter)
+  .populate("vendor", "companyName contactPerson phone email bankDetails")
+  .populate("items.rawItem", "name sku unit")
+  .populate("createdBy", "name email")
+  .populate("approvedBy", "name email")
+  .populate("payments.recordedBy", "name email")
+  .sort({ createdAt: -1 });
 
     const total = await PurchaseOrder.countDocuments();
     const draft = await PurchaseOrder.countDocuments({ status: "DRAFT" });
@@ -378,7 +379,7 @@ router.get("/:id", async (req, res) => {
     const purchaseOrder = await PurchaseOrder.findById(req.params.id)
       .populate(
         "vendor",
-        "companyName contactPerson phone email address gstNumber",
+        "companyName contactPerson phone email address gstNumber bankDetails",
       )
       .populate("items.rawItem", "name sku unit description sellingPrice")
       .populate("createdBy", "name email")
@@ -404,7 +405,9 @@ router.get("/:id", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/raw-items", async (req, res) => {
   try {
-    const { search = "", limit = 50 } = req.query;
+    const { search = "", limit = 0 } = req.query;
+    // limit=0 (default) → NO limit: return the full catalog.
+    // Callers that want truncation must pass an explicit limit.
     const filter = search
       ? {
           $or: [
@@ -413,14 +416,14 @@ router.get("/data/raw-items", async (req, res) => {
           ],
         }
       : {};
-    const rawItems = await RawItem.find(filter)
-      .limit(parseInt(limit))
-      .sort({ name: 1 })
+    let query = RawItem.find(filter).sort({ name: 1 });
+    const lim = parseInt(limit);
+    if (lim > 0) query = query.limit(lim);
+    const rawItems = await query
       .select(
         "name sku category customCategory unit customUnit description sellingPrice minStock maxStock quantity status",
       )
-      .lean()
-      .sort({ name: 1 });
+      .lean();
 
     const formattedItems = rawItems.map((item) => ({
       id: item._id.toString(),
@@ -672,6 +675,14 @@ router.post("/", async (req, res) => {
       } catch (emailError) {
         console.error("Failed to send PO email (non-critical):", emailError);
       }
+
+      NotificationService.sendToRole("ceo", {
+        title: "New Purchase Order Issued",
+        body: `${poNumber} — ₹${totalAmount.toLocaleString("en-IN")} to ${vendorName || "vendor"}`,
+        type: "request",
+        url: `/ceo/dashboard/purchase-orders/${purchaseOrder._id}`,
+        tag: `po-${purchaseOrder._id}`,
+      }).catch(() => {});
     }
 
     return res.status(201).json({
@@ -1066,8 +1077,19 @@ router.patch("/:id/status", async (req, res) => {
       });
     }
 
+    const wasIssuedBefore = purchaseOrder.status === "ISSUED";
     purchaseOrder.status = status;
     if (status === "ISSUED") purchaseOrder.approvedBy = req.user.id;
+
+    if (status === "ISSUED" && !wasIssuedBefore) {
+      NotificationService.sendToRole("ceo", {
+        title: "New Purchase Order Issued",
+        body: `${purchaseOrder.poNumber} — ₹${(purchaseOrder.totalAmount || 0).toLocaleString("en-IN")} to ${purchaseOrder.vendorName || "vendor"}`,
+        type: "request",
+        url: `/ceo/dashboard/purchase-orders/${purchaseOrder._id}`,
+        tag: `po-${purchaseOrder._id}`,
+      }).catch(() => {});
+    }
 
     if (notes) {
       purchaseOrder.notes = purchaseOrder.notes
@@ -1142,24 +1164,42 @@ router.post("/:id/receive", async (req, res) => {
         0,
         +(poItem.quantity - poItem.receivedQuantity).toFixed(4),
       );
-      if (qty > pending + 0.001) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot receive ${qty} of ${poItem.itemName}. Only ${pending.toFixed(4)} pending.`,
+
+      // Extra delivery: cap received at ordered qty, record surplus separately in stock
+      const qtyToReceiveAgainstPO = Math.min(qty, pending);
+      const surplusQty = +(qty - qtyToReceiveAgainstPO).toFixed(4);
+
+      if (qtyToReceiveAgainstPO > 0) {
+        updates.push({
+          poItem,
+          rawItemId: poItem.rawItem?._id || poItem.rawItem,
+          variantId: ri.variantId || poItem.variantId,
+          variantCombination: ri.variantCombination?.length
+            ? ri.variantCombination
+            : poItem.variantCombination || [],
+          qtyInPoUnit: qtyToReceiveAgainstPO,
+          poUnit: poItem.unit,
+          unitPrice: poItem.unitPrice,
+          surplusQty: 0,
         });
       }
 
-      updates.push({
-        poItem,
-        rawItemId: poItem.rawItem?._id || poItem.rawItem,
-        variantId: ri.variantId || poItem.variantId,
-        variantCombination: ri.variantCombination?.length
-          ? ri.variantCombination
-          : poItem.variantCombination || [],
-        qtyInPoUnit: qty,
-        poUnit: poItem.unit,
-        unitPrice: poItem.unitPrice,
-      });
+      // Push any surplus as a stock-in-only entry (not counted against PO received qty)
+      if (surplusQty > 0.001) {
+        updates.push({
+          poItem,
+          rawItemId: poItem.rawItem?._id || poItem.rawItem,
+          variantId: ri.variantId || poItem.variantId,
+          variantCombination: ri.variantCombination?.length
+            ? ri.variantCombination
+            : poItem.variantCombination || [],
+          qtyInPoUnit: 0,         // not counted against PO
+          poUnit: poItem.unit,
+          unitPrice: poItem.unitPrice,
+          surplusQty,             // only added to stock
+          isSurplus: true,
+        });
+      }
     }
 
     if (!updates.length) {
@@ -1180,7 +1220,12 @@ router.post("/:id/receive", async (req, res) => {
         qtyInPoUnit,
         poUnit,
         unitPrice,
+        surplusQty,
+        isSurplus,
       } = u;
+
+      // Effective qty hitting stock = PO portion + any surplus
+      const effectiveQtyInPoUnit = qtyInPoUnit + (surplusQty || 0);
 
       const rawItem = await RawItem.findById(rawItemId);
       if (!rawItem) {
@@ -1191,26 +1236,31 @@ router.post("/:id/receive", async (req, res) => {
       const registeredUnit = rawItem.customUnit || rawItem.unit;
       const fromUnit = poUnit || registeredUnit;
 
-      let qtyInRegisteredUnit = qtyInPoUnit;
+      let qtyInRegisteredUnit = effectiveQtyInPoUnit;
       if (fromUnit !== registeredUnit) {
         qtyInRegisteredUnit = await convertQuantity(
-          qtyInPoUnit,
+          effectiveQtyInPoUnit,
           fromUnit,
           registeredUnit,
         );
       }
 
-      poItem.receivedQuantity += qtyInPoUnit;
-      poItem.pendingQuantity = Math.max(
-        0,
-        poItem.quantity - poItem.receivedQuantity,
-      );
-      poItem.status =
-        poItem.receivedQuantity >= poItem.quantity
-          ? "COMPLETED"
-          : poItem.receivedQuantity > 0
-            ? "PARTIALLY_RECEIVED"
-            : "PENDING";
+      // Only advance PO received counter for non-surplus entries
+      if (!u.isSurplus) {
+        poItem.receivedQuantity += qtyInPoUnit;
+        poItem.pendingQuantity = Math.max(
+          0,
+          poItem.quantity - poItem.receivedQuantity,
+        );
+        poItem.status =
+          poItem.receivedQuantity >= poItem.quantity
+            ? "COMPLETED"
+            : poItem.receivedQuantity > 0
+              ? "PARTIALLY_RECEIVED"
+              : "PENDING";
+      }
+
+      
 
       const previousBaseQty = rawItem.quantity;
 
@@ -1313,7 +1363,12 @@ router.post("/:id/receive", async (req, res) => {
         converted: fromUnit !== registeredUnit,
       });
 
-      totalReceivedInPoUnits += qtyInPoUnit;
+      totalReceivedInPoUnits += u.isSurplus ? 0 : qtyInPoUnit;
+      if (u.isSurplus) {
+        console.log(
+          `[receive] Surplus of ${u.surplusQty} ${poItem.unit} for ${poItem.itemName} — added to stock only, not counted against PO.`
+        );
+      }
     }
 
     purchaseOrder.deliveries.unshift({

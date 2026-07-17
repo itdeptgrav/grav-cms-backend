@@ -9,8 +9,12 @@ const RawItem  = require("../../../../models/CMS_Models/Inventory/Products/RawIt
 const Unit     = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Employee = require("../../../../models/Employee");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+const NotificationService = require("../../../../services/NotificationService");
+const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest");
 
 router.use(EmployeeAuth);
+const PM_APPROVAL_FOR_MRF =
+  String(process.env.PM_APPROVAL_FOR_MRF || "false").toLowerCase() === "true";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 function buildFullName(emp) {
@@ -267,9 +271,70 @@ router.get("/", async (req, res) => {
 
     res.json({
       success: true, mrfs, stats,
+      pmApprovalRequired: PM_APPROVAL_FOR_MRF,
       pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total/parseInt(limit)) },
     });
   } catch (e) { console.error("[MRF GET /]", e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STORE-SIDE: New Product Registration Requests (from cowork employees)
+// Registered BEFORE "/:id" — otherwise Express matches "/:id" first and
+// treats "product-requests" as an MRF id, returning nothing.
+// ═══════════════════════════════════════════════════════════════════════════
+router.get("/product-requests", async (req, res) => {
+  try {
+    const requests = await RawItemAddRequest.find({})
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ success: true, requests });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.patch("/product-requests/:id/approve", async (req, res) => {
+  try {
+    const doc = await RawItemAddRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
+
+    doc.status = "ADDED";
+    doc.resolvedBy = getActorId(req);
+    doc.resolvedAt = new Date();
+    if (req.body.storeNote) doc.storeNote = req.body.storeNote;
+    await doc.save();
+
+    NotificationService.sendToUser(doc.requestedBy, {
+      title: "Product Request Approved",
+      body: `Your requested item(s) are being added to inventory by the store.`,
+      type: "request",
+      url: "/coworking/mrf",
+      tag: `product-request-${doc._id}`,
+    }).catch(() => {});
+
+    res.json({ success: true, message: "Marked as approved", request: doc });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.patch("/product-requests/:id/reject", async (req, res) => {
+  try {
+    const doc = await RawItemAddRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
+
+    doc.status = "REJECTED";
+    doc.storeNote = req.body.note || "";
+    doc.resolvedBy = getActorId(req);
+    doc.resolvedAt = new Date();
+    await doc.save();
+
+    NotificationService.sendToUser(doc.requestedBy, {
+      title: "Product Request Rejected",
+      body: doc.storeNote ? `Reason: ${doc.storeNote}` : "Your product request was rejected.",
+      type: "request",
+      url: "/coworking/mrf",
+      tag: `product-request-${doc._id}`,
+    }).catch(() => {});
+
+    res.json({ success: true, message: "Request rejected", request: doc });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ── GET /:id ──────────────────────────────────────────────────────────────────
@@ -327,6 +392,12 @@ router.post("/", async (req, res) => {
       items:  builtItems,
     });
     await mrf.save();
+    NotificationService.sendToRole(["project_manager", "admin"], {
+      title: "New Material Request",
+      body: `${mrf.mrfNumber} — ${fullName} requested ${builtItems.length} item(s)`,
+      url: "/project-manager/dashboard/requests",
+      tag: `mrf-${mrf._id}`,
+    }).catch(() => {});
     res.status(201).json({ success: true, message: "MRF created", mrf });
   } catch (e) { console.error("[MRF POST /]", e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -375,20 +446,37 @@ router.post("/bypass", async (req, res) => {
       requestType,
       deadline: requestType === "TIME_BASED" ? new Date(deadline) : null,
       reason, priority, costCentre, projectReference,
-      status:     "APPROVED",
-      items:      builtItems.map(i => ({ ...i, itemStatus: "APPROVED" })),
-      approvedBy: actorId,
-      approvedAt: new Date(),
+      status:     PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED",
+      items:      builtItems.map(i => ({ ...i, itemStatus: PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED" })),
+      ...(PM_APPROVAL_FOR_MRF ? {} : { approvedBy: actorId, approvedAt: new Date() }),
       storeNotes: `Bypass MRF raised by ${req.user.name || "Store"}`,
     });
     await mrf.save();
-    res.status(201).json({ success: true, message: "Bypass MRF created & auto-approved", mrf });
+    NotificationService.sendToRole(["project_manager", "admin"], {
+      title: "New Material Request (On-Behalf)",
+      body: `${mrf.mrfNumber} — raised by store for ${empFullName}`,
+      url: "/project-manager/dashboard/requests",
+      tag: `mrf-${mrf._id}`,
+    }).catch(() => {});
+    res.status(201).json({
+      success: true,
+      message: PM_APPROVAL_FOR_MRF
+        ? "MRF created — awaiting PM approval before issue"
+        : "Bypass MRF created & auto-approved",
+      mrf,
+    });
   } catch (e) { console.error("[MRF POST /bypass]", e); res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ── PATCH /:id/approve ────────────────────────────────────────────────────────
 router.patch("/:id/approve", async (req, res) => {
   try {
+    if (PM_APPROVAL_FOR_MRF) {
+      return res.status(403).json({
+        success: false,
+        message: "MRF approval is handled by the Project Manager. Ask the PM to approve this request.",
+      });
+    }
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
     if (mrf.status !== "PENDING")
@@ -420,6 +508,12 @@ router.patch("/:id/approve", async (req, res) => {
 // ── PATCH /:id/reject ─────────────────────────────────────────────────────────
 router.patch("/:id/reject", async (req, res) => {
   try {
+    if (PM_APPROVAL_FOR_MRF) {
+      return res.status(403).json({
+        success: false,
+        message: "MRF rejection is handled by the Project Manager.",
+      });
+    }
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
     if (!["PENDING","APPROVED"].includes(mrf.status))
@@ -460,6 +554,15 @@ router.post("/:id/issue", async (req, res) => {
     const { items=[], storeNotes="" } = req.body;
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
+
+    // PM approval gate — issuance blocked until PM approves
+    if (PM_APPROVAL_FOR_MRF && !mrf.pmApproved) {
+      return res.status(403).json({
+        success: false,
+        message: "Awaiting PM approval — materials cannot be issued until the Project Manager approves this MRF.",
+      });
+    }
+
     if (!["APPROVED","PARTIALLY_ISSUED"].includes(mrf.status))
       return res.status(400).json({ success: false, message: `Cannot issue — status is ${mrf.status}` });
 
@@ -484,6 +587,13 @@ router.post("/:id/issue", async (req, res) => {
       mrfItem.consumedQty  = mrfItem.issuedQty - mrfItem.returnedQty;
       mrfItem.itemStatus   = "ISSUED";
       if (line.storeNotes) mrfItem.storeNotes = line.storeNotes;
+      mrfItem.issueHistory = mrfItem.issueHistory || [];
+      mrfItem.issueHistory.push({
+        issuedQty,
+        notes:      line.storeNotes || storeNotes || "",
+        recordedBy: getActorId(req),
+        recordedAt: new Date(),
+      });
     }
 
     if (storeNotes) mrf.storeNotes = storeNotes;
@@ -491,6 +601,17 @@ router.post("/:id/issue", async (req, res) => {
     const someIssued = mrf.items.some(i => i.itemStatus === "ISSUED");
     mrf.status = allIssued ? "ISSUED" : someIssued ? "PARTIALLY_ISSUED" : mrf.status;
     await mrf.save();
+
+    if (mrf.requestedFor) {
+      NotificationService.sendToUser(mrf.requestedFor, {
+        title: "Materials Issued",
+        body: `Your request ${mrf.mrfNumber} has been issued by the store.`,
+        type: "request",
+        url: "/coworking",
+        tag: `mrf-${mrf._id}`,
+      }).catch(() => {});
+    }
+
     res.json({ success: true, message: "Materials issued", mrf });
   } catch (e) { console.error("[MRF issue]", e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -528,6 +649,7 @@ router.post("/:id/items/:itemId/return", async (req, res) => {
     mrfItem.returnHistory.push({
       returnedQty: qty, notes,
       recordedBy: getActorId(req), recordedByModel: "ProjectManager",
+      recordedAt: new Date(),
     });
 
     const fullyReturned = mrfItem.returnedQty >= mrfItem.issuedQty - 0.001;
@@ -629,11 +751,14 @@ router.get("/:id/stock-check", async (req, res) => {
       success: true,
       mrf,
       itemsWithStock,
+      pmApprovalRequired: PM_APPROVAL_FOR_MRF,
     });
   } catch (err) {
     console.error("MRF stock-check error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
+
+
 
 module.exports = router;
