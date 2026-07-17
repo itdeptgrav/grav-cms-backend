@@ -172,25 +172,49 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       const targetDept = targetInfo?.department || "";
 
       if (assignerDept && targetDept && assignerDept !== targetDept) {
-        const [senderApprover, receiverApprover] = await Promise.all([
-          resolveDepartmentApprover(req.coworkUser.employeeId),
-          resolveDepartmentApprover(targetId),
-        ]);
-        if (!senderApprover) {
-          return res.status(400).json({ error: "Cannot assign — you have no manager on file to approve this cross-department task." });
+        // If the assigner is themselves the assignee's manager on file,
+        // there's no one else to approve — the gate exists to loop in a
+        // manager for a cross-department assignment, and here the assigner
+        // already IS that manager. Skip the gate (and the "no manager on
+        // file" hard-block below) entirely in this case.
+        const HrEmployee = require("../../models/Employee");
+        const targetHrEmp = await HrEmployee.findOne({ biometricId: targetId })
+          .select("primaryManager.managerId")
+          .populate("primaryManager.managerId", "biometricId")
+          .lean();
+        const assignerIsTargetsManager =
+          targetHrEmp?.primaryManager?.managerId?.biometricId === req.coworkUser.employeeId;
+
+        if (!assignerIsTargetsManager) {
+          let [senderApprover, receiverApprover] = await Promise.all([
+            resolveDepartmentApprover(req.coworkUser.employeeId),
+            resolveDepartmentApprover(targetId),
+          ]);
+
+          // No manager on file on either side → fall back to the default
+          // CoWork approver (employeeId "E000") instead of blocking the
+          // assignment outright. Only hard-blocks if E000 itself doesn't
+          // exist in cowork_employees, which shouldn't normally happen.
+          if (!senderApprover || !receiverApprover) {
+            const fallbackInfo = await getEmployeeInfo("E000");
+            if (!fallbackInfo) {
+              return res.status(400).json({ error: "Cannot assign — no manager on file to approve this cross-department task, and no default approver (E000) is configured." });
+            }
+            const fallbackApprover = { approverId: "E000", approverName: fallbackInfo.name, source: "default_fallback" };
+            if (!senderApprover) senderApprover = fallbackApprover;
+            if (!receiverApprover) receiverApprover = fallbackApprover;
+          }
+
+          departmentApprovalGate = {
+            pendingAssigneeId: targetId,
+            pendingAssigneeName: targetInfo?.name || "",
+            approvals: [
+              { approverId: senderApprover.approverId, approverName: senderApprover.approverName, side: "sender", source: senderApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+              { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+            ],
+          };
+          initialStatus = "pending_department_approval";
         }
-        if (!receiverApprover) {
-          return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this cross-department task.` });
-        }
-        departmentApprovalGate = {
-          pendingAssigneeId: targetId,
-          pendingAssigneeName: targetInfo?.name || "",
-          approvals: [
-            { approverId: senderApprover.approverId, approverName: senderApprover.approverName, side: "sender", source: senderApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
-            { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
-          ],
-        };
-        initialStatus = "pending_department_approval";
       }
     }
 
@@ -199,18 +223,40 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       && !parentTaskId && assigneeIds?.length === 1) {
       const targetId = assigneeIds[0];
       const targetInfo = await getEmployeeInfo(targetId);
-      const receiverApprover = await resolveDepartmentApprover(targetId);
-      if (!receiverApprover) {
-        return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this assignment.` });
+
+      // Same two rules as the cross-department gate above:
+      // 1) If the CEO is already this employee's manager on file, there's
+      //    no one else to approve — skip the gate entirely.
+      const HrEmployeeCeo = require("../../models/Employee");
+      const targetHrEmpCeo = await HrEmployeeCeo.findOne({ biometricId: targetId })
+        .select("primaryManager.managerId")
+        .populate("primaryManager.managerId", "biometricId")
+        .lean();
+      const ceoIsTargetsManager =
+        targetHrEmpCeo?.primaryManager?.managerId?.biometricId === req.coworkUser.employeeId;
+
+      if (!ceoIsTargetsManager) {
+        let receiverApprover = await resolveDepartmentApprover(targetId);
+
+        // 2) No manager on file → fall back to the default CoWork approver
+        // (employeeId "E000") instead of blocking the assignment outright.
+        if (!receiverApprover) {
+          const fallbackInfo = await getEmployeeInfo("E000");
+          if (!fallbackInfo) {
+            return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this assignment, and no default approver (E000) is configured.` });
+          }
+          receiverApprover = { approverId: "E000", approverName: fallbackInfo.name, source: "default_fallback" };
+        }
+
+        departmentApprovalGate = {
+          pendingAssigneeId: targetId,
+          pendingAssigneeName: targetInfo?.name || "",
+          approvals: [
+            { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+          ],
+        };
+        initialStatus = "pending_department_approval";
       }
-      departmentApprovalGate = {
-        pendingAssigneeId: targetId,
-        pendingAssigneeName: targetInfo?.name || "",
-        approvals: [
-          { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
-        ],
-      };
-      initialStatus = "pending_department_approval";
     }
 
     // ── DEADLINE-MODE TASKS: B's own department TL sets real hours ──────────

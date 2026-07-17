@@ -74,6 +74,35 @@ function _dayCfgFor(dateStr, schedule) {
     return schedule?.[dayKey] ?? { isOff: dayKey === "sunday", inTime: "09:30", outTime: "18:30" };
 }
 
+function _breakOverlapSecs(startMs, endMs, dateStr, breaks) {
+    if (!breaks || !breaks.length) return 0;
+    let overlapMs = 0;
+    for (const b of breaks) {
+        const bStart = Date.parse(`${dateStr}T${b.start}:00+05:30`);
+        const bEnd = Date.parse(`${dateStr}T${b.end}:00+05:30`);
+        if (bEnd <= bStart) continue;
+        const ovStart = Math.max(startMs, bStart);
+        const ovEnd = Math.min(endMs, bEnd);
+        if (ovEnd > ovStart) overlapMs += (ovEnd - ovStart);
+    }
+    return Math.round(overlapMs / 1000);
+}
+
+function _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMs) {
+    const officeStartMs = Date.parse(`${dateStr}T${dayCfg.inTime}:00+05:30`);
+    const officeEndMs = Date.parse(`${dateStr}T${dayCfg.outTime}:00+05:30`);
+    // Window starts at actual login — never before office start (early login
+    // doesn't inflate the target), never past office close. No login at all
+    // that day → firstStartMs is undefined → falls back to the FULL office
+    // span. Without that fallback, a total no-show would owe nothing.
+    const windowStartMs = firstStartMs != null
+        ? Math.max(officeStartMs, Math.min(firstStartMs, officeEndMs))
+        : officeStartMs;
+    const spanHrs = Math.max(0, (officeEndMs - windowStartMs) / 3600000);
+    const breakHrs = _breakOverlapSecs(windowStartMs, officeEndMs, dateStr, breaks) / 3600;
+    return Math.max(0, spanHrs - breakHrs);
+}
+
 /**
  * Main export — call this after every timer pause/stop (i.e. after every
  * cowork_work_commits write). Safe to call redundantly: it only ever acts
@@ -109,16 +138,20 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
         if (sopCfg.timerSopEnabled === false) return { ok: false, reason: "disabled" };
 
         const dailyMinHrs = parseFloat(sopCfg.timerMinDailyHrs) || 0;
+        const dailyMinPct = parseFloat(sopCfg.timerMinDailyPct) || 0;
         const deficitThresholdHrs = parseFloat(sopCfg.timerDeficitThresholdHrs) || 0;
         const deficitPoints = parseFloat(sopCfg.timerDeficitPoints) || 0;
         const overtimeThresholdHrs = parseFloat(sopCfg.timerOvertimeThresholdHrs) || 0;
         const overtimePoints = parseFloat(sopCfg.timerOvertimePoints) || 0;
+        const inactivityThresholdHrs = parseFloat(sopCfg.timerInactivityThresholdHrs) || 0;
+        const inactivityPoints = parseFloat(sopCfg.timerInactivityPoints) || 0;
 
-        if (!dailyMinHrs && !deficitThresholdHrs && !overtimeThresholdHrs) return { ok: false, reason: "not_configured" }; // not configured
+        if (!dailyMinHrs && !dailyMinPct && !deficitThresholdHrs && !overtimeThresholdHrs && !inactivityThresholdHrs) return { ok: false, reason: "not_configured" };
 
-        // ── 2. Load office schedule once ────────────────────────────────────
+        // ── 2. Load office schedule + breaks once (same doc, same read) ─────
         const officeSnap = await db.collection("cowork_settings").doc("office").get();
         const schedule = officeSnap.exists ? officeSnap.data().schedule : null;
+        const breaks = officeSnap.exists ? (officeSnap.data().breaks || []) : [];
 
         // ── 3. Load employee — biometricId, NOT the virtual employeeId ─────
         const emp = await Employee.findOne({ biometricId: employeeId });
@@ -162,8 +195,7 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
             .collection("logs")
             .get();
 
-        const secsByDate = {};      // total worked seconds per day (drives deficit)
-        const afterSecsByDate = {}; // seconds worked AFTER that day's office closing time (drives overtime)
+        const parsed = [];
         logsSnap.docs.forEach(d => {
             const data = d.data();
             // Firestore Timestamp shape varies (toMillis() on real Timestamp
@@ -181,36 +213,103 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
                 return Number.isNaN(t) ? null : t;
             })();
             if (!stoppedMs) return;
-            const secs = Number(data.secondsWorked) || 0;
-            if (secs <= 0) return;
-            const dateStr = _istDateStr(stoppedMs);
-            secsByDate[dateStr] = (secsByDate[dateStr] || 0) + secs;
+            const cumulativeSecs = Number(data.secondsWorked) || 0;
+            if (cumulativeSecs <= 0) return;
+            parsed.push({ taskId: data.taskId || "_no_task", stoppedMs, cumulativeSecs });
+        });
 
-            // Overtime = clock time OUTSIDE the office window: before opening
-            // time + after closing time (all worked time on weekly-off days).
-            // Counting both sides matters for late-night work that crosses
-            // midnight: a session ending at 00:40 lands on the NEXT day,
-            // where it's before that day's opening — still overtime.
+        const byTask = new Map();
+        parsed.forEach(p => {
+            if (!byTask.has(p.taskId)) byTask.set(p.taskId, []);
+            byTask.get(p.taskId).push(p);
+        });
+
+        const realEntries = [];
+        byTask.forEach(entries => {
+            entries.sort((a, b) => a.stoppedMs - b.stoppedMs);
+            let prevCumulative = 0;
+            entries.forEach(e => {
+                let realSecs;
+                if (e.cumulativeSecs > prevCumulative) realSecs = e.cumulativeSecs - prevCumulative;
+                else if (e.cumulativeSecs < prevCumulative) realSecs = e.cumulativeSecs;
+                else realSecs = 0;
+                if (realSecs > 0) realEntries.push({ stoppedMs: e.stoppedMs, realSecs });
+                prevCumulative = e.cumulativeSecs;
+            });
+        });
+
+        const secsByDate = {};
+        const afterSecsByDate = {};
+        realEntries.forEach(({ stoppedMs, realSecs }) => {
+            const dateStr = _istDateStr(stoppedMs);
             const dayCfg = _dayCfgFor(dateStr, schedule);
+            const startMs = stoppedMs - realSecs * 1000;
+            const breakSecs = _breakOverlapSecs(startMs, stoppedMs, dateStr, breaks);
+            const netSecs = Math.max(0, realSecs - breakSecs);
+            if (netSecs <= 0) return;
+
+            secsByDate[dateStr] = (secsByDate[dateStr] || 0) + netSecs;
+
             if (dayCfg.isOff) {
-                afterSecsByDate[dateStr] = (afterSecsByDate[dateStr] || 0) + secs;
+                afterSecsByDate[dateStr] = (afterSecsByDate[dateStr] || 0) + netSecs;
             } else {
                 const officeStartMs = Date.parse(`${dateStr}T${dayCfg.inTime}:00+05:30`);
                 const officeEndMs = Date.parse(`${dateStr}T${dayCfg.outTime}:00+05:30`);
-                const startMs = stoppedMs - secs * 1000;
-                const insideMs = Math.max(0, Math.min(stoppedMs, officeEndMs) - Math.max(startMs, officeStartMs));
-                const outsideMs = (stoppedMs - startMs) - insideMs;
+                const netStartMs = stoppedMs - netSecs * 1000;
+                const insideMs = Math.max(0, Math.min(stoppedMs, officeEndMs) - Math.max(netStartMs, officeStartMs));
+                const outsideMs = (stoppedMs - netStartMs) - insideMs;
                 if (outsideMs > 0) {
                     afterSecsByDate[dateStr] = (afterSecsByDate[dateStr] || 0) + Math.round(outsideMs / 1000);
                 }
             }
         });
 
+        const eventsSnap = await db.collection("cowork_timer_events").doc(employeeId).collection("logs").get();
+        const events = [];
+        eventsSnap.docs.forEach(d => {
+            const data = d.data();
+            const atMs = (() => {
+                const v = data.at;
+                if (!v) return null;
+                if (typeof v.toMillis === "function") return v.toMillis();
+                if (typeof v._seconds === "number") return v._seconds * 1000;
+                if (typeof v.seconds === "number") return v.seconds * 1000;
+                const t = new Date(v).getTime();
+                return Number.isNaN(t) ? null : t;
+            })();
+            if (!atMs || (data.type !== "start" && data.type !== "pause")) return;
+            events.push({ atMs, type: data.type });
+        });
+        events.sort((a, b) => a.atMs - b.atMs);
+
+        const idleSecsByDate = {};
+        const firstStartMsByDate = {}; // earliest "start" per IST day — the personalized window's opening moment
+        let openPauseMs = null;
+        events.forEach(ev => {
+            if (ev.type === "start") {
+                const dateStr = _istDateStr(ev.atMs);
+                if (firstStartMsByDate[dateStr] == null) firstStartMsByDate[dateStr] = ev.atMs;
+            }
+            if (ev.type === "pause") {
+                openPauseMs = ev.atMs;
+            } else if (ev.type === "start" && openPauseMs != null) {
+                const gapStartMs = openPauseMs, gapEndMs = ev.atMs;
+                openPauseMs = null;
+                if (gapEndMs <= gapStartMs) return;
+                const dateStr = _istDateStr(gapEndMs);
+                const breakSecs = _breakOverlapSecs(gapStartMs, gapEndMs, dateStr, breaks);
+                const idleSecs = Math.max(0, Math.round((gapEndMs - gapStartMs) / 1000) - breakSecs);
+                if (idleSecs > 0) idleSecsByDate[dateStr] = (idleSecsByDate[dateStr] || 0) + idleSecs;
+            }
+        });
+
         // ── 6. Walk each finalizable day independently ──────────────────────
         let deficitAccum = parseFloat(emp.timerDeficitAccumHrs) || 0;
         let overtimeAccum = parseFloat(emp.timerOvertimeAccumHrs) || 0;
+        let inactivityAccum = parseFloat(emp.timerInactivityAccumHrs) || 0;
         const deficitAccumBefore = deficitAccum;
         const overtimeAccumBefore = overtimeAccum;
+        const inactivityAccumBefore = inactivityAccum;
         const bleachesToAdd = []; // each carries its own `date` for correct year filing
 
         for (const dateStr of daysToFinalize) {
@@ -218,11 +317,15 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
 
             const workedHrs = (secsByDate[dateStr] || 0) / 3600;
             const afterHrs = (afterSecsByDate[dateStr] || 0) / 3600;
+            const idleHrsToday = (idleSecsByDate[dateStr] || 0) / 3600;
 
-            // Deficit — vs Daily Minimum. Skipped on weekly-off days (no
-            // target on a day the office is closed).
-            if (!dayCfg.isOff && dailyMinHrs > 0 && deficitThresholdHrs > 0 && deficitPoints > 0 && workedHrs < dailyMinHrs) {
-                deficitAccum += (dailyMinHrs - workedHrs);
+            const effectiveMinHrs = dailyMinPct > 0
+                ? (dailyMinPct / 100) * _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMsByDate[dateStr])
+                : dailyMinHrs;
+
+            const rawShortfallHrs = Math.max(0, effectiveMinHrs - workedHrs);
+            if (!dayCfg.isOff && effectiveMinHrs > 0 && deficitThresholdHrs > 0 && deficitPoints > 0 && rawShortfallHrs > 0) {
+                deficitAccum += rawShortfallHrs;
                 while (deficitAccum >= deficitThresholdHrs) {
                     bleachesToAdd.push({
                         type: "C3",
@@ -230,7 +333,7 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
                         folderName: "Time Tracking",
                         points: deficitPoints,
                         bleachType: "credit", // penalty — increases totalDeducted
-                        description: `Idle/deficit pool reached ${deficitThresholdHrs}h threshold as of ${dateStr}. Worked ${Math.round(workedHrs * 60)}min / required ${Math.round(dailyMinHrs * 60)}min that day.`,
+                        description: `Idle/deficit pool reached ${deficitThresholdHrs}h threshold as of ${dateStr}. Worked ${Math.round(workedHrs * 60)}min / required ${Math.round(effectiveMinHrs * 60)}min that day.`,
                         date: dateStr,
                         cutBy: "system",
                         cutByName: "System (Timer Engine)",
@@ -263,6 +366,25 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
                     overtimeAccum -= overtimeThresholdHrs;
                 }
             }
+
+            if (inactivityThresholdHrs > 0 && inactivityPoints > 0 && idleHrsToday > 0) {
+                inactivityAccum += idleHrsToday;
+                while (inactivityAccum >= inactivityThresholdHrs) {
+                    bleachesToAdd.push({
+                        type: "C3",
+                        sopName: "Inactivity Penalty",
+                        folderName: "Time Tracking",
+                        points: inactivityPoints,
+                        bleachType: "credit",
+                        description: `Inactivity pool reached ${inactivityThresholdHrs}h threshold as of ${dateStr}. ${Math.round(idleHrsToday * 60)}min paused-while-online that day.`,
+                        date: dateStr,
+                        cutBy: "system",
+                        cutByName: "System (Timer Engine)",
+                        cutByRole: "system",
+                    });
+                    inactivityAccum -= inactivityThresholdHrs;
+                }
+            }
         }
 
         // ── 7. File each bleach under the sopPoints year IT actually belongs to ──
@@ -285,6 +407,7 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
         // ── 8. Persist accumulators + watermark ─────────────────────────────
         emp.timerDeficitAccumHrs = +deficitAccum.toFixed(4);
         emp.timerOvertimeAccumHrs = +overtimeAccum.toFixed(4);
+        emp.timerInactivityAccumHrs = +inactivityAccum.toFixed(4);
         emp.lastFinalizedDate = daysToFinalize[daysToFinalize.length - 1];
         await emp.save();
 
@@ -298,6 +421,7 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
             bleachesApplied: bleachesToAdd,
             deficitAccum: { before: +deficitAccumBefore.toFixed(4), after: emp.timerDeficitAccumHrs },
             overtimeAccum: { before: +overtimeAccumBefore.toFixed(4), after: emp.timerOvertimeAccumHrs },
+            inactivityAccum: { before: +inactivityAccumBefore.toFixed(4), after: emp.timerInactivityAccumHrs },
             lastFinalizedDate: emp.lastFinalizedDate,
         };
 
