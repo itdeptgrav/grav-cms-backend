@@ -93,9 +93,16 @@ router.delete("/folders/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res)
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SOP ROUTES
+// SEVERITY → DEDUCTION POINTS (PDF §3.4 — C3 Conduct table)
+// Server is the source of truth: when a severity tag is sent, its points
+// value overrides anything the client sent, so the mapping can't drift.
 // ─────────────────────────────────────────────────────────────────────────────
+const VALID_SEVERITIES = ["minor", "moderate", "serious", "falsification", "idle_pool"];
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOP ROUTES
+// ────────────────────────────────────────────────────────────────────────────
 // GET /cowork/sop
 router.get("/", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
@@ -123,7 +130,11 @@ router.get("/", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
 router.post("/", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
     try {
         const { role, employeeId, name: userName } = req.coworkUser;
-        const { name, points, description, department, folderId } = req.body;
+        const { name, points, description, department, folderId, severity } = req.body;
+
+        if (severity && !VALID_SEVERITIES.includes(severity)) {
+            return res.status(400).json({ error: "Invalid severity tag." });
+        }
 
         if (!name || !points || !description || !department) {
             return res.status(400).json({ error: "name, points, description, department are required." });
@@ -147,9 +158,8 @@ router.post("/", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
         }
 
         const sop = await Sop.create({
-            name: name.trim(), points: Number(points),
-            description: description.trim(), department: department.trim(),
-            folderId: resolvedFolderId, folderName,
+            name: name.trim(), points: Number(points), severity: severity || null,
+            description: description.trim(), department: department.trim(), folderId: resolvedFolderId, folderName,
             createdBy: employeeId, createdByName: userName,
             createdByRole: role === "ceo" ? "ceo" : "tl",
             status: role === "ceo" ? "approved" : "pending",
@@ -174,10 +184,15 @@ router.patch("/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
             return res.status(403).json({ error: "TL can only edit their own SOPs." });
         }
 
-        const { name, points, description, department, folderId } = req.body;
+        const { name, points, description, department, folderId, severity } = req.body;
         if (name) sop.name = name.trim();
-        if (points) sop.points = Number(points);
-        if (description) sop.description = description.trim();
+        if (severity !== undefined) {
+            if (severity && !VALID_SEVERITIES.includes(severity)) {
+                return res.status(400).json({ error: "Invalid severity tag." });
+            }
+            sop.severity = severity || null;
+        }
+        if (points) sop.points = Number(points); if (description) sop.description = description.trim();
         if (department && role === "ceo") sop.department = department.trim();
 
         if (folderId !== undefined) {

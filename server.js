@@ -2257,6 +2257,7 @@ server.listen(PORT, () => {
           );
         }
 
+        // REPLACE
         if (_reminderSent.size > 500) _reminderSent.clear();
       } catch (e) {
         console.error("[MeetReminder cron]", e.message);
@@ -2264,4 +2265,23 @@ server.listen(PORT, () => {
     },
     5 * 60 * 1000,
   );
+
+  let _timerSopLastRunDate = null;
+  setInterval(async () => {
+    try {
+      const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+      const nowIST = new Date(Date.now() + IST_OFFSET_MS);
+      const todayIST = nowIST.toISOString().split("T")[0];
+      const hh = nowIST.getUTCHours(), mm = nowIST.getUTCMinutes();
+      const inWindow = hh === 0 && mm >= 15 && mm < 25;
+      if (!inWindow || _timerSopLastRunDate === todayIST) return;
+      _timerSopLastRunDate = todayIST;
+      const { evaluateTimerSopForAllEmployees } = require("./services/timerSop.service");
+      const result = await evaluateTimerSopForAllEmployees();
+      console.log(`[TimerSopCron] Daily run done — ${result.employeeCount} employees checked, ${result.totalBleaches} bleach entries applied.`);
+    } catch (e) {
+      console.error("[TimerSopCron]", e.message);
+    }
+  }, 5 * 60 * 1000);
+  console.log("✅ Timer SOP daily finalize cron initialized (runs ~00:15 IST)");
 });
