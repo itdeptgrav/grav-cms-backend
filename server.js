@@ -29,6 +29,7 @@ const allowedOrigins = [
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
   "https://grav-cms-dncs.vercel.app",
   "https://crm.grav.in",
+  "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev"
 ];
 const transcriptModule = require("./routes/task_routes/transcript.routes");
 
