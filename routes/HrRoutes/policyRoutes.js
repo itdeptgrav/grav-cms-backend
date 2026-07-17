@@ -23,13 +23,17 @@ const router = express.Router();
 const mongoose = require("mongoose");
 
 const Policy = require("../../models/HR_Models/Policy");
+const C4Config = require("../../models/HR_Models/C4Config");
 const Department = require("../../models/HR_Models/Departments");
 const Employee = require("../../models/Employee");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const verifyHRToken = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 const AUTO_TRIGGERS = ["absent_no_notice", "late_arrival", "early_departure"];
-const ALL_TRIGGERS = [...AUTO_TRIGGERS, "manual"];
+// Reward rule — resolves to C4 Settings' basePointsPerDay at apply time so
+// manual backfills always match what the auto engine writes.
+const REWARD_TRIGGERS = ["present_on_time"];
+const ALL_TRIGGERS = [...AUTO_TRIGGERS, ...REWARD_TRIGGERS, "manual"];
 
 // ── small helpers ────────────────────────────────────────────────────────────
 const pad2 = (n) => String(n).padStart(2, "0");
@@ -43,6 +47,252 @@ function monthRange() {
   const last = `${y}-${pad2(m + 1)}-${pad2(lastDay)}`;
   return { first, last };
 }
+
+// Local "YYYY-MM-DD" (never toISOString — it shifts back 5:30h in IST).
+function todayLocalStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// C4 CONFIG — pre-saved point values (singleton). No percentages.
+// GET  /api/hr/policy/c4-config
+// PUT  /api/hr/policy/c4-config
+// ═════════════════════════════════════════════════════════════════════════════
+router.get("/c4-config", verifyHRToken, async (req, res) => {
+  try {
+    const cfg = await C4Config.getSingleton();
+    res.json({ success: true, config: cfg });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.put("/c4-config", verifyHRToken, async (req, res) => {
+  try {
+    const cfg = await C4Config.getSingleton();
+    const NUMS = [
+      "basePointsPerDay",
+      "lateArrivalPoints",
+      "absencePoints",
+      "earlyDeparturePoints",
+      "lateThresholdMins",
+      "earlyThresholdMins",
+    ];
+    for (const f of NUMS) {
+      if (req.body[f] !== undefined && !isNaN(Number(req.body[f]))) {
+        const v = Number(req.body[f]);
+        if (v < 0)
+          return res.status(400).json({ error: `${f} cannot be negative.` });
+        cfg[f] = v;
+      }
+    }
+    if (req.body.presenceAutoCredit !== undefined)
+      cfg.presenceAutoCredit = !!req.body.presenceAutoCredit;
+    if (Array.isArray(req.body.nonWorkingStatuses))
+      cfg.nonWorkingStatuses = req.body.nonWorkingStatuses.map(String);
+    if (req.body.updatedByName)
+      cfg.updatedByName = String(req.body.updatedByName);
+    if (req.body.updatedByRole)
+      cfg.updatedByRole = String(req.body.updatedByRole);
+    cfg.updatedAt = Date.now();
+    await cfg.save();
+    res.json({ success: true, config: cfg, message: "C4 settings saved." });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PRESENCE CREDIT ENGINE — flat points, no working-day math.
+// Writes the daily base point (debit, +basePointsPerDay) into sopPoints for
+// every present-and-on-time working day, when cfg.presenceAutoCredit is on.
+//   • Dedup marker: bleach.taskId === "c4_presence" + the date.
+//   • Only credits days strictly BEFORE today (today is still in progress).
+//   • Uses updateOne ($push/$inc), deliberately bypassing employee.save() so
+//     the salary-encryption pre-save hook doesn't churn on every credit.
+//   • KNOWN LIMIT: a credit is never revoked if HR later regularizes that day
+//     to Absent — flag such days before the engine reaches them.
+// ═════════════════════════════════════════════════════════════════════════════
+const PRESENCE_MARKER = "c4_presence";
+
+async function runPresenceCredits(fromStr, toStr) {
+  const cfg = await C4Config.getSingleton();
+  const out = {
+    enabled: !!cfg.presenceAutoCredit,
+    from: fromStr,
+    to: toStr,
+    credited: 0,
+    skipped: 0,
+  };
+  if (!cfg.presenceAutoCredit) return out;
+
+  const basePerDay = Number(cfg.basePointsPerDay) || 0;
+  if (!(basePerDay > 0)) return out;
+  const nonWorking = new Set(cfg.nonWorkingStatuses || ["WO"]);
+  const lateThr = Number(cfg.lateThresholdMins) || 0;
+  const earlyThr = Number(cfg.earlyThresholdMins) || 0;
+
+  // Never credit today — the day isn't over.
+  const today = todayLocalStr();
+  const to =
+    toStr < today
+      ? toStr
+      : (() => {
+          const d = new Date(`${today}T00:00:00`);
+          d.setDate(d.getDate() - 1);
+          return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+        })();
+  if (fromStr > to) return out;
+
+  const days = await DailyAttendance.find({
+    dateStr: { $gte: fromStr, $lte: to },
+  })
+    .select(
+      "dateStr employees.biometricId employees.isLate employees.lateMins " +
+        "employees.isEarlyDeparture employees.earlyDepartureMins " +
+        "employees.systemPrediction employees.hrFinalStatus",
+    )
+    .lean();
+
+  // Already-credited set: `${bid}|${date}`
+  const emps = await Employee.find({})
+    .select(
+      "biometricId sopPoints.year sopPoints.bleaches.taskId sopPoints.bleaches.date",
+    )
+    .lean();
+  const done = new Set();
+  for (const e of emps)
+    for (const yp of e.sopPoints || [])
+      for (const b of yp.bleaches || [])
+        if (b.taskId === PRESENCE_MARKER && b.date)
+          done.add(`${e.biometricId}|${b.date}`);
+
+  for (const day of days) {
+    for (const entry of day.employees || []) {
+      const bid = entry.biometricId;
+      if (!bid) continue;
+
+      // On-time = a working day, not absent, not late/early over threshold.
+      const eff = entry.hrFinalStatus || entry.systemPrediction || "";
+      if (nonWorking.has(eff) || eff === "AB") continue;
+      const isLate = !!entry.isLate && Number(entry.lateMins || 0) > lateThr;
+      const isEarly =
+        !!entry.isEarlyDeparture &&
+        Number(entry.earlyDepartureMins || 0) > earlyThr;
+      if (isLate || isEarly) continue;
+
+      const key = `${bid}|${day.dateStr}`;
+      if (done.has(key)) {
+        out.skipped++;
+        continue;
+      }
+
+      const year = Number(day.dateStr.slice(0, 4));
+      const bleach = {
+        sopId: null,
+        policyId: null,
+        type: "C4",
+        sopName: "Present & on time",
+        folderName: "Company-wide",
+        points: basePerDay,
+        description: `Daily attendance base point (${day.dateStr})`,
+        date: day.dateStr,
+        bleachType: "debit",
+        isCredit: true,
+        taskId: PRESENCE_MARKER,
+        componentId: null,
+        cutBy: "",
+        cutByName: "System",
+        cutByRole: "system",
+        recheck: {
+          status: "none",
+          requestedAt: null,
+          requestNote: "",
+          reviewedBy: null,
+          reviewedByName: null,
+          reviewedAt: null,
+          reviewNote: "",
+        },
+      };
+
+      // Push into the matching year record; create it if absent. updateOne
+      // avoids the heavy salary pre-save hook that employee.save() triggers.
+      const r = await Employee.updateOne(
+        { biometricId: bid, "sopPoints.year": year },
+        {
+          $push: { "sopPoints.$.bleaches": bleach },
+          $inc: { "sopPoints.$.totalDeducted": -basePerDay },
+        },
+      );
+      if (!r.matchedCount) {
+        await Employee.updateOne(
+          { biometricId: bid },
+          {
+            $push: {
+              sopPoints: {
+                year,
+                totalDeducted: -basePerDay,
+                bleaches: [bleach],
+              },
+            },
+          },
+        );
+      }
+      done.add(key);
+      out.credited++;
+    }
+  }
+  return out;
+}
+
+// Hourly background pass with a 7-day lookback (self-healing: dedup makes
+// repeats free; the lookback catches late-arriving attendance docs and server
+// downtime). Global guard so hot-reloads don't stack timers.
+if (!global.__c4PresenceTimer) {
+  const kick = () => {
+    const today = todayLocalStr();
+    const d = new Date(`${today}T00:00:00`);
+    d.setDate(d.getDate() - 7);
+    const from = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    runPresenceCredits(from, today).then(
+      (r) =>
+        r.enabled &&
+        (r.credited || r.skipped) &&
+        console.log(
+          `[C4 presence] credited=${r.credited} skipped=${r.skipped} (${r.from}→${r.to})`,
+        ),
+      (e) => console.error("[C4 presence] error:", e.message),
+    );
+  };
+  global.__c4PresenceTimer = setInterval(kick, 60 * 60 * 1000);
+  setTimeout(kick, 30 * 1000); // first pass shortly after boot
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// C4 PRESENCE — manual run (for testing / backfill beyond the 7-day lookback)
+// POST /api/hr/policy/c4-presence-run   body: { from?, to? }  (YYYY-MM-DD)
+// ═════════════════════════════════════════════════════════════════════════════
+router.post("/c4-presence-run", verifyHRToken, async (req, res) => {
+  try {
+    const today = todayLocalStr();
+    const d = new Date(`${today}T00:00:00`);
+    d.setDate(d.getDate() - 7);
+    const defFrom = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    const from = (req.body.from || defFrom).slice(0, 10);
+    const to = (req.body.to || today).slice(0, 10);
+    const r = await runPresenceCredits(from, to);
+    res.json({
+      success: true,
+      ...r,
+      message: r.enabled
+        ? `Credited ${r.credited} day(s); ${r.skipped} already credited.`
+        : "Auto-credit is OFF — enable it in C4 Settings first.",
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ═════════════════════════════════════════════════════════════════════════════
 // DEPARTMENTS (for the scope dropdown on the policy form)
@@ -174,6 +424,11 @@ router.get("/points-summary", verifyHRToken, async (req, res) => {
         };
         ex.count += 1;
         catalogByType[t].set(name, ex);
+
+        // Daily presence credits stay in the totals/score but are excluded
+        // from the activity feed — hundreds of identical "+N Present" rows
+        // would bury every real event.
+        if (b.taskId === "c4_presence") continue;
 
         recent.push({
           biometricId: e.biometricId,
@@ -436,12 +691,21 @@ router.post("/", verifyHRToken, async (req, res) => {
     if (points === undefined || points === null || isNaN(Number(points)))
       return res.status(400).json({ error: "Valid points value is required." });
 
-    // Reward (debit) policies can never be auto-detected → force manual trigger.
+    // Direction constrains which rules make sense:
+    //   Reward (debit)  → "manual" or the predefined "present_on_time".
+    //   Penalty (credit) → attendance triggers or "manual" — never a reward rule.
     const finalBleachType = bleachType === "debit" ? "debit" : "credit";
     const reqTrigger = ALL_TRIGGERS.includes(triggerKey)
       ? triggerKey
       : "manual";
-    const finalTrigger = finalBleachType === "debit" ? "manual" : reqTrigger;
+    const finalTrigger =
+      finalBleachType === "debit"
+        ? REWARD_TRIGGERS.includes(reqTrigger)
+          ? reqTrigger
+          : "manual"
+        : REWARD_TRIGGERS.includes(reqTrigger)
+          ? "manual"
+          : reqTrigger;
 
     let depId = null;
     let depName = "";
@@ -519,8 +783,18 @@ router.patch("/:id", verifyHRToken, async (req, res) => {
     if (bleachType === "credit" || bleachType === "debit")
       policy.bleachType = bleachType;
 
-    // A reward can never auto-detect — keep its trigger manual no matter what.
-    if (policy.bleachType === "debit") policy.triggerKey = "manual";
+    // Keep direction and rule consistent:
+    //   reward → "manual" or "present_on_time"; penalty → never a reward rule.
+    if (
+      policy.bleachType === "debit" &&
+      !REWARD_TRIGGERS.includes(policy.triggerKey)
+    )
+      policy.triggerKey = "manual";
+    if (
+      policy.bleachType === "credit" &&
+      REWARD_TRIGGERS.includes(policy.triggerKey)
+    )
+      policy.triggerKey = "manual";
 
     if (scope !== undefined) {
       if (scope === "department") {
@@ -775,8 +1049,44 @@ router.post("/apply", verifyHRToken, async (req, res) => {
           "This policy has already been recorded for this employee on this date.",
       });
 
-    const points = Number(policy.points) || 0;
     const isReward = policy.bleachType === "debit";
+    const isPresenceReward =
+      isReward && policy.triggerKey === "present_on_time";
+
+    let points;
+    let rateNote = "";
+    let taskIdMarker = null;
+    if (isPresenceReward) {
+      // Manual BACKFILL of the daily base point for one day the auto engine
+      // missed. Points come LIVE from C4 Settings so a backfill always writes
+      // exactly what the engine would have. Cross-dedup via the engine's own
+      // "c4_presence" marker — neither side can double-credit a day.
+      const cfg = await C4Config.getSingleton();
+      points = Number(cfg.basePointsPerDay) || 0;
+      if (!(points > 0))
+        return res.status(400).json({
+          error:
+            "basePointsPerDay is 0 in C4 Settings — set the base point first.",
+        });
+      const alreadyCredited = (employee.sopPoints || []).some((yp) =>
+        (yp.bleaches || []).some(
+          (b) => b.taskId === "c4_presence" && b.date === date,
+        ),
+      );
+      if (alreadyCredited)
+        return res.status(409).json({
+          error: `This day (${date}) is already credited — by the auto engine or a previous manual apply.`,
+        });
+      taskIdMarker = "c4_presence";
+      rateNote = ` — manual backfill of the daily base point (${date})`;
+    } else {
+      points = Number(policy.points) || 0;
+      if (!(points > 0))
+        return res.status(400).json({
+          error:
+            "This policy has 0 points — nothing would be applied. Set a points value on the policy first.",
+        });
+    }
     // Penalty (credit) ADDS to the penalty score; reward (debit) SUBTRACTS.
     const signedDelta = isReward ? -points : points;
 
@@ -791,10 +1101,12 @@ router.post("/apply", verifyHRToken, async (req, res) => {
           : "Company-wide",
       points,
       description:
-        (reason && reason.trim()) || policy.description || policy.name,
+        ((reason && reason.trim()) || policy.description || policy.name) +
+        rateNote,
       date,
       bleachType: isReward ? "debit" : "credit",
       isCredit: isReward,
+      taskId: taskIdMarker, // "c4_presence" for backfills; null otherwise
       cutBy: "",
       cutByName: cutByName || "HR Manager",
       cutByRole: cutByRole || "hr_manager",
