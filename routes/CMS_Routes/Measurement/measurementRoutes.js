@@ -1132,7 +1132,7 @@ router.get("/:measurementId", async (req, res) => {
     const measurement = await Measurement.findById(measurementId)
       .populate({
         path: "employeeMeasurements.products.productId",
-        select: "name reference measurements genderCategory",
+        select: "name reference measurements genderCategory category",
       })
       .populate("convertedBy", "name email")
       .lean();
