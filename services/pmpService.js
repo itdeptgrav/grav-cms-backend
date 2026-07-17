@@ -2,8 +2,8 @@
 /**
  * pmpService.js — PMP Score Calculation Engine
  *
- * Handles: C1, C2, Pace, Annual, Projected, Gap, Flags
- * C3 = 0, C4 = 0 (not yet implemented — hardcoded)
+ * Handles: C1, C2, C3, C4 (real %, via C4Config + DailyAttendance), Pace/Base
+ * Score, Annual, Projected, Gap, Flags.
  *
  * PDF Reference: CW-DEV-PMP-01 v1.0 June 2026
  */
@@ -12,6 +12,8 @@ const { db, admin } = require("../config/firebaseAdmin");
 const { getBandMaxForEmployee } = require("../models/BandConfig");
 const c1Svc = require("./c1Service");
 const Employee = require("../models/Employee");
+const C4Config = require("../models/HR_Models/C4Config");
+const DailyAttendance = require("../models/HR_Models/Dailyattendance");
 
 
 
@@ -159,7 +161,8 @@ async function computeC2ForEmployee(employeeId) {
     const tasks = snap.docs.map(d => d.data()).filter(t => t.status !== "cancelled");
 
     let ptsEarned = 0;
-    let ptsPastDeadline = 0;
+    let ptsAssigned = 0;      // PDF denominator — every assigned goal point, deadline irrelevant
+    let ptsPastDeadline = 0;  // unchanged — kept for API compatibility, no live consumer now
     const taskBreakdown = [];
 
     tasks.forEach(t => {
@@ -171,6 +174,7 @@ async function computeC2ForEmployee(employeeId) {
         if (activities.length === 0) {
             const dueDate = t.dueDate || t.fixedDeadline || null;
             const isDeadlinePast = dueDate ? new Date(dueDate).getTime() <= now : false;
+            ptsAssigned += maxPts; // assigned counts immediately, regardless of deadline
             if (isDeadlinePast || isDone) ptsPastDeadline += maxPts;
             if (isDone) ptsEarned += maxPts;
             taskBreakdown.push({
@@ -186,8 +190,8 @@ async function computeC2ForEmployee(employeeId) {
         // ── Component-level scoring ───────────────────────────────────────────────
         let taskEarned = 0;
         let taskMeasurable = 0;
+        let taskAssigned = 0;
         const compBreakdown = [];
-
         activities.forEach(comp => {
             // ── GUARD 2: missing comp.points → treat as 0 ─────────────────────────
             const pts = Number(comp.points) || 0;
@@ -203,9 +207,10 @@ async function computeC2ForEmployee(employeeId) {
                 ? new Date(comp.deadline).getTime() <= now
                 : false;
 
+            taskAssigned += pts; // assigned counts immediately, regardless of deadline
+
             // Measurable = comp deadline passed OR already completed early
-            const measurable = compDeadlinePast || compDone;
-            if (measurable) taskMeasurable += pts;
+            const measurable = compDeadlinePast || compDone; if (measurable) taskMeasurable += pts;
 
             // Earned = done AND not late
             const earned = (compDone && !compLate) ? pts : 0;
@@ -224,6 +229,7 @@ async function computeC2ForEmployee(employeeId) {
 
         ptsEarned += taskEarned;
         ptsPastDeadline += taskMeasurable;
+        ptsAssigned += taskAssigned;
 
         taskBreakdown.push({
             taskId: t.taskId,
@@ -238,28 +244,28 @@ async function computeC2ForEmployee(employeeId) {
         });
     });
 
-    if (ptsPastDeadline === 0) {
+    if (ptsAssigned === 0) {
         return {
             c2Net: null, c2Score: null,
-            ptsEarned: 0, ptsPastDeadline: 0,
+            ptsEarned: 0, ptsAssigned: 0, ptsPastDeadline: 0,
             c2Max, taskCount: tasks.length, tasks: taskBreakdown,
         };
     }
 
-    const c2Score = ptsEarned / ptsPastDeadline;
-    const c2Net = +(c2Score * c2Max).toFixed(2);
+    const c2Score = ptsEarned / ptsAssigned; // PDF: earned / total assigned, deadline irrelevant
+    const c2Net = +(c2Score * 100).toFixed(2); // 0-100%, per PDF
 
     return {
         c2Net,
         c2Score: +c2Score.toFixed(4),
         ptsEarned: +ptsEarned.toFixed(2),
+        ptsAssigned: +ptsAssigned.toFixed(2),
         ptsPastDeadline: +ptsPastDeadline.toFixed(2),
         c2Max,
         taskCount: tasks.length,
         tasks: taskBreakdown,
     };
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // PACE SCORE — PRIMARY METRIC
 // PDF: Pace = (C1 + C2_pts_earned + C3 + C4) ÷ (C1_max + C2_pts_past_deadline) × 100
@@ -312,85 +318,81 @@ async function computeC3ForEmployee(employeeId, quarter, year) {
     };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// C4 — quarter-total attendance percentage.
+// Base Points = workingDayCount × basePointsPerDay (dynamic, from C4Config).
+// Penalty     = sum of every day's penalty this quarter (absent/late/early-
+//               departure, flat points from C4Config) — summed straight,
+//               not capped per day.
+// Final Points = Base Points − Penalty.
+// C4%          = (Final Points ÷ Base Points) × 100.
+// A day counts as "working" unless its effective status is listed in
+// C4Config.nonWorkingStatuses (default just "WO").
+// Returns c4Net: null if there were no working days at all this quarter.
+// ─────────────────────────────────────────────────────────────────────────────
 async function computeC4ForEmployee(employeeId, quarter, year) {
-    const emp = await Employee.findOne({ biometricId: employeeId }).lean();
-    if (!emp) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
-
-    const yearData = emp.sopPoints?.find(sp => sp.year === year);
-    if (!yearData) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+    const cfg = await C4Config.getSingleton();
+    const basePoints = Number(cfg.basePointsPerDay) || 0;
+    const nonWorking = new Set(cfg.nonWorkingStatuses || ["WO"]);
+    const lateThreshold = Number(cfg.lateThresholdMins) || 0;
+    const earlyThreshold = Number(cfg.earlyThresholdMins) || 0;
 
     const qStartMonth = (quarter - 1) * 3 + 1;
     const qEndMonth = qStartMonth + 2;
+    const pad = n => String(n).padStart(2, "0");
+    const qStartDateStr = `${year}-${pad(qStartMonth)}-01`;
+    const qEndDay = new Date(year, qEndMonth, 0).getDate();
+    const qEndDateStr = `${year}-${pad(qEndMonth)}-${pad(qEndDay)}`;
 
-    let totalDeductions = 0;
-    let breachCount = 0;
+    const days = await DailyAttendance.find(
+        { dateStr: { $gte: qStartDateStr, $lte: qEndDateStr }, "employees.biometricId": employeeId },
+        { dateStr: 1, "employees.$": 1 },
+    ).lean();
+
+    let workingDayCount = 0;
+    let totalPenalty = 0;
     const breaches = [];
 
-    yearData.bleaches.forEach(b => {
-        if (b.type !== "C4") return; // only attendance deductions
-        if (b.bleachType !== "credit") return; // only penalties
-        if (b.recheck?.status === "confirmed") return; // skip reversed entries
-        if (!b.date) return;
+    for (const doc of days) {
+        const entry = doc.employees?.[0];
+        if (!entry) continue;
 
-        const month = parseInt(b.date.slice(5, 7), 10);
-        if (month < qStartMonth || month > qEndMonth) return;
+        const effStatus = entry.hrFinalStatus || entry.systemPrediction;
+        if (nonWorking.has(effStatus)) continue;
 
-        totalDeductions = +(totalDeductions + Number(b.points)).toFixed(2);
-        breachCount++;
-        breaches.push({
-            sopName: b.sopName,
-            points: b.points,
-            date: b.date,
-            cutByName: b.cutByName,
-        });
-    });
+        workingDayCount++;
 
-    return {
-        c4Net: +(0 - totalDeductions).toFixed(2),
-        totalDeductions,
-        breachCount,
-        breaches,
-    };
-}
-async function computeC4ForEmployee(employeeId, quarter, year) {
-    const emp = await Employee.findOne({ biometricId: employeeId }).lean();
-    if (!emp) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+        let penalty = 0;
+        const reasons = [];
+        if (effStatus === "AB") {
+            penalty += Number(cfg.absencePoints) || 0;
+            reasons.push("absent");
+        } else {
+            if (entry.isLate && entry.lateMins > lateThreshold) {
+                penalty += Number(cfg.lateArrivalPoints) || 0;
+                reasons.push(`late (${entry.lateMins}min)`);
+            }
+            if (entry.isEarlyDeparture && entry.earlyDepartureMins > earlyThreshold) {
+                penalty += Number(cfg.earlyDeparturePoints) || 0;
+                reasons.push(`early departure (${entry.earlyDepartureMins}min)`);
+            }
+        }
 
-    const yearData = emp.sopPoints?.find(sp => sp.year === year);
-    if (!yearData) return { c4Net: 0, totalDeductions: 0, breachCount: 0, breaches: [] };
+        totalPenalty += penalty;
+        if (reasons.length > 0) {
+            breaches.push({ date: doc.dateStr, status: effStatus, reasons: reasons.join(", "), penalty });
+        }
+    }
 
-    const qStartMonth = (quarter - 1) * 3 + 1;
-    const qEndMonth = qStartMonth + 2;
+    if (workingDayCount === 0) {
+        return { c4Net: null, workingDays: 0, totalBasePoints: 0, totalPenalty: 0, finalPoints: 0, breachCount: breaches.length, breaches };
+    }
 
-    let totalDeductions = 0;
-    let breachCount = 0;
-    const breaches = [];
+    const totalBasePoints = +(workingDayCount * basePoints).toFixed(4);
+    const finalPoints = +(totalBasePoints - totalPenalty).toFixed(4);
+    const c4Net = totalBasePoints > 0 ? +((finalPoints / totalBasePoints) * 100).toFixed(2) : null;
 
-    yearData.bleaches.forEach(b => {
-        if (b.type !== "C4") return; // only attendance deductions
-        if (b.bleachType !== "credit") return; // only penalties
-        if (b.recheck?.status === "confirmed") return; // skip reversed entries
-        if (!b.date) return;
-
-        const month = parseInt(b.date.slice(5, 7), 10);
-        if (month < qStartMonth || month > qEndMonth) return;
-
-        totalDeductions = +(totalDeductions + Number(b.points)).toFixed(2);
-        breachCount++;
-        breaches.push({
-            sopName: b.sopName,
-            points: b.points,
-            date: b.date,
-            cutByName: b.cutByName,
-        });
-    });
-
-    return {
-        c4Net: +(0 - totalDeductions).toFixed(2),
-        totalDeductions,
-        breachCount,
-        breaches,
-    };
+    return { c4Net, workingDays: workingDayCount, totalBasePoints, totalPenalty: +totalPenalty.toFixed(4), finalPoints, breachCount: breaches.length, breaches };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -430,47 +432,26 @@ async function getSOPBreakdown(employeeId, quarter, year) {
     return totals;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RAW QUARTER SCORE
-// PDF: Quarterly Score = C1 + C2 + C3 + C4
-// ─────────────────────────────────────────────────────────────────────────────
-function computeQuarterScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
-    return +((c1Net || 0) + (c2Net || 0) + c3 + c4).toFixed(2);
-}
-
-function computeBaseScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
-    const components = [c1Net, c2Net].filter(v => v !== null && v !== undefined);
+function computeBaseScore({ c1Net, c2Net, c4Net, c3 = 0 }) {
+    const components = [c1Net, c2Net, c4Net].filter(v => v !== null && v !== undefined);
     const avg = components.length > 0
         ? components.reduce((s, v) => s + v, 0) / components.length
-        : 0; // no C1/C2 data yet — contributes nothing to the average itself
-    const adjustment = (c3 || 0) + (c4 || 0);
-    // Truly nothing to show only when there's no C1/C2 data AND no C3/C4
-    // deduction either — a real conduct/attendance hit should still surface
-    // even in a quarter with no tasks or goals yet.
-    if (components.length === 0 && adjustment === 0) return null;
-    return +(avg + adjustment).toFixed(2);
+        : 0;
+    if (components.length === 0 && (c3 || 0) === 0) return null;
+    return +(avg + (c3 || 0)).toFixed(2);
 }
 
 
-function computePaceScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
-    return computeBaseScore({ c1Net, c2Net, c3, c4 });
+function computePaceScore({ c1Net, c2Net, c4Net, c3 = 0 }) {
+    return computeBaseScore({ c1Net, c2Net, c4Net, c3 });
 }
 
-function computeQuarterScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
-    return computeBaseScore({ c1Net, c2Net, c3, c4 });
+function computeQuarterScore({ c1Net, c2Net, c4Net, c3 = 0 }) {
+    return computeBaseScore({ c1Net, c2Net, c4Net, c3 });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RAW QUARTER SCORE
-// PDF: Quarterly Score = C1 + C2 + C3 + C4
-// ─────────────────────────────────────────────────────────────────────────────
-function computeQuarterScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
-    return +((c1Net || 0) + (c2Net || 0) + c3 + c4).toFixed(2);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ANNUAL SCORES — Live + Projected
-// PDF: Annual = (Q1×10% + Q2×20% + Q3×30% + Q4×40%) ÷ weights_used
+// ANNUAL SCORES — Live + Projected// PDF: Annual = (Q1×10% + Q2×20% + Q3×30% + Q4×40%) ÷ weights_used
 //      Only STARTED quarters included — future quarters EXCLUDED.
 // ─────────────────────────────────────────────────────────────────────────────
 async function computeAnnualScores(employeeId, year) {
@@ -501,31 +482,30 @@ async function computeAnnualScores(employeeId, year) {
 
         const c1Data = await computeC1ForQuarter(employeeId, q, year);
         const c3Data = await computeC3ForEmployee(employeeId, q, year);
+        const c4Data = await computeC4ForEmployee(employeeId, q, year);
         const rawScore = computeQuarterScore({
             c1Net: c1Data.c1Net,
             c2Net: c2Data.c2Net,
+            c4Net: c4Data.c4Net,
             c3: c3Data.c3Net,
         });
 
         weightUsed += weight;
 
         if (q < currentQ) {
-            // Closed quarter — use actual score
             liveSum += rawScore * weight;
             projSum += rawScore * weight;
             quarters.push({
                 quarter: q, score: rawScore, status: "closed", weight,
-                c1: c1Data.c1Net, c2: c2Data.c2Net, c3: c3Data.c3Net,
+                c1: c1Data.c1Net, c2: c2Data.c2Net, c3: c3Data.c3Net, c4: c4Data.c4Net,
             });
         } else {
-            // Current (live) quarter
             liveSum += rawScore * weight;
 
-            // Projected: assume current rate (including today's actual C3)
-            // holds for the rest of the quarter.
             const projScore = computeQuarterScore({
                 c1Net: c1Data.c1Net,
                 c2Net: c2Data.c2Net,
+                c4Net: c4Data.c4Net,
                 c3: c3Data.c3Net,
             });
             projSum += projScore * weight;
@@ -533,10 +513,11 @@ async function computeAnnualScores(employeeId, year) {
             quarters.push({
                 quarter: q, score: rawScore, projectedScore: projScore,
                 status: "live", weight, dayInQuarter: dayInQ,
-                c1: c1Data.c1Net, c2: c2Data.c2Net, c3: c3Data.c3Net,
+                c1: c1Data.c1Net, c2: c2Data.c2Net, c3: c3Data.c3Net, c4: c4Data.c4Net,
             });
         }
     }
+
 
     const liveAnnual = weightUsed > 0 ? +((liveSum / weightUsed)).toFixed(2) : null;
     const projectedAnnual = weightUsed > 0 ? +((projSum / weightUsed)).toFixed(2) : null;
@@ -683,17 +664,19 @@ async function getDashboardData(employeeId, quarter, year) {
     ]);
 
     const c3 = c3Data.c3Net;
-    const c4 = c4Data.c4Net;
+    const c4Net = c4Data.c4Net;
 
     const pace = computePaceScore({
         c1Net: c1Data.c1Net,
         c2Net: c2Data.c2Net,
+        c4Net,
         c3,
     });
 
     const rawQuarterScore = computeQuarterScore({
         c1Net: c1Data.c1Net,
         c2Net: c2Data.c2Net,
+        c4Net,
         c3,
     });
 
@@ -711,11 +694,11 @@ async function getDashboardData(employeeId, quarter, year) {
     const paceComponents = [
         (c1Data.c1Net !== null && c1Data.c1Net !== undefined) ? { label: "C1%", value: c1Data.c1Net } : null,
         (c2Data.c2Net !== null && c2Data.c2Net !== undefined) ? { label: "C2%", value: c2Data.c2Net } : null,
+        (c4Net !== null && c4Net !== undefined) ? { label: "C4%", value: c4Net } : null,
     ].filter(Boolean);
     const paceFormula = paceComponents.length > 0
-        ? `(${paceComponents.map(p => p.label).join(" + ")}) / ${paceComponents.length} − C3%  ·  C4 excluded (not built yet)`
+        ? `(${paceComponents.map(p => p.label).join(" + ")}) / ${paceComponents.length} − C3%`
         : "Not enough data yet";
-
     return {
         employeeId,
         quarter,
@@ -752,12 +735,14 @@ async function getDashboardData(employeeId, quarter, year) {
         },
         c4: {
             net: c4Data.c4Net,
-            totalDeductions: c4Data.totalDeductions,
+            workingDays: c4Data.workingDays,
+            totalBasePoints: c4Data.totalBasePoints,
+            totalPenalty: c4Data.totalPenalty,
+            finalPoints: c4Data.finalPoints,
             breachCount: c4Data.breachCount,
             breaches: c4Data.breaches,
             sopPts: sopBreakdown.c4,
-        },
-        // ── Pace ──────────────────────────────────────────────────────────────────
+        },        // ── Pace ──────────────────────────────────────────────────────────────────
         pace: {
             score: pace,
             rating: getRating(pace),
