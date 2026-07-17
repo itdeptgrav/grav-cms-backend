@@ -27,6 +27,10 @@ const TRIGGER_KEYS = [
   "absent_no_notice",
   "late_arrival",
   "early_departure",
+  // Reward rule: the daily base point (C4 Settings basePointsPerDay).
+  // Auto-credited hourly by the presence engine; a policy with this trigger
+  // lets HR manually backfill a day the engine missed.
+  "present_on_time",
   "manual",
 ];
 
