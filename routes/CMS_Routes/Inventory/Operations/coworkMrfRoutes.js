@@ -19,6 +19,9 @@ const MRF      = require("../../../../models/CMS_Models/Inventory/Operations/MRF
 const RawItem  = require("../../../../models/CMS_Models/Inventory/Products/RawItem")
 const Unit     = require("../../../../models/CMS_Models/Inventory/Configurations/Unit")
 const Employee = require("../../../../models/Employee")
+const NotificationService = require("../../../../services/NotificationService")
+const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest")
+
 
 const {
   verifyCoworkToken,
@@ -161,6 +164,20 @@ async function resolveEmployeeId(biometricId) {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /data/raw-items
 // ─────────────────────────────────────────────────────────────────────────────
+router.get("/data/categories", async (req, res) => {
+  try {
+    const categories = await RawItem.distinct("category")
+    res.json({ success: true, categories: categories.filter(Boolean).sort() })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
+router.get("/data/units", async (req, res) => {
+  try {
+    const units = await Unit.distinct("name")
+    res.json({ success: true, units: units.filter(Boolean).sort() })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
 router.get("/data/raw-items", async (req, res) => {
   try {
     const { search="" } = req.query
@@ -281,6 +298,15 @@ router.post("/", async (req, res) => {
     })
 
     await mrf.save()
+
+    NotificationService.sendToRole(["project_manager", "store_manager", "admin"], {
+      title: "New Material Request",
+      body: `${mrf.mrfNumber} — ${fullName || req.user.name} requested ${builtItems.length} item(s)`,
+      type: "request",
+      url: "/project-manager/dashboard/requests",
+      tag: `mrf-${mrf._id}`,
+    }).catch(() => {})
+
     res.status(201).json({ success:true, message:"MRF created", mrf })
   } catch(err) {
     console.error("[CoworkMRF POST /]", err)
@@ -309,6 +335,132 @@ router.patch("/:id/cancel", async (req, res) => {
     res.json({ success:true, message:"MRF cancelled", mrf })
   } catch(err) {
     res.status(500).json({ success:false, message:err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /product-requests — employee's own raw-item add requests
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/product-requests", async (req, res) => {
+  try {
+    const emp = await resolveEmployeeId(req.user.id)
+    if (!emp) return res.json({ success: true, requests: [] })
+    const requests = await RawItemAddRequest.find({ requestedBy: emp._id })
+      .sort({ createdAt: -1 }).lean()
+    res.json({ success: true, requests })
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /product-requests — request the store to register new raw item(s)
+// Body: { products: [{ itemName, category, unit, notes, variants: [{attributes:[{name,value}]}] }] }
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/product-requests", async (req, res) => {
+  try {
+    const { products } = req.body
+    if (!Array.isArray(products) || !products.length)
+      return res.status(400).json({ success: false, message: "At least one product is required" })
+
+    const cleaned = products
+      .filter(p => p.itemName?.trim())
+      .map(p => ({
+        itemName: p.itemName.trim(),
+        category: p.category?.trim() || "",
+        unit:     p.unit?.trim() || "",
+        notes:    p.notes?.trim() || "",
+        variants: Array.isArray(p.variants)
+          ? p.variants
+              .filter(v => Array.isArray(v.attributes) && v.attributes.some(a => a.name?.trim() && a.value?.trim()))
+              .map(v => ({ attributes: v.attributes.filter(a => a.name?.trim() && a.value?.trim()) }))
+          : [],
+      }))
+    if (!cleaned.length)
+      return res.status(400).json({ success: false, message: "No valid product entries found" })
+
+    const emp = await resolveEmployeeId(req.user.id)
+    if (!emp) return res.status(404).json({ success: false, message: "Your HR record not found. Contact HR." })
+
+    const reqDoc = new RawItemAddRequest({
+      requestedBy:     emp._id,
+      requestedByName: buildFullName(emp) || req.user.name || "",
+      requestedByDept: emp.department || "",
+      products:        cleaned,
+    })
+    await reqDoc.save()
+
+    NotificationService.sendToRole(["store_manager", "admin"], {
+      title: "New Product Registration Request",
+      body: `${reqDoc.requestedByName} requested ${cleaned.length} new item(s) be added to inventory`,
+      type: "request",
+      url: "/store/dashboard/product-requests",
+      tag: `product-request-${reqDoc._id}`,
+    }).catch(() => {})
+
+    res.status(201).json({ success: true, message: "Request sent to store", request: reqDoc })
+  } catch (err) {
+    console.error("[CoworkMRF product-requests POST]", err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+router.get("/product-requests", async (req, res) => {
+  try {
+    const emp = await resolveEmployeeId(req.user.id)
+    if (!emp) return res.json({ success: true, requests: [] })
+    const requests = await RawItemAddRequest.find({ requestedBy: emp._id })
+      .sort({ createdAt: -1 }).lean()
+    res.json({ success: true, requests })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
+// Body: { products: [{ itemName, category, unit, notes, attributes:[{name,values:[]}] }] }
+router.post("/product-requests", async (req, res) => {
+  try {
+    const { products } = req.body
+    if (!Array.isArray(products) || !products.length)
+      return res.status(400).json({ success: false, message: "At least one product is required" })
+
+    const cleaned = products
+      .filter(p => p.itemName?.trim())
+      .map(p => ({
+        itemName: p.itemName.trim(),
+        category: p.category?.trim() || "",
+        unit:     p.unit?.trim() || "",
+        notes:    p.notes?.trim() || "",
+        attributes: Array.isArray(p.attributes)
+          ? p.attributes
+              .filter(a => a.name?.trim() && Array.isArray(a.values) && a.values.some(v => v?.trim()))
+              .map(a => ({ name: a.name.trim(), values: a.values.filter(v => v?.trim()) }))
+          : [],
+      }))
+    if (!cleaned.length)
+      return res.status(400).json({ success: false, message: "No valid product entries found" })
+
+    const emp = await resolveEmployeeId(req.user.id)
+    if (!emp) return res.status(404).json({ success: false, message: "Your HR record not found. Contact HR." })
+
+    const reqDoc = new RawItemAddRequest({
+      requestedBy:     emp._id,
+      requestedByName: buildFullName(emp) || req.user.name || "",
+      requestedByDept: emp.department || "",
+      products:        cleaned,
+    })
+    await reqDoc.save()
+
+    NotificationService.sendToRole(["store_manager", "admin"], {
+      title: "New Product Registration Request",
+      body: `${reqDoc.requestedByName} requested ${cleaned.length} new item(s) be added to inventory`,
+      type: "request",
+      url: "/store/dashboard/product-requests",
+      tag: `product-request-${reqDoc._id}`,
+    }).catch(() => {})
+
+    res.status(201).json({ success: true, message: "Request sent to store", request: reqDoc })
+  } catch (err) {
+    console.error("[CoworkMRF product-requests POST]", err)
+    res.status(500).json({ success: false, message: err.message })
   }
 })
 

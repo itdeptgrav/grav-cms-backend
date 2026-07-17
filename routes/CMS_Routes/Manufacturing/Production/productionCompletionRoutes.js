@@ -90,6 +90,87 @@ router.post("/fetch-order", async (req, res) => {
 // ── POST /mark-done ──────────────────────────────────────────────────────────
 // Pure scan logging. No WO or EmployeeProductionProgress updates — those
 // happen at packaging time (authoritative completion point).
+// ── DRY-RUN preview — checks without saving ─────────────────────────────────
+// Returns breakdown: total / valid / invalid / alreadyRecorded today / newToSave
+// ── DRY-RUN preview — checks format + WO existence + today's duplicates ──────
+router.post("/preview", async (req, res) => {
+  try {
+    const { barcodes } = req.body;
+    if (!Array.isArray(barcodes) || barcodes.length === 0) {
+      return res.status(400).json({ success: false, message: "barcodes array is required" });
+    }
+    const uniqueBarcodes = [...new Set(barcodes.map((b) => b?.trim()).filter(Boolean))];
+
+    // ── Step 1: format check ──────────────────────────────────────────────────
+    const invalidFormat   = [];
+    const formatPassed    = []; // { bc, woShortId, unitNumber }
+    for (const bc of uniqueBarcodes) {
+      const parsed = parseBarcode(bc);
+      if (!parsed.success) invalidFormat.push(bc);
+      else formatPassed.push({ bc, woShortId: parsed.woShortId, unitNumber: parsed.unitNumber });
+    }
+
+    // ── Step 2: WO existence check (batch) ───────────────────────────────────
+    // woShortId = last 8 chars of WO _id — fetch all WOs once and build a map
+    const uniqueShortIds = [...new Set(formatPassed.map((f) => f.woShortId))];
+    const allWOs = uniqueShortIds.length
+      ? await WorkOrder.find({}).select("_id workOrderNumber quantity").lean()
+      : [];
+    const woByShortId = new Map(allWOs.map((w) => [w._id.toString().slice(-8), w]));
+
+    const invalidOrder   = []; // valid format but WO not found or unit exceeds qty
+    const invalidOrderDetails = []; // { bc, reason }
+    const orderPassed    = []; // barcodes that passed both checks
+
+    for (const { bc, woShortId, unitNumber } of formatPassed) {
+      const wo = woByShortId.get(woShortId);
+      if (!wo) {
+        invalidOrder.push(bc);
+        invalidOrderDetails.push({ bc, reason: "Work order not found" });
+        continue;
+      }
+      if (unitNumber > wo.quantity) {
+        invalidOrder.push(bc);
+        invalidOrderDetails.push({ bc, reason: `Unit ${unitNumber} exceeds WO quantity (${wo.quantity})` });
+        continue;
+      }
+      orderPassed.push(bc);
+    }
+
+    // ── Step 3: already-recorded-today check ─────────────────────────────────
+    const dateBucket  = getISTMidnight(new Date());
+    const todayRecord = await ProductionCompletionScanRecord.findOne({ date: dateBucket })
+      .select("scans.barcodeId").lean();
+    const todaySet = new Set((todayRecord?.scans || []).map((s) => s.barcodeId));
+
+    const alreadyRecordedBarcodes = orderPassed.filter((bc) =>  todaySet.has(bc));
+    const newToSaveBarcodes       = orderPassed.filter((bc) => !todaySet.has(bc));
+
+    // Combined invalid list for the frontend
+    const allInvalidBarcodes = [
+      ...invalidFormat.map((bc) => ({ bc, reason: "Invalid barcode format" })),
+      ...invalidOrderDetails,
+    ];
+
+    return res.json({
+      success:               true,
+      total:                 uniqueBarcodes.length,
+      validCount:            orderPassed.length,
+      invalidCount:          allInvalidBarcodes.length,
+      invalidBarcodes:       allInvalidBarcodes,   // [{bc, reason}]
+      invalidFormatCount:    invalidFormat.length,
+      invalidOrderCount:     invalidOrder.length,
+      alreadyRecordedCount:  alreadyRecordedBarcodes.length,
+      alreadyRecordedBarcodes,
+      newToSaveCount:        newToSaveBarcodes.length,
+      newToSaveBarcodes,
+    });
+  } catch (err) {
+    console.error("preview error:", err);
+    res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
 router.post("/mark-done", async (req, res) => {
   try {
     const { barcodes, scannedBy } = req.body;

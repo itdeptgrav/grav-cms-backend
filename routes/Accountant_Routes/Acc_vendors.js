@@ -114,6 +114,7 @@ async function importedVendorRows(companyId) {
           },
         },
         totalPOs: { $sum: 1 },
+        lastDate: { $max: "$voucherDate" },
       },
     },
   ]);
@@ -132,6 +133,7 @@ async function importedVendorRows(companyId) {
     return {
       id: l._id,
       ledgerId: l._id,
+      isLedgerOnly: true,
       isImported: true,
       source: "tally_ledger",
       vendorId: `VEN-${l._id.toString().substring(18, 24).toUpperCase()}`,
@@ -142,8 +144,18 @@ async function importedVendorRows(companyId) {
       company: l.name,
       type: "Imported (Tally)",
       currency: "INR",
-      totalPayables: parseFloat(Math.abs(closingSigned).toFixed(2)),
-      outstandingPayables: parseFloat(owed.toFixed(2)),
+      // Books side only — imported ledger parties have no purchase orders.
+      ledgerPayables: parseFloat(Math.abs(closingSigned).toFixed(2)),
+      ledgerOutstanding: parseFloat(owed.toFixed(2)),
+      ledgerAdvance: parseFloat(advance.toFixed(2)),
+      voucherCount: a.totalPOs || 0,
+      ledgerLastDate: a.lastDate || null,
+      // Procurement side is empty for a ledger-only party.
+      poPayables: 0,
+      poOutstanding: 0,
+      poPaid: 0,
+      poCount: 0,
+      poLastDate: null,
       advanceToVendor: parseFloat(advance.toFixed(2)),
       balance: parseFloat(Math.abs(closingSigned).toFixed(2)),
       balanceType: closingSigned < 0 ? "Cr" : "Dr",
@@ -163,8 +175,6 @@ async function importedVendorRows(companyId) {
         pincode: "",
         country: "India",
       },
-      totalPOs: a.totalPOs || 0,
-      totalPaid: parseFloat(advance.toFixed(2)),
       aliases: l.aliases || [],
       groupName: l.groupName || null,
       _normName: normalizePartyName(l.name),
@@ -196,12 +206,21 @@ router.get("/", async (req, res) => {
   try {
     const { search = "", status } = req.query;
 
+    let cId = null;
+    if (req.query.companyId) {
+      try {
+        cId = new mongoose.Types.ObjectId(req.query.companyId);
+      } catch {
+        cId = null;
+      }
+    }
+
     let filter = {};
     if (search) {
       const vendorCodeMatch = search.match(/^VEN-?([A-Fa-f0-9]{4,12})$/i);
       if (vendorCodeMatch) {
         const suffix = vendorCodeMatch[1].toLowerCase();
-        const allVendorsRaw = await Vendor.find(filter).select("_id").lean();
+        const allVendorsRaw = await Vendor.find({}).select("_id").lean();
         const matchingIds = allVendorsRaw
           .filter((v) => v._id.toString().endsWith(suffix))
           .map((v) => v._id);
@@ -226,51 +245,73 @@ router.get("/", async (req, res) => {
 
     const vendorsWithStats = await Promise.all(
       vendors.map(async (vendor) => {
+        // ── PROCUREMENT SIDE — purchase orders & PO payments only ──────────
+        // These figures NEVER mix with books figures. A vendor that also has
+        // an accounting ledger carries both sets, shown on separate tabs.
         const purchaseOrders = await PurchaseOrder.find({
           vendor: vendor._id,
           status: { $in: ["ISSUED", "PARTIALLY_RECEIVED", "COMPLETED"] },
         });
 
-        let totalPayables = 0;
-        let outstandingPayables = 0;
-        let totalPaid = 0;
-        let totalPOs = purchaseOrders.length;
+        let poPayables = 0;
+        let poOutstanding = 0;
+        let poPaid = 0;
+        const poCount = purchaseOrders.length;
+        let poLastDate = null;
 
         purchaseOrders.forEach((po) => {
-          totalPayables += po.totalAmount || 0;
-          const poPaid =
+          poPayables += po.totalAmount || 0;
+          const paid =
             po.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
-          totalPaid += poPaid;
-          outstandingPayables += (po.totalAmount || 0) - poPaid;
+          poPaid += paid;
+          poOutstanding += (po.totalAmount || 0) - paid;
+          if (po.orderDate) {
+            const d = new Date(po.orderDate).getTime();
+            if (!poLastDate || d > poLastDate) poLastDate = d;
+          }
         });
 
-        // ── Acc_Voucher-based stats (from Tally imports / merged data) ────────
-        // FIX: compute balance from ledgerEntries aggregation instead of
-        // vendorLedger.currentBalance (which is often stale or zero).
-        // This matches the same method importedVendorRows uses, so figures
-        // reconcile with the Balance Sheet and ledger detail page.
+        // ── BOOKS SIDE — posted accounting vouchers only ────────────────────
+        // Computed from ledgerEntries aggregation (not vendorLedger
+        // .currentBalance, which goes stale). Scoped to the active company —
+        // the old code omitted companyId and summed across every company.
         let vendorLedger = null;
+        let ledgerPayables = 0;
+        let ledgerOutstanding = 0;
+        let ledgerAdvance = 0;
+        let voucherCount = 0;
+        let ledgerLastDate = null;
+
         try {
-          vendorLedger = await Acc_Ledger.findOne({
+          const ledgerQuery = {
             linkedVendorId: vendor._id,
             isActive: { $ne: false },
-          }).lean();
+          };
+          if (cId) ledgerQuery.companyId = cId;
+          vendorLedger = await Acc_Ledger.findOne(ledgerQuery).lean();
+
           if (!vendorLedger) {
-            vendorLedger = await Acc_Ledger.findOne({
+            const nameQuery = {
               name: new RegExp(
                 "^" +
-                  vendor.companyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+                  String(vendor.companyName || "").replace(
+                    /[.*+?^${}()|[\]\\]/g,
+                    "\\$&",
+                  ) +
                   "$",
                 "i",
               ),
               isActive: { $ne: false },
-            }).lean();
+            };
+            if (cId) nameQuery.companyId = cId;
+            vendorLedger = await Acc_Ledger.findOne(nameQuery).lean();
           }
+
           if (vendorLedger) {
-            // Aggregate Dr/Cr from ledger entries — reliable even when
-            // currentBalance hasn't been recalculated after a merge.
+            const match = { status: "posted" };
+            if (cId) match.companyId = cId;
             const ledgerAgg = await Acc_Voucher.aggregate([
-              { $match: { status: "posted" } },
+              { $match: match },
               { $unwind: "$ledgerEntries" },
               { $match: { "ledgerEntries.ledgerId": vendorLedger._id } },
               {
@@ -295,27 +336,28 @@ router.get("/", async (req, res) => {
                     },
                   },
                   voucherIds: { $addToSet: "$_id" },
+                  lastDate: { $max: "$voucherDate" },
                 },
               },
             ]);
+
             if (ledgerAgg.length > 0) {
               const a = ledgerAgg[0];
-              totalPOs += a.voucherIds ? a.voucherIds.length : 0;
+              voucherCount = a.voucherIds ? a.voucherIds.length : 0;
+              ledgerLastDate = a.lastDate || null;
               const openSigned =
                 (vendorLedger.openingBalanceType === "Cr" ? -1 : 1) *
                 Math.abs(vendorLedger.openingBalance || 0);
               // Sundry Creditor: negative closing = we still owe them
               const closingSigned = openSigned + (a.dr || 0) - (a.cr || 0);
-              const owed = closingSigned < 0 ? Math.abs(closingSigned) : 0;
-              if (owed > outstandingPayables) outstandingPayables = owed;
-              // Use ledger net as totalPayables when PO-based is zero
-              if (totalPayables === 0 && Math.abs(closingSigned) > 0) {
-                totalPayables = Math.abs(closingSigned);
-              }
+              ledgerPayables = Math.abs(closingSigned);
+              ledgerOutstanding =
+                closingSigned < 0 ? Math.abs(closingSigned) : 0;
+              ledgerAdvance = closingSigned > 0 ? closingSigned : 0;
             }
           }
         } catch (_) {
-          // Acc_Ledger / Acc_Voucher not available — PO stats only
+          // Acc_Ledger / Acc_Voucher not available — procurement stats only
         }
 
         const sixMonthsAgo = new Date();
@@ -326,14 +368,17 @@ router.get("/", async (req, res) => {
           status: { $in: ["PARTIALLY_RECEIVED", "COMPLETED"] },
         });
         const totalExpenses6Months = recentPOs.reduce((sum, po) => {
-          const poPaid =
+          const paid =
             po.payments?.reduce((s, p) => s + (p.amount || 0), 0) || 0;
-          return sum + poPaid;
+          return sum + paid;
         }, 0);
+
+        const R = (n) => parseFloat(Number(n || 0).toFixed(2));
 
         return {
           id: vendor._id,
           ledgerId: vendorLedger?._id || null,
+          isLedgerOnly: false,
           vendorId: `VEN-${(vendorLedger?._id || vendor._id).toString().substring(18, 24).toUpperCase()}`,
           name: vendor.companyName,
           contactPerson: vendor.contactPerson,
@@ -342,17 +387,32 @@ router.get("/", async (req, res) => {
           company: vendor.companyName,
           type: vendor.vendorType || "Business",
           currency: "INR",
-          totalPayables: parseFloat(totalPayables.toFixed(2)),
-          outstandingPayables: parseFloat(outstandingPayables.toFixed(2)),
+
+          // ── Procurement side (purchase orders) ──────────────────────────
+          poPayables: R(poPayables),
+          poOutstanding: R(poOutstanding),
+          poPaid: R(poPaid),
+          poCount,
+          poLastDate: poLastDate ? new Date(poLastDate) : null,
+
+          // ── Books side (posted vouchers) ────────────────────────────────
+          ledgerPayables: R(ledgerPayables),
+          ledgerOutstanding: R(ledgerOutstanding),
+          ledgerAdvance: R(ledgerAdvance),
+          voucherCount,
+          ledgerLastDate,
+
           unusedCredits: 0,
           paymentTerms: vendor.paymentTerms || "Net 30",
           gstin: vendor.gstNumber || "",
           pan: vendor.panNumber || "",
           status: vendor.status || "Active",
           portalStatus: "Disabled",
-          createdDate: vendor.createdAt.toLocaleDateString("en-GB"),
+          createdDate: vendor.createdAt
+            ? vendor.createdAt.toLocaleDateString("en-GB")
+            : "",
           createdBy: "System",
-          totalExpenses6Months: parseFloat(totalExpenses6Months.toFixed(2)),
+          totalExpenses6Months: R(totalExpenses6Months),
           billingAddress: vendor.address || {
             street: "",
             city: "",
@@ -360,41 +420,18 @@ router.get("/", async (req, res) => {
             pincode: "",
             country: "India",
           },
-          totalPOs,
-          totalPaid: parseFloat(totalPaid.toFixed(2)),
         };
       }),
     );
 
-    // ── Merge in imported Tally parties ───────────────────────────────────
+    // ── Imported Tally ledger parties — books side only, no PO figures ─────
+    // These are appended as SEPARATE rows. They are never merged into, or
+    // summed with, a CMS vendor. Ghost/duplicate detection is intentionally
+    // gone: "Binod Textile (procurement)" and "Binod Textile (books)" are
+    // two distinct records living on two distinct tabs.
     let allVendors = vendorsWithStats;
     try {
       let imported = await importedVendorRows(req.query.companyId);
-
-      const cmsByGstin = new Map();
-      const cmsByName = new Map();
-      for (const v of vendorsWithStats) {
-        const g = (v.gstin || "").toUpperCase().replace(/\s+/g, "");
-        if (g) cmsByGstin.set(g, v);
-        const n = normalizePartyName(v.name);
-        if (n) cmsByName.set(n, v);
-      }
-      imported = imported.map((v) => {
-        let match = null;
-        if (v._gstinKey && cmsByGstin.has(v._gstinKey))
-          match = cmsByGstin.get(v._gstinKey);
-        else if (v._normName && cmsByName.has(v._normName))
-          match = cmsByName.get(v._normName);
-        if (match) {
-          return {
-            ...v,
-            isGhost: true,
-            ghostOf: { id: match.id, name: match.name },
-            type: "Ghost (duplicate of registered)",
-          };
-        }
-        return v;
-      });
 
       const q = String(req.query.search || "")
         .trim()
@@ -409,28 +446,58 @@ router.get("/", async (req, res) => {
         );
       }
       imported = imported.map(({ _normName, _gstinKey, ...rest }) => rest);
+
+      // ── Dedupe by ledgerId — a hard identity, never by name ──────────────
+      // A CMS vendor resolves its ledger either via linkedVendorId OR via the
+      // name-regex fallback. In the fallback case the ledger's linkedVendorId
+      // is still null, so importedVendorRows legitimately emits it too — and
+      // the same ledger ends up listed twice under the same VEN- code.
+      //
+      // The CMS vendor wins: it carries contact details, status and purchase
+      // orders. The bare imported row is dropped. We match on ledgerId only.
+      // Matching on name is what produced the ghost/merge mess in the first
+      // place — two genuinely different parties can share a name, and fusing
+      // them silently destroys data.
+      const claimedLedgerIds = new Set(
+        vendorsWithStats
+          .filter((v) => v.ledgerId)
+          .map((v) => String(v.ledgerId)),
+      );
+      imported = imported.filter(
+        (v) => !v.ledgerId || !claimedLedgerIds.has(String(v.ledgerId)),
+      );
+
       if (imported.length) allVendors = [...vendorsWithStats, ...imported];
     } catch (impErr) {
-      console.error("[vendors] imported-party merge skipped:", impErr.message);
+      console.error("[vendors] imported-party load skipped:", impErr.message);
     }
 
-    const totalVendors = allVendors.length;
-    const totalPayables = allVendors.reduce(
-      (sum, v) => sum + v.totalPayables,
-      0,
-    );
-    const totalOutstanding = allVendors.reduce(
-      (sum, v) => sum + v.outstandingPayables,
-      0,
-    );
+    // ── Per-side stat blocks — summed within a side, never across ──────────
+    // A vendor with both a ledger and purchase orders contributes its books
+    // figures to `books` and its PO figures to `procurement`. Nothing is
+    // counted twice, and the two blocks are not expected to add up to
+    // anything meaningful — they measure different things.
+    const booksRows = allVendors.filter((v) => !!v.ledgerId);
+    const procurementRows = allVendors.filter((v) => !v.isLedgerOnly);
+
+    const sum = (rows, key) =>
+      parseFloat(rows.reduce((s, v) => s + (v[key] || 0), 0).toFixed(2));
 
     res.json({
       success: true,
       vendors: allVendors,
       stats: {
-        total: totalVendors,
-        totalPayables: parseFloat(totalPayables.toFixed(2)),
-        totalOutstanding: parseFloat(totalOutstanding.toFixed(2)),
+        total: allVendors.length,
+        books: {
+          total: booksRows.length,
+          totalPayables: sum(booksRows, "ledgerPayables"),
+          totalOutstanding: sum(booksRows, "ledgerOutstanding"),
+        },
+        procurement: {
+          total: procurementRows.length,
+          totalPayables: sum(procurementRows, "poPayables"),
+          totalOutstanding: sum(procurementRows, "poOutstanding"),
+        },
       },
     });
   } catch (error) {
@@ -516,26 +583,43 @@ router.get("/:id", async (req, res) => {
       return sum + poPaid;
     }, 0);
 
+    // Scope the ledger lookup to the active company. Without companyId the
+    // name-regex fallback can resolve a same-named ledger from ANOTHER
+    // company, which is how the detail page ended up pointing at a ledger
+    // that didn't belong to this vendor.
+    let detailCId = null;
+    if (req.query.companyId) {
+      try {
+        detailCId = new mongoose.Types.ObjectId(req.query.companyId);
+      } catch {
+        detailCId = null;
+      }
+    }
+
     let detailLedger = null;
     try {
-      detailLedger = await Acc_Ledger.findOne({
+      const linkQuery = {
         linkedVendorId: vendor._id,
         isActive: { $ne: false },
-      })
-        .select("_id")
-        .lean();
+      };
+      if (detailCId) linkQuery.companyId = detailCId;
+      detailLedger = await Acc_Ledger.findOne(linkQuery).select("_id").lean();
+
       if (!detailLedger) {
-        detailLedger = await Acc_Ledger.findOne({
+        const nameQuery = {
           name: new RegExp(
             "^" +
-              vendor.companyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+              String(vendor.companyName || "").replace(
+                /[.*+?^${}()|[\]\\]/g,
+                "\\$&",
+              ) +
               "$",
             "i",
           ),
           isActive: { $ne: false },
-        })
-          .select("_id")
-          .lean();
+        };
+        if (detailCId) nameQuery.companyId = detailCId;
+        detailLedger = await Acc_Ledger.findOne(nameQuery).select("_id").lean();
       }
     } catch (_) {}
 
@@ -552,6 +636,15 @@ router.get("/:id", async (req, res) => {
         company: vendor.companyName,
         type: vendor.vendorType || "Business",
         currency: "INR",
+        // These are PROCUREMENT-side figures — purchase orders and PO
+        // payments only. They are NOT the ledger balance. For the books
+        // balance, open the ledger via ledgerId. The two are never summed.
+        poPayables: parseFloat(totalPayables.toFixed(2)),
+        poOutstanding: parseFloat(outstandingPayables.toFixed(2)),
+        poPaid: parseFloat(totalPaid.toFixed(2)),
+        poCount: purchaseOrders.length,
+        // Legacy names retained so existing callers don't break. Same
+        // procurement-side numbers — deliberately NOT ledger figures.
         totalPayables: parseFloat(totalPayables.toFixed(2)),
         outstandingPayables: parseFloat(outstandingPayables.toFixed(2)),
         unusedCredits: 0,
@@ -560,7 +653,9 @@ router.get("/:id", async (req, res) => {
         pan: vendor.panNumber || "",
         status: vendor.status || "Active",
         portalStatus: "Disabled",
-        createdDate: vendor.createdAt.toLocaleDateString("en-GB"),
+        createdDate: vendor.createdAt
+          ? vendor.createdAt.toLocaleDateString("en-GB")
+          : "",
         createdBy: vendor.createdBy ? "User" : "System",
         totalExpenses6Months: parseFloat(totalExpenses6Months.toFixed(2)),
         billingAddress: vendor.address || {
@@ -607,12 +702,10 @@ router.get("/:id", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching vendor details:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching vendor details",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching vendor details",
+    });
   }
 });
 
@@ -668,12 +761,10 @@ router.get("/:id/purchase-orders", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching vendor purchase orders:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching purchase orders",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching purchase orders",
+    });
   }
 });
 
@@ -757,12 +848,10 @@ router.get("/:id/transactions", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching vendor transactions:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching transactions",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching transactions",
+    });
   }
 });
 
@@ -797,23 +886,19 @@ router.post("/:id/payment", async (req, res) => {
       vendor: req.params.id,
     });
     if (!purchaseOrder)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Purchase order not found for this vendor",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "Purchase order not found for this vendor",
+      });
 
     const totalPaid =
       purchaseOrder.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
     if (amount > remainingAmount) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
-        });
+      return res.status(400).json({
+        success: false,
+        message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
+      });
     }
 
     if (!purchaseOrder.payments) purchaseOrder.payments = [];
@@ -853,12 +938,10 @@ router.post("/:id/payment", async (req, res) => {
     });
   } catch (error) {
     console.error("Error recording payment:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while recording payment",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while recording payment",
+    });
   }
 });
 
@@ -899,12 +982,10 @@ router.patch("/:id/purchase-orders/:poId/payment-status", async (req, res) => {
     });
   } catch (error) {
     console.error("Error updating payment status:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while updating payment status",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while updating payment status",
+    });
   }
 });
 
@@ -963,12 +1044,10 @@ router.get("/:id/payments", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching vendor payments:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching payments",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching payments",
+    });
   }
 });
 
@@ -1007,12 +1086,10 @@ router.post("/", async (req, res) => {
       ],
     });
     if (existingVendor)
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Vendor with this name or email already exists",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Vendor with this name or email already exists",
+      });
 
     const vendor = new Vendor({
       companyName,
@@ -1124,16 +1201,44 @@ router.post("/:id/merge", async (req, res) => {
   try {
     const keeperId = req.params.id;
     const { mergeFromId } = req.body || {};
+
     if (!mergeFromId)
       return res
         .status(400)
         .json({ success: false, message: "mergeFromId required" });
-    if (keeperId === mergeFromId)
+    if (String(keeperId) === String(mergeFromId))
       return res
         .status(400)
         .json({ success: false, message: "Cannot merge into itself" });
 
-    const keeper = await Vendor.findById(keeperId);
+    // Scope every ledger lookup to the active company. Without this, a
+    // name-regex match can resolve a same-named ledger belonging to a
+    // DIFFERENT company and quietly move its vouchers.
+    let cId = null;
+    if (req.query.companyId || req.body.companyId) {
+      try {
+        cId = new mongoose.Types.ObjectId(
+          req.query.companyId || req.body.companyId,
+        );
+      } catch {
+        cId = null;
+      }
+    }
+    const scoped = (q) => (cId ? { ...q, companyId: cId } : q);
+
+    // Escape a name for safe use inside a RegExp. Returns null when the name
+    // is missing — a malformed vendor used to crash the whole route here with
+    // "Cannot read properties of undefined (reading 'replace')".
+    const nameRx = (s) => {
+      const t = String(s || "").trim();
+      if (!t) return null;
+      return new RegExp(
+        "^" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
+        "i",
+      );
+    };
+
+    const keeper = await Vendor.findById(keeperId).catch(() => null);
     if (!keeper)
       return res
         .status(404)
@@ -1150,11 +1255,13 @@ router.post("/:id/merge", async (req, res) => {
     let ghostLedger = null;
 
     if (ghost) {
+      // ── Path A: the ghost is a CMS Vendor ──────────────────────────────
       const poResult = await PurchaseOrder.updateMany(
         { vendor: ghost._id },
         { $set: { vendor: keeper._id } },
       );
       counts.purchaseOrders = poResult.modifiedCount || 0;
+
       try {
         const Payment = require("mongoose").model("Payment");
         const payResult = await Payment.updateMany(
@@ -1163,141 +1270,145 @@ router.post("/:id/merge", async (req, res) => {
         );
         counts.payments = payResult.modifiedCount || 0;
       } catch (_) {}
-      ghostLedger = await Acc_Ledger.findOne({ linkedVendorId: ghost._id });
+
+      ghostLedger = await Acc_Ledger.findOne(
+        scoped({ linkedVendorId: ghost._id }),
+      ).catch(() => null);
+
       if (!ghostLedger) {
-        ghostLedger = await Acc_Ledger.findOne({
-          name: new RegExp(
-            "^" +
-              ghost.companyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-              "$",
-            "i",
-          ),
-          isActive: { $ne: false },
-        });
+        const rx = nameRx(ghost.companyName);
+        if (rx) {
+          ghostLedger = await Acc_Ledger.findOne(
+            scoped({ name: rx, isActive: { $ne: false } }),
+          ).catch(() => null);
+        }
       }
+
       ghost.status = "Inactive";
-      ghost.notes = `[MERGED] Transactions moved to ${keeper.companyName} on ${new Date().toISOString()}`;
+      ghost.notes = `[MERGED] Transactions moved to ${keeper.companyName || "keeper"} on ${new Date().toISOString()}`;
       await ghost.save();
     } else {
-      ghostLedger = await Acc_Ledger.findById(mergeFromId);
+      // ── Path B: the ghost is a bare Acc_Ledger (Tally import) ──────────
+      ghostLedger = await Acc_Ledger.findById(mergeFromId).catch(() => null);
       if (!ghostLedger)
         return res
           .status(404)
           .json({ success: false, message: "Ghost vendor/ledger not found" });
-
-      // NOTE: We intentionally do NOT search for other CMS vendors by GSTIN/name
-      // and deactivate them. That was killing the ORIGINAL vendor which shares a
-      // GSTIN with the Tally-imported ghost. CMS-to-CMS vendor deduplication is
-      // handled separately on the vendors page via the ghost detection feature.
     }
 
-    let keeperLedger = await Acc_Ledger.findOne({
-      linkedVendorId: keeper._id,
-      isActive: { $ne: false },
-    });
+    let keeperLedger = await Acc_Ledger.findOne(
+      scoped({ linkedVendorId: keeper._id, isActive: { $ne: false } }),
+    ).catch(() => null);
+
     if (!keeperLedger) {
-      keeperLedger = await Acc_Ledger.findOne({
-        name: new RegExp(
-          "^" + keeper.companyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
-          "i",
-        ),
-        isActive: { $ne: false },
-      });
+      const rx = nameRx(keeper.companyName);
+      if (rx) {
+        keeperLedger = await Acc_Ledger.findOne(
+          scoped({ name: rx, isActive: { $ne: false } }),
+        ).catch(() => null);
+      }
     }
 
+    const ghostLabel =
+      ghostLedger?.name || ghost?.companyName || String(mergeFromId);
+    const keeperLabel = keeper.companyName || String(keeperId);
+
+    // ── Case 1: two distinct ledgers — migrate vouchers and balances ──────
     if (
       ghostLedger &&
       keeperLedger &&
       String(ghostLedger._id) !== String(keeperLedger._id)
     ) {
-      try {
-        const vResult = await Acc_Voucher.updateMany(
-          { partyLedgerId: ghostLedger._id },
-          {
-            $set: {
-              partyLedgerId: keeperLedger._id,
-              partyLedgerName: keeperLedger.name,
-            },
+      const vResult = await Acc_Voucher.updateMany(
+        { partyLedgerId: ghostLedger._id },
+        {
+          $set: {
+            partyLedgerId: keeperLedger._id,
+            partyLedgerName: keeperLedger.name,
           },
-        );
-        counts.vouchers = vResult.modifiedCount || 0;
+        },
+      );
+      counts.vouchers = vResult.modifiedCount || 0;
 
-        const leResult = await Acc_Voucher.updateMany(
-          { "ledgerEntries.ledgerId": ghostLedger._id },
-          {
-            $set: {
-              "ledgerEntries.$[e].ledgerId": keeperLedger._id,
-              "ledgerEntries.$[e].ledgerName": keeperLedger.name,
-            },
+      const leResult = await Acc_Voucher.updateMany(
+        { "ledgerEntries.ledgerId": ghostLedger._id },
+        {
+          $set: {
+            "ledgerEntries.$[e].ledgerId": keeperLedger._id,
+            "ledgerEntries.$[e].ledgerName": keeperLedger.name,
           },
-          { arrayFilters: [{ "e.ledgerId": ghostLedger._id }] },
-        );
-        counts.ledgerEntries = leResult.modifiedCount || 0;
+        },
+        { arrayFilters: [{ "e.ledgerId": ghostLedger._id }] },
+      );
+      counts.ledgerEntries = leResult.modifiedCount || 0;
 
-        // ── Transfer balances — SIGNED arithmetic ─────────────────────────
-        // Acc_Ledger stores balances SIGNED (positive = Dr, negative = Cr).
-        // signedBal() also tolerates the older magnitude+type convention.
-        // We ADD the ghost's signed balance to the keeper and ZERO the ghost's
-        // balance, so the books stay balanced after the merge.
-        const signedBal = (val, type) => {
-          const v = Number(val) || 0;
-          if (v < 0) return v;
-          return (type === "Cr" ? -1 : 1) * v;
-        };
+      // ── Transfer balances — SIGNED arithmetic ─────────────────────────
+      // Acc_Ledger stores balances SIGNED (positive = Dr, negative = Cr).
+      // signedBal() also tolerates the older magnitude+type convention.
+      const signedBal = (val, type) => {
+        const v = Number(val) || 0;
+        if (v < 0) return v;
+        return (type === "Cr" ? -1 : 1) * v;
+      };
 
-        const newOpenSigned =
-          signedBal(
-            keeperLedger.openingBalance,
-            keeperLedger.openingBalanceType,
-          ) +
-          signedBal(ghostLedger.openingBalance, ghostLedger.openingBalanceType);
-        const newCurrSigned =
-          signedBal(
-            keeperLedger.currentBalance,
-            keeperLedger.currentBalanceType,
-          ) +
-          signedBal(ghostLedger.currentBalance, ghostLedger.currentBalanceType);
+      const newOpenSigned =
+        signedBal(
+          keeperLedger.openingBalance,
+          keeperLedger.openingBalanceType,
+        ) +
+        signedBal(ghostLedger.openingBalance, ghostLedger.openingBalanceType);
+      const newCurrSigned =
+        signedBal(
+          keeperLedger.currentBalance,
+          keeperLedger.currentBalanceType,
+        ) +
+        signedBal(ghostLedger.currentBalance, ghostLedger.currentBalanceType);
 
-        await Acc_Ledger.updateOne(
-          { _id: keeperLedger._id },
-          {
-            $set: {
-              openingBalance: newOpenSigned, // SIGNED
-              openingBalanceType: newOpenSigned < 0 ? "Cr" : "Dr",
-              currentBalance: newCurrSigned, // SIGNED
-              currentBalanceType: newCurrSigned < 0 ? "Cr" : "Dr",
-              ...(keeperLedger.balanceFromTrialBalance ||
-              ghostLedger.balanceFromTrialBalance
-                ? { balanceFromTrialBalance: true }
-                : {}),
-            },
+      await Acc_Ledger.updateOne(
+        { _id: keeperLedger._id },
+        {
+          $set: {
+            openingBalance: newOpenSigned,
+            openingBalanceType: newOpenSigned < 0 ? "Cr" : "Dr",
+            currentBalance: newCurrSigned,
+            currentBalanceType: newCurrSigned < 0 ? "Cr" : "Dr",
+            ...(keeperLedger.balanceFromTrialBalance ||
+            ghostLedger.balanceFromTrialBalance
+              ? { balanceFromTrialBalance: true }
+              : {}),
           },
-        );
-        // Deactivate ghost ledger AND zero its balance (prevents double-count)
-        await Acc_Ledger.updateOne(
-          { _id: ghostLedger._id },
-          {
-            $set: {
-              isActive: false,
-              openingBalance: 0,
-              currentBalance: 0,
-              balanceFromTrialBalance: false,
-              name: `[MERGED] ${ghostLedger.name}`,
-            },
+        },
+      );
+
+      await Acc_Ledger.updateOne(
+        { _id: ghostLedger._id },
+        {
+          $set: {
+            isActive: false,
+            openingBalance: 0,
+            currentBalance: 0,
+            balanceFromTrialBalance: false,
+            linkedVendorId: null,
+            name: `[MERGED] ${ghostLedger.name}`,
           },
-        );
-      } catch (e) {
-        console.error("[vendor-merge] ledger migration:", e.message);
-      }
-    } else if (ghostLedger && !keeperLedger) {
-      // No keeper ledger — relink ghost ledger to keeper.
-      // FIX: use updateOne/$set so linkedVendorId is saved even if not in Mongoose schema strict definition.
+        },
+      );
+
+      return res.json({
+        success: true,
+        message: `Merged "${ghostLabel}" → "${keeperLabel}". ${counts.purchaseOrders} POs, ${counts.vouchers} vouchers, ${counts.ledgerEntries} ledger entries transferred.`,
+        counts,
+      });
+    }
+
+    // ── Case 2: only the ghost has a ledger — relink it to the keeper ─────
+    if (ghostLedger && !keeperLedger) {
       await Acc_Ledger.updateOne(
         { _id: ghostLedger._id },
         {
           $set: {
             linkedVendorId: keeper._id,
-            name: keeper.companyName,
+            name: keeper.companyName || ghostLedger.name,
             ...(keeper.gstNumber && !ghostLedger.gstin
               ? { gstin: keeper.gstNumber }
               : {}),
@@ -1308,12 +1419,60 @@ router.post("/:id/merge", async (req, res) => {
         partyLedgerId: ghostLedger._id,
         status: "posted",
       });
+
+      return res.json({
+        success: true,
+        message: `Linked ledger "${ghostLabel}" to "${keeperLabel}". ${counts.purchaseOrders} POs moved, ${counts.vouchers} vouchers now belong to the keeper.`,
+        counts,
+      });
     }
 
-    res.json({
-      success: true,
-      message: `Merged "${ghostLedger?.name || ghost?.companyName}" → "${keeper.companyName}". ${counts.purchaseOrders} POs, ${counts.vouchers} vouchers, ${counts.ledgerEntries} ledger entries transferred.`,
-      counts,
+    // ── Case 3: both point at the SAME ledger ─────────────────────────────
+    // Nothing to migrate. The ghost vendor record was still deactivated and
+    // its POs moved (Path A above). Make sure the ledger carries the link so
+    // this duplicate never resurfaces in importedVendorRows().
+    if (
+      ghostLedger &&
+      keeperLedger &&
+      String(ghostLedger._id) === String(keeperLedger._id)
+    ) {
+      if (String(keeperLedger.linkedVendorId || "") !== String(keeper._id)) {
+        await Acc_Ledger.updateOne(
+          { _id: keeperLedger._id },
+          { $set: { linkedVendorId: keeper._id } },
+        );
+      }
+      return res.json({
+        success: true,
+        message: `"${ghostLabel}" and "${keeperLabel}" already share one ledger. ${counts.purchaseOrders} POs moved; ledger link repaired. No vouchers needed migrating.`,
+        counts,
+      });
+    }
+
+    // ── Case 4: no ledger on either side ──────────────────────────────────
+    // This is the "nothing to merge" case that used to fall through both
+    // branches and return a bogus `Merged "undefined" → ...` success. There
+    // is no accounting ledger to consolidate. If the ghost was a CMS vendor
+    // its POs have already moved and it's been deactivated — that IS the
+    // merge. Say so plainly instead of pretending vouchers moved.
+    if (!ghostLedger) {
+      if (ghost) {
+        return res.json({
+          success: true,
+          message: `Merged "${ghostLabel}" → "${keeperLabel}". Neither vendor has an accounting ledger, so nothing was posted to the books. ${counts.purchaseOrders} PO${counts.purchaseOrders === 1 ? "" : "s"} and ${counts.payments} payment${counts.payments === 1 ? "" : "s"} moved; the duplicate is now Inactive.`,
+          counts,
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        message: `Nothing to merge: "${ghostLabel}" has no accounting ledger and is not a vendor record.`,
+      });
+    }
+
+    // Unreachable in practice — keeps the contract explicit.
+    return res.status(400).json({
+      success: false,
+      message: `Nothing to merge between "${ghostLabel}" and "${keeperLabel}".`,
     });
   } catch (error) {
     console.error("Error merging vendors:", error);
@@ -1333,13 +1492,11 @@ router.delete("/:id", async (req, res) => {
         .json({ success: false, message: "Vendor not found" });
     const purchaseOrders = await PurchaseOrder.find({ vendor: vendor._id });
     if (purchaseOrders.length > 0) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message:
-            "Cannot delete vendor with existing purchase orders. Mark as inactive instead.",
-        });
+      return res.status(400).json({
+        success: false,
+        message:
+          "Cannot delete vendor with existing purchase orders. Mark as inactive instead.",
+      });
     }
     await vendor.deleteOne();
     res.json({ success: true, message: "Vendor deleted successfully" });

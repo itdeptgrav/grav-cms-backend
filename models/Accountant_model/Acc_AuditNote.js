@@ -25,6 +25,8 @@ const auditNoteThreadSchema = new mongoose.Schema(
         "verified", // viewer confirms the fix is correct
         "rejected", // viewer says "not fixed" with a reason
         "reopened", // auto-set when rejected (status → in_progress)
+        "archived", // moved out of the active list (resolved/verified only)
+        "unarchived", // restored to the active list
       ],
       required: true,
     },
@@ -96,6 +98,15 @@ const auditNoteSchema = new mongoose.Schema(
     resolvedAt: { type: Date },
     verifiedByName: { type: String, default: "" },
     verifiedAt: { type: Date },
+
+    // ── Archive ─────────────────────────────────────────────────────────
+    // Orthogonal to `status`, deliberately NOT a status value. A note is
+    // archived *while still being* resolved or verified — overwriting
+    // status would destroy the lifecycle state and make unarchiving
+    // lossy. Archived notes are hidden from the default list.
+    archived: { type: Boolean, default: false, index: true },
+    archivedByName: { type: String, default: "" },
+    archivedAt: { type: Date },
   },
   {
     timestamps: true,
@@ -107,6 +118,8 @@ const auditNoteSchema = new mongoose.Schema(
 auditNoteSchema.index({ "target.type": 1, "target.id": 1 });
 // For listing by status across an org
 auditNoteSchema.index({ organizationId: 1, status: 1, updatedAt: -1 });
+// The default list excludes archived notes — index the pair it filters on
+auditNoteSchema.index({ organizationId: 1, archived: 1, updatedAt: -1 });
 
 module.exports =
   mongoose.models.Acc_AuditNote ||

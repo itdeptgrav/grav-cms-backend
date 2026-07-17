@@ -404,6 +404,7 @@ router.get("/:userId/nav-prefs", requireRole("owner"), async (req, res) => {
     res.json({
       success: true,
       user: {
+        _id: user._id,
         id: user._id,
         name: user.name,
         email: user.email,
@@ -465,13 +466,32 @@ router.put("/:userId/nav-prefs", requireRole("owner"), async (req, res) => {
           "Owners always see the full sidebar. You can't hide items from another owner.",
       });
     }
+    // Write with updateOne + $set rather than doc.save(). If `hiddenNavItems`
+    // is missing from the Acc_User schema, Mongoose's strict mode silently
+    // DROPS the assignment on save() — no error, no write, and the response
+    // still echoes the in-memory value, so it looks like it worked. The
+    // `strict: false` option forces the field through either way.
+    const upd = await Acc_User.updateOne(
+      { _id: target._id, organizationId: req.user.organizationId },
+      { $set: { hiddenNavItems: cleaned } },
+      { strict: false },
+    );
 
-    target.hiddenNavItems = cleaned;
-    await target.save();
+    if (!upd.matchedCount) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    // Read back what actually landed in the database, so the client can
+    // never be told a value was saved when it wasn't.
+    const saved = await Acc_User.findById(target._id)
+      .select("hiddenNavItems")
+      .lean();
 
     res.json({
       success: true,
-      hiddenNavItems: target.hiddenNavItems,
+      hiddenNavItems: saved?.hiddenNavItems || [],
       message: `Sidebar updated for ${target.name}. They'll see the change on next page refresh.`,
     });
   } catch (e) {
