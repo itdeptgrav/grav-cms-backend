@@ -109,10 +109,11 @@ async function computeC1ForQuarter(employeeId, quarter, year) {
         return 1; // equal weight fallback — task counts but with neutral weight
     };
 
-    const numerator = tasks.reduce((s, t) => s + (Number(t.c1.taskScore) * getHours(t)), 0);
-    const denominator = tasks.reduce((s, t) => s + getHours(t), 0);
+    const numerator = tasks.reduce((s, t) => s + Number(t.c1.taskScore), 0);
+    const denominator = tasks.length;
     const qualityRate = denominator > 0 ? Math.max(numerator / denominator, 0) : 0;
-    const c1Net = +(qualityRate * c1Max).toFixed(2);
+    const c1Net = +(qualityRate * 100).toFixed(2); // 0-100%, per PDF — no longer scaled to band c1Max
+
 
     return {
         c1Net,
@@ -429,14 +430,34 @@ async function getSOPBreakdown(employeeId, quarter, year) {
     return totals;
 }
 
-function computePaceScore({ c1Net, c1Max, c2PtsEarned, c2PtsPastDeadline, c3 = 0, c4 = 0 }) {
-    if (c1Net === null && c2PtsEarned === 0 && c2PtsPastDeadline === 0) return null;
+// ─────────────────────────────────────────────────────────────────────────────
+// RAW QUARTER SCORE
+// PDF: Quarterly Score = C1 + C2 + C3 + C4
+// ─────────────────────────────────────────────────────────────────────────────
+function computeQuarterScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
+    return +((c1Net || 0) + (c2Net || 0) + c3 + c4).toFixed(2);
+}
 
-    const numerator = (c1Net || 0) + c2PtsEarned + c3 + c4;
-    const denominator = c1Max + c2PtsPastDeadline;
-    if (denominator === 0) return null;
+function computeBaseScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
+    const components = [c1Net, c2Net].filter(v => v !== null && v !== undefined);
+    const avg = components.length > 0
+        ? components.reduce((s, v) => s + v, 0) / components.length
+        : 0; // no C1/C2 data yet — contributes nothing to the average itself
+    const adjustment = (c3 || 0) + (c4 || 0);
+    // Truly nothing to show only when there's no C1/C2 data AND no C3/C4
+    // deduction either — a real conduct/attendance hit should still surface
+    // even in a quarter with no tasks or goals yet.
+    if (components.length === 0 && adjustment === 0) return null;
+    return +(avg + adjustment).toFixed(2);
+}
 
-    return +((numerator / denominator) * 100).toFixed(2);
+
+function computePaceScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
+    return computeBaseScore({ c1Net, c2Net, c3, c4 });
+}
+
+function computeQuarterScore({ c1Net, c2Net, c3 = 0, c4 = 0 }) {
+    return computeBaseScore({ c1Net, c2Net, c3, c4 });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -479,10 +500,11 @@ async function computeAnnualScores(employeeId, year) {
         }
 
         const c1Data = await computeC1ForQuarter(employeeId, q, year);
+        const c3Data = await computeC3ForEmployee(employeeId, q, year);
         const rawScore = computeQuarterScore({
             c1Net: c1Data.c1Net,
             c2Net: c2Data.c2Net,
-            c3: 0, c4: 0,
+            c3: c3Data.c3Net,
         });
 
         weightUsed += weight;
@@ -493,25 +515,25 @@ async function computeAnnualScores(employeeId, year) {
             projSum += rawScore * weight;
             quarters.push({
                 quarter: q, score: rawScore, status: "closed", weight,
-                c1: c1Data.c1Net, c2: c2Data.c2Net,
+                c1: c1Data.c1Net, c2: c2Data.c2Net, c3: c3Data.c3Net,
             });
         } else {
             // Current (live) quarter
             liveSum += rawScore * weight;
 
-            // Projected: assume current quality rate holds for rest of quarter
-            // C3/C4 extrapolation: 0 (not implemented)
+            // Projected: assume current rate (including today's actual C3)
+            // holds for the rest of the quarter.
             const projScore = computeQuarterScore({
                 c1Net: c1Data.c1Net,
                 c2Net: c2Data.c2Net,
-                c3: 0, c4: 0,
+                c3: c3Data.c3Net,
             });
             projSum += projScore * weight;
 
             quarters.push({
                 quarter: q, score: rawScore, projectedScore: projScore,
                 status: "live", weight, dayInQuarter: dayInQ,
-                c1: c1Data.c1Net, c2: c2Data.c2Net,
+                c1: c1Data.c1Net, c2: c2Data.c2Net, c3: c3Data.c3Net,
             });
         }
     }
@@ -663,25 +685,16 @@ async function getDashboardData(employeeId, quarter, year) {
     const c3 = c3Data.c3Net;
     const c4 = c4Data.c4Net;
 
-
     const pace = computePaceScore({
         c1Net: c1Data.c1Net,
-        c1Max: c1Data.c1Max,
-        c2PtsEarned: c2Data.ptsEarned,
-        c2PtsPastDeadline: c2Data.ptsPastDeadline,
-        c3, c4,
+        c2Net: c2Data.c2Net,
+        c3,
     });
-
-    // ── SOP-based pace (raw pts earned ÷ raw pts possible) ───────────────────
-    const sopAchieved = +(sopBreakdown.c1 + sopBreakdown.c2 + sopBreakdown.c3 + sopBreakdown.c4).toFixed(2);
-    const sopAchievable = +((c1Data.taskCount || 0) * 1.0 + (c2Data.ptsPastDeadline || 0)).toFixed(2);
-    const sopPaceScore = sopAchievable > 0 ? +(sopAchieved / sopAchievable * 100).toFixed(2) : 0;
-
 
     const rawQuarterScore = computeQuarterScore({
         c1Net: c1Data.c1Net,
         c2Net: c2Data.c2Net,
-        c3, c4,
+        c3,
     });
 
     const annualData = await computeAnnualScores(employeeId, year);
@@ -694,6 +707,14 @@ async function getDashboardData(employeeId, quarter, year) {
         c2HitRate: c2Data.c2Score,
         liveAnnual: annualData.liveAnnual,
     });
+
+    const paceComponents = [
+        (c1Data.c1Net !== null && c1Data.c1Net !== undefined) ? { label: "C1%", value: c1Data.c1Net } : null,
+        (c2Data.c2Net !== null && c2Data.c2Net !== undefined) ? { label: "C2%", value: c2Data.c2Net } : null,
+    ].filter(Boolean);
+    const paceFormula = paceComponents.length > 0
+        ? `(${paceComponents.map(p => p.label).join(" + ")}) / ${paceComponents.length} − C3%  ·  C4 excluded (not built yet)`
+        : "Not enough data yet";
 
     return {
         employeeId,
@@ -736,14 +757,13 @@ async function getDashboardData(employeeId, quarter, year) {
             breaches: c4Data.breaches,
             sopPts: sopBreakdown.c4,
         },
-
         // ── Pace ──────────────────────────────────────────────────────────────────
         pace: {
-            score: sopPaceScore,
-            rating: getRating(sopPaceScore),
-            numerator: sopAchieved,
-            denominator: sopAchievable,
-            formula: `(${sopBreakdown.c1} C1 + ${sopBreakdown.c2} C2 + ${sopBreakdown.c3} C3 + ${sopBreakdown.c4} C4) ÷ (${c1Data.taskCount || 0} tasks + ${c2Data.ptsPastDeadline.toFixed(1)} C2)`,
+            score: pace,
+            rating: getRating(pace),
+            breakdown: paceComponents,
+            c3Net: c3,
+            formula: paceFormula,
         },
 
         // ── Quarter raw score ─────────────────────────────────────────────────────

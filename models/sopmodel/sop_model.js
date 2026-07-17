@@ -6,6 +6,13 @@ const sopSchema = new mongoose.Schema(
     {
         name: { type: String, trim: true },
         points: { type: Number, min: 0.5 },
+        // Severity tag drives the deduction amount (PDF §3.4 C3 table).
+        // Null = legacy SOP created before this field existed; keeps its stored `points` as-is.
+        severity: {
+            type: String,
+            enum: ["minor", "moderate", "serious", "falsification", "idle_pool", null],
+            default: null,
+        },
         description: { type: String, trim: true },
         department: { type: String, trim: true },
 
