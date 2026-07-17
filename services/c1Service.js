@@ -72,29 +72,28 @@ function calculateTaskScore(cfg, { deadlinesMissed = 0, extensionsFiled = 0, rew
 // Cancelled tasks excluded. Returns null if no eligible tasks.
 // ─────────────────────────────────────────────────────────────────────────────
 function calculateQualityRate(tasks) {
-    // Only tasks with a computed score and positive ETC
+    // Only tasks with a computed score. No longer requires etcHours > 0 —
+    // that filter existed only to avoid a zero-weight in the old weighted
+    // average, which no longer applies now every task counts as 1.
     const eligible = tasks.filter(t =>
         t.c1?.taskScore !== null &&
         t.c1?.taskScore !== undefined &&
-        !t.c1?.isExcluded &&
-        Number(t.etcHours) > 0
+        !t.c1?.isExcluded
     );
     if (eligible.length === 0) return null;
 
-    const numerator = eligible.reduce((s, t) => s + (Number(t.c1.taskScore) * Number(t.etcHours)), 0);
-    const denominator = eligible.reduce((s, t) => s + Number(t.etcHours), 0);
+    const numerator = eligible.reduce((s, t) => s + Number(t.c1.taskScore), 0);
+    const denominator = eligible.length;
     if (denominator === 0) return null;
 
     return Math.max(numerator / denominator, 0); // Floor at 0
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// calculateC1Net
-// ─────────────────────────────────────────────────────────────────────────────
 function calculateC1Net(qualityRate, c1MaxPoints) {
     if (qualityRate === null || qualityRate === undefined) return null;
-    return +(qualityRate * Number(c1MaxPoints)).toFixed(2);
+    return +(qualityRate * 100).toFixed(2);
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // computeAndStoreTaskScore
