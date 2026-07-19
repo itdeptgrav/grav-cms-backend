@@ -7,6 +7,11 @@ const mongoose = require("mongoose");
 const Sop = require("../../models/sopmodel/sop_model");
 const SopFolder = require("../../models/sopmodel/sop_folder_model");
 const Employee = require("../../models/Employee");
+const Policy = require("../../models/HR_Models/Policy");
+const C4Config = require("../../models/HR_Models/C4Config");
+const c1Svc = require("../../services/c1Service");
+const { db } = require("../../config/firebaseAdmin");
+
 
 const {
     verifyCoworkToken,
@@ -122,6 +127,73 @@ router.get("/", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
         res.json({ success: true, sops });
     } catch (e) {
         console.error("[sop/GET]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// GET /cowork/sop/all-categories — every SOP/rule across C1-C4, for the
+// "All SOPs" browse view. Combines: custom Sop catalog entries (always C3
+// when applied), HR attendance Policy entries (always C4), and the
+// system-level rules that aren't stored as a Sop/Policy document at all
+// (C1's deadline/extension/rework deductions, the Idle Pool deduction, and
+// C4's late/absence/early-departure base rates) — pulled live from their
+// actual config sources so the numbers shown here can't drift from what's
+// really applied.
+router.get("/all-categories", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+    try {
+        const [sops, policies, c1Cfg, sopSettingsSnap, c4Cfg] = await Promise.all([
+            Sop.find({ status: "approved" }).sort({ department: 1, name: 1 }).lean(),
+            Policy.find({ isActive: true }).sort({ name: 1 }).lean(),
+            c1Svc.getC1Config(),
+            db.collection("cowork_sop_settings").doc("task_events").get(),
+            C4Config.getSingleton(),
+        ]);
+
+        const timerCfg = sopSettingsSnap.exists ? sopSettingsSnap.data() : {};
+        const timerMinPct = Number(timerCfg.timerMinDailyPct) || 0;
+        const timerTargetDesc = timerMinPct > 0
+            ? `${timerMinPct}% of that day's available hours (your online-to-close window, minus breaks)`
+            : `${Number(timerCfg.timerMinDailyHrs) || 0}h`;
+
+        const c1 = [
+            { name: "Missed Deadline", points: c1Cfg.c1DeadlineDeduction, description: "Task submitted after its deadline — score decays per business hour late.", source: "system" },
+            { name: "Extension Filed", points: c1Cfg.c1ExtensionDeduction, description: "Deadline extension requested after 70% of allocated time had elapsed.", source: "system" },
+            { name: "Rework / Incomplete Submission", points: c1Cfg.c1ReworkDeduction, description: "Submission returned as incomplete — deducted per return.", source: "system" },
+        ];
+
+        // No C2-category deduction/reward rule exists yet — goal scoring is
+        // purely points-earned vs points-assigned, nothing else feeds it.
+        const c2 = [];
+
+        const c3 = [
+            ...sops.map(s => ({
+                name: s.name, points: s.points, severity: s.severity || null,
+                description: s.description, department: s.department,
+                folder: s.folderName || "Uncategorized", source: "custom",
+            })),
+            {
+                name: "Idle Pool Deduction",
+                points: Number(timerCfg.timerDeficitPoints) || 0,
+                description: `Fires once accumulated work-hour shortfall reaches ${Number(timerCfg.timerDeficitThresholdHrs) || 0}h (daily target: ${timerTargetDesc}).`,
+                source: "system",
+            },
+        ];
+
+        const c4 = [
+            ...policies.map(p => ({
+                name: p.name, points: p.points, bleachType: p.bleachType,
+                triggerKey: p.triggerKey, thresholdMins: p.thresholdMins,
+                description: p.description, scope: p.scope,
+                department: p.departmentName || null, source: "policy",
+            })),
+            { name: "Late Arrival", points: Number(c4Cfg.lateArrivalPoints) || 0, description: `Auto-detected from attendance — more than ${Number(c4Cfg.lateThresholdMins) || 0} min late.`, source: "system" },
+            { name: "Absence", points: Number(c4Cfg.absencePoints) || 0, description: "Auto-detected from attendance — marked absent for the day.", source: "system" },
+            { name: "Early Departure", points: Number(c4Cfg.earlyDeparturePoints) || 0, description: `Auto-detected from attendance — left more than ${Number(c4Cfg.earlyThresholdMins) || 0} min early.`, source: "system" },
+        ];
+
+        res.json({ success: true, c1, c2, c3, c4 });
+    } catch (e) {
+        console.error("[sop/all-categories/GET]", e.message);
         res.status(500).json({ error: e.message });
     }
 });

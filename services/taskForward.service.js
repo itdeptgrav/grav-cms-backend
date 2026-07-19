@@ -1467,7 +1467,7 @@ async function updateParentTaskProgress({ parentTaskId, updatedBy, updatedByName
 // ═════════════════════════════════════════════════════════
 //  DEADLINE PROPOSAL — employee proposes, creator approves
 // ═════════════════════════════════════════════════════════
-async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate, workedSecs = 0 }) {
+async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate, workedSecs = 0, windowSecs = 0 }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1498,7 +1498,15 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
   // How many seconds the employee is asking for (extension magnitude for
   // extensions; total window for first-time proposals). Derived from "now"
   // because the frontend computes proposedDate as `now + typedDuration`.
-  const extensionSecs = Math.max(0, Math.floor((new Date(proposedDate).getTime() - Date.now()) / 1000));
+  // Prefer the EXPLICIT typed duration sent by the frontend. The old
+  // now-subtraction assumed proposedDate = now + rawDuration; once the
+  // frontend computes proposedDate office-hours-aware (skipping nights,
+  // breaks, off days), that subtraction wildly inflates the window
+  // (3h typed on Sunday evening -> ~19h derived). Fallback kept for
+  // old clients that don't send windowSecs.
+  const extensionSecs = Number(windowSecs) > 0
+    ? Math.floor(Number(windowSecs))
+    : Math.max(0, Math.floor((new Date(proposedDate).getTime() - Date.now()) / 1000));
 
   const existingWindowSecs = task.deadlineWindowSecs || 0;
   const deadlineWindowSecs = isExtension
@@ -1576,6 +1584,38 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
   return { success: true };
 }
 
+// IST office-hours walker — same logic as taskForward.js route helper.
+// Server-side net for approveDeadline; schedule+breaks only (no holiday set).
+function _addWorkingSecsIST_svc(startMs, windowSecs, schedule, breaks) {
+  if (!schedule || windowSecs <= 0) return new Date(startMs + windowSecs * 1000).toISOString();
+  const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const IST = 5.5 * 3600000;
+  const dateStrOf = ms => new Date(ms + IST).toISOString().slice(0, 10);
+  const dowOf = ms => new Date(Date.parse(dateStrOf(ms) + "T00:00:00Z")).getUTCDay();
+  let remaining = windowSecs, cur = startMs, guard = 0;
+  while (remaining > 0 && guard++ < 3660) {
+    const ds = dateStrOf(cur);
+    const day = schedule[DAY_KEYS[dowOf(cur)]];
+    const nextMidnight = Date.parse(ds + "T00:00:00+05:30") + 86400000;
+    if (!day || day.isOff) { cur = nextMidnight; continue; }
+    const dayStart = Date.parse(`${ds}T${day.inTime}:00+05:30`);
+    const dayEnd = Date.parse(`${ds}T${day.outTime}:00+05:30`);
+    if (cur < dayStart) cur = dayStart;
+    if (cur >= dayEnd) { cur = nextMidnight; continue; }
+    const todaysBreaks = (breaks || [])
+      .map(b => ({ s: Date.parse(`${ds}T${b.start}:00+05:30`), e: Date.parse(`${ds}T${b.end}:00+05:30`) }))
+      .filter(b => b.e > b.s).sort((a, b) => a.s - b.s);
+    const inBrk = todaysBreaks.find(b => cur >= b.s && cur < b.e);
+    if (inBrk) { cur = inBrk.e; continue; }
+    const nextBrkStart = (todaysBreaks.find(b => b.s > cur) || {}).s;
+    const segEnd = Math.min(dayEnd, nextBrkStart == null ? Infinity : nextBrkStart);
+    const segSecs = Math.floor((segEnd - cur) / 1000);
+    if (segSecs >= remaining) return new Date(cur + remaining * 1000).toISOString();
+    remaining -= segSecs; cur = segEnd;
+  }
+  return new Date(cur).toISOString();
+}
+
 async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
@@ -1592,7 +1632,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
   const prevStatus = ["in_progress", "confirmed"].includes(prev) ? prev : "deadline_approved";
 
   if (approved) {
-    const newDueDate = task.proposedDeadline;
+    let newDueDate = task.proposedDeadline;
 
     // ── Trust the window that was stored at proposal time ──────────────────
     // Do NOT recompute from wall-clock (newDueDate − now) — that throws away
@@ -1607,6 +1647,25 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     // UI can render the breakdown "30 + 20 + 10 = 60".
     const wasExtension = typeof task.pendingExtensionSecs === "number" && task.pendingExtensionSecs > 0;
     const approvedWindowSecs = Number(task.deadlineWindowSecs) || 0;
+
+    // ── Office-hours safety net (first-time proposals only) ──────────────
+    // Walk approvedWindowSecs through office time from NOW and take the
+    // LATER of stored-vs-server date. A raw wall-clock date is always ≤ the
+    // office walk → gets corrected; a correct chain-anchored date is always
+    // ≥ the plain now-walk → preserved untouched. Also fixes late approvals
+    // (proposed Sunday night, approved Monday). Extensions skipped — their
+    // dueDate is intentionally stale until Start (awaitingExtensionStart).
+    if (!wasExtension && approvedWindowSecs > 0) {
+      try {
+        const officeSnap = await db.collection("cowork_settings").doc("office").get();
+        if (officeSnap.exists) {
+          const serverDue = _addWorkingSecsIST_svc(Date.now(), approvedWindowSecs, officeSnap.data().schedule || null, officeSnap.data().breaks || []);
+          if (serverDue && (!newDueDate || new Date(serverDue).getTime() > new Date(newDueDate).getTime())) {
+            newDueDate = serverDue;
+          }
+        }
+      } catch (e) { console.error("[approveDeadline office net]", e.message); }
+    }
 
     const update = {
       status: prevStatus,
