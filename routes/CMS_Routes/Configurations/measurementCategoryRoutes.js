@@ -63,10 +63,19 @@ router.post("/:id/assign-to-product-category", async (req, res) => {
       { $set: { measurements: cat.fields } }
     );
 
+    // Persist the link — this is the record that lets the system later
+    // resolve a product's category back to the correct measurement category
+    // name, instead of guessing by string similarity.
+    if (!cat.productCategories.some(pc => pc.toLowerCase() === productCategory.toLowerCase())) {
+      cat.productCategories.push(productCategory);
+      await cat.save();
+    }
+
     res.json({
       success: true,
       message: `Updated ${result.modifiedCount} product(s) in "${productCategory}" to use "${cat.name}" measurements`,
       modifiedCount: result.modifiedCount,
+      category: cat,
     });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
