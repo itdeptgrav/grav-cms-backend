@@ -1616,6 +1616,41 @@ function _addWorkingSecsIST_svc(startMs, windowSecs, schedule, breaks) {
   return new Date(cur).toISOString();
 }
 
+// Count WORKING seconds between two instants (inverse of _addWorkingSecsIST).
+// Nights, off days, and breaks contribute 0 — used for the office-hours-aware
+// extension "elapsed %" so calendar time alone can never push a task into the
+// 70%+ penalty zone before the employee could even work.
+function _workingSecsBetweenIST(startMs, endMs, schedule, breaks) {
+  if (!schedule || !startMs || !endMs || endMs <= startMs) return 0;
+  const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const IST = 5.5 * 3600000;
+  const dateStrOf = ms => new Date(ms + IST).toISOString().slice(0, 10);
+  const dowOf = ms => new Date(Date.parse(dateStrOf(ms) + "T00:00:00Z")).getUTCDay();
+  let total = 0, cur = startMs, guard = 0;
+  while (cur < endMs && guard++ < 3660) {
+    const ds = dateStrOf(cur);
+    const day = schedule[DAY_KEYS[dowOf(cur)]];
+    const nextMidnight = Date.parse(ds + "T00:00:00+05:30") + 86400000;
+    if (!day || day.isOff) { cur = nextMidnight; continue; }
+    const dayStart = Date.parse(`${ds}T${day.inTime}:00+05:30`);
+    const dayEnd = Date.parse(`${ds}T${day.outTime}:00+05:30`);
+    if (cur < dayStart) cur = dayStart;
+    if (cur >= dayEnd) { cur = nextMidnight; continue; }
+    if (cur >= endMs) break;
+    const todaysBreaks = (breaks || [])
+      .map(b => ({ s: Date.parse(`${ds}T${b.start}:00+05:30`), e: Date.parse(`${ds}T${b.end}:00+05:30`) }))
+      .filter(b => b.e > b.s).sort((a, b) => a.s - b.s);
+    const inBrk = todaysBreaks.find(b => cur >= b.s && cur < b.e);
+    if (inBrk) { cur = inBrk.e; continue; }
+    const nextBrkStart = (todaysBreaks.find(b => b.s > cur) || {}).s;
+    const segEnd = Math.min(dayEnd, nextBrkStart == null ? Infinity : nextBrkStart, endMs);
+    if (segEnd <= cur) { cur = nextMidnight; continue; }
+    total += Math.floor((segEnd - cur) / 1000);
+    cur = segEnd;
+  }
+  return total;
+}
+
 async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
@@ -1994,6 +2029,27 @@ async function sendDraftChat({ taskId, senderId, senderName, text, attachments =
     const t = taskDoc.data();
     const all = [...new Set([...(t.assigneeIds || []), t.assignedBy].filter(Boolean))];
     socket.emitToMany(all, "task_draft_chat_message", { taskId, message: { ...msg, createdAt: isoTime } });
+    // Bell + FCM + email so offline recipients see draft-chat messages.
+    // System messages are skipped — the flows that post them (propose /
+    // approve / reject / counter) already send their own _notifyMany;
+    // notifying here too would double-ping every action.
+    // Unlike sendTaskChat, the CREATOR (assignedBy) IS notified here —
+    // draft chat is a two-way negotiation and the creator's reply is
+    // required for the flow to advance.
+    if (messageType !== "system") {
+      const notifyIds = all.filter(id => id !== senderId);
+      if (notifyIds.length) {
+        await _notifyMany({
+          recipientIds: notifyIds,
+          type: "draft_chat",
+          title: `📝 Draft Chat · ${t.title || taskId}`,
+          body: `${senderName}: ${(text || "📎 attachment").slice(0, 60)}`,
+          data: { taskId, taskTitle: t.title || "" },
+          senderId,
+          senderName,
+        });
+      }
+    }
   }
   return { ...msg, createdAt: isoTime };
 }
