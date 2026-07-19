@@ -1722,9 +1722,26 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     const _dueMs = task.dueDate ? new Date(task.dueDate).getTime() : (task.fixedDeadline ? new Date(task.fixedDeadline).getTime() : null);
     if (_dueMs && task.createdAtISO) {
       const _createdMs = new Date(task.createdAtISO).getTime();
-      const _totalWindowMs = _dueMs - _createdMs;
-      if (_totalWindowMs > 0) {
-        elapsedPercent = Math.min(100, +(((Date.now() - _createdMs) / _totalWindowMs) * 100).toFixed(1));
+      // Office-hours-aware: count only WORKING seconds on both sides, so
+      // nights / breaks / off days move the % on neither numerator nor
+      // denominator. A 3h task created Sunday night is 0% until Monday
+      // office open. Wall-clock fallback if the schedule is unreadable.
+      let _officeDone = false;
+      try {
+        const _offSnap = await db.collection("cowork_settings").doc("office").get();
+        if (_offSnap.exists && _offSnap.data().schedule) {
+          const _sch = _offSnap.data().schedule;
+          const _brk = _offSnap.data().breaks || [];
+          const _tot = _workingSecsBetweenIST(_createdMs, _dueMs, _sch, _brk);
+          const _don = _workingSecsBetweenIST(_createdMs, Date.now(), _sch, _brk);
+          if (_tot > 0) { elapsedPercent = Math.min(100, +(((_don / _tot) * 100).toFixed(1))); _officeDone = true; }
+        }
+      } catch (e) { console.error("[ext elapsed office calc]", e.message); }
+      if (!_officeDone) {
+        const _totalWindowMs = _dueMs - _createdMs;
+        if (_totalWindowMs > 0) {
+          elapsedPercent = Math.min(100, +(((Date.now() - _createdMs) / _totalWindowMs) * 100).toFixed(1));
+        }
       }
     }
     if (isNaN(elapsedPercent)) elapsedPercent = 0;
