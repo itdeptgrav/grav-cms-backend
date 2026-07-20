@@ -330,70 +330,53 @@ async function computeC3ForEmployee(employeeId, quarter, year) {
 // Returns c4Net: null if there were no working days at all this quarter.
 // ─────────────────────────────────────────────────────────────────────────────
 async function computeC4ForEmployee(employeeId, quarter, year) {
+    const emp = await Employee.findOne({ biometricId: employeeId }).lean();
+    if (!emp) return { c4Net: null, basePoints: 0, penalty: 0, finalPoints: null, dayCount: 0, breachCount: 0, breaches: [] };
+
+    const yearData = emp.sopPoints?.find(sp => sp.year === year);
+    if (!yearData) return { c4Net: null, basePoints: 0, penalty: 0, finalPoints: null, dayCount: 0, breachCount: 0, breaches: [] };
+
     const cfg = await C4Config.getSingleton();
-    const basePoints = Number(cfg.basePointsPerDay) || 0;
-    const nonWorking = new Set(cfg.nonWorkingStatuses || ["WO"]);
-    const lateThreshold = Number(cfg.lateThresholdMins) || 0;
-    const earlyThreshold = Number(cfg.earlyThresholdMins) || 0;
+    const basePointsPerDay = Number(cfg.basePointsPerDay) || 0;
 
     const qStartMonth = (quarter - 1) * 3 + 1;
     const qEndMonth = qStartMonth + 2;
-    const pad = n => String(n).padStart(2, "0");
-    const qStartDateStr = `${year}-${pad(qStartMonth)}-01`;
-    const qEndDay = new Date(year, qEndMonth, 0).getDate();
-    const qEndDateStr = `${year}-${pad(qEndMonth)}-${pad(qEndDay)}`;
 
-    const days = await DailyAttendance.find(
-        { dateStr: { $gte: qStartDateStr, $lte: qEndDateStr }, "employees.biometricId": employeeId },
-        { dateStr: 1, "employees.$": 1 },
-    ).lean();
-
-    let workingDayCount = 0;
-    let totalPenalty = 0;
+    const datesSeen = new Set();
+    let penalty = 0;
     const breaches = [];
 
-    for (const doc of days) {
-        const entry = doc.employees?.[0];
-        if (!entry) continue;
+    (yearData.bleaches || []).forEach(b => {
+        if (b.type !== "C4") return;
+        if (b.recheck?.status === "confirmed") return;
+        if (!b.date) return;
 
-        const effStatus = entry.hrFinalStatus || entry.systemPrediction;
-        if (nonWorking.has(effStatus)) continue;
+        const month = parseInt(b.date.slice(5, 7), 10);
+        if (month < qStartMonth || month > qEndMonth) return;
 
-        workingDayCount++;
+        datesSeen.add(b.date); // any C4 entry that day — credit or debit — counts the day
 
-        let penalty = 0;
-        const reasons = [];
-        if (effStatus === "AB") {
-            penalty += Number(cfg.absencePoints) || 0;
-            reasons.push("absent");
-        } else {
-            if (entry.isLate && entry.lateMins > lateThreshold) {
-                penalty += Number(cfg.lateArrivalPoints) || 0;
-                reasons.push(`late (${entry.lateMins}min)`);
-            }
-            if (entry.isEarlyDeparture && entry.earlyDepartureMins > earlyThreshold) {
-                penalty += Number(cfg.earlyDeparturePoints) || 0;
-                reasons.push(`early departure (${entry.earlyDepartureMins}min)`);
-            }
+        if (b.bleachType !== "debit") {
+            const pts = Number(b.points) || 0;
+            penalty += pts;
+            breaches.push({ sopName: b.sopName, points: pts, date: b.date, cutByName: b.cutByName });
         }
+    });
 
-        totalPenalty += penalty;
-        if (reasons.length > 0) {
-            breaches.push({ date: doc.dateStr, status: effStatus, reasons: reasons.join(", "), penalty });
-        }
+    const dayCount = datesSeen.size;
+    const basePoints = +(dayCount * basePointsPerDay).toFixed(4);
+
+    console.log("[C4 DEBUG]", { employeeId, quarter, year, basePointsPerDay, dayCount, datesSeen: [...datesSeen], penalty, basePoints });
+
+    if (dayCount === 0 || basePoints === 0) {
+        return { c4Net: null, basePoints: 0, penalty: +penalty.toFixed(4), finalPoints: null, dayCount, breachCount: breaches.length, breaches };
     }
 
-    if (workingDayCount === 0) {
-        return { c4Net: null, workingDays: 0, totalBasePoints: 0, totalPenalty: 0, finalPoints: 0, breachCount: breaches.length, breaches };
-    }
+    const finalPoints = +(basePoints - penalty).toFixed(4);
+    const c4Net = +((finalPoints / basePoints) * 100).toFixed(2);
 
-    const totalBasePoints = +(workingDayCount * basePoints).toFixed(4);
-    const finalPoints = +(totalBasePoints - totalPenalty).toFixed(4);
-    const c4Net = totalBasePoints > 0 ? +((finalPoints / totalBasePoints) * 100).toFixed(2) : null;
-
-    return { c4Net, workingDays: workingDayCount, totalBasePoints, totalPenalty: +totalPenalty.toFixed(4), finalPoints, breachCount: breaches.length, breaches };
+    return { c4Net, basePoints, penalty: +penalty.toFixed(4), finalPoints, dayCount, breachCount: breaches.length, breaches };
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // getSOPBreakdown — sums SOP bleach pts by band type for a specific quarter
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,15 +716,17 @@ async function getDashboardData(employeeId, quarter, year) {
             sopPts: sopBreakdown.c3,
         },
         c4: {
-            net: c4Data.c4Net,
-            workingDays: c4Data.workingDays,
-            totalBasePoints: c4Data.totalBasePoints,
-            totalPenalty: c4Data.totalPenalty,
+            net: c4Net,
+            basePoints: c4Data.basePoints,
+            dayCount: c4Data.dayCount,
+            penalty: c4Data.penalty,
             finalPoints: c4Data.finalPoints,
             breachCount: c4Data.breachCount,
             breaches: c4Data.breaches,
             sopPts: sopBreakdown.c4,
-        },        // ── Pace ──────────────────────────────────────────────────────────────────
+        },
+
+        // ── Pace ──────────────────────────────────────────────────────────────────
         pace: {
             score: pace,
             rating: getRating(pace),
