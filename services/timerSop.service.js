@@ -174,6 +174,27 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
             daysToFinalize.push(cursor);
             cursor = _addDaysToLabel(cursor, 1);
         }
+
+        // ── OFF-period amnesty ──────────────────────────────────────────────
+        // Days while the engine was switched OFF are never judged. The toggle
+        // stamps timerSopEnabledAt every time it is turned back ON; any
+        // unfinalized day BEFORE that date belongs to the paused period —
+        // skip it and advance the watermark so it is never revisited.
+        // Calculation starts fresh from the enable date onward. Accumulators
+        // earned before the pause are kept; paused days add nothing to them.
+        if (sopCfg.timerSopEnabledAt) {
+            const enabledDateIST = _istDateStr(new Date(sopCfg.timerSopEnabledAt).getTime());
+            const skipped = daysToFinalize.filter(d => d < enabledDateIST);
+            if (skipped.length > 0) {
+                const keep = daysToFinalize.filter(d => d >= enabledDateIST);
+                daysToFinalize.length = 0;
+                daysToFinalize.push(...keep);
+                emp.lastFinalizedDate = skipped[skipped.length - 1];
+                await emp.save();
+                console.log(`[timerSop] ${employeeId}: amnesty — skipped ${skipped.length} paused day(s) up to ${skipped[skipped.length - 1]}, judging resumes from ${enabledDateIST}`);
+            }
+        }
+
         if (daysToFinalize.length === 0) {
             return {
                 ok: true,
