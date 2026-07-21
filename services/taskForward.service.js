@@ -30,6 +30,33 @@ function deadlineColor(dueDate) {
   return s === "overdue" ? "#d93025" : s === "near" ? "#f9ab00" : s === "safe" ? "#1e8e3e" : "#80868b";
 }
 
+async function _snapToNextWorkingMoment(date) {
+  const schedSnap = await db.collection("cowork_settings").doc("office").get();
+  const schedule = schedSnap.exists ? schedSnap.data().schedule : null;
+  if (!schedule) return date;
+
+  const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const parseMins = t => { if (!t) return 0; const [h, m] = t.split(":").map(Number); return h * 60 + (m || 0); };
+
+  let cursor = new Date(date);
+  for (let i = 0; i < 8; i++) {
+    const day = schedule[DAY_KEYS[cursor.getDay()]];
+    if (day && !day.isOff) {
+      const inMins = parseMins(day.inTime);
+      const outMins = parseMins(day.outTime);
+      const dayStart = new Date(cursor); dayStart.setHours(Math.floor(inMins / 60), inMins % 60, 0, 0);
+      const dayEnd = new Date(cursor); dayEnd.setHours(Math.floor(outMins / 60), outMins % 60, 0, 0);
+
+      if (cursor < dayStart) return dayStart;
+      if (cursor <= dayEnd) return cursor;
+    }
+    cursor = new Date(cursor);
+    cursor.setDate(cursor.getDate() + 1);
+    cursor.setHours(0, 0, 0, 0);
+  }
+  return date;
+}
+
 // ─── Duration formatter for draft-chat system messages ────────────────────────
 // Formats "duration from now" as a human string like "2h", "45m", "1h 30m", "3 days".
 // Used in deadline proposal/counter chat messages to AVOID a stale wall-clock timestamp
@@ -1275,7 +1302,20 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
     // ── Rejected (all flows) — back to in_progress ────────────────────────
     if (!rejectionReason?.trim()) throw new Error("Rejection reason required.");
     const tlReview = { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: false, rejectionReason: rejectionReason.trim(), reviewedAt: new Date().toISOString() };
-    await ref.update({ completionStatus: "tl_rejected", tlReview, status: "in_progress", updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    const isDeadlineMode = task.hasTimer === false;
+    const deadlineField = isDeadlineMode ? "fixedDeadline" : "dueDate";
+    const currentDeadline = task[deadlineField] || null;
+
+    let newDeadline = currentDeadline;
+    const submittedAtISO = task.completionSubmission?.submittedAt || null;
+    if (currentDeadline && submittedAtISO) {
+      const leftoverMs = new Date(currentDeadline).getTime() - new Date(submittedAtISO).getTime();
+      const snappedNow = await _snapToNextWorkingMoment(new Date());
+      newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
+    }
+
+    await ref.update({ completionStatus: "tl_rejected", tlReview, status: "in_progress", [deadlineField]: newDeadline, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
     await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ ${reviewerName} rejected.\n📝 Reason: ${rejectionReason.trim()}`, messageType: "system" });
 
     if (submitterId) {
@@ -1346,9 +1386,22 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
 
   const currentReworks = Number(task.c1?.reworksReceived) || 0;
 
+  const isDeadlineMode = task.hasTimer === false;
+  const deadlineField = isDeadlineMode ? "fixedDeadline" : "dueDate";
+  const currentDeadline = task[deadlineField] || null;
+
+  let newDeadline = currentDeadline;
+  const submittedAtISO = task.completionSubmission?.submittedAt || null;
+  if (currentDeadline && submittedAtISO) {
+    const leftoverMs = new Date(currentDeadline).getTime() - new Date(submittedAtISO).getTime();
+    const snappedNow = await _snapToNextWorkingMoment(new Date());
+    newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
+  }
+
   await ref.update({
     completionStatus: null,
     status: "in_progress",
+    [deadlineField]: newDeadline,
     "c1.reworksReceived": currentReworks + 1,
     reworkHistory: admin.firestore.FieldValue.arrayUnion({
       reworkNumber: currentReworks + 1,
@@ -1356,9 +1409,12 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
       sentBackBy: reviewerId,
       sentBackByName: reviewerName,
       sentBackAt: new Date().toISOString(),
+      previousDeadline: currentDeadline,
+      newDeadline,
     }),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+
 
   await sendTaskChat({
     taskId, senderId: reviewerId, senderName: reviewerName,
@@ -1467,7 +1523,7 @@ async function updateParentTaskProgress({ parentTaskId, updatedBy, updatedByName
 // ═════════════════════════════════════════════════════════
 //  DEADLINE PROPOSAL — employee proposes, creator approves
 // ═════════════════════════════════════════════════════════
-async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate, workedSecs = 0 }) {
+async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate, workedSecs = 0, windowSecs = 0 }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1498,7 +1554,15 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
   // How many seconds the employee is asking for (extension magnitude for
   // extensions; total window for first-time proposals). Derived from "now"
   // because the frontend computes proposedDate as `now + typedDuration`.
-  const extensionSecs = Math.max(0, Math.floor((new Date(proposedDate).getTime() - Date.now()) / 1000));
+  // Prefer the EXPLICIT typed duration sent by the frontend. The old
+  // now-subtraction assumed proposedDate = now + rawDuration; once the
+  // frontend computes proposedDate office-hours-aware (skipping nights,
+  // breaks, off days), that subtraction wildly inflates the window
+  // (3h typed on Sunday evening -> ~19h derived). Fallback kept for
+  // old clients that don't send windowSecs.
+  const extensionSecs = Number(windowSecs) > 0
+    ? Math.floor(Number(windowSecs))
+    : Math.max(0, Math.floor((new Date(proposedDate).getTime() - Date.now()) / 1000));
 
   const existingWindowSecs = task.deadlineWindowSecs || 0;
   const deadlineWindowSecs = isExtension
@@ -1576,6 +1640,73 @@ async function proposeDeadline({ taskId, employeeId, employeeName, proposedDate,
   return { success: true };
 }
 
+// IST office-hours walker — same logic as taskForward.js route helper.
+// Server-side net for approveDeadline; schedule+breaks only (no holiday set).
+function _addWorkingSecsIST_svc(startMs, windowSecs, schedule, breaks) {
+  if (!schedule || windowSecs <= 0) return new Date(startMs + windowSecs * 1000).toISOString();
+  const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const IST = 5.5 * 3600000;
+  const dateStrOf = ms => new Date(ms + IST).toISOString().slice(0, 10);
+  const dowOf = ms => new Date(Date.parse(dateStrOf(ms) + "T00:00:00Z")).getUTCDay();
+  let remaining = windowSecs, cur = startMs, guard = 0;
+  while (remaining > 0 && guard++ < 3660) {
+    const ds = dateStrOf(cur);
+    const day = schedule[DAY_KEYS[dowOf(cur)]];
+    const nextMidnight = Date.parse(ds + "T00:00:00+05:30") + 86400000;
+    if (!day || day.isOff) { cur = nextMidnight; continue; }
+    const dayStart = Date.parse(`${ds}T${day.inTime}:00+05:30`);
+    const dayEnd = Date.parse(`${ds}T${day.outTime}:00+05:30`);
+    if (cur < dayStart) cur = dayStart;
+    if (cur >= dayEnd) { cur = nextMidnight; continue; }
+    const todaysBreaks = (breaks || [])
+      .map(b => ({ s: Date.parse(`${ds}T${b.start}:00+05:30`), e: Date.parse(`${ds}T${b.end}:00+05:30`) }))
+      .filter(b => b.e > b.s).sort((a, b) => a.s - b.s);
+    const inBrk = todaysBreaks.find(b => cur >= b.s && cur < b.e);
+    if (inBrk) { cur = inBrk.e; continue; }
+    const nextBrkStart = (todaysBreaks.find(b => b.s > cur) || {}).s;
+    const segEnd = Math.min(dayEnd, nextBrkStart == null ? Infinity : nextBrkStart);
+    const segSecs = Math.floor((segEnd - cur) / 1000);
+    if (segSecs >= remaining) return new Date(cur + remaining * 1000).toISOString();
+    remaining -= segSecs; cur = segEnd;
+  }
+  return new Date(cur).toISOString();
+}
+
+// Count WORKING seconds between two instants (inverse of _addWorkingSecsIST).
+// Nights, off days, and breaks contribute 0 — used for the office-hours-aware
+// extension "elapsed %" so calendar time alone can never push a task into the
+// 70%+ penalty zone before the employee could even work.
+function _workingSecsBetweenIST(startMs, endMs, schedule, breaks) {
+  if (!schedule || !startMs || !endMs || endMs <= startMs) return 0;
+  const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const IST = 5.5 * 3600000;
+  const dateStrOf = ms => new Date(ms + IST).toISOString().slice(0, 10);
+  const dowOf = ms => new Date(Date.parse(dateStrOf(ms) + "T00:00:00Z")).getUTCDay();
+  let total = 0, cur = startMs, guard = 0;
+  while (cur < endMs && guard++ < 3660) {
+    const ds = dateStrOf(cur);
+    const day = schedule[DAY_KEYS[dowOf(cur)]];
+    const nextMidnight = Date.parse(ds + "T00:00:00+05:30") + 86400000;
+    if (!day || day.isOff) { cur = nextMidnight; continue; }
+    const dayStart = Date.parse(`${ds}T${day.inTime}:00+05:30`);
+    const dayEnd = Date.parse(`${ds}T${day.outTime}:00+05:30`);
+    if (cur < dayStart) cur = dayStart;
+    if (cur >= dayEnd) { cur = nextMidnight; continue; }
+    if (cur >= endMs) break;
+    const todaysBreaks = (breaks || [])
+      .map(b => ({ s: Date.parse(`${ds}T${b.start}:00+05:30`), e: Date.parse(`${ds}T${b.end}:00+05:30`) }))
+      .filter(b => b.e > b.s).sort((a, b) => a.s - b.s);
+    const inBrk = todaysBreaks.find(b => cur >= b.s && cur < b.e);
+    if (inBrk) { cur = inBrk.e; continue; }
+    const nextBrkStart = (todaysBreaks.find(b => b.s > cur) || {}).s;
+    const segEnd = Math.min(dayEnd, nextBrkStart == null ? Infinity : nextBrkStart, endMs);
+    if (segEnd <= cur) { cur = nextMidnight; continue; }
+    total += Math.floor((segEnd - cur) / 1000);
+    cur = segEnd;
+  }
+  return total;
+}
+
 async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
@@ -1592,7 +1723,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
   const prevStatus = ["in_progress", "confirmed"].includes(prev) ? prev : "deadline_approved";
 
   if (approved) {
-    const newDueDate = task.proposedDeadline;
+    let newDueDate = task.proposedDeadline;
 
     // ── Trust the window that was stored at proposal time ──────────────────
     // Do NOT recompute from wall-clock (newDueDate − now) — that throws away
@@ -1607,6 +1738,25 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     // UI can render the breakdown "30 + 20 + 10 = 60".
     const wasExtension = typeof task.pendingExtensionSecs === "number" && task.pendingExtensionSecs > 0;
     const approvedWindowSecs = Number(task.deadlineWindowSecs) || 0;
+
+    // ── Office-hours safety net (first-time proposals only) ──────────────
+    // Walk approvedWindowSecs through office time from NOW and take the
+    // LATER of stored-vs-server date. A raw wall-clock date is always ≤ the
+    // office walk → gets corrected; a correct chain-anchored date is always
+    // ≥ the plain now-walk → preserved untouched. Also fixes late approvals
+    // (proposed Sunday night, approved Monday). Extensions skipped — their
+    // dueDate is intentionally stale until Start (awaitingExtensionStart).
+    if (!wasExtension && approvedWindowSecs > 0) {
+      try {
+        const officeSnap = await db.collection("cowork_settings").doc("office").get();
+        if (officeSnap.exists) {
+          const serverDue = _addWorkingSecsIST_svc(Date.now(), approvedWindowSecs, officeSnap.data().schedule || null, officeSnap.data().breaks || []);
+          if (serverDue && (!newDueDate || new Date(serverDue).getTime() > new Date(newDueDate).getTime())) {
+            newDueDate = serverDue;
+          }
+        }
+      } catch (e) { console.error("[approveDeadline office net]", e.message); }
+    }
 
     const update = {
       status: prevStatus,
@@ -1935,6 +2085,27 @@ async function sendDraftChat({ taskId, senderId, senderName, text, attachments =
     const t = taskDoc.data();
     const all = [...new Set([...(t.assigneeIds || []), t.assignedBy].filter(Boolean))];
     socket.emitToMany(all, "task_draft_chat_message", { taskId, message: { ...msg, createdAt: isoTime } });
+    // Bell + FCM + email so offline recipients see draft-chat messages.
+    // System messages are skipped — the flows that post them (propose /
+    // approve / reject / counter) already send their own _notifyMany;
+    // notifying here too would double-ping every action.
+    // Unlike sendTaskChat, the CREATOR (assignedBy) IS notified here —
+    // draft chat is a two-way negotiation and the creator's reply is
+    // required for the flow to advance.
+    if (messageType !== "system") {
+      const notifyIds = all.filter(id => id !== senderId);
+      if (notifyIds.length) {
+        await _notifyMany({
+          recipientIds: notifyIds,
+          type: "draft_chat",
+          title: `📝 Draft Chat · ${t.title || taskId}`,
+          body: `${senderName}: ${(text || "📎 attachment").slice(0, 60)}`,
+          data: { taskId, taskTitle: t.title || "" },
+          senderId,
+          senderName,
+        });
+      }
+    }
   }
   return { ...msg, createdAt: isoTime };
 }

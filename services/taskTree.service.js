@@ -20,6 +20,32 @@ const arrRemove = (...a) => admin.firestore.FieldValue.arrayRemove(...a);
 // ─── ID helpers ───────────────────────────────────────────────────────────────
 const makeTaskId = () => `TASK-${uuidv4().substring(0, 8).toUpperCase()}`;
 
+async function _snapToNextWorkingMoment(date) {
+    const schedSnap = await db.collection("cowork_settings").doc("office").get();
+    const schedule = schedSnap.exists ? schedSnap.data().schedule : null;
+    if (!schedule) return date;
+
+    const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    const parseMins = t => { if (!t) return 0; const [h, m] = t.split(":").map(Number); return h * 60 + (m || 0); };
+
+    let cursor = new Date(date);
+    for (let i = 0; i < 8; i++) {
+        const day = schedule[DAY_KEYS[cursor.getDay()]];
+        if (day && !day.isOff) {
+            const inMins = parseMins(day.inTime);
+            const outMins = parseMins(day.outTime);
+            const dayStart = new Date(cursor); dayStart.setHours(Math.floor(inMins / 60), inMins % 60, 0, 0);
+            const dayEnd = new Date(cursor); dayEnd.setHours(Math.floor(outMins / 60), outMins % 60, 0, 0);
+
+            if (cursor < dayStart) return dayStart;
+            if (cursor <= dayEnd) return cursor;
+        }
+        cursor = new Date(cursor);
+        cursor.setDate(cursor.getDate() + 1);
+        cursor.setHours(0, 0, 0, 0);
+    }
+    return date;
+}
 // ─── Get depth / breadcrumb ───────────────────────────────────────────────────
 const getBreadcrumb = async (taskId) => {
     const crumbs = [];
@@ -367,10 +393,21 @@ const tlReviewCompletion = async (taskId, tlId, decision, rejectionReason) => {
         });
         await _postSystemMsg(taskId, tlId, "✅ TL approved. Sent to CEO for final review.");
     } else {
+        const taskSnap = await db.collection("cowork_tasks").doc(taskId).get();
+        const task = taskSnap.exists ? taskSnap.data() : {};
+        let newDeadline = task.deadline || null;
+        const submittedAtISO = task.completionProof?.submittedAt || null;
+        if (task.deadline && submittedAtISO) {
+            const leftoverMs = new Date(task.deadline).getTime() - new Date(submittedAtISO).getTime();
+            const snappedNow = await _snapToNextWorkingMoment(new Date());
+            newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
+        }
+
         await db.collection("cowork_tasks").doc(taskId).update({
             completionStatus: "rejected_by_tl",
             status: "in_progress",
-            tlRejection: { rejectedBy: tlId, rejectedByName: tlName, reason: rejectionReason || "Not meeting requirements", rejectedAt: new Date().toISOString() },
+            deadline: newDeadline,
+            tlRejection: { rejectedBy: tlId, rejectedByName: tlName, reason: rejectionReason || "Not meeting requirements", rejectedAt: new Date().toISOString(), previousDeadline: task.deadline || null, newDeadline },
             updatedAt: ts(),
         });
         await _postSystemMsg(taskId, tlId, `❌ TL rejected. Reason: ${rejectionReason}. Task back to In Progress.`);
@@ -388,10 +425,21 @@ const ceoReviewCompletion = async (taskId, ceoId, decision, rejectionReason) => 
         });
         await _postSystemMsg(taskId, ceoId, "🎉 CEO approved! Task marked as COMPLETED.");
     } else {
+        const taskSnap = await db.collection("cowork_tasks").doc(taskId).get();
+        const task = taskSnap.exists ? taskSnap.data() : {};
+        let newDeadline = task.deadline || null;
+        const submittedAtISO = task.completionProof?.submittedAt || null;
+        if (task.deadline && submittedAtISO) {
+            const leftoverMs = new Date(task.deadline).getTime() - new Date(submittedAtISO).getTime();
+            const snappedNow = await _snapToNextWorkingMoment(new Date());
+            newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
+        }
+
         await db.collection("cowork_tasks").doc(taskId).update({
             completionStatus: "rejected_by_ceo",
             status: "in_progress",
-            ceoRejection: { rejectedBy: ceoId, reason: rejectionReason, rejectedAt: new Date().toISOString() },
+            deadline: newDeadline,
+            ceoRejection: { rejectedBy: ceoId, reason: rejectionReason, rejectedAt: new Date().toISOString(), previousDeadline: task.deadline || null, newDeadline },
             updatedAt: ts(),
         });
         await _postSystemMsg(taskId, ceoId, `❌ CEO rejected. Reason: ${rejectionReason}. Task back to In Progress.`);
