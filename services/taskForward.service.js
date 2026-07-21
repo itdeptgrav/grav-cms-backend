@@ -30,6 +30,33 @@ function deadlineColor(dueDate) {
   return s === "overdue" ? "#d93025" : s === "near" ? "#f9ab00" : s === "safe" ? "#1e8e3e" : "#80868b";
 }
 
+async function _snapToNextWorkingMoment(date) {
+  const schedSnap = await db.collection("cowork_settings").doc("office").get();
+  const schedule = schedSnap.exists ? schedSnap.data().schedule : null;
+  if (!schedule) return date;
+
+  const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const parseMins = t => { if (!t) return 0; const [h, m] = t.split(":").map(Number); return h * 60 + (m || 0); };
+
+  let cursor = new Date(date);
+  for (let i = 0; i < 8; i++) {
+    const day = schedule[DAY_KEYS[cursor.getDay()]];
+    if (day && !day.isOff) {
+      const inMins = parseMins(day.inTime);
+      const outMins = parseMins(day.outTime);
+      const dayStart = new Date(cursor); dayStart.setHours(Math.floor(inMins / 60), inMins % 60, 0, 0);
+      const dayEnd = new Date(cursor); dayEnd.setHours(Math.floor(outMins / 60), outMins % 60, 0, 0);
+
+      if (cursor < dayStart) return dayStart;
+      if (cursor <= dayEnd) return cursor;
+    }
+    cursor = new Date(cursor);
+    cursor.setDate(cursor.getDate() + 1);
+    cursor.setHours(0, 0, 0, 0);
+  }
+  return date;
+}
+
 // ─── Duration formatter for draft-chat system messages ────────────────────────
 // Formats "duration from now" as a human string like "2h", "45m", "1h 30m", "3 days".
 // Used in deadline proposal/counter chat messages to AVOID a stale wall-clock timestamp
@@ -1275,7 +1302,20 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
     // ── Rejected (all flows) — back to in_progress ────────────────────────
     if (!rejectionReason?.trim()) throw new Error("Rejection reason required.");
     const tlReview = { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: false, rejectionReason: rejectionReason.trim(), reviewedAt: new Date().toISOString() };
-    await ref.update({ completionStatus: "tl_rejected", tlReview, status: "in_progress", updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    const isDeadlineMode = task.hasTimer === false;
+    const deadlineField = isDeadlineMode ? "fixedDeadline" : "dueDate";
+    const currentDeadline = task[deadlineField] || null;
+
+    let newDeadline = currentDeadline;
+    const submittedAtISO = task.completionSubmission?.submittedAt || null;
+    if (currentDeadline && submittedAtISO) {
+      const leftoverMs = new Date(currentDeadline).getTime() - new Date(submittedAtISO).getTime();
+      const snappedNow = await _snapToNextWorkingMoment(new Date());
+      newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
+    }
+
+    await ref.update({ completionStatus: "tl_rejected", tlReview, status: "in_progress", [deadlineField]: newDeadline, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
     await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ ${reviewerName} rejected.\n📝 Reason: ${rejectionReason.trim()}`, messageType: "system" });
 
     if (submitterId) {
@@ -1346,9 +1386,22 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
 
   const currentReworks = Number(task.c1?.reworksReceived) || 0;
 
+  const isDeadlineMode = task.hasTimer === false;
+  const deadlineField = isDeadlineMode ? "fixedDeadline" : "dueDate";
+  const currentDeadline = task[deadlineField] || null;
+
+  let newDeadline = currentDeadline;
+  const submittedAtISO = task.completionSubmission?.submittedAt || null;
+  if (currentDeadline && submittedAtISO) {
+    const leftoverMs = new Date(currentDeadline).getTime() - new Date(submittedAtISO).getTime();
+    const snappedNow = await _snapToNextWorkingMoment(new Date());
+    newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
+  }
+
   await ref.update({
     completionStatus: null,
     status: "in_progress",
+    [deadlineField]: newDeadline,
     "c1.reworksReceived": currentReworks + 1,
     reworkHistory: admin.firestore.FieldValue.arrayUnion({
       reworkNumber: currentReworks + 1,
@@ -1356,9 +1409,12 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
       sentBackBy: reviewerId,
       sentBackByName: reviewerName,
       sentBackAt: new Date().toISOString(),
+      previousDeadline: currentDeadline,
+      newDeadline,
     }),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+
 
   await sendTaskChat({
     taskId, senderId: reviewerId, senderName: reviewerName,
