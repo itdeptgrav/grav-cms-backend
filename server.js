@@ -30,6 +30,7 @@ const allowedOrigins = [
   "https://grav-cms-dncs.vercel.app",
   "https://crm.grav.in",
   https://customer.rayandcompanies.com,
+  https://rayandcompanies.com,
   "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev"
 ];
 const transcriptModule = require("./routes/task_routes/transcript.routes");
