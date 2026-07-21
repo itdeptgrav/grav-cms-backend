@@ -311,11 +311,29 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     }
     if (!autoPriority) autoPriority = 1;
 
+    // Self-assigned tasks: the chosen approver is treated as the actual
+    // assigner of record, not the employee who submitted the request. This
+    // only changes who the task is attributed to — it does not change any
+    // approval-gate logic above, which still correctly evaluates based on
+    // the real requester.
+    let effectiveAssignedBy = req.coworkUser.employeeId;
+    let effectiveAssignedByName = req.coworkUser.name;
+    let effectiveAssignedByRole = requesterRole;
+    const isSelfAssignedReq = isSelfAssigned === true || isSelfAssigned === "true";
+    if (isSelfAssignedReq && approverId) {
+      const approverInfo = await getEmployeeInfo(approverId);
+      if (approverInfo) {
+        effectiveAssignedBy = approverId;
+        effectiveAssignedByName = approverName || approverInfo.name;
+        effectiveAssignedByRole = approverInfo.role || "tl";
+      }
+    }
+
     const task = await svc.createTask({
       title: title.trim(), description, notes,
-      assignedBy: req.coworkUser.employeeId,
-      assignedByName: req.coworkUser.name,
-      assignedByRole: requesterRole,
+      assignedBy: effectiveAssignedBy,
+      assignedByName: effectiveAssignedByName,
+      assignedByRole: effectiveAssignedByRole,
       assigneeIds: departmentApprovalGate ? [] : (assigneeIds || []),
       dueDate: null,
       priority: autoPriority,
