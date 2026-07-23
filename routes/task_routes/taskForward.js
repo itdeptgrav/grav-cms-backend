@@ -172,25 +172,49 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       const targetDept = targetInfo?.department || "";
 
       if (assignerDept && targetDept && assignerDept !== targetDept) {
-        const [senderApprover, receiverApprover] = await Promise.all([
-          resolveDepartmentApprover(req.coworkUser.employeeId),
-          resolveDepartmentApprover(targetId),
-        ]);
-        if (!senderApprover) {
-          return res.status(400).json({ error: "Cannot assign — you have no manager on file to approve this cross-department task." });
+        // If the assigner is themselves the assignee's manager on file,
+        // there's no one else to approve — the gate exists to loop in a
+        // manager for a cross-department assignment, and here the assigner
+        // already IS that manager. Skip the gate (and the "no manager on
+        // file" hard-block below) entirely in this case.
+        const HrEmployee = require("../../models/Employee");
+        const targetHrEmp = await HrEmployee.findOne({ biometricId: targetId })
+          .select("primaryManager.managerId")
+          .populate("primaryManager.managerId", "biometricId")
+          .lean();
+        const assignerIsTargetsManager =
+          targetHrEmp?.primaryManager?.managerId?.biometricId === req.coworkUser.employeeId;
+
+        if (!assignerIsTargetsManager) {
+          let [senderApprover, receiverApprover] = await Promise.all([
+            resolveDepartmentApprover(req.coworkUser.employeeId),
+            resolveDepartmentApprover(targetId),
+          ]);
+
+          // No manager on file on either side → fall back to the default
+          // CoWork approver (employeeId "E000") instead of blocking the
+          // assignment outright. Only hard-blocks if E000 itself doesn't
+          // exist in cowork_employees, which shouldn't normally happen.
+          if (!senderApprover || !receiverApprover) {
+            const fallbackInfo = await getEmployeeInfo("E000");
+            if (!fallbackInfo) {
+              return res.status(400).json({ error: "Cannot assign — no manager on file to approve this cross-department task, and no default approver (E000) is configured." });
+            }
+            const fallbackApprover = { approverId: "E000", approverName: fallbackInfo.name, source: "default_fallback" };
+            if (!senderApprover) senderApprover = fallbackApprover;
+            if (!receiverApprover) receiverApprover = fallbackApprover;
+          }
+
+          departmentApprovalGate = {
+            pendingAssigneeId: targetId,
+            pendingAssigneeName: targetInfo?.name || "",
+            approvals: [
+              { approverId: senderApprover.approverId, approverName: senderApprover.approverName, side: "sender", source: senderApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+              { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+            ],
+          };
+          initialStatus = "pending_department_approval";
         }
-        if (!receiverApprover) {
-          return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this cross-department task.` });
-        }
-        departmentApprovalGate = {
-          pendingAssigneeId: targetId,
-          pendingAssigneeName: targetInfo?.name || "",
-          approvals: [
-            { approverId: senderApprover.approverId, approverName: senderApprover.approverName, side: "sender", source: senderApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
-            { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
-          ],
-        };
-        initialStatus = "pending_department_approval";
       }
     }
 
@@ -199,18 +223,40 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       && !parentTaskId && assigneeIds?.length === 1) {
       const targetId = assigneeIds[0];
       const targetInfo = await getEmployeeInfo(targetId);
-      const receiverApprover = await resolveDepartmentApprover(targetId);
-      if (!receiverApprover) {
-        return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this assignment.` });
+
+      // Same two rules as the cross-department gate above:
+      // 1) If the CEO is already this employee's manager on file, there's
+      //    no one else to approve — skip the gate entirely.
+      const HrEmployeeCeo = require("../../models/Employee");
+      const targetHrEmpCeo = await HrEmployeeCeo.findOne({ biometricId: targetId })
+        .select("primaryManager.managerId")
+        .populate("primaryManager.managerId", "biometricId")
+        .lean();
+      const ceoIsTargetsManager =
+        targetHrEmpCeo?.primaryManager?.managerId?.biometricId === req.coworkUser.employeeId;
+
+      if (!ceoIsTargetsManager) {
+        let receiverApprover = await resolveDepartmentApprover(targetId);
+
+        // 2) No manager on file → fall back to the default CoWork approver
+        // (employeeId "E000") instead of blocking the assignment outright.
+        if (!receiverApprover) {
+          const fallbackInfo = await getEmployeeInfo("E000");
+          if (!fallbackInfo) {
+            return res.status(400).json({ error: `Cannot assign — ${targetInfo?.name || "the assignee"} has no manager on file to approve this assignment, and no default approver (E000) is configured.` });
+          }
+          receiverApprover = { approverId: "E000", approverName: fallbackInfo.name, source: "default_fallback" };
+        }
+
+        departmentApprovalGate = {
+          pendingAssigneeId: targetId,
+          pendingAssigneeName: targetInfo?.name || "",
+          approvals: [
+            { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+          ],
+        };
+        initialStatus = "pending_department_approval";
       }
-      departmentApprovalGate = {
-        pendingAssigneeId: targetId,
-        pendingAssigneeName: targetInfo?.name || "",
-        approvals: [
-          { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
-        ],
-      };
-      initialStatus = "pending_department_approval";
     }
 
     // ── DEADLINE-MODE TASKS: B's own department TL sets real hours ──────────
@@ -265,11 +311,29 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     }
     if (!autoPriority) autoPriority = 1;
 
+    // Self-assigned tasks: the chosen approver is treated as the actual
+    // assigner of record, not the employee who submitted the request. This
+    // only changes who the task is attributed to — it does not change any
+    // approval-gate logic above, which still correctly evaluates based on
+    // the real requester.
+    let effectiveAssignedBy = req.coworkUser.employeeId;
+    let effectiveAssignedByName = req.coworkUser.name;
+    let effectiveAssignedByRole = requesterRole;
+    const isSelfAssignedReq = isSelfAssigned === true || isSelfAssigned === "true";
+    if (isSelfAssignedReq && approverId) {
+      const approverInfo = await getEmployeeInfo(approverId);
+      if (approverInfo) {
+        effectiveAssignedBy = approverId;
+        effectiveAssignedByName = approverName || approverInfo.name;
+        effectiveAssignedByRole = approverInfo.role || "tl";
+      }
+    }
+
     const task = await svc.createTask({
       title: title.trim(), description, notes,
-      assignedBy: req.coworkUser.employeeId,
-      assignedByName: req.coworkUser.name,
-      assignedByRole: requesterRole,
+      assignedBy: effectiveAssignedBy,
+      assignedByName: effectiveAssignedByName,
+      assignedByRole: effectiveAssignedByRole,
       assigneeIds: departmentApprovalGate ? [] : (assigneeIds || []),
       dueDate: null,
       priority: autoPriority,
@@ -1383,9 +1447,42 @@ router.get("/task/:taskId/full", verifyCoworkToken, verifyEmployeeToken, async (
 });
 
 // ── PROPOSE DEADLINE (employee sets deadline before confirming) ───────────────
+function _addWorkingSecsIST(startMs, windowSecs, schedule, breaks) {
+  if (!schedule || windowSecs <= 0) {
+    console.error("[officeDueDate] RAW FALLBACK — schedule missing or bad window", { hasSchedule: !!schedule, windowSecs });
+    return new Date(startMs + windowSecs * 1000 + 6 * 3600000).toISOString(); // BRANDED PROBE: +6h marks this exact fallback
+  }
+  const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+  const IST = 5.5 * 3600000;
+  const dateStrOf = ms => new Date(ms + IST).toISOString().slice(0, 10);
+  const dowOf = ms => new Date(Date.parse(dateStrOf(ms) + "T00:00:00Z")).getUTCDay();
+  let remaining = windowSecs, cur = startMs, guard = 0;
+  while (remaining > 0 && guard++ < 3660) {
+    const ds = dateStrOf(cur);
+    const day = schedule[DAY_KEYS[dowOf(cur)]];
+    const nextMidnight = Date.parse(ds + "T00:00:00+05:30") + 86400000;
+    if (!day || day.isOff) { cur = nextMidnight; continue; }
+    const dayStart = Date.parse(`${ds}T${day.inTime}:00+05:30`);
+    const dayEnd = Date.parse(`${ds}T${day.outTime}:00+05:30`);
+    if (cur < dayStart) cur = dayStart;
+    if (cur >= dayEnd) { cur = nextMidnight; continue; }
+    const todaysBreaks = (breaks || [])
+      .map(b => ({ s: Date.parse(`${ds}T${b.start}:00+05:30`), e: Date.parse(`${ds}T${b.end}:00+05:30`) }))
+      .filter(b => b.e > b.s).sort((a, b) => a.s - b.s);
+    const inBrk = todaysBreaks.find(b => cur >= b.s && cur < b.e);
+    if (inBrk) { cur = inBrk.e; continue; }
+    const nextBrkStart = (todaysBreaks.find(b => b.s > cur) || {}).s;
+    const segEnd = Math.min(dayEnd, nextBrkStart == null ? Infinity : nextBrkStart);
+    const segSecs = Math.floor((segEnd - cur) / 1000);
+    if (segSecs >= remaining) return new Date(cur + remaining * 1000).toISOString();
+    remaining -= segSecs; cur = segEnd;
+  }
+  return new Date(cur).toISOString();
+}
+
 router.post("/task/:taskId/propose-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { proposedDate, workedSecs } = req.body;
+    const { proposedDate, workedSecs, windowSecs, extensionSecs } = req.body;
     if (!proposedDate) return res.status(400).json({ error: "proposedDate required" });
     const result = await svc.proposeDeadline({
       taskId: req.params.taskId,
@@ -1393,6 +1490,7 @@ router.post("/task/:taskId/propose-deadline", verifyCoworkToken, verifyEmployeeT
       employeeName: req.coworkUser.name,
       proposedDate,
       workedSecs: Number(workedSecs) || 0,
+      windowSecs: Number(windowSecs) || Number(extensionSecs) || 0,
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -1422,8 +1520,20 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
     if (approvedSecs <= 0)
       return res.status(400).json({ error: "No sender-set timer to approve" });
 
-    // Compute a placeholder dueDate (actual countdown starts when employee presses Start)
-    const dueDate = new Date(Date.now() + approvedSecs * 1000).toISOString();
+    // Office-hours-aware dueDate — consumes only WORKING time (skips off
+    // days and breaks) instead of raw wall-clock addition, so a 4h task
+    // approved at 5:15pm doesn't land due 9:15pm the same night.
+    let dueDate;
+    try {
+      const officeSnap = await db.collection("cowork_settings").doc("office").get();
+      const _sched = officeSnap.exists ? officeSnap.data().schedule : null;
+      const _brks = officeSnap.exists ? (officeSnap.data().breaks || []) : [];
+      console.log("[approve-sender-timer] office doc exists:", officeSnap.exists, "| schedule days:", _sched ? Object.keys(_sched).length : 0);
+      dueDate = _addWorkingSecsIST(Date.now(), approvedSecs, _sched, _brks);
+    } catch (e) {
+      console.error("[approve-sender-timer OFFICE CALC FAILED]", e.message);
+      dueDate = new Date(Date.now() + approvedSecs * 1000 + 6 * 3600000).toISOString(); // BRANDED PROBE: +6h marks this exact fallback
+    }
 
     await taskRef.update({
       status: "deadline_approved",
@@ -1619,71 +1729,44 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     if (!task.assigneeIds?.includes(req.coworkUser.employeeId))
       return res.status(403).json({ error: "Only assigned employees can request an extension" });
 
-    // ── ETC elapsed % — determines penalty zone (replaces 48hr rule) ─────
+    // ── Due-date elapsed % — determines penalty zone. Anchored to
+    // task.dueDate/fixedDeadline directly, not etcHours or deadlineWindowSecs —
+    // either of those could hit 70%+ purely from calendar time passing, even
+    // before any work had started. ──
     const extensionFiledAt = new Date().toISOString();
     let elapsedPercent = 0;
     let isPenaltyWaived = true; // default: no penalty
 
-    const etcHours = Number(task.etcHours) || 0;
-    if (etcHours > 0 && task.createdAtISO) {
+    const _dueMs = task.dueDate ? new Date(task.dueDate).getTime() : (task.fixedDeadline ? new Date(task.fixedDeadline).getTime() : null);
+    if (_dueMs && task.createdAtISO) {
+      const _createdMs = new Date(task.createdAtISO).getTime();
+      // Office-hours-aware: count only WORKING seconds on both sides, so
+      // nights / breaks / off days move the % on neither numerator nor
+      // denominator. A 3h task created Sunday night is 0% until Monday
+      // office open. Wall-clock fallback if the schedule is unreadable.
+      let _officeDone = false;
       try {
-        const { db: _db } = require("../../config/firebaseAdmin");
-        const schedSnap = await _db.collection("cowork_settings").doc("office").get();
-        const schedule = schedSnap.exists ? schedSnap.data().schedule : null;
-
-        if (schedule) {
-          const DAY_KEYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
-          const parseMins = t => { if (!t) return 0; const [h, m] = t.split(":").map(Number); return h * 60 + (m || 0); };
-          const start = new Date(task.createdAtISO);
-          const end = new Date();
-          let totalMins = 0;
-          const cursor = new Date(start);
-
-          while (cursor < end) {
-            const day = schedule[DAY_KEYS[cursor.getDay()]];
-            if (day && !day.isOff) {
-              const inMins = parseMins(day.inTime);
-              const outMins = parseMins(day.outTime);
-              const ds = new Date(cursor); ds.setHours(Math.floor(inMins / 60), inMins % 60, 0, 0);
-              const de = new Date(cursor); de.setHours(Math.floor(outMins / 60), outMins % 60, 0, 0);
-              const ws = new Date(Math.max(start.getTime(), ds.getTime()));
-              const we = new Date(Math.min(end.getTime(), de.getTime()));
-              if (we > ws) totalMins += (we - ws) / 60000;
-            }
-            cursor.setDate(cursor.getDate() + 1);
-            cursor.setHours(0, 0, 0, 0);
-          }
-          elapsedPercent = Math.min(100, +((totalMins / 60 / etcHours) * 100).toFixed(1));
-        } else {
-          // fallback: clock time
-          const msElapsed = Date.now() - new Date(task.createdAtISO).getTime();
-          elapsedPercent = Math.min(100, +((msElapsed / (etcHours * 3600000)) * 100).toFixed(1));
+        const _offSnap = await db.collection("cowork_settings").doc("office").get();
+        if (_offSnap.exists && _offSnap.data().schedule) {
+          const _sch = _offSnap.data().schedule;
+          const _brk = _offSnap.data().breaks || [];
+          const _tot = _workingSecsBetweenIST(_createdMs, _dueMs, _sch, _brk);
+          const _don = _workingSecsBetweenIST(_createdMs, Date.now(), _sch, _brk);
+          if (_tot > 0) { elapsedPercent = Math.min(100, +(((_don / _tot) * 100).toFixed(1))); _officeDone = true; }
         }
-      } catch (schedErr) {
-        console.error("[extension elapsed calc]", schedErr.message);
-        const msElapsed = Date.now() - new Date(task.createdAtISO).getTime();
-        elapsedPercent = Math.min(100, +((msElapsed / (etcHours * 3600000)) * 100).toFixed(1));
+      } catch (e) { console.error("[ext elapsed office calc]", e.message); }
+      if (!_officeDone) {
+        const _totalWindowMs = _dueMs - _createdMs;
+        if (_totalWindowMs > 0) {
+          elapsedPercent = Math.min(100, +(((Date.now() - _createdMs) / _totalWindowMs) * 100).toFixed(1));
+        }
       }
     }
+    if (isNaN(elapsedPercent)) elapsedPercent = 0;
 
     // Zone 1 (0–50%)  : button disabled on frontend — if somehow submitted, no penalty
     // Zone 2 (50–70%) : no penalty
     // Zone 3 (70%+)   : penalty applies (−0.2 C1 deduction)
-    // If etcHours not set, fall back to deadlineWindowSecs elapsed %
-    if (elapsedPercent === 0 && task.deadlineWindowSecs > 0) {
-      let _startMs = 0;
-      if (task.startedAt) {
-        // Handle both Firestore Timestamp object and ISO string
-        _startMs = task.startedAt._seconds
-          ? task.startedAt._seconds * 1000
-          : task.startedAt.seconds
-            ? task.startedAt.seconds * 1000
-            : new Date(task.startedAt).getTime();
-      }
-      const _workedMs = _startMs > 0 ? Date.now() - _startMs : 0;
-      elapsedPercent = Math.min(100, +(((_workedMs / 1000) / task.deadlineWindowSecs) * 100).toFixed(1));
-    }
-    if (isNaN(elapsedPercent)) elapsedPercent = 0;
     isPenaltyWaived = elapsedPercent < 70;
     // ─────────────────────────────────────────────────────────────────────
 
