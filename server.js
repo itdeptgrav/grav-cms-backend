@@ -36,7 +36,11 @@ const allowedOrigins = [
 ];
 const transcriptModule = require("./routes/task_routes/transcript.routes");
 
-const { instrumentFirestore, bandwidthMiddleware, bandwidthStatsHandler } = require("./middleware/firestoreBandwidth");
+const {
+  instrumentFirestore,
+  bandwidthMiddleware,
+  bandwidthStatsHandler,
+} = require("./middleware/firestoreBandwidth");
 const { db, admin } = require("./config/firebaseAdmin");
 instrumentFirestore(admin, db);
 
@@ -905,10 +909,9 @@ app.use(
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
-
 // server.js
-const sizeConfigRoutes = require("./routes/CMS_Routes/Inventory/Configurations/sizeConfigRoutes")
-app.use("/api/cms/size-configs", sizeConfigRoutes)
+const sizeConfigRoutes = require("./routes/CMS_Routes/Inventory/Configurations/sizeConfigRoutes");
+app.use("/api/cms/size-configs", sizeConfigRoutes);
 
 // Measurement Routes
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
@@ -917,7 +920,10 @@ app.use("/api/cms/measurements", measurementRoutes);
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
 
-app.use("/api/cms/measurement-categories", require("./routes/CMS_Routes/Configurations/measurementCategoryRoutes"));
+app.use(
+  "/api/cms/measurement-categories",
+  require("./routes/CMS_Routes/Configurations/measurementCategoryRoutes"),
+);
 
 // Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
@@ -952,7 +958,7 @@ app.use(
   "/api/cowork/mrf",
   require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
 );
- 
+
 const pmRequestsRoutes = require("./routes/CMS_Routes/pm/pmRequestsRoutes");
 app.use("/api/cms/pm/requests", pmRequestsRoutes);
 
@@ -978,7 +984,10 @@ app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
 const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
 app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
 
-app.use("/api/cms/notifications", require("./routes/CMS_Routes/notificationRoutes"));
+app.use(
+  "/api/cms/notifications",
+  require("./routes/CMS_Routes/notificationRoutes"),
+);
 
 // Sales Routes
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
@@ -1295,7 +1304,10 @@ app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
 app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
 
-app.use("/api/cowork/notifications", require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"));
+app.use(
+  "/api/cowork/notifications",
+  require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"),
+);
 
 //new tree substack routes
 const taskTreeModule = require("./routes/task_routes/taskTree.routes.js");
@@ -1482,7 +1494,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
               workOrder = await WorkOrder.findById(
                 parsedBarcode.workOrderShortId,
               );
-            } catch { }
+            } catch {}
           }
           if (workOrder) {
             io.to(`workorder-${workOrder._id}`).emit("workorder-scan-update", {
@@ -1571,7 +1583,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
                 message: `${employeeName} signed out`,
                 timestamp: new Date(),
               });
-          } catch { }
+          } catch {}
           return res.json({
             success: true,
             message: `${employeeName} signed out`,
@@ -1591,7 +1603,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
         const existingSession = machineTracking.operators.find(
           (op) =>
             op.operatorIdentityId ===
-            machineTracking.currentOperatorIdentityId && !op.signOutTime,
+              machineTracking.currentOperatorIdentityId && !op.signOutTime,
         );
         if (existingSession) existingSession.signOutTime = scanTime;
       }
@@ -1615,7 +1627,7 @@ app.post("/api/cms/production/tracking/scan", async (req, res) => {
             status: `${employeeName} signed in to ${machine.name}`,
             timestamp: new Date(),
           });
-      } catch { }
+      } catch {}
 
       return res.json({
         success: true,
@@ -1753,7 +1765,7 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
                   const existing = machineTracking.operators.find(
                     (op) =>
                       op.operatorIdentityId ===
-                      machineTracking.currentOperatorIdentityId &&
+                        machineTracking.currentOperatorIdentityId &&
                       !op.signOutTime,
                   );
                   if (existing) existing.signOutTime = scan.timeStamp;
@@ -1775,7 +1787,7 @@ app.post("/api/cms/production/tracking/bulk-scans", async (req, res) => {
               const operatorSession = machineTracking.operators.find(
                 (op) =>
                   op.operatorIdentityId ===
-                  machineTracking.currentOperatorIdentityId &&
+                    machineTracking.currentOperatorIdentityId &&
                   !op.signOutTime,
               );
               if (!operatorSession)
@@ -1873,13 +1885,13 @@ app.get("/api/cms/production/tracking/status/today", async (req, res) => {
         }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? {
-            identityId: empDoc.identityId,
-            name: `${empDoc.firstName} ${empDoc.lastName}`,
-          }
+              identityId: empDoc.identityId,
+              name: `${empDoc.firstName} ${empDoc.lastName}`,
+            }
           : {
-            identityId: machine.currentOperatorIdentityId,
-            name: "Unknown Operator",
-          };
+              identityId: machine.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
       }
 
       machinesStatus.push({
@@ -1967,13 +1979,13 @@ app.get("/api/cms/production/tracking/status/:date", async (req, res) => {
         }).select("firstName lastName identityId");
         currentOperator = empDoc
           ? {
-            identityId: empDoc.identityId,
-            name: `${empDoc.firstName} ${empDoc.lastName}`,
-          }
+              identityId: empDoc.identityId,
+              name: `${empDoc.firstName} ${empDoc.lastName}`,
+            }
           : {
-            identityId: machine.currentOperatorIdentityId,
-            name: "Unknown Operator",
-          };
+              identityId: machine.currentOperatorIdentityId,
+              name: "Unknown Operator",
+            };
       }
 
       machinesStatus.push({
@@ -2271,21 +2283,29 @@ server.listen(PORT, () => {
   );
 
   let _timerSopLastRunDate = null;
-  setInterval(async () => {
-    try {
-      const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-      const nowIST = new Date(Date.now() + IST_OFFSET_MS);
-      const todayIST = nowIST.toISOString().split("T")[0];
-      const hh = nowIST.getUTCHours(), mm = nowIST.getUTCMinutes();
-      const inWindow = hh === 0 && mm >= 15 && mm < 25;
-      if (!inWindow || _timerSopLastRunDate === todayIST) return;
-      _timerSopLastRunDate = todayIST;
-      const { evaluateTimerSopForAllEmployees } = require("./services/timerSop.service");
-      const result = await evaluateTimerSopForAllEmployees();
-      console.log(`[TimerSopCron] Daily run done — ${result.employeeCount} employees checked, ${result.totalBleaches} bleach entries applied.`);
-    } catch (e) {
-      console.error("[TimerSopCron]", e.message);
-    }
-  }, 5 * 60 * 1000);
+  setInterval(
+    async () => {
+      try {
+        const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+        const nowIST = new Date(Date.now() + IST_OFFSET_MS);
+        const todayIST = nowIST.toISOString().split("T")[0];
+        const hh = nowIST.getUTCHours(),
+          mm = nowIST.getUTCMinutes();
+        const inWindow = hh === 0 && mm >= 15 && mm < 25;
+        if (!inWindow || _timerSopLastRunDate === todayIST) return;
+        _timerSopLastRunDate = todayIST;
+        const {
+          evaluateTimerSopForAllEmployees,
+        } = require("./services/timerSop.service");
+        const result = await evaluateTimerSopForAllEmployees();
+        console.log(
+          `[TimerSopCron] Daily run done — ${result.employeeCount} employees checked, ${result.totalBleaches} bleach entries applied.`,
+        );
+      } catch (e) {
+        console.error("[TimerSopCron]", e.message);
+      }
+    },
+    5 * 60 * 1000,
+  );
   console.log("✅ Timer SOP daily finalize cron initialized (runs ~00:15 IST)");
 });
