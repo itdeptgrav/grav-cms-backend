@@ -880,6 +880,45 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
 });
 
 
+// ── CHANGE DEPARTMENT (CEO only) ──────────────────────────────────────────────
+router.post("/employee/:employeeId/change-department", verifyCoworkToken, async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const { department } = req.body;
+
+    if (!department || !department.trim())
+      return res.status(400).json({ error: "Department is required" });
+    if (req.coworkUser?.role !== "ceo")
+      return res.status(403).json({ error: "Only CEO can change department" });
+
+    const empDoc = await db.collection("cowork_employees").doc(employeeId).get();
+    if (!empDoc.exists) return res.status(404).json({ error: "Employee not found" });
+    const authUid = empDoc.data().authUid;
+    const newDept = department.trim();
+
+    await db.collection("cowork_employees").doc(employeeId).update({
+      department: newDept,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    try {
+      const { sendPushToEmployees } = require("../../services/fcmPush.service");
+      await sendPushToEmployees([employeeId], "🏢 Department Updated", `Your department is now ${newDept}.`, { type: "department_changed" });
+    } catch (e) { console.error("[department_changed push]", e.message); }
+
+    if (authUid) {
+      const { invalidateEmployeeCache } = require("../../Middlewear/coworkAuth");
+      invalidateEmployeeCache(authUid);
+    }
+
+    console.log(`[ChangeDepartment] ${employeeId} → ${newDept}`);
+    res.json({ success: true, employeeId, department: newDept });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 // ── NOTIFY REQUEST RESPONSE (FCM push + email to request sender) ──────────────
 router.post("/notify-request-response", verifyCoworkToken, async (req, res) => {
   try {
