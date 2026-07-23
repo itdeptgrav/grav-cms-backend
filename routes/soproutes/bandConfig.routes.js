@@ -89,8 +89,20 @@ router.get("/band-config/employee-bands", verifyCoworkToken, verifyCeoToken, asy
             }
         }
         const map = {};
+        const seenBiometricIds = {};
         for (const emp of employees) {
             if (!emp.biometricId) continue;
+            // ── Duplicate biometricId guard ─────────────────────────────────────
+            // If two HR Employee documents share a biometricId, the later one
+            // silently overwrote the earlier one below, which is exactly how a
+            // wrong designation can show up against the right name in Cowork.
+            // This logs the collision so it can be traced to the two Mongo _ids.
+            if (seenBiometricIds[emp.biometricId]) {
+                console.warn(
+                    `[band-config/employee-bands] DUPLICATE biometricId "${emp.biometricId}": Mongo _id ${seenBiometricIds[emp.biometricId]} (designation "${map[emp.biometricId]?.designation}") vs _id ${emp._id} (designation "${emp.designation}"). The second one is winning.`
+                );
+            }
+            seenBiometricIds[emp.biometricId] = emp._id;
             map[emp.biometricId] = {
                 designation: emp.designation || null,
                 bandName: emp.designation ? (desigToBand[emp.designation] || null) : null,
