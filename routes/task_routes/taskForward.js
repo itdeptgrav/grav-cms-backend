@@ -1018,6 +1018,13 @@ router.post("/task/:taskId/department-approve", verifyCoworkToken, verifyEmploye
         updatedApprovals[idx].status = "rejected";
         updatedApprovals[idx].respondedAt = admin.firestore.Timestamp.now();
         updatedApprovals[idx].rejectionReason = rejectionReason || "";
+        // This tx.update call was missing entirely — the branch computed the
+        // rejection into a local variable and returned "success" without ever
+        // writing it to Firestore. The task's status stayed
+        // "pending_department_approval" forever, so it never left the
+        // Cross-Department Approval Needed list no matter how many times
+        // Reject was clicked.
+        tx.update(taskRef, { departmentApprovals: updatedApprovals, status: "rejected", updatedAt: admin.firestore.FieldValue.serverTimestamp() });
         return { httpStatus: 200, body: { success: true, status: "rejected" }, outcome: "rejected", task };
       }
 
@@ -1377,6 +1384,30 @@ router.post("/task/:taskId/move-to-folder", verifyCoworkToken, verifyEmployeeTok
     await batch.commit();
 
     res.json({ success: true, taskId, folderId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── 14c. EDIT TASK DETAILS (TL/CEO only) — title, description, requirements ───
+router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    if (!["ceo", "tl"].includes(req.coworkUser.role)) return res.status(403).json({ error: "Only CEO or TL can edit task details." });
+    const { title, description, requirements } = req.body;
+    if (title !== undefined && !title.trim()) return res.status(400).json({ error: "Title cannot be empty." });
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found." });
+
+    const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    if (title !== undefined) updates.title = title.trim();
+    if (description !== undefined) updates.description = description;
+    if (requirements !== undefined) updates.requirements = Array.isArray(requirements) ? requirements : [];
+
+    await taskRef.update(updates);
+    res.json({ success: true, taskId, title: updates.title, description: updates.description, requirements: updates.requirements });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
