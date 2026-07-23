@@ -29,6 +29,9 @@ const allowedOrigins = [
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
   "https://grav-cms-dncs.vercel.app",
   "https://crm.grav.in",
+  "https://customer.rayandcompanies.com",
+  "https://rayandcompanies.com",
+  "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev"
 ];
 const transcriptModule = require("./routes/task_routes/transcript.routes");
 
@@ -901,11 +904,6 @@ app.use(
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
-const RegisteredDepartments = require("./routes/CMS_Routes/Sales/Configuration/OrganizationDepartment/organizationDepartmentRoutes");
-app.use(
-  "/api/cms/configuration/organization-departments",
-  RegisteredDepartments,
-);
 
 // server.js
 const sizeConfigRoutes = require("./routes/CMS_Routes/Inventory/Configurations/sizeConfigRoutes")
@@ -917,6 +915,8 @@ app.use("/api/cms/measurements", measurementRoutes);
 
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
+
+app.use("/api/cms/measurement-categories", require("./routes/CMS_Routes/Configurations/measurementCategoryRoutes"));
 
 // Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
@@ -2260,6 +2260,7 @@ server.listen(PORT, () => {
           );
         }
 
+        // REPLACE
         if (_reminderSent.size > 500) _reminderSent.clear();
       } catch (e) {
         console.error("[MeetReminder cron]", e.message);
@@ -2267,4 +2268,23 @@ server.listen(PORT, () => {
     },
     5 * 60 * 1000,
   );
+
+  let _timerSopLastRunDate = null;
+  setInterval(async () => {
+    try {
+      const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+      const nowIST = new Date(Date.now() + IST_OFFSET_MS);
+      const todayIST = nowIST.toISOString().split("T")[0];
+      const hh = nowIST.getUTCHours(), mm = nowIST.getUTCMinutes();
+      const inWindow = hh === 0 && mm >= 15 && mm < 25;
+      if (!inWindow || _timerSopLastRunDate === todayIST) return;
+      _timerSopLastRunDate = todayIST;
+      const { evaluateTimerSopForAllEmployees } = require("./services/timerSop.service");
+      const result = await evaluateTimerSopForAllEmployees();
+      console.log(`[TimerSopCron] Daily run done — ${result.employeeCount} employees checked, ${result.totalBleaches} bleach entries applied.`);
+    } catch (e) {
+      console.error("[TimerSopCron]", e.message);
+    }
+  }, 5 * 60 * 1000);
+  console.log("✅ Timer SOP daily finalize cron initialized (runs ~00:15 IST)");
 });
