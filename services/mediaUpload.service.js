@@ -138,4 +138,86 @@ async function getOrCreateCoworkFolder(drive) {
     }
 }
 
-module.exports = { uploadToCloudinary, uploadToGoogleDrive };
+async function createResumableSession({ fileName, mimeType, fileSize, origin }) {
+    const auth = getServiceAccountAuth();
+    const client = await auth.getClient();
+    const { token } = await client.getAccessToken();
+    if (!token) throw new Error("Could not get service account access token");
+
+    const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID || null;
+
+    const res = await fetch(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true",
+        {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": mimeType || "application/octet-stream",
+                "X-Upload-Content-Length": String(fileSize),
+                ...(origin ? { Origin: origin } : {}),
+            },
+            body: JSON.stringify({
+                name: fileName,
+                mimeType: mimeType || "application/octet-stream",
+                parents: folderId ? [folderId] : [],
+            }),
+        }
+    );
+
+    if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`Drive session create failed (${res.status}): ${txt}`);
+    }
+    const sessionUrl = res.headers.get("location");
+    if (!sessionUrl) throw new Error("Drive did not return a session URL");
+    return sessionUrl;
+}
+
+async function getDriveFileStream(fileId) {
+    const auth = getServiceAccountAuth();
+    const drive = google.drive({ version: "v3", auth });
+    const meta = await drive.files.get({ fileId, supportsAllDrives: true, fields: "mimeType" });
+    const stream = await drive.files.get(
+        { fileId, alt: "media", supportsAllDrives: true },
+        { responseType: "stream" }
+    );
+    return { data: stream.data, mimeType: meta.data.mimeType };
+}
+
+async function finalizeDriveFile(fileId) {
+    const auth = getServiceAccountAuth();
+    const drive = google.drive({ version: "v3", auth });
+
+    await drive.permissions.create({
+        fileId,
+        supportsAllDrives: true,
+        requestBody: { role: "reader", type: "anyone" },
+    });
+
+    const meta = await drive.files.get({
+        fileId,
+        supportsAllDrives: true,
+        fields: "id, name, mimeType, size, webViewLink",
+    });
+
+    const isImage = (meta.data.mimeType || "").startsWith("image/");
+    const thumbUrl = `https://drive.google.com/thumbnail?id=${fileId}&sz=w2000`;
+
+    return {
+        fileId,
+        fileName: meta.data.name,
+        mimeType: meta.data.mimeType,
+        size: meta.data.size,
+        // Primary render URL — Drive's own thumbnail endpoint (more reliable than lh3).
+        // Frontend should still onError-fallback to proxyUrl for guaranteed display.
+        url: isImage ? thumbUrl : meta.data.webViewLink,
+        imageUrl: thumbUrl,
+        thumbnailUrl: thumbUrl,
+        downloadUrl: `https://drive.google.com/uc?export=download&id=${fileId}`,
+        viewUrl: `https://drive.google.com/file/d/${fileId}/view`,
+        embedUrl: `https://drive.google.com/file/d/${fileId}/preview`,
+    };
+}
+
+module.exports = { uploadToCloudinary, uploadToGoogleDrive, createResumableSession, finalizeDriveFile, getDriveFileStream };
