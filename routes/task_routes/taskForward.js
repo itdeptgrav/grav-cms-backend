@@ -1345,6 +1345,43 @@ router.delete("/task/:taskId", verifyCoworkToken, verifyEmployeeToken, async (re
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// ── 14b. MOVE TASK INTO FOLDER (CEO/TL only) ──────────────────────────────────
+router.post("/task/:taskId/move-to-folder", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { folderId } = req.body;
+    if (!["ceo", "tl"].includes(req.coworkUser.role)) return res.status(403).json({ error: "Only CEO or TL can move tasks into a folder." });
+    if (!folderId) return res.status(400).json({ error: "folderId is required." });
+    if (folderId === taskId) return res.status(400).json({ error: "A task cannot be moved into itself." });
+
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const folderRef = db.collection("cowork_tasks").doc(folderId);
+    const [taskSnap, folderSnap] = await Promise.all([taskRef.get(), folderRef.get()]);
+    if (!taskSnap.exists) return res.status(404).json({ error: "Task not found." });
+    if (!folderSnap.exists) return res.status(404).json({ error: "Folder not found." });
+    const task = taskSnap.data();
+    const folder = folderSnap.data();
+    if (!folder.isFolder) return res.status(400).json({ error: "Target is not a folder." });
+    if (task.isFolder) return res.status(400).json({ error: "A folder can't be moved into another folder." });
+
+    // Only parentTaskId + the two folders' subtaskIds change — the task keeps
+    // its own status/assigneeIds/timer exactly as they were, same as a
+    // subtask created directly under a folder keeps its own properties.
+    const oldParentId = task.parentTaskId || null;
+    const batch = db.batch();
+    batch.update(taskRef, { parentTaskId: folderId, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    batch.update(folderRef, { subtaskIds: admin.firestore.FieldValue.arrayUnion(taskId), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    if (oldParentId && oldParentId !== folderId) {
+      batch.update(db.collection("cowork_tasks").doc(oldParentId), { subtaskIds: admin.firestore.FieldValue.arrayRemove(taskId), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    }
+    await batch.commit();
+
+    res.json({ success: true, taskId, folderId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── 15. SUBMIT COMPLETION ─────────────────────────────────────────────────────
 router.post("/task/:taskId/submit-completion", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
