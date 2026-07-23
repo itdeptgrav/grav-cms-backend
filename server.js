@@ -31,7 +31,8 @@ const allowedOrigins = [
   "https://crm.grav.in",
   "https://customer.rayandcompanies.com",
   "https://rayandcompanies.com",
-  "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev"
+  "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev",
+  "https://grav-cms-backend.onrender.com"
 ];
 const transcriptModule = require("./routes/task_routes/transcript.routes");
 
