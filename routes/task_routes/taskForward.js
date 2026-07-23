@@ -210,7 +210,9 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
             pendingAssigneeName: targetInfo?.name || "",
             approvals: [
               { approverId: senderApprover.approverId, approverName: senderApprover.approverName, side: "sender", source: senderApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
-              { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "pending", respondedAt: null, rejectionReason: null },
+              // Starts "waiting", not "pending" — the receiver's TL isn't shown this as
+              // actionable until the sender's TL approves first (see department-approve).
+              { approverId: receiverApprover.approverId, approverName: receiverApprover.approverName, side: "receiver", source: receiverApprover.source, status: "waiting", respondedAt: null, rejectionReason: null },
             ],
           };
           initialStatus = "pending_department_approval";
@@ -1022,6 +1024,17 @@ router.post("/task/:taskId/department-approve", verifyCoworkToken, verifyEmploye
       updatedApprovals[idx].status = "approved";
       updatedApprovals[idx].respondedAt = admin.firestore.Timestamp.now();
       updatedApprovals[idx].rejectionReason = null;
+
+      // ── Sequential gate ────────────────────────────────────────────────────
+      // Once the sender's TL approves, flip the receiver's entry from "waiting"
+      // to "pending" — that's the moment it's actually sent to the receiver's
+      // TL. Before this runs, the receiver's TL has no "pending" entry to act
+      // on at all, so they can't approve out of order.
+      if (updatedApprovals[idx].side === "sender") {
+        const receiverIdx = updatedApprovals.findIndex(a => a.side === "receiver" && a.status === "waiting");
+        if (receiverIdx !== -1) updatedApprovals[receiverIdx].status = "pending";
+      }
+
       const allApproved = updatedApprovals.every(a => a.status === "approved");
 
       if (!allApproved) {
@@ -1030,7 +1043,17 @@ router.post("/task/:taskId/department-approve", verifyCoworkToken, verifyEmploye
       }
       const finalAssigneeId = task.pendingAssigneeId;
       const finalStatus = (task.hasTimer === false) ? "pending_tl_hours" : "open";
-      tx.update(taskRef, { departmentApprovals: updatedApprovals, status: finalStatus, assigneeIds: admin.firestore.FieldValue.arrayUnion(finalAssigneeId), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      // ── Visibility gate ──────────────────────────────────────────────────────
+      // Only add the assignee to assigneeIds here when going straight to "open"
+      // (duration was already set at creation). If it's dropping into
+      // "pending_tl_hours" instead, the assignee is added later, inside
+      // department-tl-set-hours, at the exact moment the timer is actually set —
+      // the task stays invisible to them until then.
+      const updatePayload = { departmentApprovals: updatedApprovals, status: finalStatus, updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+      if (finalStatus === "open") {
+        updatePayload.assigneeIds = admin.firestore.FieldValue.arrayUnion(finalAssigneeId);
+      }
+      tx.update(taskRef, updatePayload);
       return { httpStatus: 200, body: { success: true, status: finalStatus }, outcome: "completed", task, finalAssigneeId, finalStatus };
     });
     if (result.outcome === "rejected") {
@@ -1065,10 +1088,14 @@ router.post("/task/:taskId/department-tl-set-hours", verifyCoworkToken, verifyEm
     if (task.status !== "pending_tl_hours") {
       return res.status(400).json({ error: "This task is not waiting on TL hours — it may already be active." });
     }
-    if (!task.assigneeIds?.length) {
+    // pendingAssigneeId covers the cross-department-approval path, where the
+    // assignee isn't added to assigneeIds until this exact step (see below).
+    // Falls back to assigneeIds[0] for the no-gate deadline-mode path, where
+    // the assignee was already present from task creation.
+    const targetId = task.pendingAssigneeId || task.assigneeIds?.[0];
+    if (!targetId) {
       return res.status(400).json({ error: "This task has no assignee yet." });
     }
-    const targetId = task.assigneeIds[0];
     const targetInfo = await getEmployeeInfo(targetId);
     const callerDept = req.coworkUser.employeeData?.department || "";
     if (role !== "tl" || !targetInfo || targetInfo.department !== callerDept) {
@@ -1084,6 +1111,9 @@ router.post("/task/:taskId/department-tl-set-hours", verifyCoworkToken, verifyEm
     // same senderTimerWindowSecs mechanism as any other task. Lands in the
     // EXISTING "Draft" section and negotiates via the EXISTING
     // approve-sender-timer flow — no custom logic needed for that part.
+    // arrayUnion here is also what first makes the task visible to the
+    // assignee on the cross-department path — it's a no-op if they were
+    // already present (the no-gate deadline-mode path).
     await taskRef.update({
       status: "open",
       hasTimer: true,
@@ -1093,6 +1123,7 @@ router.post("/task/:taskId/department-tl-set-hours", verifyCoworkToken, verifyEm
       tlHoursSetByName: name,
       tlHoursSetAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      assigneeIds: admin.firestore.FieldValue.arrayUnion(targetId),
     });
 
     await postSystemChatMessage(taskId, `⏱ ${name} (TL) set the estimated hours — task is now active.`, employeeId, name);
