@@ -331,6 +331,123 @@ async function applyApprovedAction(reqDoc, approver) {
     return { entityId: ledger._id };
   }
 
+  // LEDGER ── merge one ledger into another (mirrors POST /ledgers/:id/merge)
+  //
+  // Repoints every voucher reference from source to destination, folds the
+  // balances, and empties the source. Deliberately NOT handled by the generic
+  // "update" executor above — that would $set the request body onto the
+  // source ledger and move nothing.
+  if (kind === "ledger" && action === "merge") {
+    if (!target?.id) throw new Error("ledger merge: target.id missing");
+    const destId = payload?.destinationLedgerId;
+    if (!destId) throw new Error("ledger merge: destinationLedgerId missing");
+
+    const source = await Acc_Ledger.findById(target.id);
+    if (!source) throw new Error("Source ledger not found");
+    const dest = await Acc_Ledger.findById(destId);
+    if (!dest || dest.isActive === false)
+      throw new Error("Destination ledger not found");
+    if (String(source._id) === String(dest._id))
+      throw new Error("Source and destination cannot be the same ledger");
+    if (String(source.companyId) !== String(dest.companyId))
+      throw new Error("Source and destination must belong to the same company");
+    if (source.nature && dest.nature && source.nature !== dest.nature)
+      throw new Error(
+        `Cannot merge a ${source.nature} ledger into a ${dest.nature} ledger`,
+      );
+
+    const counts = { ledgerEntries: 0, partyVouchers: 0, bankVouchers: 0 };
+
+    const leRes = await Acc_Voucher.updateMany(
+      { "ledgerEntries.ledgerId": source._id },
+      {
+        $set: {
+          "ledgerEntries.$[elem].ledgerId": dest._id,
+          "ledgerEntries.$[elem].ledgerName": dest.name,
+          "ledgerEntries.$[elem].groupName": dest.groupName,
+        },
+      },
+      { arrayFilters: [{ "elem.ledgerId": source._id }] },
+    );
+    counts.ledgerEntries = leRes.modifiedCount || 0;
+
+    const partyRes = await Acc_Voucher.updateMany(
+      { partyLedgerId: source._id },
+      { $set: { partyLedgerId: dest._id, partyLedgerName: dest.name } },
+    );
+    counts.partyVouchers = partyRes.modifiedCount || 0;
+
+    const bankRes = await Acc_Voucher.updateMany(
+      { bankLedgerId: source._id },
+      { $set: { bankLedgerId: dest._id } },
+    );
+    counts.bankVouchers = bankRes.modifiedCount || 0;
+
+    // Signed balances: +ve = Dr, −ve = Cr.
+    const signed = (val, type) => {
+      const v = Number(val) || 0;
+      if (v < 0) return v;
+      return (type === "Cr" ? -1 : 1) * v;
+    };
+    const newOpening =
+      signed(dest.openingBalance, dest.openingBalanceType) +
+      signed(source.openingBalance, source.openingBalanceType);
+    const newCurrent =
+      signed(dest.currentBalance, dest.currentBalanceType) +
+      signed(source.currentBalance, source.currentBalanceType);
+
+    await Acc_Ledger.updateOne(
+      { _id: dest._id },
+      {
+        $set: {
+          openingBalance: newOpening,
+          openingBalanceType: newOpening < 0 ? "Cr" : "Dr",
+          currentBalance: newCurrent,
+          currentBalanceType: newCurrent < 0 ? "Cr" : "Dr",
+          ...(dest.balanceFromTrialBalance || source.balanceFromTrialBalance
+            ? { balanceFromTrialBalance: true }
+            : {}),
+          ...(source.linkedVendorId && !dest.linkedVendorId
+            ? { linkedVendorId: source.linkedVendorId }
+            : {}),
+          ...(source.linkedCustomerId && !dest.linkedCustomerId
+            ? { linkedCustomerId: source.linkedCustomerId }
+            : {}),
+          ...(source.linkedEmployeeId && !dest.linkedEmployeeId
+            ? { linkedEmployeeId: source.linkedEmployeeId }
+            : {}),
+        },
+      },
+    );
+
+    const sourceUpdate = {
+      openingBalance: 0,
+      openingBalanceType: "Dr",
+      currentBalance: 0,
+      currentBalanceType: "Dr",
+      balanceFromTrialBalance: false,
+      linkedVendorId: null,
+      linkedCustomerId: null,
+      linkedEmployeeId: null,
+      mergedIntoLedgerId: dest._id,
+      mergedAt: new Date(),
+      updatedBy: approver.id,
+    };
+    if (payload?.deactivateSource !== false) {
+      sourceUpdate.isActive = false;
+      sourceUpdate.deletedAt = new Date();
+      if (!/^\[MERGED\]/.test(source.name || ""))
+        sourceUpdate.name = `[MERGED] ${source.name}`;
+    }
+    await Acc_Ledger.updateOne(
+      { _id: source._id },
+      { $set: sourceUpdate },
+      { strict: false },
+    );
+
+    return { entityId: dest._id, counts };
+  }
+
   // LEDGER ── soft-delete an unused ledger (mirrors DELETE /ledgers/:id, clean case)
   if (kind === "ledger" && action === "delete") {
     if (!target?.id) throw new Error("ledger delete: target.id missing");

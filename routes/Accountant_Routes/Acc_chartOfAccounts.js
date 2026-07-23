@@ -415,6 +415,21 @@ async function coaApprovalGate(req, res, next) {
   } else if (m === "DELETE" && /\/ledgers\/[^/]+$/.test(p)) {
     kind = "ledger";
     action = "delete";
+  } else if (m === "POST" && /\/ledgers\/[^/]+\/transfer-balance$/.test(p)) {
+    // Transferring a balance posts a real journal voucher and moves money
+    // between ledgers. The $-anchored /ledgers/:id patterns above don't match
+    // this path (it has a trailing segment), so editors were bypassing the
+    // approval queue entirely on the single most consequential COA operation.
+    kind = "ledger";
+    action = "update";
+  } else if (m === "POST" && /\/ledgers\/[^/]+\/merge$/.test(p)) {
+    // Merging rewrites POSTED vouchers — the most destructive COA operation
+    // there is. It gets its OWN action, not "update": the generic update
+    // executor would blindly $set the request body onto the source ledger,
+    // writing a junk `destinationLedgerId` field and moving no vouchers at
+    // all, while reporting success to the approver.
+    kind = "ledger";
+    action = "merge";
   } else if (m === "POST" && /\/groups$/.test(p)) {
     kind = "group";
     action = "create";
@@ -449,8 +464,23 @@ async function coaApprovalGate(req, res, next) {
       Acc_Group,
     } = require("../../models/Accountant_model/Acc_MasterModels");
 
+    // The transfer-balance path ends in a verb, not the id — take the segment
+    // right after "ledgers" instead of blindly popping the last one.
+    const parts = req.path.split("/").filter(Boolean);
+    const idIdx = parts.findIndex((s) => s === "ledgers" || s === "groups");
+    // Paths like /ledgers/:id/merge end in a VERB, not the id — popping the
+    // last segment files the approval against a target of "merge". Take the
+    // segment immediately after "ledgers"/"groups" instead.
+    const _parts = req.path.split("/").filter(Boolean);
+    const _idIdx = _parts.findIndex((s) => s === "ledgers" || s === "groups");
     const targetId =
-      action === "create" ? null : String(req.path.split("/").pop());
+      action === "create"
+        ? null
+        : String(
+            _idIdx >= 0 && _parts[_idIdx + 1]
+              ? _parts[_idIdx + 1]
+              : _parts[_parts.length - 1],
+          );
     const collection = kind === "ledger" ? "Acc_Ledger" : "Acc_Group";
 
     let companyId, title, payload;
@@ -472,6 +502,65 @@ async function coaApprovalGate(req, res, next) {
       companyId = ent.companyId;
       title = `${action === "delete" ? "Delete" : "Edit"} ${kind} "${ent.name}"`;
       payload = action === "update" ? req.body || {} : { id: targetId };
+
+      // Merge needs a self-describing title and payload. An approver seeing
+      // "Edit ledger X" with a payload of {destinationLedgerId: "6a3f…"} has
+      // no idea what they're approving — so resolve the destination's name
+      // and count what will actually move, and store it all on the request.
+      if (action === "merge") {
+        const destId = req.body?.destinationLedgerId;
+        if (!destId) {
+          return res.status(400).json({
+            success: false,
+            message: "destinationLedgerId required",
+          });
+        }
+        const destLed = await Acc_Ledger.findById(destId).select(
+          "name groupName nature companyId isActive",
+        );
+        if (!destLed || destLed.isActive === false) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Destination ledger not found" });
+        }
+        if (String(destLed.companyId) !== String(ent.companyId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Source and destination must belong to the same company.",
+          });
+        }
+        if (String(destId) === String(targetId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Source and destination cannot be the same ledger.",
+          });
+        }
+
+        const {
+          Acc_Voucher,
+        } = require("../../models/Accountant_model/Acc_VoucherModels");
+        const [entryCount, partyCount, bankCount] = await Promise.all([
+          Acc_Voucher.countDocuments({ "ledgerEntries.ledgerId": targetId }),
+          Acc_Voucher.countDocuments({ partyLedgerId: targetId }),
+          Acc_Voucher.countDocuments({ bankLedgerId: targetId }),
+        ]);
+
+        title = `Merge ledger "${ent.name}" → "${destLed.name}"`;
+        payload = {
+          destinationLedgerId: String(destId),
+          destinationLedgerName: destLed.name,
+          destinationGroupName: destLed.groupName || "",
+          sourceLedgerId: String(targetId),
+          sourceLedgerName: ent.name,
+          deactivateSource: req.body?.deactivateSource !== false,
+          // Snapshot of impact at submission time, so the approver can see
+          // the blast radius without running any query themselves.
+          affectedVoucherLines: entryCount,
+          affectedPartyVouchers: partyCount,
+          affectedBankVouchers: bankCount,
+          totalAffected: entryCount + partyCount + bankCount,
+        };
+      }
 
       // Mirror the handlers' hard guards so an editor can't queue an
       // impossible action.
@@ -5069,6 +5158,190 @@ async function postPayrollRunById(companyId, runId, options = {}) {
   if (!items.length) throw new Error("Payroll run has no items to post.");
   return postPayrollRun(companyId, run, items, options);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/accountant/chart-of-accounts/ledgers/:id/merge
+//   Body: { destinationLedgerId, deactivateSource? }
+//
+// MERGE a ledger into another. Unlike transfer-balance — which leaves both
+// ledgers alive and posts a balancing journal between them — a merge REWRITES
+// HISTORY: every voucher mentioning the source is repointed at the destination.
+// Afterwards the source genuinely has no transactions, rather than a zero
+// balance achieved by an offsetting entry.
+//
+// Use transfer-balance when both ledgers are real and you're moving money.
+// Use merge when the source is a DUPLICATE that shouldn't exist.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/ledgers/:id/merge", async (req, res) => {
+  try {
+    const { destinationLedgerId, deactivateSource = true } = req.body || {};
+    if (!destinationLedgerId)
+      return res
+        .status(400)
+        .json({ success: false, message: "destinationLedgerId required" });
+
+    const source = await Acc_Ledger.findById(req.params.id);
+    if (!source)
+      return res
+        .status(404)
+        .json({ success: false, message: "Source ledger not found" });
+
+    const dest = await Acc_Ledger.findById(destinationLedgerId);
+    if (!dest || dest.isActive === false)
+      return res
+        .status(404)
+        .json({ success: false, message: "Destination ledger not found" });
+
+    if (String(source._id) === String(dest._id))
+      return res.status(400).json({
+        success: false,
+        message: "Source and destination cannot be the same ledger.",
+      });
+
+    if (String(source.companyId) !== String(dest.companyId))
+      return res.status(400).json({
+        success: false,
+        message: "Source and destination must belong to the same company.",
+      });
+
+    // Merging across natures (e.g. an expense into a liability) would move the
+    // transactions onto the wrong financial statement. Refuse rather than guess.
+    if (
+      source.nature &&
+      dest.nature &&
+      String(source.nature) !== String(dest.nature)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot merge a ${source.nature} ledger into a ${dest.nature} ledger — that would move the transactions to the wrong financial statement.`,
+      });
+    }
+
+    const counts = { ledgerEntries: 0, partyVouchers: 0, bankVouchers: 0 };
+
+    // 1. Voucher LINE entries — arrayFilters rewrites only matching elements.
+    //    Covers all statuses, not just posted: a draft pointing at a dead
+    //    ledger would fail on post.
+    const leRes = await Acc_Voucher.updateMany(
+      { "ledgerEntries.ledgerId": source._id },
+      {
+        $set: {
+          "ledgerEntries.$[elem].ledgerId": dest._id,
+          "ledgerEntries.$[elem].ledgerName": dest.name,
+          "ledgerEntries.$[elem].groupName": dest.groupName,
+        },
+      },
+      { arrayFilters: [{ "elem.ledgerId": source._id }] },
+    );
+    counts.ledgerEntries = leRes.modifiedCount || 0;
+
+    // 2. Party ledger reference
+    const partyRes = await Acc_Voucher.updateMany(
+      { partyLedgerId: source._id },
+      { $set: { partyLedgerId: dest._id, partyLedgerName: dest.name } },
+    );
+    counts.partyVouchers = partyRes.modifiedCount || 0;
+
+    // 3. Bank ledger reference — receipts/payments/contra carry the bank side
+    //    here IN ADDITION to ledgerEntries. The existing delete-with-reassign
+    //    path misses this, orphaning every receipt against a merged bank.
+    const bankRes = await Acc_Voucher.updateMany(
+      { bankLedgerId: source._id },
+      { $set: { bankLedgerId: dest._id } },
+    );
+    counts.bankVouchers = bankRes.modifiedCount || 0;
+
+    // 4. Fold balances — SIGNED (+Dr / −Cr), tolerating the older
+    //    magnitude+type convention still on imported ledgers.
+    const signed = (val, type) => {
+      const v = Number(val) || 0;
+      if (v < 0) return v;
+      return (type === "Cr" ? -1 : 1) * v;
+    };
+
+    const newOpening =
+      signed(dest.openingBalance, dest.openingBalanceType) +
+      signed(source.openingBalance, source.openingBalanceType);
+    const newCurrent =
+      signed(dest.currentBalance, dest.currentBalanceType) +
+      signed(source.currentBalance, source.currentBalanceType);
+
+    await Acc_Ledger.updateOne(
+      { _id: dest._id },
+      {
+        $set: {
+          openingBalance: newOpening,
+          openingBalanceType: newOpening < 0 ? "Cr" : "Dr",
+          currentBalance: newCurrent,
+          currentBalanceType: newCurrent < 0 ? "Cr" : "Dr",
+          ...(dest.balanceFromTrialBalance || source.balanceFromTrialBalance
+            ? { balanceFromTrialBalance: true }
+            : {}),
+          // Inherit party links only where the destination has none, so a
+          // merge never silently steals an existing vendor/customer link.
+          ...(source.linkedVendorId && !dest.linkedVendorId
+            ? { linkedVendorId: source.linkedVendorId }
+            : {}),
+          ...(source.linkedCustomerId && !dest.linkedCustomerId
+            ? { linkedCustomerId: source.linkedCustomerId }
+            : {}),
+          ...(source.linkedEmployeeId && !dest.linkedEmployeeId
+            ? { linkedEmployeeId: source.linkedEmployeeId }
+            : {}),
+        },
+      },
+    );
+
+    // 5. Empty the source. Its transactions now live on the destination, so
+    //    its balances MUST go to zero — leaving them double-counts the same
+    //    money in the Trial Balance.
+    const sourceUpdate = {
+      openingBalance: 0,
+      openingBalanceType: "Dr",
+      currentBalance: 0,
+      currentBalanceType: "Dr",
+      balanceFromTrialBalance: false,
+      linkedVendorId: null,
+      linkedCustomerId: null,
+      linkedEmployeeId: null,
+      mergedIntoLedgerId: dest._id,
+      mergedAt: new Date(),
+    };
+    if (deactivateSource) {
+      sourceUpdate.isActive = false;
+      sourceUpdate.deletedAt = new Date();
+      if (!/^\[MERGED\]/.test(source.name || ""))
+        sourceUpdate.name = `[MERGED] ${source.name}`;
+    }
+
+    await Acc_Ledger.updateOne(
+      { _id: source._id },
+      { $set: sourceUpdate },
+      { strict: false }, // mergedIntoLedgerId/mergedAt may not be in the schema
+    );
+
+    const total =
+      counts.ledgerEntries + counts.partyVouchers + counts.bankVouchers;
+    const cleanName = String(source.name || "").replace(/^\[MERGED\] /, "");
+
+    res.json({
+      success: true,
+      message: total
+        ? `Merged "${cleanName}" into "${dest.name}". ${counts.ledgerEntries} voucher line(s), ${counts.partyVouchers} party reference(s) and ${counts.bankVouchers} bank reference(s) moved.${deactivateSource ? " The old ledger is now inactive." : " The old ledger is now empty."}`
+        : `Merged "${cleanName}" into "${dest.name}". It had no transactions; balances folded in.`,
+      counts,
+      destination: {
+        _id: dest._id,
+        name: dest.name,
+        currentBalance: newCurrent,
+        currentBalanceType: newCurrent < 0 ? "Cr" : "Dr",
+      },
+    });
+  } catch (err) {
+    console.error("Ledger merge:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 module.exports = router;
 module.exports.postPayrollRunById = postPayrollRunById;
