@@ -140,6 +140,48 @@ async function getOrCreateFolder(drive, folderName, parentId) {
 //         └── {meetId}/
 //               ├── E001_John_audio_M004.webm
 //               └── E001_John_audio_M004 (1).webm  ← if rejoined
+async function uploadFileWithRetry(
+  drive,
+  finalFileName,
+  mimeType,
+  meetFolderId,
+  buffer,
+) {
+  const RETRIES = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    try {
+      // Streams are single-use — must rebuild fresh on every attempt,
+      // or a retry silently uploads zero bytes.
+      const readable = new Readable();
+      readable._read = () => {};
+      readable.push(buffer);
+      readable.push(null);
+
+      return await drive.files.create({
+        supportsAllDrives: true,
+        requestBody: { name: finalFileName, mimeType, parents: [meetFolderId] },
+        media: { mimeType, body: readable },
+        fields: "id, name, webViewLink, size",
+      });
+    } catch (e) {
+      lastErr = e;
+      const reason = e?.errors?.[0]?.reason || "";
+      const isTransient =
+        reason === "transientFailure" ||
+        reason === "backendError" ||
+        e?.code === 500 ||
+        e?.code === 503;
+      console.warn(
+        `[Drive] Upload attempt ${attempt}/${RETRIES} failed${isTransient ? " (transient — retrying)" : " (not retryable)"}: ${e.message}`,
+      );
+      if (!isTransient || attempt === RETRIES) throw e;
+      await new Promise((r) => setTimeout(r, attempt * 1000)); // 1s, then 2s
+    }
+  }
+  throw lastErr;
+}
+
 async function uploadAudioToDrive(buffer, baseFileName, mimeType, meetId) {
   const drive = getDriveClient();
 
@@ -171,21 +213,13 @@ async function uploadAudioToDrive(buffer, baseFileName, mimeType, meetId) {
     ext,
   );
 
-  const readable = new Readable();
-  readable._read = () => {};
-  readable.push(buffer);
-  readable.push(null);
-
-  const response = await drive.files.create({
-    supportsAllDrives: true,
-    requestBody: {
-      name: finalFileName,
-      mimeType,
-      parents: [meetFolderId],
-    },
-    media: { mimeType, body: readable },
-    fields: "id, name, webViewLink, size",
-  });
+  const response = await uploadFileWithRetry(
+    drive,
+    finalFileName,
+    mimeType,
+    meetFolderId,
+    buffer,
+  );
 
   // Make file publicly readable
   await drive.permissions.create({
@@ -605,7 +639,7 @@ module.exports = function (io) {
         fileSize: merged.length,
       });
     } catch (e) {
-      console.error("[GuestAudioFinalize] Error:", e.message);
+      console.error("[GuestAudioFinalize] Error:", e.stack || e.message);
       res.status(500).json({ error: e.message });
     }
   });
