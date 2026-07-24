@@ -331,8 +331,29 @@ async function applyApprovedAction(reqDoc, approver) {
     return { entityId: ledger._id };
   }
 
-  // LEDGER ── merge one ledger into another (mirrors POST /ledgers/:id/merge)
-  //
+  // VOUCHER ── link/unlink a purchase voucher to a PO (mirrors /:id/link-po)
+  if (kind === "voucher" && action === "link_po") {
+    const v = await Acc_Voucher.findById(target.id);
+    if (!v) throw new Error("Voucher not found");
+    if (payload?.unlink) {
+      v.purchaseOrderId = undefined;
+      v.purchaseOrderNumber = "";
+    } else {
+      if (!payload?.purchaseOrderId)
+        throw new Error("link_po: purchaseOrderId missing");
+      v.purchaseOrderId = payload.purchaseOrderId;
+      v.purchaseOrderNumber = payload.purchaseOrderNumber || "";
+      v.sourceSystem = v.sourceSystem || "auto_from_po";
+      v.sourceId = payload.purchaseOrderId;
+      v.sourceReference =
+        v.sourceReference || payload.purchaseOrderNumber || "";
+    }
+    v.updatedBy = approver.id;
+    await v.save();
+    return { entityId: v._id };
+  }
+
+  // LEDGER ── merge one ledger into another (mirrors POST /ledgers/:id/merge)  //
   // Repoints every voucher reference from source to destination, folds the
   // balances, and empties the source. Deliberately NOT handled by the generic
   // "update" executor above — that would $set the request body onto the

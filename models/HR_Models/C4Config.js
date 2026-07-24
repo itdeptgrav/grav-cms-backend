@@ -4,8 +4,8 @@
 //
 // No percentages, no working-day math. Every value is a flat point amount:
 //   • basePointsPerDay      → REWARD earned for each day present & on time
-//                             (written automatically by the presence engine
-//                              when presenceAutoCredit is on)
+//                             (credited automatically by the always-on
+//                              presence engine)
 //   • lateArrivalPoints     → flat deduction per late instance
 //   • absencePoints         → flat deduction per absent (AB) day
 //   • earlyDeparturePoints  → flat deduction per early-departure instance
@@ -18,13 +18,9 @@ const mongoose = require("mongoose");
 
 const c4ConfigSchema = new mongoose.Schema({
   // ── Reward ────────────────────────────────────────────────────────────────
-  // Flat points earned per working day present & on time.
+  // Flat points earned per working day present & on time. The presence engine
+  // is ALWAYS ON — it credits this automatically (hourly, 7-day lookback).
   basePointsPerDay: { type: Number, default: 1, min: 0 },
-
-  // When true, the presence engine automatically credits basePointsPerDay to
-  // every employee for each past present-and-on-time day (deduped, hourly,
-  // 7-day lookback). OFF by default — nothing writes until HR turns it on.
-  presenceAutoCredit: { type: Boolean, default: false },
 
   // ── Penalties — FLAT POINTS ───────────────────────────────────────────────
   lateArrivalPoints: { type: Number, default: 1, min: 0 }, // per instance
@@ -37,6 +33,10 @@ const c4ConfigSchema = new mongoose.Schema({
 
   // Effective statuses that do NOT count as a working day (week-offs etc).
   nonWorkingStatuses: { type: [String], default: ["WO"] },
+
+  // Throttle stamp for the lazy presence pass (runs at most once per hour,
+  // claimed atomically so concurrent requests can't double-run).
+  lastPresenceRunAt: { type: Date, default: () => new Date(0) },
 
   updatedByName: { type: String, default: "" },
   updatedByRole: { type: String, default: "" },
