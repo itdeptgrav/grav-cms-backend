@@ -17,7 +17,7 @@ const LOGIN_URL = process.env.COWORK_APP_URL || "https://cowork.grav.in";
 
 // ── Internal Brevo send ────────────────────────────────────────────────────
 async function _send({ to, subject, html, text }) {
-    if (process.env.ENABLE_EMAILS !== "true") return;
+    if (process.env.ENABLE_EMAILS !== "true") { console.warn(`[Email] SKIPPED "${subject}" — ENABLE_EMAILS is not "true"`); return; }
     const key = process.env.BREVO_API_KEY;
     if (!key) { console.warn("[Email] BREVO_API_KEY not set"); return; }
     try {
@@ -76,8 +76,8 @@ function _quote(text, color) { return `<blockquote style="border-left:3px solid 
  * @param {Object} opts.data              extra context (taskId, groupId, meetId, etc.)
  */
 async function sendNotificationEmail({ senderId, senderName, receiverId, receiverName, receiverEmail, type, title, body, data = {} }) {
-    if (!receiverEmail) return;
-    if (process.env.ENABLE_EMAILS !== "true") return;
+    if (!receiverEmail) { console.warn(`[Email] SKIPPED "${type}" for ${receiverId || "unknown"} — no email on file`); return; }
+    if (process.env.ENABLE_EMAILS !== "true") { console.warn(`[Email] SKIPPED "${type}" for ${receiverId || "unknown"} — ENABLE_EMAILS is not "true"`); return; }
 
     const app = `${LOGIN_URL}/coworking`;
     let subject = title;
@@ -198,6 +198,10 @@ async function sendNotificationEmail({ senderId, senderName, receiverId, receive
         const roleLabel = data.newRole === "tl" ? "Team Lead" : "Employee";
         subject = `Your CoWork role has been updated to ${roleLabel}`;
         html = _wrap("Role Changed", `<p>Your CoWork role has been updated to <strong>${roleLabel}</strong> by ${senderName}.</p><p>You have been logged out. Please log in again to continue.</p>${_btn("Log In", LOGIN_URL)}`);
+    }
+    else if (type === "department_changed") {
+        subject = `Your CoWork department has been updated to ${data.newDepartment || ""}`;
+        html = _wrap("Department Changed", `<p>Your CoWork department has been updated by ${senderName}.</p>${_table(data.oldDepartment ? _row("Previous Department", data.oldDepartment) : "", _row("New Department", data.newDepartment || ""))}${_btn("Open CoWork", app)}`);
     }
     else if (type === "password_reset") {
         subject = `Your CoWork password was reset`;
