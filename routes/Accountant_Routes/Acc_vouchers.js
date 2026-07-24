@@ -1338,7 +1338,7 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
 /* GET /po-lookup                                                       */
 router.get("/po-lookup", auth, async (req, res) => {
   try {
-    const { q, vendorId, limit = 20 } = req.query;
+    const { q, vendorId, limit = 20, page = 1 } = req.query;
     let PurchaseOrder;
     try {
       PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
@@ -1356,16 +1356,61 @@ router.get("/po-lookup", auth, async (req, res) => {
         String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
         "i",
       );
+    const _limit = Math.min(Math.max(parseInt(limit) || 20, 1), 50);
+    const _page = Math.max(parseInt(page) || 1, 1);
 
-    const pos = await PurchaseOrder.find(filter)
-      .populate("vendor", "companyName gstNumber email phone contactPerson")
-      .populate("items.rawItem", "name sku unit category hsnCode gstRate")
-      .select(
-        "poNumber orderDate expectedDeliveryDate totalAmount status items vendor gstDetails",
-      )
-      .sort({ orderDate: -1 })
-      .limit(parseInt(limit))
-      .lean();
+    const [pos, totalCount] = await Promise.all([
+      PurchaseOrder.find(filter)
+        .populate("vendor", "companyName gstNumber email phone contactPerson")
+        .populate("items.rawItem", "name sku unit category hsnCode gstRate")
+        .select(
+          "poNumber orderDate expectedDeliveryDate totalAmount status paymentStatus items vendor gstDetails",
+        )
+        .sort({ orderDate: -1 })
+        .skip((_page - 1) * _limit)
+        .limit(_limit)
+        .lean(),
+      PurchaseOrder.countDocuments(filter),
+    ]);
+
+    // ── Billing status, computed from linked purchase vouchers ────────────
+    // A PO is BILLED when purchase vouchers exist against it. That is NOT
+    // "paid" — the vendor has invoiced us and we owe the money. Cancelled and
+    // void vouchers are excluded so cancelling a bill releases the PO back to
+    // billable, which is exactly what should happen.
+    const poIds = pos.map((p) => p._id);
+    let billMap = new Map();
+    if (poIds.length) {
+      const billed = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            purchaseOrderId: { $in: poIds },
+            voucherType: "purchase",
+            status: { $in: ["posted", "pending_approval", "draft"] },
+          },
+        },
+        {
+          $group: {
+            _id: "$purchaseOrderId",
+            billedAmount: {
+              $sum: {
+                $cond: [{ $eq: ["$status", "posted"] }, "$grandTotal", 0],
+              },
+            },
+            pendingAmount: {
+              $sum: {
+                $cond: [{ $ne: ["$status", "posted"] }, "$grandTotal", 0],
+              },
+            },
+            voucherCount: { $sum: 1 },
+            postedCount: {
+              $sum: { $cond: [{ $eq: ["$status", "posted"] }, 1, 0] },
+            },
+          },
+        },
+      ]);
+      billMap = new Map(billed.map((b) => [String(b._id), b]));
+    }
 
     const result = pos.map((po) => ({
       _id: po._id,
@@ -1374,6 +1419,28 @@ router.get("/po-lookup", auth, async (req, res) => {
       expectedDeliveryDate: po.expectedDeliveryDate,
       totalAmount: po.totalAmount,
       status: po.status,
+      paymentStatus: po.paymentStatus || "PENDING",
+      ...(() => {
+        const b = billMap.get(String(po._id)) || {};
+        const billedAmount = b.billedAmount || 0;
+        const total = Number(po.totalAmount) || 0;
+        // 1% tolerance — freight, rounding and rate tweaks make exact
+        // equality between a PO and its bill unrealistic in practice.
+        const billingStatus =
+          billedAmount <= 0
+            ? "NOT_BILLED"
+            : billedAmount >= total * 0.99
+              ? "FULLY_BILLED"
+              : "PARTIALLY_BILLED";
+        return {
+          billedAmount,
+          pendingBillAmount: b.pendingAmount || 0,
+          remainingToBill: Math.max(total - billedAmount, 0),
+          voucherCount: b.voucherCount || 0,
+          postedVoucherCount: b.postedCount || 0,
+          billingStatus,
+        };
+      })(),
       vendor: po.vendor
         ? {
             _id: po.vendor._id,
@@ -1400,10 +1467,439 @@ router.get("/po-lookup", auth, async (req, res) => {
         category: item.rawItem?.category || "",
       })),
     }));
-    res.json({ purchaseOrders: result, count: result.length });
+    res.json({
+      purchaseOrders: result,
+      count: result.length,
+      pagination: {
+        total: totalCount,
+        page: _page,
+        limit: _limit,
+        totalPages: Math.ceil(totalCount / _limit) || 1,
+      },
+    });
   } catch (e) {
     console.error("[po-lookup]", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+/* GET /po-detail/:poId — one PO with its items and billing history          */
+/* MUST be declared BEFORE router.get("/:id") or Express matches that first. */
+router.get("/po-detail/:poId", auth, async (req, res) => {
+  try {
+    let PurchaseOrder;
+    try {
+      PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+    } catch {
+      return res.status(404).json({ error: "PO module not available" });
+    }
+
+    const po = await PurchaseOrder.findById(req.params.poId)
+      .populate("vendor", "companyName gstNumber email phone contactPerson")
+      .populate("items.rawItem", "name sku unit category hsnCode gstRate")
+      .lean();
+    if (!po) return res.status(404).json({ error: "Purchase order not found" });
+
+    // Every accounting voucher raised against this PO, newest first. Cancelled
+    // and void vouchers are INCLUDED here — the history should show that a
+    // bill was raised and then cancelled — but they don't count toward the
+    // billed total below, so cancelling releases the PO back to billable.
+    const vouchers = await Acc_Voucher.find({ purchaseOrderId: po._id })
+      .select(
+        "voucherNumber voucherDate grandTotal status partyLedgerName partyLedgerId referenceNumber referenceDate totalTax subtotal dueDate createdAt",
+      )
+      .sort({ voucherDate: -1, createdAt: -1 })
+      .lean();
+
+    const billedAmount = vouchers
+      .filter((v) => v.status === "posted")
+      .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
+    const pendingBillAmount = vouchers
+      .filter((v) => ["draft", "pending_approval"].includes(v.status))
+      .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
+
+    const total = Number(po.totalAmount) || 0;
+    // 1% tolerance — freight, rounding and rate tweaks make exact equality
+    // between a PO and its bill unrealistic.
+    const billingStatus =
+      billedAmount <= 0
+        ? "NOT_BILLED"
+        : billedAmount >= total * 0.99
+          ? "FULLY_BILLED"
+          : "PARTIALLY_BILLED";
+
+    // PO-side payments recorded in the CMS (separate from accounting payment
+    // vouchers — this is the Store/Inventory dept's own record).
+    const poPaid = (po.payments || []).reduce(
+      (s, p) => s + (Number(p.amount) || 0),
+      0,
+    );
+
+    // Delivery events — the Store dept logs each receipt against the PO.
+    // Useful here because "when did the goods actually arrive" is the question
+    // an accountant asks when deciding whether a bill is legitimate.
+    const deliveries = (po.deliveries || [])
+      .map((d) => ({
+        deliveryDate: d.deliveryDate,
+        quantityReceived: d.quantityReceived || 0,
+        notes: d.notes || "",
+        receivedBy: d.receivedBy || null,
+      }))
+      .sort((a, b) => new Date(b.deliveryDate) - new Date(a.deliveryDate));
+
+    // Open return requests reduce what's legitimately billable — flagging
+    // them stops someone billing for goods that went back.
+    const openReturns = (po.returnRequests || []).filter(
+      (r) => !/complet|closed|resolved/i.test(String(r.status || "")),
+    ).length;
+
+    // Have we already paid this vendor through the books? Payment vouchers
+    // don't carry purchaseOrderId, so we match on the party ledger of the
+    // purchase vouchers raised against this PO.
+    const partyIds = [
+      ...new Set(
+        vouchers
+          .filter((v) => v.partyLedgerId)
+          .map((v) => String(v.partyLedgerId)),
+      ),
+    ];
+
+    res.json({
+      purchaseOrder: {
+        _id: po._id,
+        poNumber: po.poNumber,
+        orderDate: po.orderDate,
+        expectedDeliveryDate: po.expectedDeliveryDate,
+        status: po.status,
+        paymentStatus: po.paymentStatus || "PENDING",
+        totalAmount: total,
+        subtotal: po.subtotal || 0,
+        taxAmount: po.taxAmount || 0,
+        shippingCharges: po.shippingCharges || 0,
+        discount: po.discount || 0,
+        notes: po.notes || "",
+        paymentTerms: po.paymentTerms || "",
+        totalReceived: po.totalReceived || 0,
+        totalPending: po.totalPending || 0,
+        // A PO can carry a linked vendor OR just a typed vendorName. The
+        // second kind can't auto-match a ledger on the voucher form.
+        vendor: po.vendor
+          ? {
+              _id: po.vendor._id,
+              companyName: po.vendor.companyName,
+              gstNumber: po.vendor.gstNumber,
+              email: po.vendor.email,
+              phone: po.vendor.phone,
+            }
+          : null,
+        vendorName: po.vendorName || "",
+        items: (po.items || []).map((it) => ({
+          _id: it._id,
+          itemName: it.itemName || it.rawItem?.name || "",
+          sku: it.rawItem?.sku || it.sku || "",
+          hsnCode: it.rawItem?.hsnCode || it.hsnCode || "",
+          unit: it.unit || it.rawItem?.unit || "Nos",
+          gstRate: it.rawItem?.gstRate || it.gstRate || 0,
+          quantity: it.quantity || 0,
+          unitPrice: it.unitPrice || 0,
+          totalPrice: it.totalPrice || 0,
+          receivedQuantity: it.receivedQuantity || 0,
+          pendingQuantity:
+            it.pendingQuantity ??
+            (it.quantity || 0) - (it.receivedQuantity || 0),
+          status: it.status || "PENDING",
+        })),
+        billedAmount,
+        pendingBillAmount,
+        remainingToBill: Math.max(total - billedAmount, 0),
+        billingStatus,
+        poPaid,
+        poRemaining: Math.max(total - poPaid, 0),
+        deliveries,
+        openReturns,
+        // Ageing — how long this PO has sat unbilled since delivery. The
+        // single most actionable number on this screen: goods received and
+        // never invoiced means an understated liability in your books.
+        daysSinceOrder: po.orderDate
+          ? Math.floor((Date.now() - new Date(po.orderDate)) / 86400000)
+          : null,
+        isOverdueDelivery:
+          po.expectedDeliveryDate &&
+          (po.totalPending || 0) > 0 &&
+          new Date(po.expectedDeliveryDate) < new Date(),
+      },
+      vouchers,
+    });
+  } catch (e) {
+    console.error("[po-detail]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* GET /po-match-candidates/:poId — unlinked purchase vouchers for this PO   */
+/* MUST be declared BEFORE router.get("/:id").                               */
+router.get("/po-match-candidates/:poId", auth, async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+
+    let PurchaseOrder;
+    try {
+      PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+    } catch {
+      return res.status(404).json({ error: "PO module not available" });
+    }
+    const po = await PurchaseOrder.findById(req.params.poId)
+      .populate("vendor", "companyName gstNumber")
+      .lean();
+    if (!po) return res.status(404).json({ error: "Purchase order not found" });
+
+    // Only vouchers with NO PO link are candidates. A voucher already tied to
+    // another PO must be unlinked there first, or the same bill would count
+    // toward two POs and overstate how much has been billed.
+    const filter = {
+      companyId,
+      voucherType: "purchase",
+      status: { $in: ["posted", "pending_approval", "draft"] },
+      $or: [{ purchaseOrderId: { $exists: false } }, { purchaseOrderId: null }],
+    };
+
+    if (req.query.q) {
+      const rx = new RegExp(
+        String(req.query.q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i",
+      );
+      filter.$and = [
+        {
+          $or: [
+            { voucherNumber: rx },
+            { referenceNumber: rx },
+            { partyLedgerName: rx },
+          ],
+        },
+      ];
+    }
+
+    const candidates = await Acc_Voucher.find(filter)
+      .select(
+        "voucherNumber voucherDate grandTotal status partyLedgerName partyLedgerId referenceNumber referenceDate subtotal totalTax",
+      )
+      .sort({ voucherDate: -1 })
+      .limit(100)
+      .lean();
+
+    // Score each candidate so the likely match floats to the top. This is a
+    // HINT, not a decision — the user still picks. Vendor name and amount are
+    // the two signals that actually discriminate.
+    const poVendor = String(po.vendor?.companyName || po.vendorName || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
+    const poTotal = Number(po.totalAmount) || 0;
+
+    const scored = candidates.map((v) => {
+      let score = 0;
+      const reasons = [];
+
+      const vName = String(v.partyLedgerName || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+      if (
+        poVendor &&
+        vName &&
+        (vName.includes(poVendor) || poVendor.includes(vName))
+      ) {
+        score += 50;
+        reasons.push("vendor matches");
+      }
+
+      const amt = Number(v.grandTotal) || 0;
+      if (poTotal > 0 && amt > 0) {
+        const diff = Math.abs(amt - poTotal) / poTotal;
+        if (diff < 0.01) {
+          score += 40;
+          reasons.push("amount matches exactly");
+        } else if (diff < 0.1) {
+          score += 20;
+          reasons.push("amount within 10%");
+        }
+      }
+
+      // A bill raised near the order date is more likely to be this PO's.
+      if (po.orderDate && v.voucherDate) {
+        const days = Math.abs(
+          (new Date(v.voucherDate) - new Date(po.orderDate)) / 86400000,
+        );
+        if (days <= 30) {
+          score += 10;
+          reasons.push("dated near the PO");
+        }
+      }
+
+      return { ...v, matchScore: score, matchReasons: reasons };
+    });
+
+    scored.sort((a, b) => b.matchScore - a.matchScore);
+
+    res.json({
+      purchaseOrder: {
+        _id: po._id,
+        poNumber: po.poNumber,
+        totalAmount: poTotal,
+        orderDate: po.orderDate,
+        vendorName: po.vendor?.companyName || po.vendorName || "",
+      },
+      candidates: scored,
+    });
+  } catch (e) {
+    console.error("[po-match-candidates]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* POST /:id/link-po — attach an existing voucher to a purchase order        */
+/* Body: { purchaseOrderId, purchaseOrderNumber }  — pass null to UNLINK.    */
+router.post("/:id/link-po", auth, async (req, res) => {
+  try {
+    const voucher = await Acc_Voucher.findById(req.params.id);
+    if (!voucher) return res.status(404).json({ error: "Voucher not found" });
+    if (voucher.voucherType !== "purchase")
+      return res
+        .status(400)
+        .json({ error: "Only purchase vouchers can be linked to a PO." });
+    if (["cancelled", "void"].includes(voucher.status))
+      return res.status(400).json({
+        error: `Cannot link a ${voucher.status} voucher to a purchase order.`,
+      });
+
+    const { purchaseOrderId, purchaseOrderNumber } = req.body || {};
+    const isUnlink = !purchaseOrderId;
+
+    // Linking rewrites a POSTED voucher and changes what the PO reports as
+    // billed. That is the same class of change as editing the voucher, so it
+    // goes through the same gate — otherwise this route is a way for an
+    // editor to modify posted records without review.
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    const canActDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    if (role === "viewer" || perms.canEdit === false) {
+      return res
+        .status(403)
+        .json({ error: "Read-only access — you can't match vouchers to POs." });
+    }
+
+    let po = null;
+    if (!isUnlink) {
+      let PurchaseOrder;
+      try {
+        PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+      } catch {
+        return res.status(404).json({ error: "PO module not available" });
+      }
+      po = await PurchaseOrder.findById(purchaseOrderId)
+        .select("poNumber totalAmount status")
+        .lean();
+      if (!po)
+        return res.status(404).json({ error: "Purchase order not found" });
+      if (/cancel/i.test(po.status || ""))
+        return res
+          .status(400)
+          .json({ error: "Cannot link to a cancelled purchase order." });
+
+      if (
+        voucher.purchaseOrderId &&
+        String(voucher.purchaseOrderId) !== String(purchaseOrderId)
+      ) {
+        return res.status(409).json({
+          error: `This voucher is already linked to ${voucher.purchaseOrderNumber || "another PO"}. Unlink it there first.`,
+        });
+      }
+    }
+
+    if (!canActDirectly && voucher.status === "posted") {
+      if (!req.user?.organizationId)
+        return res
+          .status(403)
+          .json({ error: "Your role can't modify posted vouchers." });
+
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "link_po",
+        "target.id": voucher._id,
+        status: "pending",
+      });
+      if (dup)
+        return res.status(200).json({
+          _pendingApproval: true,
+          message: "A match request is already pending for this voucher.",
+        });
+
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: voucher.companyId,
+        kind: "voucher",
+        action: "link_po",
+        title: isUnlink
+          ? `Unlink ${voucher.voucherNumber} from ${voucher.purchaseOrderNumber || "its PO"}`
+          : `Match ${voucher.voucherType} ${voucher.voucherNumber} → PO ${po.poNumber}`,
+        target: { collection: "Acc_Voucher", id: voucher._id },
+        payload: {
+          voucherId: String(voucher._id),
+          voucherNumber: voucher.voucherNumber,
+          voucherAmount: Number(voucher.grandTotal || 0),
+          purchaseOrderId: isUnlink ? null : String(purchaseOrderId),
+          purchaseOrderNumber: isUnlink ? null : po.poNumber,
+          poTotalAmount: isUnlink ? null : Number(po.totalAmount || 0),
+          unlink: isUnlink,
+        },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+
+      return res.status(202).json({
+        _pendingApproval: true,
+        message: "Match request sent to an admin for approval.",
+      });
+    }
+
+    // Direct path — owners / approvers / accountants.
+    if (isUnlink) {
+      voucher.purchaseOrderId = undefined;
+      voucher.purchaseOrderNumber = "";
+    } else {
+      voucher.purchaseOrderId = purchaseOrderId;
+      voucher.purchaseOrderNumber = po.poNumber || purchaseOrderNumber || "";
+      voucher.sourceSystem = voucher.sourceSystem || "auto_from_po";
+      voucher.sourceId = purchaseOrderId;
+      voucher.sourceReference = voucher.sourceReference || po.poNumber || "";
+    }
+    voucher.updatedBy = req.user?.id;
+    await voucher.save();
+
+    res.json({
+      success: true,
+      message: isUnlink
+        ? `Unlinked ${voucher.voucherNumber}.`
+        : `Matched ${voucher.voucherNumber} to ${po.poNumber}.`,
+      voucher: {
+        _id: voucher._id,
+        voucherNumber: voucher.voucherNumber,
+        purchaseOrderId: voucher.purchaseOrderId || null,
+        purchaseOrderNumber: voucher.purchaseOrderNumber || "",
+      },
+    });
+  } catch (e) {
+    console.error("[link-po]", e);
+    res.status(400).json({ error: e.message });
   }
 });
 
@@ -1614,6 +2110,16 @@ router.post("/", auth, async (req, res) => {
 
     body.financialYear = computeFY(body.voucherDate);
     body.createdBy = req.user?.id;
+
+    // Mark PO-sourced vouchers so the Day Book and audit trail show where
+    // they came from. `purchaseOrderId` itself is carried through by the
+    // schema field added in Acc_VoucherModels.
+    if (body.purchaseOrderId) {
+      body.sourceSystem = body.sourceSystem || "auto_from_po";
+      body.sourceId = body.purchaseOrderId;
+      body.sourceReference =
+        body.sourceReference || body.purchaseOrderNumber || "";
+    }
 
     // Resolve partyLedgerName if missing. Accept both legacy `partyLedger`
     // and current `partyLedgerId` field names.

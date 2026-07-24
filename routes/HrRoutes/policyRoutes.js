@@ -60,6 +60,7 @@ function todayLocalStr() {
 // PUT  /api/hr/policy/c4-config
 // ═════════════════════════════════════════════════════════════════════════════
 router.get("/c4-config", verifyHRToken, async (req, res) => {
+  maybeRunPresenceCredits("c4-config");
   try {
     const cfg = await C4Config.getSingleton();
     res.json({ success: true, config: cfg });
@@ -87,8 +88,6 @@ router.put("/c4-config", verifyHRToken, async (req, res) => {
         cfg[f] = v;
       }
     }
-    if (req.body.presenceAutoCredit !== undefined)
-      cfg.presenceAutoCredit = !!req.body.presenceAutoCredit;
     if (Array.isArray(req.body.nonWorkingStatuses))
       cfg.nonWorkingStatuses = req.body.nonWorkingStatuses.map(String);
     if (req.body.updatedByName)
@@ -104,9 +103,13 @@ router.put("/c4-config", verifyHRToken, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// PRESENCE CREDIT ENGINE — flat points, no working-day math.
+// PRESENCE CREDIT ENGINE — flat points, ALWAYS ON.
 // Writes the daily base point (debit, +basePointsPerDay) into sopPoints for
-// every present-and-on-time working day, when cfg.presenceAutoCredit is on.
+// every present-and-on-time working day.
+//   • CREDIT RULE (allowlist): effective status must be present-type — "P" or
+//     a "P/…" half-present variant — AND not late/early over threshold.
+//     Empty, unknown, leave, half-day, WO and AB statuses are SKIPPED with a
+//     counted reason, never blanket-credited.
 //   • Dedup marker: bleach.taskId === "c4_presence" + the date.
 //   • Only credits days strictly BEFORE today (today is still in progress).
 //   • Uses updateOne ($push/$inc), deliberately bypassing employee.save() so
@@ -116,27 +119,42 @@ router.put("/c4-config", verifyHRToken, async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 const PRESENCE_MARKER = "c4_presence";
 
-async function runPresenceCredits(fromStr, toStr) {
+// Present-type = "P" or half-present "P/…" (P/CL, P/SL, P/PL, P/LWP).
+const isPresentType = (eff) => eff === "P" || String(eff).startsWith("P/");
+
+async function runPresenceCredits(fromStr, toStr, opts = {}) {
   const cfg = await C4Config.getSingleton();
   const out = {
-    enabled: !!cfg.presenceAutoCredit,
     from: fromStr,
     to: toStr,
     credited: 0,
-    skipped: 0,
+    alreadyCredited: 0,
+    skippedLate: 0,
+    skippedEarly: 0,
+    skippedAbsent: 0,
+    skippedNonWorking: 0, // WO etc — includes worked Sundays kept as WO
+    skippedOtherStatus: 0, // leave, half-day, empty/unknown status
+    errors: [],
   };
-  if (!cfg.presenceAutoCredit) return out;
 
   const basePerDay = Number(cfg.basePointsPerDay) || 0;
-  if (!(basePerDay > 0)) return out;
+  if (!(basePerDay > 0)) {
+    out.errors.push("basePointsPerDay is 0 — nothing to credit.");
+    return out;
+  }
   const nonWorking = new Set(cfg.nonWorkingStatuses || ["WO"]);
   const lateThr = Number(cfg.lateThresholdMins) || 0;
   const earlyThr = Number(cfg.earlyThresholdMins) || 0;
 
-  // Never credit today — the day isn't over.
+  // Daytime passes never credit today (someone can still leave early at 3pm).
+  // ONLY the fixed-time night cron passes { allowToday: true } — by then the
+  // day's punches and statuses are settled.
   const today = todayLocalStr();
-  const to =
-    toStr < today
+  const to = opts.allowToday
+    ? toStr < today
+      ? toStr
+      : today
+    : toStr < today
       ? toStr
       : (() => {
           const d = new Date(`${today}T00:00:00`);
@@ -144,6 +162,7 @@ async function runPresenceCredits(fromStr, toStr) {
           return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
         })();
   if (fromStr > to) return out;
+  out.to = to;
 
   const days = await DailyAttendance.find({
     dateStr: { $gte: fromStr, $lte: to },
@@ -173,18 +192,39 @@ async function runPresenceCredits(fromStr, toStr) {
       const bid = entry.biometricId;
       if (!bid) continue;
 
-      // On-time = a working day, not absent, not late/early over threshold.
       const eff = entry.hrFinalStatus || entry.systemPrediction || "";
-      if (nonWorking.has(eff) || eff === "AB") continue;
+
+      // Classification — every skip is counted so runs are auditable.
+      if (nonWorking.has(eff)) {
+        out.skippedNonWorking++;
+        continue;
+      }
+      if (eff === "AB") {
+        out.skippedAbsent++;
+        continue;
+      }
+      if (!isPresentType(eff)) {
+        // leave (L-CL/…), half-day (HD), LWP, empty or unknown status —
+        // never blanket-credited.
+        out.skippedOtherStatus++;
+        continue;
+      }
       const isLate = !!entry.isLate && Number(entry.lateMins || 0) > lateThr;
+      if (isLate) {
+        out.skippedLate++;
+        continue;
+      }
       const isEarly =
         !!entry.isEarlyDeparture &&
         Number(entry.earlyDepartureMins || 0) > earlyThr;
-      if (isLate || isEarly) continue;
+      if (isEarly) {
+        out.skippedEarly++;
+        continue;
+      }
 
       const key = `${bid}|${day.dateStr}`;
       if (done.has(key)) {
-        out.skipped++;
+        out.alreadyCredited++;
         continue;
       }
 
@@ -216,51 +256,91 @@ async function runPresenceCredits(fromStr, toStr) {
         },
       };
 
-      // Push into the matching year record; create it if absent. updateOne
-      // avoids the heavy salary pre-save hook that employee.save() triggers.
-      const r = await Employee.updateOne(
-        { biometricId: bid, "sopPoints.year": year },
-        {
-          $push: { "sopPoints.$.bleaches": bleach },
-          $inc: { "sopPoints.$.totalDeducted": -basePerDay },
-        },
-      );
-      if (!r.matchedCount) {
-        await Employee.updateOne(
-          { biometricId: bid },
+      try {
+        // Push into the matching year record; create it if absent. updateOne
+        // avoids the heavy salary pre-save hook that employee.save() triggers.
+        const r = await Employee.updateOne(
+          { biometricId: bid, "sopPoints.year": year },
           {
-            $push: {
-              sopPoints: {
-                year,
-                totalDeducted: -basePerDay,
-                bleaches: [bleach],
-              },
-            },
+            $push: { "sopPoints.$.bleaches": bleach },
+            $inc: { "sopPoints.$.totalDeducted": -basePerDay },
           },
         );
+        if (!r.matchedCount) {
+          await Employee.updateOne(
+            { biometricId: bid },
+            {
+              $push: {
+                sopPoints: {
+                  year,
+                  totalDeducted: -basePerDay,
+                  bleaches: [bleach],
+                },
+              },
+            },
+          );
+        }
+        done.add(key);
+        out.credited++;
+      } catch (e) {
+        out.errors.push(`${bid} ${day.dateStr}: ${e.message}`);
       }
-      done.add(key);
-      out.credited++;
     }
   }
   return out;
 }
 
-// Hourly background pass with a 7-day lookback (self-healing: dedup makes
-// repeats free; the lookback catches late-arriving attendance docs and server
-// downtime). Global guard so hot-reloads don't stack timers.
+// ── LAZY SELF-HEALING PASS — the reliable path on Render ─────────────────────
+// Render spins the instance down when idle, so setInterval alone NEVER fires
+// on a sleeping server. This trigger runs the presence pass whenever anyone
+// actually uses the module (suggestions, dashboard, config, policy list),
+// throttled to once per hour via an ATOMIC claim on lastPresenceRunAt so
+// concurrent requests can't double-run. Covers YESTERDAY ONLY — wide
+// backfills are deliberate acts (daily cron: 30 days, or the manual
+// Credit-range button), never a restart side-effect.
+const PRESENCE_THROTTLE_MS = 60 * 60 * 1000;
+
+function maybeRunPresenceCredits(trigger) {
+  (async () => {
+    const cutoff = new Date(Date.now() - PRESENCE_THROTTLE_MS);
+    // Atomic claim: only one request wins the slot; missing field (older
+    // config docs) counts as "never ran".
+    const claimed = await C4Config.findOneAndUpdate(
+      {
+        $or: [
+          { lastPresenceRunAt: { $lt: cutoff } },
+          { lastPresenceRunAt: { $exists: false } },
+        ],
+      },
+      { $set: { lastPresenceRunAt: new Date() } },
+    );
+    if (!claimed) return; // ran within the last hour (or another request won)
+
+    const today = todayLocalStr();
+    const d = new Date(`${today}T00:00:00`);
+    d.setDate(d.getDate() - 1);
+    const from = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    const r = await runPresenceCredits(from, today);
+    if (r.credited || r.errors.length)
+      console.log(
+        `[C4 presence:${trigger}] credited=${r.credited} already=${r.alreadyCredited} late=${r.skippedLate} early=${r.skippedEarly} ab=${r.skippedAbsent} wo=${r.skippedNonWorking} other=${r.skippedOtherStatus}${r.errors.length ? " errors=" + r.errors.length : ""}`,
+      );
+  })().catch((e) => console.error("[C4 presence:lazy]", e.message));
+}
+
+// Interval + boot pass still run whenever the instance happens to be awake —
+// a free bonus, but the lazy trigger above is what guarantees correctness.
 if (!global.__c4PresenceTimer) {
   const kick = () => {
     const today = todayLocalStr();
     const d = new Date(`${today}T00:00:00`);
-    d.setDate(d.getDate() - 7);
+    d.setDate(d.getDate() - 1);
     const from = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     runPresenceCredits(from, today).then(
       (r) =>
-        r.enabled &&
-        (r.credited || r.skipped) &&
+        (r.credited || r.errors.length) &&
         console.log(
-          `[C4 presence] credited=${r.credited} skipped=${r.skipped} (${r.from}→${r.to})`,
+          `[C4 presence] credited=${r.credited} already=${r.alreadyCredited} late=${r.skippedLate} early=${r.skippedEarly} ab=${r.skippedAbsent} wo=${r.skippedNonWorking} other=${r.skippedOtherStatus} (${r.from}→${r.to})${r.errors.length ? " errors=" + r.errors.length : ""}`,
         ),
       (e) => console.error("[C4 presence] error:", e.message),
     );
@@ -269,9 +349,53 @@ if (!global.__c4PresenceTimer) {
   setTimeout(kick, 30 * 1000); // first pass shortly after boot
 }
 
+// ── FIXED-TIME DAILY CREDIT (node-cron) ──────────────────────────────────────
+// The instance is kept permanently awake by an external uptime pinger, so an
+// in-process cron fires reliably. Every night at 21:30 IST it credits TODAY
+// (shifts and punches are settled by then) plus yesterday as self-heal in case
+// the previous night's tick was missed. Dedup makes both free on re-runs.
+// To change the time, edit the "30 21" cron string below (min hour).
+if (!global.__c4PresenceCron) {
+  try {
+    const nodeCron = require("node-cron");
+    global.__c4PresenceCron = nodeCron.schedule(
+      "30 21 * * *",
+      () => {
+        const today = todayLocalStr();
+        const d = new Date(`${today}T00:00:00`);
+        d.setDate(d.getDate() - 1);
+        const from = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+        runPresenceCredits(from, today, { allowToday: true }).then(
+          async (r) => {
+            await C4Config.updateOne(
+              {},
+              { $set: { lastPresenceRunAt: new Date() } },
+            ).catch(() => {});
+            console.log(
+              `[C4 presence:nodecron 21:30] credited=${r.credited} already=${r.alreadyCredited} late=${r.skippedLate} early=${r.skippedEarly} ab=${r.skippedAbsent} wo=${r.skippedNonWorking} other=${r.skippedOtherStatus} (${r.from}→${r.to})${r.errors.length ? " errors=" + r.errors.length : ""}`,
+            );
+          },
+          (e) => console.error("[C4 presence:nodecron] failed:", e.message),
+        );
+      },
+      { timezone: "Asia/Kolkata" },
+    );
+    console.log(
+      "✅ C4 presence node-cron scheduled — daily 21:30 IST (credits today + yesterday)",
+    );
+  } catch (e) {
+    console.warn(
+      "⚠️ node-cron unavailable — presence relies on the hourly/lazy passes only:",
+      e.message,
+    );
+  }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
-// C4 PRESENCE — manual run (for testing / backfill beyond the 7-day lookback)
+// C4 PRESENCE — manual run for ANY custom range (one day, one month, anything)
 // POST /api/hr/policy/c4-presence-run   body: { from?, to? }  (YYYY-MM-DD)
+// Defaults to the last 7 days. Returns a full per-reason breakdown so every
+// run is auditable.
 // ═════════════════════════════════════════════════════════════════════════════
 router.post("/c4-presence-run", verifyHRToken, async (req, res) => {
   try {
@@ -285,9 +409,12 @@ router.post("/c4-presence-run", verifyHRToken, async (req, res) => {
     res.json({
       success: true,
       ...r,
-      message: r.enabled
-        ? `Credited ${r.credited} day(s); ${r.skipped} already credited.`
-        : "Auto-credit is OFF — enable it in C4 Settings first.",
+      message:
+        `Credited ${r.credited} day(s) (${r.from} → ${r.to}). ` +
+        `Skipped: ${r.alreadyCredited} already credited, ${r.skippedLate} late, ` +
+        `${r.skippedEarly} early, ${r.skippedAbsent} absent, ${r.skippedNonWorking} week-off, ` +
+        `${r.skippedOtherStatus} leave/half-day/no-status.` +
+        (r.errors.length ? ` ${r.errors.length} error(s).` : ""),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -355,6 +482,7 @@ router.get("/employees", verifyHRToken, async (req, res) => {
 // "higher = better" number to show on screen.
 // ═════════════════════════════════════════════════════════════════════════════
 router.get("/points-summary", verifyHRToken, async (req, res) => {
+  maybeRunPresenceCredits("points-summary");
   try {
     const year = req.query.year
       ? Number(req.query.year)
@@ -362,6 +490,19 @@ router.get("/points-summary", verifyHRToken, async (req, res) => {
     const from = req.query.from ? String(req.query.from).slice(0, 10) : null;
     const to = req.query.to ? String(req.query.to).slice(0, 10) : null;
     const typeFilter = req.query.type || null;
+    // Server-side filters + pagination — the client never has to pull the
+    // whole company to render one screen.
+    const deptParam = req.query.department || null;
+    const searchParam = (req.query.search || "").trim().toLowerCase();
+    const empPage = Math.max(1, Number(req.query.empPage) || 1);
+    const empLimit = Math.min(
+      100,
+      Math.max(5, Number(req.query.empLimit) || 20),
+    );
+    const recentLimit = Math.min(
+      150,
+      Math.max(10, Number(req.query.recentLimit) || 50),
+    );
 
     const emps = await Employee.find({
       $or: [{ status: "active" }, { isActive: true }],
@@ -473,14 +614,44 @@ router.get("/points-summary", verifyHRToken, async (req, res) => {
 
     const grandNet = types.reduce((s, t) => s + t.net, 0);
 
+    // Distinct departments (for the filter dropdown) BEFORE filtering.
+    const allDepartments = [
+      ...new Set(employees.map((e) => e.department || "—")),
+    ].sort();
+
+    // Department + search filters, then paginate. Sorting stays best-first.
+    let filteredEmployees = employees;
+    if (deptParam && deptParam !== "all")
+      filteredEmployees = filteredEmployees.filter(
+        (e) => (e.department || "—") === deptParam,
+      );
+    if (searchParam)
+      filteredEmployees = filteredEmployees.filter(
+        (e) =>
+          e.name.toLowerCase().includes(searchParam) ||
+          (e.biometricId || "").toLowerCase().includes(searchParam),
+      );
+    filteredEmployees.sort((a, b) => a.net - b.net); // best (lowest net) first
+    const employeeTotal = filteredEmployees.length;
+    const empTotalPages = Math.max(1, Math.ceil(employeeTotal / empLimit));
+    const pageEmployees = filteredEmployees.slice(
+      (empPage - 1) * empLimit,
+      (empPage - 1) * empLimit + empLimit,
+    );
+
     res.json({
       success: true,
       year,
       from,
       to,
       types,
-      employees: employees.sort((a, b) => a.net - b.net), // best (lowest net) first
-      recent: recent.slice(0, 150),
+      employees: pageEmployees,
+      employeeTotal,
+      empPage,
+      empLimit,
+      empTotalPages,
+      departments: allDepartments,
+      recent: recent.slice(0, recentLimit),
       catalog,
       grandNet: +grandNet.toFixed(2),
       grandScore: +(-grandNet).toFixed(2),
@@ -651,6 +822,7 @@ router.get("/external-rules", verifyHRToken, async (req, res) => {
 // GET /api/hr/policy?scope=&department=
 // ═════════════════════════════════════════════════════════════════════════════
 router.get("/", verifyHRToken, async (req, res) => {
+  maybeRunPresenceCredits("policy-list");
   try {
     const { scope, department } = req.query;
     const q = {};
@@ -709,17 +881,34 @@ router.post("/", verifyHRToken, async (req, res) => {
 
     let depId = null;
     let depName = "";
+    let depIds = [];
+    let depNames = [];
     const finalScope = scope === "department" ? "department" : "global";
     if (finalScope === "department") {
-      if (!departmentId)
+      const wanted = Array.isArray(req.body.departmentIds)
+        ? req.body.departmentIds.filter(Boolean)
+        : departmentId
+          ? [departmentId]
+          : [];
+      if (!wanted.length)
+        return res.status(400).json({
+          error: "Pick at least one department for a department policy.",
+        });
+      const deps = await Department.find({ _id: { $in: wanted } }).lean();
+      if (deps.length !== wanted.length)
         return res
-          .status(400)
-          .json({ error: "departmentId is required for a department policy." });
-      const dep = await Department.findById(departmentId).lean();
-      if (!dep) return res.status(404).json({ error: "Department not found." });
-      depId = dep._id;
-      depName = dep.name;
+          .status(404)
+          .json({ error: "One or more departments were not found." });
+      depIds = deps.map((d) => d._id);
+      depNames = deps.map((d) => d.name);
+      depId = depIds[0];
+      depName = depNames[0];
     }
+
+    // The present-on-time reward is the always-on credit engine's policy —
+    // it cannot be created inactive.
+    const forceActive =
+      finalBleachType === "debit" && finalTrigger === "present_on_time";
 
     const policy = await Policy.create({
       name: name.trim(),
@@ -729,12 +918,14 @@ router.post("/", verifyHRToken, async (req, res) => {
       scope: finalScope,
       departmentId: depId,
       departmentName: depName,
+      departmentIds: depIds,
+      departmentNames: depNames,
       triggerKey: finalTrigger,
       thresholdMins:
         thresholdMins !== undefined && !isNaN(Number(thresholdMins))
           ? Number(thresholdMins)
           : 15,
-      isActive: isActive === undefined ? true : !!isActive,
+      isActive: forceActive ? true : isActive === undefined ? true : !!isActive,
       bleachType: finalBleachType,
       createdByName: createdByName || "HR Manager",
       createdByRole: createdByRole || "hr_manager",
@@ -796,28 +987,50 @@ router.patch("/:id", verifyHRToken, async (req, res) => {
     )
       policy.triggerKey = "manual";
 
+    // The present-on-time reward mirrors the always-on credit engine —
+    // it can never be deactivated, from the UI or the API.
+    if (
+      policy.bleachType === "debit" &&
+      policy.triggerKey === "present_on_time"
+    )
+      policy.isActive = true;
+
+    const wantedIds = Array.isArray(req.body.departmentIds)
+      ? req.body.departmentIds.filter(Boolean)
+      : departmentId !== undefined && departmentId
+        ? [departmentId]
+        : undefined;
+
     if (scope !== undefined) {
       if (scope === "department") {
-        if (!departmentId)
+        if (!wantedIds || !wantedIds.length)
           return res.status(400).json({
-            error: "departmentId is required for a department policy.",
+            error: "Pick at least one department for a department policy.",
           });
-        const dep = await Department.findById(departmentId).lean();
-        if (!dep)
-          return res.status(404).json({ error: "Department not found." });
+        const deps = await Department.find({ _id: { $in: wantedIds } }).lean();
+        if (deps.length !== wantedIds.length)
+          return res
+            .status(404)
+            .json({ error: "One or more departments were not found." });
         policy.scope = "department";
-        policy.departmentId = dep._id;
-        policy.departmentName = dep.name;
+        policy.departmentIds = deps.map((d) => d._id);
+        policy.departmentNames = deps.map((d) => d.name);
+        policy.departmentId = policy.departmentIds[0];
+        policy.departmentName = policy.departmentNames[0];
       } else {
         policy.scope = "global";
         policy.departmentId = null;
         policy.departmentName = "";
+        policy.departmentIds = [];
+        policy.departmentNames = [];
       }
-    } else if (departmentId !== undefined && policy.scope === "department") {
-      const dep = await Department.findById(departmentId).lean();
-      if (dep) {
-        policy.departmentId = dep._id;
-        policy.departmentName = dep.name;
+    } else if (wantedIds && policy.scope === "department") {
+      const deps = await Department.find({ _id: { $in: wantedIds } }).lean();
+      if (deps.length) {
+        policy.departmentIds = deps.map((d) => d._id);
+        policy.departmentNames = deps.map((d) => d.name);
+        policy.departmentId = policy.departmentIds[0];
+        policy.departmentName = policy.departmentNames[0];
       }
     }
 
@@ -852,6 +1065,7 @@ router.delete("/:id", verifyHRToken, async (req, res) => {
 // Nothing is written — HR must accept each via POST /apply.
 // ═════════════════════════════════════════════════════════════════════════════
 router.get("/suggestions", verifyHRToken, async (req, res) => {
+  maybeRunPresenceCredits("suggestions");
   try {
     const { first, last } = monthRange();
     const from = (req.query.from || first).slice(0, 10);
@@ -862,6 +1076,10 @@ router.get("/suggestions", verifyHRToken, async (req, res) => {
       isActive: true,
       triggerKey: { $in: AUTO_TRIGGERS },
     }).lean();
+
+    // Non-working statuses (week-offs) never produce violations.
+    const cfgForScan = await C4Config.getSingleton();
+    const nonWorkingSet = new Set(cfgForScan.nonWorkingStatuses || ["WO"]);
 
     if (!policies.length) {
       return res.json({
@@ -875,14 +1093,23 @@ router.get("/suggestions", verifyHRToken, async (req, res) => {
     }
 
     // Index policies: global[trigger] = [...]; dept[name][trigger] = [...]
+    // A multi-department policy is indexed under EVERY department it targets.
     const globalByTrigger = {};
     const deptByTrigger = {};
     for (const p of policies) {
-      if (p.scope === "department" && p.departmentName) {
-        deptByTrigger[p.departmentName] = deptByTrigger[p.departmentName] || {};
-        deptByTrigger[p.departmentName][p.triggerKey] =
-          deptByTrigger[p.departmentName][p.triggerKey] || [];
-        deptByTrigger[p.departmentName][p.triggerKey].push(p);
+      if (p.scope === "department") {
+        const names =
+          Array.isArray(p.departmentNames) && p.departmentNames.length
+            ? p.departmentNames
+            : p.departmentName
+              ? [p.departmentName]
+              : [];
+        for (const dn of names) {
+          deptByTrigger[dn] = deptByTrigger[dn] || {};
+          deptByTrigger[dn][p.triggerKey] =
+            deptByTrigger[dn][p.triggerKey] || [];
+          deptByTrigger[dn][p.triggerKey].push(p);
+        }
       } else {
         globalByTrigger[p.triggerKey] = globalByTrigger[p.triggerKey] || [];
         globalByTrigger[p.triggerKey].push(p);
@@ -921,6 +1148,9 @@ router.get("/suggestions", verifyHRToken, async (req, res) => {
 
     const matches = (entry, policy) => {
       const eff = entry.hrFinalStatus || entry.systemPrediction || "";
+      // A non-working day (WO etc) can NEVER produce a violation — someone
+      // working on their week-off must not be flagged late/early/absent.
+      if (nonWorkingSet.has(eff)) return false;
       switch (policy.triggerKey) {
         case "absent_no_notice":
           return eff === "AB";
@@ -1143,6 +1373,44 @@ router.post("/apply", verifyHRToken, async (req, res) => {
         ? `${points} pt(s) awarded to ${who} for "${policy.name}".`
         : `${points} pt(s) deducted from ${who} for "${policy.name}".`,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EXTERNAL CRON HOOK — the fixed-schedule path that works on sleeping Render.
+// GET/POST /api/hr/policy/c4-presence-cron?key=<C4_CRON_KEY>
+//
+// Point a free external scheduler (cron-job.org) at this URL daily. The HTTP
+// request WAKES the instance, then this handler credits the latest completed
+// day only (older days = manual Credit-range). Secured by the C4_CRON_KEY env var (no HR cookie needed,
+// since external schedulers can't log in). If the env var isn't set, the
+// endpoint refuses to run — it can't be used unsecured by accident.
+// ═════════════════════════════════════════════════════════════════════════════
+router.all("/c4-presence-cron", async (req, res) => {
+  try {
+    const expected = process.env.C4_CRON_KEY;
+    if (!expected)
+      return res.status(403).json({
+        error:
+          "C4_CRON_KEY is not set on the server — add it in Render env vars to enable this endpoint.",
+      });
+    const key = req.query.key || req.headers["x-cron-key"];
+    if (key !== expected)
+      return res.status(401).json({ error: "Invalid cron key." });
+
+    const today = todayLocalStr();
+    const d = new Date(`${today}T00:00:00`);
+    d.setDate(d.getDate() - 1);
+    const from = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    // Same contract as the 21:30 node-cron: credits today (settled by evening)
+    // + yesterday as self-heal. Schedule this in the evening, not the morning.
+    const r = await runPresenceCredits(from, today, { allowToday: true });
+    console.log(
+      `[C4 presence:cron] credited=${r.credited} already=${r.alreadyCredited} (${r.from}→${r.to})`,
+    );
+    res.json({ success: true, ...r });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
