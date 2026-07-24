@@ -900,20 +900,37 @@ router.post("/products/resolve", verifyCustomerToken, async (req, res) => {
       return res.status(200).json({ success: true, products: {} });
     }
 
-    const uniqueIds = [...new Set(productIds)].slice(0, 200);
-    const items = await StockItem.find({ _id: { $in: uniqueIds } })
-      .select("name images")
-      .lean();
+  const uniqueIds = [...new Set(productIds)].slice(0, 200);
+  // `variants` is required: most StockItems carry images ONLY on variants,
+  // so selecting just `images` returns null for the majority of products.
+  // Same 3-tier fallback cross-org-assign.js already uses.
+  const items = await StockItem.find({ _id: { $in: uniqueIds } })
+    .select("name images variants")
+    .lean();
 
-    const products = {};
-    items.forEach((item) => {
-      products[item._id.toString()] = {
-        name: item.name,
-        image: item.images?.[0] || null,
-      };
-    });
+  const firstUrl = (arr) => {
+    if (!Array.isArray(arr) || !arr[0]) return null;
+    const f = arr[0];
+    if (typeof f === "string") return f;
+    return f.url || f.secure_url || f.path || null;
+  };
 
-    res.status(200).json({ success: true, products });
+  const products = {};
+  items.forEach((item) => {
+    let image = firstUrl(item.images);
+    if (!image && Array.isArray(item.variants)) {
+      for (const v of item.variants) {
+        const u = firstUrl(v.images);
+        if (u) {
+          image = u;
+          break;
+        }
+      }
+    }
+    products[item._id.toString()] = { name: item.name, image };
+  });
+
+  res.status(200).json({ success: true, products });
   } catch (error) {
     console.error("Error resolving product names:", error);
     res.status(500).json({ success: false, message: "Server error" });

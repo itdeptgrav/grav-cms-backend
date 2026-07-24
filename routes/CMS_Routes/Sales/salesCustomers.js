@@ -23,7 +23,10 @@ const { sendCustomerEmail } = require("../../../utils/salesEmailService");
 // ── Temp password generator ───────────────────────────────────────────────────
 const generateTempPassword = () => {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789@#";
-  return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+  return Array.from(
+    { length: 10 },
+    () => chars[Math.floor(Math.random() * chars.length)],
+  ).join("");
 };
 
 // ─── GET /api/cms/sales/customers ─────────────────────────────────────────────
@@ -70,12 +73,16 @@ router.get("/", salesAuth, async (req, res) => {
       hasPassword: !!password,
     }));
 
-    const [total_all, active, withPassword, createdBySales] = await Promise.all([
-      Customer.countDocuments(),
-      Customer.countDocuments({ isActive: true }),
-      Customer.countDocuments({ password: { $exists: true, $ne: null, $ne: "" } }),
-      Customer.countDocuments({ createdBySales: true }),
-    ]);
+    const [total_all, active, withPassword, createdBySales] = await Promise.all(
+      [
+        Customer.countDocuments(),
+        Customer.countDocuments({ isActive: true }),
+        Customer.countDocuments({
+          password: { $exists: true, $ne: null, $ne: "" },
+        }),
+        Customer.countDocuments({ createdBySales: true }),
+      ],
+    );
 
     res.json({
       success: true,
@@ -138,7 +145,7 @@ router.post("/", salesAuth, async (req, res) => {
       name: name.trim(),
       email,
       phone,
-      password: tempPassword,        // hashed by pre-save hook
+      password: tempPassword, // hashed by pre-save hook
       profile: {
         ...profile,
         avatar: profile.avatar || null,
@@ -157,7 +164,8 @@ router.post("/", salesAuth, async (req, res) => {
       email: customer.email,
       password: tempPassword,
       salesRepName: req.user?.name,
-      portalUrl: process.env.CUSTOMER_PORTAL_URL || "https://portal.gravclothing.com",
+      portalUrl:
+        process.env.CUSTOMER_PORTAL_URL || "https://portal.gravclothing.com",
     }).catch(() => {});
 
     const safe = customer.toObject();
@@ -174,7 +182,12 @@ router.post("/", salesAuth, async (req, res) => {
     if (err.code === 11000) {
       // MongoDB unique index violation — tell the user exactly which field
       const field = Object.keys(err.keyValue || {})[0] || "field";
-      const label = field === "email" ? "email address" : field === "phone" ? "phone number" : field;
+      const label =
+        field === "email"
+          ? "email address"
+          : field === "phone"
+            ? "phone number"
+            : field;
       return res.status(409).json({
         success: false,
         message: `A customer with this ${label} already exists`,
@@ -198,7 +211,9 @@ router.get("/stock-items/search", salesAuth, async (req, res) => {
     if (category && category !== "all") filter.category = category;
 
     const items = await StockItem.find(filter)
-      .select("name reference category images variants baseSalesPrice attributes")
+      .select(
+        "name reference category images variants baseSalesPrice attributes",
+      )
       .limit(parseInt(limit))
       .lean();
 
@@ -213,11 +228,16 @@ router.get("/:id", salesAuth, async (req, res) => {
   try {
     const rawCustomer = await Customer.findById(req.params.id)
       .select("+password -cart -favorites -__v")
-      .populate("assignedStockItems.stockItemId", "name reference category images variants")
+      .populate(
+        "assignedStockItems.stockItemId",
+        "name reference category images variants",
+      )
       .lean();
 
     if (!rawCustomer)
-      return res.status(404).json({ success: false, message: "Customer not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
 
     const { password, ...customer } = rawCustomer;
     customer.hasPassword = !!password;
@@ -241,11 +261,13 @@ router.patch("/:id", salesAuth, async (req, res) => {
     const customer = await Customer.findByIdAndUpdate(
       req.params.id,
       { $set: req.body },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     ).select("-password -cart -favorites -__v");
 
     if (!customer)
-      return res.status(404).json({ success: false, message: "Customer not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
 
     // Build changed-fields list for email
     const changedFields = [];
@@ -293,11 +315,13 @@ router.post("/:id/reset-password", salesAuth, async (req, res) => {
     const customer = await Customer.findByIdAndUpdate(
       req.params.id,
       { password: hashed },
-      { new: true }
+      { new: true },
     ).select("name email");
 
     if (!customer)
-      return res.status(404).json({ success: false, message: "Customer not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
 
     // Send password reset email (non-blocking)
     sendCustomerEmail("passwordReset", customer.email, {
@@ -305,10 +329,14 @@ router.post("/:id/reset-password", salesAuth, async (req, res) => {
       email: customer.email,
       newPassword,
       resetBy: req.user?.name || "Sales Team",
-      portalUrl: process.env.CUSTOMER_PORTAL_URL || "https://portal.gravclothing.com",
+      portalUrl:
+        process.env.CUSTOMER_PORTAL_URL || "https://portal.gravclothing.com",
     }).catch(() => {});
 
-    res.json({ success: true, message: "Password reset successfully. Notification sent to customer." });
+    res.json({
+      success: true,
+      message: "Password reset successfully. Notification sent to customer.",
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -319,7 +347,9 @@ router.patch("/:id/toggle-status", salesAuth, async (req, res) => {
   try {
     const customer = await Customer.findById(req.params.id);
     if (!customer)
-      return res.status(404).json({ success: false, message: "Customer not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
 
     customer.isActive = !customer.isActive;
     await customer.save();
@@ -347,21 +377,23 @@ router.get("/:id/orders", salesAuth, async (req, res) => {
     try {
       custObjectId = new mongoose.Types.ObjectId(req.params.id);
     } catch {
-      return res.status(400).json({ success: false, message: "Invalid customer ID" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid customer ID" });
     }
 
     const orders = await CustomerRequest.find({ customerId: custObjectId })
       .sort({ createdAt: -1 })
       .select(
         "requestId status priority requestType measurementName measurementId " +
-        "customerInfo items finalOrderPrice totalPaidAmount totalDueAmount " +
-        "quotations.quotationNumber quotations.grandTotal quotations.status " +
-        "quotations.paymentSchedule quotations.paymentSubmissions " +
-        "quotations.validUntil quotations.date quotations.notes " +
-        "quotations.items quotations.totalGST quotations.subtotalBeforeGST " +
-        "quotations.shippingCharges quotations.customAdditionalCharges " +
-        "processingStartedAt estimatedCompletion actualCompletion " +
-        "createdAt updatedAt"
+          "customerInfo items finalOrderPrice totalPaidAmount totalDueAmount " +
+          "quotations.quotationNumber quotations.grandTotal quotations.status " +
+          "quotations.paymentSchedule quotations.paymentSubmissions " +
+          "quotations.validUntil quotations.date quotations.notes " +
+          "quotations.items quotations.totalGST quotations.subtotalBeforeGST " +
+          "quotations.shippingCharges quotations.customAdditionalCharges " +
+          "processingStartedAt estimatedCompletion actualCompletion " +
+          "createdAt updatedAt",
       )
       .lean();
 
@@ -377,7 +409,7 @@ router.get("/:id/work-orders", salesAuth, async (req, res) => {
   try {
     const workOrders = await WorkOrder.find({ customerId: req.params.id })
       .select(
-        "workOrderNumber status quantity stockItemName stockItemReference variantAttributes priority timeline assignedDeadline createdAt isSplitOrder parentWorkOrderId productionCompletion.overallCompletionPercentage cuttingStatus"
+        "workOrderNumber status quantity stockItemName stockItemReference variantAttributes priority timeline assignedDeadline createdAt isSplitOrder parentWorkOrderId productionCompletion.overallCompletionPercentage cuttingStatus",
       )
       .sort({ createdAt: -1 })
       .limit(100)
@@ -398,7 +430,7 @@ router.get("/:id/measurements", salesAuth, async (req, res) => {
     const raw = await Measurement.find({ organizationId: req.params.id })
       .select(
         "name description registeredEmployeeIds employeeMeasurements " +
-        "convertedToPO poConversionDate createdAt"
+          "convertedToPO poConversionDate createdAt",
       )
       .sort({ createdAt: -1 })
       .lean();
@@ -407,24 +439,28 @@ router.get("/:id/measurements", salesAuth, async (req, res) => {
     // measuredEmployees / completionRate fields as they may be stale or
     // rely on isCompleted status which is not relevant here.
     const measurements = raw.map((m) => {
-      const totalRegistered = m.registeredEmployeeIds?.length || m.employeeMeasurements?.length || 0;
-      const actualMeasured  = m.employeeMeasurements?.length || 0;
-      const pending         = Math.max(0, totalRegistered - actualMeasured);
-      const completionRate  = totalRegistered > 0
-        ? Math.round((actualMeasured / totalRegistered) * 100)
-        : (actualMeasured > 0 ? 100 : 0);
+      const totalRegistered =
+        m.registeredEmployeeIds?.length || m.employeeMeasurements?.length || 0;
+      const actualMeasured = m.employeeMeasurements?.length || 0;
+      const pending = Math.max(0, totalRegistered - actualMeasured);
+      const completionRate =
+        totalRegistered > 0
+          ? Math.round((actualMeasured / totalRegistered) * 100)
+          : actualMeasured > 0
+            ? 100
+            : 0;
 
       return {
-        _id:                  m._id,
-        name:                 m.name,
-        description:          m.description,
+        _id: m._id,
+        name: m.name,
+        description: m.description,
         totalRegistered,
         actualMeasured,
         pending,
         completionRate,
-        convertedToPO:        m.convertedToPO,
-        poConversionDate:     m.poConversionDate,
-        createdAt:            m.createdAt,
+        convertedToPO: m.convertedToPO,
+        poConversionDate: m.poConversionDate,
+        createdAt: m.createdAt,
       };
     });
 
@@ -441,14 +477,20 @@ router.get("/:id/assigned-items", salesAuth, async (req, res) => {
       .select("assignedStockItems name customerId")
       .populate({
         path: "assignedStockItems.stockItemId",
-        select: "name reference category images variants attributes baseSalesPrice",
+        select:
+          "name reference category genderCategory images variants attributes baseSalesPrice",
       })
       .lean();
 
     if (!customer)
-      return res.status(404).json({ success: false, message: "Customer not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
 
-    res.json({ success: true, assignedItems: customer.assignedStockItems || [] });
+    res.json({
+      success: true,
+      assignedItems: customer.assignedStockItems || [],
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -460,18 +502,24 @@ router.post("/:id/assign-items", salesAuth, async (req, res) => {
     const { stockItemIds = [], mode = "replace" } = req.body;
 
     if (!Array.isArray(stockItemIds))
-      return res.status(400).json({ success: false, message: "stockItemIds must be an array" });
+      return res
+        .status(400)
+        .json({ success: false, message: "stockItemIds must be an array" });
 
     const customer = await Customer.findById(req.params.id);
     if (!customer)
-      return res.status(404).json({ success: false, message: "Customer not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
 
     const stockItems = await StockItem.find({ _id: { $in: stockItemIds } })
       .select("name reference")
       .lean();
 
     const itemMap = {};
-    stockItems.forEach((s) => { itemMap[s._id.toString()] = s; });
+    stockItems.forEach((s) => {
+      itemMap[s._id.toString()] = s;
+    });
 
     const newAssignments = stockItemIds
       .filter((id) => itemMap[id])
@@ -488,9 +536,11 @@ router.post("/:id/assign-items", salesAuth, async (req, res) => {
       customer.assignedStockItems = newAssignments;
     } else {
       const existingIds = new Set(
-        customer.assignedStockItems.map((a) => a.stockItemId.toString())
+        customer.assignedStockItems.map((a) => a.stockItemId.toString()),
       );
-      const toAdd = newAssignments.filter((a) => !existingIds.has(a.stockItemId.toString()));
+      const toAdd = newAssignments.filter(
+        (a) => !existingIds.has(a.stockItemId.toString()),
+      );
       customer.assignedStockItems.push(...toAdd);
     }
 
@@ -511,17 +561,127 @@ router.delete("/:id/assign-items/:itemId", salesAuth, async (req, res) => {
   try {
     const customer = await Customer.findById(req.params.id);
     if (!customer)
-      return res.status(404).json({ success: false, message: "Customer not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
 
     customer.assignedStockItems = customer.assignedStockItems.filter(
       (a) =>
         a._id.toString() !== req.params.itemId &&
-        a.stockItemId.toString() !== req.params.itemId
+        a.stockItemId.toString() !== req.params.itemId,
     );
     await customer.save();
 
     res.json({ success: true, message: "Item removed from customer" });
   } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/cms/sales/customers/:id/create-request ────────────────────────
+// Sales creates a bulk request ON BEHALF of a customer.
+// Same payload as /api/customer/requests but authenticated by sales JWT.
+router.post("/:id/create-request", salesAuth, async (req, res) => {
+  try {
+    const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
+    const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+    const customer = await Customer.findById(req.params.id)
+      .select("name email phone profile customerId")
+      .lean();
+    if (!customer)
+      return res
+        .status(404)
+        .json({ success: false, message: "Customer not found" });
+
+    const { customerInfo = {}, items = [] } = req.body;
+    if (!items.length)
+      return res
+        .status(400)
+        .json({ success: false, message: "At least one item is required" });
+
+    const validatedItems = [];
+    for (const item of items) {
+      const stockItem = await StockItem.findById(item.stockItemId)
+        .select("name reference baseSalesPrice variants")
+        .lean();
+      if (!stockItem) continue;
+
+      const validatedVariants = [];
+      let totalQuantity = 0;
+      for (const variant of item.variants || []) {
+        const qty = Number(variant.quantity) || 0;
+        if (qty <= 0) continue;
+        const matchedVariant = (stockItem.variants || []).find(
+          (v) => v._id.toString() === variant.variantId,
+        );
+        const unitPrice =
+          matchedVariant?.price || stockItem.baseSalesPrice || 0;
+        totalQuantity += qty;
+        validatedVariants.push({
+          variantId: variant.variantId || null,
+          attributes: variant.attributes || [],
+          quantity: qty,
+          specialInstructions: (variant.specialInstructions || []).filter(
+            Boolean,
+          ),
+          estimatedPrice: unitPrice * qty,
+        });
+      }
+      if (!validatedVariants.length) continue;
+      validatedItems.push({
+        stockItemId: stockItem._id,
+        stockItemName: stockItem.name,
+        stockItemReference: stockItem.reference,
+        variants: validatedVariants,
+        totalQuantity,
+        totalEstimatedPrice: validatedVariants.reduce(
+          (s, v) => s + v.estimatedPrice,
+          0,
+        ),
+      });
+    }
+
+    if (!validatedItems.length)
+      return res
+        .status(400)
+        .json({ success: false, message: "No valid items in request" });
+
+    const count = await CustomerRequest.countDocuments();
+    const requestId = `REQ-${new Date().getFullYear()}-${String(count + 1).padStart(4, "0")}`;
+
+    const newRequest = new CustomerRequest({
+      requestId,
+      customerId: customer._id,
+      customerInfo: {
+        name: customerInfo.name || customer.name,
+        email: customerInfo.email || customer.email,
+        phone: customerInfo.phone || customer.phone,
+        address:
+          customerInfo.address || customer.profile?.address?.street || "",
+        city: customerInfo.city || customer.profile?.address?.city || "",
+        postalCode:
+          customerInfo.postalCode || customer.profile?.address?.pincode || "",
+        description: customerInfo.description || "",
+        deliveryDeadline: customerInfo.deliveryDeadline || null,
+        preferredContactMethod: customerInfo.preferredContactMethod || "phone",
+      },
+      items: validatedItems,
+      status: "pending",
+      priority: customerInfo.priority || "medium",
+      createdBySales: true,
+      createdBySalesId: req.user?.id,
+      createdAt: new Date(),
+    });
+    await newRequest.save();
+
+    res.status(201).json({
+      success: true,
+      message: "Request created on behalf of customer",
+      requestId: newRequest.requestId,
+      _id: newRequest._id,
+    });
+  } catch (err) {
+    console.error("[salesCustomers] create-request", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });

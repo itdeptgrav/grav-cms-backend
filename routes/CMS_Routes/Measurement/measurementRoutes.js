@@ -77,12 +77,10 @@ router.get("/organizations", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching organizations:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching organizations",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching organizations",
+    });
   }
 });
 
@@ -114,12 +112,10 @@ router.get("/organization/:orgId/employees", async (req, res) => {
     res.status(200).json({ success: true, organization: customer, employees });
   } catch (error) {
     console.error("Error fetching organization employees:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching employees",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching employees",
+    });
   }
 });
 
@@ -135,12 +131,10 @@ router.get("/stock-item/:productId", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Product not found" });
 
-    res
-      .status(200)
-      .json({
-        success: true,
-        stockItem: { ...stockItem, measurements: stockItem.measurements || [] },
-      });
+    res.status(200).json({
+      success: true,
+      stockItem: { ...stockItem, measurements: stockItem.measurements || [] },
+    });
   } catch (error) {
     console.error("Error fetching stock item:", error);
     res
@@ -224,12 +218,10 @@ router.get("/organization/:orgId", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching organization:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching organization",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching organization",
+    });
   }
 });
 
@@ -546,21 +538,17 @@ router.post("/", async (req, res) => {
     });
 
     await newMeasurement.save();
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Measurement created successfully",
-        measurement: newMeasurement,
-      });
+    res.status(201).json({
+      success: true,
+      message: "Measurement created successfully",
+      measurement: newMeasurement,
+    });
   } catch (error) {
     console.error("Error creating measurement:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while creating measurement",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while creating measurement",
+    });
   }
 });
 
@@ -587,17 +575,17 @@ router.put("/:measurementId", async (req, res) => {
       measurement.description = description?.trim() || "";
 
     // Merge registered employee IDs (don't drop existing ones)
-     if (registeredEmployeeIds !== undefined) {
-       const newIdSet = new Set(
-         (registeredEmployeeIds || []).map((id) => id.toString()),
-       );
-       // Prune employeeMeasurements — remove entries for absent employees
-       measurement.employeeMeasurements =
-         measurement.employeeMeasurements.filter((emp) =>
-           newIdSet.has(emp.employeeId.toString()),
-         );
-       measurement.registeredEmployeeIds = registeredEmployeeIds || [];
-     }
+    if (registeredEmployeeIds !== undefined) {
+      const newIdSet = new Set(
+        (registeredEmployeeIds || []).map((id) => id.toString()),
+      );
+      // Prune employeeMeasurements — remove entries for absent employees
+      measurement.employeeMeasurements =
+        measurement.employeeMeasurements.filter((emp) =>
+          newIdSet.has(emp.employeeId.toString()),
+        );
+      measurement.registeredEmployeeIds = registeredEmployeeIds || [];
+    }
 
     // ========== FIX: Auto-assign variants in measurement data ==========
     let processedMeasurementData = measurementData;
@@ -822,22 +810,18 @@ router.put("/:measurementId", async (req, res) => {
     measurement.updatedAt = new Date();
 
     const saved = await measurement.save();
-    res
-      .status(200)
-      .json({
-        success: true,
-        message: "Measurement updated successfully",
-        measurement: saved,
-      });
+    res.status(200).json({
+      success: true,
+      message: "Measurement updated successfully",
+      measurement: saved,
+    });
   } catch (error) {
     console.error("Error updating measurement:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while updating measurement",
-        error: error.message,
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while updating measurement",
+      error: error.message,
+    });
   }
 });
 
@@ -1108,13 +1092,11 @@ router.put("/:measurementId/add-employees", async (req, res) => {
     });
   } catch (error) {
     console.error("Error adding employees:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while adding employees",
-        error: error.message,
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while adding employees",
+      error: error.message,
+    });
   }
 });
 
@@ -1164,12 +1146,10 @@ router.get("/:measurementId", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching measurement:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching measurement",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching measurement",
+    });
   }
 });
 
@@ -1204,12 +1184,10 @@ router.get("/organization/:orgId/measurements", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching measurements:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching measurements",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching measurements",
+    });
   }
 });
 
@@ -1228,12 +1206,10 @@ router.delete("/:measurementId", async (req, res) => {
       .json({ success: true, message: "Measurement deleted successfully" });
   } catch (error) {
     console.error("Error deleting measurement:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while deleting measurement",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while deleting measurement",
+    });
   }
 });
 
@@ -1252,12 +1228,10 @@ router.post("/:measurementId/assign-product", async (req, res) => {
         .json({ success: false, message: "Valid measurement ID is required" });
     }
     if (!employeeId || !product?.productId) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "employeeId and product.productId are required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "employeeId and product.productId are required",
+      });
     }
 
     // ── 1. Fetch stock item ───────────────────────────────────────────────
@@ -1342,12 +1316,10 @@ router.post("/:measurementId/assign-product", async (req, res) => {
       (e) => e.employeeId.toString() === employeeId.toString(),
     );
     if (!empEntry) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "Employee not found in this measurement",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "Employee not found in this measurement",
+      });
     }
 
     // Append this product — do NOT clear existing products or categoryMeasurements
@@ -1390,12 +1362,10 @@ router.post("/:measurementId/assign-product", async (req, res) => {
     });
   } catch (error) {
     console.error("Error assigning product:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while assigning product",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while assigning product",
+    });
   }
 });
 
@@ -1413,7 +1383,7 @@ router.post("/:measurementId/po-confirmation", async (req, res) => {
     const measurement = await Measurement.findById(measurementId)
       .populate({
         path: "employeeMeasurements.products.productId",
-        select: "_id name baseSalesPrice variants",
+        select: "_id name baseSalesPrice variants images",
       })
       .lean();
 
@@ -1497,7 +1467,34 @@ router.post("/:measurementId/po-confirmation", async (req, res) => {
         const total = qty * unitPrice;
         empTotal += total;
 
+        // Image: assigned variant → any variant → product-level.
+        const firstUrl = (arr) => {
+          if (!Array.isArray(arr) || !arr[0]) return null;
+          const f = arr[0];
+          if (typeof f === "string") return f;
+          return f.url || f.secure_url || f.path || null;
+        };
+        let image = null;
+        if (p.variantId && si.variants?.length) {
+          const v = si.variants.find(
+            (v) => v._id.toString() === p.variantId.toString(),
+          );
+          image = firstUrl(v?.images);
+        }
+        if (!image && si.variants?.length) {
+          for (const v of si.variants) {
+            const u = firstUrl(v.images);
+            if (u) {
+              image = u;
+              break;
+            }
+          }
+        }
+        if (!image) image = firstUrl(si.images);
+
         productRows.push({
+          productId: pid,
+          image,
           productName: displayName,
           variantName,
           qty,
@@ -1522,12 +1519,10 @@ router.post("/:measurementId/po-confirmation", async (req, res) => {
     res.status(200).json({ success: true, rows, grandTotal });
   } catch (error) {
     console.error("PO confirmation error:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while building confirmation",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while building confirmation",
+    });
   }
 });
 
@@ -1548,12 +1543,10 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
         .json({ success: false, message: "Valid measurement ID is required" });
     }
     if (!selectedEmployeeIds?.length) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Select at least one employee for the PO",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Select at least one employee for the PO",
+      });
     }
 
     const measurement = await Measurement.findById(measurementId)
@@ -1585,12 +1578,10 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
       );
 
     if (!selectedEmployeeMeasurements.length) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "None of the selected employees found in this measurement.",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "None of the selected employees found in this measurement.",
+      });
     }
 
     // ── Split each selected employee's products into included / excluded ──
@@ -1646,13 +1637,11 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
       totalFields > 0 &&
       Math.round((completedFields / totalFields) * 100) < 100
     ) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message:
-            "Cannot convert: some selected employees have incomplete measurements.",
-        });
+      return res.status(400).json({
+        success: false,
+        message:
+          "Cannot convert: some selected employees have incomplete measurements.",
+      });
     }
 
     const customer = await Customer.findById(measurement.organizationId);
@@ -1960,12 +1949,10 @@ router.get("/organization/:orgId/export-product-pricing", async (req, res) => {
       }),
     );
     if (!measuredEmployeeIds.size)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: "No employees have been measured yet",
-        });
+      return res.status(404).json({
+        success: false,
+        message: "No employees have been measured yet",
+      });
 
     const measuredEmployees = await EmployeeMpc.find({
       customerId: orgId,
@@ -2349,12 +2336,10 @@ router.get("/:measurementId/export-grouped", async (req, res) => {
     res.send(csv);
   } catch (error) {
     console.error("Export grouped error:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while exporting grouped measurement",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while exporting grouped measurement",
+    });
   }
 });
 
@@ -2649,12 +2634,10 @@ router.get("/", async (req, res) => {
     res.status(200).json({ success: true, employees: processed });
   } catch (error) {
     console.error("Error fetching employees:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching employees",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching employees",
+    });
   }
 });
 
