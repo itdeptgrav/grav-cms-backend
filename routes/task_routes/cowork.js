@@ -871,6 +871,7 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
     // Invalidate auth cache so new role takes effect immediately
     const { invalidateEmployeeCache } = require("../../Middlewear/coworkAuth");
     invalidateEmployeeCache(authUid);
+    invalidateEmpListCache(); // ← keep the Admin panel table in sync immediately
 
     console.log(`[ChangeRole] ${employeeId} → ${role} | session revoked | cache cleared`);
     res.json({ success: true, employeeId, role });
@@ -893,7 +894,9 @@ router.post("/employee/:employeeId/change-department", verifyCoworkToken, async 
 
     const empDoc = await db.collection("cowork_employees").doc(employeeId).get();
     if (!empDoc.exists) return res.status(404).json({ error: "Employee not found" });
-    const authUid = empDoc.data().authUid;
+    const empData = empDoc.data();
+    const authUid = empData.authUid;
+    const oldDept = empData.department || "";
     const newDept = department.trim();
 
     await db.collection("cowork_employees").doc(employeeId).update({
@@ -906,10 +909,26 @@ router.post("/employee/:employeeId/change-department", verifyCoworkToken, async 
       await sendPushToEmployees([employeeId], "🏢 Department Updated", `Your department is now ${newDept}.`, { type: "department_changed" });
     } catch (e) { console.error("[department_changed push]", e.message); }
 
+    try {
+      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
+      await sendNotificationEmail({
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.name || "Admin CEO",
+        receiverId: employeeId,
+        receiverName: empData.name || employeeId,
+        receiverEmail: empData.email,
+        type: "department_changed",
+        title: "Your CoWork department has been updated",
+        body: `Your department is now ${newDept}.`,
+        data: { oldDepartment: oldDept, newDepartment: newDept },
+      });
+    } catch (e) { console.error("[department_changed email]", e.message); }
+
     if (authUid) {
       const { invalidateEmployeeCache } = require("../../Middlewear/coworkAuth");
       invalidateEmployeeCache(authUid);
     }
+    invalidateEmpListCache(); // ← keep the Admin panel table in sync immediately
 
     console.log(`[ChangeDepartment] ${employeeId} → ${newDept}`);
     res.json({ success: true, employeeId, department: newDept });
