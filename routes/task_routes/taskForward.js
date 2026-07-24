@@ -407,6 +407,20 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
         senderName: req.coworkUser.name,
       });
     }
+
+    // Self-assigned task awaiting approval — notify the approver now, at creation time
+    if (isSelfAssignedReq && approverId) {
+      await _notify({
+        recipientIds: [approverId],
+        type: "self_assign_pending",
+        title: `👤 Self-Task Needs Your Approval`,
+        body: `${req.coworkUser.name} created a self-assigned task "${title.trim()}" and needs your approval before they can start.`,
+        data: { taskId: task.taskId, taskTitle: title.trim() },
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.name,
+      });
+    }
+
     res.status(201).json({ success: true, task });
     // Email is now handled inside svc.createTask() via _notifyMany → sendNotificationEmail
 
@@ -1046,7 +1060,15 @@ router.post("/task/:taskId/department-approve", verifyCoworkToken, verifyEmploye
 
       if (!allApproved) {
         tx.update(taskRef, { departmentApprovals: updatedApprovals, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-        return { httpStatus: 200, body: { success: true, status: "pending_department_approval", message: "Your approval is recorded. Waiting on the other approver." }, outcome: "waiting" };
+        // If this approval just came from the sender's side, the receiver's
+        // entry was flipped "waiting" → "pending" a few lines up — that's the
+        // exact moment it becomes their turn. Re-find them here (independent
+        // of the block-scoped receiverIdx above) so the notification below
+        // knows who to tell.
+        const nowPendingApprover = updatedApprovals[idx].side === "sender"
+          ? updatedApprovals.find(a => a.side === "receiver" && a.status === "pending")
+          : null;
+        return { httpStatus: 200, body: { success: true, status: "pending_department_approval", message: "Your approval is recorded. Waiting on the other approver." }, outcome: "waiting", task, nowPendingApprover };
       }
       const finalAssigneeId = task.pendingAssigneeId;
       const finalStatus = (task.hasTimer === false) ? "pending_tl_hours" : "open";
@@ -1066,6 +1088,9 @@ router.post("/task/:taskId/department-approve", verifyCoworkToken, verifyEmploye
     if (result.outcome === "rejected") {
       await postSystemChatMessage(taskId, `❌ Cross-department assignment rejected by ${name}${rejectionReason ? `: "${rejectionReason}"` : ""}`, employeeId, name);
       await _notify({ recipientIds: [result.task.assignedBy].filter(Boolean), type: "department_approval_rejected", title: "❌ Assignment Rejected", body: `${name} rejected your cross-department task "${result.task.title}"${rejectionReason ? `: ${rejectionReason}` : ""}`, data: { taskId }, senderId: employeeId, senderName: name });
+    } else if (result.outcome === "waiting" && result.nowPendingApprover) {
+      await postSystemChatMessage(taskId, `☑️ ${name} approved — waiting on ${result.nowPendingApprover.approverName || "the other department"} to approve.`, employeeId, name);
+      await _notify({ recipientIds: [result.nowPendingApprover.approverId].filter(Boolean), type: "department_approval_your_turn", title: "🔔 Your Approval Needed", body: `${name} approved "${result.task.title}" from their side. It's now waiting on your approval.`, data: { taskId }, senderId: employeeId, senderName: name });
     } else if (result.outcome === "completed" && result.finalStatus === "pending_tl_hours") {
       await postSystemChatMessage(taskId, "✅ Both HODs approved — waiting on the assignee's TL to set estimated hours.", employeeId, name);
       const draftTargetInfo = await getEmployeeInfo(result.finalAssigneeId);
