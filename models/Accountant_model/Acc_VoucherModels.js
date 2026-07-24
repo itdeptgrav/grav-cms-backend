@@ -439,6 +439,20 @@ const tallyVoucherSchema = new mongoose.Schema(
       lastGeneratedAt: { type: Date },
     },
 
+    // ─── Purchase-order linkage ─────────────────────────────────────────────
+    // Set when a purchase voucher is raised against a CMS purchase order.
+    // This is what lets the PO know how much of it has been BILLED — which is
+    // NOT the same as paid. A purchase voucher means the vendor invoiced us
+    // and an AP liability now exists; settling it is a separate payment
+    // voucher. Keeping the two apart is why `billingStatus` and the PO's own
+    // `paymentStatus` are different fields.
+    purchaseOrderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PurchaseOrder",
+      index: true,
+    },
+    purchaseOrderNumber: { type: String, trim: true },
+
     // ─── CMS bridge ─────────────────────────────────────────────────────────
     sourceSystem: {
       type: String,

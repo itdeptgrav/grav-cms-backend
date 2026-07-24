@@ -76,6 +76,16 @@ const policySchema = new mongoose.Schema(
     // department as a name string — suggestion matching is done by name.
     departmentName: { type: String, default: "" },
 
+    // Multi-department support: a department-scoped policy may target several
+    // departments at once. `departmentId`/`departmentName` above stay filled
+    // with the FIRST entry for backward compatibility.
+    departmentIds: {
+      type: [mongoose.Schema.Types.ObjectId],
+      ref: "Department",
+      default: [],
+    },
+    departmentNames: { type: [String], default: [] },
+
     // ── Attendance auto-trigger ────────────────────────────────────────────
     triggerKey: {
       type: String,
