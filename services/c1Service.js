@@ -341,7 +341,12 @@ async function writeReworkDeduction({ employeeId, taskId, taskTitle, reviewerId 
             folderName: taskTitle || taskId,
             points: pts,
             description: `Rework #${reworkNumber} · −${pts} pts · ${taskTitle || taskId}`,
-            isC1: true, bleachType: "debit", isCredit: false,
+            // This is a deduction, not a reward — bleachType must be "credit"
+            // (shown red) to match _writeC1BleachEntries' own convention below.
+            // It was wrongly set to "debit" (shown green), inverting the color
+            // and sign on every rework penalty while the running totalDeducted
+            // total itself stayed correct (it's a separate, unsigned sum of pts).
+            isC1: true, bleachType: "credit", isCredit: false,
             date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
             taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
         };
@@ -378,7 +383,9 @@ async function writeExtensionDeduction({ employeeId, taskId, taskTitle, reviewer
             folderName: taskTitle || taskId,
             points: pts,
             description: `Extension filed · −${pts} pts · ${taskTitle || taskId}`,
-            isC1: true, bleachType: "debit", isCredit: false,
+            // Same inversion as writeReworkDeduction above — this is a deduction,
+            // so bleachType must be "credit" (red), not "debit" (green).
+            isC1: true, bleachType: "credit", isCredit: false,
             date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
             taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
         };
