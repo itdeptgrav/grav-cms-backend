@@ -154,6 +154,17 @@ const operationSchema = new mongoose.Schema({
   operatorCost: {
     type: Number,
     min: 0
+  },
+  // ── Salary basis — department and designation used to derive operatorSalary ──
+  salaryDept: {
+    type: String,
+    trim: true,
+    default: ""
+  },
+  salaryDesig: {
+    type: String,
+    trim: true,
+    default: ""
   }
 }, { _id: false });
 

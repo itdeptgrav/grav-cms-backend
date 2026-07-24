@@ -18,6 +18,7 @@ const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:8081",
   "http://localhost:3001",
+  "http://localhost:3002",
   "https://grav-cms.vercel.app",
   "http://10.119.220.161:3000",
   "https://cms.grav.in",
