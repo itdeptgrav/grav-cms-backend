@@ -351,7 +351,7 @@ if (!global.__c4PresenceTimer) {
 
 // ── FIXED-TIME DAILY CREDIT (node-cron) ──────────────────────────────────────
 // The instance is kept permanently awake by an external uptime pinger, so an
-// in-process cron fires reliably. Every night at 21:30 IST it credits TODAY
+// in-process cron fires reliably. Every night at 23:30 IST it credits TODAY
 // (shifts and punches are settled by then) plus yesterday as self-heal in case
 // the previous night's tick was missed. Dedup makes both free on re-runs.
 // To change the time, edit the "30 21" cron string below (min hour).
@@ -359,7 +359,7 @@ if (!global.__c4PresenceCron) {
   try {
     const nodeCron = require("node-cron");
     global.__c4PresenceCron = nodeCron.schedule(
-      "30 21 * * *",
+      "30 23 * * *",
       () => {
         const today = todayLocalStr();
         const d = new Date(`${today}T00:00:00`);
@@ -372,7 +372,7 @@ if (!global.__c4PresenceCron) {
               { $set: { lastPresenceRunAt: new Date() } },
             ).catch(() => {});
             console.log(
-              `[C4 presence:nodecron 21:30] credited=${r.credited} already=${r.alreadyCredited} late=${r.skippedLate} early=${r.skippedEarly} ab=${r.skippedAbsent} wo=${r.skippedNonWorking} other=${r.skippedOtherStatus} (${r.from}→${r.to})${r.errors.length ? " errors=" + r.errors.length : ""}`,
+              `[C4 presence:nodecron 23:30] credited=${r.credited} already=${r.alreadyCredited} late=${r.skippedLate} early=${r.skippedEarly} ab=${r.skippedAbsent} wo=${r.skippedNonWorking} other=${r.skippedOtherStatus} (${r.from}→${r.to})${r.errors.length ? " errors=" + r.errors.length : ""}`,
             );
           },
           (e) => console.error("[C4 presence:nodecron] failed:", e.message),
@@ -381,7 +381,7 @@ if (!global.__c4PresenceCron) {
       { timezone: "Asia/Kolkata" },
     );
     console.log(
-      "✅ C4 presence node-cron scheduled — daily 21:30 IST (credits today + yesterday)",
+      "✅ C4 presence node-cron scheduled — daily 23:30 IST (credits today + yesterday)",
     );
   } catch (e) {
     console.warn(
