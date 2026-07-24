@@ -1389,17 +1389,29 @@ router.post("/task/:taskId/move-to-folder", verifyCoworkToken, verifyEmployeeTok
   }
 });
 
-// ── 14c. EDIT TASK DETAILS (TL/CEO only) — title, description, requirements ───
+// Mirrors isConfirmed/isStarted from tasks/page.js exactly (the same statuses
+// that already gate the Edit Task button on the frontend), so "has this task
+// passed draft" means the same thing on both sides.
+const EDIT_PASSED_DRAFT_STATUSES = ["confirmed", "in_progress", "done", "submitted", "tl_approved", "tl_final_approved", "ceo_approved"];
+
 router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    if (!["ceo", "tl"].includes(req.coworkUser.role)) return res.status(403).json({ error: "Only CEO or TL can edit task details." });
     const { title, description, requirements } = req.body;
-    if (title !== undefined && !title.trim()) return res.status(400).json({ error: "Title cannot be empty." });
 
     const taskRef = db.collection("cowork_tasks").doc(taskId);
     const snap = await taskRef.get();
     if (!snap.exists) return res.status(404).json({ error: "Task not found." });
+    const task = snap.data();
+
+    const hasPassedDraft = EDIT_PASSED_DRAFT_STATUSES.includes(task.status);
+    if (!hasPassedDraft) {
+      if (!["ceo", "tl"].includes(req.coworkUser.role)) return res.status(403).json({ error: "Only CEO or TL can edit task details." });
+    } else if (task.assignedBy !== req.coworkUser.employeeId) {
+      return res.status(403).json({ error: "This task has already started — only the sender who assigned it can edit it now." });
+    }
+
+    if (title !== undefined && !title.trim()) return res.status(400).json({ error: "Title cannot be empty." });
 
     const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
     if (title !== undefined) updates.title = title.trim();
@@ -1408,6 +1420,42 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
 
     await taskRef.update(updates);
     res.json({ success: true, taskId, title: updates.title, description: updates.description, requirements: updates.requirements });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── RESET TASK TO DRAFT (sender only, only meaningful once past draft) ────────
+// Separate endpoint on purpose, matching the frontend: editing content and
+// resetting workflow state are two distinct confirmations, not one combined
+// call — the person can save the edit and decline the reset independently.
+router.post("/task/:taskId/reset-to-draft", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const taskRef = db.collection("cowork_tasks").doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found." });
+    const task = snap.data();
+
+    if (task.assignedBy !== req.coworkUser.employeeId) {
+      return res.status(403).json({ error: "Only the sender who assigned this task can reset it." });
+    }
+    if (!EDIT_PASSED_DRAFT_STATUSES.includes(task.status)) {
+      return res.status(400).json({ error: "This task hasn't started yet — there's nothing to reset." });
+    }
+
+    // Only the negotiated deadline/duration and status are reset here — timer
+    // history, chat, and activity logs are left untouched. I haven't traced
+    // every downstream field those touch and don't want to guess at clearing
+    // something that turns out to matter elsewhere.
+    await taskRef.update({
+      status: "open",
+      deadlineWindowSecs: admin.firestore.FieldValue.delete(),
+      deadlineApprovedBy: admin.firestore.FieldValue.delete(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true, taskId, status: "open" });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
