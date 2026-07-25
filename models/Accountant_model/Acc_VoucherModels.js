@@ -452,6 +452,10 @@ const tallyVoucherSchema = new mongoose.Schema(
       index: true,
     },
     purchaseOrderNumber: { type: String, trim: true },
+    // Slice of a payment voucher applied to the linked PO. A vendor payment
+    // can span several POs; only this amount is written to the PO's payments[].
+    // Absent → the whole party-leg amount is treated as applied to this PO.
+    poAppliedAmount: { type: Number },
 
     // ─── CMS bridge ─────────────────────────────────────────────────────────
     sourceSystem: {
