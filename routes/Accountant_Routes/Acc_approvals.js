@@ -331,6 +331,26 @@ async function applyApprovedAction(reqDoc, approver) {
     return { entityId: ledger._id };
   }
 
+  // VOUCHER ── match/unlink a payment voucher to a PO (mirrors /:id/match-payment)
+  if (kind === "voucher" && action === "match_payment") {
+    const v = await Acc_Voucher.findById(target.id);
+    if (!v) throw new Error("Payment voucher not found");
+    const { writePaymentToPO, removePaymentFromPO } = require("./Acc_vouchers");
+    if (removePaymentFromPO) await removePaymentFromPO(v).catch(() => {});
+    if (payload?.unlink) {
+      v.purchaseOrderId = undefined;
+      v.purchaseOrderNumber = "";
+      v.poAppliedAmount = undefined;
+    } else {
+      v.purchaseOrderId = payload.purchaseOrderId;
+      v.purchaseOrderNumber = payload.purchaseOrderNumber || "";
+    }
+    v.updatedBy = approver.id;
+    await v.save();
+    if (writePaymentToPO) await writePaymentToPO(v).catch(() => {});
+    return { entityId: v._id };
+  }
+
   // VOUCHER ── link/unlink a purchase voucher to a PO (mirrors /:id/link-po)
   if (kind === "voucher" && action === "link_po") {
     const v = await Acc_Voucher.findById(target.id);
