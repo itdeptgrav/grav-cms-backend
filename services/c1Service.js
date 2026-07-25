@@ -119,12 +119,13 @@ async function _writeC1BleachEntries({ employeeId, taskId, taskTitle, reviewerNa
         // ── Single entry — final task score ──────────────────────────────────────
         // taskScore already includes ALL deductions (rework + extension + deadline)
         // We write ONE entry only — the net earned score.
-        // Rework/extension are NOT written separately (they are included in taskScore)
-        // Deadline is NOT written separately (included in taskScore)
-        // reworksReceived already written to SOP immediately via writeReworkDeduction
-        // exclude here to avoid double-counting
+        // Rework/extension/deadline are NOT written separately here (they are
+        // included in the combined taskScore) — each is written as its own
+        // dedicated SOP entry elsewhere (writeReworkDeduction / writeExtensionDeduction /
+        // writeDeadlineDeduction, called immediately at the moment each happens),
+        // so all three are zeroed below to avoid double-counting in this ledger entry.
         const taskScore = calculateTaskScore(cfg, {
-            deadlinesMissed, extensionsFiled, reworksReceived: 0, isRejected
+            deadlinesMissed: 0, extensionsFiled, reworksReceived: 0, isRejected
         });
 
         if (isRejected) {
@@ -203,8 +204,10 @@ async function computeAndStoreTaskScore({ taskId, taskData, employeeId, isReject
         const deadlineDate = officialDeadline ? new Date(officialDeadline) : null;
 
         let deadlinesMissed = Number(c1.deadlinesMissed) || 0;
+        let isNewDeadlineMiss = false;
         if (deadlineDate && !isNaN(deadlineDate) && submittedAtDate > deadlineDate) {
             deadlinesMissed += 1;
+            isNewDeadlineMiss = true;
         }
 
         const extensionsFiled = Number(c1.extensionsFiled) || 0;
@@ -238,6 +241,18 @@ async function computeAndStoreTaskScore({ taskId, taskData, employeeId, isReject
                 reviewerId: taskData.tlReview?.reviewedBy || taskData.ceoReview?.reviewedBy || "",
                 deadlinesMissed, extensionsFiled, reworksReceived, isRejected, cfg,
             }).catch(e => console.error("[c1 bleach]", e.message)));
+
+            // Deadline miss — own visible SOP entry, same as rework/extension,
+            // instead of only being folded into the combined completion score.
+            if (isNewDeadlineMiss) {
+                setImmediate(() => writeDeadlineDeduction({
+                    employeeId,
+                    taskId,
+                    taskTitle: taskData.title || taskId,
+                    reviewerName: taskData.tlReview?.reviewedByName || taskData.ceoReview?.reviewedByName || "TL",
+                    reviewerId: taskData.tlReview?.reviewedBy || taskData.ceoReview?.reviewedBy || "",
+                }).catch(e => console.error("[c1 deadline write]", e.message)));
+            }
         }
 
         // ── Update employee C1 score cache (non-blocking) ─────────────────────────
@@ -404,6 +419,39 @@ async function writeExtensionDeduction({ employeeId, taskId, taskTitle, reviewer
     }
 }
 
+async function writeDeadlineDeduction({ employeeId, taskId, taskTitle, reviewerId = "", reviewerName = "" }) {
+    try {
+        const cfg = await getC1Config();
+        const pts = +Number(cfg.c1DeadlineDeduction).toFixed(2);
+        const employee = await Employee.findOne({ biometricId: employeeId });
+        if (!employee) return;
+        const today = new Date().toISOString().split("T")[0];
+        const year = new Date().getFullYear();
+        const entry = {
+            sopName: "C1 — Deadline Missed",
+            type: "C1",
+            folderName: taskTitle || taskId,
+            points: pts,
+            description: `Deadline missed · −${pts} pts · ${taskTitle || taskId}`,
+            isC1: true, bleachType: "credit", isCredit: false,
+            date: today, cutBy: reviewerId, cutByName: reviewerName, cutByRole: "tl",
+            taskId, recheck: { status: "none", requestedAt: null, requestNote: "", reviewedBy: null, reviewedByName: null, reviewedAt: null, reviewNote: "" },
+        };
+        if (!employee.sopPoints) employee.sopPoints = [];
+        const yearIndex = employee.sopPoints.findIndex(sp => sp.year === year);
+        if (yearIndex >= 0) {
+            employee.sopPoints[yearIndex].bleaches.push(entry);
+            employee.sopPoints[yearIndex].totalDeducted = +(employee.sopPoints[yearIndex].totalDeducted + pts).toFixed(2);
+        } else {
+            employee.sopPoints.push({ year, totalDeducted: pts, bleaches: [entry] });
+        }
+        await employee.save();
+        console.log(`[C1 deadline] Wrote −${pts} pts for ${employeeId} on task ${taskId}`);
+    } catch (e) {
+        console.error("[writeDeadlineDeduction]", e.message);
+    }
+}
+
 module.exports = {
     getC1Config,
     calculateTaskScore,
@@ -413,5 +461,6 @@ module.exports = {
     markTaskCancelled,
     writeReworkDeduction,
     writeExtensionDeduction,
+    writeDeadlineDeduction,
     C1_DEFAULTS,
 };

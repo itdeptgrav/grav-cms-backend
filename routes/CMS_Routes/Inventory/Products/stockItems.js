@@ -672,7 +672,9 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
               seconds,
               totalSeconds: minutes * 60 + seconds,
               operatorSalary: parseFloat(op.operatorSalary) || 0,
-              operatorCost: parseFloat(op.operatorCost) || 0
+              operatorCost: parseFloat(op.operatorCost) || 0,
+              salaryDept:  op.salaryDept  || "",
+              salaryDesig: op.salaryDesig || "",
             };
           });
         }
