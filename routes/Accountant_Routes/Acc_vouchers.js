@@ -507,16 +507,11 @@ router.get("/", auth, async (req, res) => {
       }
     }
 
-    // For a purchase-voucher listing, flag which bills have a payment against
-    // them, so the UI can show a "Pay" action vs a "paid" tick without a
-    // per-row request. A bill counts as paid when a posted payment voucher is
-    // allocated to it (bill-wise) or shares its PO link.
     if (voucherType === "purchase" && items.length) {
       const billNames = items
         .flatMap((v) => [v.voucherNumber, v.referenceNumber])
         .filter(Boolean);
       const poIds = items.map((v) => v.purchaseOrderId).filter(Boolean);
-
       const payments = await Acc_Voucher.find({
         companyId,
         voucherType: "payment",
@@ -528,7 +523,6 @@ router.get("/", auth, async (req, res) => {
       })
         .select("ledgerEntries purchaseOrderId")
         .lean();
-
       const paidBillNames = new Set();
       const paidPOs = new Set();
       for (const p of payments) {
@@ -1539,8 +1533,6 @@ router.get("/po-lookup", auth, async (req, res) => {
       ]);
       billMap = new Map(billed.map((b) => [String(b._id), b]));
 
-      // Parallel roll-up of posted PAYMENT vouchers, so the list can show
-      // paid state alongside billed state. Payment ≠ billing — separate query.
       const paid = await Acc_Voucher.aggregate([
         {
           $match: {
@@ -1585,13 +1577,6 @@ router.get("/po-lookup", auth, async (req, res) => {
             : billedAmount >= total * 0.99
               ? "FULLY_BILLED"
               : "PARTIALLY_BILLED";
-        const paidAmount = b.paidAmount || 0;
-        const paymentStatusComputed =
-          paidAmount >= total * 0.99
-            ? "PAID"
-            : paidAmount > 0
-              ? "PARTIALLY_PAID"
-              : "UNPAID";
         return {
           billedAmount,
           pendingBillAmount: b.pendingAmount || 0,
@@ -1599,10 +1584,15 @@ router.get("/po-lookup", auth, async (req, res) => {
           voucherCount: b.voucherCount || 0,
           postedVoucherCount: b.postedCount || 0,
           billingStatus,
-          paidAmount,
-          remainingToPay: Math.max(total - paidAmount, 0),
+          paidAmount: b.paidAmount || 0,
+          remainingToPay: Math.max(total - (b.paidAmount || 0), 0),
           paymentCount: b.paymentCount || 0,
-          paymentStatusComputed,
+          paymentStatusComputed:
+            (b.paidAmount || 0) >= total * 0.99
+              ? "PAID"
+              : (b.paidAmount || 0) > 0
+                ? "PARTIALLY_PAID"
+                : "UNPAID",
         };
       })(),
       vendor: po.vendor
@@ -1675,16 +1665,11 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
       .sort({ voucherDate: -1, createdAt: -1 })
       .lean();
 
-    // Split the linked vouchers by kind: purchase vouchers are BILLS, payment
-    // vouchers are money OUT. They were all fetched together because both
-    // carry purchaseOrderId, but they answer different questions.
     const billingVouchers = vouchers.filter(
       (v) => v.voucherType === "purchase" || !v.voucherType,
     );
     const paymentVouchers = vouchers.filter((v) => v.voucherType === "payment");
 
-    // What exactly has been billed, line by line — so the same PO billed
-    // across two invoices shows which items each one covered, with amounts.
     const billedItems = [];
     for (const v of billingVouchers) {
       if (v.status !== "posted") continue;
@@ -1692,7 +1677,7 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
         billedItems.push({
           voucherNumber: v.voucherNumber,
           voucherDate: v.voucherDate,
-          itemName: e.stockItemName || e.chargeDescription || "—",
+          itemName: e.stockItemName || e.chargeDescription || "\u2014",
           quantity: e.quantity || 0,
           unit: e.unit || "",
           rate: e.rate || 0,
@@ -1709,10 +1694,6 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
     const pendingBillAmount = billingVouchers
       .filter((v) => ["draft", "pending_approval"].includes(v.status))
       .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
-
-    // Paid through the BOOKS — posted payment vouchers linked to this PO.
-    // This is the accounting truth, distinct from the CMS payments[] the Store
-    // dept may have entered by hand.
     const paidThroughBooks = paymentVouchers
       .filter((v) => v.status === "posted")
       .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
@@ -1814,7 +1795,6 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
         billingStatus,
         poPaid,
         poRemaining: Math.max(total - poPaid, 0),
-        // Paid through the accounting books (posted payment vouchers).
         paidThroughBooks,
         booksRemaining: Math.max(total - paidThroughBooks, 0),
         paymentStatusComputed:
@@ -1823,8 +1803,6 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
             : paidThroughBooks > 0
               ? "PARTIALLY_PAID"
               : "UNPAID",
-        // Line-by-line breakdown of what's been billed — answers "which items
-        // did each invoice cover", important when a PO is billed in parts.
         billedItems,
         deliveries,
         openReturns,
@@ -2230,6 +2208,163 @@ router.get("/roundoff-ledger", auth, async (req, res) => {
   } catch (e) {
     console.error("[roundoff-ledger]", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+/* GET /payment-match-candidates — purchase vouchers a payment can settle    */
+/* MUST be declared BEFORE router.get("/:id") — it's a literal path.         */
+router.get("/payment-match-candidates", auth, async (req, res) => {
+  try {
+    const { companyId, q, partyLedgerId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+
+    const filter = { companyId, voucherType: "purchase", status: "posted" };
+    if (partyLedgerId) filter.partyLedgerId = partyLedgerId;
+    if (q) {
+      const rx = new RegExp(
+        String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i",
+      );
+      filter.$or = [
+        { voucherNumber: rx },
+        { referenceNumber: rx },
+        { partyLedgerName: rx },
+        { purchaseOrderNumber: rx },
+      ];
+    }
+
+    const bills = await Acc_Voucher.find(filter)
+      .select(
+        "voucherNumber voucherDate grandTotal partyLedgerName partyLedgerId referenceNumber purchaseOrderId purchaseOrderNumber",
+      )
+      .sort({ voucherDate: -1 })
+      .limit(100)
+      .lean();
+
+    res.json({ candidates: bills });
+  } catch (e) {
+    console.error("[payment-match-candidates]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* POST /:id/match-payment — link a PAYMENT voucher to a purchase voucher,    */
+/* inheriting that bill's PO so the PO's paymentStatus updates.               */
+/* Body: { purchaseVoucherId }  — pass null to UNLINK.                        */
+router.post("/:id/match-payment", auth, async (req, res) => {
+  try {
+    const payment = await Acc_Voucher.findById(req.params.id);
+    if (!payment) return res.status(404).json({ error: "Voucher not found" });
+    if (payment.voucherType !== "payment")
+      return res
+        .status(400)
+        .json({ error: "Only payment vouchers can be matched this way." });
+    if (["cancelled", "void"].includes(payment.status))
+      return res
+        .status(400)
+        .json({ error: `Cannot match a ${payment.status} voucher.` });
+
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    if (role === "viewer" || perms.canEdit === false)
+      return res
+        .status(403)
+        .json({ error: "Read-only access — you can't match payments." });
+    const canActDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    const { purchaseVoucherId } = req.body || {};
+    const isUnlink = !purchaseVoucherId;
+
+    let poId = null,
+      poNumber = "";
+    if (!isUnlink) {
+      const bill = await Acc_Voucher.findById(purchaseVoucherId)
+        .select("purchaseOrderId purchaseOrderNumber voucherType")
+        .lean();
+      if (!bill || bill.voucherType !== "purchase")
+        return res.status(404).json({ error: "Purchase voucher not found." });
+      if (!bill.purchaseOrderId)
+        return res.status(400).json({
+          error:
+            "That bill isn't linked to any purchase order yet. Match the bill to a PO first, then match this payment.",
+        });
+      poId = bill.purchaseOrderId;
+      poNumber = bill.purchaseOrderNumber || "";
+    }
+
+    if (!canActDirectly && payment.status === "posted") {
+      if (!req.user?.organizationId)
+        return res
+          .status(403)
+          .json({ error: "Your role can't modify posted vouchers." });
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "match_payment",
+        "target.id": payment._id,
+        status: "pending",
+      });
+      if (dup)
+        return res
+          .status(200)
+          .json({ _pendingApproval: true, message: "Already pending." });
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: payment.companyId,
+        kind: "voucher",
+        action: "match_payment",
+        title: isUnlink
+          ? `Unlink payment ${payment.voucherNumber} from its PO`
+          : `Match payment ${payment.voucherNumber} -> PO ${poNumber}`,
+        target: { collection: "Acc_Voucher", id: payment._id },
+        payload: {
+          purchaseOrderId: isUnlink ? null : String(poId),
+          purchaseOrderNumber: isUnlink ? null : poNumber,
+          unlink: isUnlink,
+        },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+      return res.status(202).json({
+        _pendingApproval: true,
+        message: "Match request sent for approval.",
+      });
+    }
+
+    await removePaymentFromPO(payment).catch(() => {});
+    if (isUnlink) {
+      payment.purchaseOrderId = undefined;
+      payment.purchaseOrderNumber = "";
+      payment.poAppliedAmount = undefined;
+    } else {
+      payment.purchaseOrderId = poId;
+      payment.purchaseOrderNumber = poNumber;
+      payment.poAppliedAmount = undefined;
+    }
+    payment.updatedBy = req.user?.id;
+    await payment.save();
+    await writePaymentToPO(payment).catch((e) =>
+      console.error("[match-payment writeback]", e.message),
+    );
+
+    res.json({
+      success: true,
+      message: isUnlink
+        ? `Unlinked ${payment.voucherNumber}.`
+        : `Matched ${payment.voucherNumber} to PO ${poNumber}.`,
+      purchaseOrderId: payment.purchaseOrderId || null,
+      purchaseOrderNumber: payment.purchaseOrderNumber || "",
+    });
+  } catch (e) {
+    console.error("[match-payment]", e);
+    res.status(400).json({ error: e.message });
   }
 });
 
@@ -2958,3 +3093,5 @@ router.get("/summary/by-type", auth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.writePaymentToPO = writePaymentToPO;
+module.exports.removePaymentFromPO = removePaymentFromPO;
