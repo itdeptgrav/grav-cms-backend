@@ -6,9 +6,9 @@ const mongoose = require("mongoose");
 const returnEntrySchema = new mongoose.Schema(
   {
     returnedQty: { type: Number, required: true, min: 0 },
-    returnedAt:  { type: Date, default: Date.now },
-    notes:       { type: String, trim: true, default: "" },
-    recordedBy:  { type: mongoose.Schema.Types.ObjectId, refPath: "recordedByModel", default: null },
+    returnedAt: { type: Date, default: Date.now },
+    notes: { type: String, trim: true, default: "" },
+    recordedBy: { type: mongoose.Schema.Types.ObjectId, refPath: "recordedByModel", default: null },
     recordedByModel: { type: String, enum: ["Employee", "ProjectManager"], default: "ProjectManager" },
   },
   { _id: true }
@@ -17,33 +17,33 @@ const returnEntrySchema = new mongoose.Schema(
 // ── Per-item sub-doc ──────────────────────────────────────────────────────────
 const mrfItemSchema = new mongoose.Schema(
   {
-    rawItem:            { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
-    rawItemName:        { type: String, trim: true, required: true },
-    rawItemSku:         { type: String, trim: true, default: "" },
-    variantId:          { type: mongoose.Schema.Types.ObjectId, default: null },
+    rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+    rawItemName: { type: String, trim: true, required: true },
+    rawItemSku: { type: String, trim: true, default: "" },
+    variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     variantCombination: [{ type: String, trim: true }],
 
     requestedQty: { type: Number, required: true, min: 0 },
-    unit:         { type: String, trim: true, required: true },
-    baseUnit:     { type: String, trim: true, default: "" },
-    issuedQty:    { type: Number, default: 0, min: 0 },
-    returnedQty:  { type: Number, default: 0, min: 0 },
-    consumedQty:  { type: Number, default: 0, min: 0 },
+    unit: { type: String, trim: true, required: true },
+    baseUnit: { type: String, trim: true, default: "" },
+    issuedQty: { type: Number, default: 0, min: 0 },
+    returnedQty: { type: Number, default: 0, min: 0 },
+    consumedQty: { type: Number, default: 0, min: 0 },
 
     itemStatus: {
       type: String,
-      enum: ["PENDING", "APPROVED", "ISSUED", "PARTIALLY_RETURNED", "RETURNED", "OVERDUE", "REJECTED"],
+      enum: ["PENDING", "APPROVED", "PARTIALLY_ISSUED", "ISSUED", "PARTIALLY_RETURNED", "RETURNED", "OVERDUE", "REJECTED"],
       default: "PENDING",
     },
 
     returnHistory: [returnEntrySchema],
     issueHistory: [{
-      issuedQty:  { type: Number, required: true },
-      notes:      { type: String, default: "" },
+      issuedQty: { type: Number, required: true },
+      notes: { type: String, default: "" },
       recordedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
       recordedAt: { type: Date, default: Date.now },
     }],
-    storeNotes:    { type: String, trim: true, default: "" },
+    storeNotes: { type: String, trim: true, default: "" },
   },
   { _id: true }
 );
@@ -54,10 +54,10 @@ const mrfSchema = new mongoose.Schema(
     mrfNumber: { type: String, unique: true, trim: true, required: true },
 
     // Who the materials are FOR
-    requestedFor:     { type: mongoose.Schema.Types.ObjectId, ref: "Employee", required: true },
+    requestedFor: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", required: true },
     requestedForName: { type: String, trim: true, default: "" },
     requestedForDept: { type: String, trim: true, default: "" },
-    requestedForId:   { type: String, trim: true, default: "" }, // employee ID / badge
+    requestedForId: { type: String, trim: true, default: "" }, // employee ID / badge
 
     // How the MRF was created
     // SELF     → employee raised it themselves via Cowork
@@ -69,9 +69,9 @@ const mrfSchema = new mongoose.Schema(
     },
 
     // Who actually created it (employee if SELF, ProjectManager if BYPASS)
-    createdByRef:      { type: mongoose.Schema.Types.ObjectId, refPath: "createdByModel", required: true },
-    createdByModel:    { type: String, enum: ["Employee", "ProjectManager"], default: "Employee" },
-    createdByName:     { type: String, trim: true, default: "" },
+    createdByRef: { type: mongoose.Schema.Types.ObjectId, refPath: "createdByModel", required: true },
+    createdByModel: { type: String, enum: ["Employee", "ProjectManager"], default: "Employee" },
+    createdByName: { type: String, trim: true, default: "" },
 
     requestType: {
       type: String,
@@ -80,7 +80,7 @@ const mrfSchema = new mongoose.Schema(
     },
 
     deadline: { type: Date, default: null },
-    reason:   { type: String, trim: true, default: "" },
+    reason: { type: String, trim: true, default: "" },
 
     // Priority
     priority: {
@@ -90,7 +90,7 @@ const mrfSchema = new mongoose.Schema(
     },
 
     // Cost centre / project reference (optional, for tracking)
-    costCentre:       { type: String, trim: true, default: "" },
+    costCentre: { type: String, trim: true, default: "" },
     projectReference: { type: String, trim: true, default: "" },
 
     status: {
@@ -113,23 +113,23 @@ const mrfSchema = new mongoose.Schema(
     //pm action 
 
     // ── PM approval layer ──────────────────────────────────────────────
-    pmApproved:      { type: Boolean, default: false },
-    pmApprovedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
-    pmApprovedAt:    { type: Date, default: null },
-    pmRejected:      { type: Boolean, default: false },
-    pmRejectedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
-    pmRejectedAt:    { type: Date, default: null },
+    pmApproved: { type: Boolean, default: false },
+    pmApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    pmApprovedAt: { type: Date, default: null },
+    pmRejected: { type: Boolean, default: false },
+    pmRejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    pmRejectedAt: { type: Date, default: null },
     pmRejectionNote: { type: String, default: "" },
 
     // Store actions audit
-    approvedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
-    approvedAt:    { type: Date, default: null },
-    rejectedBy:    { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
-    rejectedAt:    { type: Date, default: null },
+    approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    approvedAt: { type: Date, default: null },
+    rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
+    rejectedAt: { type: Date, default: null },
     rejectionNote: { type: String, trim: true, default: "" },
-    cancelledBy:   { type: mongoose.Schema.Types.ObjectId, refPath: "cancelledByModel", default: null },
+    cancelledBy: { type: mongoose.Schema.Types.ObjectId, refPath: "cancelledByModel", default: null },
     cancelledByModel: { type: String, enum: ["Employee", "ProjectManager"], default: "ProjectManager" },
-    cancelledAt:   { type: Date, default: null },
+    cancelledAt: { type: Date, default: null },
     cancellationNote: { type: String, trim: true, default: "" },
 
     storeNotes: { type: String, trim: true, default: "" },
@@ -146,8 +146,8 @@ mrfSchema.index({ creationMode: 1, createdAt: -1 });
 mrfSchema.pre("validate", async function (next) {
   if (!this.mrfNumber) {
     const now = new Date();
-    const yy  = String(now.getFullYear()).slice(-2);
-    const mm  = String(now.getMonth() + 1).padStart(2, "0");
+    const yy = String(now.getFullYear()).slice(-2);
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
     const prefix = `MRF-${yy}${mm}-`;
     const last = await mongoose
       .model("MRF")
