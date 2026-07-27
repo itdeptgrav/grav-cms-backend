@@ -1,12 +1,12 @@
 // routes/CMS_Routes/Inventory/Operations/mrfRoutes.js
 // Mount: app.use("/api/cms/inventory/mrf", mrfRoutes)
 
-const express  = require("express");
-const router   = express.Router();
+const express = require("express");
+const router = express.Router();
 const mongoose = require("mongoose");
-const MRF      = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
-const RawItem  = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
-const Unit     = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
+const MRF = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
+const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Employee = require("../../../../models/Employee");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const NotificationService = require("../../../../services/NotificationService");
@@ -66,13 +66,13 @@ async function adjustStock(rawItemId, variantId, variantCombination, delta, txnM
     matchedVariant.quantity = Math.max(0, (matchedVariant.quantity || 0) + delta);
     matchedVariant.status =
       matchedVariant.quantity === 0 ? "Out of Stock" :
-      matchedVariant.quantity <= (matchedVariant.minStock || raw.minStock || 0) ? "Low Stock" : "In Stock";
+        matchedVariant.quantity <= (matchedVariant.minStock || raw.minStock || 0) ? "Low Stock" : "In Stock";
   }
 
   raw.quantity = Math.max(0, prevQty + delta);
   raw.status =
     raw.quantity === 0 ? "Out of Stock" :
-    raw.quantity <= (raw.minStock || 0) ? "Low Stock" : "In Stock";
+      raw.quantity <= (raw.minStock || 0) ? "Low Stock" : "In Stock";
 
   raw.stockTransactions.push({
     ...txnMeta,
@@ -110,15 +110,15 @@ async function buildMrfItems(items) {
     if (!raw) continue;
     const baseUnit = raw.customUnit || raw.unit || "unit";
     built.push({
-      rawItem:            raw._id,
-      rawItemName:        raw.name,
-      rawItemSku:         raw.sku || "",
-      variantId:          it.variantId || null,
+      rawItem: raw._id,
+      rawItemName: raw.name,
+      rawItemSku: raw.sku || "",
+      variantId: it.variantId || null,
       variantCombination: it.variantCombination || [],
-      requestedQty:       parseFloat(it.requestedQty),
-      unit:               it.unit || baseUnit,
+      requestedQty: parseFloat(it.requestedQty),
+      unit: it.unit || baseUnit,
       baseUnit,
-      itemStatus:         "PENDING",
+      itemStatus: "PENDING",
     });
   }
   return built;
@@ -170,21 +170,27 @@ router.get("/data/employees", async (req, res) => {
     const s = search.trim();
     const filter = {
       $or: [
-        { firstName:   { $regex: s, $options: "i" } },
-        { middleName:  { $regex: s, $options: "i" } },
-        { lastName:    { $regex: s, $options: "i" } },
+        { firstName: { $regex: s, $options: "i" } },
+        { middleName: { $regex: s, $options: "i" } },
+        { lastName: { $regex: s, $options: "i" } },
         { biometricId: { $regex: s, $options: "i" } },
-        { identityId:  { $regex: s, $options: "i" } },
-        { email:       { $regex: s, $options: "i" } },
-        { name:        { $regex: s, $options: "i" } },  // fallback for single-field name
+        { identityId: { $regex: s, $options: "i" } },
+        { email: { $regex: s, $options: "i" } },
+        { name: { $regex: s, $options: "i" } },  // fallback for single-field name
         {
           $expr: {
             $regexMatch: {
-              input: { $trim: { input: { $concat: [
-                { $ifNull: ["$firstName",""] }, " ",
-                { $ifNull: ["$middleName",""] }, " ",
-                { $ifNull: ["$lastName",""] }
-              ]}}},
+              input: {
+                $trim: {
+                  input: {
+                    $concat: [
+                      { $ifNull: ["$firstName", ""] }, " ",
+                      { $ifNull: ["$middleName", ""] }, " ",
+                      { $ifNull: ["$lastName", ""] }
+                    ]
+                  }
+                }
+              },
               regex: s, options: "i"
             }
           }
@@ -198,11 +204,11 @@ router.get("/data/employees", async (req, res) => {
     res.json({
       success: true,
       employees: employees.map(e => ({
-        _id:         e._id,
-        fullName:    buildFullName(e),
+        _id: e._id,
+        fullName: buildFullName(e),
         biometricId: e.biometricId || e.identityId || "",
-        department:  e.department || "",
-        email:       e.email || "",
+        department: e.department || "",
+        email: e.email || "",
         designation: e.designation || "",
       })),
     });
@@ -224,28 +230,28 @@ router.get("/", async (req, res) => {
       filter.requestedFor = req.user.id;
     }
 
-    if (status)       filter.status       = status;
-    if (requestType)  filter.requestType  = requestType;
+    if (status) filter.status = status;
+    if (requestType) filter.requestType = requestType;
     if (creationMode) filter.creationMode = creationMode;
-    if (priority)     filter.priority     = priority;
+    if (priority) filter.priority = priority;
     if (search) {
       filter.$or = [
-        { mrfNumber:        { $regex: search, $options: "i" } },
+        { mrfNumber: { $regex: search, $options: "i" } },
         { requestedForName: { $regex: search, $options: "i" } },
-        { requestedForId:   { $regex: search, $options: "i" } },
-        { reason:           { $regex: search, $options: "i" } },
-        { costCentre:       { $regex: search, $options: "i" } },
+        { requestedForId: { $regex: search, $options: "i" } },
+        { reason: { $regex: search, $options: "i" } },
+        { costCentre: { $regex: search, $options: "i" } },
         { projectReference: { $regex: search, $options: "i" } },
       ];
     }
 
-    const skip  = (parseInt(page) - 1) * parseInt(limit);
+    const skip = (parseInt(page) - 1) * parseInt(limit);
     const total = await MRF.countDocuments(filter);
-    const mrfs  = await MRF.find(filter)
+    const mrfs = await MRF.find(filter)
       .sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit))
       .populate("requestedFor", "firstName middleName lastName biometricId identityId name department")
-      .populate("approvedBy",   "firstName lastName name")
-      .populate("rejectedBy",   "firstName lastName name")
+      .populate("approvedBy", "firstName lastName name")
+      .populate("rejectedBy", "firstName lastName name")
       .lean();
 
     mrfs.forEach(mrf => {
@@ -255,24 +261,47 @@ router.get("/", async (req, res) => {
     });
     markOverdue(mrfs);
 
+    // Attach "originally requested as X" to any MRF that was spawned from a
+    // product-request match/approve — one batched lookup, not one per MRF.
+    const mrfIds = mrfs.map(m => m._id);
+    if (mrfIds.length) {
+      const sourceDocs = await RawItemAddRequest.find({ "products.spawnedMrf": { $in: mrfIds } })
+        .select("products requestedByName")
+        .lean();
+      const sourceByMrfId = {};
+      sourceDocs.forEach(doc => {
+        (doc.products || []).forEach(p => {
+          if (p.spawnedMrf) {
+            sourceByMrfId[p.spawnedMrf.toString()] = { itemName: p.itemName, requestedByName: doc.requestedByName };
+          }
+        });
+      });
+      mrfs.forEach(mrf => {
+        mrf.sourceProductRequest = sourceByMrfId[mrf._id.toString()] || null;
+      });
+    }
+
     // Stats — no filter, always global counts for the store dashboard
+
     const statsAgg = await MRF.aggregate([
-      { $group: {
-        _id: null,
-        total:    { $sum: 1 },
-        pending:  { $sum: { $cond: [{ $eq: ["$status","PENDING"]  }, 1, 0] } },
-        approved: { $sum: { $cond: [{ $eq: ["$status","APPROVED"] }, 1, 0] } },
-        issued:   { $sum: { $cond: [{ $in: ["$status",["ISSUED","PARTIALLY_ISSUED"]] }, 1, 0] } },
-        bypass:   { $sum: { $cond: [{ $eq: ["$creationMode","BYPASS"] }, 1, 0] } },
-      }},
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          pending: { $sum: { $cond: [{ $eq: ["$status", "PENDING"] }, 1, 0] } },
+          approved: { $sum: { $cond: [{ $eq: ["$status", "APPROVED"] }, 1, 0] } },
+          issued: { $sum: { $cond: [{ $in: ["$status", ["ISSUED", "PARTIALLY_ISSUED"]] }, 1, 0] } },
+          bypass: { $sum: { $cond: [{ $eq: ["$creationMode", "BYPASS"] }, 1, 0] } },
+        }
+      },
     ]);
-    const stats = statsAgg[0] || { total:0, pending:0, approved:0, issued:0, bypass:0 };
+    const stats = statsAgg[0] || { total: 0, pending: 0, approved: 0, issued: 0, bypass: 0 };
     delete stats._id;
 
     res.json({
       success: true, mrfs, stats,
       pmApprovalRequired: PM_APPROVAL_FOR_MRF,
-      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total/parseInt(limit)) },
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) },
     });
   } catch (e) { console.error("[MRF GET /]", e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -284,54 +313,265 @@ router.get("/", async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 router.get("/product-requests", async (req, res) => {
   try {
-    const requests = await RawItemAddRequest.find({})
+    const { status } = req.query;
+    const filter = {};
+    if (status) filter.status = status;
+    const requests = await RawItemAddRequest.find(filter)
       .sort({ createdAt: -1 })
+      .populate("requestedBy", "firstName middleName lastName name department")
+      .populate("matchedTo", "name sku")
+      .populate("products.matchedTo", "name sku")
+      .populate("products.spawnedMrf", "mrfNumber status")
       .lean();
     res.json({ success: true, requests });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-router.patch("/product-requests/:id/approve", async (req, res) => {
+router.get("/product-requests/:id", async (req, res) => {
   try {
+    const request = await RawItemAddRequest.findById(req.params.id)
+      .populate("requestedBy", "firstName middleName lastName name department")
+      .populate("matchedTo", "name sku")
+      .populate("products.matchedTo", "name sku")
+      .populate("products.spawnedMrf", "mrfNumber status")
+      .lean();
+    if (!request) return res.status(404).json({ success: false, message: "Product request not found" });
+    res.json({ success: true, request });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+function cartesianProduct(arrays) {
+  if (!arrays || arrays.length === 0) return [[]];
+  return arrays.reduce((acc, vals) => {
+    const result = [];
+    for (const prefix of acc) {
+      for (const val of vals) {
+        result.push([...prefix, val]);
+      }
+    }
+    return result;
+  }, [[]]);
+}
+
+router.patch("/product-requests/:id/match", async (req, res) => {
+  try {
+    const { rawItemId, productId, requestedQty, unit, variantId, variantCombination } = req.body;
+    if (!rawItemId) return res.status(400).json({ success: false, message: "rawItemId required" });
+    if (!productId) return res.status(400).json({ success: false, message: "productId required" });
+    if (!requestedQty || parseFloat(requestedQty) <= 0) {
+      return res.status(400).json({ success: false, message: "requestedQty required" });
+    }
+
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
 
-    doc.status = "ADDED";
+    const product = doc.products.id(productId);
+    if (!product) return res.status(404).json({ success: false, message: "Product not found on this request" });
+    if (!["PENDING", "MATCHED"].includes(product.status)) {
+      return res.status(400).json({ success: false, message: `Cannot match – this product's status is ${product.status}` });
+    }
+
+    const rawItem = await RawItem.findById(rawItemId);
+    if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
+    if ((rawItem.variants || []).length > 0 && !variantId) {
+      return res.status(400).json({ success: false, message: "This item has variants — pick one before matching" });
+    }
+
+    // If this product was matched before, it already has a spawned MRF.
+    // Editing the match should correct THAT SAME MRF, not retire it and
+    // mint a new number — only safe to do while it's still untouched
+    // (PENDING, nothing issued); block it otherwise.
+    const wasRematch = !!product.spawnedMrf;
+    let oldMrf = null;
+    if (wasRematch) {
+      oldMrf = await MRF.findById(product.spawnedMrf);
+      if (oldMrf) {
+        const anyIssued = oldMrf.items.some(i => (i.issuedQty || 0) > 0);
+        if (anyIssued || oldMrf.status !== "PENDING") {
+          return res.status(400).json({
+            success: false,
+            message: `Cannot re-match — ${oldMrf.mrfNumber} is already ${oldMrf.status.toLowerCase()}${anyIssued ? " with items issued" : ""}. Resolve or cancel it directly instead.`,
+          });
+        }
+      }
+    }
+
+    const builtItems = await buildMrfItems([{ rawItemId, requestedQty, unit: unit || product.unit, variantId, variantCombination }]);
+    if (!builtItems.length) {
+      return res.status(400).json({ success: false, message: "Could not build a request line for that item" });
+    }
+
+    let mrf;
+    if (oldMrf) {
+      // Same MRF id/number — just swap which item it points to.
+      oldMrf.items = builtItems;
+      oldMrf.reason = doc.reason || `Matched from product request: ${product.itemName}`;
+      oldMrf.priority = doc.priority;
+      await oldMrf.save();
+      mrf = oldMrf;
+    } else {
+      mrf = new MRF({
+        requestedFor: doc.requestedBy,
+        requestedForName: doc.requestedByName,
+        requestedForDept: doc.requestedByDept,
+        creationMode: "SELF",
+        createdByRef: doc.requestedBy,
+        createdByModel: "Employee",
+        createdByName: doc.requestedByName,
+        requestType: "USES_BASED",
+        deadline: null,
+        reason: doc.reason || `Matched from product request: ${product.itemName}`,
+        priority: doc.priority,
+        status: "PENDING",
+        items: builtItems,
+      });
+      await mrf.save();
+    }
+
+    product.matchedTo = rawItemId;
+    product.status = "MATCHED";
+    product.spawnedMrf = mrf._id;
+    product.resolvedAt = new Date();
     doc.resolvedBy = getActorId(req);
-    doc.resolvedAt = new Date();
-    if (req.body.storeNote) doc.storeNote = req.body.storeNote;
+    doc.recomputeStatus();
+    await doc.save();
+
+    NotificationService.sendToUser(doc.requestedBy, {
+      title: "Product Request Matched",
+      body: wasRematch
+        ? `Your requested product "${product.itemName}" was re-matched to "${rawItem.name}" — request ${mrf.mrfNumber} updated.`
+        : `Your requested product "${product.itemName}" was found in inventory as "${rawItem.name}" — request ${mrf.mrfNumber} created.`,
+      type: "request",
+      url: "/coworking/mrf",
+      tag: `product-request-${doc._id}-${product._id}`,
+    }).catch(() => { });
+
+    res.json({ success: true, message: "Matched to existing item", request: doc, mrfId: mrf._id, mrfNumber: mrf.mrfNumber, wasRematch });
+  } catch (e) {
+    console.error("[Match Product Request]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.patch("/product-requests/:id/approve", async (req, res) => {
+  try {
+    const { productId, storeNote, requestedQty, unit } = req.body;
+    if (!productId) return res.status(400).json({ success: false, message: "productId required" });
+    if (!requestedQty || parseFloat(requestedQty) <= 0) {
+      return res.status(400).json({ success: false, message: "requestedQty required" });
+    }
+
+    const doc = await RawItemAddRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
+
+    const product = doc.products.id(productId);
+    if (!product) return res.status(404).json({ success: false, message: "Product not found on this request" });
+    if (product.status !== "PENDING") {
+      return res.status(400).json({ success: false, message: `Cannot approve – this product's status is ${product.status}` });
+    }
+
+    let variants = [];
+    if (product.attributes && product.attributes.length > 0) {
+      const combos = cartesianProduct(product.attributes.map(a => a.values));
+      variants = combos.map(combo => ({
+        combination: combo.map((val, idx) => ({ attribute: product.attributes[idx].name, value: val })),
+        quantity: 0,
+        status: "Out of Stock",
+        sku: `${product.itemName.substring(0, 3)}-${combo.join('-')}`.toUpperCase(),
+      }));
+    }
+
+    const newRawItem = new RawItem({
+      name: product.itemName,
+      category: product.category || "",
+      unit: product.unit || "unit",
+      customUnit: product.unit || "unit",
+      quantity: 0,
+      status: "Out of Stock",
+      variants: variants,
+      sku: `${product.itemName.substring(0, 4)}-${Date.now()}`.toUpperCase(),
+      minStock: 0,
+    });
+    await newRawItem.save();
+
+    const builtItems = await buildMrfItems([{ rawItemId: newRawItem._id, requestedQty, unit: unit || product.unit }]);
+
+    const mrf = new MRF({
+      requestedFor: doc.requestedBy,
+      requestedForName: doc.requestedByName,
+      requestedForDept: doc.requestedByDept,
+      creationMode: "SELF",
+      createdByRef: doc.requestedBy,
+      createdByModel: "Employee",
+      createdByName: doc.requestedByName,
+      requestType: "USES_BASED",
+      deadline: null,
+      reason: doc.reason || `Approved from product request: ${product.itemName}`,
+      priority: doc.priority,
+      status: "PENDING",
+      items: builtItems,
+    });
+    await mrf.save();
+
+    product.status = "ADDED";
+    product.matchedTo = newRawItem._id;
+    product.spawnedMrf = mrf._id;
+    product.resolvedAt = new Date();
+    if (storeNote) product.storeNote = storeNote;
+    doc.resolvedBy = getActorId(req);
+    doc.recomputeStatus();
     await doc.save();
 
     NotificationService.sendToUser(doc.requestedBy, {
       title: "Product Request Approved",
-      body: `Your requested item(s) are being added to inventory by the store.`,
+      body: `Your requested product "${product.itemName}" has been added to inventory — request ${mrf.mrfNumber} created.`,
       type: "request",
       url: "/coworking/mrf",
-      tag: `product-request-${doc._id}`,
-    }).catch(() => {});
+      tag: `product-request-${doc._id}-${product._id}`,
+    }).catch(() => { });
 
-    res.json({ success: true, message: "Marked as approved", request: doc });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    res.json({ success: true, message: "Product added to inventory", request: doc, rawItem: newRawItem, mrfId: mrf._id, mrfNumber: mrf.mrfNumber });
+  } catch (e) {
+    console.error("[Approve Product Request]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
 });
-
 router.patch("/product-requests/:id/reject", async (req, res) => {
   try {
+    const { note, productId } = req.body;
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
 
-    doc.status = "REJECTED";
-    doc.storeNote = req.body.note || "";
+    if (productId) {
+      const product = doc.products.id(productId);
+      if (!product) return res.status(404).json({ success: false, message: "Product not found on this request" });
+      if (product.status !== "PENDING") {
+        return res.status(400).json({ success: false, message: `Cannot reject – this product's status is ${product.status}` });
+      }
+      product.status = "REJECTED";
+      product.storeNote = note || "";
+      product.resolvedAt = new Date();
+    } else {
+      doc.products.forEach(p => {
+        if (p.status === "PENDING") {
+          p.status = "REJECTED";
+          p.storeNote = note || "";
+          p.resolvedAt = new Date();
+        }
+      });
+    }
+    doc.storeNote = note || "";
     doc.resolvedBy = getActorId(req);
-    doc.resolvedAt = new Date();
+    doc.recomputeStatus();
     await doc.save();
 
     NotificationService.sendToUser(doc.requestedBy, {
       title: "Product Request Rejected",
-      body: doc.storeNote ? `Reason: ${doc.storeNote}` : "Your product request was rejected.",
+      body: note ? `Reason: ${note}` : "Your product request was rejected.",
       type: "request",
       url: "/coworking/mrf",
       tag: `product-request-${doc._id}`,
-    }).catch(() => {});
+    }).catch(() => { });
 
     res.json({ success: true, message: "Request rejected", request: doc });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
@@ -342,8 +582,8 @@ router.get("/:id", async (req, res) => {
   try {
     const mrf = await MRF.findById(req.params.id)
       .populate("requestedFor", "firstName middleName lastName biometricId identityId name department email designation")
-      .populate("approvedBy",   "firstName lastName name")
-      .populate("rejectedBy",   "firstName lastName name")
+      .populate("approvedBy", "firstName lastName name")
+      .populate("rejectedBy", "firstName lastName name")
       .lean();
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
     if (mrf.requestedFor && typeof mrf.requestedFor === "object")
@@ -356,8 +596,8 @@ router.get("/:id", async (req, res) => {
 // ── POST / — employee creates own MRF ────────────────────────────────────────
 router.post("/", async (req, res) => {
   try {
-    const { requestType, deadline, reason="", priority="NORMAL", costCentre="", projectReference="", items } = req.body;
-    if (!["TIME_BASED","USES_BASED"].includes(requestType))
+    const { requestType, deadline, reason = "", priority = "NORMAL", costCentre = "", projectReference = "", items } = req.body;
+    if (!["TIME_BASED", "USES_BASED"].includes(requestType))
       return res.status(400).json({ success: false, message: "Invalid requestType" });
     if (requestType === "TIME_BASED" && !deadline)
       return res.status(400).json({ success: false, message: "Deadline required for TIME_BASED" });
@@ -373,23 +613,23 @@ router.post("/", async (req, res) => {
       $or: [{ _id: actorId }, { biometricId: req.user.id }, { identityId: req.user.id }]
     }).select("firstName middleName lastName name biometricId identityId department").lean();
 
-    const fullName    = buildFullName(employee) || req.user.name || "";
+    const fullName = buildFullName(employee) || req.user.name || "";
     const biometricId = employee?.biometricId || employee?.identityId || "";
 
     const mrf = new MRF({
-      requestedFor:     employee?._id || actorId,
+      requestedFor: employee?._id || actorId,
       requestedForName: fullName,
       requestedForDept: employee?.department || "",
-      requestedForId:   biometricId,
-      creationMode:     "SELF",
-      createdByRef:     employee?._id || actorId,
-      createdByModel:   "Employee",
-      createdByName:    fullName,
+      requestedForId: biometricId,
+      creationMode: "SELF",
+      createdByRef: employee?._id || actorId,
+      createdByModel: "Employee",
+      createdByName: fullName,
       requestType,
       deadline: requestType === "TIME_BASED" ? new Date(deadline) : null,
       reason, priority, costCentre, projectReference,
       status: "PENDING",
-      items:  builtItems,
+      items: builtItems,
     });
     await mrf.save();
     NotificationService.sendToRole(["project_manager", "admin"], {
@@ -397,7 +637,7 @@ router.post("/", async (req, res) => {
       body: `${mrf.mrfNumber} — ${fullName} requested ${builtItems.length} item(s)`,
       url: "/project-manager/dashboard/requests",
       tag: `mrf-${mrf._id}`,
-    }).catch(() => {});
+    }).catch(() => { });
     res.status(201).json({ success: true, message: "MRF created", mrf });
   } catch (e) { console.error("[MRF POST /]", e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -408,13 +648,13 @@ router.post("/bypass", async (req, res) => {
   try {
     const {
       employeeMongoId,   // ← frontend sends this (MongoDB _id of the employee)
-      requestType, deadline, reason="",
-      priority="NORMAL", costCentre="", projectReference="", items,
+      requestType, deadline, reason = "",
+      priority = "NORMAL", costCentre = "", projectReference = "", items,
     } = req.body;
 
     if (!employeeMongoId)
       return res.status(400).json({ success: false, message: "employeeMongoId is required" });
-    if (!["TIME_BASED","USES_BASED"].includes(requestType))
+    if (!["TIME_BASED", "USES_BASED"].includes(requestType))
       return res.status(400).json({ success: false, message: "Invalid requestType" });
     if (requestType === "TIME_BASED" && !deadline)
       return res.status(400).json({ success: false, message: "Deadline required for TIME_BASED" });
@@ -430,24 +670,24 @@ router.post("/bypass", async (req, res) => {
     if (!builtItems.length)
       return res.status(400).json({ success: false, message: "No valid items found" });
 
-    const actorId     = getActorId(req);
+    const actorId = getActorId(req);
     const empFullName = buildFullName(employee);
     const biometricId = employee.biometricId || employee.identityId || "";
 
     const mrf = new MRF({
-      requestedFor:     employee._id,
+      requestedFor: employee._id,
       requestedForName: empFullName,
       requestedForDept: employee.department || "",
-      requestedForId:   biometricId,
-      creationMode:     "BYPASS",
-      createdByRef:     actorId,           // ← PM's ObjectId, not a string
-      createdByModel:   "ProjectManager",
-      createdByName:    req.user.name || "",
+      requestedForId: biometricId,
+      creationMode: "BYPASS",
+      createdByRef: actorId,           // ← PM's ObjectId, not a string
+      createdByModel: "ProjectManager",
+      createdByName: req.user.name || "",
       requestType,
       deadline: requestType === "TIME_BASED" ? new Date(deadline) : null,
       reason, priority, costCentre, projectReference,
-      status:     PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED",
-      items:      builtItems.map(i => ({ ...i, itemStatus: PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED" })),
+      status: PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED",
+      items: builtItems.map(i => ({ ...i, itemStatus: PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED" })),
       ...(PM_APPROVAL_FOR_MRF ? {} : { approvedBy: actorId, approvedAt: new Date() }),
       storeNotes: `Bypass MRF raised by ${req.user.name || "Store"}`,
     });
@@ -457,7 +697,7 @@ router.post("/bypass", async (req, res) => {
       body: `${mrf.mrfNumber} — raised by store for ${empFullName}`,
       url: "/project-manager/dashboard/requests",
       tag: `mrf-${mrf._id}`,
-    }).catch(() => {});
+    }).catch(() => { });
     res.status(201).json({
       success: true,
       message: PM_APPROVAL_FOR_MRF
@@ -497,7 +737,7 @@ router.patch("/:id/approve", async (req, res) => {
     if (mrf.items.every(i => i.itemStatus === "REJECTED"))
       return res.status(400).json({ success: false, message: "At least one item must be approved." });
 
-    mrf.status     = "APPROVED";
+    mrf.status = "APPROVED";
     mrf.approvedBy = getActorId(req);
     mrf.approvedAt = new Date();
     await mrf.save();
@@ -516,12 +756,12 @@ router.patch("/:id/reject", async (req, res) => {
     }
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
-    if (!["PENDING","APPROVED"].includes(mrf.status))
+    if (!["PENDING", "APPROVED"].includes(mrf.status))
       return res.status(400).json({ success: false, message: `Cannot reject — status is ${mrf.status}` });
 
-    mrf.status        = "REJECTED";
-    mrf.rejectedBy    = getActorId(req);
-    mrf.rejectedAt    = new Date();
+    mrf.status = "REJECTED";
+    mrf.rejectedBy = getActorId(req);
+    mrf.rejectedAt = new Date();
     mrf.rejectionNote = req.body.rejectionNote || "";
     mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED"; });
     await mrf.save();
@@ -534,13 +774,13 @@ router.patch("/:id/cancel", async (req, res) => {
   try {
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
-    if (!["PENDING","APPROVED"].includes(mrf.status))
+    if (!["PENDING", "APPROVED"].includes(mrf.status))
       return res.status(400).json({ success: false, message: "Only PENDING or APPROVED MRFs can be cancelled" });
 
-    mrf.status           = "CANCELLED";
-    mrf.cancelledBy      = getActorId(req);
+    mrf.status = "CANCELLED";
+    mrf.cancelledBy = getActorId(req);
     mrf.cancelledByModel = req.user.role === "employee" ? "Employee" : "ProjectManager";
-    mrf.cancelledAt      = new Date();
+    mrf.cancelledAt = new Date();
     mrf.cancellationNote = req.body.cancellationNote || "";
     mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED"; });
     await mrf.save();
@@ -551,7 +791,7 @@ router.patch("/:id/cancel", async (req, res) => {
 // ── POST /:id/issue ───────────────────────────────────────────────────────────
 router.post("/:id/issue", async (req, res) => {
   try {
-    const { items=[], storeNotes="" } = req.body;
+    const { items = [], storeNotes = "" } = req.body;
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
 
@@ -563,11 +803,11 @@ router.post("/:id/issue", async (req, res) => {
       });
     }
 
-    if (!["APPROVED","PARTIALLY_ISSUED"].includes(mrf.status))
+    if (!["APPROVED", "PARTIALLY_ISSUED"].includes(mrf.status))
       return res.status(400).json({ success: false, message: `Cannot issue — status is ${mrf.status}` });
 
     for (const line of items) {
-      const mrfItem   = mrf.items.id(line.itemId);
+      const mrfItem = mrf.items.id(line.itemId);
       if (!mrfItem) continue;
       const issuedQty = parseFloat(line.issuedQty) || 0;
       if (issuedQty <= 0) continue;
@@ -576,29 +816,29 @@ router.post("/:id/issue", async (req, res) => {
       await adjustStock(
         mrfItem.rawItem, mrfItem.variantId, mrfItem.variantCombination, -deductQty,
         {
-          type:        mrfItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
-          quantity:    deductQty,
-          reason:      `MRF Issue — ${mrf.mrfNumber}`,
-          notes:       `Issued to ${mrf.requestedForName} (${mrf.requestedForDept}). MRF: ${mrf.mrfNumber}`,
+          type: mrfItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
+          quantity: deductQty,
+          reason: `MRF Issue — ${mrf.mrfNumber}`,
+          notes: `Issued to ${mrf.requestedForName} (${mrf.requestedForDept}). MRF: ${mrf.mrfNumber}`,
           performedBy: getActorId(req),
         }
       );
-      mrfItem.issuedQty   += issuedQty;
-      mrfItem.consumedQty  = mrfItem.issuedQty - mrfItem.returnedQty;
-      mrfItem.itemStatus   = "ISSUED";
+      mrfItem.issuedQty += issuedQty;
+      mrfItem.consumedQty = mrfItem.issuedQty - mrfItem.returnedQty;
+      mrfItem.itemStatus = mrfItem.issuedQty >= mrfItem.requestedQty - 0.001 ? "ISSUED" : "PARTIALLY_ISSUED";
       if (line.storeNotes) mrfItem.storeNotes = line.storeNotes;
       mrfItem.issueHistory = mrfItem.issueHistory || [];
       mrfItem.issueHistory.push({
         issuedQty,
-        notes:      line.storeNotes || storeNotes || "",
+        notes: line.storeNotes || storeNotes || "",
         recordedBy: getActorId(req),
         recordedAt: new Date(),
       });
     }
 
     if (storeNotes) mrf.storeNotes = storeNotes;
-    const allIssued  = mrf.items.every(i => ["ISSUED","REJECTED"].includes(i.itemStatus));
-    const someIssued = mrf.items.some(i => i.itemStatus === "ISSUED");
+    const allIssued = mrf.items.every(i => ["ISSUED", "REJECTED"].includes(i.itemStatus));
+    const someIssued = mrf.items.some(i => ["ISSUED", "PARTIALLY_ISSUED"].includes(i.itemStatus));
     mrf.status = allIssued ? "ISSUED" : someIssued ? "PARTIALLY_ISSUED" : mrf.status;
     await mrf.save();
 
@@ -609,7 +849,7 @@ router.post("/:id/issue", async (req, res) => {
         type: "request",
         url: "/coworking",
         tag: `mrf-${mrf._id}`,
-      }).catch(() => {});
+      }).catch(() => { });
     }
 
     res.json({ success: true, message: "Materials issued", mrf });
@@ -619,7 +859,7 @@ router.post("/:id/issue", async (req, res) => {
 // ── POST /:id/items/:itemId/return ────────────────────────────────────────────
 router.post("/:id/items/:itemId/return", async (req, res) => {
   try {
-    const { returnedQty, notes="" } = req.body;
+    const { returnedQty, notes = "" } = req.body;
     const qty = parseFloat(returnedQty) || 0;
     if (qty <= 0) return res.status(400).json({ success: false, message: "returnedQty must be > 0" });
 
@@ -636,16 +876,16 @@ router.post("/:id/items/:itemId/return", async (req, res) => {
     await adjustStock(
       mrfItem.rawItem, mrfItem.variantId, mrfItem.variantCombination, +creditQty,
       {
-        type:        mrfItem.variantId ? "VARIANT_ADD" : "ADD",
-        quantity:    creditQty,
-        reason:      `MRF Return — ${mrf.mrfNumber}`,
-        notes:       notes || `Return from ${mrf.requestedForName}. MRF: ${mrf.mrfNumber}`,
+        type: mrfItem.variantId ? "VARIANT_ADD" : "ADD",
+        quantity: creditQty,
+        reason: `MRF Return — ${mrf.mrfNumber}`,
+        notes: notes || `Return from ${mrf.requestedForName}. MRF: ${mrf.mrfNumber}`,
         performedBy: getActorId(req),
       }
     );
 
     mrfItem.returnedQty += qty;
-    mrfItem.consumedQty  = mrfItem.issuedQty - mrfItem.returnedQty;
+    mrfItem.consumedQty = mrfItem.issuedQty - mrfItem.returnedQty;
     mrfItem.returnHistory.push({
       returnedQty: qty, notes,
       recordedBy: getActorId(req), recordedByModel: "ProjectManager",
@@ -653,10 +893,10 @@ router.post("/:id/items/:itemId/return", async (req, res) => {
     });
 
     const fullyReturned = mrfItem.returnedQty >= mrfItem.issuedQty - 0.001;
-    mrfItem.itemStatus  = fullyReturned ? "RETURNED" : "PARTIALLY_RETURNED";
+    mrfItem.itemStatus = fullyReturned ? "RETURNED" : "PARTIALLY_RETURNED";
 
-    const allReturned  = mrf.items.every(i => ["RETURNED","REJECTED"].includes(i.itemStatus));
-    const someReturned = mrf.items.some(i => ["RETURNED","PARTIALLY_RETURNED"].includes(i.itemStatus));
+    const allReturned = mrf.items.every(i => ["RETURNED", "REJECTED"].includes(i.itemStatus));
+    const someReturned = mrf.items.some(i => ["RETURNED", "PARTIALLY_RETURNED"].includes(i.itemStatus));
     mrf.status = allReturned ? "COMPLETED" : someReturned ? "PARTIALLY_RETURNED" : mrf.status;
 
     await mrf.save();
@@ -674,35 +914,35 @@ router.get("/:id/stock-check", async (req, res) => {
       )
       .populate("approvedBy", "firstName lastName name")
       .lean();
- 
+
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
- 
+
     // Attach resolved full name
     if (mrf.requestedFor && typeof mrf.requestedFor === "object") {
       mrf.requestedFor._fullName = buildFullName(mrf.requestedFor);
     }
- 
+
     // Mark overdue flag (reuse existing helper)
     markOverdue([mrf]);
- 
+
     // ── Live stock lookup for each item ──────────────────────────────────
     const rawItemIds = [
       ...new Set(mrf.items.map(i => i.rawItem?.toString()).filter(Boolean)),
     ];
- 
+
     const rawDocs = rawItemIds.length
       ? await RawItem.find({ _id: { $in: rawItemIds } })
-          .select("name quantity unit customUnit variants minStock")
-          .lean()
+        .select("name quantity unit customUnit variants minStock")
+        .lean()
       : [];
- 
+
     const rawDocMap = new Map(rawDocs.map(r => [r._id.toString(), r]));
- 
+
     const itemsWithStock = mrf.items.map(item => {
       const doc = rawDocMap.get(item.rawItem?.toString());
       let available = null;
-      let minStock  = 0;
- 
+      let minStock = 0;
+
       if (doc) {
         // Variant-level stock first
         if (item.variantId && Array.isArray(doc.variants)) {
@@ -711,30 +951,30 @@ router.get("/:id/stock-check", async (req, res) => {
           );
           if (v) {
             available = v.quantity ?? 0;
-            minStock  = v.minStock ?? doc.minStock ?? 0;
+            minStock = v.minStock ?? doc.minStock ?? 0;
           }
         }
         // Fall back to product-level stock
         if (available === null) {
           available = doc.quantity ?? 0;
-          minStock  = doc.minStock ?? 0;
+          minStock = doc.minStock ?? 0;
         }
       }
- 
-      const requestedQty     = item.requestedQty || 0;
-      const issuedQty        = item.issuedQty    || 0;
-      const returnedQty      = item.returnedQty  || 0;
-      const shortfall        = available !== null ? Math.max(0, requestedQty - available) : null;
+
+      const requestedQty = item.requestedQty || 0;
+      const issuedQty = item.issuedQty || 0;
+      const returnedQty = item.returnedQty || 0;
+      const shortfall = available !== null ? Math.max(0, requestedQty - available) : null;
       const remainingToIssue = Math.max(0, requestedQty - issuedQty);
- 
+
       let stockStatus = "unknown";
       if (available !== null) {
-        if (available <= 0)              stockStatus = "out_of_stock";
-        else if (shortfall > 0)          stockStatus = "shortage";
+        if (available <= 0) stockStatus = "out_of_stock";
+        else if (shortfall > 0) stockStatus = "shortage";
         else if (available - requestedQty <= minStock) stockStatus = "low";
-        else                             stockStatus = "ok";
+        else stockStatus = "ok";
       }
- 
+
       return {
         ...item,
         // Live stock fields appended
@@ -746,12 +986,33 @@ router.get("/:id/stock-check", async (req, res) => {
         returnedQty,
       };
     });
- 
+
+    // If this MRF was spawned from a product-request match/approve, find
+    // that source so the page can link back to it — that's where "Edit
+    // Match" lives, and there's otherwise no trail back to it once resolved.
+    let sourceProductRequest = null;
+    const sourceDoc = await RawItemAddRequest.findOne({ "products.spawnedMrf": req.params.id })
+      .select("products requestedByName")
+      .lean();
+    if (sourceDoc) {
+      const sourceProduct = (sourceDoc.products || []).find(
+        p => p.spawnedMrf && p.spawnedMrf.toString() === req.params.id
+      );
+      if (sourceProduct) {
+        sourceProductRequest = {
+          id: sourceDoc._id,
+          itemName: sourceProduct.itemName,
+          requestedByName: sourceDoc.requestedByName,
+        };
+      }
+    }
+
     return res.json({
       success: true,
       mrf,
       itemsWithStock,
       pmApprovalRequired: PM_APPROVAL_FOR_MRF,
+      sourceProductRequest,
     });
   } catch (err) {
     console.error("MRF stock-check error:", err);
