@@ -2641,4 +2641,28 @@ router.get("/", async (req, res) => {
   }
 });
 
+// DELETE /api/cms/measurements/:measurementId/employees/:employeeId
+// Removes a single employee from an existing session without touching the rest.
+router.delete("/:measurementId/employees/:employeeId", async (req, res) => {
+  try {
+    const { measurementId, employeeId } = req.params;
+    const measurement = await Measurement.findById(measurementId);
+    if (!measurement) return res.status(404).json({ success: false, message: "Session not found" });
+    if (measurement.convertedToPO || measurement.poRequestId)
+      return res.status(400).json({ success: false, message: "Cannot modify a session already converted to PO" });
+
+    measurement.employeeMeasurements = measurement.employeeMeasurements.filter(
+      (e) => e.employeeId?.toString() !== employeeId
+    );
+    measurement.registeredEmployeeIds = (measurement.registeredEmployeeIds || []).filter(
+      (id) => id.toString() !== employeeId
+    );
+    await measurement.save();
+
+    res.json({ success: true, message: "Person removed from session" });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 module.exports = router;
