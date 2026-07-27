@@ -62,7 +62,7 @@ const scheduledWorkOrderSchema = new mongoose.Schema(
       default: false,
     },
   },
-  { _id: true, timestamps: true }
+  { _id: true, timestamps: true },
 );
 
 // Break configuration schema
@@ -90,7 +90,7 @@ const breakConfigSchema = new mongoose.Schema(
       default: true,
     },
   },
-  { _id: true }
+  { _id: true },
 );
 
 // Work hours configuration
@@ -117,7 +117,7 @@ const workHoursSchema = new mongoose.Schema(
       default: false,
     },
   },
-  { _id: false }
+  { _id: false },
 );
 
 // Main production schedule schema
@@ -146,6 +146,15 @@ const productionScheduleSchema = new mongoose.Schema(
       default: false,
     },
     isSaturdayOverride: {
+      type: Boolean,
+      default: false,
+    },
+    // Production overriding an HR company holiday for THIS day only.
+    // HR owns the holiday calendar and it is applied as a read-time overlay,
+    // so without a stored flag the overlay would keep forcing the day closed
+    // and the Active Day switch would silently revert on every fetch.
+    // Setting this does not change anything on HR's side.
+    holidayOverride: {
       type: Boolean,
       default: false,
     },
@@ -215,7 +224,7 @@ const productionScheduleSchema = new mongoose.Schema(
     timestamps: true,
     toJSON: { virtuals: true },
     toObject: { virtuals: true },
-  }
+  },
 );
 
 // Indexes
@@ -227,7 +236,10 @@ productionScheduleSchema.index({
 
 // Calculate available minutes
 productionScheduleSchema.methods.calculateAvailableMinutes = function () {
-  if (!this.workHours.isActive || this.isHoliday) {
+  // An overridden company holiday is a normal working day for production.
+  const closed = this.isHoliday && !this.holidayOverride;
+
+  if (!this.workHours.isActive || closed) {
     this.availableMinutes = 0;
     return 0;
   }
@@ -236,7 +248,7 @@ productionScheduleSchema.methods.calculateAvailableMinutes = function () {
   const allBreaks = [...(this.defaultBreaks || []), ...(this.breaks || [])];
   const breakMinutes = allBreaks.reduce(
     (sum, br) => sum + (br.durationMinutes || 0),
-    0
+    0,
   );
 
   this.availableMinutes = Math.max(0, totalMinutes - breakMinutes);
@@ -247,7 +259,7 @@ productionScheduleSchema.methods.calculateAvailableMinutes = function () {
 productionScheduleSchema.methods.calculateScheduledMinutes = function () {
   const scheduled = (this.scheduledWorkOrders || []).reduce(
     (sum, wo) => sum + (wo.durationMinutes || 0),
-    0
+    0,
   );
   this.scheduledMinutes = scheduled;
   return scheduled;
