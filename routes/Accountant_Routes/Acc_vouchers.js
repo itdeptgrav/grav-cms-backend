@@ -171,6 +171,96 @@ async function applyLedgerBalances(voucher, direction = 1, session = null) {
     }
   }
 }
+// writePaymentToPO — mirror a POSTED payment voucher onto the CMS PO's
+// payments[] + paymentStatus, in the shape the Store dept reads. Idempotent
+// via accountantVoucherId; PO model is strict:false so extra fields persist.
+async function writePaymentToPO(voucher) {
+  if (
+    !voucher ||
+    voucher.voucherType !== "payment" ||
+    voucher.status !== "posted" ||
+    !voucher.purchaseOrderId
+  )
+    return;
+  let PurchaseOrder;
+  try {
+    PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+  } catch {
+    return;
+  }
+  const po = await PurchaseOrder.findById(voucher.purchaseOrderId);
+  if (!po) return;
+  const partyLeg = (voucher.ledgerEntries || []).find(
+    (e) => e.isPartyLedger && e.type === "Dr",
+  );
+  const applied =
+    Number(voucher.poAppliedAmount) ||
+    Number(partyLeg && partyLeg.amount) ||
+    Number(voucher.grandTotal) ||
+    0;
+  if (applied <= 0) return;
+  po.payments = po.payments || [];
+  const methodMap = {
+    cash: "CASH",
+    cheque: "CHEQUE",
+    neft: "BANK_TRANSFER",
+    rtgs: "BANK_TRANSFER",
+    imps: "BANK_TRANSFER",
+    upi: "ONLINE",
+    card: "ONLINE",
+    online: "ONLINE",
+    other: "OTHER",
+  };
+  const row = {
+    amount: Number(applied.toFixed(2)),
+    paymentMethod: methodMap[voucher.paymentMode] || "BANK_TRANSFER",
+    referenceNumber: voucher.instrumentNumber || voucher.voucherNumber || "",
+    paymentDate: voucher.voucherDate || new Date(),
+    date: voucher.voucherDate || new Date(),
+    notes: `Accountant voucher ${voucher.voucherNumber}`,
+    accountantVoucherId: voucher._id,
+    recordedVia: "accountant",
+  };
+  const ex = po.payments.find(
+    (p) => String(p.accountantVoucherId || "") === String(voucher._id),
+  );
+  if (ex) Object.assign(ex, row);
+  else po.payments.unshift(row);
+  const paid = po.payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  po.paymentStatus =
+    paid >= (Number(po.totalAmount) || 0)
+      ? "COMPLETED"
+      : paid > 0
+        ? "PARTIAL"
+        : "PENDING";
+  await po.save();
+}
+
+async function removePaymentFromPO(voucher) {
+  if (!voucher || voucher.voucherType !== "payment" || !voucher.purchaseOrderId)
+    return;
+  let PurchaseOrder;
+  try {
+    PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+  } catch {
+    return;
+  }
+  const po = await PurchaseOrder.findById(voucher.purchaseOrderId);
+  if (!po || !Array.isArray(po.payments)) return;
+  const before = po.payments.length;
+  po.payments = po.payments.filter(
+    (p) => String(p.accountantVoucherId || "") !== String(voucher._id),
+  );
+  if (po.payments.length === before) return;
+  const paid = po.payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  po.paymentStatus =
+    paid >= (Number(po.totalAmount) || 0)
+      ? "COMPLETED"
+      : paid > 0
+        ? "PARTIAL"
+        : "PENDING";
+  await po.save();
+}
 
 /* ------------------------------------------------------------------ */
 /* GET /cash-bank-ledgers                                              */
@@ -414,6 +504,38 @@ router.get("/", auth, async (req, res) => {
         if (firstDr) {
           v.partyLedgerName = firstDr.ledgerName || "";
         }
+      }
+    }
+
+    if (voucherType === "purchase" && items.length) {
+      const billNames = items
+        .flatMap((v) => [v.voucherNumber, v.referenceNumber])
+        .filter(Boolean);
+      const poIds = items.map((v) => v.purchaseOrderId).filter(Boolean);
+      const payments = await Acc_Voucher.find({
+        companyId,
+        voucherType: "payment",
+        status: "posted",
+        $or: [
+          { "ledgerEntries.billAllocations.billName": { $in: billNames } },
+          ...(poIds.length ? [{ purchaseOrderId: { $in: poIds } }] : []),
+        ],
+      })
+        .select("ledgerEntries purchaseOrderId")
+        .lean();
+      const paidBillNames = new Set();
+      const paidPOs = new Set();
+      for (const p of payments) {
+        if (p.purchaseOrderId) paidPOs.add(String(p.purchaseOrderId));
+        for (const e of p.ledgerEntries || [])
+          for (const a of e.billAllocations || [])
+            if (a.billName) paidBillNames.add(a.billName);
+      }
+      for (const v of items) {
+        v.isPaid =
+          paidBillNames.has(v.voucherNumber) ||
+          paidBillNames.has(v.referenceNumber) ||
+          (v.purchaseOrderId && paidPOs.has(String(v.purchaseOrderId)));
       }
     }
 
@@ -1102,7 +1224,7 @@ router.get("/unpaid-bills", auth, async (req, res) => {
     })
       .sort({ voucherDate: 1 })
       .select(
-        "voucherNumber voucherDate referenceNumber referenceDate dueDate grandTotal",
+        "voucherNumber voucherDate referenceNumber referenceDate dueDate grandTotal purchaseOrderId purchaseOrderNumber",
       )
       .limit(200)
       .lean();
@@ -1410,6 +1532,29 @@ router.get("/po-lookup", auth, async (req, res) => {
         },
       ]);
       billMap = new Map(billed.map((b) => [String(b._id), b]));
+
+      const paid = await Acc_Voucher.aggregate([
+        {
+          $match: {
+            purchaseOrderId: { $in: poIds },
+            voucherType: "payment",
+            status: "posted",
+          },
+        },
+        {
+          $group: {
+            _id: "$purchaseOrderId",
+            paidAmount: { $sum: "$grandTotal" },
+            paymentCount: { $sum: 1 },
+          },
+        },
+      ]);
+      for (const p of paid) {
+        const row = billMap.get(String(p._id)) || {};
+        row.paidAmount = p.paidAmount;
+        row.paymentCount = p.paymentCount;
+        billMap.set(String(p._id), row);
+      }
     }
 
     const result = pos.map((po) => ({
@@ -1439,6 +1584,15 @@ router.get("/po-lookup", auth, async (req, res) => {
           voucherCount: b.voucherCount || 0,
           postedVoucherCount: b.postedCount || 0,
           billingStatus,
+          paidAmount: b.paidAmount || 0,
+          remainingToPay: Math.max(total - (b.paidAmount || 0), 0),
+          paymentCount: b.paymentCount || 0,
+          paymentStatusComputed:
+            (b.paidAmount || 0) >= total * 0.99
+              ? "PAID"
+              : (b.paidAmount || 0) > 0
+                ? "PARTIALLY_PAID"
+                : "UNPAID",
         };
       })(),
       vendor: po.vendor
@@ -1506,16 +1660,42 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
     // billed total below, so cancelling releases the PO back to billable.
     const vouchers = await Acc_Voucher.find({ purchaseOrderId: po._id })
       .select(
-        "voucherNumber voucherDate grandTotal status partyLedgerName partyLedgerId referenceNumber referenceDate totalTax subtotal dueDate createdAt",
+        "voucherNumber voucherDate grandTotal status partyLedgerName partyLedgerId referenceNumber referenceDate totalTax subtotal dueDate createdAt inventoryEntries voucherType paymentMode instrumentNumber",
       )
       .sort({ voucherDate: -1, createdAt: -1 })
       .lean();
 
-    const billedAmount = vouchers
+    const billingVouchers = vouchers.filter(
+      (v) => v.voucherType === "purchase" || !v.voucherType,
+    );
+    const paymentVouchers = vouchers.filter((v) => v.voucherType === "payment");
+
+    const billedItems = [];
+    for (const v of billingVouchers) {
+      if (v.status !== "posted") continue;
+      for (const e of v.inventoryEntries || []) {
+        billedItems.push({
+          voucherNumber: v.voucherNumber,
+          voucherDate: v.voucherDate,
+          itemName: e.stockItemName || e.chargeDescription || "\u2014",
+          quantity: e.quantity || 0,
+          unit: e.unit || "",
+          rate: e.rate || 0,
+          amount: e.amount || 0,
+          taxRate: e.taxRate || 0,
+          isCharge: !!e.isCharge,
+        });
+      }
+    }
+
+    const billedAmount = billingVouchers
       .filter((v) => v.status === "posted")
       .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
-    const pendingBillAmount = vouchers
+    const pendingBillAmount = billingVouchers
       .filter((v) => ["draft", "pending_approval"].includes(v.status))
+      .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
+    const paidThroughBooks = paymentVouchers
+      .filter((v) => v.status === "posted")
       .reduce((s, v) => s + (Number(v.grandTotal) || 0), 0);
 
     const total = Number(po.totalAmount) || 0;
@@ -1615,6 +1795,15 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
         billingStatus,
         poPaid,
         poRemaining: Math.max(total - poPaid, 0),
+        paidThroughBooks,
+        booksRemaining: Math.max(total - paidThroughBooks, 0),
+        paymentStatusComputed:
+          paidThroughBooks >= total * 0.99
+            ? "PAID"
+            : paidThroughBooks > 0
+              ? "PARTIALLY_PAID"
+              : "UNPAID",
+        billedItems,
         deliveries,
         openReturns,
         // Ageing — how long this PO has sat unbilled since delivery. The
@@ -1628,7 +1817,8 @@ router.get("/po-detail/:poId", auth, async (req, res) => {
           (po.totalPending || 0) > 0 &&
           new Date(po.expectedDeliveryDate) < new Date(),
       },
-      vouchers,
+      vouchers: billingVouchers,
+      paymentVouchers,
     });
   } catch (e) {
     console.error("[po-detail]", e);
@@ -2021,6 +2211,163 @@ router.get("/roundoff-ledger", auth, async (req, res) => {
   }
 });
 
+/* GET /payment-match-candidates — purchase vouchers a payment can settle    */
+/* MUST be declared BEFORE router.get("/:id") — it's a literal path.         */
+router.get("/payment-match-candidates", auth, async (req, res) => {
+  try {
+    const { companyId, q, partyLedgerId } = req.query;
+    if (!companyId)
+      return res.status(400).json({ error: "companyId required" });
+
+    const filter = { companyId, voucherType: "purchase", status: "posted" };
+    if (partyLedgerId) filter.partyLedgerId = partyLedgerId;
+    if (q) {
+      const rx = new RegExp(
+        String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i",
+      );
+      filter.$or = [
+        { voucherNumber: rx },
+        { referenceNumber: rx },
+        { partyLedgerName: rx },
+        { purchaseOrderNumber: rx },
+      ];
+    }
+
+    const bills = await Acc_Voucher.find(filter)
+      .select(
+        "voucherNumber voucherDate grandTotal partyLedgerName partyLedgerId referenceNumber purchaseOrderId purchaseOrderNumber",
+      )
+      .sort({ voucherDate: -1 })
+      .limit(100)
+      .lean();
+
+    res.json({ candidates: bills });
+  } catch (e) {
+    console.error("[payment-match-candidates]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* POST /:id/match-payment — link a PAYMENT voucher to a purchase voucher,    */
+/* inheriting that bill's PO so the PO's paymentStatus updates.               */
+/* Body: { purchaseVoucherId }  — pass null to UNLINK.                        */
+router.post("/:id/match-payment", auth, async (req, res) => {
+  try {
+    const payment = await Acc_Voucher.findById(req.params.id);
+    if (!payment) return res.status(404).json({ error: "Voucher not found" });
+    if (payment.voucherType !== "payment")
+      return res
+        .status(400)
+        .json({ error: "Only payment vouchers can be matched this way." });
+    if (["cancelled", "void"].includes(payment.status))
+      return res
+        .status(400)
+        .json({ error: `Cannot match a ${payment.status} voucher.` });
+
+    const perms = req.user?.permissions || {};
+    const role = req.user?.role;
+    if (role === "viewer" || perms.canEdit === false)
+      return res
+        .status(403)
+        .json({ error: "Read-only access — you can't match payments." });
+    const canActDirectly =
+      perms.canPostDirectly ||
+      ["owner", "approver", "admin", "accountant"].includes(role);
+
+    const { purchaseVoucherId } = req.body || {};
+    const isUnlink = !purchaseVoucherId;
+
+    let poId = null,
+      poNumber = "";
+    if (!isUnlink) {
+      const bill = await Acc_Voucher.findById(purchaseVoucherId)
+        .select("purchaseOrderId purchaseOrderNumber voucherType")
+        .lean();
+      if (!bill || bill.voucherType !== "purchase")
+        return res.status(404).json({ error: "Purchase voucher not found." });
+      if (!bill.purchaseOrderId)
+        return res.status(400).json({
+          error:
+            "That bill isn't linked to any purchase order yet. Match the bill to a PO first, then match this payment.",
+        });
+      poId = bill.purchaseOrderId;
+      poNumber = bill.purchaseOrderNumber || "";
+    }
+
+    if (!canActDirectly && payment.status === "posted") {
+      if (!req.user?.organizationId)
+        return res
+          .status(403)
+          .json({ error: "Your role can't modify posted vouchers." });
+      const {
+        Acc_ApprovalRequest,
+      } = require("../../models/Accountant_model/Acc_OrgModels");
+      const dup = await Acc_ApprovalRequest.findOne({
+        organizationId: req.user.organizationId,
+        kind: "voucher",
+        action: "match_payment",
+        "target.id": payment._id,
+        status: "pending",
+      });
+      if (dup)
+        return res
+          .status(200)
+          .json({ _pendingApproval: true, message: "Already pending." });
+      await Acc_ApprovalRequest.create({
+        organizationId: req.user.organizationId,
+        companyId: payment.companyId,
+        kind: "voucher",
+        action: "match_payment",
+        title: isUnlink
+          ? `Unlink payment ${payment.voucherNumber} from its PO`
+          : `Match payment ${payment.voucherNumber} -> PO ${poNumber}`,
+        target: { collection: "Acc_Voucher", id: payment._id },
+        payload: {
+          purchaseOrderId: isUnlink ? null : String(poId),
+          purchaseOrderNumber: isUnlink ? null : poNumber,
+          unlink: isUnlink,
+        },
+        requestedBy: req.user.id,
+        requestedByName: req.user.name || "",
+        status: "pending",
+      });
+      return res.status(202).json({
+        _pendingApproval: true,
+        message: "Match request sent for approval.",
+      });
+    }
+
+    await removePaymentFromPO(payment).catch(() => {});
+    if (isUnlink) {
+      payment.purchaseOrderId = undefined;
+      payment.purchaseOrderNumber = "";
+      payment.poAppliedAmount = undefined;
+    } else {
+      payment.purchaseOrderId = poId;
+      payment.purchaseOrderNumber = poNumber;
+      payment.poAppliedAmount = undefined;
+    }
+    payment.updatedBy = req.user?.id;
+    await payment.save();
+    await writePaymentToPO(payment).catch((e) =>
+      console.error("[match-payment writeback]", e.message),
+    );
+
+    res.json({
+      success: true,
+      message: isUnlink
+        ? `Unlinked ${payment.voucherNumber}.`
+        : `Matched ${payment.voucherNumber} to PO ${poNumber}.`,
+      purchaseOrderId: payment.purchaseOrderId || null,
+      purchaseOrderNumber: payment.purchaseOrderNumber || "",
+    });
+  } catch (e) {
+    console.error("[match-payment]", e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
 /* ------------------------------------------------------------------ */
 /* Get one                                                             */
 /* ------------------------------------------------------------------ */
@@ -2224,6 +2571,9 @@ router.post("/", auth, async (req, res) => {
       voucher.postedAt = new Date();
       await voucher.save();
       await applyLedgerBalances(voucher, +1);
+      await writePaymentToPO(voucher).catch((e) =>
+        console.error("[PO payment writeback]", e.message),
+      );
     }
 
     res.status(201).json(voucher);
@@ -2394,6 +2744,9 @@ router.put("/:id", auth, async (req, res) => {
     // Re-apply balances if it remains posted.
     if (wasPosted) {
       await applyLedgerBalances(existing, +1);
+      await writePaymentToPO(existing).catch((e) =>
+        console.error("[PO payment writeback]", e.message),
+      );
     }
 
     res.json(existing);
@@ -2428,6 +2781,9 @@ router.post("/:id/post", auth, async (req, res) => {
     await applyLedgerBalances(voucher, +1, session);
 
     await session.commitTransaction();
+    await writePaymentToPO(voucher).catch((e) =>
+      console.error("[PO payment writeback]", e.message),
+    );
     res.json(voucher);
   } catch (e) {
     await session.abortTransaction();
@@ -2509,6 +2865,9 @@ router.post("/:id/cancel", auth, async (req, res) => {
       v.updatedBy = req.user?.id;
       await v.save({ session });
       await session.commitTransaction();
+      await removePaymentFromPO(v).catch((e) =>
+        console.error("[PO payment reversal]", e.message),
+      );
       res.json(v);
     } catch (e) {
       await session.abortTransaction();
@@ -2584,6 +2943,9 @@ router.post("/:id/void", auth, async (req, res) => {
     voucher.status = "void";
     voucher.updatedBy = req.user?.id;
     await voucher.save();
+    await removePaymentFromPO(voucher).catch((e) =>
+      console.error("[PO payment reversal]", e.message),
+    );
     res.json(voucher);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -2626,6 +2988,9 @@ router.post("/:id/approve", auth, async (req, res) => {
     await applyLedgerBalances(voucher, +1, session);
 
     await session.commitTransaction();
+    await writePaymentToPO(voucher).catch((e) =>
+      console.error("[PO payment writeback]", e.message),
+    );
     res.json(voucher);
   } catch (e) {
     try {
@@ -2728,3 +3093,5 @@ router.get("/summary/by-type", auth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.writePaymentToPO = writePaymentToPO;
+module.exports.removePaymentFromPO = removePaymentFromPO;

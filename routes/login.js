@@ -27,6 +27,7 @@ const ProductionSupervisorDepartment = require("../models/ProductionSupervisorDe
 const QCDepartment = require("../models/QCDepartment");
 const CEODepartment = require("../models/CEODepartment");
 const StoreDepartment = require("../models/StoreDepartment"); // ✅ NEW
+const EmbroideryDepartment = require("../models/EmbroideryDepartment");
 
 router.post("/login", async (req, res) => {
   try {
@@ -87,6 +88,13 @@ router.post("/login", async (req, res) => {
                           email: email.toLowerCase(),
                         });
                         if (user) userModel = "store";
+                        else {
+                          // ✅ NEW: Embroidery
+                          user = await EmbroideryDepartment.findOne({
+                            email: email.toLowerCase(),
+                          });
+                          if (user) userModel = "embroidery";
+                        }
                       }
                     }
                   }
@@ -151,6 +159,8 @@ router.post("/login", async (req, res) => {
     if (user.role === "quality_control") redirectPath = "/qc/dashboard";
     if (user.role === "store_manager")
       redirectPath = "/store/dashboard/overview"; // ✅ NEW
+    if (user.role === "embroidery")
+      redirectPath = "/embroidery/dashboard/overview"; // ✅ NEW
 
     res.status(200).json({
       success: true,
@@ -228,8 +238,10 @@ router.post("/verify", async (req, res) => {
       case "qc":
         user = await QCDepartment.findById(decoded.id).select("-password");
         break;
-      case "store":
-        user = await StoreDepartment.findById(decoded.id).select("-password");
+      case "embroidery":
+        user = await EmbroideryDepartment.findById(decoded.id).select(
+          "-password",
+        );
         break; // ✅ NEW
       default:
         user = await HRDepartment.findById(decoded.id).select("-password");
