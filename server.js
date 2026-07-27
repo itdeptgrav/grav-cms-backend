@@ -451,6 +451,7 @@ connectDB().then(async () => {
   await createDefaultCuttingMaster();
   seedQCUser();
   seedCEOUser();
+  seedEmbroideryUser();
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
@@ -464,6 +465,7 @@ const StockItemForVariant = require("./models/CMS_Models/Inventory/Products/Stoc
 const ProductionSupervisorDepartment = require("./models/ProductionSupervisorDepartment");
 const QCDepartment = require("./models/QCDepartment");
 const CEODepartment = require("./models/CEODepartment");
+const EmbroideryDepartment = require("./models/EmbroideryDepartment");
 
 const createDefaultCuttingMaster = async () => {
   try {
@@ -543,6 +545,35 @@ const seedQCUser = async () => {
     console.error("❌ QC seed error:", err);
   }
 };
+
+// ✅ Auto-create default Embroidery user
+const seedEmbroideryUser = async () => {
+  try {
+    const existing = await EmbroideryDepartment.findOne({
+      email: "embroidery@grav.in",
+    });
+    if (existing) {
+      console.log("ℹ️  Embroidery user already exists: embroidery@grav.in");
+      return;
+    }
+    await EmbroideryDepartment.create({
+      name: "Embroidery Supervisor",
+      email: "embroidery@grav.in",
+      password: "Emb@12345",
+      employeeId: "EMB001",
+      phone: "",
+      department: "Embroidery",
+      role: "embroidery",
+      isActive: true,
+    });
+    console.log(
+      "✅ Seeded default Embroidery user: embroidery@grav.in / Emb@12345 (EMB001)",
+    );
+  } catch (err) {
+    console.error("❌ Embroidery seed error:", err);
+  }
+};
+
 
 async function createDefaultProductionSupervisor() {
   try {
@@ -920,6 +951,9 @@ app.use("/api/cms/measurements", measurementRoutes);
 
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
+
+const embroideryRoutes = require("./routes/CMS_Routes/Manufacturing/Embroidery/embroideryRoutes");
+app.use("/api/cms/manufacturing/embroidery", embroideryRoutes);
 
 app.use(
   "/api/cms/measurement-categories",
