@@ -9,9 +9,19 @@ const admin = require("firebase-admin");
 
 const webpush = require("web-push");
 
-// VAPID keys — must match NEXT_PUBLIC_FIREBASE_VAPID_KEY on frontend
-// Get these from Firebase Console → Project Settings → Cloud Messaging → Web Push certificates
-const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || process.env.VAPID_PUBLIC_KEY || "";
+// VAPID keys for the raw web-push fallback (iOS PWA). NOT the FCM path — FCM
+// authenticates with the service account and only needs the public key on the
+// frontend.
+//
+// VAPID_PUBLIC_KEY takes precedence over NEXT_PUBLIC_FIREBASE_VAPID_KEY on
+// purpose. `web-push` is a singleton: this file and NotificationService.js
+// share one cached instance, so whichever calls setVapidDetails last wins for
+// BOTH. NotificationService uses VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY; if this
+// file preferred the Firebase key it would pair a Firebase public key with a
+// different private key, and the mismatched pair would make every raw web-push
+// (including all store-side notifications) fail with a 403 from the push
+// service. Preferring the same variable keeps the two in agreement.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
 const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:rakesh.biswal@grav.in";
 

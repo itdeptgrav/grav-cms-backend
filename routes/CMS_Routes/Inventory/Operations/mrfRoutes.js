@@ -12,9 +12,21 @@ const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const NotificationService = require("../../../../services/NotificationService");
 const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest");
 
+const mrfNotify = require("../../../../services/mrfNotify.service");
+const mrfChat = require("../../../../services/mrfChat.service");
+const { buildContext } = require("../../../../services/mrfContext.service");
+const mrfUnits = require("../../../../services/mrfUnits.service");
+
 router.use(EmployeeAuth);
-const PM_APPROVAL_FOR_MRF =
-  String(process.env.PM_APPROVAL_FOR_MRF || "false").toLowerCase() === "true";
+
+// ── Approval flow ─────────────────────────────────────────────────────────
+// Employee → Primary Manager/TL (in cowork) → Store.
+// The store no longer approves or rejects MRFs; by the time one appears here
+// it has already been approved by the requester's TL, or auto-forwarded
+// because no TL could be resolved. What the store owns is availability and
+// issuance — see PATCH /:id/availability and POST /:id/unfulfilled.
+const isStoreActionable = (mrf) =>
+  mrf.tlApproved || mrf.autoForwarded || mrf.creationMode === "BYPASS" || mrf.pmApproved;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 function buildFullName(emp) {
@@ -30,24 +42,10 @@ function getActorId(req) {
   return req.user._id || req.user.id;
 }
 
-async function convertQty(qty, fromUnit, toUnit) {
-  if (!fromUnit || !toUnit || fromUnit === toUnit) return qty;
-  try {
-    const fromDoc = await Unit.findOne({ name: fromUnit })
-      .populate("conversions.toUnit", "name").lean();
-    if (fromDoc) {
-      const d = (fromDoc.conversions || []).find(c => (c.toUnit?.name || c.toUnit) === toUnit);
-      if (d?.quantity) return qty * d.quantity;
-    }
-    const toDoc = await Unit.findOne({ name: toUnit })
-      .populate("conversions.toUnit", "name").lean();
-    if (toDoc) {
-      const r = (toDoc.conversions || []).find(c => (c.toUnit?.name || c.toUnit) === fromUnit);
-      if (r?.quantity) return qty / r.quantity;
-    }
-    return qty;
-  } catch { return qty; }
-}
+// Unit handling is centralised in mrfUnits.service: the requester's chosen
+// unit is authoritative for every displayed and entered quantity, and
+// conversion to the catalogue base unit happens only where stock is touched.
+const convertQty = mrfUnits.convertQty;
 
 async function adjustStock(rawItemId, variantId, variantCombination, delta, txnMeta) {
   const raw = await RawItem.findById(rawItemId);
@@ -83,22 +81,64 @@ async function adjustStock(rawItemId, variantId, variantCombination, delta, txnM
   await raw.save();
 }
 
-async function buildUnitConversions() {
-  const units = await Unit.find({}).populate("conversions.toUnit", "name").lean();
-  const map = {};
-  units.forEach(u => {
-    if (!map[u.name]) map[u.name] = [];
-    (u.conversions || []).forEach(c => {
-      const toName = c.toUnit?.name || c.toUnit;
-      if (toName && c.quantity > 0) {
-        map[u.name].push({ name: toName, factor: c.quantity });
-        if (!map[toName]) map[toName] = [];
-        if (!map[toName].some(x => x.name === u.name))
-          map[toName].push({ name: u.name, factor: +(1 / c.quantity).toFixed(8) });
-      }
-    });
+const buildUnitConversions = mrfUnits.buildUnitConversions;
+
+/** Actor label for audit entries and chat system messages. */
+const actorName = (req) => req.user?.name || req.user?.firstName || "Store";
+
+/**
+ * May the Store act on this product request (match / register / reject)?
+ *
+ * Approved by the requester's TL, or auto-forwarded because no TL could be
+ * resolved. The third case covers requests raised BEFORE TL approval existed:
+ * `approvalStatus` defaults to PENDING_TL on those, so a store person who had
+ * already started working one would suddenly find it frozen. If the store has
+ * already actioned any product on it, that decision was clearly made under the
+ * old rules and must stand.
+ */
+function prStoreActionable(doc) {
+  if (!doc) return false;
+  if (doc.approvalStatus === "TL_APPROVED") return true;
+  if (doc.approvalStatus === "TL_REJECTED") return false;
+  if (doc.autoForwarded) return true;
+  return (doc.products || []).some(p => p.status && p.status !== "PENDING");
+}
+
+/** Guard for the store's mutating product-request routes. */
+function requirePrApproved(doc, res) {
+  if (prStoreActionable(doc)) return true;
+  res.status(403).json({
+    success: false,
+    message: doc.approvalStatus === "TL_REJECTED"
+      ? `This product request was rejected by ${doc.tlRejectedByName || "the requester's Primary Manager/TL"} — it cannot be actioned.`
+      : `This product request is still awaiting approval from ${doc.approverName || "the requester's Primary Manager/TL"}. You can discuss it in the chat, but it cannot be matched or registered until they approve.`,
   });
-  return map;
+  return false;
+}
+
+/**
+ * An MRF spawned from a product request still needs the requester's TL to
+ * approve the issue — the store only decided *which catalogue item* it is.
+ * Returns the approver-routing patch plus the requester's biometric id.
+ */
+async function approverPatchFor(employeeId) {
+  const mrfApprover = require("../../../../services/mrfApprover.service");
+  const emp = await Employee.findById(employeeId)
+    .select("_id firstName middleName lastName name biometricId identityId department primaryManager isActive status")
+    .lean();
+  if (!emp) {
+    return {
+      patch: {
+        approverResolution: "MANAGER_NOT_FOUND",
+        approvalRoute: "AUTO_STORE",
+        autoForwarded: true,
+        autoForwardReason: "Requester's HR record could not be read — sent directly to the Store.",
+      },
+      requestedForId: "",
+    };
+  }
+  const patch = await mrfApprover.resolveApprover(emp);
+  return { patch, requestedForId: emp.biometricId || emp.identityId || "" };
 }
 
 async function buildMrfItems(items) {
@@ -115,10 +155,20 @@ async function buildMrfItems(items) {
       rawItemSku: raw.sku || "",
       variantId: it.variantId || null,
       variantCombination: it.variantCombination || [],
+      description: String(it.description || "").trim().slice(0, 1000),
+      specifications: String(it.specifications || "").trim().slice(0, 1000),
+      images: Array.isArray(it.images)
+        ? it.images
+          .filter(im => im?.url && /^https?:\/\//i.test(im.url))
+          .slice(0, 5)
+          .map(im => ({ url: im.url, publicId: im.publicId || "", name: im.name || "" }))
+        : [],
       requestedQty: parseFloat(it.requestedQty),
+      // The unit the requester chose is authoritative for this line.
       unit: it.unit || baseUnit,
       baseUnit,
       itemStatus: "PENDING",
+      availability: "UNREVIEWED",
     });
   }
   return built;
@@ -258,6 +308,9 @@ router.get("/", async (req, res) => {
       if (mrf.requestedFor && typeof mrf.requestedFor === "object") {
         mrf.requestedFor._fullName = buildFullName(mrf.requestedFor);
       }
+      // Same contextual copy the requester and TL see, phrased for the store.
+      mrf.context = buildContext(mrf, "store");
+      mrf.storeActionable = isStoreActionable(mrf);
     });
     markOverdue(mrfs);
 
@@ -292,15 +345,28 @@ router.get("/", async (req, res) => {
           approved: { $sum: { $cond: [{ $eq: ["$status", "APPROVED"] }, 1, 0] } },
           issued: { $sum: { $cond: [{ $in: ["$status", ["ISSUED", "PARTIALLY_ISSUED"]] }, 1, 0] } },
           bypass: { $sum: { $cond: [{ $eq: ["$creationMode", "BYPASS"] }, 1, 0] } },
+          // Approved and sitting with the store, availability not yet recorded.
+          awaitingStore: {
+            $sum: {
+              $cond: [
+                { $and: [{ $eq: ["$status", "APPROVED"] }, { $eq: ["$storeReviewedAt", null] }] },
+                1, 0,
+              ],
+            },
+          },
         }
       },
     ]);
-    const stats = statsAgg[0] || { total: 0, pending: 0, approved: 0, issued: 0, bypass: 0 };
+    const stats = statsAgg[0] || { total: 0, pending: 0, approved: 0, issued: 0, bypass: 0, awaitingStore: 0 };
     delete stats._id;
 
     res.json({
       success: true, mrfs, stats,
-      pmApprovalRequired: PM_APPROVAL_FOR_MRF,
+      // MRF approval now happens in cowork (Employee → TL → Store). The store
+      // never approves; these flags tell the UI to render accordingly.
+      approvalFlow: "TL",
+      pmApprovalRequired: false,
+      storeCanApprove: false,
       pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) },
     });
   } catch (e) { console.error("[MRF GET /]", e); res.status(500).json({ success: false, message: e.message }); }
@@ -314,6 +380,12 @@ router.get("/", async (req, res) => {
 router.get("/product-requests", async (req, res) => {
   try {
     const { status } = req.query;
+    // The Store SEES every product request, approved or not — so they know
+    // what is coming and can ask about it in the chat. What they cannot do is
+    // ACT on one (match / register / reject) before the requester's Primary
+    // Manager/TL has approved it; that gate lives on the mutating routes
+    // below, not here. Hiding unapproved requests entirely would leave the
+    // store unable to prepare or answer questions about them.
     const filter = {};
     if (status) filter.status = status;
     const requests = await RawItemAddRequest.find(filter)
@@ -336,8 +408,73 @@ router.get("/product-requests/:id", async (req, res) => {
       .populate("products.spawnedMrf", "mrfNumber status")
       .lean();
     if (!request) return res.status(404).json({ success: false, message: "Product request not found" });
-    res.json({ success: true, request });
+    // Viewable either way; whether the store can act on it is a separate
+    // question the UI reads off `storeActionable`.
+    res.json({
+      success: true,
+      request,
+      storeActionable: prStoreActionable(request),
+      awaitingTlMessage: prStoreActionable(request)
+        ? ""
+        : request.approvalStatus === "TL_REJECTED"
+          ? `Rejected by ${request.tlRejectedByName || "the requester's Primary Manager/TL"}.${request.tlRejectionNote ? ` Reason: "${request.tlRejectionNote}"` : ""}`
+          : `Awaiting approval from ${request.approverName || "the requester's Primary Manager/TL"}. You can discuss it in the chat, but it cannot be matched or registered until they approve.`,
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ── Product request chat — store side of the same thread ─────────────────
+// Registered before "/:id" so Express does not read "product-requests" as an
+// MRF id.
+router.get("/product-requests/:id/chat", async (req, res) => {
+  try {
+    const doc = await RawItemAddRequest.findById(req.params.id)
+      .select("products approvalStatus status").lean();
+    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" });
+    // Chat is open before approval on purpose — the store asking "what exactly
+    // is this?" is often what lets the TL decide.
+
+    const messages = await mrfChat.listMessages(req.params.id, {
+      subjectType: "PRODUCT_REQUEST", limit: req.query.limit, before: req.query.before,
+    });
+    await mrfChat.markRead(req.params.id, getActorId(req), "PRODUCT_REQUEST");
+
+    res.json({
+      success: true,
+      messages,
+      mrfNumber: mrfChat.describeSubject(doc, "PRODUCT_REQUEST").label,
+      status: doc.status,
+      isFinal: doc.status === "RESOLVED" || doc.status === "REJECTED",
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.post("/product-requests/:id/chat", async (req, res) => {
+  try {
+    const doc = await RawItemAddRequest.findById(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" });
+    // Deliberately not gated on approval — see the GET above.
+
+    const attachments = Array.isArray(req.body.attachments)
+      ? req.body.attachments
+        .filter(a => a?.url && /^https?:\/\//i.test(a.url))
+        .slice(0, 5)
+        .map(a => ({ url: a.url, publicId: a.publicId || "", name: a.name || "", type: a.type || "image" }))
+      : [];
+
+    const message = await mrfChat.postMessage(doc, {
+      subjectType: "PRODUCT_REQUEST",
+      body: req.body.body,
+      attachments,
+      senderRef: getActorId(req),
+      senderName: actorName(req),
+      senderRole: "store",
+    });
+
+    res.status(201).json({ success: true, message });
+  } catch (e) {
+    res.status(e.status || 500).json({ success: false, message: e.message });
+  }
 });
 
 function cartesianProduct(arrays) {
@@ -364,6 +501,7 @@ router.patch("/product-requests/:id/match", async (req, res) => {
 
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!requirePrApproved(doc, res)) return;
 
     const product = doc.products.id(productId);
     if (!product) return res.status(404).json({ success: false, message: "Product not found on this request" });
@@ -410,10 +548,16 @@ router.patch("/product-requests/:id/match", async (req, res) => {
       await oldMrf.save();
       mrf = oldMrf;
     } else {
+      // Route it to the requester's TL just like a directly-raised MRF —
+      // matching an item to the catalogue is not an approval to issue it.
+      const { patch: approver, requestedForId } = await approverPatchFor(doc.requestedBy);
+      const autoForward = approver.approvalRoute === "AUTO_STORE";
+
       mrf = new MRF({
         requestedFor: doc.requestedBy,
         requestedForName: doc.requestedByName,
         requestedForDept: doc.requestedByDept,
+        requestedForId,
         creationMode: "SELF",
         createdByRef: doc.requestedBy,
         createdByModel: "Employee",
@@ -422,10 +566,21 @@ router.patch("/product-requests/:id/match", async (req, res) => {
         deadline: null,
         reason: doc.reason || `Matched from product request: ${product.itemName}`,
         priority: doc.priority,
-        status: "PENDING",
-        items: builtItems,
+        ...approver,
+        status: autoForward ? "APPROVED" : "PENDING",
+        items: autoForward
+          ? builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }))
+          : builtItems,
+        ...(autoForward ? { approvedAt: new Date() } : {}),
+      });
+      mrf.logEvent({
+        action: "CREATED", actorName: actorName(req), actorRole: "store",
+        detail: `Created from product request "${product.itemName}" matched to "${rawItem.name}".`,
       });
       await mrf.save();
+
+      if (autoForward) mrfNotify.autoForwarded(mrf).catch(() => { });
+      else mrfNotify.submitted(mrf).catch(() => { });
     }
 
     product.matchedTo = rawItemId;
@@ -463,6 +618,7 @@ router.patch("/product-requests/:id/approve", async (req, res) => {
 
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!requirePrApproved(doc, res)) return;
 
     const product = doc.products.id(productId);
     if (!product) return res.status(404).json({ success: false, message: "Product not found on this request" });
@@ -494,12 +650,25 @@ router.patch("/product-requests/:id/approve", async (req, res) => {
     });
     await newRawItem.save();
 
-    const builtItems = await buildMrfItems([{ rawItemId: newRawItem._id, requestedQty, unit: unit || product.unit }]);
+    const builtItems = await buildMrfItems([{
+      rawItemId: newRawItem._id,
+      requestedQty,
+      unit: unit || product.unit,
+      // Carry the requester's own photos and notes onto the new MRF line.
+      description: product.notes || "",
+      images: product.images || [],
+    }]);
+
+    // Registering the product does not approve the issue — the requester's TL
+    // still decides, same as any other MRF.
+    const { patch: approver, requestedForId } = await approverPatchFor(doc.requestedBy);
+    const autoForward = approver.approvalRoute === "AUTO_STORE";
 
     const mrf = new MRF({
       requestedFor: doc.requestedBy,
       requestedForName: doc.requestedByName,
       requestedForDept: doc.requestedByDept,
+      requestedForId,
       creationMode: "SELF",
       createdByRef: doc.requestedBy,
       createdByModel: "Employee",
@@ -508,10 +677,21 @@ router.patch("/product-requests/:id/approve", async (req, res) => {
       deadline: null,
       reason: doc.reason || `Approved from product request: ${product.itemName}`,
       priority: doc.priority,
-      status: "PENDING",
-      items: builtItems,
+      ...approver,
+      status: autoForward ? "APPROVED" : "PENDING",
+      items: autoForward
+        ? builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }))
+        : builtItems,
+      ...(autoForward ? { approvedAt: new Date() } : {}),
+    });
+    mrf.logEvent({
+      action: "CREATED", actorName: actorName(req), actorRole: "store",
+      detail: `Created from product request "${product.itemName}" after registering it in inventory.`,
     });
     await mrf.save();
+
+    if (autoForward) mrfNotify.autoForwarded(mrf).catch(() => { });
+    else mrfNotify.submitted(mrf).catch(() => { });
 
     product.status = "ADDED";
     product.matchedTo = newRawItem._id;
@@ -541,6 +721,7 @@ router.patch("/product-requests/:id/reject", async (req, res) => {
     const { note, productId } = req.body;
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!requirePrApproved(doc, res)) return;
 
     if (productId) {
       const product = doc.products.id(productId);
@@ -589,7 +770,12 @@ router.get("/:id", async (req, res) => {
     if (mrf.requestedFor && typeof mrf.requestedFor === "object")
       mrf.requestedFor._fullName = buildFullName(mrf.requestedFor);
     markOverdue([mrf]);
-    res.json({ success: true, mrf });
+    res.json({
+      success: true,
+      mrf,
+      context: buildContext(mrf, "store"),
+      storeActionable: isStoreActionable(mrf),
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -616,6 +802,11 @@ router.post("/", async (req, res) => {
     const fullName = buildFullName(employee) || req.user.name || "";
     const biometricId = employee?.biometricId || employee?.identityId || "";
 
+    // Same routing as the cowork side: Employee → Primary Manager/TL → Store,
+    // falling through to the Store when no TL can be resolved.
+    const { patch: approver } = await approverPatchFor(employee?._id || actorId);
+    const autoForward = approver.approvalRoute === "AUTO_STORE";
+
     const mrf = new MRF({
       requestedFor: employee?._id || actorId,
       requestedForName: fullName,
@@ -628,17 +819,29 @@ router.post("/", async (req, res) => {
       requestType,
       deadline: requestType === "TIME_BASED" ? new Date(deadline) : null,
       reason, priority, costCentre, projectReference,
-      status: "PENDING",
-      items: builtItems,
+      ...approver,
+      status: autoForward ? "APPROVED" : "PENDING",
+      items: autoForward
+        ? builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }))
+        : builtItems,
+      ...(autoForward ? { approvedAt: new Date() } : {}),
+    });
+    mrf.logEvent({
+      action: "CREATED", actorName: fullName, actorRole: "employee",
+      detail: autoForward ? approver.autoForwardReason : `Submitted for approval by ${approver.approverName}.`,
     });
     await mrf.save();
-    NotificationService.sendToRole(["project_manager", "admin"], {
-      title: "New Material Request",
-      body: `${mrf.mrfNumber} — ${fullName} requested ${builtItems.length} item(s)`,
-      url: "/project-manager/dashboard/requests",
-      tag: `mrf-${mrf._id}`,
-    }).catch(() => { });
-    res.status(201).json({ success: true, message: "MRF created", mrf });
+
+    if (autoForward) mrfNotify.autoForwarded(mrf).catch(() => { });
+    else mrfNotify.submitted(mrf).catch(() => { });
+
+    res.status(201).json({
+      success: true,
+      message: autoForward
+        ? approver.autoForwardReason
+        : `${mrf.mrfNumber} submitted — waiting for approval from ${approver.approverName}.`,
+      mrf,
+    });
   } catch (e) { console.error("[MRF POST /]", e); res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -686,87 +889,261 @@ router.post("/bypass", async (req, res) => {
       requestType,
       deadline: requestType === "TIME_BASED" ? new Date(deadline) : null,
       reason, priority, costCentre, projectReference,
-      status: PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED",
-      items: builtItems.map(i => ({ ...i, itemStatus: PM_APPROVAL_FOR_MRF ? "PENDING" : "APPROVED" })),
-      ...(PM_APPROVAL_FOR_MRF ? {} : { approvedBy: actorId, approvedAt: new Date() }),
+      // A bypass MRF is raised by the store, standing in front of the
+      // employee — there is no TL step to wait for.
+      approverResolution: "RESOLVED",
+      approvalRoute: "AUTO_STORE",
+      autoForwarded: true,
+      autoForwardReason: `Raised on behalf of ${empFullName} by the Store — no TL approval step applies.`,
+      status: "APPROVED",
+      items: builtItems.map(i => ({ ...i, itemStatus: "APPROVED" })),
+      approvedBy: actorId,
+      approvedAt: new Date(),
       storeNotes: `Bypass MRF raised by ${req.user.name || "Store"}`,
     });
+    mrf.logEvent({
+      action: "CREATED", actorName: actorName(req), actorRole: "store",
+      detail: `Raised on behalf of ${empFullName} — no TL approval required.`,
+    });
     await mrf.save();
-    NotificationService.sendToRole(["project_manager", "admin"], {
-      title: "New Material Request (On-Behalf)",
-      body: `${mrf.mrfNumber} — raised by store for ${empFullName}`,
-      url: "/project-manager/dashboard/requests",
-      tag: `mrf-${mrf._id}`,
-    }).catch(() => { });
+
+    // Tell the employee it exists — they did not raise it themselves.
+    if (mrf.requestedForId) {
+      mrfNotify.notifyCowork({
+        recipientIds: [mrf.requestedForId],
+        type: "request",
+        tag: `mrf-bypass-${mrf._id}`,
+        title: "Material request raised for you",
+        body: `${mrf.mrfNumber}: the Store raised a material request on your behalf for ${builtItems.length} item(s).`,
+        data: { mrfId: String(mrf._id), mrfNumber: mrf.mrfNumber, url: "/coworking/mrf" },
+      }).catch(() => { });
+    }
+
     res.status(201).json({
       success: true,
-      message: PM_APPROVAL_FOR_MRF
-        ? "MRF created — awaiting PM approval before issue"
-        : "Bypass MRF created & auto-approved",
+      message: "On-behalf MRF created and approved — ready to issue.",
       mrf,
     });
   } catch (e) { console.error("[MRF POST /bypass]", e); res.status(500).json({ success: false, message: e.message }); }
 });
 
-// ── PATCH /:id/approve ────────────────────────────────────────────────────────
-router.patch("/:id/approve", async (req, res) => {
-  try {
-    if (PM_APPROVAL_FOR_MRF) {
-      return res.status(403).json({
-        success: false,
-        message: "MRF approval is handled by the Project Manager. Ask the PM to approve this request.",
-      });
-    }
-    const mrf = await MRF.findById(req.params.id);
-    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
-    if (mrf.status !== "PENDING")
-      return res.status(400).json({ success: false, message: `Cannot approve — status is ${mrf.status}` });
-
-    const { storeNotes, itemApprovals } = req.body;
-    if (storeNotes) mrf.storeNotes = storeNotes;
-
-    if (itemApprovals && typeof itemApprovals === "object") {
-      mrf.items.forEach(item => {
-        const decision = itemApprovals[String(item._id)];
-        item.itemStatus = decision === "REJECTED" ? "REJECTED" : "APPROVED";
-      });
-    } else {
-      mrf.items.forEach(item => { item.itemStatus = "APPROVED"; });
-    }
-
-    if (mrf.items.every(i => i.itemStatus === "REJECTED"))
-      return res.status(400).json({ success: false, message: "At least one item must be approved." });
-
-    mrf.status = "APPROVED";
-    mrf.approvedBy = getActorId(req);
-    mrf.approvedAt = new Date();
-    await mrf.save();
-    res.json({ success: true, message: "MRF approved", mrf });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+// ── PATCH /:id/approve — retired ─────────────────────────────────────────────
+// Approval moved to the requester's Primary Manager/TL in cowork. Kept as an
+// explicit 403 rather than deleted so any stale client gets told why instead
+// of a confusing 404.
+router.patch("/:id/approve", (req, res) => {
+  res.status(403).json({
+    success: false,
+    message: "MRFs are approved by the requester's Primary Manager/TL in CoWork. The store records availability and issues material — it does not approve.",
+  });
 });
 
-// ── PATCH /:id/reject ─────────────────────────────────────────────────────────
-router.patch("/:id/reject", async (req, res) => {
+// ── PATCH /:id/reject — retired ──────────────────────────────────────────────
+router.patch("/:id/reject", (req, res) => {
+  res.status(403).json({
+    success: false,
+    message: "Only the requester's Primary Manager/TL can reject an MRF. If the material cannot be supplied, use 'Cannot Fulfil' instead so the requester sees the correct reason.",
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PATCH /:id/availability — the store's core action
+//
+// Records what the store actually found, per item:
+//   AVAILABLE | PARTIAL | NOT_AVAILABLE | ALTERNATIVE
+// This is independent of issuance — it is how the requester and TL learn
+// whether their material exists before anything is handed over.
+//
+// Body: { items: [{ itemId, availability, availableQty?, note?,
+//                   alternativeName?, alternativeRawItemId? }], storeNotes? }
+// ═══════════════════════════════════════════════════════════════════════════
+const AVAILABILITY_VALUES = ["AVAILABLE", "PARTIAL", "NOT_AVAILABLE", "ALTERNATIVE"];
+
+router.patch("/:id/availability", async (req, res) => {
   try {
-    if (PM_APPROVAL_FOR_MRF) {
-      return res.status(403).json({
-        success: false,
-        message: "MRF rejection is handled by the Project Manager.",
-      });
-    }
+    const { items = [], storeNotes } = req.body;
+    if (!Array.isArray(items) || !items.length)
+      return res.status(400).json({ success: false, message: "No availability updates supplied" });
+
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
-    if (!["PENDING", "APPROVED"].includes(mrf.status))
-      return res.status(400).json({ success: false, message: `Cannot reject — status is ${mrf.status}` });
 
-    mrf.status = "REJECTED";
-    mrf.rejectedBy = getActorId(req);
-    mrf.rejectedAt = new Date();
-    mrf.rejectionNote = req.body.rejectionNote || "";
-    mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED"; });
+    if (!isStoreActionable(mrf))
+      return res.status(403).json({
+        success: false,
+        message: `This request has not been approved yet — it is still with ${mrf.approverName || "the requester's Primary Manager/TL"}.`,
+      });
+    if (["REJECTED", "CANCELLED"].includes(mrf.status))
+      return res.status(400).json({ success: false, message: `Cannot update — this request is ${mrf.status.toLowerCase()}.` });
+
+    const who = actorName(req);
+    const summary = [];
+
+    for (const line of items) {
+      const item = mrf.items.id(line.itemId);
+      if (!item) continue;
+      if (["REJECTED", "UNFULFILLED"].includes(item.itemStatus)) continue;
+
+      const availability = String(line.availability || "").toUpperCase();
+      if (!AVAILABILITY_VALUES.includes(availability))
+        return res.status(400).json({
+          success: false,
+          message: `Invalid availability "${line.availability}" — expected one of ${AVAILABILITY_VALUES.join(", ")}.`,
+        });
+
+      const remaining = Math.max(0, (item.requestedQty || 0) - (item.issuedQty || 0));
+
+      // availableQty is always in the requester's unit — the same unit the
+      // store person is looking at on screen.
+      let availableQty;
+      if (availability === "AVAILABLE") availableQty = remaining;
+      else if (availability === "NOT_AVAILABLE") availableQty = 0;
+      else if (availability === "PARTIAL") {
+        availableQty = parseFloat(line.availableQty);
+        if (!Number.isFinite(availableQty) || availableQty <= 0)
+          return res.status(400).json({
+            success: false,
+            message: `Enter how much of "${item.rawItemName}" is available — a partial quantity must be greater than zero.`,
+          });
+        if (availableQty >= remaining) {
+          // "Partial" that covers the whole remainder is just available.
+          availableQty = remaining;
+        }
+      } else {
+        availableQty = line.availableQty === undefined || line.availableQty === null
+          ? null : parseFloat(line.availableQty);
+      }
+
+      const finalAvailability =
+        availability === "PARTIAL" && availableQty >= remaining ? "AVAILABLE" : availability;
+
+      if (finalAvailability === "ALTERNATIVE" && !String(line.alternativeName || "").trim())
+        return res.status(400).json({
+          success: false,
+          message: `Name the alternative product you are offering for "${item.rawItemName}".`,
+        });
+
+      item.availability = finalAvailability;
+      item.availableQty = availableQty;
+      item.availabilityNote = String(line.note || "").trim().slice(0, 500);
+      item.availabilityUpdatedAt = new Date();
+      item.availabilityUpdatedBy = getActorId(req);
+      item.availabilityUpdatedByName = who;
+      item.alternativeItem = finalAvailability === "ALTERNATIVE"
+        ? {
+          rawItem: line.alternativeRawItemId || null,
+          name: String(line.alternativeName || "").trim(),
+          note: String(line.alternativeNote || "").trim().slice(0, 500),
+        }
+        : { rawItem: null, name: "", note: "" };
+
+      summary.push({
+        itemId: String(item._id),
+        name: item.rawItemName,
+        unit: item.unit,
+        availability: finalAvailability,
+        requested: item.requestedQty,
+        available: availableQty,
+        note: item.availabilityNote,
+        alternativeName: item.alternativeItem?.name || "",
+      });
+    }
+
+    if (!summary.length)
+      return res.status(400).json({ success: false, message: "None of the supplied items are on this request." });
+
+    if (storeNotes !== undefined) mrf.storeNotes = String(storeNotes || "").trim();
+    if (!mrf.storeReviewedAt) mrf.storeReviewedAt = new Date();
+
+    const detail = summary
+      .map(s => `${s.name}: ${s.availability.replace(/_/g, " ").toLowerCase()}${s.availability === "PARTIAL" ? ` (${s.available} of ${s.requested} ${s.unit})` : ""}`)
+      .join("; ");
+    mrf.logEvent({ action: "AVAILABILITY_UPDATED", actorName: who, actorRole: "store", detail });
+
     await mrf.save();
-    res.json({ success: true, message: "MRF rejected", mrf });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+
+    mrfChat.systemMessage(mrf, `Store availability update — ${detail}`, who);
+    mrfNotify.availabilityUpdated(mrf, summary).catch(e => console.error("[availability notify]", e.message));
+
+    const obj = mrf.toObject();
+    res.json({
+      success: true,
+      message: "Availability recorded — the requester and their TL have been notified.",
+      mrf: obj,
+      summary,
+      context: buildContext(obj, "store"),
+    });
+  } catch (e) {
+    console.error("[MRF availability]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /:id/unfulfilled — close an approved request the store cannot supply.
+//
+// Deliberately NOT called "reject": rejection means the TL said no. This means
+// the TL said yes and the material does not exist. The requester sees two
+// different messages because they need to do two different things.
+// ═══════════════════════════════════════════════════════════════════════════
+router.post("/:id/unfulfilled", async (req, res) => {
+  try {
+    const reason = String(req.body.reason || "").trim();
+    if (!reason)
+      return res.status(400).json({
+        success: false,
+        message: "A reason is required — the requester and their TL both see it.",
+      });
+
+    const mrf = await MRF.findById(req.params.id);
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
+
+    if (!isStoreActionable(mrf))
+      return res.status(403).json({ success: false, message: "This request has not been approved yet." });
+    if (["REJECTED", "CANCELLED", "UNFULFILLED", "COMPLETED"].includes(mrf.status))
+      return res.status(400).json({ success: false, message: `This request is already ${mrf.status.toLowerCase()}.` });
+
+    const anyIssued = mrf.items.some(i => (i.issuedQty || 0) > 0);
+    const who = actorName(req);
+
+    mrf.items.forEach(i => {
+      // Anything already handed over keeps its issued state; only what is
+      // still owed becomes unfulfillable.
+      if ((i.issuedQty || 0) > 0) return;
+      if (i.itemStatus === "REJECTED") return;
+      i.itemStatus = "UNFULFILLED";
+      if (i.availability === "UNREVIEWED") i.availability = "NOT_AVAILABLE";
+    });
+
+    // If some material already went out, the request is partially issued and
+    // closed — not wholly unfulfilled.
+    mrf.status = anyIssued ? "PARTIALLY_ISSUED" : "UNFULFILLED";
+    mrf.unfulfilledAt = new Date();
+    mrf.unfulfilledBy = getActorId(req);
+    mrf.unfulfilledByName = who;
+    mrf.unfulfilledReason = reason;
+    if (!mrf.storeReviewedAt) mrf.storeReviewedAt = new Date();
+
+    mrf.logEvent({
+      action: "STORE_UNFULFILLED", actorName: who, actorRole: "store",
+      detail: anyIssued ? `Remaining quantity cannot be supplied. ${reason}` : reason,
+    });
+    await mrf.save();
+
+    mrfChat.systemMessage(mrf, `The Store cannot supply ${anyIssued ? "the remaining quantity" : "this request"}. Reason: ${reason}`, who);
+    mrfNotify.unfulfilled(mrf).catch(e => console.error("[unfulfilled notify]", e.message));
+
+    const obj = mrf.toObject();
+    res.json({
+      success: true,
+      message: "Request closed as unfulfillable — the requester and their TL have been notified.",
+      mrf: obj,
+      context: buildContext(obj, "store"),
+    });
+  } catch (e) {
+    console.error("[MRF unfulfilled]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
 });
 
 // ── PATCH /:id/cancel ─────────────────────────────────────────────────────────
@@ -795,23 +1172,72 @@ router.post("/:id/issue", async (req, res) => {
     const mrf = await MRF.findById(req.params.id);
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
 
-    // PM approval gate — issuance blocked until PM approves
-    if (PM_APPROVAL_FOR_MRF && !mrf.pmApproved) {
+    // Approval gate — the requester's Primary Manager/TL must have approved,
+    // unless no TL could be resolved (auto-forwarded) or the store raised it.
+    if (!isStoreActionable(mrf)) {
       return res.status(403).json({
         success: false,
-        message: "Awaiting PM approval — materials cannot be issued until the Project Manager approves this MRF.",
+        message: `Cannot issue — this request is still awaiting approval from ${mrf.approverName || "the requester's Primary Manager/TL"}.`,
       });
     }
 
+    if (mrf.status === "CANCELLED")
+      return res.status(400).json({ success: false, message: "This request was cancelled by the requester — do not issue against it." });
     if (!["APPROVED", "PARTIALLY_ISSUED"].includes(mrf.status))
       return res.status(400).json({ success: false, message: `Cannot issue — status is ${mrf.status}` });
 
+    // ── Validate every line before touching stock ──────────────────────────
+    // All-or-nothing: a partially applied issue would leave stock and the MRF
+    // disagreeing, and two store people issuing at once makes that likely.
+    const planned = [];
     for (const line of items) {
       const mrfItem = mrf.items.id(line.itemId);
       if (!mrfItem) continue;
       const issuedQty = parseFloat(line.issuedQty) || 0;
       if (issuedQty <= 0) continue;
 
+      if (["REJECTED", "UNFULFILLED"].includes(mrfItem.itemStatus))
+        return res.status(400).json({
+          success: false,
+          message: `"${mrfItem.rawItemName}" is marked ${mrfItem.itemStatus.toLowerCase()} on this request and cannot be issued.`,
+        });
+
+      const remaining = Math.max(0, (mrfItem.requestedQty || 0) - (mrfItem.issuedQty || 0));
+      if (issuedQty > remaining + 0.001)
+        return res.status(400).json({
+          success: false,
+          message: `Cannot issue ${issuedQty} ${mrfItem.unit} of "${mrfItem.rawItemName}" — only ${remaining} ${mrfItem.unit} is still owed on this request.`,
+        });
+
+      planned.push({ mrfItem, issuedQty, notes: line.storeNotes || "" });
+    }
+
+    if (!planned.length)
+      return res.status(400).json({ success: false, message: "Enter at least one quantity to issue." });
+
+    // Re-check live stock at the moment of issue — inventory may have moved
+    // since the store person opened the page.
+    const stockNow = await mrfUnits.enrichItemsWithStock(planned.map(p => p.mrfItem.toObject()));
+    const short = [];
+    planned.forEach((p, i) => {
+      const live = stockNow[i];
+      if (live.available !== null && p.issuedQty > live.available + 0.001) {
+        short.push(`${p.mrfItem.rawItemName}: trying to issue ${p.issuedQty} ${p.mrfItem.unit} but only ${live.available} ${p.mrfItem.unit} is in stock right now`);
+      }
+    });
+    if (short.length)
+      return res.status(409).json({
+        success: false,
+        message: "Stock changed since this page was loaded — nothing was issued.",
+        details: short,
+      });
+
+    const who = actorName(req);
+    const issuedLines = [];
+
+    for (const { mrfItem, issuedQty, notes } of planned) {
+      // The only place a requester-unit quantity is converted to the
+      // catalogue's base unit: the stock ledger.
       const deductQty = await convertQty(issuedQty, mrfItem.unit, mrfItem.baseUnit);
       await adjustStock(
         mrfItem.rawItem, mrfItem.variantId, mrfItem.variantCombination, -deductQty,
@@ -826,33 +1252,59 @@ router.post("/:id/issue", async (req, res) => {
       mrfItem.issuedQty += issuedQty;
       mrfItem.consumedQty = mrfItem.issuedQty - mrfItem.returnedQty;
       mrfItem.itemStatus = mrfItem.issuedQty >= mrfItem.requestedQty - 0.001 ? "ISSUED" : "PARTIALLY_ISSUED";
-      if (line.storeNotes) mrfItem.storeNotes = line.storeNotes;
+      // Issuing settles the availability question for what just went out.
+      if (mrfItem.itemStatus === "ISSUED") mrfItem.availability = "AVAILABLE";
+      if (notes) mrfItem.storeNotes = notes;
       mrfItem.issueHistory = mrfItem.issueHistory || [];
       mrfItem.issueHistory.push({
         issuedQty,
-        notes: line.storeNotes || storeNotes || "",
+        notes: notes || storeNotes || "",
         recordedBy: getActorId(req),
         recordedAt: new Date(),
+      });
+
+      issuedLines.push({
+        name: mrfItem.rawItemName,
+        unit: mrfItem.unit,
+        issuedQty,
+        remaining: Math.max(0, (mrfItem.requestedQty || 0) - mrfItem.issuedQty),
       });
     }
 
     if (storeNotes) mrf.storeNotes = storeNotes;
-    const allIssued = mrf.items.every(i => ["ISSUED", "REJECTED"].includes(i.itemStatus));
-    const someIssued = mrf.items.some(i => ["ISSUED", "PARTIALLY_ISSUED"].includes(i.itemStatus));
+    if (!mrf.storeReviewedAt) mrf.storeReviewedAt = new Date();
+
+    // Fully issued only when every live line is done; UNFULFILLED lines are
+    // settled and must not hold the request open, but must not fake completion
+    // either — the status stays PARTIALLY_ISSUED if anything is still owed.
+    const live = mrf.items.filter(i => !["REJECTED", "UNFULFILLED"].includes(i.itemStatus));
+    const allIssued = live.length > 0 && live.every(i => i.itemStatus === "ISSUED");
+    const someIssued = mrf.items.some(i => (i.issuedQty || 0) > 0);
     mrf.status = allIssued ? "ISSUED" : someIssued ? "PARTIALLY_ISSUED" : mrf.status;
+
+    const detail = issuedLines
+      .map(l => `${l.issuedQty} ${l.unit} of ${l.name}${l.remaining > 0 ? ` (${l.remaining} ${l.unit} still pending)` : ""}`)
+      .join("; ");
+    mrf.logEvent({
+      action: allIssued ? "FULLY_ISSUED" : "PARTIALLY_ISSUED",
+      actorName: who, actorRole: "store", detail,
+    });
+
     await mrf.save();
 
-    if (mrf.requestedFor) {
-      NotificationService.sendToUser(mrf.requestedFor, {
-        title: "Materials Issued",
-        body: `Your request ${mrf.mrfNumber} has been issued by the store.`,
-        type: "request",
-        url: "/coworking",
-        tag: `mrf-${mrf._id}`,
-      }).catch(() => { });
-    }
+    mrfChat.systemMessage(mrf, `Store issued ${detail}.`, who);
+    mrfNotify.issued(mrf, issuedLines).catch(e => console.error("[issue notify]", e.message));
 
-    res.json({ success: true, message: "Materials issued", mrf });
+    const obj = mrf.toObject();
+    res.json({
+      success: true,
+      message: allIssued
+        ? "All requested material issued."
+        : `Issued. ${issuedLines.filter(l => l.remaining > 0).map(l => `${l.remaining} ${l.unit} of ${l.name}`).join(", ")} still pending on this request.`,
+      mrf: obj,
+      issued: issuedLines,
+      context: buildContext(obj, "store"),
+    });
   } catch (e) { console.error("[MRF issue]", e); res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -926,66 +1378,12 @@ router.get("/:id/stock-check", async (req, res) => {
     markOverdue([mrf]);
 
     // ── Live stock lookup for each item ──────────────────────────────────
-    const rawItemIds = [
-      ...new Set(mrf.items.map(i => i.rawItem?.toString()).filter(Boolean)),
-    ];
-
-    const rawDocs = rawItemIds.length
-      ? await RawItem.find({ _id: { $in: rawItemIds } })
-        .select("name quantity unit customUnit variants minStock")
-        .lean()
-      : [];
-
-    const rawDocMap = new Map(rawDocs.map(r => [r._id.toString(), r]));
-
-    const itemsWithStock = mrf.items.map(item => {
-      const doc = rawDocMap.get(item.rawItem?.toString());
-      let available = null;
-      let minStock = 0;
-
-      if (doc) {
-        // Variant-level stock first
-        if (item.variantId && Array.isArray(doc.variants)) {
-          const v = doc.variants.find(
-            vv => vv._id?.toString() === item.variantId?.toString()
-          );
-          if (v) {
-            available = v.quantity ?? 0;
-            minStock = v.minStock ?? doc.minStock ?? 0;
-          }
-        }
-        // Fall back to product-level stock
-        if (available === null) {
-          available = doc.quantity ?? 0;
-          minStock = doc.minStock ?? 0;
-        }
-      }
-
-      const requestedQty = item.requestedQty || 0;
-      const issuedQty = item.issuedQty || 0;
-      const returnedQty = item.returnedQty || 0;
-      const shortfall = available !== null ? Math.max(0, requestedQty - available) : null;
-      const remainingToIssue = Math.max(0, requestedQty - issuedQty);
-
-      let stockStatus = "unknown";
-      if (available !== null) {
-        if (available <= 0) stockStatus = "out_of_stock";
-        else if (shortfall > 0) stockStatus = "shortage";
-        else if (available - requestedQty <= minStock) stockStatus = "low";
-        else stockStatus = "ok";
-      }
-
-      return {
-        ...item,
-        // Live stock fields appended
-        available,
-        shortfall,
-        minStock,
-        stockStatus,
-        remainingToIssue,
-        returnedQty,
-      };
-    });
+    // `available` comes back in the REQUESTER's unit, not the catalogue base
+    // unit. The store UI prints it beside `item.unit`, so returning the base
+    // figure here (as this endpoint used to) showed the wrong number whenever
+    // the two differed — 20 pcs in stock reading as "20 packets available"
+    // against a request for 2 packets.
+    const itemsWithStock = await mrfUnits.enrichItemsWithStock(mrf.items || []);
 
     // If this MRF was spawned from a product-request match/approve, find
     // that source so the page can link back to it — that's where "Edit
@@ -1011,13 +1409,80 @@ router.get("/:id/stock-check", async (req, res) => {
       success: true,
       mrf,
       itemsWithStock,
-      pmApprovalRequired: PM_APPROVAL_FOR_MRF,
+      // Approval belongs to the requester's TL in cowork — the store never
+      // approves, so these stay false for every client.
+      approvalFlow: "TL",
+      pmApprovalRequired: false,
+      storeCanApprove: false,
+      storeActionable: isStoreActionable(mrf),
+      context: buildContext(mrf, "store"),
       sourceProductRequest,
     });
   } catch (err) {
     console.error("MRF stock-check error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MRF chat — store side of the same thread the requester and TL use.
+// Auth here is the CMS JWT; the cowork side hits the mirror of these routes in
+// coworkMrfRoutes.js. Both go through services/mrfChat.service.js.
+// ═══════════════════════════════════════════════════════════════════════════
+
+router.get("/:id/chat", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id).select("mrfNumber status").lean();
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
+
+    const messages = await mrfChat.listMessages(req.params.id, {
+      limit: req.query.limit, before: req.query.before,
+    });
+    await mrfChat.markRead(req.params.id, getActorId(req));
+
+    res.json({
+      success: true,
+      messages,
+      mrfNumber: mrf.mrfNumber,
+      status: mrf.status,
+      // A closed request keeps its thread open — the store may still owe the
+      // requester an explanation — but the UI flags it.
+      isFinal: ["COMPLETED", "REJECTED", "CANCELLED", "UNFULFILLED"].includes(mrf.status),
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.post("/:id/chat", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id);
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
+
+    const attachments = Array.isArray(req.body.attachments)
+      ? req.body.attachments
+        .filter(a => a?.url && /^https?:\/\//i.test(a.url))
+        .slice(0, 5)
+        .map(a => ({ url: a.url, publicId: a.publicId || "", name: a.name || "", type: a.type || "image" }))
+      : [];
+
+    const message = await mrfChat.postMessage(mrf, {
+      body: req.body.body,
+      attachments,
+      senderRef: getActorId(req),
+      senderName: actorName(req),
+      senderRole: "store",
+    });
+
+    res.status(201).json({ success: true, message });
+  } catch (e) {
+    res.status(e.status || 500).json({ success: false, message: e.message });
+  }
+});
+
+router.patch("/:id/chat/read", async (req, res) => {
+  try {
+    const r = await mrfChat.markRead(req.params.id, getActorId(req));
+    res.json({ success: true, ...r });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 
