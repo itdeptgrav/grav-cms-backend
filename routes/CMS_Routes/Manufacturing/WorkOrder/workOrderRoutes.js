@@ -419,7 +419,7 @@ router.get("/:id/planning", async (req, res) => {
     const { id } = req.params;
 
     const workOrder = await WorkOrder.findById(id)
-      .populate("stockItemId", "name reference operations rawItems")
+      .populate("stockItemId", "name reference operations rawItems images genderCategory")
       .populate({
         path: "customerRequestId",
         select: "customerInfo deliveryDeadline",
@@ -519,6 +519,201 @@ router.get("/:id/planning", async (req, res) => {
   } catch (error) {
     console.error("Error fetching work order for planning:", error);
     res.status(500).json({ success: false, message: "Server error while fetching work order details" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /:id/raw-item-requirement — WO-scoped equivalent of the MO-wide
+// /api/cms/sales/requests/:requestId/raw-item-requirement endpoint, same
+// { perProduct, totals, grand } response shape so the frontend can reuse
+// <RawItemRequirementSlider /> unmodified, just scoped to this one work order.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/:id/raw-item-requirement", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid work order ID" });
+    }
+
+    const workOrder = await WorkOrder.findById(id)
+      .select("workOrderNumber stockItemName stockItemReference stockItemId variantAttributes quantity rawMaterials")
+      .populate("stockItemId", "images variants")
+      .lean();
+    if (!workOrder) {
+      return res.status(404).json({ success: false, message: "Work order not found" });
+    }
+
+    const rawMaterials = workOrder.rawMaterials || [];
+    if (rawMaterials.length === 0) {
+      return res.json({
+        success: true,
+        workOrderNumber: workOrder.workOrderNumber,
+        perProduct: [],
+        totals: [],
+        grand: { totalLineItems: 0, totalRequired: 0, totalAvailable: 0, shortfallCount: 0 },
+      });
+    }
+
+    // Live stock lookup for every unique raw item referenced by this WO
+    const uniqueRawItemIds = [
+      ...new Set(rawMaterials.map((rm) => rm.rawItemId?.toString()).filter(Boolean)),
+    ];
+    const rawItemDocs = uniqueRawItemIds.length
+      ? await RawItem.find({
+          _id: { $in: uniqueRawItemIds.map((rid) => new mongoose.Types.ObjectId(rid)) },
+        }).lean()
+      : [];
+    const rawItemMap = new Map(rawItemDocs.map((r) => [r._id.toString(), r]));
+
+    const productImage = (() => {
+      const si = workOrder.stockItemId;
+      if (si?.variants?.length) {
+        const withImg = si.variants.find((v) => v.images?.length > 0);
+        if (withImg) return withImg.images[0];
+      }
+      return si?.images?.[0] || null;
+    })();
+
+    const totals = [];
+    let totalRequired = 0;
+    let totalAvailable = 0;
+    let shortfallCount = 0;
+
+    for (const rm of rawMaterials) {
+      const rawItemId = rm.rawItemId?.toString() || "";
+      const doc = rawItemId ? rawItemMap.get(rawItemId) : null;
+
+      let available = null;
+      let minStock = 0;
+      let unitConversions = [];
+      let variantDoc = null;
+
+      if (doc) {
+        if (rm.rawItemVariantId && Array.isArray(doc.variants)) {
+          variantDoc = doc.variants.find((v) => v._id?.toString() === rm.rawItemVariantId.toString());
+        }
+        if (!variantDoc && rm.rawItemVariantCombination?.length > 0 && Array.isArray(doc.variants)) {
+          variantDoc = doc.variants.find(
+            (v) =>
+              v.combination?.length === rm.rawItemVariantCombination.length &&
+              v.combination.every((val, idx) => val === rm.rawItemVariantCombination[idx])
+          );
+        }
+        if (variantDoc) {
+          available = variantDoc.quantity || 0;
+          minStock = variantDoc.minStock ?? doc.minStock ?? 0;
+        } else {
+          available = doc.quantity || 0;
+          minStock = doc.minStock || 0;
+        }
+
+        const convSourceVariant = variantDoc || doc.variants?.[0];
+        if (convSourceVariant?.unitConversions?.length) unitConversions = convSourceVariant.unitConversions;
+        else if (convSourceVariant?.unitConversion?.toUnit) unitConversions = [convSourceVariant.unitConversion];
+      }
+
+      const baseUnit = doc ? doc.customUnit || doc.unit : rm.unit;
+      let availableInBomUnit = available;
+      if (available !== null && baseUnit && rm.unit && baseUnit !== rm.unit) {
+        const conv = unitConversions.find((c) => c.fromUnit === baseUnit && c.toUnit === rm.unit);
+        const inv = unitConversions.find((c) => c.fromUnit === rm.unit && c.toUnit === baseUnit);
+        if (conv?.quantity) availableInBomUnit = available * conv.quantity;
+        else if (inv?.quantity) availableInBomUnit = available / inv.quantity;
+      }
+
+      const quantityRequired = rm.quantityRequired || 0;
+      const shortfall = availableInBomUnit !== null ? Math.max(0, quantityRequired - availableInBomUnit) : null;
+
+      let status = "unknown";
+      if (availableInBomUnit !== null) {
+        if (availableInBomUnit <= 0) status = "out_of_stock";
+        else if (shortfall > 0) status = "shortage";
+        else if (availableInBomUnit - quantityRequired <= minStock) status = "low";
+        else status = "ok";
+      }
+
+      totalRequired += quantityRequired;
+      if (available !== null) totalAvailable += available;
+      if (shortfall && shortfall > 0) shortfallCount++;
+
+      totals.push({
+        rawItemId,
+        variantId: rm.rawItemVariantId?.toString() || "",
+        rawItemName: rm.name,
+        rawItemSku: rm.sku || "",
+        variantCombination: rm.rawItemVariantCombination || [],
+        unit: rm.unit,
+        baseUnit,
+        quantityRequired,
+        unitCost: rm.unitCost || 0,
+        totalCost: rm.totalCost || (rm.unitCost || 0) * quantityRequired,
+        available,
+        availableInBomUnit,
+        shortfall,
+        minStock,
+        status,
+        unitConversions,
+        // WO-specific allocation bookkeeping (not present on the MO-wide endpoint)
+        allocationStatus: rm.allocationStatus,
+        quantityAllocated: rm.quantityAllocated || 0,
+        quantityIssued: rm.quantityIssued || 0,
+      });
+    }
+
+    const variantLabel = (workOrder.variantAttributes || []).map((a) => a.value).join(" / ") || "Default";
+    const perPiece = (t) => (workOrder.quantity > 0 ? t.quantityRequired / workOrder.quantity : 0);
+
+    const perProduct = [
+      {
+        productName: workOrder.stockItemName,
+        stockItemReference: workOrder.stockItemReference || "",
+        totalQuantity: workOrder.quantity || 0,
+        image: productImage,
+        rawItems: totals.map((t) => ({
+          rawItemId: t.rawItemId,
+          variantId: t.variantId,
+          rawItemName: t.rawItemName,
+          rawItemSku: t.rawItemSku,
+          variantCombination: t.variantCombination,
+          unit: t.unit,
+          baseUnit: t.baseUnit,
+          perPieceQty: perPiece(t),
+          quantityRequired: t.quantityRequired,
+          unitCost: t.unitCost,
+          totalCost: t.totalCost,
+        })),
+        variantBreakdowns: [
+          {
+            variantLabel,
+            quantity: workOrder.quantity || 0,
+            rawItems: totals.map((t) => ({
+              rawItemId: t.rawItemId,
+              variantId: t.variantId,
+              rawItemName: t.rawItemName,
+              perPieceQty: perPiece(t),
+              quantityRequired: t.quantityRequired,
+              unit: t.unit,
+            })),
+          },
+        ],
+      },
+    ];
+
+    res.json({
+      success: true,
+      workOrderNumber: workOrder.workOrderNumber,
+      perProduct,
+      totals,
+      grand: {
+        totalLineItems: totals.length,
+        totalRequired,
+        totalAvailable,
+        shortfallCount,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching WO raw-item-requirement:", error);
+    res.status(500).json({ success: false, message: "Server error while fetching raw item requirement" });
   }
 });
 

@@ -202,6 +202,20 @@ const dispatchRecordSchema = new mongoose.Schema(
   { _id: true },
 );
 
+// ── Bulk Order Tracking tab's own dispatch ledger (Manufacturing-Order routes) ──
+// Kept separate from `dispatchRecordSchema`/`dispatchRecords` above, which is the
+// person-wise/bulk dispatch ledger used elsewhere — this one backs the
+// PM-facing "Bulk Order Tracking" tab's dispatch-bulk / bulk-dispatch-history routes.
+const bulkDispatchHistoryEntrySchema = new mongoose.Schema(
+  {
+    quantity: { type: Number, required: true, min: 1 },
+    notes: { type: String, trim: true, default: "" },
+    dispatchedBy: { type: String, default: "" },
+    dispatchedAt: { type: Date, default: Date.now },
+  },
+  { _id: true },
+);
+
 // ── WorkOrder ─────────────────────────────────────────────────────────────────
 const workOrderSchema = new mongoose.Schema(
   {
@@ -335,6 +349,7 @@ const workOrderSchema = new mongoose.Schema(
 
     dispatchedQuantity: { type: Number, default: 0, min: 0 },
     dispatchRecords: [dispatchRecordSchema],
+    bulkDispatchHistory: [bulkDispatchHistoryEntrySchema],
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "SalesDepartment" },
     plannedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
