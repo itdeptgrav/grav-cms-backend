@@ -1,8 +1,17 @@
-// models/CMS_Models/Manufacturing/Production/ProductionSchedule.js
+// models/CMS_Models/Sales/SalesSchedule/SalesSchedule.js
+//
+// Sales-side planning calendar.
+//
+// Deliberately a SEPARATE collection from ProductionSchedule even though the
+// shape is nearly identical. Sales plans against EVERY manufacturing order and
+// work order — including ones production has not accepted yet, and ones that
+// are cancelled or already finished — so the two calendars would fight over the
+// same documents if they shared a collection. Production owns what the factory
+// actually runs; this owns what sales has promised.
 
 const mongoose = require("mongoose");
 
-// SIMPLIFIED: Only store essential WO reference data
+// Only essential WO reference data is stored — the rest is populated on read.
 const scheduledWorkOrderSchema = new mongoose.Schema(
   {
     workOrderId: {
@@ -28,6 +37,14 @@ const scheduledWorkOrderSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
+    // True when the work order carried no operation timings and the duration
+    // below is a fallback rather than a real estimate. Sales sees work orders
+    // that have not been costed yet, so this is common here and never happens
+    // on the production calendar.
+    isEstimatedDuration: {
+      type: Boolean,
+      default: false,
+    },
     // Visual tracking
     colorCode: {
       type: String,
@@ -43,7 +60,7 @@ const scheduledWorkOrderSchema = new mongoose.Schema(
       enum: ["scheduled", "in_progress", "completed", "delayed", "cancelled"],
       default: "scheduled",
     },
-    // Multi-day tracking - FIXED: Track span info
+    // Multi-day tracking
     isMultiDay: {
       type: Boolean,
       default: false,
@@ -120,13 +137,13 @@ const workHoursSchema = new mongoose.Schema(
   { _id: false },
 );
 
-// Main production schedule schema
-const productionScheduleSchema = new mongoose.Schema(
+const salesScheduleSchema = new mongoose.Schema(
   {
+    // Indexed once, below, as a unique index. Declaring `index: true` here as
+    // well is what makes mongoose log a duplicate-index warning at boot.
     date: {
       type: Date,
       required: true,
-      index: true,
     },
     // Day configuration
     workHours: workHoursSchema,
@@ -149,16 +166,16 @@ const productionScheduleSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
-    // Production overriding an HR company holiday for THIS day only.
-    // HR owns the holiday calendar and it is applied as a read-time overlay,
-    // so without a stored flag the overlay would keep forcing the day closed
-    // and the Active Day switch would silently revert on every fetch.
-    // Setting this does not change anything on HR's side.
+    // Sales overriding an HR company holiday for THIS day only. HR owns the
+    // holiday calendar and it is applied as a read-time overlay, so without a
+    // stored flag the overlay would keep forcing the day closed and the Active
+    // Day switch would silently revert on every fetch. Setting this does not
+    // change anything on HR's side, nor on the production calendar.
     holidayOverride: {
       type: Boolean,
       default: false,
     },
-    // Scheduled work orders - SIMPLIFIED
+    // Planned work orders
     scheduledWorkOrders: [scheduledWorkOrderSchema],
     // Capacity tracking
     availableMinutes: {
@@ -188,13 +205,13 @@ const productionScheduleSchema = new mongoose.Schema(
     },
     lockedBy: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "ProjectManager",
+      ref: "Employee",
     },
     modifications: [
       {
         modifiedBy: {
           type: mongoose.Schema.Types.ObjectId,
-          ref: "ProjectManager",
+          ref: "Employee",
         },
         modifiedAt: {
           type: Date,
@@ -228,15 +245,13 @@ const productionScheduleSchema = new mongoose.Schema(
 );
 
 // Indexes
-productionScheduleSchema.index({ date: 1 }, { unique: true });
-productionScheduleSchema.index({ "scheduledWorkOrders.workOrderId": 1 });
-productionScheduleSchema.index({
-  "scheduledWorkOrders.manufacturingOrderId": 1,
-});
+salesScheduleSchema.index({ date: 1 }, { unique: true });
+salesScheduleSchema.index({ "scheduledWorkOrders.workOrderId": 1 });
+salesScheduleSchema.index({ "scheduledWorkOrders.manufacturingOrderId": 1 });
 
 // Calculate available minutes
-productionScheduleSchema.methods.calculateAvailableMinutes = function () {
-  // An overridden company holiday is a normal working day for production.
+salesScheduleSchema.methods.calculateAvailableMinutes = function () {
+  // An overridden company holiday is a normal working day for this calendar.
   const closed = this.isHoliday && !this.holidayOverride;
 
   if (!this.workHours.isActive || closed) {
@@ -244,7 +259,7 @@ productionScheduleSchema.methods.calculateAvailableMinutes = function () {
     return 0;
   }
 
-  let totalMinutes = this.workHours.totalMinutes;
+  const totalMinutes = this.workHours.totalMinutes;
   const allBreaks = [...(this.defaultBreaks || []), ...(this.breaks || [])];
   const breakMinutes = allBreaks.reduce(
     (sum, br) => sum + (br.durationMinutes || 0),
@@ -256,7 +271,7 @@ productionScheduleSchema.methods.calculateAvailableMinutes = function () {
 };
 
 // Calculate scheduled minutes
-productionScheduleSchema.methods.calculateScheduledMinutes = function () {
+salesScheduleSchema.methods.calculateScheduledMinutes = function () {
   const scheduled = (this.scheduledWorkOrders || []).reduce(
     (sum, wo) => sum + (wo.durationMinutes || 0),
     0,
@@ -266,7 +281,7 @@ productionScheduleSchema.methods.calculateScheduledMinutes = function () {
 };
 
 // Calculate utilization
-productionScheduleSchema.methods.calculateUtilization = function () {
+salesScheduleSchema.methods.calculateUtilization = function () {
   this.calculateAvailableMinutes();
   this.calculateScheduledMinutes();
 
@@ -283,22 +298,15 @@ productionScheduleSchema.methods.calculateUtilization = function () {
   return this.utilizationPercentage;
 };
 
-// Pre-save middleware
-productionScheduleSchema.pre("save", function (next) {
+salesScheduleSchema.pre("save", function (next) {
   this.calculateUtilization();
 
-  // Auto-lock past dates
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const scheduleDate = new Date(this.date);
-  scheduleDate.setHours(0, 0, 0, 0);
-
-  if (scheduleDate < today && !this.isLocked) {
-    this.isLocked = true;
-    this.lockedAt = new Date();
-  }
+  // NOTE: unlike ProductionSchedule, past days are NOT auto-locked here.
+  // Sales regularly back-fills a plan for a week that has already started
+  // (a late PI, a re-promise after a slip), and auto-locking made those edits
+  // silently impossible.
 
   next();
 });
 
-module.exports = mongoose.model("ProductionSchedule", productionScheduleSchema);
+module.exports = mongoose.model("SalesSchedule", salesScheduleSchema);

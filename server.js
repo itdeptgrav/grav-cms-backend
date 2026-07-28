@@ -1029,6 +1029,11 @@ app.use(
 );
 
 // Sales Routes
+// Mounted BEFORE the catch-all sales routers below, which own `/:requestId/...`
+// patterns at the same prefix and would otherwise be able to shadow this one.
+const salesScheduleRoutes = require("./routes/CMS_Routes/Sales/SalesSchedule/salesScheduleRoutes");
+app.use("/api/cms/sales/sales-schedule", salesScheduleRoutes);
+
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
 app.use("/api/cms/sales", salesRoutes);
 
