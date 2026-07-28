@@ -7,6 +7,7 @@
 
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
@@ -713,6 +714,114 @@ router.get("/queue", async (req, res) => {
     });
   } catch (err) {
     console.error("[EMB queue]", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GET /manufacturing-orders/:moId — embroidery performance scoped to one MO,
+// for the Project Manager's per-MO "Embroidery" tab: WO-wise done/pending,
+// operator leaderboard, and a day-wise trend across this MO's work orders.
+// ═════════════════════════════════════════════════════════════════════════════
+router.get("/manufacturing-orders/:moId", async (req, res) => {
+  try {
+    const { moId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(moId)) {
+      return res.status(400).json({ success: false, message: "Invalid MO id" });
+    }
+
+    const workOrders = await WorkOrder.find({
+      customerRequestId: moId,
+      status: { $ne: "pending" },
+    })
+      .select("workOrderNumber stockItemName stockItemReference quantity variantAttributes stockItemId")
+      .lean();
+
+    if (!workOrders.length) {
+      return res.json({
+        success: true,
+        workOrders: [],
+        totals: { total: 0, done: 0, pending: 0, percent: 0 },
+        operators: [],
+        trend: [],
+      });
+    }
+
+    const woIds = workOrders.map((w) => w._id);
+    const stockItemIds = [...new Set(workOrders.map((w) => w.stockItemId?.toString()).filter(Boolean))];
+    const stockItems = stockItemIds.length
+      ? await StockItem.find({ _id: { $in: stockItemIds } }).select("name images variants").lean()
+      : [];
+    const siMap = new Map(stockItems.map((s) => [s._id.toString(), s]));
+
+    const records = await EmbroideryRecord.find({ workOrderId: { $in: woIds } })
+      .sort({ scannedAt: -1 })
+      .lean();
+
+    const recByWo = new Map();
+    for (const r of records) {
+      const k = String(r.workOrderId);
+      if (!recByWo.has(k)) recByWo.set(k, []);
+      recByWo.get(k).push(r);
+    }
+
+    const woRows = workOrders.map((wo) => {
+      const recs = recByWo.get(String(wo._id)) || [];
+      const doneUnits = [...new Set(recs.map((r) => r.unitNumber))];
+      const total = wo.quantity || 0;
+      const done = doneUnits.length;
+      const pending = Math.max(0, total - done);
+      const si = wo.stockItemId ? siMap.get(wo.stockItemId.toString()) : null;
+      return {
+        workOrderId: wo._id,
+        workOrderNumber: wo.workOrderNumber,
+        productName: wo.stockItemName || si?.name || "—",
+        variantLabel: variantLabelOf(wo),
+        image: resolveImage(wo, si),
+        total,
+        done,
+        pending,
+        percent: total ? Math.round((done / total) * 100) : 0,
+        state: done === 0 ? "not_started" : done >= total ? "finished" : "in_progress",
+        lastScan: recs[0]?.scannedAt || null,
+      };
+    });
+
+    // Operator leaderboard across this MO
+    const opMap = new Map();
+    for (const r of records) {
+      const k = r.operatorBiometricId;
+      if (!opMap.has(k)) {
+        opMap.set(k, { biometricId: k, name: r.operatorName, pieces: 0, firstScan: r.scannedAt, lastScan: r.scannedAt });
+      }
+      const o = opMap.get(k);
+      o.pieces += 1;
+      if (new Date(r.scannedAt) < new Date(o.firstScan)) o.firstScan = r.scannedAt;
+      if (new Date(r.scannedAt) > new Date(o.lastScan)) o.lastScan = r.scannedAt;
+    }
+    const operators = [...opMap.values()].sort((a, b) => b.pieces - a.pieces);
+
+    // Day-wise trend for this MO
+    const dayMap = new Map();
+    for (const r of records) dayMap.set(r.date, (dayMap.get(r.date) || 0) + 1);
+    const trend = [...dayMap.entries()]
+      .map(([date, pieces]) => ({ date, pieces }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    const totals = woRows.reduce(
+      (acc, w) => {
+        acc.total += w.total;
+        acc.done += w.done;
+        acc.pending += w.pending;
+        return acc;
+      },
+      { total: 0, done: 0, pending: 0 }
+    );
+    totals.percent = totals.total ? Math.round((totals.done / totals.total) * 100) : 0;
+
+    res.json({ success: true, workOrders: woRows, totals, operators, trend });
+  } catch (err) {
+    console.error("[EMB MO overview]", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });

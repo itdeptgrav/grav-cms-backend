@@ -413,7 +413,7 @@ router.get("/trend", async (req, res) => {
 // ─── GET /inspections ──────────────────────────────────────────────────────────
 router.get("/inspections", async (req, res) => {
   try {
-    const { date, startDate, endDate, status, qcBiometricId } = req.query;
+    const { date, startDate, endDate, status, qcBiometricId, manufacturingOrderId } = req.query;
     const filter = {};
 
     if (date) filter.date = date;
@@ -421,11 +421,14 @@ router.get("/inspections", async (req, res) => {
       filter.date = {};
       if (startDate) filter.date.$gte = startDate;
       if (endDate)   filter.date.$lte = endDate;
-    } else {
+    } else if (!manufacturingOrderId) {
+      // Only default to "today" when this isn't an MO-scoped query — an MO tab
+      // wants the full inspection history for that order, not just today's.
       filter.date = istDateString();
     }
     if (status && ["passed", "defective"].includes(status)) filter.status = status;
     if (qcBiometricId) filter.inspectedByBiometricId = qcBiometricId;
+    if (manufacturingOrderId) filter.manufacturingOrderId = manufacturingOrderId;
 
     const inspections = await QCInspection.find(filter).sort({ inspectedAt: -1 }).lean();
 
