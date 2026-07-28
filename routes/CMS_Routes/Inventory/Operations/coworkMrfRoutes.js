@@ -1,20 +1,21 @@
 // routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes.js
 // ──────────────────────────────────────────────────────────────────────────────
-// MRF endpoints for the COWORK side (employee-facing).
-// Uses verifyCoworkToken (Firebase) instead of EmployeeAuthMiddleware.
+// MRF endpoints for the COWORK side.
 //
-// Mount in your main Express app:
-//   const { verifyCoworkToken, verifyEmployeeToken } = require("./Middlewear/coworkAuth");
-//   app.use("/api/cowork/mrf", require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"));
+// Serves two audiences from the same Firebase session:
+//   • the requester    — raises requests, tracks them, chats
+//   • the TL / Primary Manager — approvals queue, approve / reject, chat
+//
+// Approval flow:  Employee → Primary Manager/TL → Store
+// The Project Manager is not part of this flow.
 //
 // req.coworkUser = { employeeId, role, name, authUid, employeeData }
-//   employeeId = biometricId string (e.g. "GR022")
+//   employeeId = biometricId string (e.g. "GR022")  ← what TL routing keys on
 //   role       = "employee" | "tl" | "ceo"
 // ──────────────────────────────────────────────────────────────────────────────
 
 const express = require("express")
 const router = express.Router()
-const mongoose = require("mongoose")
 const MRF = require("../../../../models/CMS_Models/Inventory/Operations/MRF")
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem")
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit")
@@ -22,6 +23,11 @@ const Employee = require("../../../../models/Employee")
 const NotificationService = require("../../../../services/NotificationService")
 const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest")
 
+const mrfApprover = require("../../../../services/mrfApprover.service")
+const mrfNotify = require("../../../../services/mrfNotify.service")
+const mrfChat = require("../../../../services/mrfChat.service")
+const { buildContext } = require("../../../../services/mrfContext.service")
+const { buildUnitConversions, enrichItemsWithStock } = require("../../../../services/mrfUnits.service")
 
 const {
   verifyCoworkToken,
@@ -32,7 +38,6 @@ router.use(verifyCoworkToken)
 router.use(verifyEmployeeToken)
 
 // ── Normalise coworkUser → standard user shape used by helpers ────────────────
-// Attach req.user so all helpers below work identically to the store-side routes
 router.use((req, _res, next) => {
   req.user = {
     id: req.coworkUser.employeeId,  // biometricId string
@@ -43,83 +48,35 @@ router.use((req, _res, next) => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers (copied from mrfRoutes.js — keeping them local avoids coupling)
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildFullName(emp) {
-  if (!emp) return ""
-  return [emp.firstName, emp.middleName, emp.lastName]
-    .filter(Boolean).join(" ").trim() || emp.email || ""
+const buildFullName = mrfApprover.buildFullName
+
+// Resolve biometricId string → Employee doc
+async function resolveEmployee(biometricId) {
+  return Employee.findOne({
+    $or: [{ biometricId }, { identityId: biometricId }]
+  })
+    .select("_id firstName middleName lastName name email department biometricId identityId primaryManager isActive status")
+    .lean()
 }
 
-async function convertQty(qty, fromUnit, toUnit) {
-  if (!fromUnit || !toUnit || fromUnit === toUnit) return qty
-  try {
-    const fromDoc = await Unit.findOne({ name: fromUnit }).populate("conversions.toUnit", "name").lean()
-    if (fromDoc) {
-      const d = (fromDoc.conversions || []).find(c => (c.toUnit?.name || c.toUnit) === toUnit)
-      if (d?.quantity) return qty * d.quantity
-    }
-    const toDoc = await Unit.findOne({ name: toUnit }).populate("conversions.toUnit", "name").lean()
-    if (toDoc) {
-      const r = (toDoc.conversions || []).find(c => (c.toUnit?.name || c.toUnit) === fromUnit)
-      if (r?.quantity) return qty / r.quantity
-    }
-    return qty
-  } catch { return qty }
-}
+const MAX_IMAGES_PER_ITEM = 5
 
-async function adjustStock(rawItemId, variantId, variantCombination, delta, txnMeta) {
-  const raw = await RawItem.findById(rawItemId)
-  if (!raw) throw new Error(`RawItem ${rawItemId} not found`)
-  const prevQty = raw.quantity || 0
-
-  let matchedVariant = null
-  if (variantId && raw.variants?.length) matchedVariant = raw.variants.id(variantId)
-  if (!matchedVariant && variantCombination?.length && raw.variants?.length) {
-    matchedVariant = raw.variants.find(v =>
-      v.combination?.length === variantCombination.length &&
-      v.combination.every((val, i) => val === variantCombination[i])
-    )
-  }
-  if (matchedVariant) {
-    matchedVariant.quantity = Math.max(0, (matchedVariant.quantity || 0) + delta)
-    matchedVariant.status =
-      matchedVariant.quantity === 0 ? "Out of Stock" :
-        matchedVariant.quantity <= (matchedVariant.minStock || raw.minStock || 0) ? "Low Stock" : "In Stock"
-  }
-  raw.quantity = Math.max(0, prevQty + delta)
-  raw.status = raw.quantity === 0 ? "Out of Stock" : raw.quantity <= (raw.minStock || 0) ? "Low Stock" : "In Stock"
-  raw.stockTransactions.push({
-    ...txnMeta,
-    previousQuantity: prevQty, newQuantity: raw.quantity,
-    ...(matchedVariant ? { variantId, variantCombination } : {}),
-  })
-  await raw.save()
-}
-
-async function buildUnitConversions() {
-  const units = await Unit.find({}).populate("conversions.toUnit", "name").lean()
-  const map = {}
-  // Pass 1 — forward
-  units.forEach(u => {
-    if (!map[u.name]) map[u.name] = []
-      ; (u.conversions || []).forEach(c => {
-        const toName = c.toUnit?.name || c.toUnit
-        if (toName && c.quantity > 0) map[u.name].push({ name: toName, factor: c.quantity })
-      })
-  })
-  // Pass 2 — reverse (e.g. 1 packet=10pcs → pcs→0.1packet)
-  units.forEach(u => {
-    ; (u.conversions || []).forEach(c => {
-      const toName = c.toUnit?.name || c.toUnit
-      if (!toName || !c.quantity || c.quantity <= 0) return
-      if (!map[toName]) map[toName] = []
-      if (!map[toName].some(x => x.name === u.name))
-        map[toName].push({ name: u.name, factor: +(1 / c.quantity).toFixed(8) })
-    })
-  })
-  return map
+// Product images arrive as already-uploaded Cloudinary results from the
+// client. Only the fields we render are kept — anything else the client sends
+// is dropped rather than persisted blindly.
+function cleanImages(images) {
+  if (!Array.isArray(images)) return []
+  return images
+    .filter(im => im && typeof im.url === "string" && /^https?:\/\//i.test(im.url))
+    .slice(0, MAX_IMAGES_PER_ITEM)
+    .map(im => ({
+      url: im.url.trim(),
+      publicId: String(im.publicId || "").trim(),
+      name: String(im.name || "").trim().slice(0, 120),
+    }))
 }
 
 async function buildMrfItems(items) {
@@ -135,10 +92,16 @@ async function buildMrfItems(items) {
       rawItemSku: raw.sku || "",
       variantId: it.variantId || null,
       variantCombination: it.variantCombination || [],
+      // Requester-supplied context — shown to the TL and the Store Person.
+      description: String(it.description || "").trim().slice(0, 1000),
+      specifications: String(it.specifications || "").trim().slice(0, 1000),
+      images: cleanImages(it.images),
       requestedQty: parseFloat(it.requestedQty),
+      // The unit the requester picked wins; baseUnit only as a fallback.
       unit: it.unit || baseUnit,
       baseUnit,
       itemStatus: "PENDING",
+      availability: "UNREVIEWED",
     })
   }
   return built
@@ -153,16 +116,78 @@ function markOverdue(mrfs) {
   })
 }
 
-// Resolve biometricId string → MongoDB Employee _id
-async function resolveEmployeeId(biometricId) {
-  const emp = await Employee.findOne({
-    $or: [{ biometricId }, { identityId: biometricId }]
-  }).select("_id firstName middleName lastName department biometricId identityId").lean()
-  return emp
+/** Attach the shared contextual message to each MRF for the given audience. */
+function withContext(mrfs, audience) {
+  const list = Array.isArray(mrfs) ? mrfs : [mrfs]
+  list.forEach(m => { m.context = buildContext(m, audience) })
+  return mrfs
 }
 
+/**
+ * Who may see and act on this MRF.
+ *
+ * The stored approverBiometricId is the fast path, but MRFs raised before
+ * approver routing existed have no approver stored at all — those are matched
+ * to a TL through the requester's live HR primaryManager link (the same
+ * fallback GET /approvals uses to list them). Without this, such a request
+ * shows up in a TL's queue and then refuses every action they take on it.
+ *
+ * Returns { canView, canApprove, backfill } — `backfill` means the approver
+ * was resolved live and should be written onto the MRF the next time it is
+ * saved, so the fallback only ever runs once per request.
+ */
+async function resolveAccess(mrf, user) {
+  if (!mrf) return { canView: false, canApprove: false }
+
+  const isRequester =
+    (!!mrf.requestedForId && mrf.requestedForId === user.id) ||
+    (!!mrf.requesterCoworkId && mrf.requesterCoworkId === user.id)
+  const isApprover =
+    (!!mrf.approverBiometricId && mrf.approverBiometricId === user.id) ||
+    (mrf.approverAltIds || []).includes(user.id)
+
+  if (isApprover) return { canView: true, canApprove: true }
+  if (user.role === "ceo") return { canView: true, canApprove: true }
+  if (isRequester) return { canView: true, canApprove: false, isRequester: true }
+
+  // ── Legacy: no approver was ever stored on this MRF ──────────────────
+  if (!mrf.approverBiometricId) {
+    const requester = await Employee.findById(mrf.requestedFor)
+      .select("primaryManager").lean()
+    const managerId = requester?.primaryManager?.managerId
+    if (managerId) {
+      const me = await resolveEmployee(user.id)
+      if (me && String(me._id) === String(managerId)) {
+        return { canView: true, canApprove: true, backfill: me }
+      }
+    }
+  }
+
+  return { canView: false, canApprove: false }
+}
+
+/** Write a live-resolved approver onto the MRF so the fallback runs once. */
+function applyBackfill(mrf, me) {
+  if (!me) return
+  const ids = mrfApprover.coworkIdsOf(me)
+  mrf.approverEmployee = me._id
+  mrf.approverBiometricId = ids[0] || ""
+  mrf.approverAltIds = ids
+  mrf.approverName = buildFullName(me)
+  mrf.approverResolution = "RESOLVED"
+  mrf.approvalRoute = "TL"
+}
+
+const chatSenderFor = (req, emp, roleOverride) => ({
+  senderRef: emp?._id || null,
+  senderBiometricId: req.user.id,
+  senderName: buildFullName(emp) || req.user.name || "",
+  senderRole: roleOverride
+    || (req.user.role === "ceo" ? "ceo" : (req.user.role === "tl" ? "tl" : "employee")),
+})
+
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /data/raw-items
+// Reference data
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/categories", async (req, res) => {
   try {
@@ -212,16 +237,309 @@ router.get("/data/raw-items", async (req, res) => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /  — employee sees only their own MRFs
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Who approves my requests? Shown in the new-request drawer so the requester
+ * knows up front where it is going — and hears about a missing HR link before
+ * they spend time filling the form.
+ */
+router.get("/my-approver", async (req, res) => {
+  try {
+    const emp = await resolveEmployee(req.user.id)
+    if (!emp) return res.json({ success: true, approver: null, resolution: "NO_HR_RECORD" })
+    const a = await mrfApprover.resolveApprover(emp)
+    res.json({
+      success: true,
+      approver: a.approverBiometricId
+        ? { name: a.approverName, biometricId: a.approverBiometricId }
+        : null,
+      resolution: a.approverResolution,
+      willAutoForward: a.approvalRoute === "AUTO_STORE",
+      message: a.approvalRoute === "AUTO_STORE"
+        ? a.autoForwardReason
+        : `Requests you raise go to ${a.approverName} for approval.`,
+    })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TL / PRIMARY MANAGER — approvals queue
+// Registered before "/:id" so Express does not read "approvals" as an id.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /approvals — every MRF this user is the Primary Manager/TL for.
+ *
+ * Matched on approverBiometricId, which was resolved from the requester's HR
+ * record at submission time. MRFs raised before approver routing existed have
+ * no approverBiometricId, so they are also matched via the requester's
+ * primaryManager link — otherwise they would be invisible to everyone.
+ */
+router.get("/approvals", async (req, res) => {
+  try {
+    const { status = "PENDING", page = 1, limit = 20, search = "" } = req.query
+
+    const legacyIds = await mrfApprover.listManagedEmployeeIds(req.user.id)
+    const scope = {
+      $or: [
+        // Either id the approver's HR record carries may be the one their
+        // cowork session presents — match both, same as resolveAccess does.
+        { approverBiometricId: req.user.id },
+        { approverAltIds: req.user.id },
+        ...(legacyIds.length
+          ? [{
+            $and: [
+              { $or: [{ approverBiometricId: { $in: ["", null] } }, { approverBiometricId: { $exists: false } }] },
+              { requestedFor: { $in: legacyIds } },
+            ],
+          }]
+          : []),
+      ],
+    }
+
+    const filter = { ...scope }
+    if (status && status !== "ALL") filter.status = status
+    if (search) {
+      filter.$and = [{
+        $or: [
+          { mrfNumber: { $regex: search, $options: "i" } },
+          { requestedForName: { $regex: search, $options: "i" } },
+          { requestedForId: { $regex: search, $options: "i" } },
+          { reason: { $regex: search, $options: "i" } },
+        ],
+      }]
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit)
+    const total = await MRF.countDocuments(filter)
+    const mrfs = await MRF.find(filter)
+      .sort({ priority: -1, createdAt: -1 })
+      .skip(skip).limit(parseInt(limit))
+      .lean()
+
+    markOverdue(mrfs)
+    withContext(mrfs, "tl")
+
+    const statsAgg = await MRF.aggregate([
+      { $match: scope },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          pending: { $sum: { $cond: [{ $eq: ["$status", "PENDING"] }, 1, 0] } },
+          approved: { $sum: { $cond: [{ $eq: ["$status", "APPROVED"] }, 1, 0] } },
+          rejected: { $sum: { $cond: [{ $eq: ["$status", "REJECTED"] }, 1, 0] } },
+          issued: { $sum: { $cond: [{ $in: ["$status", ["ISSUED", "PARTIALLY_ISSUED"]] }, 1, 0] } },
+        },
+      },
+    ])
+    const stats = statsAgg[0] || { total: 0, pending: 0, approved: 0, rejected: 0, issued: 0 }
+    delete stats._id
+
+    // ── Product requests awaiting this same TL ──────────────────────────
+    // New-product requests are approved by the same person under the same
+    // rules, so they belong in one queue rather than a second screen.
+    const prScope = {
+      $or: [
+        { approverBiometricId: req.user.id },
+        { approverAltIds: req.user.id },
+        ...(legacyIds.length
+          ? [{
+            $and: [
+              { $or: [{ approverBiometricId: { $in: ["", null] } }, { approverBiometricId: { $exists: false } }] },
+              { requestedBy: { $in: legacyIds } },
+            ],
+          }]
+          : []),
+      ],
+    }
+    const PR_STATUS_MAP = { PENDING: "PENDING_TL", APPROVED: "TL_APPROVED", REJECTED: "TL_REJECTED" }
+    const prFilter = { ...prScope }
+    if (status && status !== "ALL") prFilter.approvalStatus = PR_STATUS_MAP[status] || status
+
+    const productRequests = await RawItemAddRequest.find(prFilter)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .populate("products.matchedTo", "name sku")
+      .populate("products.spawnedMrf", "mrfNumber status")
+      .lean()
+
+    const prCounts = await RawItemAddRequest.aggregate([
+      { $match: prScope },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          pending: { $sum: { $cond: [{ $eq: ["$approvalStatus", "PENDING_TL"] }, 1, 0] } },
+          approved: { $sum: { $cond: [{ $eq: ["$approvalStatus", "TL_APPROVED"] }, 1, 0] } },
+          rejected: { $sum: { $cond: [{ $eq: ["$approvalStatus", "TL_REJECTED"] }, 1, 0] } },
+        },
+      },
+    ])
+    const pr = prCounts[0] || { total: 0, pending: 0, approved: 0, rejected: 0 }
+
+    // One combined count so the tab badge reflects everything needing action.
+    const combinedStats = {
+      total: (stats.total || 0) + pr.total,
+      pending: (stats.pending || 0) + pr.pending,
+      approved: (stats.approved || 0) + pr.approved,
+      rejected: (stats.rejected || 0) + pr.rejected,
+      issued: stats.issued || 0,
+    }
+
+    res.json({
+      success: true,
+      mrfs,
+      productRequests,
+      stats: combinedStats,
+      mrfStats: stats,
+      productRequestStats: pr,
+      pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) },
+    })
+  } catch (err) {
+    console.error("[CoworkMRF GET /approvals]", err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+/**
+ * PATCH /:id/tl-approve — the only approval step in the flow.
+ * On success the request moves straight to the Store.
+ *
+ * Deliberately does NOT block on stock. The store reports availability after
+ * approval; a TL approving "yes, this person may have it" is a separate
+ * question from "does the store have it today".
+ */
+router.patch("/:id/tl-approve", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id)
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+
+    const access = await resolveAccess(mrf.toObject(), req.user)
+    if (!access.canApprove)
+      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
+    if (access.backfill) applyBackfill(mrf, access.backfill)
+
+    if (mrf.status === "CANCELLED")
+      return res.status(400).json({ success: false, message: "This request was cancelled by the requester." })
+    if (mrf.tlApproved)
+      return res.json({ success: true, message: "Already approved", mrf, alreadyDone: true })
+    if (mrf.status !== "PENDING")
+      return res.status(400).json({ success: false, message: `Cannot approve — this request is already ${mrf.status.toLowerCase().replace(/_/g, " ")}.` })
+
+    const { itemDecisions, note = "" } = req.body
+
+    // Per-item approve/reject. Everything not explicitly rejected is approved.
+    if (itemDecisions && typeof itemDecisions === "object") {
+      mrf.items.forEach(item => {
+        const d = itemDecisions[String(item._id)]
+        item.itemStatus = d === "REJECTED" || d === "reject" ? "REJECTED" : "APPROVED"
+      })
+      if (mrf.items.every(i => i.itemStatus === "REJECTED"))
+        return res.status(400).json({
+          success: false,
+          message: "Every item was rejected — use Reject on the whole request instead.",
+        })
+    } else {
+      mrf.items.forEach(item => { item.itemStatus = "APPROVED" })
+    }
+
+    const actor = await resolveEmployee(req.user.id)
+    const actorName = buildFullName(actor) || req.user.name || ""
+
+    mrf.tlApproved = true
+    mrf.tlApprovedBy = actor?._id || null
+    mrf.tlApprovedByName = actorName
+    mrf.tlApprovedAt = new Date()
+    mrf.tlRejected = false
+    mrf.tlRejectedBy = null; mrf.tlRejectedAt = null; mrf.tlRejectionNote = ""
+    mrf.status = "APPROVED"
+    mrf.approvedAt = new Date()
+    if (note) mrf.storeNotes = note
+
+    const rejectedCount = mrf.items.filter(i => i.itemStatus === "REJECTED").length
+    mrf.logEvent({
+      action: "TL_APPROVED",
+      actorName, actorRole: "tl",
+      detail: rejectedCount
+        ? `Approved with ${rejectedCount} item(s) rejected.${note ? ` Note: ${note}` : ""}`
+        : (note || "Approved and forwarded to the Store."),
+    })
+
+    await mrf.save()
+
+    mrfChat.systemMessage(mrf, `${actorName || "The TL"} approved this request — it is now with the Store.`, actorName)
+    mrfNotify.tlApproved(mrf).catch(e => console.error("[tlApprove notify]", e.message))
+
+    res.json({ success: true, message: "Approved and sent to the Store", mrf, context: buildContext(mrf.toObject(), "tl") })
+  } catch (err) {
+    console.error("[CoworkMRF tl-approve]", err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+/** PATCH /:id/tl-reject — reason is mandatory, the requester is told why. */
+router.patch("/:id/tl-reject", async (req, res) => {
+  try {
+    const note = String(req.body.note || req.body.rejectionNote || "").trim()
+    if (!note)
+      return res.status(400).json({ success: false, message: "A rejection reason is required — the requester sees it." })
+
+    const mrf = await MRF.findById(req.params.id)
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+
+    const access = await resolveAccess(mrf.toObject(), req.user)
+    if (!access.canApprove)
+      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
+    if (access.backfill) applyBackfill(mrf, access.backfill)
+
+    if (["ISSUED", "PARTIALLY_ISSUED", "PARTIALLY_RETURNED", "COMPLETED"].includes(mrf.status))
+      return res.status(400).json({ success: false, message: "Cannot reject — the Store has already issued material against this request." })
+    if (mrf.status === "CANCELLED")
+      return res.status(400).json({ success: false, message: "This request was already cancelled." })
+    if (mrf.tlRejected)
+      return res.json({ success: true, message: "Already rejected", mrf, alreadyDone: true })
+
+    const actor = await resolveEmployee(req.user.id)
+    const actorName = buildFullName(actor) || req.user.name || ""
+
+    mrf.tlRejected = true
+    mrf.tlRejectedBy = actor?._id || null
+    mrf.tlRejectedByName = actorName
+    mrf.tlRejectedAt = new Date()
+    mrf.tlRejectionNote = note
+    mrf.tlApproved = false
+    mrf.status = "REJECTED"
+    mrf.rejectedAt = new Date()
+    mrf.rejectionNote = note
+    mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED" })
+
+    mrf.logEvent({ action: "TL_REJECTED", actorName, actorRole: "tl", detail: note })
+    await mrf.save()
+
+    mrfChat.systemMessage(mrf, `${actorName || "The TL"} rejected this request. Reason: ${note}`, actorName)
+    mrfNotify.tlRejected(mrf).catch(e => console.error("[tlReject notify]", e.message))
+
+    res.json({ success: true, message: "Request rejected", mrf, context: buildContext(mrf.toObject(), "tl") })
+  } catch (err) {
+    console.error("[CoworkMRF tl-reject]", err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// REQUESTER — own requests
+// ═════════════════════════════════════════════════════════════════════════════
+
 router.get("/", async (req, res) => {
   try {
     const { status, requestType, priority, page = 1, limit = 20 } = req.query
 
-    // Always scope to this employee — resolve biometricId → _id
-    const emp = await resolveEmployeeId(req.user.id)
-    if (!emp) return res.json({ success: true, mrfs: [], stats: { total: 0, pending: 0, approved: 0, issued: 0 }, pagination: { total: 0, page: 1, totalPages: 1 } })
+    const emp = await resolveEmployee(req.user.id)
+    if (!emp) return res.json({
+      success: true, mrfs: [],
+      stats: { total: 0, pending: 0, approved: 0, issued: 0 },
+      pagination: { total: 0, page: 1, totalPages: 1 },
+    })
 
     const filter = { requestedFor: emp._id }
     if (status) filter.status = status
@@ -235,6 +553,7 @@ router.get("/", async (req, res) => {
       .lean()
 
     markOverdue(mrfs)
+    withContext(mrfs, "requester")
 
     const statsAgg = await MRF.aggregate([
       { $match: { requestedFor: emp._id } },
@@ -258,12 +577,16 @@ router.get("/", async (req, res) => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /  — employee creates their own MRF
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * POST / — employee raises a material request.
+ *
+ * Resolves the Primary Manager/TL from the HR record and routes there. If no
+ * TL can be resolved the request is auto-forwarded to the Store rather than
+ * blocked, flagged so every screen can explain why nobody approved it.
+ */
 router.post("/", async (req, res) => {
   try {
-    const { requestType, deadline, reason = "", priority = "NORMAL", items } = req.body
+    const { requestType, deadline, neededBy, reason = "", priority = "NORMAL", items } = req.body
 
     if (!["TIME_BASED", "USES_BASED"].includes(requestType))
       return res.status(400).json({ success: false, message: "Invalid requestType" })
@@ -276,40 +599,97 @@ router.post("/", async (req, res) => {
     if (!builtItems.length)
       return res.status(400).json({ success: false, message: "No valid items found" })
 
-    // Resolve employee identity
-    const emp = await resolveEmployeeId(req.user.id)
+    const emp = await resolveEmployee(req.user.id)
     if (!emp) return res.status(404).json({ success: false, message: "Your HR record not found. Contact HR." })
+
+    // ── Accidental double-submit guard ──────────────────────────────────
+    // Same person, same items, same quantities, still open, within 2 minutes →
+    // return the request they already have instead of minting a second one.
+    const signature = builtItems
+      .map(i => `${i.rawItem}:${i.variantId || ""}:${i.requestedQty}:${i.unit}`)
+      .sort().join("|")
+    const recent = await MRF.find({
+      requestedFor: emp._id,
+      status: { $in: ["PENDING", "APPROVED"] },
+      createdAt: { $gte: new Date(Date.now() - 2 * 60 * 1000) },
+    }).lean()
+    const dupe = recent.find(m =>
+      (m.items || []).map(i => `${i.rawItem}:${i.variantId || ""}:${i.requestedQty}:${i.unit}`)
+        .sort().join("|") === signature
+    )
+    if (dupe) {
+      return res.status(200).json({
+        success: true,
+        duplicate: true,
+        message: `You already raised this exact request a moment ago (${dupe.mrfNumber}). We have not created a second one.`,
+        mrf: dupe,
+      })
+    }
 
     const fullName = buildFullName(emp)
     const biometricId = emp.biometricId || emp.identityId || req.user.id
+    const approver = await mrfApprover.resolveApprover(emp)
+    const autoForward = approver.approvalRoute === "AUTO_STORE"
 
     const mrf = new MRF({
       requestedFor: emp._id,
       requestedForName: fullName || req.user.name || "",
       requestedForDept: emp.department || "",
       requestedForId: biometricId,
+      // The id this session actually authenticates as — notifications must be
+      // addressed to it, and it is not always the HR biometricId.
+      requesterCoworkId: req.user.id,
       creationMode: "SELF",
       createdByRef: emp._id,
       createdByModel: "Employee",
       createdByName: fullName || req.user.name || "",
       requestType,
       deadline: requestType === "TIME_BASED" ? new Date(deadline) : null,
+      // When the requester needs it in hand — shown to them, the TL and the Store.
+      neededBy: neededBy ? new Date(neededBy) : null,
       reason, priority,
-      status: "PENDING",
-      items: builtItems,
+      ...approver,
+      // No TL to approve → it goes straight to the Store, already approved.
+      status: autoForward ? "APPROVED" : "PENDING",
+      items: autoForward
+        ? builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }))
+        : builtItems,
+      ...(autoForward ? { approvedAt: new Date() } : {}),
     })
+
+    mrf.logEvent({
+      action: "CREATED",
+      actorName: fullName || req.user.name || "",
+      actorRole: "employee",
+      detail: autoForward
+        ? approver.autoForwardReason
+        : `Submitted for approval by ${approver.approverName}.`,
+    })
+    if (autoForward) {
+      mrf.logEvent({
+        action: "AUTO_FORWARDED",
+        actorName: "System", actorRole: "system",
+        detail: approver.autoForwardReason,
+      })
+    }
 
     await mrf.save()
 
-    NotificationService.sendToRole(["project_manager", "store_manager", "admin"], {
-      title: "New Material Request",
-      body: `${mrf.mrfNumber} — ${fullName || req.user.name} requested ${builtItems.length} item(s)`,
-      type: "request",
-      url: "/project-manager/dashboard/requests",
-      tag: `mrf-${mrf._id}`,
-    }).catch(() => { })
+    if (autoForward) {
+      mrfNotify.autoForwarded(mrf).catch(e => console.error("[mrf autoForward notify]", e.message))
+    } else {
+      mrfNotify.submitted(mrf).catch(e => console.error("[mrf submitted notify]", e.message))
+    }
 
-    res.status(201).json({ success: true, message: "MRF created", mrf })
+    const obj = mrf.toObject()
+    res.status(201).json({
+      success: true,
+      message: autoForward
+        ? approver.autoForwardReason
+        : `${mrf.mrfNumber} submitted — waiting for approval from ${approver.approverName}.`,
+      mrf: obj,
+      context: buildContext(obj, "requester"),
+    })
   } catch (err) {
     console.error("[CoworkMRF POST /]", err)
     res.status(500).json({ success: false, message: err.message })
@@ -317,35 +697,12 @@ router.post("/", async (req, res) => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH /:id/cancel — employee cancels their own PENDING MRF
-// ─────────────────────────────────────────────────────────────────────────────
-router.patch("/:id/cancel", async (req, res) => {
-  try {
-    const emp = await resolveEmployeeId(req.user.id)
-    const mrf = await MRF.findOne({ _id: req.params.id, requestedFor: emp?._id })
-    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
-    if (mrf.status !== "PENDING")
-      return res.status(400).json({ success: false, message: "Only PENDING requests can be cancelled" })
-
-    mrf.status = "CANCELLED"
-    mrf.cancelledBy = emp._id
-    mrf.cancelledByModel = "Employee"
-    mrf.cancelledAt = new Date()
-    mrf.cancellationNote = req.body.cancellationNote || "Cancelled by employee"
-    mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED" })
-    await mrf.save()
-    res.json({ success: true, message: "MRF cancelled", mrf })
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message })
-  }
-})
-
-// ─────────────────────────────────────────────────────────────────────────────
 // GET /product-requests — employee's own raw-item add requests
+// Registered before "/:id".
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/product-requests", async (req, res) => {
   try {
-    const emp = await resolveEmployeeId(req.user.id)
+    const emp = await resolveEmployee(req.user.id)
     if (!emp) return res.json({ success: true, requests: [] })
     const requests = await RawItemAddRequest.find({ requestedBy: emp._id })
       .sort({ createdAt: -1 })
@@ -359,15 +716,14 @@ router.get("/product-requests", async (req, res) => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /product-requests — manual entry only, no backend availability check.
-// Store side (mrfRoutes.js) reviews and either matches to an existing RawItem
-// or creates a new one from the details below.
-// Body: { products: [{ itemName, category, unit, notes, attributes:[{name,values:[]}] }] }
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * POST /product-requests — ask the store to register an item that is not in
+ * the catalogue yet. Manual entry only; the store reviews and either matches
+ * it to an existing RawItem or creates a new one.
+ */
 router.post("/product-requests", async (req, res) => {
   try {
-    const { products, priority, reason } = req.body
+    const { products, priority, reason, neededBy } = req.body
     if (!Array.isArray(products) || !products.length)
       return res.status(400).json({ success: false, message: "At least one product is required" })
 
@@ -377,7 +733,9 @@ router.post("/product-requests", async (req, res) => {
         itemName: p.itemName.trim(),
         category: p.category?.trim() || "",
         unit: p.unit?.trim() || "",
+        requestedQty: p.requestedQty ? parseFloat(p.requestedQty) : null,
         notes: p.notes?.trim() || "",
+        images: cleanImages(p.images),
         attributes: Array.isArray(p.attributes)
           ? p.attributes
             .filter(a => a.name?.trim() && Array.isArray(a.values) && a.values.some(v => v?.trim()))
@@ -387,31 +745,363 @@ router.post("/product-requests", async (req, res) => {
     if (!cleaned.length)
       return res.status(400).json({ success: false, message: "No valid product entries found" })
 
-    const emp = await resolveEmployeeId(req.user.id)
+    const emp = await resolveEmployee(req.user.id)
     if (!emp) return res.status(404).json({ success: false, message: "Your HR record not found. Contact HR." })
+
+    // Route to the requester's Primary Manager/TL first, exactly like an MRF.
+    // The Store must not see this — let alone start matching it against the
+    // catalogue — until the TL has approved.
+    const approver = await mrfApprover.resolveApprover(emp)
+    const autoForward = approver.approvalRoute === "AUTO_STORE"
 
     const reqDoc = new RawItemAddRequest({
       requestedBy: emp._id,
       requestedByName: buildFullName(emp) || req.user.name || "",
       requestedByDept: emp.department || "",
+      requesterCoworkId: req.user.id,
       products: cleaned,
       priority: ["LOW", "NORMAL", "HIGH", "URGENT"].includes(priority) ? priority : "NORMAL",
       reason: reason?.trim() || "",
+      neededBy: neededBy ? new Date(neededBy) : null,
+      ...approver,
+      approvalStatus: autoForward ? "TL_APPROVED" : "PENDING_TL",
+      ...(autoForward ? { tlApproved: true, tlApprovedAt: new Date() } : {}),
     })
     await reqDoc.save()
 
-    NotificationService.sendToRole(["store_manager", "admin"], {
-      title: "New Product Registration Request",
-      body: `${reqDoc.requestedByName} requested ${cleaned.length} new item(s) be added to inventory`,
-      type: "request",
-      url: `/store/dashboard/order-requests/mrf/${reqDoc._id}`, tag: `product-request-${reqDoc._id}`,
-    }).catch(() => { })
+    if (autoForward) {
+      mrfNotify.productRequestAutoForwarded(reqDoc).catch(e => console.error("[pr autoFwd notify]", e.message))
+    } else {
+      mrfNotify.productRequestSubmitted(reqDoc).catch(e => console.error("[pr submitted notify]", e.message))
+    }
 
-    res.status(201).json({ success: true, message: "Request sent to store", request: reqDoc })
+    res.status(201).json({
+      success: true,
+      message: autoForward
+        ? (approver.autoForwardReason || "Sent directly to the Store — no Primary Manager/TL could be identified.")
+        : `Sent to ${approver.approverName} for approval. The Store will see it once approved.`,
+      request: reqDoc,
+    })
   } catch (err) {
     console.error("[CoworkMRF product-requests POST]", err)
     res.status(500).json({ success: false, message: err.message })
   }
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Product request — TL approval
+//
+// Mirrors the MRF approval endpoints. Only after the TL approves does the
+// Store see the request at all, so matching against the catalogue never
+// happens ahead of approval.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Same legacy-safe approver check used for MRFs, applied to product requests. */
+async function resolvePrAccess(doc, user) {
+  if (!doc) return { canView: false, canApprove: false }
+
+  const isRequester =
+    (!!doc.requesterCoworkId && doc.requesterCoworkId === user.id)
+  const isApprover =
+    (!!doc.approverBiometricId && doc.approverBiometricId === user.id) ||
+    (doc.approverAltIds || []).includes(user.id)
+
+  if (isApprover) return { canView: true, canApprove: true }
+  if (user.role === "ceo") return { canView: true, canApprove: true }
+  if (isRequester) return { canView: true, canApprove: false, isRequester: true }
+
+  // Raised before approver routing existed — fall back to the live HR link.
+  if (!doc.approverBiometricId) {
+    const requester = await Employee.findById(doc.requestedBy).select("primaryManager").lean()
+    const managerId = requester?.primaryManager?.managerId
+    if (managerId) {
+      const me = await resolveEmployee(user.id)
+      if (me && String(me._id) === String(managerId)) {
+        return { canView: true, canApprove: true, backfill: me }
+      }
+    }
+  }
+  return { canView: false, canApprove: false }
+}
+
+router.patch("/product-requests/:id/tl-approve", async (req, res) => {
+  try {
+    const doc = await RawItemAddRequest.findById(req.params.id)
+    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
+
+    const access = await resolvePrAccess(doc.toObject(), req.user)
+    if (!access.canApprove)
+      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
+
+    if (access.backfill) {
+      const ids = mrfApprover.coworkIdsOf(access.backfill)
+      doc.approverEmployee = access.backfill._id
+      doc.approverBiometricId = ids[0] || ""
+      doc.approverAltIds = ids
+      doc.approverName = buildFullName(access.backfill)
+    }
+
+    if (doc.approvalStatus === "TL_APPROVED")
+      return res.json({ success: true, message: "Already approved", request: doc, alreadyDone: true })
+    if (doc.approvalStatus === "TL_REJECTED")
+      return res.status(400).json({ success: false, message: "This request was already rejected." })
+
+    const actor = await resolveEmployee(req.user.id)
+    const actorName = buildFullName(actor) || req.user.name || ""
+
+    doc.approvalStatus = "TL_APPROVED"
+    doc.tlApproved = true
+    doc.tlApprovedBy = actor?._id || null
+    doc.tlApprovedByName = actorName
+    doc.tlApprovedAt = new Date()
+    doc.tlRejected = false
+    doc.tlRejectedAt = null
+    doc.tlRejectionNote = ""
+    await doc.save()
+
+    mrfNotify.productRequestTlApproved(doc).catch(e => console.error("[pr approve notify]", e.message))
+
+    res.json({ success: true, message: "Approved — the Store can now register or match this product.", request: doc })
+  } catch (err) {
+    console.error("[CoworkMRF pr tl-approve]", err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+router.patch("/product-requests/:id/tl-reject", async (req, res) => {
+  try {
+    const note = String(req.body.note || "").trim()
+    if (!note)
+      return res.status(400).json({ success: false, message: "A rejection reason is required — the requester sees it." })
+
+    const doc = await RawItemAddRequest.findById(req.params.id)
+    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
+
+    const access = await resolvePrAccess(doc.toObject(), req.user)
+    if (!access.canApprove)
+      return res.status(403).json({ success: false, message: "You are not the approver for this request." })
+
+    if (doc.approvalStatus === "TL_REJECTED")
+      return res.json({ success: true, message: "Already rejected", request: doc, alreadyDone: true })
+    if (doc.products.some(p => p.status !== "PENDING"))
+      return res.status(400).json({ success: false, message: "The Store has already acted on this request — it cannot be rejected now." })
+
+    const actor = await resolveEmployee(req.user.id)
+    const actorName = buildFullName(actor) || req.user.name || ""
+
+    doc.approvalStatus = "TL_REJECTED"
+    doc.tlRejected = true
+    doc.tlRejectedBy = actor?._id || null
+    doc.tlRejectedByName = actorName
+    doc.tlRejectedAt = new Date()
+    doc.tlRejectionNote = note
+    doc.tlApproved = false
+    doc.status = "REJECTED"
+    doc.products.forEach(p => {
+      if (p.status === "PENDING") {
+        p.status = "REJECTED"
+        p.storeNote = `Rejected by ${actorName || "Primary Manager/TL"}: ${note}`
+        p.resolvedAt = new Date()
+      }
+    })
+    await doc.save()
+
+    mrfNotify.productRequestTlRejected(doc).catch(e => console.error("[pr reject notify]", e.message))
+
+    res.json({ success: true, message: "Product request rejected", request: doc })
+  } catch (err) {
+    console.error("[CoworkMRF pr tl-reject]", err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+// ── Product request chat — same thread mechanism as MRFs ─────────────────
+router.get("/product-requests/:id/chat", async (req, res) => {
+  try {
+    const doc = await RawItemAddRequest.findById(req.params.id).lean()
+    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
+    const access = await resolvePrAccess(doc, req.user)
+    if (!access.canView)
+      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
+
+    const messages = await mrfChat.listMessages(doc._id, {
+      subjectType: "PRODUCT_REQUEST", limit: req.query.limit, before: req.query.before,
+    })
+    await mrfChat.markRead(doc._id, req.user.id, "PRODUCT_REQUEST")
+
+    res.json({
+      success: true,
+      messages,
+      mrfNumber: mrfChat.describeSubject(doc, "PRODUCT_REQUEST").label,
+      status: doc.approvalStatus,
+      isFinal: doc.approvalStatus === "TL_REJECTED" || doc.status === "RESOLVED",
+    })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
+router.post("/product-requests/:id/chat", async (req, res) => {
+  try {
+    const doc = await RawItemAddRequest.findById(req.params.id)
+    if (!doc) return res.status(404).json({ success: false, message: "Product request not found" })
+    const access = await resolvePrAccess(doc.toObject(), req.user)
+    if (!access.canView)
+      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
+
+    const emp = await resolveEmployee(req.user.id)
+    const message = await mrfChat.postMessage(doc, {
+      subjectType: "PRODUCT_REQUEST",
+      body: req.body.body,
+      attachments: cleanImages(req.body.attachments).map(a => ({ ...a, type: "image" })),
+      ...chatSenderFor(req, emp, access.isRequester ? "employee" : undefined),
+    })
+
+    res.status(201).json({ success: true, message })
+  } catch (err) {
+    res.status(err.status || 500).json({ success: false, message: err.message })
+  }
+})
+
+router.patch("/product-requests/:id/chat/read", async (req, res) => {
+  try {
+    const r = await mrfChat.markRead(req.params.id, req.user.id, "PRODUCT_REQUEST")
+    res.json({ success: true, ...r })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Single MRF — detail, cancel, chat
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** GET /:id — full detail with live stock, for requester / TL / CEO. */
+router.get("/:id", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id)
+      .populate("requestedFor", "firstName middleName lastName name department designation email biometricId identityId")
+      .lean()
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+    const access = await resolveAccess(mrf, req.user)
+    if (!access.canView)
+      return res.status(403).json({ success: false, message: "You do not have access to this request." })
+
+    markOverdue([mrf])
+    const audience = access.isRequester ? "requester" : "tl"
+    const itemsWithStock = await enrichItemsWithStock(mrf.items || [])
+
+    res.json({
+      success: true,
+      mrf,
+      itemsWithStock,
+      context: buildContext(mrf, audience),
+      audience,
+      canApprove: access.canApprove && mrf.status === "PENDING",
+    })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
+/**
+ * PATCH /:id/cancel — the requester withdraws.
+ * Allowed while PENDING, and while APPROVED as long as nothing has been
+ * issued yet; once material has moved, cancelling would desync stock.
+ */
+router.patch("/:id/cancel", async (req, res) => {
+  try {
+    const emp = await resolveEmployee(req.user.id)
+    const mrf = await MRF.findOne({ _id: req.params.id, requestedFor: emp?._id })
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+
+    if (["CANCELLED", "REJECTED"].includes(mrf.status))
+      return res.status(400).json({ success: false, message: `This request is already ${mrf.status.toLowerCase()}.` })
+
+    const anyIssued = mrf.items.some(i => (i.issuedQty || 0) > 0)
+    if (anyIssued)
+      return res.status(400).json({
+        success: false,
+        message: "Material has already been issued against this request — it cannot be cancelled. Return the issued material to the Store instead.",
+      })
+    if (!["PENDING", "APPROVED"].includes(mrf.status))
+      return res.status(400).json({ success: false, message: `Cannot cancel — this request is ${mrf.status.toLowerCase().replace(/_/g, " ")}.` })
+
+    const wasApproved = mrf.status === "APPROVED"
+    const actorName = buildFullName(emp) || req.user.name || ""
+
+    mrf.status = "CANCELLED"
+    mrf.cancelledBy = emp._id
+    mrf.cancelledByModel = "Employee"
+    mrf.cancelledAt = new Date()
+    mrf.cancellationNote = req.body.cancellationNote || "Cancelled by employee"
+    mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED" })
+    mrf.logEvent({
+      action: "CANCELLED", actorName, actorRole: "employee",
+      detail: mrf.cancellationNote + (wasApproved ? " (was already with the Store)" : ""),
+    })
+    await mrf.save()
+
+    mrfChat.systemMessage(mrf, `${actorName || "The requester"} cancelled this request. ${mrf.cancellationNote}`, actorName)
+    mrfNotify.cancelled(mrf).catch(e => console.error("[mrf cancel notify]", e.message))
+
+    res.json({ success: true, message: "Request cancelled", mrf, context: buildContext(mrf.toObject(), "requester") })
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message })
+  }
+})
+
+/** GET /:id/chat — the MRF's own thread. */
+router.get("/:id/chat", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id).lean()
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+    const access = await resolveAccess(mrf, req.user)
+    if (!access.canView)
+      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
+
+    const messages = await mrfChat.listMessages(mrf._id, {
+      limit: req.query.limit, before: req.query.before,
+    })
+    await mrfChat.markRead(mrf._id, req.user.id)
+
+    res.json({
+      success: true,
+      messages,
+      mrfNumber: mrf.mrfNumber,
+      // The thread stays open on a closed request — a store person may still
+      // need to explain something — but the UI flags it.
+      isFinal: ["COMPLETED", "REJECTED", "CANCELLED", "UNFULFILLED"].includes(mrf.status),
+      status: mrf.status,
+    })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+})
+
+/** POST /:id/chat — requester or TL posts a message. */
+router.post("/:id/chat", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id)
+    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
+    const access = await resolveAccess(mrf.toObject(), req.user)
+    if (!access.canView)
+      return res.status(403).json({ success: false, message: "You do not have access to this conversation." })
+    if (access.backfill) { applyBackfill(mrf, access.backfill); await mrf.save() }
+
+    const emp = await resolveEmployee(req.user.id)
+    const message = await mrfChat.postMessage(mrf, {
+      body: req.body.body,
+      attachments: cleanImages(req.body.attachments).map(a => ({ ...a, type: "image" })),
+      // Label by role ON THIS REQUEST, not the account's global role — a TL
+      // raising their own MRF is the requester in that thread.
+      ...chatSenderFor(req, emp, access.isRequester ? "employee" : undefined),
+    })
+
+    res.status(201).json({ success: true, message })
+  } catch (err) {
+    res.status(err.status || 500).json({ success: false, message: err.message })
+  }
+})
+
+/** PATCH /:id/chat/read — clear this user's unread badge. */
+router.patch("/:id/chat/read", async (req, res) => {
+  try {
+    const r = await mrfChat.markRead(req.params.id, req.user.id)
+    res.json({ success: true, ...r })
+  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
 })
 
 module.exports = router

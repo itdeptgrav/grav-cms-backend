@@ -14,6 +14,18 @@ const returnEntrySchema = new mongoose.Schema(
   { _id: true }
 );
 
+// ── Product image attached by the requester ──────────────────────────────────
+// Uploaded to Cloudinary from the cowork side before the MRF is submitted, so
+// the TL and the Store Person both see exactly which product is being asked for.
+const productImageSchema = new mongoose.Schema(
+  {
+    url: { type: String, trim: true, required: true },
+    publicId: { type: String, trim: true, default: "" },
+    name: { type: String, trim: true, default: "" },
+  },
+  { _id: false }
+);
+
 // ── Per-item sub-doc ──────────────────────────────────────────────────────────
 const mrfItemSchema = new mongoose.Schema(
   {
@@ -23,6 +35,16 @@ const mrfItemSchema = new mongoose.Schema(
     variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     variantCombination: [{ type: String, trim: true }],
 
+    // Requester-supplied product context (free text — the catalogue record is
+    // the source of truth for name/SKU, this is what the requester *meant*).
+    description: { type: String, trim: true, default: "" },
+    specifications: { type: String, trim: true, default: "" },
+    images: { type: [productImageSchema], default: [] },
+
+    // `unit` is the unit the REQUESTER chose and is authoritative for every
+    // quantity on this line (requestedQty / issuedQty / returnedQty /
+    // availableQty). `baseUnit` is only the catalogue unit — conversion to it
+    // happens at the stock-adjustment boundary and nowhere else.
     requestedQty: { type: Number, required: true, min: 0 },
     unit: { type: String, trim: true, required: true },
     baseUnit: { type: String, trim: true, default: "" },
@@ -32,8 +54,33 @@ const mrfItemSchema = new mongoose.Schema(
 
     itemStatus: {
       type: String,
-      enum: ["PENDING", "APPROVED", "PARTIALLY_ISSUED", "ISSUED", "PARTIALLY_RETURNED", "RETURNED", "OVERDUE", "REJECTED"],
+      enum: [
+        "PENDING", "APPROVED", "PARTIALLY_ISSUED", "ISSUED",
+        "PARTIALLY_RETURNED", "RETURNED", "OVERDUE", "REJECTED", "UNFULFILLED",
+      ],
       default: "PENDING",
+    },
+
+    // ── Store availability reporting ──────────────────────────────────────
+    // Set by the Store Person after the TL approves. Independent of
+    // itemStatus: availability is "what the store found", itemStatus is
+    // "how much has actually moved".
+    availability: {
+      type: String,
+      enum: ["UNREVIEWED", "AVAILABLE", "PARTIAL", "NOT_AVAILABLE", "ALTERNATIVE"],
+      default: "UNREVIEWED",
+    },
+    availableQty: { type: Number, default: null },     // in `unit`, as reported by store
+    availabilityNote: { type: String, trim: true, default: "" },
+    availabilityUpdatedAt: { type: Date, default: null },
+    availabilityUpdatedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+    availabilityUpdatedByName: { type: String, trim: true, default: "" },
+
+    // Populated when availability === "ALTERNATIVE"
+    alternativeItem: {
+      rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
+      name: { type: String, trim: true, default: "" },
+      note: { type: String, trim: true, default: "" },
     },
 
     returnHistory: [returnEntrySchema],
@@ -46,6 +93,24 @@ const mrfItemSchema = new mongoose.Schema(
     storeNotes: { type: String, trim: true, default: "" },
   },
   { _id: true }
+);
+
+// Remaining quantity still owed on this line, in the requester's unit.
+mrfItemSchema.virtual("remainingQty").get(function () {
+  if (["REJECTED", "UNFULFILLED"].includes(this.itemStatus)) return 0;
+  return Math.max(0, (this.requestedQty || 0) - (this.issuedQty || 0));
+});
+
+// ── Audit trail entry — powers "who did what, when" in the status UI ─────────
+const statusEventSchema = new mongoose.Schema(
+  {
+    at: { type: Date, default: Date.now },
+    action: { type: String, trim: true, required: true }, // CREATED | TL_APPROVED | ISSUED | …
+    actorName: { type: String, trim: true, default: "" },
+    actorRole: { type: String, trim: true, default: "" },  // employee | tl | store | system
+    detail: { type: String, trim: true, default: "" },
+  },
+  { _id: false }
 );
 
 // ── Main MRF schema ───────────────────────────────────────────────────────────
@@ -79,7 +144,15 @@ const mrfSchema = new mongoose.Schema(
       required: true,
     },
 
+    // Return deadline — TIME_BASED requests only. When the material must come
+    // BACK to the store.
     deadline: { type: Date, default: null },
+
+    // When the requester needs the material IN HAND. Applies to every request
+    // type, and is the date the TL and the Store plan around — distinct from
+    // `deadline`, which is about returning it afterwards.
+    neededBy: { type: Date, default: null },
+
     reason: { type: String, trim: true, default: "" },
 
     // Priority
@@ -96,13 +169,14 @@ const mrfSchema = new mongoose.Schema(
     status: {
       type: String,
       enum: [
-        "PENDING",
-        "APPROVED",
+        "PENDING",           // awaiting Primary Manager / TL approval
+        "APPROVED",          // TL approved — with the store now
         "PARTIALLY_ISSUED",
         "ISSUED",
         "PARTIALLY_RETURNED",
         "COMPLETED",
-        "REJECTED",
+        "REJECTED",          // TL said no
+        "UNFULFILLED",       // TL said yes, store cannot supply it
         "CANCELLED",
       ],
       default: "PENDING",
@@ -110,9 +184,65 @@ const mrfSchema = new mongoose.Schema(
 
     items: [mrfItemSchema],
 
-    //pm action 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Approval routing — Employee → Primary Manager/TL → Store
+    // Resolved at creation time from the HR Employee record:
+    //   requester.primaryManager.managerId → Employee → biometricId
+    // The TL's approval queue is filtered on approverBiometricId, which is the
+    // same id their cowork session carries (req.coworkUser.employeeId).
+    // ═══════════════════════════════════════════════════════════════════════
+    approverEmployee: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    approverBiometricId: { type: String, trim: true, default: "" },
+    approverName: { type: String, trim: true, default: "" },
 
-    // ── PM approval layer ──────────────────────────────────────────────
+    // An HR record can carry both a biometricId and an identityId, and a
+    // cowork session identifies itself with whichever one its
+    // cowork_employees doc uses. Matching on a single field silently drops
+    // the approval queue and every notification for anyone whose two ids
+    // differ, so every id the approver could be logged in as is stored and
+    // all of them are matched.
+    approverAltIds: { type: [String], default: [] },
+
+    // The requester's cowork session id — the id their notifications must be
+    // addressed to. Kept separate from requestedForId, which is the HR badge
+    // number shown on store screens; the two are usually equal but not always.
+    requesterCoworkId: { type: String, trim: true, default: "" },
+
+    // Why routing landed where it did — drives the contextual message shown to
+    // the requester when no TL could be found.
+    approverResolution: {
+      type: String,
+      enum: [
+        "RESOLVED",
+        "NO_MANAGER",             // employee has no primaryManager in HR
+        "MANAGER_NOT_FOUND",      // managerId points at a missing Employee doc
+        "MANAGER_INACTIVE",       // manager exists but is inactive/suspended
+        "MANAGER_NO_BIOMETRIC",   // manager has no biometricId → cannot log in to cowork
+        "SELF_MANAGED",           // requester is their own manager
+      ],
+      default: "RESOLVED",
+    },
+
+    // TL → Store, or straight to Store when no TL could be resolved.
+    approvalRoute: { type: String, enum: ["TL", "AUTO_STORE"], default: "TL" },
+    autoForwarded: { type: Boolean, default: false },
+    autoForwardReason: { type: String, trim: true, default: "" },
+
+    // ── TL approval layer ──────────────────────────────────────────────
+    tlApproved: { type: Boolean, default: false },
+    tlApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    tlApprovedByName: { type: String, trim: true, default: "" },
+    tlApprovedAt: { type: Date, default: null },
+    tlRejected: { type: Boolean, default: false },
+    tlRejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    tlRejectedByName: { type: String, trim: true, default: "" },
+    tlRejectedAt: { type: Date, default: null },
+    tlRejectionNote: { type: String, trim: true, default: "" },
+
+    // ── PM approval layer — RETAINED FOR HISTORY ONLY ─────────────────────
+    // PM approval is no longer part of the flow (Employee → TL → Store).
+    // These fields stay so pre-existing MRFs keep rendering their audit trail;
+    // nothing writes to them any more.
     pmApproved: { type: Boolean, default: false },
     pmApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: "ProjectManager", default: null },
     pmApprovedAt: { type: Date, default: null },
@@ -132,7 +262,26 @@ const mrfSchema = new mongoose.Schema(
     cancelledAt: { type: Date, default: null },
     cancellationNote: { type: String, trim: true, default: "" },
 
+    // Store closed it as impossible to supply (TL approved, but no stock and no
+    // alternative). Distinct from REJECTED so the requester can tell the two apart.
+    unfulfilledAt: { type: Date, default: null },
+    unfulfilledBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+    unfulfilledByName: { type: String, trim: true, default: "" },
+    unfulfilledReason: { type: String, trim: true, default: "" },
+
+    // Set the first time the store touches availability — used to tell
+    // "sitting in the store queue" apart from "store is working on it".
+    storeReviewedAt: { type: Date, default: null },
+
     storeNotes: { type: String, trim: true, default: "" },
+
+    // ── MRF-scoped chat (messages live in the MrfChatMessage collection) ──
+    chatMessageCount: { type: Number, default: 0 },
+    chatLastMessageAt: { type: Date, default: null },
+    chatLastMessageBy: { type: String, trim: true, default: "" },
+
+    // Statuses / actions in chronological order.
+    statusHistory: { type: [statusEventSchema], default: [] },
   },
   { timestamps: true }
 );
@@ -141,6 +290,16 @@ mrfSchema.index({ requestedFor: 1, status: 1, createdAt: -1 });
 mrfSchema.index({ status: 1, createdAt: -1 });
 mrfSchema.index({ requestType: 1, deadline: 1 });
 mrfSchema.index({ creationMode: 1, createdAt: -1 });
+// TL approval queue lookup — the hot path for the cowork approvals page.
+mrfSchema.index({ approverBiometricId: 1, status: 1, createdAt: -1 });
+mrfSchema.index({ approverAltIds: 1, status: 1 });
+
+// Append an audit event. Callers should use this rather than pushing directly
+// so every entry carries a consistent shape.
+mrfSchema.methods.logEvent = function ({ action, actorName = "", actorRole = "", detail = "" }) {
+  this.statusHistory.push({ at: new Date(), action, actorName, actorRole, detail });
+  return this;
+};
 
 // Auto-generate MRF number
 mrfSchema.pre("validate", async function (next) {
