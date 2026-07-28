@@ -420,4 +420,110 @@ router.get("/logs", async (req, res) => {
   }
 });
 
+// ── GET /manufacturing-orders/:moId ── daily production performance for one MO ──
+// For the Project Manager's per-MO "Production" tab: day-wise completed-unit
+// trend, per-WO completion, and a scanned-by contributor breakdown, all scoped
+// to just this MO's work orders (matched via the WO short-id embedded in every
+// barcode, same technique /overview already uses for the global view).
+router.get("/manufacturing-orders/:moId", async (req, res) => {
+  try {
+    const { moId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(moId)) {
+      return res.status(400).json({ success: false, message: "Invalid MO id" });
+    }
+    const days = Math.min(parseInt(req.query.days, 10) || 30, 180);
+
+    const workOrders = await WorkOrder.find({
+      customerRequestId: moId,
+      status: { $ne: "pending" },
+    })
+      .select("workOrderNumber stockItemName quantity")
+      .lean();
+
+    if (!workOrders.length) {
+      return res.json({
+        success: true,
+        workOrders: [],
+        totals: { total: 0, done: 0, pending: 0, percent: 0 },
+        trend: [],
+        contributors: [],
+        days,
+      });
+    }
+
+    const shortIdToWo = new Map(workOrders.map((wo) => [wo._id.toString().slice(-8), wo]));
+
+    const cutoff = getISTMidnight(new Date());
+    cutoff.setDate(cutoff.getDate() - (days - 1));
+
+    const docs = await ProductionCompletionScanRecord.find({ date: { $gte: cutoff } })
+      .select("date scans")
+      .lean();
+
+    const woUnits = new Map(); // workOrderId string -> Set(unit numbers)
+    const contributorMap = new Map(); // scannedBy string -> count
+    const trend = [];
+
+    for (const doc of docs) {
+      let dayCount = 0;
+      for (const scan of doc.scans || []) {
+        const parsed = parseBarcode(scan.barcodeId);
+        if (!parsed.success) continue;
+        const wo = shortIdToWo.get(parsed.woShortId);
+        if (!wo) continue; // scan belongs to a different MO
+
+        dayCount++;
+
+        const woKey = wo._id.toString();
+        if (!woUnits.has(woKey)) woUnits.set(woKey, new Set());
+        woUnits.get(woKey).add(parsed.unitNumber);
+
+        const who = scan.scannedBy?.trim() || "Unrecorded";
+        contributorMap.set(who, (contributorMap.get(who) || 0) + 1);
+      }
+      if (dayCount > 0) trend.push({ date: doc.date, completedUnits: dayCount });
+    }
+    trend.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    const workOrderRows = workOrders.map((wo) => {
+      const units = woUnits.get(wo._id.toString()) || new Set();
+      const total = wo.quantity || 0;
+      const done = units.size;
+      return {
+        workOrderId: wo._id,
+        workOrderNumber: wo.workOrderNumber,
+        productName: wo.stockItemName || "—",
+        total,
+        done,
+        pending: Math.max(0, total - done),
+        percent: total ? Math.round((done / total) * 100) : 0,
+      };
+    });
+
+    const contributors = [...contributorMap.entries()]
+      .map(([name, scans]) => ({ name, scans }))
+      .sort((a, b) => b.scans - a.scans);
+
+    const totalUnits = workOrderRows.reduce((s, w) => s + w.total, 0);
+    const totalDone = workOrderRows.reduce((s, w) => s + w.done, 0);
+
+    res.json({
+      success: true,
+      workOrders: workOrderRows,
+      totals: {
+        total: totalUnits,
+        done: totalDone,
+        pending: Math.max(0, totalUnits - totalDone),
+        percent: totalUnits ? Math.round((totalDone / totalUnits) * 100) : 0,
+      },
+      trend,
+      contributors,
+      days,
+    });
+  } catch (err) {
+    console.error("[Production Completion MO overview]", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 module.exports = router;

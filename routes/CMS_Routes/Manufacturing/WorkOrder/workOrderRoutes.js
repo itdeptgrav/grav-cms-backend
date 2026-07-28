@@ -766,13 +766,6 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
       );
     }
 
-    if (quantity > canProduceQuantity) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot produce ${quantity} units. Maximum producible is ${canProduceQuantity} units with current stock.`,
-      });
-    }
-
     if (splitRemaining && remainingQuantity > 0) {
       const newRawMaterials = workOrder.rawMaterials.map(rm => {
         const req = workOrder.quantity > 0 ? rm.quantityRequired / workOrder.quantity : 0;
