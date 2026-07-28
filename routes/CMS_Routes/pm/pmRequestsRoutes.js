@@ -9,6 +9,7 @@ const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/Wo
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
 const Unit = require("../../../models/CMS_Models/Inventory/Configurations/Unit");
 const NotificationService = require("../../../services/NotificationService");
+const { buildContext } = require("../../../services/mrfContext.service");
 
 async function convertQty(qty, fromUnit, toUnit) {
   if (qty == null || !fromUnit || !toUnit || fromUnit === toUnit) return qty;
@@ -87,13 +88,22 @@ router.get("/", async (req, res) => {
       pmApproved: !!m.pmApproved, pmApprovedAt: m.pmApprovedAt || null,
       pmRejected: !!m.pmRejected, pmRejectedAt: m.pmRejectedAt || null,
       pmRejectionNote: m.pmRejectionNote || "",
+      // MRFs are approved by the requester's TL, not the PM — surface who and
+      // when so the PM row still tells the whole story, read-only.
+      readOnly: true,
+      approverName: m.approverName || "",
+      tlApproved: !!m.tlApproved, tlApprovedAt: m.tlApprovedAt || null,
+      tlApprovedByName: m.tlApprovedByName || "",
+      tlRejected: !!m.tlRejected, tlRejectedAt: m.tlRejectedAt || null,
+      tlRejectionNote: m.tlRejectionNote || "",
+      autoForwarded: !!m.autoForwarded,
       createdAt: m.createdAt,
     }));
 
     const requests = [...mo, ...mrf]
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
-    res.json({ success: true, requests });
+    res.json({ success: true, requests, mrfReadOnly: true });
   } catch (e) {
     console.error("[PM requests list]", e);
     res.status(500).json({ success: false, message: e.message });
@@ -109,6 +119,7 @@ router.get("/mrf/:id", async (req, res) => {
       .populate("requestedFor", "firstName middleName lastName name department email designation biometricId")
       .populate("pmApprovedBy", "name")
       .populate("pmRejectedBy", "name")
+      .populate("approverEmployee", "firstName middleName lastName name biometricId")
       .lean();
     if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
 
@@ -141,7 +152,14 @@ router.get("/mrf/:id", async (req, res) => {
     }
     mrf.items = enriched;
 
-    res.json({ success: true, mrf });
+    res.json({
+      success: true,
+      mrf,
+      // View-only: approval belongs to the requester's Primary Manager/TL.
+      readOnly: true,
+      readOnlyReason: MRF_READ_ONLY_MESSAGE,
+      context: buildContext(mrf, "store"),
+    });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
@@ -160,82 +178,23 @@ router.get("/mo/:id", async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════
-// PATCH /mrf/:id/approve  — PM approval (this IS the approval now)
+// MRF approval is no longer a PM responsibility.
+//
+// The flow is Employee → Primary Manager/TL (in CoWork) → Store. The PM keeps
+// read-only visibility of MRFs for oversight (GET / and GET /mrf/:id above),
+// but cannot approve or reject them. These endpoints answer 403 with the
+// reason rather than 404 so an out-of-date client explains itself.
 // ═════════════════════════════════════════════════════════════════════
-router.patch("/mrf/:id/approve", async (req, res) => {
-  try {
-    const mrf = await MRF.findById(req.params.id);
-    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
-    if (mrf.pmApproved) return res.json({ success: true, message: "Already PM-approved", mrf });
-    if (["REJECTED", "CANCELLED"].includes(mrf.status))
-      return res.status(400).json({ success: false, message: `Cannot approve — status is ${mrf.status}` });
+const MRF_READ_ONLY_MESSAGE =
+  "Material Requests are approved by the requester's Primary Manager/TL in CoWork. " +
+  "The Project Manager has view-only access to MRFs.";
 
-    mrf.pmApproved = true;
-    mrf.pmApprovedBy = getActorId(req);
-    mrf.pmApprovedAt = new Date();
-    mrf.pmRejected = false; mrf.pmRejectedBy = null; mrf.pmRejectedAt = null; mrf.pmRejectionNote = "";
-
-    // Advance the store status machine so issuance can proceed
-    if (mrf.status === "PENDING") {
-      mrf.status = "APPROVED";
-      mrf.approvedBy = getActorId(req);
-      mrf.approvedAt = new Date();
-      mrf.items.forEach(i => { if (i.itemStatus === "PENDING") i.itemStatus = "APPROVED"; });
-    }
-
-    await mrf.save();
-    NotificationService.sendToRole(["store_manager", "admin"], {
-      title: "MRF Approved by PM",
-      body: `${mrf.mrfNumber} — ${mrf.requestedForName}. Issue the materials now.`,
-      url: `/store/dashboard/order-requests/mrf/${mrf._id}`,
-      tag: `mrf-${mrf._id}`,
-    }).catch(() => {});
-    res.json({ success: true, message: "MRF approved", mrf });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+router.patch("/mrf/:id/approve", (req, res) => {
+  res.status(403).json({ success: false, readOnly: true, message: MRF_READ_ONLY_MESSAGE });
 });
 
-// ═════════════════════════════════════════════════════════════════════
-// PATCH /mrf/:id/reject
-// ═════════════════════════════════════════════════════════════════════
-router.patch("/mrf/:id/reject", async (req, res) => {
-  try {
-    const mrf = await MRF.findById(req.params.id);
-    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" });
-    if (["ISSUED", "PARTIALLY_ISSUED", "PARTIALLY_RETURNED", "COMPLETED"].includes(mrf.status))
-      return res.status(400).json({ success: false, message: "Cannot reject — materials already issued" });
-
-    mrf.pmRejected = true;
-    mrf.pmRejectedBy = getActorId(req);
-    mrf.pmRejectedAt = new Date();
-    mrf.pmRejectionNote = req.body.note || "";
-    mrf.pmApproved = false;
-
-    mrf.status = "REJECTED";
-    mrf.rejectedBy = getActorId(req);
-    mrf.rejectedAt = new Date();
-    mrf.rejectionNote = req.body.note || "Rejected by PM";
-    mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED"; });
-
-    await mrf.save();
-    NotificationService.sendToRole(["store_manager", "admin"], {
-      title: "MRF Rejected by PM",
-      body: `${mrf.mrfNumber} — ${mrf.requestedForName}.${req.body.note ? ` Reason: ${req.body.note}` : ""}`,
-      url: `/store/dashboard/order-requests/mrf/${mrf._id}`,
-      tag: `mrf-${mrf._id}`,
-    }).catch(() => {});
-
-    if (mrf.requestedFor) {
-      NotificationService.sendToUser(mrf.requestedFor, {
-        title: "Request Rejected",
-        body: `Your material request ${mrf.mrfNumber} was rejected.${req.body.note ? ` Reason: ${req.body.note}` : ""}`,
-        type: "request",
-        url: "/coworking",
-        tag: `mrf-${mrf._id}`,
-      }).catch(() => {});
-    }
-
-    res.json({ success: true, message: "MRF rejected", mrf });
-  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+router.patch("/mrf/:id/reject", (req, res) => {
+  res.status(403).json({ success: false, readOnly: true, message: MRF_READ_ONLY_MESSAGE });
 });
 
 // ═════════════════════════════════════════════════════════════════════
