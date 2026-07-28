@@ -941,6 +941,10 @@ app.use(
 const overviewRoutes = require("./routes/CMS_Routes/Inventory/overview/overview");
 app.use("/api/cms/inventory/overview", overviewRoutes);
 
+// Inventory Chatbot (Store Assistant) — PM-facing Q&A over live inventory data
+const inventoryChatbotRoutes = require("./routes/CMS_Routes/Inventory/chatbot/inventoryChatbot.routes");
+app.use("/api/cms/inventory/chatbot", inventoryChatbotRoutes);
+
 // server.js
 const sizeConfigRoutes = require("./routes/CMS_Routes/Inventory/Configurations/sizeConfigRoutes");
 app.use("/api/cms/size-configs", sizeConfigRoutes);

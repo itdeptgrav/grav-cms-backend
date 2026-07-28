@@ -161,8 +161,44 @@ router.get("/", async (req, res) => {
         }
       },
 
-      // Apply derived status filter if requested
-      ...(status ? [{ $match: { derivedStatus: status } }] : []),
+      // PM-facing simplified status — collapse everything down to just
+      // pending / in_progress / completed (+ cancelled when it genuinely happened).
+      // Rule: any work order scheduled/planned/in-progress/etc. => "in_progress".
+      {
+        $addFields: {
+          displayStatus: {
+            $switch: {
+              branches: [
+                { case: { $eq: ["$workOrdersCount", 0] }, then: "pending" },
+                {
+                  case: {
+                    $and: [
+                      { $gt: ["$workOrdersCount", 0] },
+                      { $eq: ["$_cancelledCount", "$workOrdersCount"] }
+                    ]
+                  },
+                  then: "cancelled"
+                },
+                { case: { $gte: ["$completionPercentage", 100] }, then: "completed" },
+                {
+                  case: {
+                    $or: [
+                      { $gt: ["$_scheduledCount", 0] },
+                      { $gt: ["$_anyInProgress", 0] },
+                      { $gt: ["$completionPercentage", 0] }
+                    ]
+                  },
+                  then: "in_progress"
+                }
+              ],
+              default: "pending"
+            }
+          }
+        }
+      },
+
+      // Apply simplified status filter if requested (pending/in_progress/completed/cancelled)
+      ...(status ? [{ $match: { displayStatus: status } }] : []),
 
       // Paginate + count in one go
       {
@@ -175,7 +211,8 @@ router.get("/", async (req, res) => {
               $project: {
                 _id: 1,
                 requestId: 1,
-                customerInfo: { name: 1, email: 1 },
+                customerInfo: { name: 1, email: 1, deliveryDeadline: 1 },
+                estimatedCompletion: 1,
                 finalOrderPrice: 1,
                 totalQuantity: 1,
                 priority: 1,
@@ -185,7 +222,8 @@ router.get("/", async (req, res) => {
                 workOrdersCount: 1,
                 completionPercentage: 1,
                 completedQuantity: "$_totalCompleted",
-                status: "$derivedStatus"
+                status: "$derivedStatus",
+                displayStatus: 1
               }
             }
           ],
@@ -211,10 +249,14 @@ router.get("/", async (req, res) => {
       completedQuantity: r.completedQuantity || 0,
       completionPercentage: r.completionPercentage || 0,
       status: r.status,
+      // Simplified 3-bucket status for card display (pending/in_progress/completed, +cancelled)
+      displayStatus: r.displayStatus || "pending",
       priority: r.priority,
       createdAt: r.createdAt,
       requestType: r.requestType || "customer_request",
       measurementName: r.measurementName || null,
+      deliveryDeadline: r.customerInfo?.deliveryDeadline || null,
+      estimatedCompletion: r.estimatedCompletion || null,
     }));
 
     res.json({
