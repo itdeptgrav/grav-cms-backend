@@ -1,9 +1,23 @@
-// routes/CMS_Routes/Production/Dashboard/productionSchedule/productionScheduleRoutes.js
-// OPTIMIZED VERSION - Reduced response times from 2-5s to <500ms
+// routes/CMS_Routes/Sales/SalesSchedule/salesScheduleRoutes.js
+//
+// Sales planning calendar. Same drag-and-drop planning logic as the production
+// schedule, but a different audience and therefore a different rule about what
+// is visible:
+//
+//   Production shows only what it can actually run right now — sales-approved
+//   orders whose work orders are planned/scheduled/ready and already costed.
+//
+//   Sales plans the whole book. EVERY customer request and EVERY work order is
+//   listed here regardless of request status, work order status, or whether the
+//   work order has operation timings yet. Sales needs to promise dates on an
+//   order long before production will accept it.
+//
+// It writes to its own SalesSchedule collection, so nothing here can move,
+// unassign, or recapacity anything on the production calendar.
 
 const express = require("express");
 const router = express.Router();
-const ProductionSchedule = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionSchedule/ProductionSchedule");
+const SalesSchedule = require("../../../../models/CMS_Models/Sales/SalesSchedule/SalesSchedule");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
@@ -18,7 +32,7 @@ try {
     LeaveManagement.CompanyHoliday || mongoose.models.CompanyHoliday || null;
 } catch (err) {
   CompanyHoliday = mongoose.models?.CompanyHoliday || null;
-  console.warn("[schedule] CompanyHoliday model unavailable:", err.message);
+  console.warn("[sales-schedule] CompanyHoliday model unavailable:", err.message);
 }
 
 router.use(EmployeeAuthMiddleware);
@@ -30,7 +44,7 @@ router.use(EmployeeAuthMiddleware);
 /**
  * Map of "YYYY-MM-DD" -> holiday document for the given range.
  * `working_sunday` is the inverse case: HR declaring a Sunday IS a work day,
- * so it must never block scheduling.
+ * so it must never block planning.
  */
 async function getCompanyHolidayMap(startDate, endDate) {
   const map = new Map();
@@ -43,7 +57,7 @@ async function getCompanyHolidayMap(startDate, endDate) {
 
     for (const h of docs) map.set(h.date, h);
   } catch (err) {
-    console.error("[schedule] company holiday lookup failed:", err.message);
+    console.error("[sales-schedule] company holiday lookup failed:", err.message);
   }
 
   return map;
@@ -56,11 +70,9 @@ function holidayBlocks(holiday) {
 
 /**
  * Overlay HR holidays onto schedule documents before they leave the API.
- *
- * Production can override a company holiday for a single day — the factory
- * running on Independence Day, for instance. When `holidayOverride` is set on
- * the schedule document the day stays workable and we only keep the label, so
- * the calendar can still show WHY the day is unusual.
+ * Sales can override a company holiday for a single day; when `holidayOverride`
+ * is set the day stays workable and we keep only the label so the calendar can
+ * still show WHY the day is unusual.
  */
 function applyHolidayOverlay(schedule, holidayMap) {
   const h = holidayMap.get(formatDate(schedule.date));
@@ -80,7 +92,6 @@ function applyHolidayOverlay(schedule, holidayMap) {
     return schedule;
   }
 
-  // Production has explicitly switched this day back on — respect it.
   if (schedule.holidayOverride === true) {
     schedule.isHoliday = false;
     schedule.holidayReason = "";
@@ -96,7 +107,7 @@ function applyHolidayOverlay(schedule, holidayMap) {
 }
 
 // ============================================================================
-// SIMPLE DATE UTILITIES
+// DATE UTILITIES
 // ============================================================================
 
 function parseDate(input) {
@@ -152,12 +163,6 @@ function formatDate(date) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function isSameDate(date1, date2) {
-  const d1 = parseDate(date1);
-  const d2 = parseDate(date2);
-  return d1.getTime() === d2.getTime();
-}
-
 function addDays(date, days) {
   const d = parseDate(date);
   d.setDate(d.getDate() + days);
@@ -169,20 +174,18 @@ function getDayOfWeek(date) {
 }
 
 // ============================================================================
-// OPTIMIZED SCHEDULE MANAGEMENT
+// SCHEDULE MANAGEMENT
 // ============================================================================
 
 async function getScheduleForDate(date) {
   const searchDate = parseDate(date);
 
-  // FIX 1: Use lean() for faster read-only queries
-  let schedule = await ProductionSchedule.findOne({ date: searchDate }).lean();
+  let schedule = await SalesSchedule.findOne({ date: searchDate }).lean();
 
   if (!schedule) {
-    const dayOfWeek = getDayOfWeek(searchDate);
-    const isSunday = dayOfWeek === 0;
+    const isSunday = getDayOfWeek(searchDate) === 0;
 
-    const newSchedule = new ProductionSchedule({
+    const newSchedule = new SalesSchedule({
       date: searchDate,
       workHours: {
         startTime: "09:30",
@@ -224,22 +227,45 @@ async function getScheduleForDate(date) {
 
 function canScheduleOnDay(schedule) {
   if (!schedule) return false;
-  // An HR holiday that production has explicitly overridden is workable.
+  // An HR holiday that sales has explicitly overridden is workable.
   if (schedule.isHoliday && schedule.holidayOverride !== true) return false;
   if (!schedule.workHours || !schedule.workHours.isActive) return false;
-  const dayOfWeek = getDayOfWeek(schedule.date);
-  if (dayOfWeek === 0 && !schedule.isSundayOverride) return false;
+  if (getDayOfWeek(schedule.date) === 0 && !schedule.isSundayOverride)
+    return false;
   return true;
 }
 
-function calculateWODuration(workOrder) {
-  if (!workOrder.operations || workOrder.operations.length === 0) return 0;
-  const totalSeconds = workOrder.operations.reduce(
+// ============================================================================
+// DURATION
+// ============================================================================
+
+// Sales lists work orders that production would never show, including ones with
+// no operations attached yet. Those have no computable duration, and refusing
+// to place them would make the "show everything" rule useless — the work order
+// would appear in the panel and then fail the moment it was dropped. They get a
+// nominal block instead, flagged so the UI can mark the bar as an estimate.
+const FALLBACK_MINUTES_PER_UNIT = 5;
+const FALLBACK_MIN_BLOCK = 60;
+
+function woDuration(workOrder) {
+  const totalSeconds = (workOrder.operations || []).reduce(
     (sum, op) => sum + (op.plannedTimeSeconds || op.estimatedTimeSeconds || 0),
     0,
   );
-  const minutesPerUnit = Math.ceil(totalSeconds / 60);
-  return minutesPerUnit * (workOrder.quantity || 1);
+
+  if (totalSeconds > 0) {
+    const minutesPerUnit = Math.ceil(totalSeconds / 60);
+    return {
+      minutes: minutesPerUnit * (workOrder.quantity || 1),
+      estimated: false,
+    };
+  }
+
+  const qty = Math.max(1, workOrder.quantity || 1);
+  return {
+    minutes: Math.max(FALLBACK_MIN_BLOCK, qty * FALLBACK_MINUTES_PER_UNIT),
+    estimated: true,
+  };
 }
 
 function generateUniqueColor(workOrderNumber, manufacturingOrderId) {
@@ -260,7 +286,7 @@ function generateUniqueColor(workOrderNumber, manufacturingOrderId) {
 }
 
 // ============================================================================
-// TIME-OF-DAY HELPERS  (break-aware placement)
+// TIME-OF-DAY HELPERS (break-aware placement)
 // ============================================================================
 
 function toMins(hhmm) {
@@ -352,7 +378,7 @@ function placeWork(schedule, workMinutes) {
 }
 
 // ============================================================================
-// OPTIMIZED SCHEDULING LOGIC
+// PLANNING
 // ============================================================================
 
 async function scheduleWorkOrder(
@@ -365,7 +391,6 @@ async function scheduleWorkOrder(
 ) {
   const startDateObj = parseDate(startDate);
 
-  // FIX 2: Use lean() + select() to only get needed fields
   const wo = await WorkOrder.findById(workOrderId)
     .select("workOrderNumber quantity operations stockItemId")
     .populate("stockItemId", "name genderCategory")
@@ -373,15 +398,16 @@ async function scheduleWorkOrder(
 
   if (!wo) throw new Error("Work order not found");
 
-  const durationMinutes = calculateWODuration(wo);
-  if (durationMinutes <= 0) throw new Error("Work order has no duration");
+  // Unlike production, a work order with no operation timings is NOT rejected —
+  // it gets a fallback block. See woDuration().
+  const { minutes: durationMinutes, estimated: isEstimatedDuration } =
+    woDuration(wo);
 
   if (!isReschedule) {
-    // FIX 3: Use exists() for faster existence check
-    const existing = await ProductionSchedule.exists({
+    const existing = await SalesSchedule.exists({
       "scheduledWorkOrders.workOrderId": workOrderId,
     });
-    if (existing) throw new Error("Already scheduled");
+    if (existing) throw new Error("Already planned on the sales calendar");
   }
 
   const uniqueColor =
@@ -393,9 +419,8 @@ async function scheduleWorkOrder(
   let dayNumber = 1;
   const maxDays = 100;
 
-  // FIX 4: Batch fetch schedules for date range
   const endDate = addDays(startDateObj, maxDays);
-  const schedulesInRange = await ProductionSchedule.find({
+  const schedulesInRange = await SalesSchedule.find({
     date: { $gte: startDateObj, $lte: endDate },
   }).lean();
 
@@ -403,14 +428,13 @@ async function scheduleWorkOrder(
     schedulesInRange.map((s) => [formatDate(s.date), s]),
   );
 
-  // HR company holidays for the whole window, fetched once.
   const holidayMap = await getCompanyHolidayMap(startDateObj, endDate);
 
-  // Snapshot of what is ACTUALLY in the database, captured before we book
-  // anything in memory. The bulkWrite below must decide $push vs $set from
-  // this, never from the live objects — those get a provisional entry added
-  // as we go, which would otherwise make every new booking look like an
-  // update and target a filter that matches no document.
+  // Snapshot of what is ACTUALLY in the database, captured before anything is
+  // booked in memory. The bulkWrite below must decide $push vs $set from this,
+  // never from the live objects — those get a provisional entry added as we go,
+  // which would otherwise make every new booking look like an update and target
+  // a filter that matches no document.
   const persistedByDate = new Map();
   const rememberPersisted = (key, sched) => {
     if (persistedByDate.has(key)) return;
@@ -436,8 +460,6 @@ async function scheduleWorkOrder(
     }
     rememberPersisted(formatDate(currentDate), schedule);
 
-    // HR company holiday blocks the day, unless production has explicitly
-    // overridden it for this date.
     if (
       holidayBlocks(holidayMap.get(formatDate(currentDate))) &&
       schedule.holidayOverride !== true
@@ -451,10 +473,8 @@ async function scheduleWorkOrder(
       continue;
     }
 
-    // FIX: capacity is what is GENUINELY free — work window minus breaks minus
-    // minutes already booked. The old formula (totalMinutes - breaks - sum of
-    // durations) ignored WHERE the booked work sat, so a day already occupied
-    // until 11:00 could not be topped up correctly.
+    // Capacity is what is GENUINELY free — work window minus breaks minus
+    // minutes already booked, accounting for WHERE the booked work sits.
     const available = freeMinutes(schedule);
 
     if (available <= 0) {
@@ -464,9 +484,6 @@ async function scheduleWorkOrder(
 
     const minutesToSchedule = Math.min(remainingMinutes, available);
 
-    // FIX: lay the work into real free time. The old code set every work order
-    // to start at workHours.startTime and end at start + duration, so all work
-    // orders on a day overlapped at 09:30 and lunch was worked straight through.
     const placed = placeWork(schedule, minutesToSchedule);
     if (!placed) {
       currentDate = addDays(currentDate, 1);
@@ -484,6 +501,7 @@ async function scheduleWorkOrder(
       scheduledStartTime: startTime,
       scheduledEndTime: endTime,
       durationMinutes: minutesToSchedule,
+      isEstimatedDuration,
       colorCode: uniqueColor,
       currentDayNumber: dayNumber,
       totalDaysSpanned: 0,
@@ -525,7 +543,6 @@ async function scheduleWorkOrder(
     seg.isMultiDay = isMultiDay;
   }
 
-  // FIX 5: Use bulkWrite for batch updates (much faster than individual saves)
   const bulkOps = [];
 
   for (const seg of segments) {
@@ -535,7 +552,6 @@ async function scheduleWorkOrder(
       : false;
 
     if (alreadyInDb) {
-      // Update existing
       bulkOps.push({
         updateOne: {
           filter: {
@@ -550,6 +566,7 @@ async function scheduleWorkOrder(
                 scheduledStartTime: seg.scheduledStartTime,
                 scheduledEndTime: seg.scheduledEndTime,
                 durationMinutes: seg.durationMinutes,
+                isEstimatedDuration: seg.isEstimatedDuration,
                 colorCode: uniqueColor,
                 isMultiDay: seg.isMultiDay,
                 totalDaysSpanned: seg.totalDaysSpanned,
@@ -561,14 +578,13 @@ async function scheduleWorkOrder(
         },
       });
     } else {
-      // Add new
       bulkOps.push({
         updateOne: {
           filter: { _id: seg.scheduleId },
           update: {
-            // ONE $push key holding BOTH arrays. Two separate `$push:` keys in the
-            // same object literal is a JS duplicate-key — the second silently wins
-            // and scheduledWorkOrders never gets written.
+            // ONE $push key holding BOTH arrays. Two separate `$push:` keys in
+            // the same object literal is a JS duplicate-key — the second wins
+            // silently and scheduledWorkOrders never gets written.
             $push: {
               scheduledWorkOrders: {
                 workOrderId: seg.workOrderId,
@@ -576,6 +592,7 @@ async function scheduleWorkOrder(
                 scheduledStartTime: seg.scheduledStartTime,
                 scheduledEndTime: seg.scheduledEndTime,
                 durationMinutes: seg.durationMinutes,
+                isEstimatedDuration: seg.isEstimatedDuration,
                 colorCode: uniqueColor,
                 position: 0,
                 status: "scheduled",
@@ -587,7 +604,7 @@ async function scheduleWorkOrder(
                 modifiedBy: userId,
                 modifiedAt: new Date(),
                 modificationType: "work_order_added",
-                details: `Scheduled ${wo.workOrderNumber} (Day ${seg.currentDayNumber}/${totalDays})`,
+                details: `Planned ${wo.workOrderNumber} (Day ${seg.currentDayNumber}/${totalDays})`,
               },
             },
           },
@@ -597,53 +614,53 @@ async function scheduleWorkOrder(
   }
 
   if (bulkOps.length > 0) {
-    await ProductionSchedule.bulkWrite(bulkOps);
+    await SalesSchedule.bulkWrite(bulkOps);
   }
 
-  // FIX 6: Update utilization in separate batch (non-blocking)
+  // Utilization recalculated off the request path.
   const scheduleIds = segments.map((s) => s.scheduleId);
   setImmediate(async () => {
-    const schedulesToUpdate = await ProductionSchedule.find({
-      _id: { $in: scheduleIds },
-    });
-    for (const schedule of schedulesToUpdate) {
-      schedule.calculateUtilization();
-      await schedule.save();
+    try {
+      const schedulesToUpdate = await SalesSchedule.find({
+        _id: { $in: scheduleIds },
+      });
+      for (const schedule of schedulesToUpdate) {
+        schedule.calculateUtilization();
+        await schedule.save();
+      }
+    } catch (err) {
+      console.error("[sales-schedule] utilization recalc failed:", err.message);
     }
   });
 
   return {
     success: true,
-    totalDays: totalDays,
-    segments: segments,
+    totalDays,
+    segments,
     workOrderNumber: wo.workOrderNumber,
     colorCode: uniqueColor,
+    isEstimatedDuration,
   };
 }
 
 // ============================================================================
-// OPTIMIZED AUTO-RESCHEDULE
+// CASCADE RESCHEDULE
 // ============================================================================
 
 /**
  * Everything on or after `changedDate` is re-laid from scratch, in its existing
  * order, whenever a day's availability or capacity changes.
  *
- * The old version only touched work orders that sat ON the changed day or
- * spanned across it, and it looked in a +/-7 day window. So making a day
- * inactive pushed its own work out but left everything AFTER it untouched —
- * which is exactly why this "sometimes worked and sometimes did not".
- *
- * A day going inactive, going active again, or its work hours shrinking from
- * 9h to 4h are all the same problem: the run of work after that point no
- * longer fits the way it was laid out, so it has to be recompacted.
+ * A day going inactive, going active again, or its work hours shrinking from 9h
+ * to 4h are all the same problem: the run of work after that point no longer
+ * fits the way it was laid out, so it has to be recompacted.
  */
 async function cascadeRescheduleFrom(changedDate, userId, options = {}) {
   const { dryRun = false } = options;
   const from = parseDate(changedDate);
 
   // 1. Every work order holding a segment on or after the changed day
-  const forward = await ProductionSchedule.find({
+  const forward = await SalesSchedule.find({
     date: { $gte: from },
     "scheduledWorkOrders.0": { $exists: true },
   })
@@ -674,20 +691,15 @@ async function cascadeRescheduleFrom(changedDate, userId, options = {}) {
   }
 
   if (affected.size === 0) {
-    return {
-      rescheduled: 0,
-      failed: 0,
-      affected: 0,
-      message: "Nothing to move",
-    };
+    return { rescheduled: 0, failed: 0, affected: 0, message: "Nothing to move" };
   }
 
   const ids = Array.from(affected.keys());
 
-  // 2. A multi-day work order may START before the changed day and run past
-  //    it. Take its real first date so it is put back where it began, not
-  //    dragged forward to the changed date.
-  const originals = await ProductionSchedule.find({
+  // 2. A multi-day work order may START before the changed day and run past it.
+  //    Take its real first date so it is put back where it began, not dragged
+  //    forward to the changed date.
+  const originals = await SalesSchedule.find({
     "scheduledWorkOrders.workOrderId": { $in: ids },
   })
     .select("date scheduledWorkOrders")
@@ -720,7 +732,7 @@ async function cascadeRescheduleFrom(changedDate, userId, options = {}) {
   }
 
   // 3. Lift every affected work order out, everywhere it appears
-  await ProductionSchedule.updateMany(
+  await SalesSchedule.updateMany(
     { "scheduledWorkOrders.workOrderId": { $in: ids } },
     { $pull: { scheduledWorkOrders: { workOrderId: { $in: ids } } } },
   );
@@ -764,36 +776,29 @@ async function cascadeRescheduleFrom(changedDate, userId, options = {}) {
   return results;
 }
 
-// Kept so any existing caller keeps working.
-async function autoRescheduleForDayChange(changedDate, userId) {
-  return cascadeRescheduleFrom(changedDate, userId);
-}
-
 // ============================================================================
-// OPTIMIZED API ROUTES
+// API ROUTES
 // ============================================================================
 
-// GET schedules - OPTIMIZED
+// GET schedules for a date range
 router.get("/", async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
 
     if (!startDate || !endDate) {
-      return res.status(400).json({
-        success: false,
-        message: "startDate and endDate required",
-      });
+      return res
+        .status(400)
+        .json({ success: false, message: "startDate and endDate required" });
     }
 
     const start = parseDate(startDate);
     const end = parseDate(endDate);
 
-    // FIX 9: Use lean() and minimal population
-    const schedules = await ProductionSchedule.find({
+    const schedules = await SalesSchedule.find({
       date: { $gte: start, $lte: end },
     })
       // Wide on purpose. The Overview tab is what non-calendar people read to
-      // verify a plan, so it needs the whole picture — product, quantity,
+      // verify a promise, so it needs the whole picture — product, quantity,
       // deadline, customer — not just enough to draw a bar.
       .populate({
         path: "scheduledWorkOrders.workOrderId",
@@ -813,7 +818,7 @@ router.get("/", async (req, res) => {
       .sort({ date: 1 })
       .lean();
 
-    // Fill missing dates
+    // Fill missing dates so the calendar never has holes
     const existing = new Set(schedules.map((s) => formatDate(s.date)));
     const missingDates = [];
     let current = new Date(start);
@@ -825,7 +830,6 @@ router.get("/", async (req, res) => {
       current = addDays(current, 1);
     }
 
-    // FIX 10: Batch create missing schedules
     if (missingDates.length > 0) {
       const newSchedules = await Promise.all(
         missingDates.map((date) => getScheduleForDate(date)),
@@ -835,9 +839,8 @@ router.get("/", async (req, res) => {
 
     schedules.sort((a, b) => new Date(a.date) - new Date(b.date));
 
-    // Overlay HR's company holiday calendar so the UI blocks those days and
-    // can name them. Kept as a read-time overlay rather than a write so HR
-    // remains the single source of truth for holidays.
+    // HR's company holiday calendar as a read-time overlay, so HR remains the
+    // single source of truth for holidays.
     const holidayMap = await getCompanyHolidayMap(start, end);
     if (holidayMap.size > 0) {
       for (const schedule of schedules)
@@ -846,35 +849,60 @@ router.get("/", async (req, res) => {
 
     res.json({ success: true, schedules, count: schedules.length });
   } catch (error) {
-    console.error("Error:", error);
+    console.error("[sales-schedule] list error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// GET manufacturing orders - HEAVILY OPTIMIZED
+/**
+ * GET every manufacturing order with its work orders.
+ *
+ * THIS IS THE DELIBERATE DIFFERENCE FROM THE PRODUCTION ROUTE. There is no
+ * filter on customer request status, no filter on work order status, and no
+ * requirement that the work order has operations. Sales plans the whole book,
+ * including cancelled and completed orders, so the calendar can show what was
+ * promised as well as what is live.
+ *
+ * Optional narrowing, all off by default:
+ *   ?status=a,b       customer request status
+ *   ?priority=urgent
+ *   ?search=text      request id / customer name
+ *   ?withWorkOrdersOnly=false  include orders that have no work orders at all
+ */
 router.get("/manufacturing-orders", async (req, res) => {
   try {
-    // FIX 11: Add pagination
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
 
-    // FIX 12: Use aggregation with $facet for count + results in one query
-    const [result] = await CustomerRequest.aggregate([
-      {
-        $match: {
-          "quotations.0": { $exists: true },
-          "quotations.salesApproval.approved": true,
-          status: {
-            $in: [
-              "quotation_sales_approved",
-              "production",
-              "in_progress",
-              "pending",
-            ],
-          },
-        },
-      },
+    const match = {};
+
+    if (req.query.status) {
+      const wanted = String(req.query.status)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (wanted.length) match.status = { $in: wanted };
+    }
+
+    if (req.query.priority && req.query.priority !== "all") {
+      match.priority = req.query.priority;
+    }
+
+    if (req.query.search) {
+      const rx = new RegExp(
+        String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i",
+      );
+      match.$or = [{ requestId: rx }, { "customerInfo.name": rx }];
+    }
+
+    // An order with no work orders has nothing draggable on it, so it is hidden
+    // unless explicitly asked for.
+    const requireWorkOrders = req.query.withWorkOrdersOnly !== "false";
+
+    const pipeline = [
+      { $match: match },
       {
         $lookup: {
           from: "workorders",
@@ -888,38 +916,31 @@ router.get("/manufacturing-orders", async (req, res) => {
           requestId: 1,
           customerInfo: 1,
           priority: 1,
-          workOrders: {
-            $filter: {
-              input: "$workOrders",
-              as: "wo",
-              cond: {
-                $and: [
-                  {
-                    $in: [
-                      "$$wo.status",
-                      ["planned", "scheduled", "ready_to_start"],
-                    ],
-                  },
-                  { $gt: [{ $size: { $ifNull: ["$$wo.operations", []] } }, 0] },
-                ],
-              },
-            },
-          },
+          status: 1,
+          expectedDeliveryDate: 1,
+          // NOTE: no $filter here — every work order on the request is kept.
+          workOrders: 1,
         },
       },
-      { $match: { "workOrders.0": { $exists: true } } },
-      {
-        $facet: {
-          metadata: [{ $count: "total" }],
-          data: [{ $skip: skip }, { $limit: limit }],
-        },
+    ];
+
+    if (requireWorkOrders) {
+      pipeline.push({ $match: { "workOrders.0": { $exists: true } } });
+    }
+
+    pipeline.push({ $sort: { createdAt: -1, _id: -1 } });
+    pipeline.push({
+      $facet: {
+        metadata: [{ $count: "total" }],
+        data: [{ $skip: skip }, { $limit: limit }],
       },
-    ]);
+    });
 
-    const mos = result.data;
-    const total = result.metadata[0]?.total || 0;
+    const [result] = await CustomerRequest.aggregate(pipeline);
 
-    // FIX 13: Batch fetch all work orders and schedules
+    const mos = result?.data || [];
+    const total = result?.metadata?.[0]?.total || 0;
+
     const allWOIds = mos.flatMap((mo) => mo.workOrders.map((w) => w._id));
 
     const [workOrders, scheduledWOs] = await Promise.all([
@@ -927,19 +948,18 @@ router.get("/manufacturing-orders", async (req, res) => {
         .select("_id workOrderNumber quantity status stockItemId operations")
         .populate("stockItemId", "name genderCategory")
         .lean(),
-      ProductionSchedule.find({
+      SalesSchedule.find({
         "scheduledWorkOrders.workOrderId": { $in: allWOIds },
       })
         .select("scheduledWorkOrders")
         .lean(),
     ]);
 
-    // Create maps for O(1) lookups
     const woMap = new Map(workOrders.map((wo) => [String(wo._id), wo]));
     const woColorMap = new Map();
 
     scheduledWOs.forEach((schedule) => {
-      schedule.scheduledWorkOrders.forEach((swo) => {
+      (schedule.scheduledWorkOrders || []).forEach((swo) => {
         if (swo.colorCode) {
           woColorMap.set(String(swo.workOrderId), swo.colorCode);
         }
@@ -960,6 +980,7 @@ router.get("/manufacturing-orders", async (req, res) => {
           if (!wo) return null;
 
           const isScheduled = woColorMap.has(String(wo._id));
+          const { minutes, estimated } = woDuration(wo);
 
           return {
             _id: wo._id,
@@ -968,8 +989,11 @@ router.get("/manufacturing-orders", async (req, res) => {
             status: wo.status,
             stockItemName: wo.stockItemId?.name || "Unknown",
             genderCategory: wo.stockItemId?.genderCategory || null,
-            durationMinutes: Math.ceil(calculateWODuration(wo)),
-            isScheduled: isScheduled,
+            durationMinutes: Math.ceil(minutes),
+            // Lets the panel mark the time as a guess rather than a costing.
+            isEstimatedDuration: estimated,
+            hasOperations: (wo.operations || []).length > 0,
+            isScheduled,
             colorCode: isScheduled
               ? woColorMap.get(String(wo._id))
               : moColors[mo.priority] || "#3B82F6",
@@ -980,13 +1004,15 @@ router.get("/manufacturing-orders", async (req, res) => {
       return {
         _id: mo._id,
         moNumber: `MO-${mo.requestId}`,
+        requestId: mo.requestId,
         customerInfo: mo.customerInfo,
         priority: mo.priority,
+        status: mo.status,
+        expectedDeliveryDate: mo.expectedDeliveryDate,
         colorCode: moColors[mo.priority] || "#3B82F6",
         workOrders: allWorkOrders,
         totalWorkOrders: allWorkOrders.length,
-        scheduledWorkOrders: allWorkOrders.filter((wo) => wo.isScheduled)
-          .length,
+        scheduledWorkOrders: allWorkOrders.filter((wo) => wo.isScheduled).length,
         unscheduledWorkOrders: allWorkOrders.filter((wo) => !wo.isScheduled)
           .length,
       };
@@ -1004,12 +1030,12 @@ router.get("/manufacturing-orders", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error:", error);
+    console.error("[sales-schedule] MO list error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// GET day settings - OPTIMIZED
+// GET day settings
 router.get("/day-settings/:date", async (req, res) => {
   try {
     const schedule = await getScheduleForDate(req.params.date);
@@ -1020,7 +1046,7 @@ router.get("/day-settings/:date", async (req, res) => {
   }
 });
 
-// POST schedule work order - OPTIMIZED
+// POST plan a single work order
 router.post("/schedule-work-order", async (req, res) => {
   try {
     const { workOrderId, manufacturingOrderId, startDate, colorCode } =
@@ -1036,16 +1062,17 @@ router.post("/schedule-work-order", async (req, res) => {
 
     res.json({
       success: true,
-      message: `Scheduled across ${result.totalDays} day(s)`,
+      message: `Planned across ${result.totalDays} day(s)`,
       workOrderNumber: result.workOrderNumber,
       totalDays: result.totalDays,
+      isEstimatedDuration: result.isEstimatedDuration,
     });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
   }
 });
 
-// POST schedule MO - OPTIMIZED
+// POST plan a whole manufacturing order
 router.post("/schedule-manufacturing-order", async (req, res) => {
   try {
     const { manufacturingOrderId, startDate } = req.body;
@@ -1053,14 +1080,13 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
     const mo = await CustomerRequest.findById(manufacturingOrderId)
       .select("priority requestId")
       .lean();
-    if (!mo) throw new Error("MO not found");
+    if (!mo) throw new Error("Manufacturing order not found");
 
+    // No status filter — sales plans every work order on the order.
     const workOrders = await WorkOrder.find({
       customerRequestId: manufacturingOrderId,
-      status: { $in: ["planned", "ready_to_start", "scheduled"] },
     })
       .select("_id workOrderNumber operations quantity")
-      .populate("stockItemId", "name genderCategory")
       .lean();
 
     const colors = {
@@ -1071,10 +1097,9 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
     };
     const colorCode = colors[mo.priority] || "#3B82F6";
 
-    // FIX 14: Check scheduled status in batch
     const scheduledWOIds = new Set(
       (
-        await ProductionSchedule.find({
+        await SalesSchedule.find({
           "scheduledWorkOrders.workOrderId": {
             $in: workOrders.map((w) => w._id),
           },
@@ -1100,14 +1125,11 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
           workOrderNumber: wo.workOrderNumber,
           days: result.totalDays,
         });
-        // FIX: stay on the LAST day this work order touched instead of jumping
-        // to the next one. Two bugs came from that jump:
-        //   - dropping on a Sunday pushed WO #2 to Tuesday (Sunday skipped to
-        //     Monday inside scheduleWorkOrder, then +1 landed on Tuesday)
-        //   - a day still holding free hours was abandoned
-        // scheduleWorkOrder() advances by itself once the day is full.
+        // Stay on the LAST day this work order touched instead of jumping past
+        // it — scheduleWorkOrder() advances by itself once a day is full, and
+        // skipping ahead both abandons free hours and mis-handles Sundays.
         const lastSeg = result.segments[result.segments.length - 1];
-        currentDate = parseDate(lastSeg.date);
+        if (lastSeg) currentDate = parseDate(lastSeg.date);
       } catch (error) {
         results.failed.push({
           workOrderNumber: wo.workOrderNumber,
@@ -1118,7 +1140,7 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
 
     res.json({
       success: true,
-      message: `Scheduled ${results.successful.length} work orders`,
+      message: `Planned ${results.successful.length} work order(s)`,
       results,
     });
   } catch (error) {
@@ -1126,19 +1148,18 @@ router.post("/schedule-manufacturing-order", async (req, res) => {
   }
 });
 
-// POST move work order - OPTIMIZED
+// POST move a work order to another day
 router.post("/move-work-order", async (req, res) => {
   try {
     const { workOrderId, targetDate } = req.body;
 
-    // FIX 15: Get color and MO in single query
-    const schedule = await ProductionSchedule.findOne({
+    const schedule = await SalesSchedule.findOne({
       "scheduledWorkOrders.workOrderId": workOrderId,
     })
       .select("scheduledWorkOrders")
       .lean();
 
-    if (!schedule) throw new Error("WO not scheduled");
+    if (!schedule) throw new Error("Work order is not planned");
 
     const woData = schedule.scheduledWorkOrders.find(
       (s) => String(s.workOrderId) === String(workOrderId),
@@ -1147,10 +1168,9 @@ router.post("/move-work-order", async (req, res) => {
     const colorCode = woData.colorCode;
     const moId = woData.manufacturingOrderId;
 
-    // Remove from all schedules
-    await ProductionSchedule.updateMany(
+    await SalesSchedule.updateMany(
       { "scheduledWorkOrders.workOrderId": workOrderId },
-      { $pull: { scheduledWorkOrders: { workOrderId: workOrderId } } },
+      { $pull: { scheduledWorkOrders: { workOrderId } } },
     );
 
     const result = await scheduleWorkOrder(
@@ -1159,19 +1179,23 @@ router.post("/move-work-order", async (req, res) => {
       targetDate,
       colorCode,
       req.user.id,
+      true,
     );
 
-    // Update utilization async
     setImmediate(async () => {
-      const schedulesToUpdate = await ProductionSchedule.find({
-        $or: [
-          { _id: schedule._id },
-          { "scheduledWorkOrders.workOrderId": workOrderId },
-        ],
-      });
-      for (const s of schedulesToUpdate) {
-        s.calculateUtilization();
-        await s.save();
+      try {
+        const schedulesToUpdate = await SalesSchedule.find({
+          $or: [
+            { _id: schedule._id },
+            { "scheduledWorkOrders.workOrderId": workOrderId },
+          ],
+        });
+        for (const s of schedulesToUpdate) {
+          s.calculateUtilization();
+          await s.save();
+        }
+      } catch (err) {
+        console.error("[sales-schedule] utilization recalc failed:", err.message);
       }
     });
 
@@ -1186,8 +1210,6 @@ router.post("/move-work-order", async (req, res) => {
 });
 
 // POST run the cascade for a date on its own, without touching settings.
-// Lets the UI offer "save only" and "save and reschedule" as separate choices,
-// and lets a failed cascade be retried without re-saving anything.
 router.post("/day-settings/:date/reschedule", async (req, res) => {
   try {
     const { date } = req.params;
@@ -1197,7 +1219,7 @@ router.post("/day-settings/:date/reschedule", async (req, res) => {
     });
     res.json({ success: true, result });
   } catch (error) {
-    console.error("Reschedule error:", error);
+    console.error("[sales-schedule] reschedule error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -1209,25 +1231,21 @@ router.post("/day-settings/:date/reschedule", async (req, res) => {
 /**
  * Move a work order that spans several days. Every segment is lifted and the
  * whole thing is re-laid from the target date.
- *
- * This endpoint and its alias below were MISSING, which is why dragging a
- * multi-day bar returned a 404 while single-day bars (which use
- * /move-work-order) worked fine.
  */
 async function moveWholeWorkOrder(workOrderId, targetDate, userId) {
-  const holder = await ProductionSchedule.findOne({
+  const holder = await SalesSchedule.findOne({
     "scheduledWorkOrders.workOrderId": workOrderId,
   })
     .select("scheduledWorkOrders")
     .lean();
 
-  if (!holder) throw new Error("Work order is not scheduled");
+  if (!holder) throw new Error("Work order is not planned");
 
   const woData = holder.scheduledWorkOrders.find(
     (s) => String(s.workOrderId) === String(workOrderId),
   );
 
-  await ProductionSchedule.updateMany(
+  await SalesSchedule.updateMany(
     { "scheduledWorkOrders.workOrderId": workOrderId },
     { $pull: { scheduledWorkOrders: { workOrderId } } },
   );
@@ -1252,11 +1270,7 @@ router.post("/move-entire-work-order", async (req, res) => {
       });
     }
 
-    const result = await moveWholeWorkOrder(
-      workOrderId,
-      targetDate,
-      req.user.id,
-    );
+    const result = await moveWholeWorkOrder(workOrderId, targetDate, req.user.id);
 
     res.json({
       success: true,
@@ -1264,7 +1278,7 @@ router.post("/move-entire-work-order", async (req, res) => {
       totalDays: result.totalDays,
     });
   } catch (error) {
-    console.error("move-entire-work-order:", error);
+    console.error("[sales-schedule] move-entire-work-order:", error);
     res.status(400).json({ success: false, message: error.message });
   }
 });
@@ -1280,11 +1294,7 @@ router.post("/move-work-order-all-segments", async (req, res) => {
       });
     }
 
-    const result = await moveWholeWorkOrder(
-      workOrderId,
-      targetDate,
-      req.user.id,
-    );
+    const result = await moveWholeWorkOrder(workOrderId, targetDate, req.user.id);
 
     res.json({
       success: true,
@@ -1293,7 +1303,7 @@ router.post("/move-work-order-all-segments", async (req, res) => {
       segmentsMoved: result.totalDays,
     });
   } catch (error) {
-    console.error("move-work-order-all-segments:", error);
+    console.error("[sales-schedule] move-work-order-all-segments:", error);
     res.status(400).json({ success: false, message: error.message });
   }
 });
@@ -1370,27 +1380,19 @@ router.post("/reorder-day", async (req, res) => {
       });
     }
 
-    const schedule = await ProductionSchedule.findOne({
-      date: parseDate(date),
-    });
+    const schedule = await SalesSchedule.findOne({ date: parseDate(date) });
     if (!schedule) {
       return res.status(404).json({ success: false, message: "Day not found" });
     }
 
     const keyOf = (swo) => String(bySegment ? swo._id : swo.workOrderId);
     const rank = new Map(
-      (bySegment ? segmentIds : workOrderIds)
-        .map(String)
-        .map((id, i) => [id, i]),
+      (bySegment ? segmentIds : workOrderIds).map(String).map((id, i) => [id, i]),
     );
 
     const sorted = [...(schedule.scheduledWorkOrders || [])].sort((a, b) => {
-      const ra = rank.has(keyOf(a))
-        ? rank.get(keyOf(a))
-        : Number.MAX_SAFE_INTEGER;
-      const rb = rank.has(keyOf(b))
-        ? rank.get(keyOf(b))
-        : Number.MAX_SAFE_INTEGER;
+      const ra = rank.has(keyOf(a)) ? rank.get(keyOf(a)) : Number.MAX_SAFE_INTEGER;
+      const rb = rank.has(keyOf(b)) ? rank.get(keyOf(b)) : Number.MAX_SAFE_INTEGER;
       if (ra !== rb) return ra - rb;
       return (a.position || 0) - (b.position || 0);
     });
@@ -1407,18 +1409,14 @@ router.post("/reorder-day", async (req, res) => {
 
     await schedule.save();
 
-    res.json({
-      success: true,
-      message: "Order updated",
-      count: sorted.length,
-    });
+    res.json({ success: true, message: "Order updated", count: sorted.length });
   } catch (error) {
-    console.error("reorder-day:", error);
+    console.error("[sales-schedule] reorder-day:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// PUT update day settings - OPTIMIZED
+// PUT update day settings
 router.put("/day-settings/:date", async (req, res) => {
   try {
     const { date } = req.params;
@@ -1431,19 +1429,16 @@ router.put("/day-settings/:date", async (req, res) => {
       isSundayOverride,
       notes,
       isActive,
-      // dryRun asks "what would this change move?" without changing anything,
-      // so the UI can put a real number in front of the user before committing.
+      // "What would this change move?" without changing anything, so the UI can
+      // put a real number in front of the user before committing.
       dryRun,
-      // The cascade is now OPT-IN and runs only after the settings are already
-      // committed. Previously it ran inline before the response, so a slow or
-      // failing reschedule took the settings change down with it and the day
-      // appeared to revert.
+      // The cascade is OPT-IN and runs only after the settings are already
+      // committed, so a slow or failing reschedule can never take the settings
+      // change down with it.
       reschedule,
     } = req.body;
 
-    const schedule = await ProductionSchedule.findOne({
-      date: parseDate(date),
-    });
+    const schedule = await SalesSchedule.findOne({ date: parseDate(date) });
     if (!schedule) {
       const newSchedule = await getScheduleForDate(date);
       return res.json({ success: true, schedule: newSchedule });
@@ -1459,8 +1454,7 @@ router.put("/day-settings/:date", async (req, res) => {
     const wasAvailable = canScheduleOnDay(schedule.toObject());
     const originalAvailableMinutes = schedule.availableMinutes;
 
-    const dayOfWeek = getDayOfWeek(date);
-    const isSunday = dayOfWeek === 0;
+    const isSunday = getDayOfWeek(date) === 0;
 
     if (isSunday && isSundayOverride !== undefined) {
       schedule.isSundayOverride = isSundayOverride;
@@ -1482,9 +1476,8 @@ router.put("/day-settings/:date", async (req, res) => {
       if (isActive) {
         schedule.isHoliday = false;
         // If HR marked this date a company holiday, switching the day on is an
-        // explicit production override. Without this flag the read-time overlay
-        // would keep forcing the day closed and the toggle would appear to do
-        // nothing — which is exactly what happened on Independence Day.
+        // explicit override. Without this flag the read-time overlay would keep
+        // forcing the day closed and the toggle would appear to do nothing.
         schedule.holidayOverride = true;
         if (isSunday) schedule.isSundayOverride = true;
         if (!schedule.notes || /off|holiday|inactive/i.test(schedule.notes)) {
@@ -1507,13 +1500,12 @@ router.put("/day-settings/:date", async (req, res) => {
       const [eh, em] = (workHours.endTime || schedule.workHours.endTime)
         .split(":")
         .map(Number);
-      const totalMinutes = eh * 60 + em - (sh * 60 + sm);
 
       schedule.workHours.startTime =
         workHours.startTime || schedule.workHours.startTime;
       schedule.workHours.endTime =
         workHours.endTime || schedule.workHours.endTime;
-      schedule.workHours.totalMinutes = totalMinutes;
+      schedule.workHours.totalMinutes = eh * 60 + em - (sh * 60 + sm);
       schedule.workHours.customHours = true;
     }
 
@@ -1541,7 +1533,7 @@ router.put("/day-settings/:date", async (req, res) => {
       modifiedBy: req.user.id,
       modifiedAt: new Date(),
       modificationType: "day_settings_changed",
-      details: `Updated settings`,
+      details: "Updated settings",
     });
 
     await schedule.save();
@@ -1551,14 +1543,13 @@ router.put("/day-settings/:date", async (req, res) => {
     const availableMinutesChanged =
       originalAvailableMinutes !== schedule.availableMinutes;
 
-    // The day is SAVED at this point, whatever happens next. The cascade is a
-    // separate step so it can never roll back or mask the settings change.
+    // The day is SAVED at this point, whatever happens next.
     let autoRescheduleResult = null;
     if (reschedule === true && (dayStatusChanged || availableMinutesChanged)) {
       try {
         autoRescheduleResult = await cascadeRescheduleFrom(date, req.user.id);
       } catch (err) {
-        console.error("[schedule] cascade failed after save:", err);
+        console.error("[sales-schedule] cascade failed after save:", err);
         autoRescheduleResult = {
           rescheduled: 0,
           failed: 0,
@@ -1568,7 +1559,7 @@ router.put("/day-settings/:date", async (req, res) => {
       }
     }
 
-    let finalSchedule = await ProductionSchedule.findById(schedule._id).lean();
+    let finalSchedule = await SalesSchedule.findById(schedule._id).lean();
     if (finalSchedule) {
       const hMap = await getCompanyHolidayMap(
         finalSchedule.date,
@@ -1586,13 +1577,12 @@ router.put("/day-settings/:date", async (req, res) => {
       autoRescheduleResult,
     });
   } catch (error) {
+    console.error("[sales-schedule] day-settings error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// POST remove MANY work orders in one call.
-// Lets the UI unassign a whole selection behind a single confirmation instead
-// of firing one request (and one prompt) per work order.
+// POST remove MANY work orders in one call, behind a single confirmation.
 router.post("/remove-work-orders", async (req, res) => {
   try {
     const { workOrderIds } = req.body;
@@ -1606,13 +1596,13 @@ router.post("/remove-work-orders", async (req, res) => {
 
     const ids = workOrderIds.map(String);
 
-    const affected = await ProductionSchedule.find({
+    const affected = await SalesSchedule.find({
       "scheduledWorkOrders.workOrderId": { $in: ids },
     })
       .select("_id")
       .lean();
 
-    const result = await ProductionSchedule.updateMany(
+    const result = await SalesSchedule.updateMany(
       { "scheduledWorkOrders.workOrderId": { $in: ids } },
       {
         $pull: { scheduledWorkOrders: { workOrderId: { $in: ids } } },
@@ -1627,15 +1617,18 @@ router.post("/remove-work-orders", async (req, res) => {
       },
     );
 
-    // Recalculate utilization off the request path
     const scheduleIds = affected.map((a) => a._id);
     setImmediate(async () => {
-      const schedulesToUpdate = await ProductionSchedule.find({
-        _id: { $in: scheduleIds },
-      });
-      for (const schedule of schedulesToUpdate) {
-        schedule.calculateUtilization();
-        await schedule.save();
+      try {
+        const schedulesToUpdate = await SalesSchedule.find({
+          _id: { $in: scheduleIds },
+        });
+        for (const schedule of schedulesToUpdate) {
+          schedule.calculateUtilization();
+          await schedule.save();
+        }
+      } catch (err) {
+        console.error("[sales-schedule] utilization recalc failed:", err.message);
       }
     });
 
@@ -1646,7 +1639,7 @@ router.post("/remove-work-orders", async (req, res) => {
       daysAffected: result.modifiedCount,
     });
   } catch (error) {
-    console.error("Bulk remove error:", error);
+    console.error("[sales-schedule] bulk remove error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -1675,16 +1668,21 @@ router.get("/company-holidays", async (req, res) => {
   }
 });
 
-// DELETE remove work order - OPTIMIZED
+// DELETE one work order off the calendar entirely
 router.delete("/remove-work-order/:workOrderId", async (req, res) => {
   try {
     const { workOrderId } = req.params;
 
-    // FIX 17: Use updateMany instead of finding all schedules
-    const result = await ProductionSchedule.updateMany(
+    const affected = await SalesSchedule.find({
+      "scheduledWorkOrders.workOrderId": workOrderId,
+    })
+      .select("_id")
+      .lean();
+
+    const result = await SalesSchedule.updateMany(
       { "scheduledWorkOrders.workOrderId": workOrderId },
       {
-        $pull: { scheduledWorkOrders: { workOrderId: workOrderId } },
+        $pull: { scheduledWorkOrders: { workOrderId } },
         $push: {
           modifications: {
             modifiedBy: req.user.id,
@@ -1697,29 +1695,198 @@ router.delete("/remove-work-order/:workOrderId", async (req, res) => {
     );
 
     if (result.modifiedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Work order not found in schedule",
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Work order not found in schedule" });
     }
 
-    // Update utilization async
+    // Recalculate from the ids captured BEFORE the pull. The production route
+    // re-finds them by regex over modifications.details, which is both slow and
+    // wrong once a day has accumulated several entries.
+    const scheduleIds = affected.map((a) => a._id);
     setImmediate(async () => {
-      const schedules = await ProductionSchedule.find({
-        "modifications.details": { $regex: workOrderId },
-      });
-      for (const schedule of schedules) {
-        schedule.calculateUtilization();
-        await schedule.save();
+      try {
+        const schedules = await SalesSchedule.find({
+          _id: { $in: scheduleIds },
+        });
+        for (const schedule of schedules) {
+          schedule.calculateUtilization();
+          await schedule.save();
+        }
+      } catch (err) {
+        console.error("[sales-schedule] utilization recalc failed:", err.message);
       }
     });
 
     res.json({
       success: true,
-      message: `Work order removed from ${result.modifiedCount} schedule(s)`,
+      message: `Work order removed from ${result.modifiedCount} day(s)`,
       schedulesAffected: result.modifiedCount,
     });
   } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// DELETE one segment of one work order off one specific day.
+// The day view removes a single bar rather than the whole multi-day run.
+router.delete("/remove-schedule/:scheduleId/:workOrderScheduleId", async (req, res) => {
+  try {
+    const { scheduleId, workOrderScheduleId } = req.params;
+
+    const schedule = await SalesSchedule.findById(scheduleId);
+    if (!schedule) {
+      return res.status(404).json({ success: false, message: "Day not found" });
+    }
+
+    const entry = schedule.scheduledWorkOrders.id(workOrderScheduleId);
+    if (!entry) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Not planned on this day" });
+    }
+
+    schedule.scheduledWorkOrders.pull({ _id: workOrderScheduleId });
+    schedule.modifications.push({
+      modifiedBy: req.user.id,
+      modifiedAt: new Date(),
+      modificationType: "work_order_removed",
+      details: `Removed one segment of work order ${entry.workOrderId}`,
+    });
+
+    await schedule.save();
+
+    res.json({ success: true, message: "Removed from this day" });
+  } catch (error) {
+    console.error("[sales-schedule] remove-schedule:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// PUT hand-set the start/end time of one bar on one day.
+// A manual override: the times are stored as given and the duration recomputed
+// from them, so the day view can nudge something without re-laying the day.
+router.put("/update-schedule/:scheduleId/:workOrderScheduleId", async (req, res) => {
+  try {
+    const { scheduleId, workOrderScheduleId } = req.params;
+    const { startTime, endTime } = req.body;
+
+    if (!startTime || !endTime) {
+      return res
+        .status(400)
+        .json({ success: false, message: "startTime and endTime are required" });
+    }
+
+    const schedule = await SalesSchedule.findById(scheduleId);
+    if (!schedule) {
+      return res.status(404).json({ success: false, message: "Day not found" });
+    }
+
+    const entry = schedule.scheduledWorkOrders.id(workOrderScheduleId);
+    if (!entry) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Not planned on this day" });
+    }
+
+    const start = new Date(startTime);
+    const end = new Date(endTime);
+
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return res
+        .status(400)
+        .json({ success: false, message: "startTime or endTime is not a date" });
+    }
+    if (end <= start) {
+      return res
+        .status(400)
+        .json({ success: false, message: "endTime must be after startTime" });
+    }
+
+    entry.scheduledStartTime = start;
+    entry.scheduledEndTime = end;
+    entry.durationMinutes = Math.round((end - start) / 60000);
+
+    schedule.modifications.push({
+      modifiedBy: req.user.id,
+      modifiedAt: new Date(),
+      modificationType: "work_order_rescheduled",
+      details: `Hand-set times for work order ${entry.workOrderId}`,
+    });
+
+    await schedule.save();
+
+    res.json({ success: true, message: "Times updated" });
+  } catch (error) {
+    console.error("[sales-schedule] update-schedule:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET rollup for the analytics panel
+router.get("/analytics", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res
+        .status(400)
+        .json({ success: false, message: "startDate and endDate required" });
+    }
+
+    const schedules = await SalesSchedule.find({
+      date: { $gte: parseDate(startDate), $lte: parseDate(endDate) },
+    })
+      .select(
+        "date availableMinutes scheduledMinutes utilizationPercentage isHoliday holidayOverride workHours scheduledWorkOrders",
+      )
+      .sort({ date: 1 })
+      .lean();
+
+    const days = schedules.map((s) => ({
+      date: s.date,
+      availableMinutes: s.availableMinutes || 0,
+      scheduledMinutes: s.scheduledMinutes || 0,
+      utilizationPercentage: s.utilizationPercentage || 0,
+      workOrderCount: (s.scheduledWorkOrders || []).length,
+      isWorkingDay: canScheduleOnDay(s),
+    }));
+
+    const workingDays = days.filter((d) => d.isWorkingDay);
+    const totalAvailable = workingDays.reduce(
+      (n, d) => n + d.availableMinutes,
+      0,
+    );
+    const totalScheduled = workingDays.reduce(
+      (n, d) => n + d.scheduledMinutes,
+      0,
+    );
+
+    const uniqueWOs = new Set();
+    schedules.forEach((s) =>
+      (s.scheduledWorkOrders || []).forEach((swo) =>
+        uniqueWOs.add(String(swo.workOrderId)),
+      ),
+    );
+
+    res.json({
+      success: true,
+      analytics: {
+        days,
+        totalDays: days.length,
+        workingDays: workingDays.length,
+        totalAvailableMinutes: totalAvailable,
+        totalScheduledMinutes: totalScheduled,
+        utilization:
+          totalAvailable > 0
+            ? Math.round((totalScheduled / totalAvailable) * 10000) / 100
+            : 0,
+        overCapacityDays: days.filter((d) => d.utilizationPercentage > 100)
+          .length,
+        distinctWorkOrders: uniqueWOs.size,
+      },
+    });
+  } catch (error) {
+    console.error("[sales-schedule] analytics:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -1730,18 +1897,18 @@ router.delete("/remove-work-order/:workOrderId", async (req, res) => {
 //
 // Everything above treats a work order as one indivisible run that the engine
 // lays out. That is fine until a rush job lands mid-morning and an eight-hour
-// item has to become "four hours today, the rest on Thursday". These endpoints
-// are how a planner does that by hand:
+// item has to become "four hours today, the rest on Thursday". These three
+// endpoints are how a planner does that by hand:
 //
 //   /resize-segment  shorten one day's bar; the remainder spills forward
 //   /move-segment    move ONE bar, leaving the work order's other bars alone
 //   /reorder-day     now orders by segment, so two bars of the same work order
 //                    on one day can be sequenced independently
 //
-// They address a single subdocument by its `_id`, never by workOrderId — a work
-// order may hold several segments on the same day once it has been split. The
-// workOrderId-keyed operations elsewhere ($pull on remove, move-entire-work-
-// order) still deliberately act on ALL of them.
+// They all address a single subdocument by its `_id`, never by workOrderId —
+// that is the whole point. A work order may legitimately hold several segments
+// on the same day now, and the workOrderId-keyed operations elsewhere ($pull on
+// remove, move-entire-work-order) still deliberately act on ALL of them.
 
 // Work minutes inside a wall-clock window, breaks excluded. durationMinutes is
 // counted this way everywhere else — placeWork() steps OVER breaks rather than
@@ -1813,6 +1980,7 @@ async function placeExtraMinutes({ startDate, minutes, entry, userId, detail }) 
                   scheduledStartTime,
                   scheduledEndTime,
                   durationMinutes: take,
+                  isEstimatedDuration: entry.isEstimatedDuration || false,
                   colorCode: entry.colorCode,
                   position: (schedule.scheduledWorkOrders || []).length,
                   status: "scheduled",
@@ -1842,13 +2010,9 @@ async function placeExtraMinutes({ startDate, minutes, entry, userId, detail }) 
     if (remaining > 0) currentDate = addDays(currentDate, 1);
   }
 
-  if (ops.length) await ProductionSchedule.bulkWrite(ops);
+  if (ops.length) await SalesSchedule.bulkWrite(ops);
 
-  return {
-    segments,
-    placed: Math.round(minutes) - remaining,
-    unplaced: remaining,
-  };
+  return { segments, placed: Math.round(minutes) - remaining, unplaced: remaining };
 }
 
 /**
@@ -1858,7 +2022,7 @@ async function placeExtraMinutes({ startDate, minutes, entry, userId, detail }) 
  * the bar tooltips and the ‹ › continuation arrows read from.
  */
 async function refreshSpanFlags(workOrderId) {
-  const days = await ProductionSchedule.find({
+  const days = await SalesSchedule.find({
     "scheduledWorkOrders.workOrderId": workOrderId,
   })
     .select("date scheduledWorkOrders")
@@ -1882,7 +2046,7 @@ async function refreshSpanFlags(workOrderId) {
   const total = rows.length;
   if (!total) return;
 
-  await ProductionSchedule.bulkWrite(
+  await SalesSchedule.bulkWrite(
     rows.map((r, i) => ({
       updateOne: {
         filter: { _id: r.scheduleId, "scheduledWorkOrders._id": r.segmentId },
@@ -1899,7 +2063,7 @@ async function refreshSpanFlags(workOrderId) {
 }
 
 async function recalcDays(scheduleIds) {
-  const docs = await ProductionSchedule.find({ _id: { $in: scheduleIds } });
+  const docs = await SalesSchedule.find({ _id: { $in: scheduleIds } });
   for (const doc of docs) {
     doc.calculateUtilization();
     await doc.save();
@@ -1925,7 +2089,7 @@ router.post("/resize-segment", async (req, res) => {
       });
     }
 
-    const schedule = await ProductionSchedule.findById(scheduleId);
+    const schedule = await SalesSchedule.findById(scheduleId);
     if (!schedule) {
       return res.status(404).json({ success: false, message: "Day not found" });
     }
@@ -1995,6 +2159,7 @@ router.post("/resize-segment", async (req, res) => {
           workOrderId: segment.workOrderId,
           manufacturingOrderId: segment.manufacturingOrderId,
           colorCode: segment.colorCode,
+          isEstimatedDuration: segment.isEstimatedDuration,
         },
         userId: req.user.id,
         detail: `Split off ${spillMinutes}m from ${formatDate(schedule.date)}`,
@@ -2004,13 +2169,11 @@ router.post("/resize-segment", async (req, res) => {
     await refreshSpanFlags(segment.workOrderId);
     await recalcDays([
       schedule._id,
-      ...(
-        await ProductionSchedule.find({
-          "scheduledWorkOrders.workOrderId": segment.workOrderId,
-        })
-          .select("_id")
-          .lean()
-      ).map((d) => d._id),
+      ...(await SalesSchedule.find({
+        "scheduledWorkOrders.workOrderId": segment.workOrderId,
+      })
+        .select("_id")
+        .lean()).map((d) => d._id),
     ]);
 
     res.json({
@@ -2029,7 +2192,7 @@ router.post("/resize-segment", async (req, res) => {
       spillDates: spill.segments.map((s) => formatDate(s.date)),
     });
   } catch (error) {
-    console.error("[schedule] resize-segment:", error);
+    console.error("[sales-schedule] resize-segment:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -2054,7 +2217,7 @@ router.post("/move-segment", async (req, res) => {
       });
     }
 
-    const schedule = await ProductionSchedule.findById(scheduleId);
+    const schedule = await SalesSchedule.findById(scheduleId);
     if (!schedule) {
       return res.status(404).json({ success: false, message: "Day not found" });
     }
@@ -2070,6 +2233,7 @@ router.post("/move-segment", async (req, res) => {
       workOrderId: segment.workOrderId,
       manufacturingOrderId: segment.manufacturingOrderId,
       colorCode: segment.colorCode,
+      isEstimatedDuration: segment.isEstimatedDuration,
     };
     const minutes = segment.durationMinutes || 0;
 
@@ -2109,7 +2273,7 @@ router.post("/move-segment", async (req, res) => {
     await refreshSpanFlags(entry.workOrderId);
     await recalcDays(
       (
-        await ProductionSchedule.find({
+        await SalesSchedule.find({
           $or: [
             { _id: schedule._id },
             { "scheduledWorkOrders.workOrderId": entry.workOrderId },
@@ -2126,25 +2290,18 @@ router.post("/move-segment", async (req, res) => {
       unplaced: spill.unplaced,
     });
   } catch (error) {
-    console.error("[schedule] move-segment:", error);
+    console.error("[sales-schedule] move-segment:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// GET check scheduled status - OPTIMIZED
+// GET whether a work order already sits on the sales calendar
 router.get("/check-scheduled/:workOrderId", async (req, res) => {
   try {
-    const { workOrderId } = req.params;
-
-    // FIX 18: Use exists() instead of findOne
-    const exists = await ProductionSchedule.exists({
-      "scheduledWorkOrders.workOrderId": workOrderId,
+    const exists = await SalesSchedule.exists({
+      "scheduledWorkOrders.workOrderId": req.params.workOrderId,
     });
-
-    res.json({
-      success: true,
-      isScheduled: !!exists,
-    });
+    res.json({ success: true, isScheduled: !!exists });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
