@@ -154,6 +154,24 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ── MRF request chat ──────────────────────────────────────────────────
+  // One room per material request, shared by the requester and their TL (on
+  // cowork) and the Store Person (on the CMS). The backend emits
+  // `mrf_chat_message` into it from services/mrfChat.service.js, so both
+  // frontends see the same thread live regardless of how they authenticated.
+  socket.on("join_mrf", (mrfId) => {
+    if (mrfId) {
+      socket.join(`mrf_${mrfId}`);
+      console.log(`Socket ${socket.id} joined mrf_${mrfId}`);
+    }
+  });
+
+  socket.on("leave_mrf", (mrfId) => {
+    if (mrfId) {
+      socket.leave(`mrf_${mrfId}`);
+    }
+  });
+
   // ── COWORKING SPACE: Meeting room (for audio recording signals) ───────────
   socket.on("join_meeting_room", (meetId) => {
     if (meetId) {
