@@ -184,21 +184,63 @@ function clearAccountantCookie(res) {
 /* ------------------------------------------------------------------ */
 /* setLegacyUser — populate req.user from a legacy CMS token          */
 /* ------------------------------------------------------------------ */
+/**
+ * Populate req.user from a legacy CMS token (one with no organizationId).
+ *
+ * ─── SECURITY NOTE — READ BEFORE CHANGING ────────────────────────────────
+ * This grants FULL accounting rights to any token that merely lacks an
+ * organizationId: canEdit, canPostDirectly, canApprove and canManageSettings
+ * are all unconditionally true, and `requireCompanyAccess` waves `isLegacy`
+ * past company scoping. Every department login in the system issues a token
+ * without an organizationId — so any logged-in user of any department is one
+ * request away from posting and approving vouchers.
+ *
+ * It is left ENABLED here on purpose. Revoking it blind would lock out
+ * whoever is legitimately relying on it today, and who that is cannot be
+ * determined from the source alone. The logging below identifies them; once
+ * the log is quiet, or the real users have been assigned proper organization
+ * memberships, replace the permission block with all-false and delete this
+ * note.
+ *
+ * Set ACCOUNTANT_LEGACY_STRICT=true to enforce immediately.
+ * ---------------------------------------------------------------------- */
 function setLegacyUser(req, decoded) {
+  const strict = process.env.ACCOUNTANT_LEGACY_STRICT === "true";
+
+  console.warn(
+    "[accountant-auth] LEGACY OWNER GRANT — " +
+      `user=${decoded.email || decoded.id || "unknown"} ` +
+      `role=${decoded.role || "(none)"} ` +
+      `dept=${decoded.deptSlug || decoded.userType || "(none)"} ` +
+      `path=${req.method} ${req.originalUrl} ` +
+      `mode=${strict ? "denied" : "granted"}`,
+  );
+
   req.user = {
     id: decoded.id || decoded._id || decoded.userId,
-    role: decoded.role || "owner",
+    // No longer silently promoted to "owner" — an absent role is an absent
+    // role. The permission block below is what actually gates access.
+    role: decoded.role || "legacy",
     email: decoded.email,
     name: decoded.name,
     isLegacy: true,
-    permissions: {
-      canView: true,
-      canEdit: true,
-      canPostDirectly: true,
-      canApprove: true,
-      canManageTeam: false,
-      canManageSettings: true,
-    },
+    permissions: strict
+      ? {
+          canView: false,
+          canEdit: false,
+          canPostDirectly: false,
+          canApprove: false,
+          canManageTeam: false,
+          canManageSettings: false,
+        }
+      : {
+          canView: true,
+          canEdit: true,
+          canPostDirectly: true,
+          canApprove: true,
+          canManageTeam: false,
+          canManageSettings: true,
+        },
   };
   req.organization = null;
 }

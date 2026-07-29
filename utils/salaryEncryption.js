@@ -141,7 +141,10 @@ function decryptNumber(val) {
  */
 function encryptSalaryFields(salaryObj) {
     if (!salaryObj || typeof salaryObj !== "object") return salaryObj;
-    const result = { ...salaryObj };
+    // Same guard as decryptSalaryFields — see the note there.
+    const converted =
+        typeof salaryObj.toObject === "function" ? salaryObj.toObject() : null;
+    const result = converted || { ...salaryObj };
     for (const field of SALARY_NUM_FIELDS) {
         if (field in result && result[field] !== undefined && result[field] !== null) {
             // Skip 0 values — storing "0" encrypted wastes space and still reveals nothing
@@ -161,7 +164,15 @@ function encryptSalaryFields(salaryObj) {
  */
 function decryptSalaryFields(salaryObj) {
     if (!salaryObj || typeof salaryObj !== "object") return salaryObj;
-    const result = typeof salaryObj.toObject === "function" ? salaryObj.toObject() : { ...salaryObj };
+
+    // A mongoose nested path that was excluded by .select() is still a truthy
+    // object with a toObject() method — but that method returns undefined.
+    // `"gross" in undefined` then throws, and the failure surfaces somewhere
+    // unrelated to the query that caused it. Fall back to the object itself.
+    const converted =
+        typeof salaryObj.toObject === "function" ? salaryObj.toObject() : null;
+    const result = converted || { ...salaryObj };
+
     for (const field of SALARY_NUM_FIELDS) {
         if (field in result) {
             result[field] = decryptNumber(result[field]);

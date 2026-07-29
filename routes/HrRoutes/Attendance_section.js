@@ -7800,3 +7800,7 @@ module.exports.applyApprovedLeavesForDate = applyApprovedLeavesForDate;
 module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
 module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
 module.exports.syncTodayOnly = syncTodayOnly;
+// Exported so Access Control can filter employees by operator/executive using
+// the SAME policy HR configures here (designation lists, department
+// categories) rather than a second, drifting copy of the rules.
+module.exports.resolveEmployeeType = resolveEmployeeType;
