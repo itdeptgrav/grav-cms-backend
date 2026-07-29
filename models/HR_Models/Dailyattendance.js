@@ -19,7 +19,17 @@ const STATUS_ENUM = [
   "P*",
   "P~",
   "HD",
+  // Promoted by the late / early-out count policy: 3rd late becomes a half
+  // day, 5th becomes a full absence, and the same ladder runs for early
+  // departures. The route layer has always produced these codes and the
+  // override endpoint has always accepted them — but they were missing here,
+  // so `systemPrediction` and `hrFinalStatus` both failed enum validation the
+  // moment one was written. Same pay weight as HD / AB; the separate codes
+  // exist so the REASON a day was docked survives onto the record and export.
+  "LHD",
   "AB",
+  "LAB",
+  "EAB",
   "WO",
   "PH",
   "FH",
