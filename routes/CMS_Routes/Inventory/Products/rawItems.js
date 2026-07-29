@@ -16,6 +16,7 @@ const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawIte
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
+const stockAccountability = require("../../../../services/stockAccountability.service");
 
 const RAW_ITEM_CATEGORIES = [
   "Fabric", "Thread", "Fasteners", "Elastic", "Interlining",
@@ -246,6 +247,65 @@ router.get("/suppliers", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/data/categories", async (req, res) => {
   res.json({ success: true, categories: RAW_ITEM_CATEGORIES });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /accountability — every stock movement across every raw item, for a date
+// range, with the totals and series the charts render.
+//
+// Registered BEFORE "/:id" — otherwise Express matches "/:id" first and treats
+// "accountability" as a raw-item id.
+//
+// Query: from, to (ISO dates; default = today), category, search, page, limit
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/accountability", async (req, res) => {
+  try {
+    const { from, to, category = "ALL", search = "", page = 1, limit = 50 } = req.query;
+
+    // Default to today — the store's normal question is "what moved today?".
+    // Dates arrive as calendar days, so widen them to cover the whole day in
+    // server-local time; a bare `new Date("2026-07-29")` is midnight UTC and
+    // would silently drop or borrow movements either side of the boundary.
+    const start = from ? new Date(from) : new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = to ? new Date(to) : new Date(from || Date.now());
+    end.setHours(23, 59, 59, 999);
+
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return res.status(400).json({ success: false, message: "Invalid date range" });
+    }
+    if (start > end) {
+      return res.status(400).json({ success: false, message: "'from' must be on or before 'to'" });
+    }
+
+    const rows = await stockAccountability.listMovements(start, end, { category, search });
+    const summary = stockAccountability.summarise(rows, start, end);
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const perPage = Math.min(500, Math.max(1, parseInt(limit, 10) || 50));
+    const startIdx = (pageNum - 1) * perPage;
+
+    res.json({
+      success: true,
+      // Summary is over the WHOLE range, not just the visible page — a chart
+      // that only counted page 1 would be quietly wrong.
+      ...summary,
+      movements: rows.slice(startIdx, startIdx + perPage),
+      pagination: {
+        total: rows.length,
+        page: pageNum,
+        limit: perPage,
+        totalPages: Math.max(1, Math.ceil(rows.length / perPage)),
+      },
+      range: { from: start, to: end },
+      categories: Object.keys(stockAccountability.CATEGORY).map(k => ({
+        key: k, label: stockAccountability.CATEGORY_LABEL[k],
+      })),
+    });
+  } catch (error) {
+    console.error("Error building accountability report:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
