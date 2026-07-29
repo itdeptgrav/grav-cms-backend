@@ -179,6 +179,50 @@ function legacyRolePermissions(role) {
 /* Role-checking factory                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Translate a legacy allow-list into the capability it was actually asking for.
+ *
+ * THE BUG THIS EXISTS TO FIX
+ * --------------------------
+ * The 65 accounting routes are gated by `makeAuth(["accountant","admin"])`,
+ * which compares a role-name STRING. No new-system token can ever contain
+ * "accountant" or "admin" — those tokens carry owner / approver / editor /
+ * viewer. So once the correct accountant_token started being issued, every
+ * new-system user was refused by every route, owner included, with
+ * "Required role: accountant or admin. You are: viewer."
+ *
+ * Making the allow-list simply accept the four new roles is not the fix either:
+ * that is the hole that let a viewer through `adminOnlyAuth`, and it would let a
+ * viewer post vouchers on all 65 routes, because the fine-grained
+ * `requirePermission` guard is used on only three of them.
+ *
+ * So the allow-list is read for what it MEANT, and answered from the role's
+ * capabilities instead of its name:
+ *
+ *   makeAuth(["admin"])                    → manage settings   → owner only
+ *   makeAuth(["accountant", ...])          → the module gate   → read to look,
+ *                                                                edit to change
+ *
+ * Method-based, because these routes never had a read/write split of their own —
+ * a single middleware sits in front of both the GET that lists credit notes and
+ * the POST that issues one. Deriving it from the HTTP verb is what makes
+ * "Viewer · read-only" true across all 65 without editing any of them.
+ */
+function requiredCapability(allowedRoles, method) {
+  // adminOnly — "admin" without "accountant" beside it.
+  if (allowedRoles.includes("admin") && !allowedRoles.includes("accountant")) {
+    return "canManageSettings";
+  }
+  const safe = method === "GET" || method === "HEAD" || method === "OPTIONS";
+  return safe ? "canView" : "canEdit";
+}
+
+const CAPABILITY_REFUSAL = {
+  canView: "You do not have access to the accounting module.",
+  canEdit: "Your accounting role is read-only, so this change was not saved.",
+  canManageSettings: "Only the accounting owner can change this.",
+};
+
 function makeAuth(allowedRoles = []) {
   return (req, res, next) => {
     if (DEV_BYPASS) {
@@ -199,12 +243,32 @@ function makeAuth(allowedRoles = []) {
       const role = decoded.role;
 
       const isNew = isNewRole(role);
-      const allowedExplicit =
-        allowedRoles.length === 0 || allowedRoles.includes(role);
+      const permissions = isNew
+        ? newRolePermissions(role)
+        : legacyRolePermissions(role);
 
-      if (!isNew && !allowedExplicit) {
+      if (isNew) {
+        // Answered from capabilities — a name comparison can only ever fail
+        // here, since the two vocabularies share no words. See
+        // requiredCapability above.
+        const capability = requiredCapability(allowedRoles, req.method);
+        if (!permissions[capability]) {
+          return res.status(403).json({
+            success: false,
+            code: "INSUFFICIENT_ROLE",
+            role,
+            requires: capability,
+            message: CAPABILITY_REFUSAL[capability],
+          });
+        }
+      } else if (allowedRoles.length && !allowedRoles.includes(role)) {
+        // Legacy tokens keep the original name check, unchanged. It has to
+        // stay: legacyRolePermissions() grants canView to ANY role string, so
+        // answering these from capabilities would open the accounting module to
+        // every department login in the system.
         return res.status(403).json({
           success: false,
+          code: "INSUFFICIENT_ROLE",
           message: `Access denied. Required role: ${allowedRoles.join(" or ")}. You are: ${role}.`,
         });
       }
@@ -216,9 +280,7 @@ function makeAuth(allowedRoles = []) {
         employeeId: decoded.employeeId,
         name: decoded.name,
         email: decoded.email,
-        permissions: isNew
-          ? newRolePermissions(role)
-          : legacyRolePermissions(role),
+        permissions,
         isNewSystem: isNew,
       };
 

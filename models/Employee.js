@@ -92,6 +92,36 @@ const employeeSchema = new mongoose.Schema({
 
   department: { type: String },
   departmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Department" },
+
+  // Which CMS department this employee may sign in to.
+  //
+  // Separate from `departmentId` above on purpose. That one is the HR org
+  // chart — a label for reporting, renamed freely by HR staff. This one is an
+  // ACCESS grant, and an HR rename must never silently change who can log in
+  // where. An employee with this unset cannot reach any dashboard; they can
+  // still open the onboarding page, which is public, but every login attempt
+  // is refused by the server.
+  accessDepartmentId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "AccessDepartment",
+    default: null,
+    index: true,
+  },
+
+  // Additional departments this employee may sign in to.
+  //
+  // A project manager who also needs to see Store, a supervisor covering QC.
+  // `accessDepartmentId` above stays as the PRIMARY — the one they land on by
+  // default — and this holds the rest. Kept as a separate field rather than
+  // folding the primary into an array so that nothing already reading
+  // accessDepartmentId has to change.
+  //
+  // The union of the two is what the server enforces at login; the onboarding
+  // page shows exactly that set and nothing else.
+  additionalDepartmentIds: {
+    type: [{ type: mongoose.Schema.Types.ObjectId, ref: "AccessDepartment" }],
+    default: [],
+  },
   designation: { type: String, trim: true },
   jobPosition: { type: String }, // kept for backward compat
   jobTitle: { type: String },
