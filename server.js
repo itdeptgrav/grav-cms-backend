@@ -1011,6 +1011,12 @@ app.use(
 const mrfRoutes = require("./routes/CMS_Routes/Inventory/Operations/mrfRoutes");
 app.use("/api/cms/inventory/mrf", mrfRoutes);
 
+// Store-raised requisition forms (the paper form that precedes a PO)
+app.use(
+  "/api/cms/inventory/requisitions",
+  require("./routes/CMS_Routes/Inventory/Operations/requisitionRoutes")
+);
+
 app.use(
   "/api/cowork/mrf",
   require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
