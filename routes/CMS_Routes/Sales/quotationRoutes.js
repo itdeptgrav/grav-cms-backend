@@ -13,6 +13,7 @@ const mongoose = require("mongoose");
 const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
 const StockIssuance = require("../../../models/CMS_Models/Inventory/Operations/StockIssuance");
+const MeasurementSizeConfig = require("../../../models/CMS_Models/Inventory/Configurations/MeasurementSizeConfig");
 
 router.use(EmployeeAuthMiddleware);
 
@@ -120,6 +121,155 @@ router.patch("/work-orders/:id/assigned-deadline", async (req, res) => {
 });
 
 
+// ── Measurement-PO variant resolution ───────────────────────────────────────
+// For a bulk order, item.variants[] already carries the real size the
+// customer ordered, so BOM lookup is exact. For a measurement-conversion
+// order, convert-to-po (routes/CMS_Routes/Measurement/measurementRoutes.js)
+// never knows each person's real size at that point — it just groups every
+// person onto whichever variant they already had, defaulting to
+// stockItem.variants[0] ("any random/common variant") when unset. That means
+// raw-item requirements computed straight off request.items are computed
+// against the WRONG size for anyone who got the placeholder variant.
+//
+// This resolves the CORRECT variant per person by running their actual
+// measurement value (e.g. Chest: 40) through the Settings-configured
+// MeasurementSizeConfig for that product, then re-aggregates quantities by
+// resolved variant — i.e. it reconstructs a request.items[]-shaped structure
+// the same way a bulk order would already have it, so every existing
+// BOM/shortfall/committed-stock calculation below runs unchanged on top of it.
+async function resolveMeasurementRequestItems(request) {
+  const measurement = await Measurement.findById(request.measurementId)
+    .populate({
+      path: "employeeMeasurements.products.productId",
+      select: "name reference variants baseSalesPrice",
+    })
+    .lean();
+  if (!measurement || !measurement.employeeMeasurements?.length) {
+    return { items: null, unresolved: [] };
+  }
+
+  const productIds = new Set();
+  measurement.employeeMeasurements.forEach((emp) =>
+    (emp.products || []).forEach((p) => {
+      const pid = p.productId?._id?.toString() || p.productId?.toString();
+      if (pid) productIds.add(pid);
+    }),
+  );
+
+  const configs = productIds.size
+    ? await MeasurementSizeConfig.find({
+        productId: { $in: [...productIds] },
+        isActive: true,
+      }).lean()
+    : [];
+  const configsByProduct = new Map();
+  configs.forEach((c) => {
+    const pid = c.productId.toString();
+    if (!configsByProduct.has(pid)) configsByProduct.set(pid, []);
+    configsByProduct.get(pid).push(c);
+  });
+
+  const productMap = new Map(); // `${stockItemId}_${variantId}` -> aggregated row
+  const unresolved = []; // people whose size fell back to the placeholder variant
+
+  for (const emp of measurement.employeeMeasurements) {
+    for (const measuredProduct of emp.products || []) {
+      const si = measuredProduct.productId;
+      if (!si || !si._id) continue;
+      const pid = si._id.toString();
+
+      // 1) Try every size config configured for this product until one of
+      //    them has a real measured value that falls inside a rule's range.
+      let resolvedVariant = null;
+      const candidateConfigs = configsByProduct.get(pid) || [];
+      for (const cfg of candidateConfigs) {
+        const measField = (measuredProduct.measurements || []).find(
+          (m) =>
+            m.measurementName?.trim().toLowerCase() ===
+            cfg.measurementParameter?.trim().toLowerCase(),
+        );
+        const val = parseFloat(measField?.value);
+        if (measField?.value === undefined || measField.value === "" || Number.isNaN(val))
+          continue;
+        const rule = (cfg.rules || []).find((r) => val >= r.fromValue && val < r.toValue);
+        if (!rule) continue;
+
+        if (rule.variantId) {
+          resolvedVariant = (si.variants || []).find(
+            (v) => v._id.toString() === rule.variantId.toString(),
+          );
+        }
+        if (!resolvedVariant) {
+          const normSize = String(rule.sizeValue || "").trim().toLowerCase();
+          resolvedVariant = (si.variants || []).find((v) =>
+            (v.attributes || []).some(
+              (a) => String(a.value || "").trim().toLowerCase() === normSize,
+            ),
+          );
+        }
+        if (resolvedVariant) break;
+      }
+
+      // 2) No config / no matching rule / resolved variant not found on the
+      //    product anymore — fall back to whatever convert-to-po already
+      //    assigned (mirrors its own needsAutoAssign → variants[0] logic),
+      //    and flag it so the store side can see this one wasn't confirmed.
+      let dv = resolvedVariant;
+      let flaggedUnresolved = false;
+      if (!dv) {
+        flaggedUnresolved = true;
+        const fallbackVariantId = measuredProduct.variantId;
+        const needsAutoAssign =
+          !fallbackVariantId ||
+          ["null", "undefined", ""].includes(String(fallbackVariantId).trim());
+        dv = needsAutoAssign
+          ? si.variants?.[0] || null
+          : (si.variants || []).find(
+              (v) => v._id.toString() === fallbackVariantId.toString(),
+            ) || si.variants?.[0] || null;
+      }
+
+      const variantAttributes =
+        dv?.attributes?.map((a) => ({ name: a.name || "Attribute", value: a.value })) || [];
+      const variantId = dv?._id?.toString() || "default";
+      const quantity = measuredProduct.quantity || 1;
+      const key = `${pid}_${variantId}`;
+
+      if (!productMap.has(key)) {
+        productMap.set(key, {
+          stockItemId: si._id,
+          stockItemName: si.name,
+          stockItemReference: si.reference || "",
+          variantAttributes,
+          totalQuantity: 0,
+        });
+      }
+      productMap.get(key).totalQuantity += quantity;
+
+      if (flaggedUnresolved) {
+        unresolved.push({
+          employeeName: emp.employeeName,
+          employeeUIN: emp.employeeUIN,
+          productName: si.name,
+          reason: candidateConfigs.length
+            ? "Measurement value didn't match any configured size range"
+            : "No size configuration found for this product",
+        });
+      }
+    }
+  }
+
+  const items = Array.from(productMap.values()).map((p) => ({
+    stockItemId: p.stockItemId,
+    stockItemName: p.stockItemName,
+    stockItemReference: p.stockItemReference,
+    variants: [{ attributes: p.variantAttributes, quantity: p.totalQuantity }],
+    totalQuantity: p.totalQuantity,
+  }));
+
+  return { items, unresolved };
+}
+
 router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -128,7 +278,31 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
     if (!request) {
       return res.status(404).json({ success: false, message: "Customer request not found" });
     }
- 
+
+    // Measurement-PO orders: re-derive items[] via the size config so BOM
+    // lookup runs against each person's actual resolved size instead of the
+    // common/placeholder variant convert-to-po fell back to. Everything below
+    // this point stays untouched — it just consumes whatever request.items is.
+    let sizeResolution = null;
+    if (
+      (request.requestType === "measurement_conversion" || request.measurementId) &&
+      request.measurementId
+    ) {
+      try {
+        const resolved = await resolveMeasurementRequestItems(request);
+        if (resolved.items?.length) {
+          request.items = resolved.items;
+          sizeResolution = {
+            usedSizeConfig: true,
+            unresolvedCount: resolved.unresolved.length,
+            unresolved: resolved.unresolved,
+          };
+        }
+      } catch (resolveErr) {
+        console.error("Measurement size-config resolution (non-fatal):", resolveErr.message);
+      }
+    }
+
     if (!Array.isArray(request.items) || request.items.length === 0) {
       return res.json({
         success: true,
@@ -571,6 +745,7 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
         totalAvailable,
         shortfallCount,
       },
+      sizeResolution,
     });
   } catch (err) {
     console.error("Raw-item requirement error:", err);
