@@ -345,7 +345,7 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
           variantName = v.attributes.map((a) => a.value).join(" • ");
       }
 
-      const measurementsArray = Array.isArray(data.measurements)
+      let measurementsArray = Array.isArray(data.measurements)
         ? data.measurements
         : Object.entries(data.measurements || {}).map(
             ([measurementName, value]) => ({
@@ -354,6 +354,15 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
               unit: "",
             }),
           );
+      // Nothing sent for this product — seed field names from the product's
+      // own configured measurement list instead of persisting an empty array.
+      if (!measurementsArray.length && stockItem.measurements?.length) {
+        measurementsArray = stockItem.measurements.map((fieldName) => ({
+          measurementName: fieldName,
+          value: "",
+          unit: "",
+        }));
+      }
 
       employeeMeasurementsMap.get(employeeId).products.push({
         productId: data.productId,
@@ -662,13 +671,24 @@ router.put("/:measurementId", async (req, res) => {
             variantName = v.attributes.map((a) => a.value).join(" • ");
         }
 
-        const measurementsArray = Array.isArray(data.measurements)
+        let measurementsArray = Array.isArray(data.measurements)
           ? data.measurements
           : Object.entries(data.measurements || {}).map(([n, v]) => ({
               measurementName: n,
               value: v || "",
               unit: "",
             }));
+        // Nothing sent for this product — seed field names from the
+        // product's own configured measurement list instead of persisting
+        // an empty array (this is what makes an already-broken product
+        // entry self-heal the next time the session is saved).
+        if (!measurementsArray.length && si.measurements?.length) {
+          measurementsArray = si.measurements.map((fieldName) => ({
+            measurementName: fieldName,
+            value: "",
+            unit: "",
+          }));
+        }
 
         incomingByEmployee.get(eid).products.push({
           productId: data.productId,
@@ -825,6 +845,205 @@ router.put("/:measurementId", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /:measurementId/ai-import — AI-assisted measurement extraction
+//
+// Sales sometimes gets a measurement file back from the customer in whatever
+// format they used (wrong headers, merged columns, freeform notes...). This
+// endpoint hands the raw file text + a STRICT list of valid targets for this
+// session (which person, which product/category, which exact field name) to
+// Gemini and asks it to map values onto ONLY those exact identifiers.
+//
+// Nothing is written to the database here — measurements are too sensitive
+// for a silent AI write. This returns a PROPOSAL for the sales person to
+// review in the UI; every proposed match is also re-validated server-side
+// against the real target list before being returned, so even a
+// hallucinated identifier from the model can't reach the frontend.
+// ─────────────────────────────────────────────────────────────────────────────
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const AI_IMPORT_MODELS = [
+  "gemini-3-flash-preview",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+];
+const MAX_AI_IMPORT_TARGETS = 800;
+
+async function callGeminiJson(apiKey, prompt) {
+  let lastError = null;
+  for (const modelName of AI_IMPORT_MODELS) {
+    try {
+      const url = `${GEMINI_BASE}/models/${modelName}:generateContent?key=${apiKey}`;
+      const body = {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 8192,
+          responseMimeType: "application/json",
+        },
+      };
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        lastError = new Error(err?.error?.message || `HTTP ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) {
+        lastError = new Error("Empty response from Gemini");
+        continue;
+      }
+      return JSON.parse(text);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError || new Error("All Gemini models failed");
+}
+
+router.post("/:measurementId/ai-import", async (req, res) => {
+  try {
+    const { measurementId } = req.params;
+    const { content } = req.body || {};
+
+    if (!content || typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ success: false, message: "File content is required." });
+    }
+    if (content.length > 200000) {
+      return res.status(400).json({ success: false, message: "File is too large for AI import. Keep it under ~200KB." });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ success: false, message: "GEMINI_API_KEY not set in .env on the server." });
+    }
+
+    const measurement = await Measurement.findById(measurementId)
+      .select("employeeMeasurements")
+      .populate({ path: "employeeMeasurements.products.productId", select: "measurements" })
+      .lean();
+    if (!measurement) {
+      return res.status(404).json({ success: false, message: "Measurement session not found" });
+    }
+
+    // ── Build the strict valid-target list — the AI can only ever match
+    // against entries in this list, never invent its own. ──────────────────
+    // A product's stored `measurements` can be an empty array (assigned
+    // through a flow that never seeded field names from the product's own
+    // configured measurement list) — fall back to the product's live field
+    // list so AI import isn't blocked by that gap. Same fallback as the
+    // GET /:measurementId route.
+    const validTargets = [];
+    (measurement.employeeMeasurements || []).forEach((emp) => {
+      const employeeId = emp.employeeId?.toString();
+      if (emp.noProductAssigned) {
+        (emp.categoryMeasurements || []).forEach((cm) => {
+          (cm.measurements || []).forEach((m) => {
+            validTargets.push({
+              employeeId,
+              employeeUIN: emp.employeeUIN,
+              employeeName: emp.employeeName,
+              targetType: "category",
+              targetName: cm.categoryName,
+              fieldName: m.fieldName,
+            });
+          });
+        });
+      } else {
+        (emp.products || []).forEach((prod) => {
+          const fieldNames = prod.measurements?.length
+            ? prod.measurements.map((m) => m.measurementName)
+            : (prod.productId?.measurements || []);
+          fieldNames.forEach((fieldName) => {
+            validTargets.push({
+              employeeId,
+              employeeUIN: emp.employeeUIN,
+              employeeName: emp.employeeName,
+              targetType: "product",
+              targetName: prod.productName,
+              fieldName,
+            });
+          });
+        });
+      }
+    });
+
+    if (!validTargets.length) {
+      return res.json({ success: true, matches: [], unmatchedNotes: ["This session has no measurement fields to fill."] });
+    }
+    if (validTargets.length > MAX_AI_IMPORT_TARGETS) {
+      return res.status(400).json({
+        success: false,
+        message: `This session has ${validTargets.length} measurement fields — AI import supports up to ${MAX_AI_IMPORT_TARGETS} at a time. Try the strict CSV import instead, or split into smaller sessions.`,
+      });
+    }
+
+    // A lookup key the model must reproduce EXACTLY, one line per valid target.
+    const targetLines = validTargets
+      .map((t, i) => `${i}\t${t.employeeUIN}\t${t.employeeName}\t${t.targetType}\t${t.targetName}\t${t.fieldName}`)
+      .join("\n");
+
+    const prompt = `You are extracting garment measurement values from a file a customer sent back, for a sales team. The file may be a CSV with wrong/renamed/reordered headers, tab-separated text, or freeform notes — the format is NOT guaranteed to be correct.
+
+These measurements directly drive production — accuracy matters more than coverage. Only report a value when you are confident it belongs to a specific person AND a specific field. If you're unsure, leave it out.
+
+VALID TARGETS — this is the ONLY set of (person, field) combinations that exist in this session. You may ONLY report matches using the index number of a row below, copied exactly. Do not invent people, products, categories, or field names that are not in this list.
+Format: index<TAB>employeeUIN<TAB>employeeName<TAB>targetType<TAB>targetName<TAB>fieldName
+
+${targetLines}
+
+RAW FILE CONTENT to extract values from:
+"""
+${content.slice(0, 150000)}
+"""
+
+Match rows in the raw content to valid targets primarily by UIN (exact or close match — allow for typos/case), falling back to employee name if UIN is missing or ambiguous, then to product/category name, then to field name (allow reasonable synonyms/abbreviations, e.g. "Ln" = "Length", "Chest" = "Bust" only if that field doesn't otherwise exist for that person). Do not convert units — report the value exactly as written in the source.
+
+Return ONLY valid JSON, no markdown fences, matching this exact shape:
+{
+  "matches": [
+    { "targetIndex": <integer index from the list above>, "value": "<string, as found>", "confidence": "high" | "medium" | "low", "sourceText": "<short excerpt of the raw text this came from, for the reviewer>" }
+  ],
+  "unmatchedNotes": ["<short note about any data you saw but could not confidently map, if any>"]
+}`;
+
+    const aiResult = await callGeminiJson(apiKey, prompt);
+    const rawMatches = Array.isArray(aiResult?.matches) ? aiResult.matches : [];
+    const unmatchedNotes = Array.isArray(aiResult?.unmatchedNotes) ? aiResult.unmatchedNotes : [];
+
+    // ── Re-validate every match against the real target list server-side —
+    // never trust the model's echoed identifiers at face value. ────────────
+    const matches = [];
+    for (const m of rawMatches) {
+      const idx = Number(m?.targetIndex);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= validTargets.length) continue;
+      if (typeof m.value !== "string" || !m.value.trim()) continue;
+      const target = validTargets[idx];
+      matches.push({
+        employeeId: target.employeeId,
+        employeeUIN: target.employeeUIN,
+        employeeName: target.employeeName,
+        targetType: target.targetType,
+        targetName: target.targetName,
+        fieldName: target.fieldName,
+        value: m.value.trim(),
+        confidence: ["high", "medium", "low"].includes(m.confidence) ? m.confidence : "low",
+        sourceText: typeof m.sourceText === "string" ? m.sourceText.slice(0, 200) : "",
+      });
+    }
+
+    res.json({ success: true, matches, unmatchedNotes });
+  } catch (error) {
+    console.error("[Measurement AI import] Error:", error);
+    res.status(500).json({ success: false, message: error.message || "Server error while running AI import." });
+  }
+});
+
 // ADD NEW EMPLOYEES to existing measurement (OPTIMIZED)
 router.put("/:measurementId/add-employees", async (req, res) => {
   try {
@@ -972,13 +1191,23 @@ router.put("/:measurementId/add-employees", async (req, res) => {
           }
         }
 
-        const measurementsArray = Array.isArray(data.measurements)
+        let measurementsArray = Array.isArray(data.measurements)
           ? data.measurements
           : Object.entries(data.measurements || {}).map(([n, v]) => ({
               measurementName: n,
               value: v || "",
               unit: "",
             }));
+        // Nothing sent for this product — seed field names from the
+        // product's own configured measurement list instead of persisting
+        // an empty array.
+        if (!measurementsArray.length && si.measurements?.length) {
+          measurementsArray = si.measurements.map((fieldName) => ({
+            measurementName: fieldName,
+            value: "",
+            unit: "",
+          }));
+        }
 
         groupedByEmployee.get(eid).products.push({
           productId: data.productId,
@@ -1124,11 +1353,26 @@ router.get("/:measurementId", async (req, res) => {
         .status(404)
         .json({ success: false, message: "Measurement not found" });
 
-    // Ensure productName is set from populated data
+    // Ensure productName is set from populated data. Also: a product can end
+    // up with a stored EMPTY `measurements` array (e.g. it was assigned to a
+    // person through a flow that didn't seed field names from the product's
+    // own configured measurement list) — when that happens, backfill it here
+    // from the product's live `measurements` field list so the person still
+    // gets fillable inputs instead of "No measurement fields configured".
+    // This is read-time only (doesn't touch the DB); it becomes permanent
+    // the next time this session is saved, since Save round-trips whatever
+    // this GET returned.
     measurement.employeeMeasurements.forEach((emp) => {
       emp.products.forEach((product) => {
         if (product.productId?.name)
           product.productName = product.productId.name;
+        if (!product.measurements?.length && product.productId?.measurements?.length) {
+          product.measurements = product.productId.measurements.map((fieldName) => ({
+            measurementName: fieldName,
+            value: "",
+            unit: "",
+          }));
+        }
       });
     });
 
@@ -2339,275 +2583,6 @@ router.get("/:measurementId/export-grouped", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Server error while exporting grouped measurement",
-    });
-  }
-});
-
-router.put("/:measurementId", async (req, res) => {
-  try {
-    const { measurementId } = req.params;
-    const {
-      name,
-      description,
-      measurementData,
-      registeredEmployeeIds,
-      categoryData,
-    } = req.body;
-
-    const measurement = await Measurement.findById(measurementId);
-    if (!measurement)
-      return res
-        .status(404)
-        .json({ success: false, message: "Measurement not found" });
-
-    if (name !== undefined && name.trim()) measurement.name = name.trim();
-    if (description !== undefined)
-      measurement.description = description?.trim() || "";
-
-    // ── FIX 1: REPLACE registeredEmployeeIds — do NOT merge ───────────────
-    // The frontend sends the complete current list. If an employee was removed
-    // in the UI, they won't appear in this array, so we must honour that.
-    if (registeredEmployeeIds !== undefined) {
-      const newIdSet = new Set(
-        (registeredEmployeeIds || []).map((id) => id.toString()),
-      );
-
-      // ── FIX 2: Remove employeeMeasurements for absent employees ───────
-      // This is the critical missing step — without it, removed employees
-      // stay in the array and come back on the next page load.
-      measurement.employeeMeasurements =
-        measurement.employeeMeasurements.filter((emp) =>
-          newIdSet.has(emp.employeeId.toString()),
-        );
-
-      // Replace the registered ID list entirely
-      measurement.registeredEmployeeIds = registeredEmployeeIds || [];
-    }
-
-    // ── Build existingMap from the (now-pruned) employeeMeasurements ──────
-    const existingMap = new Map();
-    measurement.employeeMeasurements.forEach((emp) => {
-      existingMap.set(emp.employeeId.toString(), { emp });
-    });
-
-    // ── Auto-assign variants in measurement data ──────────────────────────
-    let processedMeasurementData = measurementData;
-    if (measurementData?.length) {
-      const productIds = [
-        ...new Set(measurementData.map((d) => d.productId).filter(Boolean)),
-      ];
-      const stockItems = await StockItem.find({ _id: { $in: productIds } })
-        .select("_id name variants")
-        .lean();
-      const stockItemMap = new Map(
-        stockItems.map((si) => [si._id.toString(), si]),
-      );
-
-      processedMeasurementData = measurementData.map((data) => {
-        if (!data.productId || data.variantId) return data; // already has variant
-        const si = stockItemMap.get(data.productId.toString());
-        if (!si?.variants?.length) return data;
-        const matchedVariant =
-          si.variants.find(
-            (v) =>
-              v.gender?.toLowerCase() === data.gender?.toLowerCase() ||
-              v.name?.toLowerCase().includes(data.gender?.toLowerCase()),
-          ) || si.variants[0];
-        return {
-          ...data,
-          variantId: matchedVariant._id,
-          variantName: matchedVariant.name || "Default",
-        };
-      });
-    }
-
-    // ── Process product-based employees ───────────────────────────────────
-    if (processedMeasurementData?.length) {
-      const incomingByEmployee = new Map();
-
-      for (const data of processedMeasurementData) {
-        if (!data.employeeId || !data.productId) continue;
-        const eid = data.employeeId.toString();
-
-        if (!incomingByEmployee.has(eid)) {
-          incomingByEmployee.set(eid, {
-            employeeId: data.employeeId,
-            employeeName: data.employeeName,
-            employeeUIN: data.employeeUIN,
-            gender: data.gender,
-            remarks: data.remarks || "",
-            products: [],
-          });
-        }
-
-        const si =
-          (await StockItem.findById(data.productId)
-            .select("name variants")
-            .lean()) || {};
-        const variantName = data.variantId
-          ? si.variants?.find(
-              (v) => v._id.toString() === data.variantId.toString(),
-            )?.name || "Default"
-          : "Default";
-
-        const measurementsArray = Array.isArray(data.measurements)
-          ? data.measurements
-          : Object.entries(data.measurements || {}).map(([n, v]) => ({
-              measurementName: n,
-              value: v || "",
-              unit: "",
-            }));
-
-        incomingByEmployee.get(eid).products.push({
-          productId: data.productId,
-          productName: si.name || data.productName,
-          variantId: data.variantId || null,
-          variantName,
-          quantity: data.quantity || 1,
-          measurements: measurementsArray,
-          measuredAt: new Date(),
-        });
-      }
-
-      for (const [eid, inData] of incomingByEmployee) {
-        const isCompleted = inData.products.every((p) =>
-          p.measurements.every((m) => m.value?.trim()),
-        );
-
-        if (existingMap.has(eid)) {
-          // Update existing employee in-place
-          const { emp } = existingMap.get(eid);
-          emp.products = inData.products;
-          emp.remarks = inData.remarks || emp.remarks;
-          emp.noProductAssigned = false;
-          emp.isCompleted = isCompleted;
-          emp.completedAt = isCompleted ? new Date() : emp.completedAt;
-        } else {
-          // New employee added during this edit
-          let empName = inData.employeeName,
-            empUIN = inData.employeeUIN,
-            empGender = inData.gender;
-          if (!empName) {
-            const dbEmp = await EmployeeMpc.findById(eid)
-              .select("name uin gender")
-              .lean();
-            if (dbEmp) {
-              empName = dbEmp.name;
-              empUIN = dbEmp.uin;
-              empGender = dbEmp.gender;
-            }
-          }
-          const newEntry = {
-            employeeId: eid,
-            employeeName: empName || eid,
-            employeeUIN: empUIN || "",
-            gender: empGender || "",
-            remarks: inData.remarks || "",
-            noProductAssigned: false,
-            products: inData.products,
-            categoryMeasurements: [],
-            isCompleted,
-            completedAt: isCompleted ? new Date() : null,
-          };
-          measurement.employeeMeasurements.push(newEntry);
-          existingMap.set(eid, {
-            emp: measurement.employeeMeasurements[
-              measurement.employeeMeasurements.length - 1
-            ],
-          });
-        }
-      }
-    }
-
-    // ── Process no-product / category-based employees ─────────────────────
-    for (const catEmp of categoryData || []) {
-      if (!catEmp.employeeId) continue;
-      const eid = catEmp.employeeId.toString();
-      const isCompleted =
-        catEmp.categoryMeasurements?.every((cm) =>
-          cm.measurements?.every((m) => m.value?.trim()),
-        ) || false;
-
-      if (existingMap.has(eid)) {
-        const { emp } = existingMap.get(eid);
-        emp.categoryMeasurements = catEmp.categoryMeasurements || [];
-        emp.remarks = catEmp.remarks || emp.remarks;
-        emp.noProductAssigned = true;
-        emp.isCompleted = isCompleted;
-        emp.completedAt = isCompleted ? new Date() : emp.completedAt;
-      } else {
-        const dbEmp = await EmployeeMpc.findById(eid)
-          .select("name uin gender")
-          .lean();
-        if (!dbEmp) continue;
-        measurement.employeeMeasurements.push({
-          employeeId: eid,
-          employeeName: dbEmp.name,
-          employeeUIN: dbEmp.uin,
-          gender: dbEmp.gender,
-          remarks: catEmp.remarks || "",
-          noProductAssigned: true,
-          products: [],
-          categoryMeasurements: catEmp.categoryMeasurements || [],
-          isCompleted,
-          completedAt: isCompleted ? new Date() : null,
-        });
-      }
-    }
-
-    // ── Recalculate stats ─────────────────────────────────────────────────
-    measurement.totalRegisteredEmployees =
-      measurement.registeredEmployeeIds?.length || 0;
-    measurement.measuredEmployees = measurement.employeeMeasurements.filter(
-      (e) => e.isCompleted,
-    ).length;
-    measurement.pendingEmployees =
-      measurement.totalRegisteredEmployees - measurement.measuredEmployees;
-    measurement.completionRate =
-      measurement.totalRegisteredEmployees > 0
-        ? Math.round(
-            (measurement.measuredEmployees /
-              measurement.totalRegisteredEmployees) *
-              100,
-          )
-        : 0;
-
-    let totalMeasurements = 0,
-      completedMeasurements = 0;
-    measurement.employeeMeasurements.forEach((emp) => {
-      if (emp.noProductAssigned) {
-        emp.categoryMeasurements?.forEach((cm) => {
-          totalMeasurements += cm.measurements?.length || 0;
-          completedMeasurements +=
-            cm.measurements?.filter((m) => m.value?.trim()).length || 0;
-        });
-      } else {
-        emp.products.forEach((p) => {
-          totalMeasurements += p.measurements.length;
-          completedMeasurements += p.measurements.filter((m) =>
-            m.value?.trim(),
-          ).length;
-        });
-      }
-    });
-    measurement.totalMeasurements = totalMeasurements;
-    measurement.completedMeasurements = completedMeasurements;
-    measurement.pendingMeasurements = totalMeasurements - completedMeasurements;
-    measurement.updatedBy = req.user.id;
-    measurement.updatedAt = new Date();
-
-    const saved = await measurement.save();
-    res.status(200).json({
-      success: true,
-      message: "Measurement updated successfully",
-      measurement: saved,
-    });
-  } catch (error) {
-    console.error("Error updating measurement:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while updating measurement",
-      error: error.message,
     });
   }
 });
