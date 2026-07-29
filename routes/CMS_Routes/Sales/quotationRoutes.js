@@ -171,6 +171,11 @@ async function resolveMeasurementRequestItems(request) {
 
   const productMap = new Map(); // `${stockItemId}_${variantId}` -> aggregated row
   const unresolved = []; // people whose size fell back to the placeholder variant
+  // `${employeeId}_${stockItemId}` -> resolved StockItem variant _id string.
+  // Lets WO creation assign each employee to the WO matching their OWN
+  // resolved size, instead of guessing off the stale variantId that was on
+  // the Measurement doc from conversion time.
+  const employeeVariantMap = new Map();
 
   for (const emp of measurement.employeeMeasurements) {
     for (const measuredProduct of emp.products || []) {
@@ -235,11 +240,14 @@ async function resolveMeasurementRequestItems(request) {
       const quantity = measuredProduct.quantity || 1;
       const key = `${pid}_${variantId}`;
 
+      employeeVariantMap.set(`${emp.employeeId?.toString()}_${pid}`, variantId);
+
       if (!productMap.has(key)) {
         productMap.set(key, {
           stockItemId: si._id,
           stockItemName: si.name,
           stockItemReference: si.reference || "",
+          variantId,
           variantAttributes,
           totalQuantity: 0,
         });
@@ -263,11 +271,17 @@ async function resolveMeasurementRequestItems(request) {
     stockItemId: p.stockItemId,
     stockItemName: p.stockItemName,
     stockItemReference: p.stockItemReference,
-    variants: [{ attributes: p.variantAttributes, quantity: p.totalQuantity }],
+    variants: [
+      {
+        variantId: p.variantId !== "default" ? p.variantId : undefined,
+        attributes: p.variantAttributes,
+        quantity: p.totalQuantity,
+      },
+    ],
     totalQuantity: p.totalQuantity,
   }));
 
-  return { items, unresolved };
+  return { items, unresolved, employeeVariantMap };
 }
 
 router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
@@ -1548,11 +1562,35 @@ async function createWorkOrdersAndProgress(request, userId) {
       .lean();
   }
 
+  // Measurement-PO orders: WOs get created here, one per stockItem/variant in
+  // request.items — but request.items was built at convert-to-po time by
+  // dumping every person onto whichever variant they already had (defaulting
+  // to stockItem.variants[0], "any random/common variant" per the product
+  // owner). That means every WO — and its BOM snapshot — got created against
+  // the WRONG size. Re-resolve the real per-person variant via the Settings
+  // size config right here, BEFORE any WO exists, so the WO itself (not just
+  // a later display) is correct. request.items itself (pricing/summary,
+  // already saved to the customer) is left untouched — only the LOCAL loop
+  // below uses the corrected breakdown.
+  let effectiveItems = request.items;
+  let employeeVariantMap = null;
+  if (isMeasurementOrder && request.measurementId) {
+    try {
+      const resolved = await resolveMeasurementRequestItems(request);
+      if (resolved.items?.length) {
+        effectiveItems = resolved.items;
+        employeeVariantMap = resolved.employeeVariantMap;
+      }
+    } catch (resolveErr) {
+      console.error("[createWorkOrdersAndProgress] Measurement size-config resolution (non-fatal):", resolveErr.message);
+    }
+  }
+
   const createdWorkOrders = [];
   const skippedVariants = [];
   const createdProgressDocs = [];
 
-  for (const item of request.items) {
+  for (const item of effectiveItems) {
     const stockItem = await StockItem.findById(item.stockItemId);
     if (!stockItem) { console.warn(`StockItem not found: ${item.stockItemId}`); continue; }
 
@@ -1637,18 +1675,32 @@ async function createWorkOrdersAndProgress(request, userId) {
         const employeeEntries = [];
 
         for (const empM of measurement.employeeMeasurements || []) {
-          const productEntry = (empM.products || []).find(p => {
-            const pIdMatch = p.productId?.toString() === stockIdStr;
-            if (!pIdMatch) {
-              if (p.productId) return false;
-              if (p.productName !== item.stockItemName) return false;
+          // Prefer the size-config resolution's own map — it knows each
+          // person's REAL resolved variant. Falls back to the old
+          // productId/variantId heuristic only when resolution didn't run
+          // (e.g. no size config exists yet for this product).
+          let productEntry;
+          if (employeeVariantMap) {
+            const resolvedVariantId = employeeVariantMap.get(`${empM.employeeId?.toString()}_${stockIdStr}`);
+            if (resolvedVariantId !== woVariantIdStr) continue;
+            productEntry = (empM.products || []).find(p => {
+              const pIdMatch = p.productId?.toString() === stockIdStr;
+              return pIdMatch || (!p.productId && p.productName === item.stockItemName);
+            });
+          } else {
+            productEntry = (empM.products || []).find(p => {
+              const pIdMatch = p.productId?.toString() === stockIdStr;
+              if (!pIdMatch) {
+                if (p.productId) return false;
+                if (p.productName !== item.stockItemName) return false;
+                if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
+                return true;
+              }
               if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
+              if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
               return true;
-            }
-            if (woVariantIdStr && p.variantId) return p.variantId.toString() === woVariantIdStr;
-            if (woVariantIdStr && !p.variantId) return p.productName === item.stockItemName;
-            return true;
-          });
+            });
+          }
           if (!productEntry) continue;
           employeeEntries.push({
             employeeId: empM.employeeId, employeeName: empM.employeeName,
