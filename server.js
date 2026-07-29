@@ -465,11 +465,29 @@ const connectDB = async () => {
   }
 };
 
+/* ─── BOOT SEEDING ────────────────────────────────────────────────────────
+ * Departments are now created and managed from the CEO Access Control screen,
+ * so recreating seven of them on every restart is worse than pointless:
+ *
+ *   - it resurrects accounts an administrator has deliberately deactivated
+ *   - it prints working credentials into the server log on every boot, where
+ *     they sit in log aggregators and terminal scrollback forever
+ *   - the passwords are literals in this file, which is exactly the hardcoding
+ *     this whole change set exists to remove
+ *
+ * The ONLY thing seeded now is a CEO account, and only if none exists — the
+ * bootstrap needed to reach Access Control and create everything else. It
+ * prints nothing about credentials.
+ * --------------------------------------------------------------------- */
 connectDB().then(async () => {
-  await createDefaultCuttingMaster();
-  seedQCUser();
-  seedCEOUser();
-  seedEmbroideryUser();
+  await ensureCeoExists();
+
+  // Register the department/access tables on whatever database this instance
+  // is pointed at, so moving from local to production needs no manual step.
+  // Strictly additive: it inserts what is missing and modifies nothing that
+  // already exists — no renames, no password changes, no reactivations.
+  const { ensureAccessDepartments } = require("./services/ensureAccessDepartments");
+  await ensureAccessDepartments(mongoose.connection);
 });
 
 const CuttingMaster = require("./models/CuttingMasterDepartment");
@@ -517,6 +535,49 @@ const createDefaultCuttingMaster = async () => {
 };
 
 // ✅ Auto-create default CEO user
+/**
+ * Ensure exactly one bootstrap CEO account exists, and say nothing about it.
+ *
+ * This is the only account created automatically. Everything else — every
+ * department, every login — is created by a human in the CEO Access Control
+ * screen, which is the point of the access refactor.
+ *
+ * If the account already exists this returns immediately: it never resets a
+ * password, never reactivates a deliberately disabled account, and never logs
+ * a credential. The seed password comes from CEO_SEED_PASSWORD when set, so
+ * the fallback literal below only ever applies to a brand-new empty database.
+ */
+async function ensureCeoExists() {
+  try {
+    const existing = await CEODepartment.findOne({ email: "ceo@grav.in" });
+    if (existing) return;
+
+    const password = process.env.CEO_SEED_PASSWORD || "CEO@2026";
+
+    await CEODepartment.create({
+      name: "Chief Executive Officer",
+      email: "ceo@grav.in",
+      password,                  // hashed by the model's pre-save hook
+      role: "ceo",
+      department: "Executive",
+      employeeId: "CEO001",
+      isActive: true,
+    });
+
+    // Deliberately no credentials in this message. A boot log is copied into
+    // aggregators, screenshots and terminal scrollback; a password printed
+    // once is a password leaked permanently.
+    console.log(
+      "[bootstrap] No CEO account existed — one was created for ceo@grav.in. " +
+        "Sign in and change the password, then create the remaining " +
+        "departments from CEO → Access Control.",
+    );
+  } catch (err) {
+    console.error("[bootstrap] Could not ensure a CEO account:", err.message);
+  }
+}
+
+// Retained but no longer called on boot — see ensureCeoExists above.
 const seedCEOUser = async () => {
   try {
     const existing = await CEODepartment.findOne({ email: "ceo@grav.in" });
@@ -691,11 +752,10 @@ const createDefaultPackagingDispatch = async () => {
 };
 
 // Update the database connection section
-connectDB().then(async () => {
-  await createDefaultAccountant(); // ✅ ADD THIS
-  await createDefaultPackagingDispatch();
-  await createDefaultProductionSupervisor();
-});
+// Accountant / Packaging / Production-Supervisor seeding removed — see the
+// note on the CEO bootstrap above. Those departments already exist as rows in
+// access_departments and are managed from the CEO Access Control screen; the
+// seeders only re-created accounts and logged their passwords on every restart.
 //changes
 
 const StockItem = require("./models/CMS_Models/Inventory/Products/StockItem.js");
@@ -816,6 +876,29 @@ app.use("/api/hr/overview", hrOverviewRoutes);
 app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
 
 app.use("/api/hr", hrProfileRoutes);
+
+/* ─── DEPARTMENT ACCESS (admin-managed) ───────────────────────────────────
+ * Mounted BEFORE the legacy `authRoutes` on the same prefix. Express matches
+ * in registration order, so /api/auth/login, /verify, /logout are served by
+ * the new router; anything it does not define still falls through to the old
+ * one. The new login itself falls back to the legacy twelve-collection lookup
+ * for any email absent from dept_users, so nobody is logged out at cutover.
+ *
+ * Removal order at the end of the rollout: drop the legacy fallback inside
+ * deptAuth first, then unmount `authRoutes` below.
+ * --------------------------------------------------------------------- */
+const deptAuthRoutes = require("./routes/auth/deptAuth");
+app.use("/api/auth", deptAuthRoutes);
+
+const requirePlatformAdmin = require("./Middlewear/requirePlatformAdmin");
+const accessAdminRoutes = require("./routes/Admin/accessAdmin");
+app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
+
+// Unauthenticated on purpose — backs the public /onboarding tile grid.
+// Returns names and icons only; never emails, counts or user data.
+const publicDepartmentRoutes = require("./routes/Admin/publicDepartments");
+app.use("/api/public", publicDepartmentRoutes);
+
 app.use("/api/auth", authRoutes);
 app.use("/api/employees", employeeRoutes);
 

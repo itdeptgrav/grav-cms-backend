@@ -243,6 +243,12 @@ router.post("/verify", async (req, res) => {
           "-password",
         );
         break; // ✅ NEW
+      // Store was missing from this switch entirely: a store token fell to the
+      // `default` branch below, was looked up in hrdepartments, found nothing,
+      // and got a 401. Store users could log in but never verify.
+      case "store":
+        user = await StoreDepartment.findById(decoded.id).select("-password");
+        break;
       default:
         user = await HRDepartment.findById(decoded.id).select("-password");
         break;
