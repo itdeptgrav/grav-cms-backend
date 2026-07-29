@@ -309,6 +309,41 @@ router.get("/accountability", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /data/attributes-batch?ids=a,b,c — lightweight batch lookup of just the
+// attribute definitions (name + values) for a set of raw items, so a BOM/raw-
+// items list can label each variant's plain combination values with the
+// attribute name they belong to (e.g. "Color: Red" instead of just "Red")
+// without an N+1 fetch per row. Registered BEFORE "/:id" for the same reason
+// as /accountability above.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/data/attributes-batch", async (req, res) => {
+  try {
+    const ids = String(req.query.ids || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => mongoose.Types.ObjectId.isValid(s));
+    if (!ids.length) return res.json({ success: true, rawItems: [] });
+
+    const docs = await RawItem.find({ _id: { $in: [...new Set(ids)] } })
+      .select("name sku attributes")
+      .lean();
+
+    res.json({
+      success: true,
+      rawItems: docs.map((d) => ({
+        _id: d._id,
+        name: d.name,
+        sku: d.sku,
+        attributes: d.attributes || [],
+      })),
+    });
+  } catch (error) {
+    console.error("Error fetching raw item attributes batch:", error);
+    res.status(500).json({ success: false, message: "Server error while fetching raw item attributes" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET raw item by ID — populates variants.vendorNicknames.vendor
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {

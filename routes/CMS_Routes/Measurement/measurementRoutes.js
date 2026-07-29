@@ -6,11 +6,33 @@ const Measurement = require("../../../models/Customer_Models/Measurement");
 const Customer = require("../../../models/Customer_Models/Customer");
 const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+const MeasurementCategory = require("../../../models/CMS_Models/Configurations/MeasurementCategory");
 const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewear");
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
+
+// Resolves a product's raw category (StockItem.category, e.g. "Bottoms") to
+// the Settings-configured measurement category NAME (e.g. "Pant") via the
+// persisted link (MeasurementCategory.productCategories) — mirrors
+// mapProductCategory() in components/sales/PersonWisePOSection.js and
+// app/sales/dashboard/configurations/measurements/[id]/page.js so CSV
+// exports/imports use the same column convention everywhere.
+const mapProductCategory = (rawCategory = "", dynamicCategories = []) => {
+  const cat = (rawCategory || "").trim().toLowerCase();
+  if (!cat) return null;
+  if (dynamicCategories.length > 0) {
+    const match = dynamicCategories.find((c) =>
+      (c.productCategories || []).some((pc) => pc.trim().toLowerCase() === cat)
+    );
+    return match ? match.name : null;
+  }
+  if (cat.includes("shirt") || cat.includes("top")) return "Shirts";
+  if (cat.includes("pant") || cat.includes("bottom")) return "Pant";
+  if (cat.includes("jacket") || cat.includes("outer")) return "Jacket";
+  return null;
+};
 
 // GET organizations with measurement stats
 router.get("/organizations", async (req, res) => {
@@ -2340,27 +2362,24 @@ router.get("/:measurementId/export", async (req, res) => {
 
     const empDetailsMap = new Map(empDocs.map((e) => [e._id.toString(), e]));
 
-    // ── 2. Category → column-prefix mapping & preferred column order ──────
-    //   Product category  →  prefix shown in CSV header
-    const CATEGORY_LABEL = {
-      Outerwear: "Jacket",
-      Shirts: "Shirt",
-      Bottoms: "Trouser",
-    };
-    // Jacket columns come first, then Shirt, then Trouser — same as Excel
-    const CATEGORY_ORDER = ["Outerwear", "Shirts", "Bottoms"];
+    // ── 2. Settings-configured measurement categories — the column prefix
+    //   must always be the Settings category NAME (e.g. "Shirts", "Pant"),
+    //   never a product-name / hardcoded translation, so this export lines
+    //   up with the CSV template & import on the sales side.
+    const dynamicCategories = await MeasurementCategory.find({}).lean();
 
-    // ── 3. Collect all field names per category (first-seen order) ────────
+    // ── 3. Collect all field names per resolved category (first-seen order) ─
     //   Sources:
-    //     • product-based employees  → productId.category  +  measurements[].measurementName
-    //     • category-only employees  → categoryMeasurements[].categoryName + measurements[].fieldName
-    const categoryFieldsMap = new Map(); // category → string[]
+    //     • product-based employees  → mapProductCategory(productId.category) + measurements[].measurementName
+    //     • category-only employees  → categoryMeasurements[].categoryName (already a Settings name) + measurements[].fieldName
+    const categoryFieldsMap = new Map(); // resolved category name → string[]
 
     measurement.employeeMeasurements.forEach((emp) => {
       // Product-based
       (emp.products || []).forEach((p) => {
-        const cat = p.productId?.category;
-        if (!cat) return;
+        const rawCat = p.productId?.category;
+        if (!rawCat) return;
+        const cat = mapProductCategory(rawCat, dynamicCategories) || rawCat;
         if (!categoryFieldsMap.has(cat)) categoryFieldsMap.set(cat, []);
         (p.measurements || []).forEach((m) => {
           if (
@@ -2382,21 +2401,11 @@ router.get("/:measurementId/export", async (req, res) => {
       });
     });
 
-    // ── 4. Apply preferred order; unknown categories go at the end ────────
-    const orderedCategories = [
-      ...CATEGORY_ORDER.filter((c) => categoryFieldsMap.has(c)),
-      ...Array.from(categoryFieldsMap.keys()).filter(
-        (c) => !CATEGORY_ORDER.includes(c),
-      ),
-    ];
-
-    // ── 5. Build header row & meta array for value lookup ─────────────────
-    //   headerMeta[i] = { category, field }  — parallel to measurement columns
+    // ── 4. Header row — "{Category} {Field}", categories in first-seen order ─
     const headerMeta = [];
-    orderedCategories.forEach((cat) => {
-      const label = CATEGORY_LABEL[cat] || cat;
-      categoryFieldsMap.get(cat).forEach((field) => {
-        headerMeta.push({ category: cat, field, col: `${label} ${field}` });
+    categoryFieldsMap.forEach((fields, cat) => {
+      fields.forEach((field) => {
+        headerMeta.push({ category: cat, field, col: `${cat} ${field}` });
       });
     });
 
@@ -2419,8 +2428,9 @@ router.get("/:measurementId/export", async (req, res) => {
 
       // From assigned products (takes precedence)
       (emp.products || []).forEach((p) => {
-        const cat = p.productId?.category;
-        if (!cat) return;
+        const rawCat = p.productId?.category;
+        if (!rawCat) return;
+        const cat = mapProductCategory(rawCat, dynamicCategories) || rawCat;
         if (!catValMap[cat]) catValMap[cat] = {};
         (p.measurements || []).forEach((m) => {
           if (m.measurementName)
