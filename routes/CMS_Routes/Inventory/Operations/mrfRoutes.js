@@ -1341,7 +1341,11 @@ router.post("/:id/items/:itemId/return", async (req, res) => {
     mrfItem.returnHistory.push({
       returnedQty: qty, notes,
       recordedBy: getActorId(req), recordedByModel: "ProjectManager",
-      recordedAt: new Date(),
+      // The schema field is `returnedAt`. This used to push `recordedAt`,
+      // which Mongoose stripped as unknown — the timestamp only survived
+      // because `returnedAt` has a Date.now default, and anything reading
+      // `recordedAt` (the store's own activity log) got undefined.
+      returnedAt: new Date(),
     });
 
     const fullyReturned = mrfItem.returnedQty >= mrfItem.issuedQty - 0.001;
@@ -1351,7 +1355,31 @@ router.post("/:id/items/:itemId/return", async (req, res) => {
     const someReturned = mrf.items.some(i => ["RETURNED", "PARTIALLY_RETURNED"].includes(i.itemStatus));
     mrf.status = allReturned ? "COMPLETED" : someReturned ? "PARTIALLY_RETURNED" : mrf.status;
 
+    const who = actorName(req);
+    mrf.logEvent({
+      action: allReturned ? "FULLY_RETURNED" : "RETURNED",
+      actorName: who, actorRole: "store",
+      detail: `${qty} ${mrfItem.unit} of ${mrfItem.rawItemName} returned${notes ? ` — ${notes}` : ""}`,
+    });
+
     await mrf.save();
+
+    // A return was the one movement that told nobody. The requester needs to
+    // know their return was recorded (it clears what they owe), and the TL
+    // needs it because the request may now be complete.
+    mrfChat.systemMessage(
+      mrf,
+      `${who} recorded a return of ${qty} ${mrfItem.unit} of ${mrfItem.rawItemName}.${notes ? ` Note: ${notes}` : ""}`,
+      who
+    );
+    mrfNotify.returned(mrf, {
+      name: mrfItem.rawItemName,
+      unit: mrfItem.unit,
+      returnedQty: qty,
+      outstanding: Math.max(0, (mrfItem.issuedQty || 0) - (mrfItem.returnedQty || 0)),
+      complete: allReturned,
+    }).catch(e => console.error("[return notify]", e.message));
+
     res.json({ success: true, message: `${qty} ${mrfItem.unit} returned & stock credited`, mrf });
   } catch (e) { console.error("[MRF return]", e); res.status(500).json({ success: false, message: e.message }); }
 });

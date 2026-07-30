@@ -294,6 +294,38 @@ async function issued(mrf, lines = []) {
   }
 }
 
+/**
+ * Material came back to the store. Previously silent — the requester was never
+ * told their return had been recorded, which matters because it is what clears
+ * what they still owe.
+ */
+async function returned(mrf, line) {
+  const returnedText = `${fmtQty(line.returnedQty, line.unit)} of ${line.name}`;
+  const stillOut = line.outstanding > 0.001
+    ? ` ${fmtQty(line.outstanding, line.unit)} still with you.`
+    : " Nothing further outstanding on this item.";
+
+  await notifyCowork({
+    recipientIds: [requesterId(mrf)],
+    type: "request",
+    tag: `mrf-returned-${mrf._id}-${Date.now()}`,
+    title: line.complete ? "Return completed" : "Return recorded",
+    body: N(mrf, `the Store recorded your return of ${returnedText}.${stillOut}`),
+    data: linkData(mrf),
+  });
+
+  if (tlId(mrf).length) {
+    await notifyCowork({
+      recipientIds: [tlId(mrf)],
+      type: "request",
+      tag: `mrf-returned-tl-${mrf._id}-${Date.now()}`,
+      title: line.complete ? "Material fully returned" : "Material returned",
+      body: N(mrf, `${mrf.requestedForName} returned ${returnedText}.`),
+      data: tlLinkData(mrf),
+    });
+  }
+}
+
 /** Store closed it as impossible to supply. */
 async function unfulfilled(mrf) {
   await notifyCowork({
@@ -476,7 +508,7 @@ async function productRequestTlRejected(doc) {
 module.exports = {
   notifyCowork, notifyStore,
   submitted, autoForwarded, tlApproved, tlRejected,
-  availabilityUpdated, issued, unfulfilled, cancelled,
+  availabilityUpdated, issued, returned, unfulfilled, cancelled,
   chatMessage, subjectChatMessage,
   productRequestSubmitted, productRequestAutoForwarded,
   productRequestTlApproved, productRequestTlRejected,
