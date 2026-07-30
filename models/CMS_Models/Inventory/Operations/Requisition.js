@@ -71,6 +71,12 @@ const requisitionSchema = new mongoose.Schema(
     pettyCashGivenToEmployee: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
     pettyCashNote: { type: String, trim: true, default: "" },
 
+    // NOTE: there are deliberately no bank / UPI fields here. The PDF prints a
+    // PAYMENT DETAILS block, but those rows are pen-filled at the market by
+    // whoever hands over the money — the same treatment as Vendor and Price on
+    // the item table. Adding columns nothing writes would leave dead fields
+    // that later readers assume carry data.
+
     priority: {
       type: String,
       enum: ["LOW", "NORMAL", "HIGH", "URGENT"],
