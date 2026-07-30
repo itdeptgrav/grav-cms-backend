@@ -2519,6 +2519,7 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
                 barcodeId: scan.barcodeId,
                 woRef: wo || null,
                 opsEverDone: new Set(),
+                opsToday: new Set(),
                 firstSeenDate: tsStr,
                 lastScannedDate: tsStr,
                 datesActive: new Set([tsStr]),
@@ -2529,6 +2530,7 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
             }
             const ph = pieceHist.get(key);
             ops.forEach((c) => ph.opsEverDone.add(c));
+            if (isToday) ops.forEach((c) => ph.opsToday.add(c));
             if (tsStr < ph.firstSeenDate) ph.firstSeenDate = tsStr;
             if (tsStr > ph.lastScannedDate) ph.lastScannedDate = tsStr;
             ph.datesActive.add(tsStr);
@@ -2715,8 +2717,11 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
       // Operation efficiency data
       const operationsData = expectedOps.map(
         ({ opCode, opName, samSeconds, samMins, machineType }) => {
+          // Scoped to TODAY — this is a "daily" summary; ph.opsEverDone spans the
+          // multi-day lookback and would otherwise inflate "today" piece counts
+          // with work done on prior days.
           const piecesWithOp = pieces.filter((ph) =>
-            ph.opsEverDone.has(opCode),
+            ph.opsToday.has(opCode),
           ).length;
           const stats = opStats.get(opCode);
           const avgActual = stats?.avgSecs || null;
@@ -2757,10 +2762,10 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
         },
       );
 
-      // Extra ops scanned but not in StockItem
+      // Extra ops scanned today but not in StockItem
       const allScannedCodes = new Set();
       for (const ph of pieces)
-        for (const c of ph.opsEverDone) allScannedCodes.add(c);
+        for (const c of ph.opsToday) allScannedCodes.add(c);
       const extraOps = [...allScannedCodes]
         .filter((c) => !expectedSet.has(c))
         .map((code) => {
@@ -2771,7 +2776,7 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
             isExtra: true,
             samSeconds: null,
             samMins: null,
-            piecesWithOp: pieces.filter((ph) => ph.opsEverDone.has(code))
+            piecesWithOp: pieces.filter((ph) => ph.opsToday.has(code))
               .length,
             avgActualSecs: st?.avgSecs || null,
             efficiencyPct: null,
@@ -2853,7 +2858,10 @@ router.get("/daily-summary", ceoAuth, async (req, res) => {
         workOrderStatus: wo.status || "unknown",
         variantAttributes: wo.variantAttributes || [],
         totalQuantity: wo.quantity || 0,
-        totalUniquePieces: pieces.length,
+        // Pieces with any scan TODAY (matches kpis.totalPieces / the daily
+        // KPI strip). `pieces.length` would count the full 13-day lookback.
+        totalUniquePieces: pieces.filter((ph) => ph.todayScans.length > 0)
+          .length,
         completePieces: completePcs,
         inProgressPieces: inProgressPcs,
         notStartedPieces: Math.max(0, notStartedPcs),
