@@ -158,6 +158,7 @@ router.post("/", async (req, res) => {
     const {
       items, department, requiredBy, reason, notes, priority,
       requestedByEmployee, requestedByName, requestedById,
+      pettyCashAmount, pettyCashGivenTo, pettyCashGivenToEmployee, pettyCashNote,
     } = req.body;
 
     const { items: cleaned, error } = cleanItems(items);
@@ -176,6 +177,24 @@ router.post("/", async (req, res) => {
       ? ([resolved.firstName, resolved.middleName, resolved.lastName].filter(Boolean).join(" ").trim() || resolved.name || "")
       : String(requestedByName || "").trim();
 
+    if (pettyCashAmount !== "" && pettyCashAmount !== null && pettyCashAmount !== undefined &&
+      Number(pettyCashAmount) < 0) {
+      return res.status(400).json({ success: false, message: "Petty cash amount cannot be negative" });
+    }
+
+    // Petty cash can go to anyone — a driver, a contractor, someone with no HR
+    // record at all — so the name is accepted as free text. When the client did
+    // match it to an employee, the HR spelling wins so the printed cash record
+    // names them as HR knows them; otherwise the typed name is kept verbatim.
+    let cashPerson = null;
+    if (pettyCashGivenToEmployee) {
+      cashPerson = await Employee.findById(pettyCashGivenToEmployee)
+        .select("firstName middleName lastName name").lean();
+    }
+    const cashPersonName = cashPerson
+      ? ([cashPerson.firstName, cashPerson.middleName, cashPerson.lastName].filter(Boolean).join(" ").trim() || cashPerson.name || "")
+      : String(pettyCashGivenTo || "").trim();
+
     const requisition = new Requisition({
       items: cleaned,
       requestedByEmployee: resolved?._id || null,
@@ -189,6 +208,16 @@ router.post("/", async (req, res) => {
       reason: String(reason || "").trim(),
       notes: String(notes || "").trim(),
       priority: ["LOW", "NORMAL", "HIGH", "URGENT"].includes(priority) ? priority : "NORMAL",
+      // Blank stays null, not 0 — "no cash handed over" and "zero rupees
+      // handed over" print differently on the form.
+      pettyCashAmount:
+        pettyCashAmount === "" || pettyCashAmount === null || pettyCashAmount === undefined ||
+          Number.isNaN(Number(pettyCashAmount))
+          ? null
+          : Number(pettyCashAmount),
+      pettyCashGivenTo: cashPersonName,
+      pettyCashGivenToEmployee: cashPerson?._id || null,
+      pettyCashNote: String(pettyCashNote || "").trim(),
       status: "SUBMITTED",
       createdByRef: getActorId(req),
       createdByName: actorName(req),
