@@ -1889,26 +1889,9 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
       });
     }
 
-    // Validate all included measurements are complete
-    let totalFields = 0,
-      completedFields = 0;
-    convertibleEmployees.forEach((emp) => {
-      emp.includedProducts.forEach((p) => {
-        totalFields += p.measurements?.length || 0;
-        completedFields +=
-          p.measurements?.filter((m) => m.value?.trim()).length || 0;
-      });
-    });
-    if (
-      totalFields > 0 &&
-      Math.round((completedFields / totalFields) * 100) < 100
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Cannot convert: some selected employees have incomplete measurements.",
-      });
-    }
+    // NOTE: deliberately NOT blocking on incomplete measurements — sales
+    // needs to be able to submit/convert a PO even before every field is
+    // filled in (measurements can be completed later, before cutting).
 
     const customer = await Customer.findById(measurement.organizationId);
     if (!customer)

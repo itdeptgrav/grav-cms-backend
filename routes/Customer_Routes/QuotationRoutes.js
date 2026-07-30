@@ -341,33 +341,24 @@ router.post('/requests/:requestId/quotation/payment', verifyCustomerToken, async
 
     // Add to payment submissions array
     quotation.paymentSubmissions.push(paymentSubmission);
-    
-    // Update payment step totals
-    const currentPaid = paymentStep.paidAmount || 0;
-    quotation.paymentSchedule[paymentStepIndex].paidAmount = currentPaid + paymentAmount;
-    quotation.paymentSchedule[paymentStepIndex].paidDate = new Date();
-    
-    // Update payment method if not set
+
+    // NOTE: paymentStep.paidAmount/status and request.totalPaidAmount/totalDueAmount
+    // are DELIBERATELY not touched here. This is a customer-submitted receipt —
+    // it only becomes real money once a sales person verifies it via
+    // PUT /api/cms/sales/payment-submissions/:submissionId/status. Bumping the
+    // "paid" numbers immediately on submission (the old behaviour) made the
+    // sales dashboard show a payment as done before anyone on sales had
+    // actually checked it.
+    //
+    // Payment method/transaction id ARE still worth recording on the step as
+    // metadata even before verification, so sales sees what to check against.
     if (!paymentStep.paymentMethod) {
       quotation.paymentSchedule[paymentStepIndex].paymentMethod = paymentMethod;
     }
-    
     if (transactionId && !paymentStep.transactionId) {
       quotation.paymentSchedule[paymentStepIndex].transactionId = transactionId;
     }
 
-    // Update payment step status
-    const updatedPaidAmount = currentPaid + paymentAmount;
-    if (updatedPaidAmount >= paymentStep.amount) {
-      quotation.paymentSchedule[paymentStepIndex].status = 'paid';
-    } else if (updatedPaidAmount > 0) {
-      quotation.paymentSchedule[paymentStepIndex].status = 'partially_paid';
-    }
-
-    // Update request totals
-    request.totalPaidAmount = (request.totalPaidAmount || 0) + paymentAmount;
-    request.totalDueAmount = quotation.grandTotal - request.totalPaidAmount;
-    request.lastPaymentDate = new Date();
     request.updatedAt = new Date();
 
     // Add note
