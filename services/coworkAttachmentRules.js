@@ -1,0 +1,133 @@
+/**
+ * GRAV-CMS-BACKEND/services/coworkAttachmentRules.js
+ *
+ * The validation half of Cowork attachments, with NO dependencies.
+ *
+ * Split out from `coworkAttachment.service.js` because these are the security
+ * decisions — what a file really is, what may be stored, how big, and what a
+ * filename is allowed to contain — and they should be testable without a
+ * Firebase credential or a Drive client. A rule that can only be exercised by
+ * standing up the whole service tends not to be exercised.
+ */
+
+const COWORK_FOLDER_NAME = "Cowork Attachments";
+const COLLECTION = "cowork_attachments";
+
+/** 50 MB. Matches the voucher service's multer cap. */
+const MAX_BYTES = 50 * 1024 * 1024;
+
+/**
+ * What may be stored, keyed by the type read from the FILE'S OWN BYTES.
+ *
+ * The client's `mimetype` and filename are both attacker-controlled and are
+ * used for nothing here except the display name. A `.pdf` that is actually an
+ * HTML document would otherwise be stored and later served as a PDF.
+ */
+const ALLOWED = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "text/plain",
+  "text/csv",
+]);
+
+const startsWith = (buf, bytes) =>
+  buf.length >= bytes.length && bytes.every((b, i) => buf[i] === b);
+
+/**
+ * The file's real type, from its leading bytes.
+ *
+ * Returns null when nothing recognisable is found, which is a refusal rather
+ * than a fallback — "unknown" must never become `application/octet-stream` and
+ * slip past the allow-list.
+ *
+ * The Office formats are all ZIP containers and share `PK\x03\x04`, so a
+ * declared subtype is consulted ONLY to choose between them, and only after the
+ * container itself has been proven a ZIP. That is the one place a client's
+ * claim is honoured, and it cannot widen the allow-list: a ZIP claiming to be a
+ * PDF still resolves as a ZIP and is refused.
+ */
+function sniffMimeType(buffer, declaredType) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return null;
+
+  if (startsWith(buffer, [0x25, 0x50, 0x44, 0x46])) return "application/pdf";
+  if (startsWith(buffer, [0x89, 0x50, 0x4e, 0x47])) return "image/png";
+  if (startsWith(buffer, [0xff, 0xd8, 0xff])) return "image/jpeg";
+  if (
+    startsWith(buffer, [0x52, 0x49, 0x46, 0x46]) &&
+    buffer.length >= 12 &&
+    buffer.slice(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  // Legacy Office (.doc/.xls/.ppt) — OLE2 compound file.
+  if (startsWith(buffer, [0xd0, 0xcf, 0x11, 0xe0])) {
+    const ole = {
+      "application/vnd.ms-excel": "application/vnd.ms-excel",
+      "application/vnd.ms-powerpoint": "application/vnd.ms-powerpoint",
+    };
+    return ole[declaredType] || "application/msword";
+  }
+
+  // OOXML (.docx/.xlsx/.pptx) — a ZIP container.
+  if (startsWith(buffer, [0x50, 0x4b, 0x03, 0x04])) {
+    const ooxml = new Set([
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ]);
+    return ooxml.has(declaredType) ? declaredType : null;
+  }
+
+  // Text has no magic number. Accepted only when the bytes really are text and
+  // the client said so — a binary claiming text/plain fails the scan below.
+  if (declaredType === "text/plain" || declaredType === "text/csv") {
+    const head = buffer.slice(0, 512);
+    for (const byte of head) {
+      const printable =
+        byte === 0x09 || byte === 0x0a || byte === 0x0d || (byte >= 0x20 && byte < 0x7f);
+      if (!printable) return null;
+    }
+    return declaredType;
+  }
+
+  return null;
+}
+
+/** A filename safe to store and to put in a Content-Disposition header. */
+function safeName(name) {
+  const base = typeof name === "string" ? name : "";
+  const cleaned = base
+    /* Header-injection first: this string ends up inside a quoted
+       Content-Disposition value, where a quote or a newline would let the
+       client write headers of its own. */
+    .replace(/[\r\n"\\]/g, "")
+    .replace(/[/\\]/g, "-")
+    /* Then path traversal. The name is used as a Drive title and a download
+       filename, neither of which is a filesystem path — but a browser may
+       write it to disk, and "safe" should not depend on knowing every
+       consumer. */
+    .replace(/\.{2,}/g, ".")
+    .replace(/^[.\s]+/, "")
+    .trim()
+    .slice(0, 180);
+  return cleaned || "attachment";
+}
+
+
+module.exports = {
+  sniffMimeType,
+  safeName,
+  ALLOWED,
+  MAX_BYTES,
+  COLLECTION,
+  COWORK_FOLDER_NAME,
+};
