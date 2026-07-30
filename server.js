@@ -833,6 +833,13 @@ const salesSettingsRoutes = require("./routes/CMS_Routes/Sales/salesSettings");
 
 app.use("/api/cms/sales/settings", salesSettingsRoutes);
 
+// Address/contact block printed on Sales PDFs (quotations, measurement POs,
+// work-order progress). Its own record — independent of the store letterhead.
+app.use(
+  "/api/cms/sales/pdf-settings",
+  require("./routes/CMS_Routes/Sales/salesPdfSettingsRoutes")
+);
+
 app.use(
   "/api/cms/crm/call-schedules",
   require("./routes/CMS_Routes/Sales/callSchedule"),
@@ -1015,6 +1022,13 @@ app.use("/api/cms/inventory/mrf", mrfRoutes);
 app.use(
   "/api/cms/inventory/requisitions",
   require("./routes/CMS_Routes/Inventory/Operations/requisitionRoutes")
+);
+
+// Address/contact block printed on Store PDFs. Store module only — brand name
+// and logo are not configurable here.
+app.use(
+  "/api/cms/inventory/store-settings",
+  require("./routes/CMS_Routes/Inventory/Operations/storeSettingsRoutes")
 );
 
 app.use(
