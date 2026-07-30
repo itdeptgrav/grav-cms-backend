@@ -53,9 +53,23 @@ const requisitionSchema = new mongoose.Schema(
     requestedById: { type: String, trim: true, default: "" },   // biometric / badge
 
     department: { type: String, trim: true, default: "" },
+
+    // Shown throughout the UI and on the PDF as "Due At". The stored name is
+    // left as-is so existing requisitions keep their dates — renaming the
+    // field would need a migration for a purely cosmetic change.
     requiredBy: { type: Date, default: null },
+
     reason: { type: String, trim: true, default: "" },
     notes: { type: String, trim: true, default: "" },
+
+    // ── Petty cash ────────────────────────────────────────────────────
+    // Cash handed over so the requested items can be bought directly. Both
+    // optional: plenty of requisitions involve no cash at all, and the amount
+    // is often decided after the form is printed.
+    pettyCashAmount: { type: Number, default: null },
+    pettyCashGivenTo: { type: String, trim: true, default: "" },
+    pettyCashGivenToEmployee: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    pettyCashNote: { type: String, trim: true, default: "" },
 
     priority: {
       type: String,
