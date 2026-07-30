@@ -221,6 +221,63 @@ async function _buildPath(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  1. CREATE TASK (CEO or TL — replaces CEO-only)
 // ═════════════════════════════════════════════════════════
+
+/**
+ * The rank a new task should carry so it lands at the BOTTOM of one person's
+ * active queue.
+ *
+ * Two faults this replaces, both of which put new work in the middle of
+ * somebody's list:
+ *
+ *  1. It counted open tasks and added one. A count collides the moment a queue
+ *     has gaps — three active tasks ranked 5, 6, 7 count as 3, so the new task
+ *     was stored at 4 and sorted ABOVE all of them. Gaps are normal: closing a
+ *     task leaves one.
+ *  2. The "open" test was `status not-in [done, cancelled]`, and legacy leaves
+ *     `status` at "open" for an entire review cycle while `completionStatus`
+ *     moves. Approved work was therefore counted as active.
+ *
+ * So: highest ACTIVE stored rank + 1, clamped to the 1..10 scale the rest of
+ * the product uses. Nothing else is renumbered — a new task is one write, and
+ * reshuffling a queue because somebody was given more work would move tasks a
+ * manager had deliberately ordered.
+ */
+const { isBudgetSettled } = require("./activePriority");
+
+const _CLOSED_STATUS = new Set(["done", "cancelled"]);
+const _CLOSED_REVIEW = new Set(["completed", "approved", "tl_approved", "ceo_approved"]);
+
+async function nextActiveRankFor(db, employeeId) {
+  const snap = await db.collection("cowork_tasks")
+    .where("assigneeIds", "array-contains", employeeId)
+    .get();
+
+  let highest = 0;
+  snap.forEach((doc) => {
+    const t = doc.data() || {};
+    if (t.isDeleted) return;
+    if (_CLOSED_STATUS.has(t.status)) return;
+    if (_CLOSED_REVIEW.has(t.completionStatus)) return;
+    // A task whose time budget is still being agreed is not in the queue, so it
+    // must not push the next task's rank up and leave a gap that never closes.
+    if (!isBudgetSettled(t)) return;
+    const stored = (t.assigneePriorities || {})[employeeId];
+    const rank = Number(typeof stored === "number" ? stored : t.priority);
+    if (Number.isFinite(rank) && rank > highest) highest = rank;
+  });
+
+  return highest === 0 ? 1 : Math.min(10, highest + 1);
+}
+
+/** Per-assignee ranks for a new task. Each queue is computed independently. */
+async function assigneePrioritiesFor(db, assigneeIds) {
+  const map = {};
+  for (const id of assigneeIds || []) {
+    map[id] = await nextActiveRankFor(db, id);
+  }
+  return map;
+}
+
 async function createTask({ title, description, notes, requirements = [], assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
   pendingAssigneeId = null, pendingAssigneeName = null, departmentApprovals = null,
   isGoldTask = false,
@@ -401,6 +458,31 @@ async function createTask({ title, description, notes, requirements = [], assign
     });
   }
 
+  // ── PENDING ASSIGNEE — cross-department / CEO gate ──────────────────────────
+  // A gated task is created with assigneeIds EMPTY and the target parked in
+  // pendingAssigneeId, so the fan-out above skips entirely and the one person
+  // the work is addressed to was told nothing at all. They found out only when
+  // both approvals landed.
+  //
+  // Deliberately NOT "task_assigned": the task is not theirs yet and may still
+  // be rejected. A separate type keeps the client from offering start/submit
+  // actions on work that has not cleared the gate, and keeps this out of any
+  // "assigned to me" count.
+  //
+  // No socket "new_task" emit either — that event carries the task into the
+  // assignee's live list, which is exactly what must not happen before approval.
+  if (!assigneeIds?.length && pendingAssigneeId) {
+    await _notifyMany({
+      recipientIds: [pendingAssigneeId],
+      type: "task_pending_department_approval",
+      title: `⏳ Pending Approval · ${title}`,
+      body: `${assignedByName || assignedBy} wants to assign you a task. It is waiting for department approval.`,
+      data: { taskId, taskTitle: title, parentTaskId: parentTaskId || "" },
+      senderId: assignedBy,
+      senderName: assignedByName || assignedBy,
+    });
+  }
+
   // ── P1 CONFLICT CHECK — same function used by play-button and drag triggers ──
   const _p1HasTimeBudget = fixedDeadline || Number(senderTimerWindowSecs) > 0 || Number(etcHours) > 0;
   if (Number(priority) === 1 && _p1HasTimeBudget && assigneeIds?.length) {
@@ -457,6 +539,144 @@ async function confirmTaskReceipt({ taskId, employeeId, employeeName }) {
   await _notifyMany({ recipientIds: [...new Set(notifyIds)], type: "task_confirmed", title: `✅ Confirmed · ${task.title}`, body: `${employeeName} acknowledged task "${task.title}"`, data: { taskId, taskTitle: task.title }, senderId: employeeId, senderName: employeeName });
   socket.emitToMany([...new Set(notifyIds)], "task_confirmed", { taskId, employeeId, employeeName });
   return { success: true };
+}
+
+// ═════════════════════════════════════════════════════════
+//  2b. DECLINE ASSIGNMENT — assignee refuses the work outright
+// ═════════════════════════════════════════════════════════
+// The mirror of confirmTaskReceipt. Until now an assignee could refuse the
+// TERMS (reject-sender-timer, which reopens the budget negotiation and leaves
+// the task with them) but had no way to hand the work back at all — status
+// "rejected" was only ever reached by a cross-department approver refusing a
+// gate, never by the person the work was for.
+//
+// Same guards as confirmTaskReceipt, in the same order:
+//   · must be an assignee            (assigneeIds includes employeeId)
+//   · must not have confirmed already (a declined task you accepted is a
+//     cancellation, which is a different act with a different owner)
+// Plus a required reason: refusing work silently leaves the assignor with a
+// stalled task and no way to find out why.
+//
+// Writes status "rejected", which is the status the department-gate refusal
+// already uses — so every existing reader (the old task page's tab grouping,
+// the new UI's mapper) treats it correctly with no change.
+async function declineAssignment({ taskId, employeeId, employeeName, reason }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+
+  if (!task.assigneeIds?.includes(employeeId) && task.pendingAssigneeId !== employeeId) {
+    throw new Error("Not assigned to this task.");
+  }
+  if (task.confirmedBy?.includes(employeeId)) {
+    throw new Error("You have already accepted this task. Ask for it to be cancelled instead.");
+  }
+  if (task.status === "rejected") throw new Error("This task has already been declined.");
+  if (["done", "completed", "cancelled"].includes(task.status)) {
+    throw new Error("This task is closed.");
+  }
+  if (!reason?.trim()) throw new Error("A reason is required to decline a task.");
+
+  await ref.update({
+    status: "rejected",
+    assignmentDeclinedBy: employeeId,
+    assignmentDeclinedByName: employeeName || "",
+    assignmentDeclinedReason: reason.trim(),
+    assignmentDeclinedAt: new Date().toISOString(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // The system chat line is posted by the ROUTE — postSystemChatMessage is
+  // defined there, as it is for department-tl-set-hours. Keeping the service
+  // free of it also keeps this function callable from a job or a script.
+
+  const notifyIds = [task.assignedBy, task.originalAssignedBy].filter(
+    (id) => id && id !== employeeId,
+  );
+  await _notifyMany({
+    recipientIds: [...new Set(notifyIds)],
+    type: "task_declined",
+    title: `\u26d4 Declined · ${task.title}`,
+    body: `${employeeName} declined "${task.title}" — ${reason.trim()}`,
+    data: { taskId, taskTitle: task.title },
+    senderId: employeeId,
+    senderName: employeeName,
+  });
+  socket.emitToMany([...new Set(notifyIds)], "task_declined", {
+    taskId,
+    employeeId,
+    employeeName,
+    reason: reason.trim(),
+  });
+
+  return { success: true, status: "rejected" };
+}
+
+// ═════════════════════════════════════════════════════════
+//  2c. SET BUDGET ON AN ACTIVE TASK
+// ═════════════════════════════════════════════════════════
+// department-tl-set-hours opens with `if (task.status !== "pending_tl_hours")
+// return 400`, because it exists to activate a task waiting at the gate. That
+// is correct for what it does, and it is NOT a route for changing the budget of
+// work already running — which is what approving a time-budget extension needs.
+//
+// Rather than loosening that guard (which would change a route the old frontend
+// relies on), this is its sibling for the active case. Same authority rule:
+// the budget belongs to whoever MANAGES the assignee, resolved through the same
+// _getPrimaryManagerApprover the approval chain uses, so no new notion of
+// hierarchy is introduced.
+async function setActiveTaskBudget({ taskId, employeeId, employeeName, hoursValue, hoursUnit }) {
+  // Caller MUST have verified that employeeId manages the assignee. See the route.
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+
+  if (["done", "completed", "cancelled", "rejected"].includes(task.status)) {
+    throw new Error("This task is closed, so its budget cannot be changed.");
+  }
+
+  const targetId = task.pendingAssigneeId || task.assigneeIds?.[0];
+  if (!targetId) throw new Error("This task has no assignee yet.");
+
+  // The MANAGER check is done by the caller, not here — `_getPrimaryManagerApprover`
+  // is defined in the route file, which is also where department-tl-set-hours
+  // performs the identical check. Keeping the lookup there means one definition
+  // of "who manages the assignee" rather than a second copy in this layer.
+  const val = Number(hoursValue) || 0;
+  if (val <= 0) throw new Error("Enter a valid number of hours.");
+  const unit = hoursUnit || "hours";
+  const secs = val * (unit === "minutes" ? 60 : unit === "days" ? 86400 : 3600);
+
+  const previousSecs = Number(task.deadlineWindowSecs) || Number(task.senderTimerWindowSecs) || 0;
+
+  // deadlineWindowSecs is the AGREED window — the field resolveTimeBudget reads
+  // first and the one the queue plans against. senderTimerWindowSecs is left
+  // alone: it records what was originally proposed, and overwriting it would
+  // erase the fact that the budget ever changed.
+  await ref.update({
+    deadlineWindowSecs: secs,
+    etcHours: secs / 3600,
+    budgetSetBy: employeeId,
+    budgetSetByName: employeeName || "",
+    budgetSetAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // Posted by the route, as above.
+
+  await _notifyMany({
+    recipientIds: [targetId].filter((id) => id && id !== employeeId),
+    type: "task_budget_changed",
+    title: `\u23f1 Time budget updated · ${task.title}`,
+    body: `${employeeName} set the budget to ${(secs / 3600).toFixed(2)}h.`,
+    data: { taskId, taskTitle: task.title },
+    senderId: employeeId,
+    senderName: employeeName,
+  });
+
+  return { success: true, previousSecs, deadlineWindowSecs: secs };
 }
 
 // ═════════════════════════════════════════════════════════
@@ -575,12 +795,12 @@ async function forwardTask({ parentTaskId, forwardedBy, forwardedByName, assignm
     let fwdPriority = Number(assignment.priority) || null;
     const fwdAssigneePriorities = {};
     try {
-      const existing = await db.collection("cowork_tasks")
-        .where("assigneeIds", "array-contains", assignment.employeeId)
-        .where("status", "not-in", ["done", "cancelled"])
-        .get();
-      fwdAssigneePriorities[assignment.employeeId] = existing.size + 1;
-      if (!fwdPriority) fwdPriority = existing.size + 1;
+      // Highest active rank + 1, not the open COUNT + 1: a count collides
+      // whenever the queue has a gap, and the old filter counted approved work
+      // as open. Same rule as every other create path.
+      const next = await nextActiveRankFor(db, assignment.employeeId);
+      fwdAssigneePriorities[assignment.employeeId] = next;
+      if (!fwdPriority) fwdPriority = next;
     } catch (e) {
       console.warn("[forwardTask] auto-priority fallback:", e.message);
       if (!fwdPriority) fwdPriority = 1;
@@ -1242,7 +1462,116 @@ async function submitCompletionRequest({ taskId, employeeId, employeeName, messa
 //           tl_final    (TL approves → task complete)
 //           ceo_direct  (CEO is reviewing directly → task complete)
 // ═════════════════════════════════════════════════════════
-async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason }) {
+
+/**
+ * Rework must name what is wrong with it.
+ *
+ * A reviewer could previously send work back with a free-text reason alone, so
+ * the assignee was told "fix it" and left to infer which of the acceptance
+ * criteria had failed. The criteria already exist on the task — `requirements`,
+ * written at creation — so this asks the reviewer to point at them rather than
+ * describe them again.
+ *
+ * Validated HERE and not only in the browser: the endpoint is reachable
+ * directly, and a rule enforced in one client is not a rule.
+ *
+ * Returns the selected criteria as TEXT. Indices would be smaller but they are
+ * positional, and a later edit to the requirements array would silently
+ * re-point a historical rework at a different criterion — a record of what was
+ * asked for must not change meaning afterwards.
+ */
+function validateReworkRequirements(task, selected) {
+  const available = Array.isArray(task.requirements)
+    ? task.requirements.filter((r) => typeof r === "string" && r.trim() !== "")
+    : [];
+
+  // A task with no acceptance criteria cannot have one selected. Refusing the
+  // rework would strand the reviewer with no way to return the work at all,
+  // so the requirement applies only where there is something to require.
+  if (available.length === 0) return [];
+
+  const chosen = (Array.isArray(selected) ? selected : [])
+    .map((r) => (typeof r === "string" ? r.trim() : ""))
+    .filter((r) => r !== "");
+
+  // Only criteria that actually belong to this task. A caller could otherwise
+  // write arbitrary text into the task's history under the reviewer's name.
+  const valid = chosen.filter((r) => available.includes(r));
+
+  if (valid.length === 0) {
+    throw new Error(
+      "Select at least one completion requirement that needs changes before sending for rework.",
+    );
+  }
+  return [...new Set(valid)];
+}
+
+/**
+ * Attachment metadata, in the shape task chat already uses.
+ *
+ * The engine never receives a FILE — task chat has always taken
+ * `{ url, name, type, downloadUrl }` for something already uploaded, and this
+ * reuses that exactly rather than introducing a second document system. Only
+ * those four fields survive: anything else a caller sends is dropped, so a
+ * client cannot smuggle arbitrary structure into a task's permanent history.
+ */
+function readReworkAttachmentIds(ids) {
+  // IDs of records already created by the attachment routes, which have
+  // already checked permission and validated the bytes. Stored as references
+  // so this write cannot become a second upload path.
+  return (Array.isArray(ids) ? ids : [])
+    .filter((x) => typeof x === "string" && x.trim() !== "")
+    .slice(0, 10)
+    .map((x) => x.trim());
+}
+
+function readReworkAttachments(files) {
+  return (Array.isArray(files) ? files : [])
+    .filter((f) => f && typeof f.url === "string" && f.url.trim() !== "")
+    .slice(0, 10)
+    .map((f) => ({
+      url: String(f.url),
+      name: typeof f.name === "string" && f.name.trim() ? f.name.trim() : "attachment",
+      type: typeof f.type === "string" ? f.type : "file",
+      downloadUrl: typeof f.downloadUrl === "string" ? f.downloadUrl : String(f.url),
+    }));
+}
+
+/**
+ * One rework, appended rather than overwritten, so the history survives.
+ *
+ * `reason` is the review note the engine already required; `note` is the
+ * reviewer's optional extra context. Kept apart because they answer different
+ * questions — why the work came back, and what to do about it — and merging
+ * them would make the required one optional in practice.
+ */
+function reworkHistoryEntry(
+  task,
+  reviewerId,
+  reviewerName,
+  requirements,
+  reason,
+  note,
+  attachments,
+  attachmentIds,
+) {
+  return [
+    ...(Array.isArray(task.reworkHistory) ? task.reworkHistory : []),
+    {
+      attempt: (Array.isArray(task.reworkHistory) ? task.reworkHistory.length : 0) + 1,
+      reviewerId,
+      reviewerName,
+      requirements,
+      reason: (reason || "").trim(),
+      note: typeof note === "string" ? note.trim() : "",
+      attachments: readReworkAttachments(attachments),
+      attachmentIds: readReworkAttachmentIds(attachmentIds),
+      requestedAt: new Date().toISOString(),
+    },
+  ];
+}
+
+async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1301,6 +1630,9 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
   } else {
     // ── Rejected (all flows) — back to in_progress ────────────────────────
     if (!rejectionReason?.trim()) throw new Error("Rejection reason required.");
+    // What exactly failed. Enforced server-side — see `validateReworkRequirements`.
+    const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+    const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
     const tlReview = { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: false, rejectionReason: rejectionReason.trim(), reviewedAt: new Date().toISOString() };
 
     const isDeadlineMode = task.hasTimer === false;
@@ -1315,7 +1647,8 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
       newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
     }
 
-    await ref.update({ completionStatus: "tl_rejected", tlReview, status: "in_progress", [deadlineField]: newDeadline, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    await ref.update({ completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
+      completionStatus: "tl_rejected", tlReview, status: "in_progress", [deadlineField]: newDeadline, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
     await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ ${reviewerName} rejected.\n📝 Reason: ${rejectionReason.trim()}`, messageType: "system" });
 
     if (submitterId) {
@@ -1377,7 +1710,7 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
 // ═════════════════════════════════════════════════════════
 //  C1 REWORK — TL sends task back for rework (-0.2 per occurrence)
 // ═════════════════════════════════════════════════════════
-async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiveDeduction = false }) {
+async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiveDeduction = false, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1398,8 +1731,12 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
     newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
   }
 
+  // What exactly failed — enforced here, not only in the browser.
+  const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+  const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, reworkReason, reworkNote, reworkAttachments, reworkAttachmentIds);
   await ref.update({
-    completionStatus: null,
+    completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
+      completionStatus: null,
     status: "in_progress",
     [deadlineField]: newDeadline,
     "c1.reworksReceived": currentReworks + 1,
@@ -1456,7 +1793,7 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
 //  14. CEO FINAL REVIEW (only for tl_then_ceo flow)
 //  Called after TL has already approved (completionStatus === "tl_approved")
 // ═════════════════════════════════════════════════════════
-async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason }) {
+async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1482,7 +1819,11 @@ async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved,
     if (task.parentTaskId) await _syncParentProgress(task.parentTaskId);
   } else {
     if (!rejectionReason?.trim()) throw new Error("Rejection reason required.");
+    // What exactly failed. Enforced server-side — see `validateReworkRequirements`.
+    const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+    const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
     await ref.update({
+      completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
       completionStatus: "ceo_rejected", status: "in_progress",
       ceoReview: { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: false, rejectionReason: rejectionReason.trim(), reviewedAt: new Date().toISOString() },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1707,7 +2048,7 @@ function _workingSecsBetweenIST(startMs, endMs, schedule, breaks) {
   return total;
 }
 
-async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason }) {
+async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1834,6 +2175,8 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     socket.emitToMany(task.assigneeIds || [], "deadline_approved", { taskId, dueDate: newDueDate });
   } else {
     if (!rejectionReason?.trim()) throw new Error("Rejection reason is required.");
+    const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+    const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
     // ── Roll deadlineWindowSecs back to what it was before this proposal ──
     // proposeDeadline wrote the new proposed total into deadlineWindowSecs so
     // TL/CEO could see "X asked". On rejection that value must be reverted —
@@ -1844,6 +2187,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
       : (Number(task.originalWindowSecs) || 0) +
       ((task.extensions || []).reduce((s, e) => s + (Number(e.addedSecs) || 0), 0));
     await ref.update({
+      completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
       status: "open",
       deadlineWindowSecs: rolledBackWindowSecs,
       deadlineWindowSecsBeforeProposal: null,   // clear the snapshot
@@ -2380,6 +2724,13 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
 }
 
 module.exports = {
+  declineAssignment,
+  setActiveTaskBudget,
+  validateReworkRequirements,
+  readReworkAttachments,
+  readReworkAttachmentIds,
+  nextActiveRankFor,
+  assigneePrioritiesFor,
   createTask,
   createParentTask: createTask,
   confirmTaskReceipt,
