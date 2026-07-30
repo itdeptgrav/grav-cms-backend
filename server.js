@@ -1469,6 +1469,13 @@ app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
 app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
 
+// Time-budget negotiation loop: propose a counter (/task/:id/budget/counter),
+// or accept what stands (/task/:id/budget/accept).
+app.use("/cowork", require("./routes/task_routes/budgetNegotiation.js"));
+
+// Reference attachments: /cowork/attachments, /cowork/attachments/entity/:id.
+app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
+
 app.use(
   "/api/cowork/notifications",
   require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"),
