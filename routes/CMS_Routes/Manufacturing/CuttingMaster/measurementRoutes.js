@@ -233,9 +233,70 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
       .filter(Boolean);
 
     // ── Fetch all WOs for this MO ────────────────────────────────────────
+    // NOTE: unlike the Work Orders tab's own listing route, this fetches
+    // every WO regardless of status — a "Pending" WO's product must still
+    // show up here, so its image can't depend on that other, status-filtered
+    // fetch (that was the actual thumbnail bug: this tab used to borrow the
+    // Work Orders tab's already-loaded image map, which silently excluded
+    // pending WOs). Resolve the image directly from StockItem instead.
     const workOrders = await WorkOrder.find({ customerRequestId: moId })
-      .select("_id workOrderNumber stockItemName stockItemId")
+      .select("_id workOrderNumber stockItemName stockItemId variantId variantAttributes")
       .lean();
+
+    const stockItemIds = [
+      ...new Set(workOrders.map((w) => w.stockItemId?.toString()).filter(Boolean)),
+    ];
+    const stockItems = stockItemIds.length
+      ? await StockItem.find({ _id: { $in: stockItemIds } })
+          .select("images variants")
+          .lean()
+      : [];
+    const stockItemById = new Map(stockItems.map((si) => [si._id.toString(), si]));
+
+    const firstUrl = (arr) => (Array.isArray(arr) && arr[0]) || null;
+    const pickStockItemImage = (si, wo) => {
+      if (!si) return null;
+
+      // 1. This WO's own resolved variant — variantId first, then attribute
+      //    set — so a product with many differently-photographed variants
+      //    (color/size) shows the RIGHT one, not just any available image.
+      if (Array.isArray(si.variants)) {
+        let matched = null;
+        if (wo.variantId) {
+          matched = si.variants.find((v) => v._id?.toString() === wo.variantId?.toString());
+        }
+        if (!matched && wo.variantAttributes?.length) {
+          matched = si.variants.find((v) => {
+            const vAttrs = v.attributes || [];
+            if (vAttrs.length !== wo.variantAttributes.length) return false;
+            return wo.variantAttributes.every((wa) =>
+              vAttrs.some(
+                (va) =>
+                  String(va.name).toLowerCase() === String(wa.name).toLowerCase() &&
+                  String(va.value).toLowerCase() === String(wa.value).toLowerCase(),
+              ),
+            );
+          });
+        }
+        if (matched) {
+          const url = firstUrl(matched.images);
+          if (url) return url;
+        }
+      }
+
+      // 2. Product-level image
+      const topUrl = firstUrl(si.images);
+      if (topUrl) return topUrl;
+
+      // 3. Last resort — any variant that happens to have an image
+      if (Array.isArray(si.variants)) {
+        for (const v of si.variants) {
+          const url = firstUrl(v?.images);
+          if (url) return url;
+        }
+      }
+      return null;
+    };
 
     // ── Fetch progress docs for these employees on these WOs ─────────────
     const progressDocs = await EmployeeProductionProgress.find({
@@ -291,6 +352,7 @@ router.get("/manufacturing-orders/:moId/search-employees", async (req, res) => {
           completedUnits: progress.completedUnits || 0,
           completionPercentage: progress.completionPercentage || 0,
           isDispatched: progress.isDispatched || false,
+          stockItemImage: pickStockItemImage(stockItemById.get(wo.stockItemId?.toString()), wo),
         });
       }
 

@@ -1485,15 +1485,31 @@ router.put("/payment-submissions/:submissionId/status", async (req, res) => {
       if (status === 'verified' && previousStatus !== 'verified') {
         paymentStep.paidAmount = (paymentStep.paidAmount || 0) + submission.submittedAmount;
         paymentStep.paidDate = new Date();
+        // The customer-submission route intentionally leaves these alone until
+        // now — this is the ONE place a payment actually becomes "paid" on the
+        // request, gated on a sales person confirming it.
+        request.totalPaidAmount = (request.totalPaidAmount || 0) + submission.submittedAmount;
+        request.totalDueAmount = quotation.grandTotal - request.totalPaidAmount;
+        request.lastPaymentDate = new Date();
       } else if (previousStatus === 'verified' && status !== 'verified') {
         paymentStep.paidAmount = Math.max(0, (paymentStep.paidAmount || 0) - submission.submittedAmount);
+        request.totalPaidAmount = Math.max(0, (request.totalPaidAmount || 0) - submission.submittedAmount);
+        request.totalDueAmount = quotation.grandTotal - request.totalPaidAmount;
       }
       if (paymentStep.paidAmount >= paymentStep.amount) paymentStep.status = 'paid';
       else if (paymentStep.paidAmount > 0) paymentStep.status = 'partially_paid';
       else paymentStep.status = 'pending';
     }
+    request.updatedAt = new Date();
+    request.notes = request.notes || [];
+    request.notes.push({
+      text: `Payment submission of ₹${submission.submittedAmount} for ${paymentStep?.name || `Step ${submission.paymentStepNumber}`} marked ${status}${verificationNotes ? ` — ${verificationNotes}` : ""}.`,
+      addedBy: req.user.id,
+      addedByModel: "SalesDepartment",
+      createdAt: new Date(),
+    });
     await request.save();
-    res.json({ success: true, message: "Payment submission status updated", submission });
+    res.json({ success: true, message: "Payment submission status updated", submission, request });
   } catch (error) {
     console.error("Error updating payment submission:", error);
     res.status(500).json({ success: false, message: "Server error while updating payment submission" });

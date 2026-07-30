@@ -793,7 +793,7 @@ router.get("/emplloyeeTracking/:id", async (req, res) => {
     })
       .select(
         "workOrderNumber status quantity stockItemId stockItemName stockItemReference " +
-        "operations forwardedToVendor productionCompletion variantAttributes rawMaterials " +
+        "operations forwardedToVendor productionCompletion variantId variantAttributes rawMaterials " +
         "assignedDeadline"                                              // ← ADDED
       )
       .populate("stockItemId", "name reference genderCategory images variants")
