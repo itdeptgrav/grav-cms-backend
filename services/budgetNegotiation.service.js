@@ -66,12 +66,27 @@ function currentNegotiation(task) {
     return task.budgetNegotiation;
   }
   const opening = Number(task.senderTimerWindowSecs) || 0;
+  const assignee = (task.assigneeIds || [])[0] || null;
+  // A SELF task reverses the opening: the CREATOR (the assignee) proposed the
+  // budget when they made the task, and it is their MANAGER (the assigner of
+  // record, `assignedBy`) who approves or negotiates it — not the other way
+  // round. Without this the self-task opening read as "the manager proposed and
+  // you accept", when the manager has not even seen it yet.
+  const isSelf = task.isSelfAssigned === true || task.isSelfAssigned === "true";
   return {
-    state: opening > 0 ? WAITING_FOR_ASSIGNEE : null,
+    state:
+      opening > 0
+        ? isSelf
+          ? WAITING_FOR_ASSIGNOR
+          : WAITING_FOR_ASSIGNEE
+        : null,
     currentSecs: opening,
-    proposedBy: task.assignedBy || null,
-    proposedByName: task.assignedByName || "",
-    waitingFor: (task.assigneeIds || [])[0] || null,
+    proposedBy: isSelf ? assignee : task.assignedBy || null,
+    // The manager's name is stored (`assignedByName`); the assignee's is
+    // resolved on the client from the directory, so an empty string is right.
+    proposedByName: isSelf ? "" : task.assignedByName || "",
+    waitingFor: isSelf ? task.assignedBy || null : assignee,
+    waitingForName: isSelf ? task.assignedByName || "" : "",
     round: opening > 0 ? 1 : 0,
     history: [],
   };

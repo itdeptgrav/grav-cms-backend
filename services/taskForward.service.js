@@ -278,7 +278,7 @@ async function assigneePrioritiesFor(db, assigneeIds) {
   return map;
 }
 
-async function createTask({ title, description, notes, requirements = [], assignedBy, assignedByName, assignedByRole, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
+async function createTask({ title, description, notes, requirements = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
   pendingAssigneeId = null, pendingAssigneeName = null, departmentApprovals = null,
   isGoldTask = false,
   c2Config = null,
@@ -336,6 +336,10 @@ async function createTask({ title, description, notes, requirements = [], assign
     assignedBy,
     assignedByName: assignedByName || "",
     assignedByRole: assignedByRole || null,
+    // The person who actually CREATED the task, distinct from the assigner of
+    // record. For a self task these differ: the creator is the assignee, the
+    // assigner of record is their manager. The "Created by" display reads this.
+    createdBy: createdBy || assignedBy || null,
     actualCreatedBy,
     actualCreatedByName,
     rootCreatedByRole: resolvedRootRole,
