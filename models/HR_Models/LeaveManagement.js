@@ -186,6 +186,7 @@ const leaveApplicationSchema = new mongoose.Schema(
     ],
 
     hrApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
+    hrApprovedByName: { type: String, default: null },
     hrApprovedAt: { type: Date },
     hrRemarks: { type: String },
     rejectedBy: { type: mongoose.Schema.Types.ObjectId },
@@ -326,6 +327,7 @@ const regularizationRequestSchema = new mongoose.Schema(
       },
     ],
     hrApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
+    hrApprovedByName: { type: String, default: null },
     hrApprovedAt: { type: Date },
     hrRemarks: { type: String },
     rejectedBy: { type: mongoose.Schema.Types.ObjectId },

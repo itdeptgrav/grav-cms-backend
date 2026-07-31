@@ -78,17 +78,20 @@ const DEPARTMENTS = [
     description: "Packing, dispatch and delivery." },
 ];
 
-const PLATFORM_ADMIN = {
-  key: "platform_admin",
-  slug: "platform-admin",
-  name: "Platform Administration",
-  description: "Manage departments, access and users.",
-  dashboardPath: "/ceo/dashboard/access",
-  showOnOnboarding: false,
-  sortOrder: 0,
-  legacyRole: "platform_admin",
-  legacyUserType: "platform_admin",
-};
+// Platform administration is NOT a department.
+//
+// It used to be seeded as one, with a dashboardPath of /ceo/dashboard/access —
+// the same console the Executive Office tile opens. That gave the product two
+// admin identities for one place: an extra row in the department list, an extra
+// icon in the rail, and a second thing to keep in step.
+//
+// Administrator is a property of a PERSON, not a place: the `isAdmin` flag on
+// the account, which requirePlatformAdmin re-reads from the database on every
+// request. Access Control lives inside the Executive Office, where it always
+// did. Rows already created in a live database are left exactly where they are
+// — this seeder is additive and never deletes — but nothing new is created and
+// the API filters the slug out of the department list.
+const PLATFORM_ADMIN_SLUG = "platform-admin";
 
 /** The role literal most rows in a collection carry — never assumed. */
 function dominantRole(rows) {
@@ -189,12 +192,6 @@ async function ensureAccessDepartments(connection) {
         if (res.upsertedCount) usersCreated++;
       }
     }
-
-    await AccessDepartment.updateOne(
-      { key: PLATFORM_ADMIN.key },
-      { $setOnInsert: { ...PLATFORM_ADMIN, isSystem: true, isActive: true } },
-      { upsert: true },
-    );
 
     if (departmentsCreated || usersCreated) {
       console.log(

@@ -34,6 +34,10 @@ const EmployeeAuthMiddleware = (req, res, next) => {
       id: decoded.id,
       role: decoded.role,
       employeeId: decoded.employeeId,
+      // Carried through for audit logging — the token holds these and dropping
+      // them meant every change log recorded an id with no name against it.
+      name: decoded.name || "",
+      email: decoded.email || "",
     };
 
     next();
