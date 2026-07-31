@@ -18,6 +18,13 @@
 "use strict";
 
 require("dotenv").config();
+
+// `mongodb+srv://` needs a DNS SRV lookup at connect time. On networks whose
+// resolver refuses SRV queries the driver dies with "querySrv ECONNREFUSED"
+// before it ever reaches Atlas. Point the resolver this script uses at public
+// DNS so the lookup succeeds regardless of the machine's configured resolver.
+try { require("dns").setServers(["1.1.1.1", "8.8.8.8"]); } catch { /* older node */ }
+
 const mongoose = require("mongoose");
 
 const Employee = require("../models/Employee");

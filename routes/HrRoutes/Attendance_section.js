@@ -10,6 +10,7 @@ const Employee = require("../../models/Employee");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 const mongoose = require("mongoose");
+const { recordChange } = require("../../services/changeLog");
 require("../../models/HR_Models/LeaveManagement");
 function getCompanyHoliday() {
   return mongoose.model("CompanyHoliday");
@@ -2143,6 +2144,36 @@ router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+// GET /hr/attendance/day-range?from=YYYY-MM-DD&to=YYYY-MM-DD
+// One cheap query for a whole year's per-day present counts — powers the overview
+// heatmap (a full-year contribution grid) WITHOUT firing one request per day.
+// Reads the already-synced per-day summaries; never triggers a device sync.
+router.get("/day-range", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const from = String(req.query.from || "").slice(0, 10);
+    const to = String(req.query.to || "").slice(0, 10);
+    if (!from || !to) {
+      return res.status(400).json({ success: false, message: "from and to are required" });
+    }
+    const docs = await DailyAttendance.find({ dateStr: { $gte: from, $lte: to } })
+      .select("dateStr summary holiday")
+      .sort({ dateStr: 1 })
+      .lean();
+
+    const days = docs.map((d) => ({
+      date: d.dateStr,
+      present: d.summary?.presentCount || 0,
+      total: d.summary?.total || 0,
+      holiday: d.holiday?.name ? { name: d.holiday.name, statusCode: d.holiday.statusCode } : null,
+    }));
+
+    res.status(200).json({ success: true, from, to, days });
+  } catch (err) {
+    console.error("[DAY-RANGE]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/departments", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const [a, b, c] = await Promise.all([
@@ -3402,10 +3433,15 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
 
     const emp = dayDoc.employees[empIdx];
     const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
+    // Read before the assignment below overwrites it — the change log needs the
+    // value as it was, and two lines later it is gone.
+    const previousRemarks = emp.hrRemarks || "";
 
     if (hrFinalStatus !== undefined) emp.hrFinalStatus = hrFinalStatus || null;
     if (hrRemarks !== undefined) emp.hrRemarks = hrRemarks || null;
     emp.hrReviewedAt = new Date();
+    // Record WHO edited — the actual signed-in user, not a flat "HR".
+    emp.hrReviewedBy = req.user?.name || req.user?.email || "HR";
 
     const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
     const punchChanges = [];
@@ -3616,6 +3652,26 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     } catch (leaveErr) {
       console.error("[DAY-OVERRIDE] Leave sync error:", leaveErr.message);
     }
+
+    // Who changed this attendance day, and from what to what.
+    //
+    // HR is the first department on the change log. An overridden attendance
+    // day moves leave balances and payroll, so "somebody set this to LAB" was
+    // never a good enough answer — this makes it a name and a time. Never
+    // awaited into the response path: a failed log entry is a gap in history,
+    // a failed save because of it is lost work.
+    recordChange(req, {
+      departmentSlug: "hr",
+      entity: "attendance",
+      entityId: `${biometricId}:${dateStr}`,
+      entityLabel: `${biometricId} on ${dateStr}`,
+      action: "update",
+      summary: `Attendance for ${biometricId} on ${dateStr} set to ${
+        hrFinalStatus || "(cleared)"
+      }`,
+      before: { status: oldStatus, remarks: previousRemarks },
+      after: { status: hrFinalStatus || null, remarks: hrRemarks || "" },
+    });
 
     res.json({
       success: true,
@@ -3842,8 +3898,12 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
         .json({ success: false, message: "dateStr and updates[] required" });
     let ok = 0,
       fail = 0;
+    const reviewer = req.user?.name || req.user?.email || "HR";
     for (const u of updates) {
-      const set = { "employees.$.hrReviewedAt": new Date() };
+      const set = {
+        "employees.$.hrReviewedAt": new Date(),
+        "employees.$.hrReviewedBy": reviewer,
+      };
       if (u.hrFinalStatus !== undefined)
         set["employees.$.hrFinalStatus"] = u.hrFinalStatus || null;
       if (u.hrRemarks !== undefined)
@@ -6652,7 +6712,7 @@ router.patch(
                     time: newDate,
                     punchType: r.proposedPunchType,
                     source: "miss_punch",
-                    addedBy: req.user?.id,
+                    addedBy: req.user?.name || req.user?.email || req.user?.id,
                     addedAt: new Date(),
                   };
                   if (existingIdx >= 0)
@@ -6695,7 +6755,7 @@ router.patch(
                   time: newDate,
                   punchType: pc.punchType,
                   source: "miss_punch",
-                  addedBy: req.user?.id,
+                  addedBy: req.user?.name || req.user?.email || req.user?.id,
                   addedAt: new Date(),
                 };
                 if (existingIdx >= 0)
