@@ -2066,6 +2066,21 @@ router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeT
   try {
     const { approved, rejectionReason, explicitDueDate, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     if (typeof approved !== "boolean") return res.status(400).json({ error: "approved (boolean) required" });
+    // On the record-based flow the assignee's PRIMARY MANAGER owns the date (a
+    // cross-department extension is decided inside the assignee's management
+    // chain, not by the assignor). Resolve them so the service can allow it.
+    let assigneeManagerId = null;
+    if (explicitDueDate) {
+      try {
+        const tSnap = await db.collection("cowork_tasks").doc(req.params.taskId).get();
+        const t = tSnap.exists ? tSnap.data() : null;
+        const assigneeId = t?.pendingAssigneeId || (Array.isArray(t?.assigneeIds) ? t.assigneeIds[0] : null);
+        if (assigneeId) {
+          const mgr = await _getPrimaryManagerApprover(assigneeId);
+          assigneeManagerId = mgr?.approverId ?? null;
+        }
+      } catch (e) { console.warn("[approve-deadline manager resolve]", e.message); }
+    }
     const result = await svc.approveDeadline({
       taskId: req.params.taskId,
       approverId: req.coworkUser.employeeId,
@@ -2075,6 +2090,8 @@ router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeT
       // Set by the record-based deadline-extension flow, which applies the agreed
       // date directly rather than through the on-task pending_deadline_approval state.
       explicitDueDate: explicitDueDate || null,
+      // The assignee's manager (Option A: they own the date, not the assignor).
+      assigneeManagerId,
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
