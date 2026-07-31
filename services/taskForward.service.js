@@ -2052,24 +2052,30 @@ function _workingSecsBetweenIST(startMs, endMs, schedule, breaks) {
   return total;
 }
 
-async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason, explicitDueDate, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
+async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason, explicitDueDate, assigneeManagerId, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
   const task = doc.data();
-
-  // Only the creator can approve/reject
-  if (task.assignedBy !== approverId) throw new Error("Only the task creator can approve or reject the deadline.");
 
   // ── Record-based deadline-extension approve ────────────────────────────────
   // The current deadline-extension flow keeps its pending state in the
   // `cowork_task_deadline_extensions` collection, NOT on the task — so the task
   // is never moved into `pending_deadline_approval`, and the status gate below
   // would (wrongly) throw "No pending deadline proposal." for every one of these.
-  // When the assignor approves such a request the agreed date is passed in
-  // explicitly and applied here directly. This is a DATE-only decision: the
-  // window (hours) is a separate record and is left untouched.
+  // When the request is approved the agreed date is passed in explicitly and
+  // applied here directly. This is a DATE-only decision: the window (hours) is a
+  // separate record and is left untouched.
+  //
+  // WHO may move it: the assignee's PRIMARY MANAGER owns the date, not only the
+  // assignor — a cross-department extension is decided entirely inside the
+  // assignee's management chain. `assigneeManagerId` is resolved from HR by the
+  // route; either they or the assignor (assignedBy) may apply the date.
   if (explicitDueDate) {
+    const mayMove =
+      approverId === task.assignedBy ||
+      (assigneeManagerId && approverId === assigneeManagerId);
+    if (!mayMove) throw new Error("Only the assignee's manager or the task creator can move this deadline.");
     if (!approved) {
       // A refusal on this flow changes nothing on the task; the extension record
       // carries the refusal. Nothing to write here.
@@ -2102,6 +2108,10 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     } catch (e) { console.error("[approveDeadline explicit notify]", e.message); }
     return { success: true, taskId, dueDate: explicitDueDate, approved: true };
   }
+
+  // The legacy on-task flow (proposeDeadline → pending_deadline_approval): only
+  // the creator decides here.
+  if (task.assignedBy !== approverId) throw new Error("Only the task creator can approve or reject the deadline.");
 
   if (task.status !== "pending_deadline_approval") throw new Error("No pending deadline proposal.");
 
