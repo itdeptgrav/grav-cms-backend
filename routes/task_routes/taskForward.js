@@ -358,6 +358,10 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       assignedBy: effectiveAssignedBy,
       assignedByName: effectiveAssignedByName,
       assignedByRole: effectiveAssignedByRole,
+      // The REAL creator — the person who clicked create. Differs from
+      // `assignedBy` only for a self task, where the assigner of record is the
+      // creator's manager but the "Created by" credit stays with the creator.
+      createdBy: req.coworkUser.employeeId,
       assigneeIds: departmentApprovalGate ? [] : (assigneeIds || []),
       dueDate: null,
       priority: autoPriority,
@@ -1453,6 +1457,9 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       assignedBy: subAssignedBy,
       assignedByName: subAssignedByName,
       assignedByRole: subAssignedByRole,
+      // Real creator (the person breaking the work out), distinct from the
+      // assigner of record when a self subtask is manager-mediated.
+      createdBy: req.coworkUser.employeeId,
       assigneeIds,
       dueDate: null,
       priority: subtaskPriority,
