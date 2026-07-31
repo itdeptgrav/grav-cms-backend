@@ -2064,7 +2064,7 @@ router.post("/task/:taskId/reject-sender-timer", verifyCoworkToken, verifyEmploy
 // ── APPROVE / REJECT DEADLINE (task creator only) ─────────────────────────────
 router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
+    const { approved, rejectionReason, explicitDueDate, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     if (typeof approved !== "boolean") return res.status(400).json({ error: "approved (boolean) required" });
     const result = await svc.approveDeadline({
       taskId: req.params.taskId,
@@ -2072,6 +2072,9 @@ router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeT
       approverName: req.coworkUser.name,
       approved,
       rejectionReason: rejectionReason || "",
+      // Set by the record-based deadline-extension flow, which applies the agreed
+      // date directly rather than through the on-task pending_deadline_approval state.
+      explicitDueDate: explicitDueDate || null,
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }

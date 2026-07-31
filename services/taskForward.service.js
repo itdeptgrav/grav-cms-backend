@@ -2052,7 +2052,7 @@ function _workingSecsBetweenIST(startMs, endMs, schedule, breaks) {
   return total;
 }
 
-async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
+async function approveDeadline({ taskId, approverId, approverName, approved, rejectionReason, explicitDueDate, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -2060,6 +2060,49 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
 
   // Only the creator can approve/reject
   if (task.assignedBy !== approverId) throw new Error("Only the task creator can approve or reject the deadline.");
+
+  // ── Record-based deadline-extension approve ────────────────────────────────
+  // The current deadline-extension flow keeps its pending state in the
+  // `cowork_task_deadline_extensions` collection, NOT on the task — so the task
+  // is never moved into `pending_deadline_approval`, and the status gate below
+  // would (wrongly) throw "No pending deadline proposal." for every one of these.
+  // When the assignor approves such a request the agreed date is passed in
+  // explicitly and applied here directly. This is a DATE-only decision: the
+  // window (hours) is a separate record and is left untouched.
+  if (explicitDueDate) {
+    if (!approved) {
+      // A refusal on this flow changes nothing on the task; the extension record
+      // carries the refusal. Nothing to write here.
+      return { success: true, taskId, dueDate: task.dueDate ?? null, approved: false };
+    }
+    await ref.update({
+      dueDate: explicitDueDate,
+      deadlineApprovedBy: approverId,
+      deadlineApprovedByName: approverName,
+      deadlineApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
+      deadlineProposalRejected: false,
+      deadlineRejectionReason: null,
+      deadlineStatus: deadlineStatus(explicitDueDate),
+      deadlineColor: deadlineColor(explicitDueDate),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    try {
+      await sendDraftChat({
+        taskId, senderId: approverId, senderName: approverName,
+        text: `✅ ${approverName} approved the revised deadline.`,
+        messageType: "system",
+      });
+      await _notifyMany({
+        recipientIds: task.assigneeIds || [],
+        type: "deadline_approved",
+        title: `✅ Deadline Approved · ${task.title}`,
+        body: `Your revised deadline was approved.`,
+        data: { taskId, taskTitle: task.title },
+      });
+    } catch (e) { console.error("[approveDeadline explicit notify]", e.message); }
+    return { success: true, taskId, dueDate: explicitDueDate, approved: true };
+  }
+
   if (task.status !== "pending_deadline_approval") throw new Error("No pending deadline proposal.");
 
   // Determine what status to restore after approval
