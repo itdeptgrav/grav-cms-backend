@@ -316,21 +316,40 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     }
     if (!autoPriority) autoPriority = 1;
 
-    // Self-assigned tasks: the chosen approver is treated as the actual
-    // assigner of record, not the employee who submitted the request. This
-    // only changes who the task is attributed to — it does not change any
-    // approval-gate logic above, which still correctly evaluates based on
-    // the real requester.
+    // Self-assigned tasks: the counterparty is the assignee's PRIMARY MANAGER,
+    // recorded as the assigner of record. The creator cannot negotiate a time
+    // budget with, set the priority of, or review their OWN work, so their
+    // manager stands on the other side of every one of those turns (budget
+    // negotiation reads `assignedBy`, `_reviewFlow` notifies `assignedBy`, and
+    // priority is the manager's by the reporting-line rule). The manager is
+    // resolved from HR — the form shows no approver field. An explicit approverId
+    // still wins if a client sends one. Someone with NO manager on file (e.g. the
+    // CEO) stays their own approver, matching the priority rule that only binds
+    // people who have a manager. This changes ATTRIBUTION only; the approval
+    // gates above still evaluate against the real requester.
     let effectiveAssignedBy = req.coworkUser.employeeId;
     let effectiveAssignedByName = req.coworkUser.name;
     let effectiveAssignedByRole = requesterRole;
+    let selfApproverId = approverId || null;
+    let selfApproverName = approverName || null;
     const isSelfAssignedReq = isSelfAssigned === true || isSelfAssigned === "true";
-    if (isSelfAssignedReq && approverId) {
-      const approverInfo = await getEmployeeInfo(approverId);
-      if (approverInfo) {
-        effectiveAssignedBy = approverId;
-        effectiveAssignedByName = approverName || approverInfo.name;
-        effectiveAssignedByRole = approverInfo.role || "tl";
+    if (isSelfAssignedReq) {
+      if (!selfApproverId) {
+        const selfAssigneeId =
+          (Array.isArray(assigneeIds) && assigneeIds[0]) || req.coworkUser.employeeId;
+        const mgr = await _getPrimaryManagerApprover(selfAssigneeId);
+        if (mgr && mgr.approverId) {
+          selfApproverId = mgr.approverId;
+          selfApproverName = mgr.approverName;
+        }
+      }
+      if (selfApproverId && selfApproverId !== req.coworkUser.employeeId) {
+        const approverInfo = await getEmployeeInfo(selfApproverId);
+        if (approverInfo) {
+          effectiveAssignedBy = selfApproverId;
+          effectiveAssignedByName = selfApproverName || approverInfo.name;
+          effectiveAssignedByRole = approverInfo.role || "tl";
+        }
       }
     }
 
@@ -365,8 +384,10 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       fixedDeadline: fixedDeadline || null,
       isSelfAssigned: isSelfAssigned === true || isSelfAssigned === "true",
       visibleTo: Array.isArray(visibleTo) ? visibleTo : (visibleTo ? [visibleTo] : []),
-      approverId: approverId || null,
-      approverName: approverName || null,
+      // The self-task approver — resolved to the assignee's primary manager above
+      // when the client sent none — so the manager owns the approval/review too.
+      approverId: selfApproverId,
+      approverName: selfApproverName,
       // Mark whether this is a CEO-created root task (for visibility filtering)
       createdByCeo: requesterRole === "ceo" && !parentTaskId,
       createdByTl: requesterRole === "tl",
@@ -1368,7 +1389,10 @@ router.get("/task/:taskId/forward-budget", verifyCoworkToken, verifyEmployeeToke
 // ── 6. CREATE SUBTASK ─────────────────────────────────────────────────────────
 router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, priority } = req.body;
+    // A subtask follows the SAME lifecycle as a standard task — the timer/budget
+    // negotiation, priority and review all apply — so it carries the same fields
+    // rather than a truncated set that dropped the budget silently.
+    const { title, description, notes, assigneeIds, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
@@ -1381,6 +1405,32 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       || parent.assigneeIds?.includes(employeeId)
       || parent.assignedBy === employeeId;
     if (!canCreate) return res.status(403).json({ error: "Not authorized to create subtasks here." });
+
+    // Self-assigned subtask (you break your own work into a piece for yourself):
+    // the counterparty is the assignee's PRIMARY MANAGER, exactly like a self
+    // task — you cannot negotiate a budget with or review your own subtask. For a
+    // subtask delegated to someone ELSE, the creator stays the assigner of record.
+    let subAssignedBy = employeeId;
+    let subAssignedByName = name;
+    let subAssignedByRole = requesterRole;
+    let subApproverId = approverId || null;
+    let subApproverName = approverName || null;
+    const subIsSelf = (isSelfAssigned === true || isSelfAssigned === "true")
+      || (assigneeIds.length === 1 && assigneeIds[0] === employeeId);
+    if (subIsSelf) {
+      if (!subApproverId) {
+        const mgr = await _getPrimaryManagerApprover(assigneeIds[0]);
+        if (mgr && mgr.approverId) { subApproverId = mgr.approverId; subApproverName = mgr.approverName; }
+      }
+      if (subApproverId && subApproverId !== employeeId) {
+        const approverInfo = await getEmployeeInfo(subApproverId);
+        if (approverInfo) {
+          subAssignedBy = subApproverId;
+          subAssignedByName = subApproverName || approverInfo.name;
+          subAssignedByRole = approverInfo.role || "tl";
+        }
+      }
+    }
 
     // Per-person auto-priority for subtask
     let subtaskAssigneePriorities = {};
@@ -1400,9 +1450,9 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
 
     const subtask = await svc.createTask({
       title: title.trim(), description, notes,
-      assignedBy: employeeId,
-      assignedByName: name,
-      assignedByRole: requesterRole,
+      assignedBy: subAssignedBy,
+      assignedByName: subAssignedByName,
+      assignedByRole: subAssignedByRole,
       assigneeIds,
       dueDate: null,
       priority: subtaskPriority,
@@ -1411,6 +1461,15 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       // TL subtasks should NOT show in CEO tree
       createdByTl: requesterRole === "tl",
       createdByCeo: requesterRole === "ceo",
+      // Standard-flow parity: the timer/budget negotiation applies (assignee
+      // proposes within the budget, the assigner of record decides), and a self
+      // subtask is approved & reviewed by the assignee's manager.
+      hasTimer: hasTimer !== false && hasTimer !== "false",
+      fixedDeadline: fixedDeadline || null,
+      senderTimerWindowSecs: Number(senderTimerWindowSecs) || 0,
+      isSelfAssigned: subIsSelf,
+      approverId: subApproverId,
+      approverName: subApproverName,
     });
 
     // Post chat notification in parent task (visible to CEO + TL)
