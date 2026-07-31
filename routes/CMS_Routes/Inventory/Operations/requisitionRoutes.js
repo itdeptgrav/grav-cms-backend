@@ -6,6 +6,7 @@
 
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 const Requisition = require("../../../../models/CMS_Models/Inventory/Operations/Requisition");
 const Employee = require("../../../../models/Employee");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
@@ -159,6 +160,7 @@ router.post("/", async (req, res) => {
       items, department, requiredBy, reason, notes, priority,
       requestedByEmployee, requestedByName, requestedById,
       pettyCashAmount, pettyCashGivenTo, pettyCashGivenToEmployee, pettyCashNote,
+      sourceMrfId, sourceMrfNumber,
     } = req.body;
 
     const { items: cleaned, error } = cleanItems(items);
@@ -221,6 +223,8 @@ router.post("/", async (req, res) => {
       status: "SUBMITTED",
       createdByRef: getActorId(req),
       createdByName: actorName(req),
+      sourceMrfId: mongoose.Types.ObjectId.isValid(sourceMrfId) ? sourceMrfId : null,
+      sourceMrfNumber: String(sourceMrfNumber || "").trim(),
     });
 
     await requisition.save();
