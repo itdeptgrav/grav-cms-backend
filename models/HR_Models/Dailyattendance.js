@@ -144,6 +144,9 @@ const employeeEntrySchema = new mongoose.Schema(
     },
     hrRemarks: { type: String, default: null },
     hrReviewedAt: { type: Date, default: null },
+    // Who made the override — the actual signed-in user's name (falls back to
+    // their email, then a generic label). Shown in the UI instead of a flat "HR".
+    hrReviewedBy: { type: String, default: null },
 
     shiftStart: { type: String, default: "09:30" },
     shiftEnd: { type: String, default: "18:30" },

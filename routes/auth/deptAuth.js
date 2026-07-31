@@ -327,12 +327,20 @@ async function attachAccountantSession(res, dept, email, issuedAt = null) {
   }
 }
 
-function buildTokenPayload(user, dept) {
+/**
+ * @param adoptDeptRole  Take the role from `dept` rather than from the user's
+ *   own frozen legacy literal. Used when an administrator opens a department
+ *   other than their own: carrying "ceo" into the Sales dashboard would make
+ *   every role check there read the wrong answer. Only ever set for an admin,
+ *   and only for a department the server has just re-verified.
+ */
+function buildTokenPayload(user, dept, { adoptDeptRole = false } = {}) {
   return {
     v: 2,
     id: String(user._id),
     // Frozen legacy literal — this is what every existing role check reads.
-    role: user.legacyRole || dept?.legacyRole || dept?.slug || "",
+    role: (adoptDeptRole ? null : user.legacyRole) ||
+      dept?.legacyRole || dept?.slug || "",
     userType: dept?.legacyUserType || dept?.slug || "",
     // The new, dynamic identity. `dept` is always present on this path (a
     // DeptUser cannot exist without one), so the static fallback is only a
@@ -808,6 +816,7 @@ router.post("/verify", async (req, res) => {
           email: accUser.email,
           role: dept.legacyRole || "accountant",
           accountantRole: accUser.role,
+          deptRole: accUser.role,
           employeeId: "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -875,6 +884,7 @@ router.post("/verify", async (req, res) => {
           name: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
           email: employee.email,
           role: dept.legacyRole || dept.slug,
+          deptRole: await require("../../services/departmentRoles").getRole(dept.slug, employee.email),
           employeeId: employee.biometricId || "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -908,10 +918,23 @@ router.post("/verify", async (req, res) => {
         return res.status(401).json({ success: false, message: "Session expired" });
       }
 
-      const dept = await AccessDepartment.findById(user.departmentId);
+      // An admin's session may be pointed at a department other than the one
+      // their account belongs to (see switch-department). Everyone else is read
+      // from their own record, so a hand-edited token cannot move them.
+      const dept = user.isAdmin && decoded.deptId
+        ? await AccessDepartment.findById(decoded.deptId)
+        : await AccessDepartment.findById(user.departmentId);
+
       if (!dept || !dept.isActive) {
         return res.status(401).json({ success: false, message: "Department is not active" });
       }
+
+      // Accounting needs its module token here too, or an admin who switched
+      // into it arrives holding only the CMS token and the module reads their
+      // department role instead of their accounting one.
+      const accSession = await attachAccountantSession(
+        res, dept, user.email, decoded.iat,
+      );
 
       return res.status(200).json({
         success: true,
@@ -919,7 +942,14 @@ router.post("/verify", async (req, res) => {
           id: user._id,
           name: user.name,
           email: user.email,
-          role: user.legacyRole || dept.legacyRole || dept.slug,
+          // Matches what the token carries — an admin viewing another
+          // department reports THAT department's role, not their own, or the
+          // page and the token would disagree about who is asking.
+          role:
+            (user.isAdmin && String(dept._id) !== String(user.departmentId)
+              ? null
+              : user.legacyRole) || dept.legacyRole || dept.slug,
+          deptRole: await require("../../services/departmentRoles").getRole(dept.slug, user.email),
           employeeId: user.employeeId || "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -928,6 +958,28 @@ router.post("/verify", async (req, res) => {
           mustChangePassword: user.mustChangePassword,
         },
         department: dept.toPublicTile(),
+        // What this account may open.
+        //
+        // This was missing entirely, and the portal reads it to decide which
+        // tiles are live — so a signed-in department account saw the whole grid
+        // greyed out, including the CEO, who can open everything.
+        //
+        // An administrator gets every active department, which is not a new
+        // grant: DepartmentGuard and every /api/admin route already admit an
+        // admin anywhere. The grid was simply the one place that did not say so.
+        // Administration is not a department — see ensureAccessDepartments.
+        // The legacy row may still exist in a live database, so it is filtered
+        // here rather than deleted; Access Control lives inside the Executive
+        // Office and an admin reaches it there.
+        departments: user.isAdmin
+          ? (await AccessDepartment.find({
+              isActive: true,
+              slug: { $ne: "platform-admin" },
+            }).sort({ sortOrder: 1, name: 1 }))
+              .map((d) => d.toPublicTile())
+          : [dept.toPublicTile()],
+        accountantRole: accSession?.role || null,
+        accountantToken: accSession?.token || null,
       });
     }
 
@@ -951,6 +1003,7 @@ router.post("/verify", async (req, res) => {
         name: legacyUser.name,
         email: legacyUser.email,
         role: legacyUser.role,
+        deptRole: dept ? await require("../../services/departmentRoles").getRole(dept.slug, legacyUser.email) : null,
         employeeId: legacyUser.employeeId,
         department: legacyUser.department,
         deptSlug: resolveSlug(dept, userType),
@@ -1149,10 +1202,21 @@ router.post("/switch-department", async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const dept = await AccessDepartment.findById(user.departmentId);
+    const own = await AccessDepartment.findById(user.departmentId);
+
+    // An administrator may open any active department — the route guard and
+    // every /api/admin route already admit them anywhere, so refusing here
+    // just meant the portal showed a tile that then would not open.
+    const dept = user.isAdmin
+      ? await AccessDepartment.findOne({ slug, isActive: true })
+      : own;
+
     if (!dept || dept.slug !== slug || !dept.isActive) return deny();
 
-    const fresh = signToken(buildTokenPayload(user, dept));
+    const adoptDeptRole =
+      Boolean(user.isAdmin) && String(dept._id) !== String(user.departmentId);
+
+    const fresh = signToken(buildTokenPayload(user, dept, { adoptDeptRole }));
     res.cookie(COOKIE_NAME, fresh, cookieOptions());
     const accSession = await attachAccountantSession(
       res, dept, user.email, decoded.iat,

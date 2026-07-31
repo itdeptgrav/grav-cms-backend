@@ -5,6 +5,7 @@ const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const emailService = require("../../services/emailService");
+const { recordChange } = require("../../services/changeLog");
 const {
   encryptSalaryFields,
   decryptSalaryFields,
@@ -215,11 +216,31 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
       password: temporaryPassword,
       temporaryPassword: temporaryPassword,
       createdBy: user.id,
+      createdByName: user.name || "",
       createdAt: new Date(),
     });
 
     await newEmployee.save();
     console.log("Employee saved with ID:", newEmployee._id);
+
+    // Audit: who created this employee. Fire-and-forget — recordChange never
+    // throws and must never delay or fail the create it is recording.
+    const createdName =
+      `${newEmployee.firstName || ""} ${newEmployee.lastName || ""}`.trim();
+    recordChange(req, {
+      departmentSlug: "hr",
+      entity: "employee",
+      entityId: newEmployee._id,
+      entityLabel: createdName,
+      action: "create",
+      summary: `Created employee ${createdName}`,
+      after: {
+        name: createdName,
+        department: newEmployee.department,
+        designation: newEmployee.designation || newEmployee.jobTitle,
+        biometricId: newEmployee.biometricId,
+      },
+    });
 
     // Send welcome email asynchronously
     if (process.env.ENABLE_EMAILS === "true" && employeeData.email) {
@@ -314,6 +335,13 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         .json({ success: false, message: "Permission denied" });
     }
 
+    // Snapshot the non-sensitive fields before the write, so the change log can
+    // diff old against new. Salary/PAN are never read here — the log redacts
+    // them regardless, and this whitelist keeps them out to begin with.
+    const beforeDoc = await Employee.findById(id)
+      .select("firstName lastName department designation jobTitle status email phone")
+      .lean();
+
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
     if (
       updateData.profilePhoto &&
@@ -356,6 +384,11 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       (f) => delete updateData[f],
     );
 
+    // Stamp who last edited (findByIdAndUpdate treats these as $set).
+    updateData.updatedBy = user.id;
+    updateData.updatedByName = user.name || "";
+    updateData.updatedAt = new Date();
+
     // Sanitize empty-string ObjectId fields to prevent BSONError cast failures
     if (updateData.departmentId === "" || updateData.departmentId === null) {
       delete updateData.departmentId;
@@ -388,6 +421,36 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+
+    // Audit: who last edited, and which display fields moved.
+    const updatedName =
+      `${updated.firstName || ""} ${updated.lastName || ""}`.trim();
+    recordChange(req, {
+      departmentSlug: "hr",
+      entity: "employee",
+      entityId: id,
+      entityLabel: updatedName,
+      action: "update",
+      summary: `Updated employee ${updatedName}`,
+      before: beforeDoc
+        ? {
+            department: beforeDoc.department,
+            designation: beforeDoc.designation,
+            jobTitle: beforeDoc.jobTitle,
+            status: beforeDoc.status,
+            email: beforeDoc.email,
+            phone: beforeDoc.phone,
+          }
+        : undefined,
+      after: {
+        department: updated.department,
+        designation: updated.designation,
+        jobTitle: updated.jobTitle,
+        status: updated.status,
+        email: updated.email,
+        phone: updated.phone,
+      },
+    });
 
     // Decrypt salary before sending to client
     const decryptedDoc = decryptEmployeeDoc(updated);
@@ -976,7 +1039,15 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // AFTER: direct update, runValidators:false — only touches these two fields
     const employee = await Employee.findByIdAndUpdate(
       req.params.id,
-      { $set: { isActive: false, status: "inactive" } },
+      {
+        $set: {
+          isActive: false,
+          status: "inactive",
+          updatedBy: user.id,
+          updatedByName: user.name || "",
+          updatedAt: new Date(),
+        },
+      },
       { new: true, runValidators: false },
     );
 
@@ -984,6 +1055,18 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+
+    // Audit: who deactivated this employee.
+    recordChange(req, {
+      departmentSlug: "hr",
+      entity: "employee",
+      entityId: req.params.id,
+      entityLabel: `${employee.firstName || ""} ${employee.lastName || ""}`.trim(),
+      action: "delete",
+      summary: "Deactivated employee",
+      before: { status: "active" },
+      after: { status: "inactive" },
+    });
 
     res
       .status(200)

@@ -364,6 +364,13 @@ const employeeSchema = new mongoose.Schema({
 
   // ─── SYSTEM ──────────────────────────────────────────────────────────────────
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "HRDepartment" },
+  // Denormalised actor names, so "who created / who last edited" reads without a
+  // join and stays correct even if that account is later renamed or removed.
+  // The authoritative per-edit trail lives in the change_logs collection; these
+  // two are the convenience copy shown on the record itself.
+  createdByName: { type: String, default: "" },
+  updatedBy: { type: mongoose.Schema.Types.ObjectId },
+  updatedByName: { type: String, default: "" },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
 });
