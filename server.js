@@ -1072,6 +1072,11 @@ app.use(
   require("./routes/CMS_Routes/Configurations/measurementCategoryRoutes"),
 );
 
+app.use(
+  "/api/cms/measurement-templates",
+  require("./routes/CMS_Routes/Configurations/measurementTemplateRoutes"),
+);
+
 // Manufacturing Routes
 const manufacturingOrderRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/manufacturingOrderRoutes");
 app.use(
