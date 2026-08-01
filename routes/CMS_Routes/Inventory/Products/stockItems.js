@@ -65,7 +65,13 @@ async function processVariantRawItems(rawItemsInput) {
   const processedRawItems = [];
   if (!rawItemsInput || !Array.isArray(rawItemsInput) || !rawItemsInput.length) return processedRawItems;
 
-  const validInputs = rawItemsInput.filter(ri => ri.rawItemId && parseFloat(ri.quantity) > 0);
+  // requiredQuantity/allowancePercent drive the effective quantity — see below.
+  // Legacy callers that only send `quantity` (no breakdown) fall back to
+  // requiredQuantity = quantity, allowancePercent = 0, same as before.
+  const validInputs = rawItemsInput.filter(ri => {
+    const req = ri.requiredQuantity != null ? parseFloat(ri.requiredQuantity) : parseFloat(ri.quantity);
+    return ri.rawItemId && req > 0;
+  });
   if (!validInputs.length) return processedRawItems;
 
   // ── ONE batch query instead of N sequential findById calls ───────────────
@@ -117,17 +123,28 @@ async function processVariantRawItems(rawItemsInput) {
       if (v) variantCombination = v.combination || [];
     }
 
+    // Effective/consumed qty is always derived server-side from the
+    // required-qty + allowance-% breakdown, not trusted verbatim from the
+    // client, so the two can never drift apart.
+    const requiredQuantity = rawItem.requiredQuantity != null ? parseFloat(rawItem.requiredQuantity) : parseFloat(rawItem.quantity);
+    const allowancePercent = parseFloat(rawItem.allowancePercent) || 0;
+    // Rounded to 4dp so multiplying by a % doesn't leave binary-float noise
+    // like 3.3000000000000003 sitting in the DB / on the view page.
+    const finalQuantity = Math.round(requiredQuantity * (1 + allowancePercent / 100) * 10000) / 10000;
+
     processedRawItems.push({
       rawItemId:          rawItemData._id,
       rawItemName:        rawItemData.name,
       rawItemSku:         rawItemData.sku,
       variantId:          rawItem.variantId || rawItemData._id,
       variantCombination,
-      quantity:           parseFloat(rawItem.quantity),
+      requiredQuantity,
+      allowancePercent,
+      quantity:           finalQuantity,
       unit:               chosenUnit,
       baseUnit,
       unitCost:           finalUnitCost,
-      totalCost:          parseFloat(rawItem.quantity) * finalUnitCost,
+      totalCost:          finalQuantity * finalUnitCost,
     });
   }
   return processedRawItems;
