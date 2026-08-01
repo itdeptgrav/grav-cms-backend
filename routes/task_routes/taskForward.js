@@ -12,6 +12,7 @@
 
 
 const express = require("express");
+const { getTaskReviewOwner } = require("../../services/taskReviewOwner.service");
 const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 const svc = require("../../services/taskForward.service");
@@ -83,24 +84,30 @@ async function _getPrimaryManagerApprover(employeeId) {
   }
 }
 
+// The routing rule now lives in `services/taskReviewOwner.service.js`, which
+// returns the REASON alongside the id — the question "why did this go to the
+// department lead rather than their manager?" had no answer before. The old
+// department query also used `.limit(1)` with no ordering, so a department with
+// two leads could route the same task two different ways; the shared version
+// orders deterministically.
+//
+// This wrapper keeps the shape every existing caller expects.
 async function resolveDepartmentApprover(employeeId) {
-  const person = await getEmployeeInfo(employeeId);
-  if (!person) return null;
-  if (person.role === "tl") {
-    return await _getPrimaryManagerApprover(employeeId);
-  }
-  if (person.department) {
-    const tlSnap = await db.collection("cowork_employees")
-      .where("department", "==", person.department)
-      .where("role", "==", "tl")
-      .limit(1)
-      .get();
-    if (!tlSnap.empty) {
-      const tl = tlSnap.docs[0].data();
-      return { approverId: tl.employeeId, approverName: tl.name, source: "dept_tl" };
-    }
-  }
-  return await _getPrimaryManagerApprover(employeeId);
+  const owner = await getTaskReviewOwner(employeeId, {
+    getEmployeeInfo,
+    getPrimaryManager: _getPrimaryManagerApprover,
+  });
+  if (!owner.reviewerId) return null;
+  return {
+    approverId: owner.reviewerId,
+    approverName: owner.reviewerName,
+    /* Always the HR primary manager now — the department-lead branch is gone.
+       The literal stays because stored `departmentApprovals[].source` values
+       from before the change still read `dept_tl`, and rewriting history to
+       match a new rule would misrepresent decisions already taken. */
+    source: "primary_manager",
+    reason: owner.reason,
+  };
 }
 
 // ── Helper: post system message to task chat ──────────────────────────────────
@@ -272,15 +279,14 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       const assignerDept2 = assignerInfo2?.department || "";
       const targetDept2 = targetInfo2?.department || "";
       const isCrossDept2 = requesterRole !== "ceo" && assignerDept2 && targetDept2 && assignerDept2 !== targetDept2;
-      if (isCrossDept2 && targetInfo2 && targetInfo2.role !== "tl" && targetInfo2.department) {
-        const tlSnap2 = await db.collection("cowork_employees")
-          .where("department", "==", targetInfo2.department)
-          .where("role", "==", "tl")
-          .limit(1)
-          .get();
-        if (!tlSnap2.empty) {
-          const tl2 = tlSnap2.docs[0].data();
-          draftTlApprover = { approverId: tl2.employeeId, approverName: tl2.name };
+      // Who sets the budget follows the ASSIGNEE'S REPORTING LINE, not the
+      // department. The department lookup this replaces picked whichever TL
+      // happened to lead the receiving department, which is a different person
+      // from the assignee's manager in every case where the two differ.
+      if (isCrossDept2 && targetInfo2) {
+        const mgr2 = await _getPrimaryManagerApprover(assigneeIds[0]);
+        if (mgr2 && mgr2.approverId !== assignedBy) {
+          draftTlApprover = { approverId: mgr2.approverId, approverName: mgr2.approverName };
           initialStatus = "pending_tl_hours";
         }
       }
@@ -290,18 +296,15 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
 
     // Per-person auto-priority: build assigneePriorities map for EVERY assignee
     // Each person gets their own priority = their open task count + 1
+    // Highest ACTIVE rank + 1 per assignee — see `nextActiveRankFor`. The count
+    // this replaced collided whenever a queue had a gap, which put new work
+    // above tasks a manager had already ordered.
     let autoPriority = (typeof priority === "number" ? priority : Number(priority)) || null;
-    const assigneePrioritiesMap = {};
+    let assigneePrioritiesMap = {};
     if (assigneeIds?.length > 0) {
       try {
         const { db: _db } = require("../../config/firebaseAdmin");
-        for (const aid of assigneeIds) {
-          const existing = await _db.collection("cowork_tasks")
-            .where("assigneeIds", "array-contains", aid)
-            .where("status", "not-in", ["done", "cancelled"])
-            .get();
-          assigneePrioritiesMap[aid] = existing.size + 1;
-        }
+        assigneePrioritiesMap = await svc.assigneePrioritiesFor(_db, assigneeIds);
         if (!autoPriority) autoPriority = assigneePrioritiesMap[assigneeIds[0]] || 1;
       } catch (e) {
         console.warn("[task/create] auto-priority fallback:", e.message);
@@ -313,21 +316,40 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
     }
     if (!autoPriority) autoPriority = 1;
 
-    // Self-assigned tasks: the chosen approver is treated as the actual
-    // assigner of record, not the employee who submitted the request. This
-    // only changes who the task is attributed to — it does not change any
-    // approval-gate logic above, which still correctly evaluates based on
-    // the real requester.
+    // Self-assigned tasks: the counterparty is the assignee's PRIMARY MANAGER,
+    // recorded as the assigner of record. The creator cannot negotiate a time
+    // budget with, set the priority of, or review their OWN work, so their
+    // manager stands on the other side of every one of those turns (budget
+    // negotiation reads `assignedBy`, `_reviewFlow` notifies `assignedBy`, and
+    // priority is the manager's by the reporting-line rule). The manager is
+    // resolved from HR — the form shows no approver field. An explicit approverId
+    // still wins if a client sends one. Someone with NO manager on file (e.g. the
+    // CEO) stays their own approver, matching the priority rule that only binds
+    // people who have a manager. This changes ATTRIBUTION only; the approval
+    // gates above still evaluate against the real requester.
     let effectiveAssignedBy = req.coworkUser.employeeId;
     let effectiveAssignedByName = req.coworkUser.name;
     let effectiveAssignedByRole = requesterRole;
+    let selfApproverId = approverId || null;
+    let selfApproverName = approverName || null;
     const isSelfAssignedReq = isSelfAssigned === true || isSelfAssigned === "true";
-    if (isSelfAssignedReq && approverId) {
-      const approverInfo = await getEmployeeInfo(approverId);
-      if (approverInfo) {
-        effectiveAssignedBy = approverId;
-        effectiveAssignedByName = approverName || approverInfo.name;
-        effectiveAssignedByRole = approverInfo.role || "tl";
+    if (isSelfAssignedReq) {
+      if (!selfApproverId) {
+        const selfAssigneeId =
+          (Array.isArray(assigneeIds) && assigneeIds[0]) || req.coworkUser.employeeId;
+        const mgr = await _getPrimaryManagerApprover(selfAssigneeId);
+        if (mgr && mgr.approverId) {
+          selfApproverId = mgr.approverId;
+          selfApproverName = mgr.approverName;
+        }
+      }
+      if (selfApproverId && selfApproverId !== req.coworkUser.employeeId) {
+        const approverInfo = await getEmployeeInfo(selfApproverId);
+        if (approverInfo) {
+          effectiveAssignedBy = selfApproverId;
+          effectiveAssignedByName = selfApproverName || approverInfo.name;
+          effectiveAssignedByRole = approverInfo.role || "tl";
+        }
       }
     }
 
@@ -336,6 +358,10 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       assignedBy: effectiveAssignedBy,
       assignedByName: effectiveAssignedByName,
       assignedByRole: effectiveAssignedByRole,
+      // The REAL creator — the person who clicked create. Differs from
+      // `assignedBy` only for a self task, where the assigner of record is the
+      // creator's manager but the "Created by" credit stays with the creator.
+      createdBy: req.coworkUser.employeeId,
       assigneeIds: departmentApprovalGate ? [] : (assigneeIds || []),
       dueDate: null,
       priority: autoPriority,
@@ -362,8 +388,10 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       fixedDeadline: fixedDeadline || null,
       isSelfAssigned: isSelfAssigned === true || isSelfAssigned === "true",
       visibleTo: Array.isArray(visibleTo) ? visibleTo : (visibleTo ? [visibleTo] : []),
-      approverId: approverId || null,
-      approverName: approverName || null,
+      // The self-task approver — resolved to the assignee's primary manager above
+      // when the client sent none — so the manager owns the approval/review too.
+      approverId: selfApproverId,
+      approverName: selfApproverName,
       // Mark whether this is a CEO-created root task (for visibility filtering)
       createdByCeo: requesterRole === "ceo" && !parentTaskId,
       createdByTl: requesterRole === "tl",
@@ -434,13 +462,25 @@ router.post("/task/create-parent", verifyCoworkToken, verifyEmployeeToken, async
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
     if (!["ceo", "tl"].includes(req.coworkUser.role)) return res.status(403).json({ error: "Only CEO or TL can create parent tasks." });
+    let parentPriorities = {};
+    try {
+      const { db: _db } = require("../../config/firebaseAdmin");
+      parentPriorities = await svc.assigneePrioritiesFor(_db, assigneeIds);
+    } catch (e) {
+      console.warn("[parent-task/create] auto-priority fallback:", e.message);
+      assigneeIds.forEach(aid => { parentPriorities[aid] = 1; });
+    }
     const task = await svc.createTask({
       title: title.trim(), description, notes,
       assignedBy: req.coworkUser.employeeId,
       assignedByName: req.coworkUser.name,
       assignedByRole: req.coworkUser.role,
       assigneeIds, dueDate: dueDate || null,
-      priority: priority || "medium",
+      // `priority || "medium"` was here — a STRING on a 1..10 numeric scale.
+      // It reached the document as-is, so the task displayed with no priority
+      // at all and sorted unpredictably, and no per-assignee rank was written.
+      priority: Number(priority) || parentPriorities[assigneeIds[0]] || 1,
+      assigneePriorities: parentPriorities,
       parentTaskId: null,
       createdByCeo: req.coworkUser.role === "ceo",
     });
@@ -452,6 +492,145 @@ router.post("/task/create-parent", verifyCoworkToken, verifyEmployeeToken, async
 router.post("/task/:taskId/confirm", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const result = await svc.confirmTaskReceipt({ taskId: req.params.taskId, employeeId: req.coworkUser.employeeId, employeeName: req.coworkUser.name });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── PRIORITY ORDER — persist one person's queue, atomically ───────────────────
+// The gap this closes: priority had NO route at all. Both the old and the new
+// frontend write `assigneePriorities.{employeeId}` straight to Firestore from
+// the browser, which is why two tabs can leave a queue with duplicate ranks —
+// a browser cannot run a query inside a transaction, so it cannot read a queue
+// and renumber it atomically. The admin SDK can.
+//
+// This route deliberately does NOT decide the order. The caller sends the order
+// it wants and this persists it 1..N in one transaction. The ordering rule stays
+// exactly where it is; what moves here is only the guarantee that a queue is
+// never left half-written.
+//
+// Authority is the same as everywhere else that touches somebody's workload:
+// their primary manager, via `_getPrimaryManagerApprover`. Somebody with no
+// manager on record orders their own queue — the same exception the rest of the
+// product makes, because there is nobody else to ask.
+router.post("/employee/:employeeId/priority-order", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const { orderedTaskIds } = req.body || {};
+    const actor = req.coworkUser.employeeId;
+
+    if (!Array.isArray(orderedTaskIds) || orderedTaskIds.length === 0) {
+      return res.status(400).json({ error: "orderedTaskIds is required." });
+    }
+    if (orderedTaskIds.length > 500) {
+      // Firestore caps a transaction at 500 writes. Refused rather than
+      // truncated: a half-renumbered queue is worse than one nobody touched.
+      return res.status(400).json({ error: "Too many tasks to renumber in one call." });
+    }
+
+    if (actor !== employeeId) {
+      const manager = await _getPrimaryManagerApprover(employeeId);
+      if (!manager) {
+        return res.status(400).json({ error: "This employee has no manager recorded, so nobody else can set their priorities." });
+      }
+      if (manager.approverId !== actor) {
+        return res.status(403).json({ error: `Only ${manager.approverName}, who manages this employee, can reorder their work.` });
+      }
+    }
+
+    const written = await db.runTransaction(async (tx) => {
+      const refs = orderedTaskIds.map((id) => db.collection("cowork_tasks").doc(String(id)));
+      const snaps = await tx.getAll(...refs);
+
+      // Every task is verified to belong to this person BEFORE anything is
+      // written — otherwise a caller could renumber a queue by naming somebody
+      // else's task, and the transaction would happily do it.
+      snaps.forEach((snap, i) => {
+        if (!snap.exists) throw new Error(`Task ${orderedTaskIds[i]} does not exist.`);
+        const t = snap.data();
+        const holds = (t.assigneeIds || []).includes(employeeId) || t.pendingAssigneeId === employeeId;
+        if (!holds) throw new Error(`Task ${orderedTaskIds[i]} is not assigned to this employee.`);
+      });
+
+      snaps.forEach((snap, i) => {
+        const rank = Math.max(1, Math.min(10, i + 1));
+        tx.update(snap.ref, {
+          // Dot notation. Writing `assigneePriorities` whole would erase every
+          // other assignee's rank on a shared task.
+          [`assigneePriorities.${employeeId}`]: rank,
+          order: (i + 1) * 1000,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      return snaps.length;
+    });
+
+    res.json({ success: true, renumbered: written });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── DECLINE ASSIGNMENT — the assignee refuses the work outright ───────────────
+// The mirror of /confirm above. Until now the only refusal available to an
+// assignee was /reject-sender-timer, which sends the proposed TIME back and
+// leaves the task with them — there was no way to hand the work back at all.
+// Reason is required; the service enforces it and every other guard.
+router.post("/task/:taskId/decline-assignment", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const result = await svc.declineAssignment({
+      taskId: req.params.taskId,
+      employeeId: req.coworkUser.employeeId,
+      employeeName: req.coworkUser.name,
+      reason: req.body?.reason,
+    });
+    // postSystemChatMessage is defined in this file, not the service — the same
+    // arrangement department-tl-set-hours uses. Posted after the write lands so
+    // a failed decline leaves no message claiming it happened.
+    await postSystemChatMessage(
+      req.params.taskId,
+      `\u26d4 ${req.coworkUser.name} declined this task — "${String(req.body?.reason || "").trim()}"`,
+      req.coworkUser.employeeId,
+      req.coworkUser.name,
+    );
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// ── SET BUDGET ON AN ACTIVE TASK ──────────────────────────────────────────────
+// Sibling of /department-tl-set-hours, which deliberately refuses any task that
+// is not `pending_tl_hours` because its job is to ACTIVATE work waiting at the
+// gate. This one changes the budget of work already running, which is what
+// approving a time-budget extension needs. Same authority rule — the assignee's
+// primary manager — resolved by the same helper.
+router.post("/task/:taskId/set-budget", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    // The same authority check department-tl-set-hours makes, using the same
+    // helper — the time budget belongs to whoever MANAGES the assignee, which
+    // follows the reporting line rather than a department.
+    const snap = await db.collection("cowork_tasks").doc(req.params.taskId).get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found." });
+    const t = snap.data();
+    const targetId = t.pendingAssigneeId || t.assigneeIds?.[0];
+    if (!targetId) return res.status(400).json({ error: "This task has no assignee yet." });
+    const manager = await _getPrimaryManagerApprover(targetId);
+    if (!manager) {
+      return res.status(400).json({ error: "This task's assignee has no manager recorded, so nobody can set its time budget." });
+    }
+    if (manager.approverId !== req.coworkUser.employeeId) {
+      return res.status(403).json({ error: `Only ${manager.approverName}, who manages the assignee, can set hours for this task.` });
+    }
+
+    const result = await svc.setActiveTaskBudget({
+      taskId: req.params.taskId,
+      employeeId: req.coworkUser.employeeId,
+      employeeName: req.coworkUser.name,
+      hoursValue: req.body?.hoursValue,
+      hoursUnit: req.body?.hoursUnit,
+    });
+    await postSystemChatMessage(
+      req.params.taskId,
+      `\u23f1 ${req.coworkUser.name} set the time budget to ${(result.deadlineWindowSecs / 3600).toFixed(2)}h.`,
+      req.coworkUser.employeeId,
+      req.coworkUser.name,
+    );
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -554,7 +733,7 @@ router.post("/task/self-assign-repair", verifyCoworkToken, verifyEmployeeToken, 
 router.post("/task/:taskId/self-assign-approve", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { approved, rejectionReason } = req.body;
+    const { approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     const { employeeId, name: approverName } = req.coworkUser;
     const { db, admin } = require("../../config/firebaseAdmin");
     const { sendPushToEmployees } = require("../../services/fcmPush.service");
@@ -1092,13 +1271,14 @@ router.post("/task/:taskId/department-approve", verifyCoworkToken, verifyEmploye
       await postSystemChatMessage(taskId, `☑️ ${name} approved — waiting on ${result.nowPendingApprover.approverName || "the other department"} to approve.`, employeeId, name);
       await _notify({ recipientIds: [result.nowPendingApprover.approverId].filter(Boolean), type: "department_approval_your_turn", title: "🔔 Your Approval Needed", body: `${name} approved "${result.task.title}" from their side. It's now waiting on your approval.`, data: { taskId }, senderId: employeeId, senderName: name });
     } else if (result.outcome === "completed" && result.finalStatus === "pending_tl_hours") {
-      await postSystemChatMessage(taskId, "✅ Both HODs approved — waiting on the assignee's TL to set estimated hours.", employeeId, name);
-      const draftTargetInfo = await getEmployeeInfo(result.finalAssigneeId);
-      if (draftTargetInfo?.department) {
-        const tlSnap3 = await db.collection("cowork_employees").where("department", "==", draftTargetInfo.department).where("role", "==", "tl").limit(1).get();
-        if (!tlSnap3.empty) {
-          await _notify({ recipientIds: [tlSnap3.docs[0].data().employeeId], type: "department_draft_needs_hours", title: "📝 Draft Task Needs Your Hours Estimate", body: `Both HODs approved "${result.task.title}" — set the real ETC hours before it goes to your team member.`, data: { taskId }, senderId: employeeId, senderName: name });
-        }
+      // The assignee's MANAGER, not their department's TL. This is the
+      // notification that actually fires on the cross-department path, so it
+      // has to name the same person the endpoint now accepts — otherwise the
+      // system tells one person to act and refuses them when they do.
+      const draftManager = await _getPrimaryManagerApprover(result.finalAssigneeId);
+      await postSystemChatMessage(taskId, draftManager ? `✅ Both HODs approved — waiting on ${draftManager.approverName} to set estimated hours.` : "✅ Both HODs approved — waiting on the assignee's manager to set estimated hours.", employeeId, name);
+      if (draftManager) {
+        await _notify({ recipientIds: [draftManager.approverId], type: "department_draft_needs_hours", title: "📝 Draft Task Needs Your Hours Estimate", body: `Both HODs approved "${result.task.title}" — set the real ETC hours before it goes to your team member.`, data: { taskId }, senderId: employeeId, senderName: name });
       }
     } else if (result.outcome === "completed") {
       await postSystemChatMessage(taskId, "✅ Cross-department assignment approved by both sides — task is now assigned.", employeeId, name);
@@ -1128,10 +1308,25 @@ router.post("/task/:taskId/department-tl-set-hours", verifyCoworkToken, verifyEm
     if (!targetId) {
       return res.status(400).json({ error: "This task has no assignee yet." });
     }
-    const targetInfo = await getEmployeeInfo(targetId);
-    const callerDept = req.coworkUser.employeeData?.department || "";
-    if (role !== "tl" || !targetInfo || targetInfo.department !== callerDept) {
-      return res.status(403).json({ error: "Only the assignee's own department TL can set hours for this task." });
+    // The time budget belongs to whoever MANAGES the person doing the work —
+    // not to a department. The two questions are separate: department approval
+    // asks "can this cross-department work happen at all", and this asks "how
+    // many hours does this employee get for it". Only the second is a
+    // management decision about a person, so it follows the reporting line.
+    //
+    // Was: `role !== "tl" || targetInfo.department !== callerDept`, which handed
+    // the decision to the receiving department's TL — someone who may not
+    // manage the assignee at all, and who on a same-department task is not
+    // involved in the work.
+    //
+    // `_getPrimaryManagerApprover` is the same reporting lookup the approval
+    // chain already uses, so this introduces no new notion of hierarchy.
+    const manager = await _getPrimaryManagerApprover(targetId);
+    if (!manager) {
+      return res.status(400).json({ error: "This task's assignee has no manager recorded, so nobody can set its time budget." });
+    }
+    if (manager.approverId !== employeeId) {
+      return res.status(403).json({ error: `Only ${manager.approverName}, who manages the assignee, can set hours for this task.` });
     }
 
     const val = Number(hoursValue) || 0;
@@ -1198,7 +1393,10 @@ router.get("/task/:taskId/forward-budget", verifyCoworkToken, verifyEmployeeToke
 // ── 6. CREATE SUBTASK ─────────────────────────────────────────────────────────
 router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, assigneeIds, priority } = req.body;
+    // A subtask follows the SAME lifecycle as a standard task — the timer/budget
+    // negotiation, priority and review all apply — so it carries the same fields
+    // rather than a truncated set that dropped the budget silently.
+    const { title, description, notes, assigneeIds, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
@@ -1212,17 +1410,39 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       || parent.assignedBy === employeeId;
     if (!canCreate) return res.status(403).json({ error: "Not authorized to create subtasks here." });
 
+    // Self-assigned subtask (you break your own work into a piece for yourself):
+    // the counterparty is the assignee's PRIMARY MANAGER, exactly like a self
+    // task — you cannot negotiate a budget with or review your own subtask. For a
+    // subtask delegated to someone ELSE, the creator stays the assigner of record.
+    let subAssignedBy = employeeId;
+    let subAssignedByName = name;
+    let subAssignedByRole = requesterRole;
+    let subApproverId = approverId || null;
+    let subApproverName = approverName || null;
+    const subIsSelf = (isSelfAssigned === true || isSelfAssigned === "true")
+      || (assigneeIds.length === 1 && assigneeIds[0] === employeeId);
+    if (subIsSelf) {
+      if (!subApproverId) {
+        const mgr = await _getPrimaryManagerApprover(assigneeIds[0]);
+        if (mgr && mgr.approverId) { subApproverId = mgr.approverId; subApproverName = mgr.approverName; }
+      }
+      if (subApproverId && subApproverId !== employeeId) {
+        const approverInfo = await getEmployeeInfo(subApproverId);
+        if (approverInfo) {
+          subAssignedBy = subApproverId;
+          subAssignedByName = subApproverName || approverInfo.name;
+          subAssignedByRole = approverInfo.role || "tl";
+        }
+      }
+    }
+
     // Per-person auto-priority for subtask
-    const subtaskAssigneePriorities = {};
+    let subtaskAssigneePriorities = {};
     let subtaskPriority = (typeof priority === "number" ? priority : Number(priority)) || null;
     try {
-      for (const aid of assigneeIds) {
-        const existing = await db.collection("cowork_tasks")
-          .where("assigneeIds", "array-contains", aid)
-          .where("status", "not-in", ["done", "cancelled"])
-          .get();
-        subtaskAssigneePriorities[aid] = existing.size + 1;
-      }
+      // Same rule as every other create path — highest active rank + 1, with
+      // approved work excluded. See `nextActiveRankFor`.
+      subtaskAssigneePriorities = await svc.assigneePrioritiesFor(db, assigneeIds);
       if (!subtaskPriority) subtaskPriority = subtaskAssigneePriorities[assigneeIds[0]] || 1;
     } catch (e) {
       console.warn("[subtask/create] auto-priority fallback:", e.message);
@@ -1234,9 +1454,12 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
 
     const subtask = await svc.createTask({
       title: title.trim(), description, notes,
-      assignedBy: employeeId,
-      assignedByName: name,
-      assignedByRole: requesterRole,
+      assignedBy: subAssignedBy,
+      assignedByName: subAssignedByName,
+      assignedByRole: subAssignedByRole,
+      // Real creator (the person breaking the work out), distinct from the
+      // assigner of record when a self subtask is manager-mediated.
+      createdBy: req.coworkUser.employeeId,
       assigneeIds,
       dueDate: null,
       priority: subtaskPriority,
@@ -1245,6 +1468,15 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       // TL subtasks should NOT show in CEO tree
       createdByTl: requesterRole === "tl",
       createdByCeo: requesterRole === "ceo",
+      // Standard-flow parity: the timer/budget negotiation applies (assignee
+      // proposes within the budget, the assigner of record decides), and a self
+      // subtask is approved & reviewed by the assignee's manager.
+      hasTimer: hasTimer !== false && hasTimer !== "false",
+      fixedDeadline: fixedDeadline || null,
+      senderTimerWindowSecs: Number(senderTimerWindowSecs) || 0,
+      isSelfAssigned: subIsSelf,
+      approverId: subApproverId,
+      approverName: subApproverName,
     });
 
     // Post chat notification in parent task (visible to CEO + TL)
@@ -1498,7 +1730,7 @@ router.post("/task/:taskId/submit-completion", verifyCoworkToken, verifyEmployee
 // ── POST /task/:taskId/rework — TL sends task back for rework ────────────────
 router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { reworkReason, waiveDeduction } = req.body;
+    const { reworkReason, waiveDeduction, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
     if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can rework tasks." });
     const result = await svc.reworkTask({
@@ -1506,6 +1738,7 @@ router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, asyn
       reviewerId, reviewerName,
       reworkReason: reworkReason || "",
       waiveDeduction: waiveDeduction === true || waiveDeduction === "true",
+      reworkRequirements: reworkRequirements || [], reworkNote: reworkNote || "", reworkAttachments: reworkAttachments || [], reworkAttachmentIds: reworkAttachmentIds || [],
     });
     res.json(result);
   } catch (e) {
@@ -1575,9 +1808,9 @@ router.post("/task/:taskId/extension-deduction", verifyCoworkToken, verifyEmploy
 
 router.post("/task/:taskId/review-completion", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { approved, rejectionReason } = req.body;
+    const { approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     if (typeof approved !== "boolean") return res.status(400).json({ error: "approved (boolean) required" });
-    const result = await svc.reviewCompletion({ taskId: req.params.taskId, reviewerId: req.coworkUser.employeeId, reviewerName: req.coworkUser.name, approved, rejectionReason: rejectionReason || "" });
+    const result = await svc.reviewCompletion({ taskId: req.params.taskId, reviewerId: req.coworkUser.employeeId, reviewerName: req.coworkUser.name, approved, rejectionReason: rejectionReason || "", reworkRequirements: reworkRequirements || [], reworkNote: reworkNote || "", reworkAttachments: reworkAttachments || [], reworkAttachmentIds: reworkAttachmentIds || [] });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -1585,9 +1818,9 @@ router.post("/task/:taskId/review-completion", verifyCoworkToken, verifyEmployee
 // ── 17. CEO REVIEW ────────────────────────────────────────────────────────────
 router.post("/task/:taskId/ceo-review", verifyCoworkToken, verifyCeoToken, async (req, res) => {
   try {
-    const { approved, rejectionReason } = req.body;
+    const { approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     if (typeof approved !== "boolean") return res.status(400).json({ error: "approved (boolean) required" });
-    const result = await svc.ceoReviewCompletion({ taskId: req.params.taskId, reviewerId: req.coworkUser.employeeId, reviewerName: req.coworkUser.name, approved, rejectionReason: rejectionReason || "" });
+    const result = await svc.ceoReviewCompletion({ taskId: req.params.taskId, reviewerId: req.coworkUser.employeeId, reviewerName: req.coworkUser.name, approved, rejectionReason: rejectionReason || "", reworkRequirements: reworkRequirements || [], reworkNote: reworkNote || "", reworkAttachments: reworkAttachments || [], reworkAttachmentIds: reworkAttachmentIds || [] });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -1831,14 +2064,34 @@ router.post("/task/:taskId/reject-sender-timer", verifyCoworkToken, verifyEmploy
 // ── APPROVE / REJECT DEADLINE (task creator only) ─────────────────────────────
 router.post("/task/:taskId/approve-deadline", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { approved, rejectionReason } = req.body;
+    const { approved, rejectionReason, explicitDueDate, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     if (typeof approved !== "boolean") return res.status(400).json({ error: "approved (boolean) required" });
+    // On the record-based flow the assignee's PRIMARY MANAGER owns the date (a
+    // cross-department extension is decided inside the assignee's management
+    // chain, not by the assignor). Resolve them so the service can allow it.
+    let assigneeManagerId = null;
+    if (explicitDueDate) {
+      try {
+        const tSnap = await db.collection("cowork_tasks").doc(req.params.taskId).get();
+        const t = tSnap.exists ? tSnap.data() : null;
+        const assigneeId = t?.pendingAssigneeId || (Array.isArray(t?.assigneeIds) ? t.assigneeIds[0] : null);
+        if (assigneeId) {
+          const mgr = await _getPrimaryManagerApprover(assigneeId);
+          assigneeManagerId = mgr?.approverId ?? null;
+        }
+      } catch (e) { console.warn("[approve-deadline manager resolve]", e.message); }
+    }
     const result = await svc.approveDeadline({
       taskId: req.params.taskId,
       approverId: req.coworkUser.employeeId,
       approverName: req.coworkUser.name,
       approved,
       rejectionReason: rejectionReason || "",
+      // Set by the record-based deadline-extension flow, which applies the agreed
+      // date directly rather than through the on-task pending_deadline_approval state.
+      explicitDueDate: explicitDueDate || null,
+      // The assignee's manager (Option A: they own the date, not the assignor).
+      assigneeManagerId,
     });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -1889,6 +2142,21 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     const { taskId } = req.params;
     const { proposedDate, reason } = req.body;
     if (!proposedDate) return res.status(400).json({ error: "proposedDate required" });
+
+    // ── How much time is being ASKED FOR, in seconds ──────────────────────────
+    // The record used to carry only a date. That is enough to move a deadline
+    // and useless for answering "how much longer did they ask for?" — the
+    // amount can only be recovered by differencing against the window in force,
+    // and approving the request overwrites exactly that. So the history read
+    // back as 0 + 0 = 0 for every extension ever granted.
+    //
+    // Stored at REQUEST time and never recomputed: previous + added = total,
+    // all three, so a granted extension still says what it added years later.
+    // Optional, so an older client that sends only a date still works.
+    const _num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
+    const previousWindowSecs = _num(req.body.previousWindowSecs);
+    const addedSecs = _num(req.body.addedSecs);
+    const proposedWindowSecs = _num(req.body.proposedWindowSecs) || (previousWindowSecs + addedSecs);
 
     const { db, admin } = require("../../config/firebaseAdmin");
     const taskRef = db.collection("cowork_tasks").doc(taskId);
@@ -1945,6 +2213,11 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
     await taskRef.update({
       deadlineExtRequest: {
         proposedDate,
+        // The three figures, so the amount survives approval overwriting the
+        // window it was measured against.
+        previousWindowSecs,
+        addedSecs,
+        proposedWindowSecs,
         reason: reason || "",
         requestedBy: req.coworkUser.employeeId,
         requestedByName: req.coworkUser.name,
