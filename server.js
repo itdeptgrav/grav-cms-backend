@@ -847,6 +847,13 @@ app.use("/api/ceo/merchandiser", merchandiserRoutes);
 const ceoOverviewRoutes = require("./routes/CEO_Routes/overview");
 app.use("/api/ceo/overview", ceoOverviewRoutes);
 
+const ceoCommandCenterRoutes = require("./routes/CEO_Routes/commandCenter");
+app.use("/api/ceo/command-center", ceoCommandCenterRoutes);
+
+// Was never mounted before — the CEO raw-item-wastage page 404'd against it.
+const ceoRawItemWastageRoutes = require("./routes/CEO_Routes/rawItemWastageRoutes");
+app.use("/api/ceo/raw-item-wastage", ceoRawItemWastageRoutes);
+
 const ceoVendorRoutes = require("./routes/CEO_Routes/HistoryReport/vendor");
 app.use("/api/ceo/inventory/vendors", ceoVendorRoutes);
 
