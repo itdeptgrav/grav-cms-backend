@@ -79,27 +79,67 @@ function cleanImages(images) {
     }))
 }
 
+// Parent-attribute / values pairs, mirroring RawItem's own attribute shape —
+// only meaningful for an item with no rawItemId (see below).
+function cleanAttributes(attributes) {
+  if (!Array.isArray(attributes)) return []
+  return attributes
+    .map(a => ({
+      name: String(a?.name || "").trim(),
+      values: Array.isArray(a?.values) ? a.values.map(v => String(v).trim()).filter(Boolean) : [],
+    }))
+    .filter(a => a.name && a.values.length)
+}
+
 async function buildMrfItems(items) {
   const built = []
   for (const it of items) {
-    if (!it.rawItemId || !it.requestedQty || parseFloat(it.requestedQty) <= 0) continue
-    const raw = await RawItem.findById(it.rawItemId).select("name sku unit customUnit").lean()
-    if (!raw) continue
-    const baseUnit = raw.customUnit || raw.unit || "unit"
+    if (!it.requestedQty || parseFloat(it.requestedQty) <= 0) continue
+
+    // Picked from the catalogue — the existing path.
+    if (it.rawItemId) {
+      const raw = await RawItem.findById(it.rawItemId).select("name sku unit customUnit").lean()
+      if (!raw) continue
+      const baseUnit = raw.customUnit || raw.unit || "unit"
+      built.push({
+        rawItem: raw._id,
+        rawItemName: raw.name,
+        rawItemSku: raw.sku || "",
+        variantId: it.variantId || null,
+        variantCombination: it.variantCombination || [],
+        // Requester-supplied context — shown to the TL and the Store Person.
+        description: String(it.description || "").trim().slice(0, 1000),
+        specifications: String(it.specifications || "").trim().slice(0, 1000),
+        images: cleanImages(it.images),
+        requestedQty: parseFloat(it.requestedQty),
+        // The unit the requester picked wins; baseUnit only as a fallback.
+        unit: it.unit || baseUnit,
+        baseUnit,
+        itemStatus: "PENDING",
+        availability: "UNREVIEWED",
+      })
+      continue
+    }
+
+    // Not in the catalogue — describe it instead. There's no catalogue unit
+    // to fall back to, so the requester's own unit is mandatory here.
+    const itemName = String(it.itemName || "").trim()
+    const unit = String(it.unit || "").trim()
+    if (!itemName || !unit) continue
     built.push({
-      rawItem: raw._id,
-      rawItemName: raw.name,
-      rawItemSku: raw.sku || "",
-      variantId: it.variantId || null,
-      variantCombination: it.variantCombination || [],
-      // Requester-supplied context — shown to the TL and the Store Person.
-      description: String(it.description || "").trim().slice(0, 1000),
+      rawItem: null,
+      rawItemName: itemName,
+      rawItemSku: "",
+      variantId: null,
+      variantCombination: [],
+      category: String(it.category || "").trim(),
+      attributes: cleanAttributes(it.attributes),
+      description: String(it.notes || it.description || "").trim().slice(0, 1000),
       specifications: String(it.specifications || "").trim().slice(0, 1000),
       images: cleanImages(it.images),
       requestedQty: parseFloat(it.requestedQty),
-      // The unit the requester picked wins; baseUnit only as a fallback.
-      unit: it.unit || baseUnit,
-      baseUnit,
+      unit,
+      baseUnit: "",
       itemStatus: "PENDING",
       availability: "UNREVIEWED",
     })
@@ -335,64 +375,14 @@ router.get("/approvals", async (req, res) => {
     const stats = statsAgg[0] || { total: 0, pending: 0, approved: 0, rejected: 0, issued: 0 }
     delete stats._id
 
-    // ── Product requests awaiting this same TL ──────────────────────────
-    // New-product requests are approved by the same person under the same
-    // rules, so they belong in one queue rather than a second screen.
-    const prScope = {
-      $or: [
-        { approverBiometricId: req.user.id },
-        { approverAltIds: req.user.id },
-        ...(legacyIds.length
-          ? [{
-            $and: [
-              { $or: [{ approverBiometricId: { $in: ["", null] } }, { approverBiometricId: { $exists: false } }] },
-              { requestedBy: { $in: legacyIds } },
-            ],
-          }]
-          : []),
-      ],
-    }
-    const PR_STATUS_MAP = { PENDING: "PENDING_TL", APPROVED: "TL_APPROVED", REJECTED: "TL_REJECTED" }
-    const prFilter = { ...prScope }
-    if (status && status !== "ALL") prFilter.approvalStatus = PR_STATUS_MAP[status] || status
-
-    const productRequests = await RawItemAddRequest.find(prFilter)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .populate("products.matchedTo", "name sku")
-      .populate("products.spawnedMrf", "mrfNumber status")
-      .lean()
-
-    const prCounts = await RawItemAddRequest.aggregate([
-      { $match: prScope },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: 1 },
-          pending: { $sum: { $cond: [{ $eq: ["$approvalStatus", "PENDING_TL"] }, 1, 0] } },
-          approved: { $sum: { $cond: [{ $eq: ["$approvalStatus", "TL_APPROVED"] }, 1, 0] } },
-          rejected: { $sum: { $cond: [{ $eq: ["$approvalStatus", "TL_REJECTED"] }, 1, 0] } },
-        },
-      },
-    ])
-    const pr = prCounts[0] || { total: 0, pending: 0, approved: 0, rejected: 0 }
-
-    // One combined count so the tab badge reflects everything needing action.
-    const combinedStats = {
-      total: (stats.total || 0) + pr.total,
-      pending: (stats.pending || 0) + pr.pending,
-      approved: (stats.approved || 0) + pr.approved,
-      rejected: (stats.rejected || 0) + pr.rejected,
-      issued: stats.issued || 0,
-    }
+    // A request with items not yet matched to the catalogue is still just an
+    // MRF — those items carry itemStatus "UNMATCHED" once approved, and the
+    // Store resolves them on this same document. Nothing else to fetch here.
 
     res.json({
       success: true,
       mrfs,
-      productRequests,
-      stats: combinedStats,
-      mrfStats: stats,
-      productRequestStats: pr,
+      stats,
       pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) },
     })
   } catch (err) {
@@ -428,11 +418,15 @@ router.patch("/:id/tl-approve", async (req, res) => {
 
     const { itemDecisions, note = "" } = req.body
 
-    // Per-item approve/reject. Everything not explicitly rejected is approved.
+    // Per-item approve/reject. Everything not explicitly rejected is approved
+    // — except a line the requester raised without a catalogue match, which
+    // becomes UNMATCHED: TL-approved (they may have it), but the Store still
+    // has to match it to an item or register it before it's issuable.
+    const nextStatus = (item) => (item.rawItem ? "APPROVED" : "UNMATCHED")
     if (itemDecisions && typeof itemDecisions === "object") {
       mrf.items.forEach(item => {
         const d = itemDecisions[String(item._id)]
-        item.itemStatus = d === "REJECTED" || d === "reject" ? "REJECTED" : "APPROVED"
+        item.itemStatus = d === "REJECTED" || d === "reject" ? "REJECTED" : nextStatus(item)
       })
       if (mrf.items.every(i => i.itemStatus === "REJECTED"))
         return res.status(400).json({
@@ -440,7 +434,7 @@ router.patch("/:id/tl-approve", async (req, res) => {
           message: "Every item was rejected — use Reject on the whole request instead.",
         })
     } else {
-      mrf.items.forEach(item => { item.itemStatus = "APPROVED" })
+      mrf.items.forEach(item => { item.itemStatus = nextStatus(item) })
     }
 
     const actor = await resolveEmployee(req.user.id)
@@ -583,8 +577,15 @@ router.get("/", async (req, res) => {
  * Resolves the Primary Manager/TL from the HR record and routes there. If no
  * TL can be resolved the request is auto-forwarded to the Store rather than
  * blocked, flagged so every screen can explain why nobody approved it.
+ *
+ * Items may be picked from the catalogue (`rawItemId`) or, for something not
+ * in the catalogue yet, just described (`itemName` + `unit`, no `rawItemId`)
+ * — see buildMrfItems above. Either way this produces exactly ONE MRF with
+ * one mrfNumber; an unmatched item is resolved on this same document later,
+ * never a separate one. Named (not inline) so /product-requests below can
+ * forward into it.
  */
-router.post("/", async (req, res) => {
+async function createMrfRequest(req, res) {
   try {
     const { requestType, deadline, neededBy, reason = "", priority = "NORMAL", items } = req.body
 
@@ -605,8 +606,10 @@ router.post("/", async (req, res) => {
     // ── Accidental double-submit guard ──────────────────────────────────
     // Same person, same items, same quantities, still open, within 2 minutes →
     // return the request they already have instead of minting a second one.
+    // `rawItemName` is included so two different not-yet-catalogued items
+    // with the same quantity/unit don't collide on `rawItem: null`.
     const signature = builtItems
-      .map(i => `${i.rawItem}:${i.variantId || ""}:${i.requestedQty}:${i.unit}`)
+      .map(i => `${i.rawItem}:${i.rawItemName}:${i.variantId || ""}:${i.requestedQty}:${i.unit}`)
       .sort().join("|")
     const recent = await MRF.find({
       requestedFor: emp._id,
@@ -614,7 +617,7 @@ router.post("/", async (req, res) => {
       createdAt: { $gte: new Date(Date.now() - 2 * 60 * 1000) },
     }).lean()
     const dupe = recent.find(m =>
-      (m.items || []).map(i => `${i.rawItem}:${i.variantId || ""}:${i.requestedQty}:${i.unit}`)
+      (m.items || []).map(i => `${i.rawItem}:${i.rawItemName}:${i.variantId || ""}:${i.requestedQty}:${i.unit}`)
         .sort().join("|") === signature
     )
     if (dupe) {
@@ -649,10 +652,11 @@ router.post("/", async (req, res) => {
       neededBy: neededBy ? new Date(neededBy) : null,
       reason, priority,
       ...approver,
-      // No TL to approve → it goes straight to the Store, already approved.
+      // No TL to approve → it goes straight to the Store, already approved
+      // (or UNMATCHED, for a line with no catalogue item yet).
       status: autoForward ? "APPROVED" : "PENDING",
       items: autoForward
-        ? builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }))
+        ? builtItems.map(i => ({ ...i, itemStatus: i.rawItem ? "APPROVED" : "UNMATCHED" }))
         : builtItems,
       ...(autoForward ? { approvedAt: new Date() } : {}),
     })
@@ -694,11 +698,17 @@ router.post("/", async (req, res) => {
     console.error("[CoworkMRF POST /]", err)
     res.status(500).json({ success: false, message: err.message })
   }
-})
+}
+router.post("/", createMrfRequest)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /product-requests — employee's own raw-item add requests
 // Registered before "/:id".
+//
+// READ-ONLY LEGACY: kept only so pre-cutover RawItemAddRequest documents
+// remain visible/resolvable. Nothing is written here any more — new "not in
+// the catalogue" items are just MRF items with itemStatus UNMATCHED, created
+// via POST / like everything else. See createMrfRequest above.
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/product-requests", async (req, res) => {
   try {
@@ -717,75 +727,43 @@ router.get("/product-requests", async (req, res) => {
 })
 
 /**
- * POST /product-requests — ask the store to register an item that is not in
- * the catalogue yet. Manual entry only; the store reviews and either matches
- * it to an existing RawItem or creates a new one.
+ * POST /product-requests — BACKWARD-COMPAT SHIM ONLY.
+ *
+ * Product requests are no longer their own thing — "not in the catalogue"
+ * items are just MRF items with itemStatus UNMATCHED (see createMrfRequest /
+ * buildMrfItems above), so this single request gets one real mrfNumber
+ * instead of the old separate, number-less RawItemAddRequest.
+ *
+ * This route exists only so a not-yet-redeployed Coworking client (still
+ * calling the old endpoint/payload shape) doesn't 404 during the rollout
+ * window — it translates the old `products[]` shape into `items[]` and
+ * forwards into createMrfRequest. Delete this route once Coworking has
+ * redeployed against POST / directly.
  */
 router.post("/product-requests", async (req, res) => {
-  try {
-    const { products, priority, reason, neededBy } = req.body
-    if (!Array.isArray(products) || !products.length)
-      return res.status(400).json({ success: false, message: "At least one product is required" })
+  const { products, priority, reason, neededBy } = req.body
+  if (!Array.isArray(products) || !products.length)
+    return res.status(400).json({ success: false, message: "At least one product is required" })
 
-    const cleaned = products
+  req.body = {
+    requestType: "USES_BASED",
+    deadline: null,
+    neededBy,
+    reason,
+    priority,
+    items: products
       .filter(p => p.itemName?.trim())
       .map(p => ({
-        itemName: p.itemName.trim(),
-        category: p.category?.trim() || "",
-        unit: p.unit?.trim() || "",
-        requestedQty: p.requestedQty ? parseFloat(p.requestedQty) : null,
-        notes: p.notes?.trim() || "",
-        images: cleanImages(p.images),
-        attributes: Array.isArray(p.attributes)
-          ? p.attributes
-            .filter(a => a.name?.trim() && Array.isArray(a.values) && a.values.some(v => v?.trim()))
-            .map(a => ({ name: a.name.trim(), values: a.values.filter(v => v?.trim()) }))
-          : [],
-      }))
-    if (!cleaned.length)
-      return res.status(400).json({ success: false, message: "No valid product entries found" })
-
-    const emp = await resolveEmployee(req.user.id)
-    if (!emp) return res.status(404).json({ success: false, message: "Your HR record not found. Contact HR." })
-
-    // Route to the requester's Primary Manager/TL first, exactly like an MRF.
-    // The Store must not see this — let alone start matching it against the
-    // catalogue — until the TL has approved.
-    const approver = await mrfApprover.resolveApprover(emp)
-    const autoForward = approver.approvalRoute === "AUTO_STORE"
-
-    const reqDoc = new RawItemAddRequest({
-      requestedBy: emp._id,
-      requestedByName: buildFullName(emp) || req.user.name || "",
-      requestedByDept: emp.department || "",
-      requesterCoworkId: req.user.id,
-      products: cleaned,
-      priority: ["LOW", "NORMAL", "HIGH", "URGENT"].includes(priority) ? priority : "NORMAL",
-      reason: reason?.trim() || "",
-      neededBy: neededBy ? new Date(neededBy) : null,
-      ...approver,
-      approvalStatus: autoForward ? "TL_APPROVED" : "PENDING_TL",
-      ...(autoForward ? { tlApproved: true, tlApprovedAt: new Date() } : {}),
-    })
-    await reqDoc.save()
-
-    if (autoForward) {
-      mrfNotify.productRequestAutoForwarded(reqDoc).catch(e => console.error("[pr autoFwd notify]", e.message))
-    } else {
-      mrfNotify.productRequestSubmitted(reqDoc).catch(e => console.error("[pr submitted notify]", e.message))
-    }
-
-    res.status(201).json({
-      success: true,
-      message: autoForward
-        ? (approver.autoForwardReason || "Sent directly to the Store — no Primary Manager/TL could be identified.")
-        : `Sent to ${approver.approverName} for approval. The Store will see it once approved.`,
-      request: reqDoc,
-    })
-  } catch (err) {
-    console.error("[CoworkMRF product-requests POST]", err)
-    res.status(500).json({ success: false, message: err.message })
+        itemName: p.itemName,
+        category: p.category,
+        unit: p.unit,
+        requestedQty: p.requestedQty,
+        notes: p.notes,
+        attributes: p.attributes,
+        images: p.images,
+      })),
   }
+  return createMrfRequest(req, res)
 })
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -824,6 +802,12 @@ async function resolvePrAccess(doc, user) {
   return { canView: false, canApprove: false }
 }
 
+// LEGACY — for pre-cutover RawItemAddRequest docs only. A not-yet-catalogued
+// item on a NEW request is TL-approved on the same /:id/tl-approve every
+// other MRF item uses (see createMrfRequest / nextStatus above); nothing
+// creates a new RawItemAddRequest any more. This pair stays so a request
+// that was still PENDING_TL at cutover isn't stranded with no way to ever be
+// decided — delete once none remain in that state.
 router.patch("/product-requests/:id/tl-approve", async (req, res) => {
   try {
     const doc = await RawItemAddRequest.findById(req.params.id)
@@ -916,6 +900,8 @@ router.patch("/product-requests/:id/tl-reject", async (req, res) => {
 })
 
 // ── Product request chat — same thread mechanism as MRFs ─────────────────
+// READ-ONLY-DATA LEGACY: the thread itself (and posting to it) still works
+// for old RawItemAddRequest docs; nothing new creates one of these docs.
 router.get("/product-requests/:id/chat", async (req, res) => {
   try {
     const doc = await RawItemAddRequest.findById(req.params.id).lean()
