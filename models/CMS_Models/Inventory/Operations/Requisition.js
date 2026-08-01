@@ -22,6 +22,12 @@ const requisitionItemSchema = new mongoose.Schema(
     price: { type: Number, default: null },
 
     notes: { type: String, trim: true, default: "" },
+
+    // When this row was raised from a specific product on a product request
+    // ("Raise Purchase Form" on one PENDING product), its sub-document id —
+    // lets the store route write `purchaseFormRaised` back onto that exact
+    // product once this requisition is saved.
+    productId: { type: mongoose.Schema.Types.ObjectId, default: null },
   },
   { _id: true }
 );
