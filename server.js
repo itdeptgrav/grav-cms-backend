@@ -94,6 +94,11 @@ io.on("connection", (socket) => {
   });
 });
 
+/* Live document collaboration. Adds a dynamic /yjs|<documentId> namespace and
+   leaves the two connection handlers above untouched. */
+const { initDocumentCollaboration } = require("./services/documentCollab.service");
+initDocumentCollaboration(io);
+
 // Make io accessible to routes
 app.set("io", io);
 
