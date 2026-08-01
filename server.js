@@ -1000,6 +1000,30 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
+// ── Sales acting on a customer's behalf ────────────────────────────────────
+// Same MPC router, scoped to :customerId and gated by the employee JWT instead
+// of the customer cookie. Lets a sales person build a customer's measurement
+// profile cards (add people, assign products, import, export) when the customer
+// can't do it themselves — see grav-cms/app/sales/dashboard/customers/[id]/mpc.
+// Mounted BEFORE the router so req.customerId is already set when its own
+// verifyCustomerToken runs; that middleware short-circuits on req.actingOnBehalf.
+const EmployeeAuthForMpc = require("./Middlewear/EmployeeAuthMiddlewear");
+app.use(
+  "/api/cms/sales/customers/:customerId/employees",
+  EmployeeAuthForMpc,
+  (req, res, next) => {
+    const { customerId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return res.status(400).json({ success: false, message: "Invalid customer id" });
+    }
+    req.customerId = customerId;
+    req.actingOnBehalf = true;
+    req.onBehalfActor = { id: req.user?.id, name: req.user?.name };
+    next();
+  },
+  employeeMpcRoutes,
+);
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 

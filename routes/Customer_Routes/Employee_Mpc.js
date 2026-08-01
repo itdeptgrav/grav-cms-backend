@@ -8,7 +8,15 @@ const jwt = require("jsonwebtoken");
 const Customer = require("../../models/Customer_Models/Customer");
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
+// This router is mounted twice:
+//   1. /api/customer/employees                          — the customer themselves
+//   2. /api/cms/sales/customers/:customerId/employees   — a sales person acting
+//      on that customer's behalf (see server.js). That mount runs the employee
+//      JWT middleware first and pre-sets req.customerId + req.actingOnBehalf,
+//      so every handler below works unchanged for both audiences.
 const verifyCustomerToken = async (req, res, next) => {
+  // Already scoped by the sales on-behalf mount — don't demand a customer cookie.
+  if (req.customerId && req.actingOnBehalf) return next();
   try {
     const token = req.cookies.customerToken;
     if (!token) {
