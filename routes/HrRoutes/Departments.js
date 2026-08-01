@@ -1,7 +1,16 @@
 const express = require("express");
 const router = express.Router();
 const Department = require("../../models/HR_Models/Departments");
+const Employee = require("../../models/Employee");
 const EmployeeAuthMiddleware = require("../../Middlewear/EmployeeAuthMiddlewear");
+const { recordChange } = require("../../services/changeLog");
+
+// "FIRSTNAME LASTNAME (GR0045)" — the same label format employee docs already
+// store in primaryManager.managerName (see leave approval flow).
+function managerLabel(emp) {
+  const name = [emp.firstName, emp.lastName].filter(Boolean).join(" ").trim();
+  return emp.biometricId ? `${name} (${emp.biometricId})` : name;
+}
 
 // ✅ GET all departments with designations for dropdown
 router.get("/with-designations", EmployeeAuthMiddleware, async (req, res) => {
@@ -237,6 +246,168 @@ router.post("/", EmployeeAuthMiddleware, async (req, res) => {
       success: false,
       message: "Error creating department",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+});
+
+// ✅ ASSIGN department managers (+ optional propagation to existing employees)
+//
+// Body: {
+//   primaryManagerId:   ObjectId | null,   // null/"" clears the slot
+//   secondaryManagerId: ObjectId | null,
+//   applyToExisting:    boolean            // default true — push onto every
+// }                                        // active employee of this department
+//
+// New employees inherit these automatically at creation (Employee-Section POST).
+router.put("/:id/managers", EmployeeAuthMiddleware, async (req, res) => {
+  try {
+    const { user } = req;
+    if (user.role !== "hr_manager") {
+      return res.status(403).json({
+        success: false,
+        message: "Only HR can assign department managers",
+      });
+    }
+    const { id } = req.params;
+    const {
+      primaryManagerId,
+      secondaryManagerId,
+      applyToExisting = true,
+    } = req.body;
+
+    const department = await Department.findById(id);
+    if (!department) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Department not found" });
+    }
+
+    // Resolve the chosen people once; names are denormalised onto both the
+    // department and every propagated employee.
+    const resolveManager = async (managerId) => {
+      if (!managerId) return null;
+      const emp = await Employee.findById(managerId)
+        .select("firstName lastName biometricId designation")
+        .lean();
+      if (!emp) return undefined; // requested but not found → error
+      return {
+        managerId: emp._id,
+        managerName: managerLabel(emp),
+        designation: emp.designation || "",
+      };
+    };
+
+    const primary = await resolveManager(primaryManagerId);
+    const secondary = await resolveManager(secondaryManagerId);
+    if (primary === undefined || secondary === undefined) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Selected manager not found" });
+    }
+
+    const beforeSnap = {
+      primaryManager: department.primaryManager?.managerName || "",
+      secondaryManager: department.secondaryManager?.managerName || "",
+    };
+
+    department.primaryManager = primary || {
+      managerId: null,
+      managerName: "",
+      designation: "",
+    };
+    department.secondaryManager = secondary || {
+      managerId: null,
+      managerName: "",
+      designation: "",
+    };
+    department.updatedBy = user.id;
+    await department.save();
+
+    // Propagate to everyone already in the department. Matches by departmentId
+    // OR by the department name string, because older employee rows only carry
+    // the string. The managers themselves are excluded so nobody becomes their
+    // own manager. Slots without a chosen person are left untouched on the
+    // employees (clearing the department slot never mass-wipes employees).
+    let updatedEmployees = 0;
+    if (applyToExisting && (primary || secondary)) {
+      const set = { updatedAt: new Date(), updatedBy: user.id };
+      if (primary)
+        set.primaryManager = {
+          managerId: primary.managerId,
+          managerName: primary.managerName,
+        };
+      if (secondary)
+        set.secondaryManager = {
+          managerId: secondary.managerId,
+          managerName: secondary.managerName,
+        };
+      const excludeIds = [primary?.managerId, secondary?.managerId].filter(
+        Boolean,
+      );
+      const match = {
+        $and: [
+          {
+            $or: [
+              { departmentId: department._id },
+              {
+                department: {
+                  $regex: new RegExp(
+                    `^${department.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+                    "i",
+                  ),
+                },
+              },
+            ],
+          },
+          {
+            $or: [
+              { status: "active" },
+              { status: { $exists: false } },
+              { isActive: true },
+            ],
+          },
+        ],
+      };
+      if (excludeIds.length) match.$and.push({ _id: { $nin: excludeIds } });
+      // Plain $set is safe here: no salary field is touched, so bypassing the
+      // pre-save hook (which recalculates + re-encrypts salary) is fine.
+      const result = await Employee.updateMany(match, { $set: set });
+      updatedEmployees = result.modifiedCount || 0;
+    }
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      entity: "department",
+      entityId: id,
+      entityLabel: department.name,
+      action: "update",
+      summary: `Department managers set${applyToExisting ? ` (applied to ${updatedEmployees} employees)` : ""}`,
+      before: beforeSnap,
+      after: {
+        primaryManager: primary?.managerName || "",
+        secondaryManager: secondary?.managerName || "",
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Managers saved${applyToExisting ? ` — applied to ${updatedEmployees} employee${updatedEmployees === 1 ? "" : "s"}` : ""}`,
+      data: {
+        primaryManager: department.primaryManager,
+        secondaryManager: department.secondaryManager,
+        updatedEmployees,
+      },
+    });
+  } catch (error) {
+    console.error("Assign department managers error:", error);
+    if (error.name === "CastError") {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid ID" });
+    }
+    res.status(500).json({
+      success: false,
+      message: "Error assigning department managers",
     });
   }
 });

@@ -44,6 +44,27 @@ const departmentSchema = new mongoose.Schema(
         ],
       },
     ],
+    // Department-level people-in-charge. Assigning these propagates to every
+    // employee of the department (their primaryManager/secondaryManager), and
+    // new employees created under this department inherit them automatically.
+    primaryManager: {
+      managerId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Employee",
+        default: null,
+      },
+      managerName: { type: String, default: "" },
+      designation: { type: String, default: "" },
+    },
+    secondaryManager: {
+      managerId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Employee",
+        default: null,
+      },
+      managerName: { type: String, default: "" },
+      designation: { type: String, default: "" },
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "HRDepartment",
