@@ -2793,13 +2793,21 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
       transactionId, utrNumber, receiptImage, additionalNotes,
       signatoryName, signatoryContact, authorizationNote,
       digitalSignature, recordedAt,
+      // On-behalf: sales is logging a payment the customer made but could not
+      // submit themselves (paid in person, over the phone, by cheque at the
+      // office). It is recorded as verified — a sales person entering it IS
+      // the verification — but flagged and attributed so the audit trail
+      // never pretends the customer filed it.
+      isOnBehalf,
     } = req.body;
- 
+
     if (!submittedAmount || submittedAmount <= 0)
       return res.status(400).json({ success: false, message: "Amount must be greater than zero" });
     if (!paymentMethod)
       return res.status(400).json({ success: false, message: "Payment method is required" });
- 
+    if (isOnBehalf && !String(signatoryName || "").trim())
+      return res.status(400).json({ success: false, message: "A signatory name is required when recording a payment on behalf of the customer" });
+
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
  
@@ -2821,9 +2829,11 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
       status:            "verified",
       verifiedBy:        req.user?.id,
       verifiedAt:        new Date(),
-      verificationNotes: `Recorded by sales: ${req.user?.name || "Sales Team"}`,
+      verificationNotes: isOnBehalf
+        ? `Recorded on behalf of ${request.customerInfo?.name || "the customer"} by ${req.user?.name || "Sales Team"}`
+        : `Recorded by sales: ${req.user?.name || "Sales Team"}`,
       // ── Audit trail ──────────────────────────────────────────────────
-      isOnBehalf:            false,
+      isOnBehalf:            !!isOnBehalf,
       onBehalfCustomerName:  request.customerInfo?.name || "",
       recordedByName:        req.user?.name || "Sales Team",
       recordedById:          req.user?.id || null,
@@ -2857,14 +2867,18 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
     request.quotationNotifications = request.quotationNotifications || [];
     request.quotationNotifications.push({
       type: "payment_verified",
-      message: `Payment of ₹${submission.submittedAmount} recorded by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
+      message: isOnBehalf
+        ? `Payment of ₹${submission.submittedAmount} was recorded on your behalf by ${req.user?.name || "Sales Team"} (${paymentMethod}).`
+        : `Payment of ₹${submission.submittedAmount} recorded by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
       actionRequired: false,
       createdAt: new Date(),
     });
 
     request.notes = request.notes || [];
     request.notes.push({
-      text:         `Payment of ₹${submittedAmount} recorded for Step ${paymentStepNumber} by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
+      text:         isOnBehalf
+        ? `Payment of ₹${submittedAmount} recorded for Step ${paymentStepNumber} on behalf of ${request.customerInfo?.name || "the customer"} by ${req.user?.name || "Sales Team"} (${paymentMethod}). Authorised by ${signatoryName}.`
+        : `Payment of ₹${submittedAmount} recorded for Step ${paymentStepNumber} by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
       addedBy:      req.user?.id,
       addedByModel: "SalesDepartment",
       createdAt:    new Date(),
@@ -2876,12 +2890,18 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
     // Notify customer about the payment recorded
     try {
       const lastSubmission = quotation.paymentSubmissions[quotation.paymentSubmissions.length - 1];
-      await CustomerEmailService.sendPaymentRecordedEmail(request, quotation, lastSubmission, false);
+      await CustomerEmailService.sendPaymentRecordedEmail(request, quotation, lastSubmission, !!isOnBehalf);
     } catch (emailErr) {
       console.error("[record-payment] Payment notification email failed:", emailErr.message);
     }
- 
-    res.json({ success: true, message: "Payment recorded successfully", request });
+
+    res.json({
+      success: true,
+      message: isOnBehalf
+        ? "Payment recorded on behalf of the customer"
+        : "Payment recorded successfully",
+      request,
+    });
   } catch (error) {
     console.error("Error in record-payment:", error);
     res.status(500).json({ success: false, message: "Server error while recording payment" });
