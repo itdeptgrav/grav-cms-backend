@@ -15,6 +15,7 @@ const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const { readToken } = require("../config/jwt");
 
 const HRDepartment = require("../models/HRDepartment");
 const ProjectManager = require("../models/ProjectManager");
@@ -190,7 +191,11 @@ router.post("/login", async (req, res) => {
 
 router.post("/verify", async (req, res) => {
   try {
-    const token = req.cookies.auth_token;
+    // Header before cookie. This handler is currently shadowed by the one in
+    // routes/auth/deptAuth.js, which server.js mounts first — but that mount is
+    // documented as temporary, and a cookie-only read here would silently
+    // reintroduce the cross-host failure the day it is removed. See config/jwt.js.
+    const token = readToken(req);
     if (!token)
       return res
         .status(401)
