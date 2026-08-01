@@ -93,9 +93,30 @@ async function mayOpen(decoded, documentId) {
 
   const employeeId = await employeeIdOf(decoded);
   if (!employeeId) return null;
-  const members = Array.isArray(doc.memberIds) ? doc.memberIds : [];
-  return members.includes(employeeId) ? { employeeId, doc } : null;
+  const role = roleOf(doc, employeeId);
+  return role ? { employeeId, doc, role } : null;
 }
+
+/**
+ * This person's role, tolerating the pre-roles shape.
+ *
+ * Documents written before roles carry only `memberIds`. Those people were
+ * editors when the document was written, and silently demoting them to viewer
+ * on upgrade would take away access nobody chose to take away. Mirrors
+ * `readMembers` in `lib/rules/documents/access.ts` — the two must agree, or the
+ * screen and the socket disagree about who may type.
+ */
+function roleOf(doc, employeeId) {
+  if (Array.isArray(doc.members) && doc.members.length) {
+    const found = doc.members.find((m) => m && m.employeeId === employeeId);
+    return found ? found.role || "viewer" : null;
+  }
+  const ids = Array.isArray(doc.memberIds) ? doc.memberIds : [];
+  if (!ids.includes(employeeId)) return null;
+  return doc.createdById === employeeId ? "owner" : "editor";
+}
+
+const MAY_WRITE = new Set(["owner", "editor"]);
 
 async function employeeIdOf(decoded) {
   /* The token's own claim first — set by the engine when it mints sessions —
@@ -207,6 +228,28 @@ function initDocumentCollaboration(io) {
          directory lookup per event. */
       socket.data.employeeId = allowed.employeeId;
       socket.data.documentId = documentId;
+      socket.data.role = allowed.role;
+
+      /**
+       * **A viewer's edits are refused here, not hidden in the UI.**
+       *
+       * Disabling the toolbar is courtesy; this is the permission. Yjs updates
+       * arrive as `sync-update` / `awareness-update` events, and a client that
+       * simply sends them anyway would otherwise mutate the shared document.
+       * Awareness is left alone deliberately — a viewer's CARET should still be
+       * visible to the people writing, which is what makes "somebody is reading
+       * over your shoulder" legible rather than invisible.
+       */
+      if (!MAY_WRITE.has(allowed.role)) {
+        socket.use((packet, allow) => {
+          const event = Array.isArray(packet) ? String(packet[0] || "") : "";
+          if (event === "sync-update" || event === "sync-step-2") {
+            return allow(new Error("You have view access to this document."));
+          }
+          return allow();
+        });
+      }
+
       return next();
     } catch (e) {
       console.error("[docs] auth error", e.message);
