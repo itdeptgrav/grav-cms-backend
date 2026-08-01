@@ -508,11 +508,31 @@ async function listConversations(employeeId) {
 }
 
 // ── MEETINGS ──────────────────────────────────────────────
-async function scheduleCoworkMeet({ title, description, createdBy, participants, dateTime, googleMeetLink }) {
+async function scheduleCoworkMeet({ title, description, createdBy, participants, dateTime, googleMeetLink, endsAt, agenda, taskId }) {
   const meetId = await generateCoworkId("meet");
+
+  /* THE ORGANISER IS A PARTICIPANT.
+   *
+   * Legacy kept them only in `createdBy`, so the person who called the meeting
+   * was absent from its own attendee list. That is not just cosmetic: an
+   * ordinary employee's `listCoworkMeets` reads
+   * `where participants array-contains employeeId`, so a meeting whose
+   * organiser was not in the array was invisible to them on their own
+   * meetings page. Deduped, and their position is first. */
+  const withOrganiser = [createdBy, ...(Array.isArray(participants) ? participants : [])];
+  const allParticipants = [...new Set(withOrganiser.filter(Boolean))];
+
   const data = {
-    meetId, title, description: description || "", createdBy, participants,
+    meetId, title, description: description || "", createdBy, participants: allParticipants,
     dateTime, googleMeetLink, isCancelled: false,
+    /* Additive fields for the new meetings page. All default to the shape the
+       legacy app already tolerates — it ignores what it does not read, and a
+       null `taskId` is what every meeting scheduled before this had. */
+    status: "scheduled",
+    endsAt: endsAt || null,
+    agenda: Array.isArray(agenda) ? agenda.filter(a => typeof a === "string" && a.trim()) : [],
+    taskId: taskId || null,
+    presence: {},
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
   await db.collection("cowork_scheduled_meets").doc(meetId).set(data);
@@ -522,7 +542,11 @@ async function scheduleCoworkMeet({ title, description, createdBy, participants,
     createdAt: new Date().toISOString()
   });
 
-  const recipients = participants.filter(id => id !== createdBy);
+  await _appendMeetEvent({ meetId, type: "created", actorId: createdBy, actorName: createdBy, detail: `Scheduled "${title}"` });
+
+  /* Reads from the deduped list, not the raw parameter: it can be undefined,
+     and the organiser must not be notified of their own meeting. */
+  const recipients = allParticipants.filter(id => id !== createdBy);
   socket.emitToMany(recipients, "new_meet", { meetId, title, dateTime, googleMeetLink });
   await _notifyMany({ recipientIds: recipients, type: "meet_scheduled", title: `📅 Meeting Scheduled · ${title}`, body: new Date(dateTime).toLocaleString("en-IN"), data: { meetId, meetTitle: title, dateTime }, senderId: createdBy, senderName: createdBy });
   return data;
@@ -640,6 +664,155 @@ async function updateCoworkMeet({ meetId, updatedBy, title, description, dateTim
   });
 
   return { success: true, meetId };
+}
+
+// ── MEET LIFECYCLE, PRESENCE AND AUDIT ────────────────────
+//
+// Added for the new Cowork meetings page, which needs three things this
+// collection never recorded: a lifecycle beyond "cancelled or not", who was
+// actually in the room, and an audit trail.
+//
+// COMPATIBILITY. `cowork_scheduled_meets` is read by the LIVE legacy app, which
+// knows only `isCancelled`. So `status` is written ALONGSIDE it and the two are
+// kept in step — never instead of it. A meeting cancelled through the new page
+// has to disappear from the old one too, and legacy will never learn to read a
+// status string.
+
+const MEET_STATUSES = ["scheduled", "waiting", "live", "completed", "cancelled", "archived"];
+
+/**
+ * Append to the meeting's audit trail.
+ *
+ * A SUBCOLLECTION rather than an array on the document: an append-only log that
+ * grows on every join and leave would otherwise rewrite the whole meeting
+ * document each time, and two people joining at once would lose one of the
+ * entries to a last-write-wins overwrite.
+ */
+async function _appendMeetEvent({ meetId, type, actorId, actorName, detail }) {
+  await db.collection("cowork_scheduled_meets").doc(meetId).collection("events").add({
+    type,
+    actorId: actorId || "",
+    actorName: actorName || actorId || "",
+    detail: detail || "",
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function setCoworkMeetStatus({ meetId, employeeId, employeeName, status }) {
+  if (!MEET_STATUSES.includes(status)) {
+    throw new Error(`Unknown meeting status. Expected one of: ${MEET_STATUSES.join(", ")}.`);
+  }
+  const ref = db.collection("cowork_scheduled_meets").doc(meetId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Meeting not found.");
+  const meet = snap.data();
+
+  // Same authority as cancel and edit: the organiser drives the lifecycle.
+  if (meet.createdBy !== employeeId) {
+    throw new Error("Only the meeting organiser can change its status.");
+  }
+  const current = meet.isCancelled === true ? "cancelled" : (meet.status || "scheduled");
+  if (current === "cancelled" && status !== "cancelled") {
+    throw new Error("This meeting was cancelled. Schedule a new one rather than reopening it.");
+  }
+  if (current === status) return { success: true, meetId, status };
+
+  const updates = {
+    status,
+    // Kept in step for the legacy app — see the note above.
+    isCancelled: status === "cancelled",
+    updatedBy: employeeId,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  // Stamped once each, so a meeting booked for an hour that ran twenty records
+  // twenty. Re-entering `live` does not restart the clock.
+  if (status === "live" && !meet.startedAt) updates.startedAt = new Date().toISOString();
+  if ((status === "completed" || status === "archived") && !meet.endedAt) {
+    updates.endedAt = new Date().toISOString();
+  }
+  if (status === "cancelled") {
+    updates.cancelledBy = employeeId;
+    updates.cancelledByName = employeeName || "";
+    updates.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
+  }
+  await ref.update(updates);
+
+  await _appendMeetEvent({
+    meetId,
+    type: status === "live" ? "started" : status === "cancelled" ? "cancelled" : status === "completed" ? "ended" : status,
+    actorId: employeeId,
+    actorName: employeeName,
+    detail: `Status set to ${status}`,
+  });
+
+  const recipients = (meet.participants || []).filter(id => id !== employeeId);
+  socket.emitToMany(recipients, "meet_status", { meetId, status, title: meet.title });
+  return { success: true, meetId, status };
+}
+
+/**
+ * Record somebody arriving in or leaving the room.
+ *
+ * Open to any PARTICIPANT, unlike the lifecycle above — presence is a statement
+ * about yourself, and requiring the organiser to record it would make it
+ * unrecordable.
+ *
+ * Written with dot notation so two people joining at once each update their own
+ * key instead of overwriting the whole map.
+ */
+async function recordCoworkMeetPresence({ meetId, employeeId, employeeName, joined }) {
+  const ref = db.collection("cowork_scheduled_meets").doc(meetId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Meeting not found.");
+  const meet = snap.data();
+
+  const isParticipant = (meet.participants || []).includes(employeeId) || meet.createdBy === employeeId;
+  if (!isParticipant) throw new Error("You are not in this meeting.");
+
+  const now = new Date().toISOString();
+  const updates = joined
+    ? { [`presence.${employeeId}.joinedAt`]: now, [`presence.${employeeId}.leftAt`]: null }
+    : { [`presence.${employeeId}.leftAt`]: now };
+  await ref.update(updates);
+
+  await _appendMeetEvent({
+    meetId,
+    type: joined ? "joined" : "left",
+    actorId: employeeId,
+    actorName: employeeName,
+    detail: joined ? "Joined the room" : "Left the room",
+  });
+
+  const recipients = (meet.participants || []).filter(id => id !== employeeId);
+  socket.emitToMany(recipients, "meet_presence", { meetId, employeeId, joined });
+  return { success: true, meetId, employeeId, joined, at: now };
+}
+
+async function listCoworkMeetEvents(meetId) {
+  const snap = await db.collection("cowork_scheduled_meets").doc(meetId)
+    .collection("events").orderBy("createdAt", "asc").limit(500).get();
+  return snap.docs.map(d => {
+    const data = d.data();
+    return {
+      id: d.id,
+      ...data,
+      // Serialised here rather than left as a Timestamp: this crosses HTTP, and
+      // a Firestore Timestamp arrives at the browser as {_seconds,_nanoseconds}.
+      createdAt: data.createdAt?.toDate?.().toISOString() || null,
+    };
+  });
+}
+
+/**
+ * Meetings about one task.
+ *
+ * `taskId` is written by `scheduleCoworkMeet` when the meeting is created from a
+ * task. Meetings scheduled before this field existed simply do not match, which
+ * is correct — they were never linked to anything.
+ */
+async function listCoworkMeetsForTask(taskId) {
+  const snap = await db.collection("cowork_scheduled_meets").where("taskId", "==", taskId).get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
 // ── TASKS ─────────────────────────────────────────────────
@@ -1087,6 +1260,10 @@ module.exports = {
   listCoworkMeets,
   cancelCoworkMeet,
   getCoworkMeet,
+  setCoworkMeetStatus,
+  recordCoworkMeetPresence,
+  listCoworkMeetEvents,
+  listCoworkMeetsForTask,
 
 
 
