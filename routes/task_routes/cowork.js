@@ -587,10 +587,10 @@ router.get("/direct-message/:convId/messages", verifyCoworkToken, verifyEmployee
 // ── Meets ─────────────────────────────────────────────────
 router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
-    const { title, description, participants, dateTime, googleMeetLink } = req.body;
+    const { title, description, participants, dateTime, googleMeetLink, endsAt, agenda, taskId } = req.body;
     if (!title || !dateTime)
       return res.status(400).json({ error: "Title and dateTime are required." });
-    const meet = await svc.scheduleCoworkMeet({ title, description, createdBy: req.coworkUser.employeeId, participants, dateTime, googleMeetLink });
+    const meet = await svc.scheduleCoworkMeet({ title, description, createdBy: req.coworkUser.employeeId, participants, dateTime, googleMeetLink, endsAt, agenda, taskId });
     res.status(201).json({ meet });
     // Email is handled inside svc.scheduleCoworkMeet() via _notifyMany → sendNotificationEmail
 
@@ -602,12 +602,55 @@ router.get("/schedule-meet/list", verifyCoworkToken, verifyEmployeeToken, async 
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* MUST stay above `/schedule-meet/:meetId` — registered after it, Express would
+   match this path with meetId = "for-task" and return a 404 for a real task. */
+router.get("/schedule-meet/for-task/:taskId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ meets: await svc.listCoworkMeetsForTask(req.params.taskId) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 router.get("/schedule-meet/:meetId", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const meet = await svc.getCoworkMeet(req.params.meetId);
     if (!meet) return res.status(404).json({ error: "Not found" });
     res.json({ meet });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Meeting audit trail ───────────────────────────────────
+router.get("/schedule-meet/:meetId/events", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try { res.json({ events: await svc.listCoworkMeetEvents(req.params.meetId) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Lifecycle beyond cancel (organiser only; enforced in the service) ─────
+router.patch("/schedule-meet/:meetId/status", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+  try {
+    const { employeeId, name } = req.coworkUser;
+    const result = await svc.setCoworkMeetStatus({
+      meetId: req.params.meetId,
+      employeeId,
+      employeeName: name,
+      status: req.body.status,
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+/* Presence takes verifyEmployeeToken, NOT verifyCeoOrTL: it is a statement
+   about yourself, and an ordinary employee in the room has to be able to make
+   it. The service checks that the caller is actually a participant. */
+router.post("/schedule-meet/:meetId/presence", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { employeeId, name } = req.coworkUser;
+    const result = await svc.recordCoworkMeetPresence({
+      meetId: req.params.meetId,
+      employeeId,
+      employeeName: name,
+      joined: req.body.joined === true,
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // ── Edit / Update Meeting (CEO or TL who created it) ─────────
