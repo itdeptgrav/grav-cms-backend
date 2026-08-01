@@ -51,6 +51,9 @@ const rawMaterialAllocationSchema = new mongoose.Schema(
     sku: { type: String, trim: true, required: true },
     rawItemVariantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     rawItemVariantCombination: [{ type: String, trim: true }],
+    // BOM breakdown snapshot: quantityRequired = requiredQuantity * (1 + allowancePercent/100)
+    requiredQuantity: { type: Number, min: 0 },
+    allowancePercent: { type: Number, default: 0, min: 0 },
     quantityRequired: { type: Number, required: true, min: 0 },
     quantityAllocated: { type: Number, default: 0, min: 0 },
     quantityIssued: { type: Number, default: 0, min: 0 },

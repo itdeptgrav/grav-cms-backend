@@ -37,6 +37,18 @@ const variantRawItemSchema = new mongoose.Schema({
     type: String,
     trim: true
   }],
+  // ── The qty actually needed per unit produced, before allowance ──
+  requiredQuantity: {
+    type: Number,
+    min: 0
+  },
+  // ── Extra % added on top of requiredQuantity for wastage/buffer ──
+  allowancePercent: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  // ── Effective qty consumed: requiredQuantity * (1 + allowancePercent/100) ──
   quantity: {
     type: Number,
     required: true,

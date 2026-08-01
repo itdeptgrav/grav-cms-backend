@@ -405,8 +405,14 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
           const existingForProduct = productRawItems.find(
             (p) => `${p.rawItemId}|${p.variantId || ""}` === key
           );
+          // Pre-allowance required qty, scaled the same way as `required` —
+          // lets the frontend show "X required + Y% allowance = Z" instead of
+          // only the post-allowance quantity.
+          const requiredBeforeAllowance = (ri.requiredQuantity ?? ri.quantity ?? 0) * qtyOrdered;
+
           if (existingForProduct) {
             existingForProduct.quantityRequired += required;
+            existingForProduct.requiredQuantity += requiredBeforeAllowance;
             existingForProduct.totalCost += (ri.totalCost || 0) * (qtyOrdered / 1); // already qty-multiplied above; safer to just sum unitCost*req
           } else {
             productRawItems.push({
@@ -419,11 +425,12 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
               baseUnit: ri.baseUnit || ri.unit,
               perPieceQty: ri.quantity || 0,
               quantityRequired: required,
+              requiredQuantity: requiredBeforeAllowance,
               unitCost: ri.unitCost || 0,
               totalCost: (ri.unitCost || 0) * required,
             });
           }
- 
+
           // Accumulate global totals
           if (!totalsMap.has(key)) {
             totalsMap.set(key, {
@@ -435,12 +442,14 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
               unit: ri.unit,
               baseUnit: ri.baseUnit || ri.unit,
               quantityRequired: 0,
+              requiredQuantity: 0,
               unitCost: ri.unitCost || 0,
               totalCost: 0,
             });
           }
           const totalEntry = totalsMap.get(key);
           totalEntry.quantityRequired += required;
+          totalEntry.requiredQuantity += requiredBeforeAllowance;
           totalEntry.totalCost += (ri.unitCost || 0) * required;
 
           variantRawItemsForBreakdown.push({
@@ -448,7 +457,10 @@ router.get("/requests/:requestId/raw-item-requirement", async (req, res) => {
             variantId:     variantIdStr,
             rawItemName:   ri.rawItemName,
             perPieceQty:   ri.quantity || 0,
+            perPieceRequiredQty: ri.requiredQuantity ?? ri.quantity ?? 0,
+            allowancePercent: ri.allowancePercent || 0,
             quantityRequired: required,
+            requiredQuantity: requiredBeforeAllowance,
             unit:          ri.unit,
           });
         }
@@ -1652,6 +1664,10 @@ async function createWorkOrdersAndProgress(request, userId) {
           rawItemId: rawItem.rawItemId, name: rawItem.rawItemName, sku: rawItem.rawItemSku,
           rawItemVariantId: rawItem.variantId || null,
           rawItemVariantCombination: rawItem.variantCombination || [],
+          // BOM-line breakdown, scaled the same way as quantityRequired — lets
+          // the WO-scoped raw-item-requirement view show the allowance % too.
+          requiredQuantity: (rawItem.requiredQuantity ?? rawItem.quantity ?? 0) * variant.quantity,
+          allowancePercent: rawItem.allowancePercent || 0,
           quantityRequired: rawItem.quantity * variant.quantity,
           quantityAllocated: 0, quantityIssued: 0,
           unit: rawItem.unit, unitCost: rawItem.unitCost,
