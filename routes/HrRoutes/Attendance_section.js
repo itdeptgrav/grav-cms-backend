@@ -2043,6 +2043,21 @@ router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
     }
     const settings = await AttendanceSettings.getConfig();
 
+    // bid → date-of-joining. Any entry dated before its employee's DOJ is
+    // overridden to PRE-JOINING below — a not-yet-joined person can't be
+    // absent, on weekly off, or on holiday.
+    const dojDocs = await Employee.find({ dateOfJoining: { $ne: null } })
+      .select(
+        "biometricId basicInfo.biometricId workInfo.biometricId dateOfJoining",
+      )
+      .lean();
+    const dojMap = new Map();
+    for (const e of dojDocs) {
+      const b = String(extractBiometricId(e) || "").toUpperCase();
+      if (b && e.dateOfJoining)
+        dojMap.set(b, new Date(e.dateOfJoining).toISOString().split("T")[0]);
+    }
+
     // ── Inject absent employees not in DailyAttendance ───────────────
     const holidayMap = await loadHolidayMap(date, date);
     const dayOfWeek = new Date(date + "T00:00:00").getDay();
@@ -2120,13 +2135,28 @@ router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
     let employees = await applyMonthlyLatePromotion(dayDoc, settings);
     if (department && department !== "all")
       employees = employees.filter((e) => e.department === department);
+    // Pre-joining override — runs before recomputeSummary so these entries
+    // don't inflate AB/WO/holiday counts for the day.
+    employees = employees.map((e) => {
+      const doj = dojMap.get(String(e.biometricId || "").toUpperCase());
+      if (doj && date < doj)
+        return {
+          ...e,
+          systemPrediction: "PRE-JOINING",
+          hrFinalStatus: null,
+          effectiveStatus: "PRE-JOINING",
+          preJoining: true,
+          attendanceValue: 0,
+          dojStr: doj,
+        };
+      return { ...e, dojStr: doj || null };
+    });
     const summary = recomputeSummary(employees);
     employees = employees.map((e) => ({
       ...e,
-      displayStatus: getDisplayLabel(
-        e.effectiveStatus || e.systemPrediction,
-        settings,
-      ),
+      displayStatus: e.preJoining
+        ? "--"
+        : getDisplayLabel(e.effectiveStatus || e.systemPrediction, settings),
     }));
     res.json({
       success: true,
@@ -4009,6 +4039,14 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       .sort({ dateStr: 1 })
       .lean();
     const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
+    // bid → date-of-joining; pre-joining days show "--" and count nothing,
+    // keeping this screen consistent with the Excel export.
+    const dojByBid = new Map();
+    for (const emp of allActive) {
+      const b = String(extractBiometricId(emp) || "").toUpperCase();
+      if (!b || dojByBid.has(b) || !emp.dateOfJoining) continue;
+      dojByBid.set(b, new Date(emp.dateOfJoining).toISOString().split("T")[0]);
+    }
     const employees = [],
       running = new Map();
     const PAID_CODES = [
@@ -4074,7 +4112,17 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           totalAttendance: 0,
         },
       };
+      const dojStr = dojByBid.get(key) || null;
       for (const cal of allDays) {
+        // Pre-joining: "--" cell, nothing counted (no WO/holiday/AB).
+        if (dojStr && cal.dateStr < dojStr) {
+          row.days[cal.dateStr] = {
+            status: "--",
+            isSunday: cal.isSunday,
+            preJoining: true,
+          };
+          continue;
+        }
         if (cal.isFuture) {
           row.days[cal.dateStr] = {
             status: "—",
@@ -4251,7 +4299,7 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       };
       for (const emp of employees) {
         const d = emp.days[cal.dateStr];
-        if (!d || !d.status || d.status === "—") continue;
+        if (!d || !d.status || d.status === "—" || d.status === "--") continue;
         const _dts =
           d.status === "LHD"
             ? "HD"
@@ -5305,6 +5353,18 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
         : allActive;
+    // bid → date-of-joining. Days before DOJ are rendered as "--" and are
+    // excluded from every per-employee total (WO, holidays, Total Days…) so a
+    // mid-month joiner's sheet matches what they're actually owed.
+    const dojByBid = new Map();
+    for (const emp of allActive) {
+      const bid = String(extractBiometricId(emp) || "").toUpperCase();
+      if (!bid || dojByBid.has(bid) || !emp.dateOfJoining) continue;
+      dojByBid.set(
+        bid,
+        new Date(emp.dateOfJoining).toISOString().split("T")[0],
+      );
+    }
     // Query the attendance docs by date range so this works for any
     // span (single month, last quarter, custom range, etc.).
     const dayDocs = await DailyAttendance.find({
@@ -5379,7 +5439,14 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           TotalWorking: 0,
         },
       };
+      const dojStr = dojByBid.get(String(key).toUpperCase()) || null;
       for (const cal of allDays) {
+        // Pre-joining days: "--" in the cell, nothing counted — not WO, not
+        // holidays, not absences. The person wasn't on the payroll yet.
+        if (dojStr && cal.dateStr < dojStr) {
+          row.dayCodes[cal.dateStr] = "--";
+          continue;
+        }
         if (cal.isFuture) {
           row.dayCodes[cal.dateStr] = "";
           continue;
@@ -5504,9 +5571,14 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       // "Total Working Days" = elapsed days minus full absences minus half of
       //   each half-day. row.totals.A already includes the 0.5 contributed by
       //   each P/LWP, so its unpaid half is deducted automatically.
-      row.totals.Total = elapsedDays;
+      // Pre-joining days don't exist for this employee — their "Total Days"
+      // starts at their DOJ, not at the start of the export range.
+      const empElapsed = dojStr
+        ? allDays.filter((c) => !c.isFuture && c.dateStr >= dojStr).length
+        : elapsedDays;
+      row.totals.Total = empElapsed;
       row.totals.TotalWorking =
-        elapsedDays - row.totals.A - row.totals.HD * 0.5;
+        empElapsed - row.totals.A - row.totals.HD * 0.5;
       return row;
     }
     const processedBids = new Set();
@@ -5793,6 +5865,8 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       "P/SL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
       "P/PL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
       "P/LWP": { font: "FF9C0006", fill: "FFFFE0E0" },
+      // Pre-joining placeholder — muted, no fill, carries no meaning.
+      "--": { font: "FFAAAAAA", fill: null },
       "": { font: "FFAAAAAA", fill: null },
     };
     const colTotals = new Array(totalCols + 1).fill(0);
