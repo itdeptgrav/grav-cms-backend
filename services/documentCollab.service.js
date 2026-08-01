@@ -200,20 +200,39 @@ function scheduleSave(documentId, ydoc) {
  * and touches neither of the two existing `io.on("connection")` handlers.
  */
 function initDocumentCollaboration(io) {
+  /* YSocketIO owns the `/yjs|<room>` namespace and all of the Yjs sync. Create
+     it FIRST, then hang our auth off ITS namespace (`ysocketio.nsp`). */
+  const ysocketio = new YSocketIO(io, { gcEnabled: true });
+  ysocketio.initialize();
+
   /**
-   * Authentication, as our OWN namespace middleware.
+   * Authentication, as middleware on YSocketIO's OWN namespace.
    *
    * NOT `YSocketIO`'s `authenticate` option: that callback is handed only the
    * handshake, and the handshake does not carry the namespace — so there is no
-   * way from inside it to learn WHICH document is being joined. The first
-   * version read `handshake.query.name`, which is never set, so every
-   * connection was refused and the editor silently fell back to single-writer.
-   *
-   * Registered before `initialize()` so it runs first, and it takes the whole
-   * socket — `socket.nsp.name` is the room, from the server's own routing
+   * way from inside it to learn WHICH document is being joined. This takes the
+   * whole socket — `socket.nsp.name` is the room, from the server's own routing
    * rather than from anything the client claims.
+   *
+   * **Why `ysocketio.nsp.use`, and NOT a second `io.of(/^\/yjs\|.*$/)`.** The
+   * previous version registered auth on a separately-created parent namespace
+   * with the same pattern. Socket.IO does not dedupe parent namespaces by
+   * pattern — every `io.of(regex)` is a distinct one — and a connecting client
+   * is routed to the FIRST parent namespace whose pattern matches (`Server.
+   * _checkNamespace`, in insertion order). Registering auth before
+   * `initialize()` therefore placed a namespace carrying the auth middleware but
+   * NO sync handler ahead of YSocketIO's: every `/yjs|*` socket connected,
+   * passed auth and reported itself "live" — then never synced, because the
+   * handler that relays updates and awareness lived on the shadowed second
+   * namespace and never saw the connection. Attaching to `ysocketio.nsp` puts
+   * auth and sync on the one namespace the client actually reaches.
+   *
+   * It runs before any document bytes leave the server: state is emitted from
+   * the namespace's `connection` handler (`startSynchronization`), which fires
+   * only once every middleware — this one included — has called `next()`, so a
+   * refused socket never receives the document.
    */
-  io.of(/^\/yjs\|.*$/).use(async (socket, next) => {
+  ysocketio.nsp.use(async (socket, next) => {
     try {
       const documentId = documentIdOf(socket.nsp && socket.nsp.name);
       if (!documentId) return next(new Error("Unauthorized: no document"));
@@ -256,10 +275,6 @@ function initDocumentCollaboration(io) {
       return next(new Error("Unauthorized"));
     }
   });
-
-  const ysocketio = new YSocketIO(io, { gcEnabled: true });
-
-  ysocketio.initialize();
 
   /* Seed a freshly-opened room from Firestore. Without this the first client to
      connect after a restart starts from an EMPTY document and its first edit
