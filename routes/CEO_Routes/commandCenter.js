@@ -24,6 +24,12 @@ const EmbroideryRecord = require("../../models/CMS_Models/Manufacturing/Embroide
 const ReturnRequest = require("../../models/CMS_Models/Manufacturing/Return/ReturnRequest");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const Sop = require("../../models/sopmodel/sop_model");
+const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
+const {
+  resolveOrderPayment,
+  resolveVendorPayments,
+  booksSummary,
+} = require("./booksPayments");
 
 function ceoAuth(req, res, next) {
   try {
@@ -324,6 +330,38 @@ router.get("/orders", async (req, res) => {
     }
     const measById = new Map(measurements.map((m) => [String(m._id), m]));
 
+    // How many orders does each customer on this page have in total? Needed
+    // for books-payment attribution ("only_order" is safe only when 1).
+    const pageNames = [
+      ...new Set(
+        requests.map((r) => r.customerInfo?.name).filter(Boolean),
+      ),
+    ];
+    const nameCounts = new Map(
+      (
+        await CustomerRequest.aggregate([
+          { $match: { "customerInfo.name": { $in: pageNames } } },
+          { $group: { _id: "$customerInfo.name", count: { $sum: 1 } } },
+        ])
+      ).map((r) => [r._id, r.count]),
+    );
+
+    // Payment truth comes from the accountant's books, never from the ERP's
+    // own totalPaidAmount. The books index is cached, so this loop is cheap.
+    const booksByReq = new Map();
+    for (const r of requests) {
+      try {
+        booksByReq.set(
+          String(r._id),
+          await resolveOrderPayment(r, {
+            customerOrderCount: nameCounts.get(r.customerInfo?.name) ?? null,
+          }),
+        );
+      } catch {
+        /* books unavailable — order renders without payment figures */
+      }
+    }
+
     const orders = requests.map((r) => {
       const rw = wosByReq.get(String(r._id)) || [];
       const journey = buildJourney(
@@ -343,8 +381,7 @@ router.get("/orders", async (req, res) => {
         priority: r.priority,
         createdAt: r.createdAt,
         finalOrderPrice: num(r.finalOrderPrice),
-        totalPaidAmount: num(r.totalPaidAmount),
-        totalDueAmount: num(r.totalDueAmount),
+        books: booksByReq.get(String(r._id)) || null,
         workOrdersCount: rw.length,
         invalidScans: rw.reduce(
           (s, w) => s + num(w.productionCompletion?.invalidScansCount),
@@ -405,6 +442,19 @@ router.get("/order/:id", async (req, res) => {
     const q = (r.quotations || [])[0] || {};
     // Older dev data has WOs without a workOrderNumber — fall back to short id.
     const woNo = (w) => w.workOrderNumber || `WO-${String(w._id).slice(-8)}`;
+
+    // Payment truth from the accountant's books only.
+    let books = null;
+    try {
+      const customerOrderCount = r.customerInfo?.name
+        ? await CustomerRequest.countDocuments({
+            "customerInfo.name": r.customerInfo.name,
+          })
+        : null;
+      books = await resolveOrderPayment(r, { customerOrderCount });
+    } catch {
+      /* books unavailable */
+    }
 
     // Chronological event timeline stitched from every stage's timestamps.
     const events = [];
@@ -493,8 +543,7 @@ router.get("/order/:id", async (req, res) => {
         priority: r.priority,
         createdAt: r.createdAt,
         finalOrderPrice: num(r.finalOrderPrice),
-        totalPaidAmount: num(r.totalPaidAmount),
-        totalDueAmount: num(r.totalDueAmount),
+        books,
         ...journey,
       },
       workOrders,
@@ -512,6 +561,45 @@ router.get("/order/:id", async (req, res) => {
     });
   } catch (err) {
     console.error("command-center /order/:id error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ──────────────────── GET /books-payments/* ─────────────────────── */
+// Company-wide money truth for the Finance tab: received per customer,
+// paid per vendor, both straight from posted vouchers.
+router.get("/books-payments/summary", async (req, res) => {
+  try {
+    const summary = await booksSummary();
+    res.json({ success: true, ...summary });
+  } catch (err) {
+    console.error("books-payments/summary error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Vendor-side payments from the books, mapped onto ERP vendors. A payment
+// against a vendor is ONLY that vendor's ledger Dr in posted payment vouchers.
+router.get("/books-payments/vendors", async (req, res) => {
+  try {
+    const vendors = await Vendor.find({})
+      .select("companyName gstNumber email status")
+      .limit(300)
+      .lean();
+    const rows = await resolveVendorPayments(vendors);
+    rows.sort((a, b) => b.paid + b.outstanding - (a.paid + a.outstanding));
+    res.json({
+      success: true,
+      vendors: rows,
+      totals: {
+        paid: rows.reduce((s, r) => s + r.paid, 0),
+        outstanding: rows.reduce((s, r) => s + r.outstanding, 0),
+        matched: rows.filter((r) => r.matchType !== "none").length,
+        unmatched: rows.filter((r) => r.matchType === "none").length,
+      },
+    });
+  } catch (err) {
+    console.error("books-payments/vendors error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });

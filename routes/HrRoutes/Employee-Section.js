@@ -183,6 +183,41 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
       delete employeeData.secondaryManager;
     }
 
+    // ── Inherit the department's managers ─────────────────────────────────
+    // If the form didn't pick managers explicitly, a new employee reports to
+    // whoever is assigned as the department's primary/secondary manager (set
+    // from the Departments page). Explicit picks in the form always win.
+    if (
+      employeeData.departmentId &&
+      (!employeeData.primaryManager || !employeeData.secondaryManager)
+    ) {
+      try {
+        const Department = require("../../models/HR_Models/Departments");
+        const dept = await Department.findById(employeeData.departmentId)
+          .select("primaryManager secondaryManager")
+          .lean();
+        if (dept) {
+          if (!employeeData.primaryManager && dept.primaryManager?.managerId) {
+            employeeData.primaryManager = {
+              managerId: dept.primaryManager.managerId,
+              managerName: dept.primaryManager.managerName || "",
+            };
+          }
+          if (
+            !employeeData.secondaryManager &&
+            dept.secondaryManager?.managerId
+          ) {
+            employeeData.secondaryManager = {
+              managerId: dept.secondaryManager.managerId,
+              managerName: dept.secondaryManager.managerName || "",
+            };
+          }
+        }
+      } catch (e) {
+        console.warn("[CREATE] department manager inherit failed:", e.message);
+      }
+    }
+
     // ── Sparse unique index fields must NEVER be empty string ──────────────
     // MongoDB sparse+unique indexes skip null/undefined but index "".
     // Two employees with biometricId:"" → E11000 duplicate key on 2nd save.
@@ -335,12 +370,18 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         .json({ success: false, message: "Permission denied" });
     }
 
-    // Snapshot the non-sensitive fields before the write, so the change log can
-    // diff old against new. Salary/PAN are never read here — the log redacts
-    // them regardless, and this whitelist keeps them out to begin with.
+    // Snapshot before the write, so the change log can diff old against new.
+    // Gross pay is included (decrypted, under the non-redacted `grossPay` key)
+    // so the HR history page can show hikes; the raw salary object itself is
+    // never logged.
     const beforeDoc = await Employee.findById(id)
-      .select("firstName lastName department designation jobTitle status email phone")
+      .select(
+        "firstName lastName department designation jobTitle status email phone salary primaryManager secondaryManager",
+      )
       .lean();
+    const beforeGross = beforeDoc?.salary
+      ? decryptSalaryFields(beforeDoc.salary)?.gross
+      : undefined;
 
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
     if (
@@ -422,7 +463,11 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
-    // Audit: who last edited, and which display fields moved.
+    // Decrypt salary before sending to client
+    const decryptedDoc = decryptEmployeeDoc(updated);
+
+    // Audit: who last edited, and which display fields moved. Gross pay and
+    // managers are part of the diff so promotions/hikes land in the history.
     const updatedName =
       `${updated.firstName || ""} ${updated.lastName || ""}`.trim();
     recordChange(req, {
@@ -440,6 +485,9 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
             status: beforeDoc.status,
             email: beforeDoc.email,
             phone: beforeDoc.phone,
+            grossPay: beforeGross,
+            primaryManager: beforeDoc.primaryManager?.managerName || "",
+            secondaryManager: beforeDoc.secondaryManager?.managerName || "",
           }
         : undefined,
       after: {
@@ -449,11 +497,11 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         status: updated.status,
         email: updated.email,
         phone: updated.phone,
+        grossPay: decryptedDoc?.salary?.gross ?? beforeGross,
+        primaryManager: updated.primaryManager?.managerName || "",
+        secondaryManager: updated.secondaryManager?.managerName || "",
       },
     });
-
-    // Decrypt salary before sending to client
-    const decryptedDoc = decryptEmployeeDoc(updated);
     res.status(200).json({
       success: true,
       message: "Employee updated successfully",
@@ -588,7 +636,18 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
 // ─── GET ALL employees (paginated, filterable) ─────────────────────────────────
 router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    const { page = 1, limit = 10, department, status, search } = req.query;
+    const { page = 1, limit = 10, department, status, search, sort } = req.query;
+
+    // Optional sort — the list defaults to newest-first; "dob"/"dob_desc"
+    // order by date of birth (missing DOBs sink to the end via the fallback).
+    const SORTS = {
+      dob: { dateOfBirth: 1, createdAt: -1 },
+      dob_desc: { dateOfBirth: -1, createdAt: -1 },
+      name: { firstName: 1, lastName: 1 },
+      doj: { dateOfJoining: 1, createdAt: -1 },
+      doj_desc: { dateOfJoining: -1, createdAt: -1 },
+    };
+    const sortSpec = SORTS[sort] || { createdAt: -1 };
 
     let filter = {};
 
@@ -620,7 +679,7 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const [employees, total, deptStats] = await Promise.all([
       Employee.find(filter)
-        .sort({ createdAt: -1 })
+        .sort(sortSpec)
         .skip(skip)
         .limit(parseInt(limit))
         .select("-password -temporaryPassword -__v")
@@ -660,6 +719,194 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
     res
       .status(500)
       .json({ success: false, message: "Error fetching employees" });
+  }
+});
+
+// ─── BULK UPDATE ──────────────────────────────────────────────────────────────
+// PATCH /api/employees/bulk-update  { employeeIds: [...], updates: {...} }
+//
+// Applies the same partial update to every selected employee. Declared ABOVE
+// the /:id routes so it is never shadowed by them. HR only.
+//
+// Updates are flattened to dot-paths and applied via doc.set() + doc.save() —
+// NOT updateMany — because the Employee pre-save hook is what recalculates and
+// re-encrypts salary; a bare $set would store plaintext salary numbers.
+router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { user } = req;
+    if (user.role !== "hr_manager") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Permission denied" });
+    }
+    const { employeeIds, updates } = req.body || {};
+    if (!Array.isArray(employeeIds) || employeeIds.length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "employeeIds required" });
+    }
+    if (employeeIds.length > 200) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Max 200 employees per bulk update" });
+    }
+    if (!updates || typeof updates !== "object" || !Object.keys(updates).length) {
+      return res
+        .status(400)
+        .json({ success: false, message: "No updates provided" });
+    }
+
+    // Fields that must never be bulk-written: credentials/system stamps, and
+    // every unique-per-person identifier — writing one value onto many
+    // employees would either corrupt identity data or blow up on the unique
+    // indexes (biometricId, identityId, email…).
+    const clean = JSON.parse(JSON.stringify(updates));
+    [
+      "password",
+      "temporaryPassword",
+      "createdBy",
+      "createdAt",
+      "_id",
+      "__v",
+      "biometricId",
+      "identityId",
+      "email",
+      "personalEmail",
+      "phone",
+      "firstName",
+      "middleName",
+      "lastName",
+      "profilePhoto",
+    ].forEach((f) => delete clean[f]);
+    if (clean.documents) {
+      ["aadharNumber", "panNumber", "uanNumber", "passportNumber",
+       "voterIdNumber", "drivingLicenseNumber", "esicNumber", "pfNumber",
+       "aadharFile", "panFile", "resumeFile", "offerLetterFile",
+       "appointmentLetterFile", "additionalDocuments",
+      ].forEach((f) => delete clean.documents[f]);
+      if (!Object.keys(clean.documents).length) delete clean.documents;
+    }
+    if (clean.departmentId === "" || clean.departmentId === null)
+      delete clean.departmentId;
+    if (clean.primaryManager && !clean.primaryManager.managerId)
+      delete clean.primaryManager;
+    if (clean.secondaryManager && !clean.secondaryManager.managerId)
+      delete clean.secondaryManager;
+    if (!Object.keys(clean).length) {
+      return res.status(400).json({
+        success: false,
+        message: "None of the provided fields can be bulk-updated",
+      });
+    }
+
+    // Nested objects → dot paths, so a partial {salary:{gross}} or
+    // {address:{current:{city}}} merges instead of replacing the sub-document.
+    const flatten = (obj, prefix = "", out = {}) => {
+      for (const [k, v] of Object.entries(obj)) {
+        const path = prefix ? `${prefix}.${k}` : k;
+        if (
+          v &&
+          typeof v === "object" &&
+          !Array.isArray(v) &&
+          !(v instanceof Date)
+        )
+          flatten(v, path, out);
+        else out[path] = v;
+      }
+      return out;
+    };
+    const paths = flatten(clean);
+
+    const results = { updated: 0, failed: [] };
+    for (const empId of employeeIds) {
+      try {
+        const doc = await Employee.findById(empId).select(
+          "-password -temporaryPassword",
+        );
+        if (!doc) {
+          results.failed.push({ id: empId, reason: "Not found" });
+          continue;
+        }
+        const beforeGrossBulk = doc.salary
+          ? decryptSalaryFields(doc.salary)?.gross
+          : undefined;
+        const beforeSnap = {
+          department: doc.department,
+          designation: doc.designation,
+          jobTitle: doc.jobTitle,
+          status: doc.status,
+          grossPay: beforeGrossBulk,
+          primaryManager: doc.primaryManager?.managerName || "",
+          secondaryManager: doc.secondaryManager?.managerName || "",
+        };
+
+        for (const [path, value] of Object.entries(paths)) doc.set(path, value);
+        doc.set("updatedBy", user.id);
+        doc.set("updatedByName", user.name || "");
+        // pre-save hook recalculates + re-encrypts salary and stamps updatedAt
+        await doc.save();
+
+        const name = `${doc.firstName || ""} ${doc.lastName || ""}`.trim();
+        recordChange(req, {
+          departmentSlug: "hr",
+          entity: "employee",
+          entityId: doc._id,
+          entityLabel: name,
+          action: "update",
+          summary: `Bulk update (${employeeIds.length} employees)`,
+          before: beforeSnap,
+          after: {
+            department: doc.department,
+            designation: doc.designation,
+            jobTitle: doc.jobTitle,
+            status: doc.status,
+            grossPay: doc.salary
+              ? decryptSalaryFields(doc.salary)?.gross
+              : undefined,
+            primaryManager: doc.primaryManager?.managerName || "",
+            secondaryManager: doc.secondaryManager?.managerName || "",
+          },
+        });
+        results.updated++;
+      } catch (e) {
+        results.failed.push({ id: empId, reason: e.message });
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Updated ${results.updated} of ${employeeIds.length} employees`,
+      data: results,
+    });
+  } catch (error) {
+    console.error("Bulk update error:", error);
+    res.status(500).json({ success: false, message: "Error in bulk update" });
+  }
+});
+
+// ─── EMPLOYEE CHANGE HISTORY ──────────────────────────────────────────────────
+// GET /api/employees/history?employeeId=&limit=   (HR only)
+// Reads the shared change_logs collection. Declared above /:id so it is never
+// shadowed by the param route.
+router.get("/history", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    if (req.user.role !== "hr_manager") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Permission denied" });
+    }
+    const { employeeId, limit = 100 } = req.query;
+    const ChangeLog = require("../../models/Access/ChangeLog");
+    const q = { departmentSlug: "hr", entity: "employee" };
+    if (employeeId) q.entityId = String(employeeId);
+    const entries = await ChangeLog.find(q)
+      .sort({ createdAt: -1 })
+      .limit(Math.min(parseInt(limit) || 100, 300))
+      .lean();
+    res.status(200).json({ success: true, data: entries });
+  } catch (error) {
+    console.error("Employee history error:", error);
+    res.status(500).json({ success: false, message: "Error fetching history" });
   }
 });
 

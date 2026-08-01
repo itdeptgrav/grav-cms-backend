@@ -4138,6 +4138,39 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         if (cal.isDeclaredHoliday) {
           const hs = cal.holidayStatus,
             didPunch = !!entry && (entry.punchCount || 0) > 0;
+          // An HR/leave override beats the holiday. An approved LWP/LOP on a
+          // festival day is a pay deduction and must read as that status, not
+          // as the holiday.
+          const holidayOverride = entry?.hrFinalStatus || null;
+          if (holidayOverride) {
+            row.days[cal.dateStr] = {
+              status: holidayOverride,
+              displayLabel: getDisplayLabel(holidayOverride, settings),
+              holiday: cal.holiday,
+              punchedOnHoliday: didPunch,
+              netWorkMins: entry?.netWorkMins || 0,
+              otMins: entry?.otMins || 0,
+              punchCount: entry?.punchCount || 0,
+              hrOverride: true,
+            };
+            const _hs_countAs =
+              holidayOverride === "LHD"
+                ? "HD"
+                : holidayOverride === "LAB" || holidayOverride === "EAB"
+                  ? "AB"
+                  : ["P/CL", "P/SL", "P/PL", "P/LWP"].includes(holidayOverride)
+                    ? "P"
+                    : holidayOverride;
+            if (row.totals[_hs_countAs] !== undefined)
+              row.totals[_hs_countAs]++;
+            if (PAID_CODES.includes(holidayOverride))
+              row.totals.totalAttendance++;
+            if (didPunch) {
+              row.totals.totalOtMins += entry.otMins || 0;
+              row.totals.totalNetWorkMins += entry.netWorkMins || 0;
+            }
+            continue;
+          }
           row.days[cal.dateStr] = {
             status: hs,
             holiday: cal.holiday,
@@ -4145,7 +4178,7 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
             netWorkMins: entry?.netWorkMins || 0,
             otMins: entry?.otMins || 0,
             punchCount: entry?.punchCount || 0,
-            hrOverride: !!entry?.hrFinalStatus,
+            hrOverride: false,
           };
           row.totals[hs] = (row.totals[hs] || 0) + 1;
           row.totals.totalAttendance++;
@@ -4158,6 +4191,29 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         }
         if (cal.isSunday && !cal.isWorkingSunday) {
           const didPunch = !!entry && (entry.punchCount || 0) > 0;
+          // Same rule on a weekly off: an explicit HR override wins over WO
+          // even when the employee never punched.
+          if (!didPunch && entry?.hrFinalStatus) {
+            const so = entry.hrFinalStatus;
+            row.days[cal.dateStr] = {
+              status: so,
+              displayLabel: getDisplayLabel(so, settings),
+              isSunday: true,
+              hrOverride: true,
+            };
+            const _so_countAs =
+              so === "LHD"
+                ? "HD"
+                : so === "LAB" || so === "EAB"
+                  ? "AB"
+                  : ["P/CL", "P/SL", "P/PL", "P/LWP"].includes(so)
+                    ? "P"
+                    : so;
+            if (row.totals[_so_countAs] !== undefined)
+              row.totals[_so_countAs]++;
+            if (PAID_CODES.includes(so)) row.totals.totalAttendance++;
+            continue;
+          }
           if (didPunch) {
             let status = entry.systemPrediction;
             const finalStatus = entry.hrFinalStatus || status;
@@ -5459,16 +5515,52 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         if (cal.isDeclaredHoliday) {
           const hs = cal.holidayStatus,
             didPunch = !!entry && (entry.punchCount || 0) > 0;
-          sheetCode = didPunch ? "P" : toSheetCode(hs);
-          if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch)
-            row.totals.NHFH++;
-          else if (didPunch) row.totals.P++;
-          if (
-            didPunch &&
-            (entry?.hrFinalStatus ||
-              (entry?.rawPunches || []).some((p) => p.source === "manual"))
-          )
+          // An HR/leave override beats the holiday — an approved LWP/LOP (or
+          // any other final status) on a festival day must export as that
+          // status so the sheet's salary math matches what the UI shows.
+          const holidayOverride = entry?.hrFinalStatus || null;
+          if (holidayOverride) {
+            sheetCode = toSheetCode(holidayOverride) || toSheetCode(hs);
             row.hrOverrides.add(cal.dateStr);
+            if (["P", "P*", "P~", "MP", "WFH"].includes(holidayOverride))
+              row.totals.P++;
+            else if (["AB", "LWP", "LAB", "EAB"].includes(holidayOverride))
+              row.totals.A++;
+            else if (holidayOverride === "HD" || holidayOverride === "LHD")
+              row.totals.HD++;
+            else if (holidayOverride === "CO") row.totals.CO++;
+            else if (holidayOverride === "L-CL") row.totals.CL++;
+            else if (holidayOverride === "L-SL") row.totals.SL++;
+            else if (holidayOverride === "L-EL") row.totals.PL++;
+            else if (holidayOverride === "P/CL") {
+              row.totals.P++;
+              row.totals.CL = (row.totals.CL || 0) + 0.5;
+            } else if (holidayOverride === "P/SL") {
+              row.totals.P++;
+              row.totals.SL = (row.totals.SL || 0) + 0.5;
+            } else if (holidayOverride === "P/PL") {
+              row.totals.P++;
+              row.totals.PL = (row.totals.PL || 0) + 0.5;
+            } else if (holidayOverride === "P/LWP") {
+              row.totals.P++;
+              row.totals.A = (row.totals.A || 0) + 0.5;
+            } else if (holidayOverride === "WO") row.totals.WO++;
+            else {
+              // Unknown override code — fall back to the holiday itself.
+              sheetCode = toSheetCode(hs);
+              row.totals.NHFH++;
+            }
+          } else {
+            sheetCode = didPunch ? "P" : toSheetCode(hs);
+            if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch)
+              row.totals.NHFH++;
+            else if (didPunch) row.totals.P++;
+            if (
+              didPunch &&
+              (entry?.rawPunches || []).some((p) => p.source === "manual")
+            )
+              row.hrOverrides.add(cal.dateStr);
+          }
         } else if (cal.isSunday && !cal.isWorkingSunday) {
           // Weekly off counts as WO for EVERY employee, so the WO total is the
           // same across the whole sheet regardless of who punched on a Sunday.
@@ -5571,12 +5663,13 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       // "Total Working Days" = elapsed days minus full absences minus half of
       //   each half-day. row.totals.A already includes the 0.5 contributed by
       //   each P/LWP, so its unpaid half is deducted automatically.
-      // Pre-joining days don't exist for this employee — their "Total Days"
-      // starts at their DOJ, not at the start of the export range.
+      // "Total Days" is calendar-wide (31/30 per the month) — the same for
+      // every row. Only "Total Working Days" is DOJ-aware: it starts at the
+      // employee's joining date, then deducts absences and half-days.
       const empElapsed = dojStr
         ? allDays.filter((c) => !c.isFuture && c.dateStr >= dojStr).length
         : elapsedDays;
-      row.totals.Total = empElapsed;
+      row.totals.Total = elapsedDays;
       row.totals.TotalWorking =
         empElapsed - row.totals.A - row.totals.HD * 0.5;
       return row;
