@@ -34,6 +34,88 @@ const getGSTPercentage = (unitPrice) => {
   return price < 2499 ? 5 : 18;
 };
 
+// ─── QUOTATION ↔ REQUEST STATUS MACHINE ───────────────────────────────────────
+// There is exactly ONE quotation per request (request.quotations[0]). Its status
+// is the single source of truth; request.status is a projection of it. Every
+// place that touches either one must go through the helpers below, otherwise a
+// plain re-save of the quotation silently drops the request back to
+// "quotation_draft" and the customer's Approve button disappears — which is the
+// bug that made the order appear to bounce back to the start of the pipeline.
+
+// Rank of quotation.status. Higher = further along. Used to reject regressions.
+const QUOTATION_RANK = {
+  draft: 0,
+  sent_to_customer: 1,
+  customer_approved: 2,
+  sales_approved: 3,
+};
+
+// quotation.status → request.status
+const REQUEST_STATUS_FOR_QUOTATION = {
+  draft: "quotation_draft",
+  sent_to_customer: "quotation_sent",
+  customer_approved: "quotation_customer_approved",
+  sales_approved: "quotation_sales_approved",
+};
+
+// Once the order is on the shop floor its request.status is owned by production,
+// not by the quotation — never rewrite it from here.
+const POST_QUOTATION_STATUSES = [
+  "production", "shipping", "delivered", "completed", "cancelled",
+];
+
+// Project quotation.status onto request.status. `rejected` / `expired` have no
+// forward projection: the request falls back to in_progress so sales can
+// re-issue, unless production already owns the request.
+function syncRequestStatusFromQuotation(request, quotation) {
+  if (POST_QUOTATION_STATUSES.includes(request.status)) return request.status;
+
+  if (quotation.status === "rejected" || quotation.status === "expired") {
+    request.status = "in_progress";
+  } else {
+    const mapped = REQUEST_STATUS_FOR_QUOTATION[quotation.status];
+    if (mapped) request.status = mapped;
+  }
+  return request.status;
+}
+
+// True when moving from `from` to `to` would walk the quotation backwards.
+// draft → sent_to_customer → customer_approved → sales_approved is one-way;
+// only an explicit reject/expire may leave that ladder.
+function isQuotationRegression(from, to) {
+  if (!from || !to || from === to) return false;
+  if (to === "rejected" || to === "expired") return false;
+  if (from === "rejected" || from === "expired") return false; // re-issuing is fine
+  const a = QUOTATION_RANK[from], b = QUOTATION_RANK[to];
+  if (a == null || b == null) return false;
+  return b < a;
+}
+
+// The quotation popup posts the whole quotation back on every save, including a
+// paymentSchedule rebuilt from percentages — which has no paidAmount/status/
+// receipts on it. Carry the money state over from the stored steps so saving a
+// quotation can never erase a recorded payment.
+function preservePaymentState(existingSchedule = [], incomingSchedule = []) {
+  // A save that carries no schedule at all must not erase the stored one.
+  if (!incomingSchedule.length) return existingSchedule;
+  const byStep = new Map(
+    existingSchedule.map(s => [s.stepNumber, s.toObject ? s.toObject() : s]),
+  );
+  return incomingSchedule.map(step => {
+    const prev = byStep.get(step.stepNumber);
+    if (!prev) return step;
+    return {
+      ...step,
+      paidAmount:      prev.paidAmount ?? 0,
+      paidDate:        prev.paidDate ?? null,
+      status:          prev.status || step.status || "pending",
+      paymentMethod:   step.paymentMethod || prev.paymentMethod,
+      transactionId:   step.transactionId || prev.transactionId,
+      paymentReceipts: prev.paymentReceipts || [],
+    };
+  });
+}
+
 const calculateItemTotals = (quantity, unitPrice, gstPercentage) => {
   const qty = parseFloat(quantity) || 0;
   const price = parseFloat(unitPrice) || 0;
@@ -901,6 +983,16 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     const totalCustomCharges = customAdditionalCharges.reduce((sum, charge) => sum + (charge.amount || 0), 0);
     const grandTotal = subtotalBeforeGST + totalGST + shippingCharges + totalCustomCharges;
 
+    // ── Resolve the status this save should land on ─────────────────────────
+    // The popup always posts `status: 'draft'` when the user hits Save, even on
+    // a quotation that is already sent/approved. Honour a forward move only;
+    // anything backwards keeps the stored status.
+    const previousStatus = existingQuotation?.status || null;
+    const requestedStatus = quotationData.status || previousStatus || 'draft';
+    const resolvedStatus = isQuotationRegression(previousStatus, requestedStatus)
+      ? previousStatus
+      : requestedStatus;
+
     const quotation = {
       ...quotationData, items: itemsWithCalculations, customAdditionalCharges,
       subtotalBeforeGST: parseFloat(subtotalBeforeGST.toFixed(2)),
@@ -909,8 +1001,23 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       shippingCharges: parseFloat(shippingCharges.toFixed(2)),
       grandTotal: parseFloat(grandTotal.toFixed(2)),
       quotationNumber, preparedBy: req.user.id,
-      status: quotationData.status || 'draft', updatedAt: new Date()
+      status: resolvedStatus, updatedAt: new Date()
     };
+
+    if (existingQuotation) {
+      // Never let a re-save wipe the approval trail, the recorded payments, or
+      // the customer's submitted receipts — the popup does not send these back.
+      quotation.paymentSchedule = preservePaymentState(
+        existingQuotation.paymentSchedule, quotation.paymentSchedule || [],
+      );
+      delete quotation.paymentSubmissions;
+      delete quotation.customerApproval;
+      delete quotation.salesApproval;
+      delete quotation.accountantApproval;
+      delete quotation.sentToCustomerAt;
+      delete quotation.sentBy;
+      delete quotation._id;
+    }
 
     if (!existingQuotation) { quotation.createdAt = new Date(); request.quotations.push(quotation); }
     else Object.assign(existingQuotation, quotation);
@@ -918,9 +1025,13 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     const currentQuotation = existingQuotation || request.quotations[request.quotations.length - 1];
     request.currentQuotation = currentQuotation._id;
 
-    if (quotationData.status === 'sent_to_customer') {
-      request.status = 'quotation_sent'; currentQuotation.sentToCustomerAt = new Date(); currentQuotation.sentBy = req.user.id;
-    } else if (quotationData.status === 'draft') request.status = 'quotation_draft';
+    if (resolvedStatus === 'sent_to_customer' && previousStatus !== 'sent_to_customer') {
+      currentQuotation.sentToCustomerAt = new Date();
+      currentQuotation.sentBy = req.user.id;
+    }
+    // request.status is always a projection of the quotation status — never set
+    // directly, so a save can't bounce an approved order back to draft.
+    syncRequestStatusFromQuotation(request, currentQuotation);
 
     request.taxSummary = { totalGST, sgst: totalGST / 2, cgst: totalGST / 2, igst: 0 };
     request.quotationValidUntil = new Date(quotationData.validUntil);
@@ -1468,6 +1579,12 @@ router.put("/payment-submissions/:submissionId/status", async (req, res) => {
   try {
     const { submissionId } = req.params;
     const { status, verificationNotes } = req.body;
+    if (!["pending", "verified", "rejected"].includes(status)) {
+      return res.status(400).json({ success: false, message: "status must be one of pending, verified, rejected" });
+    }
+    if (status === "rejected" && !String(verificationNotes || "").trim()) {
+      return res.status(400).json({ success: false, message: "A reason is required when rejecting a payment" });
+    }
     const request = await CustomerRequest.findOne({ 'quotations.paymentSubmissions._id': submissionId });
     if (!request) return res.status(404).json({ success: false, message: "Payment submission not found" });
     const quotation = request.quotations.find(q => q.paymentSubmissions.some(s => s._id.toString() === submissionId));
@@ -1501,6 +1618,18 @@ router.put("/payment-submissions/:submissionId/status", async (req, res) => {
       else paymentStep.status = 'pending';
     }
     request.updatedAt = new Date();
+
+    // Mirror the decision into the notification feed so the customer portal can
+    // show "payment approved / rejected by sales" rather than silence.
+    request.quotationNotifications = request.quotationNotifications || [];
+    request.quotationNotifications.push({
+      type: status === "verified" ? "payment_verified" : status === "rejected" ? "payment_rejected" : "payment_received",
+      message: `Payment of ₹${submission.submittedAmount} for ${paymentStep?.name || `Step ${submission.paymentStepNumber}`} was ${status === "verified" ? "approved" : status} by ${req.user?.name || "Sales Team"}${verificationNotes ? ` — ${verificationNotes}` : ""}.`,
+      relatedId: submission._id,
+      actionRequired: false,
+      createdAt: new Date(),
+    });
+
     request.notes = request.notes || [];
     request.notes.push({
       text: `Payment submission of ₹${submission.submittedAmount} for ${paymentStep?.name || `Step ${submission.paymentStepNumber}`} marked ${status}${verificationNotes ? ` — ${verificationNotes}` : ""}.`,
@@ -1534,9 +1663,13 @@ router.post("/requests/:requestId/quotation/send", async (req, res) => {
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found to send" });
     const quotation = request.quotations[0];
-    if (quotation.status !== 'draft') return res.status(400).json({ success: false, message: "Only draft quotations can be sent" });
+    // A rejected quotation may be re-sent after the sales person revises it —
+    // otherwise a single customer rejection dead-ends the request forever.
+    if (!['draft', 'rejected', 'expired'].includes(quotation.status)) {
+      return res.status(400).json({ success: false, message: `Quotation is already '${quotation.status}' and cannot be re-sent` });
+    }
     quotation.status = 'sent_to_customer'; quotation.sentToCustomerAt = new Date(); quotation.sentBy = req.user.id; quotation.updatedAt = new Date();
-    request.status = 'quotation_sent'; request.updatedAt = new Date();
+    syncRequestStatusFromQuotation(request, quotation); request.updatedAt = new Date();
     request.quotationNotifications.push({ type: 'customer_approval', message: 'Quotation sent to customer for approval', actionRequired: false, createdAt: new Date() });
     await request.save();
     try { await CustomerEmailService.sendQuotationEmail(request, quotation, req.user); } catch (emailError) { console.error("Failed to send quotation email:", emailError); }
@@ -1773,20 +1906,53 @@ async function createWorkOrdersAndProgress(request, userId) {
 router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => {
   try {
     const { requestId } = req.params;
-    const { notes } = req.body;
+    // acknowledgeNoCustomerApproval — the sales person has been shown the
+    // "no customer approval, no advance payment" warning and chose to push the
+    // order to production anyway. Payment is deliberately NOT a precondition
+    // here: recording money is a separate flow (record-payment / verify).
+    const { notes, acknowledgeNoCustomerApproval } = req.body;
 
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });
 
     const quotation = request.quotations[0];
-    if (quotation.status !== "customer_approved") return res.status(400).json({ success: false, message: "Quotation is not approved by customer" });
+    const approvedWithoutCustomer =
+      quotation.status === "sent_to_customer" && !!acknowledgeNoCustomerApproval;
+
+    if (quotation.status !== "customer_approved" && !approvedWithoutCustomer) {
+      return res.status(400).json({
+        success: false,
+        message: quotation.status === "sent_to_customer"
+          ? "Quotation is not approved by the customer yet. Re-send with acknowledgeNoCustomerApproval to approve on their behalf."
+          : `Quotation cannot be approved from status '${quotation.status}'`,
+      });
+    }
+
+    if (approvedWithoutCustomer) {
+      // Record the implicit customer approval so both portals show a complete,
+      // honest trail rather than an order that jumped a step.
+      quotation.customerApproval = {
+        approved: true,
+        approvedAt: new Date(),
+        approvedBy: null,
+        notes: `Approved by sales (${req.user?.name || "Sales Team"}) without customer approval or advance payment.`,
+      };
+      request.notes = request.notes || [];
+      request.notes.push({
+        text: `Quotation pushed to production by ${req.user?.name || "Sales Team"} without customer approval or advance payment.${notes ? ` Reason: ${notes}` : ""}`,
+        addedBy: req.user.id,
+        addedByModel: "SalesDepartment",
+        createdAt: new Date(),
+      });
+    }
 
     quotation.status = "sales_approved";
     quotation.salesApproval = { approved: true, approvedAt: new Date(), approvedBy: req.user.id, notes: notes || "" };
     quotation.updatedAt = new Date();
-    request.status = "quotation_sales_approved";
+    syncRequestStatusFromQuotation(request, quotation);
     request.finalOrderPrice = quotation.grandTotal;
+    request.totalDueAmount = Math.max(0, quotation.grandTotal - (request.totalPaidAmount || 0));
     request.updatedAt = new Date();
     request.quotationNotifications = request.quotationNotifications.filter(n => n.type !== "sales_approval_required");
 
@@ -2352,11 +2518,22 @@ router.post("/requests/:requestId/quotation/reject", async (req, res) => {
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found" });
     const quotation = request.quotations[0];
+    if (quotation.status === 'sales_approved') {
+      return res.status(400).json({ success: false, message: "A sales-approved quotation cannot be rejected — cancel the order instead" });
+    }
     const wasCustomerApproved = quotation.status === 'customer_approved';
     quotation.status = 'rejected'; quotation.updatedAt = new Date();
-    if (wasCustomerApproved) quotation.salesApproval = { approved: false, approvedAt: new Date(), approvedBy: req.user.id, notes: reason || 'Rejected by sales team' };
-    request.status = request.status === 'quotation_customer_approved' ? 'quotation_sent' : 'in_progress';
+    quotation.salesApproval = { approved: false, approvedAt: new Date(), approvedBy: req.user.id, notes: reason || 'Rejected by sales team' };
+    // A rejected quotation always parks the request back at in_progress so it
+    // reads the same on both portals — previously it claimed 'quotation_sent'
+    // while the quotation itself said 'rejected'.
+    syncRequestStatusFromQuotation(request, quotation);
     request.updatedAt = new Date();
+    request.notes = request.notes || [];
+    request.notes.push({
+      text: `Quotation ${wasCustomerApproved ? "rejected after customer approval" : "rejected"} by ${req.user?.name || "Sales Team"}. Reason: ${reason || "—"}`,
+      addedBy: req.user.id, addedByModel: "SalesDepartment", createdAt: new Date(),
+    });
     request.quotationNotifications.push({ type: 'quotation_expired', message: `Quotation rejected: ${reason}`, actionRequired: false });
     await request.save();
     res.json({ success: true, message: "Quotation rejected", request });
@@ -2461,9 +2638,9 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
     };
     quotation.status     = "customer_approved";
     quotation.updatedAt  = new Date();
- 
-    // 2. Update request status
-    request.status       = "quotation_customer_approved";
+
+    // 2. Update request status (projection of the quotation status)
+    syncRequestStatusFromQuotation(request, quotation);
  
     // 3. Update customer info if overrides provided
     if (customerInfoOverride) {
@@ -2527,8 +2704,18 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
  
       // Update top-level payment tracking
       request.totalPaidAmount  = (request.totalPaidAmount || 0) + submission.submittedAmount;
+      request.totalDueAmount   = Math.max(0, (quotation.grandTotal || 0) - request.totalPaidAmount);
       request.lastPaymentDate  = new Date();
- 
+
+      // Surface it on both portals as a verified (sales-recorded) payment.
+      request.quotationNotifications = request.quotationNotifications || [];
+      request.quotationNotifications.push({
+        type: "payment_verified",
+        message: `Advance payment of ₹${submission.submittedAmount} recorded on behalf of the customer by ${req.user?.name || "Sales Team"}.`,
+        actionRequired: false,
+        createdAt: new Date(),
+      });
+
       paymentUpdated = true;
     }
  
@@ -2648,8 +2835,17 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
  
     // Top-level totals
     request.totalPaidAmount = (request.totalPaidAmount || 0) + submission.submittedAmount;
+    request.totalDueAmount  = Math.max(0, (quotation.grandTotal || 0) - request.totalPaidAmount);
     request.lastPaymentDate = new Date();
- 
+
+    request.quotationNotifications = request.quotationNotifications || [];
+    request.quotationNotifications.push({
+      type: "payment_verified",
+      message: `Payment of ₹${submission.submittedAmount} recorded by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
+      actionRequired: false,
+      createdAt: new Date(),
+    });
+
     request.notes = request.notes || [];
     request.notes.push({
       text:         `Payment of ₹${submittedAmount} recorded for Step ${paymentStepNumber} by ${req.user?.name || "Sales Team"} (${paymentMethod}).`,
