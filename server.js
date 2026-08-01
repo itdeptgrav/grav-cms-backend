@@ -34,6 +34,24 @@ const allowedOrigins = [
   "https://rayandcompanies.com",
   "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev",
   "https://grav-cowork-space-main-hazel.vercel.app",
+  /**
+   * Extra origins from the environment, comma-separated.
+   *
+   * Where a LAN address belongs — NOT in this literal. A dev machine's IP
+   * changes whenever it rejoins a network (`192.168.1.30` above is already
+   * dead), and an origin baked into the source is one somebody has to edit and
+   * redeploy. In production this is simply left unset and the list above is
+   * what applies.
+   *
+   *   EXTRA_ALLOWED_ORIGINS=http://192.168.1.91:3000,http://192.168.1.91:3001
+   *
+   * Gates BOTH the CORS middleware and the Socket.IO handshake, so this is what
+   * lets a second computer reach the collaboration namespace.
+   */
+  ...String(process.env.EXTRA_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean),
 ];
 const transcriptModule = require("./routes/task_routes/transcript.routes");
 
@@ -93,6 +111,11 @@ io.on("connection", (socket) => {
     console.log("❌ WebSocket client disconnected:", socket.id);
   });
 });
+
+/* Live document collaboration. Adds a dynamic /yjs|<documentId> namespace and
+   leaves the two connection handlers above untouched. */
+const { initDocumentCollaboration } = require("./services/documentCollab.service");
+initDocumentCollaboration(io);
 
 // Make io accessible to routes
 app.set("io", io);
@@ -1473,6 +1496,13 @@ app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
 // Enhanced: group/DM media messages, subtasks, task chat, deadline edit, delete
 app.use("/cowork", require("./routes/task_routes/coworkEnhanced.js"));
+
+// Time-budget negotiation loop: propose a counter (/task/:id/budget/counter),
+// or accept what stands (/task/:id/budget/accept).
+app.use("/cowork", require("./routes/task_routes/budgetNegotiation.js"));
+
+// Reference attachments: /cowork/attachments, /cowork/attachments/entity/:id.
+app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
 
 app.use(
   "/api/cowork/notifications",
