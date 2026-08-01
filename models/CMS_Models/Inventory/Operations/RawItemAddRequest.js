@@ -40,6 +40,14 @@ const productRequestSchema = new mongoose.Schema({
     ref: 'MRF',
     default: null,
   },
+  // A Purchase Form was raised for THIS product (not stocked, being bought).
+  // Set by the requisition route once the form is saved, so the Store screen
+  // can show it was already actioned instead of offering the same buttons
+  // again with no memory of what happened.
+  purchaseFormRaised: { type: Boolean, default: false },
+  purchaseRequisitionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Requisition', default: null },
+  purchaseRequisitionNumber: { type: String, trim: true, default: "" },
+  purchaseFormRaisedAt: { type: Date, default: null },
 }, { _id: true })
 
 
