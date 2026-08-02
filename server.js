@@ -1196,17 +1196,26 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
 );
 
+// Role enforcement + the editor-needs-approval queue for the routes PRODUCTION
+// actually owns. Deliberately NOT applied to /api/cms/manufacturing/* at large:
+// cutting-master, QC, packaging-dispatch and production-supervisor all write
+// through those same prefixes, and guarding them as "project-manager" would
+// park a cutting master's save in a production approver's queue. Reads are
+// untouched, and nothing changes until the first Production role is assigned.
+const pmWrites = (entity, extra = {}) =>
+  departmentWrites("project-manager", { entity, ...extra });
+
 const pmRequestsRoutes = require("./routes/CMS_Routes/pm/pmRequestsRoutes");
-app.use("/api/cms/pm/requests", pmRequestsRoutes);
+app.use("/api/cms/pm/requests", pmWrites("production request"), pmRequestsRoutes);
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
-app.use("/api/cms/production/dashboard", productionDashboardRoutes);
+app.use("/api/cms/production/dashboard", pmWrites("production dashboard"), productionDashboardRoutes);
 
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
-app.use("/api/cms/production/canvas-layout", productionMachineLayout);
+app.use("/api/cms/production/canvas-layout", pmWrites("machine layout"), productionMachineLayout);
 
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);
@@ -1216,7 +1225,7 @@ const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Productio
 app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
 
 const ProductionSchedule = require("./routes/CMS_Routes/Production/ProductionSchedule/productionScheduleRoutes.js");
-app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
+app.use("/api/cms/manufacturing/production-schedule", pmWrites("production schedule"), ProductionSchedule);
 
 const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
 app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
