@@ -32,6 +32,7 @@ const allowedOrigins = [
   "https://crm.grav.in",
   "https://customer.rayandcompanies.com",
   "https://rayandcompanies.com",
+  "https://work-space-beta-lac.vercel.app",
   "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev",
   "https://grav-cowork-space-main-hazel.vercel.app",
   /**
