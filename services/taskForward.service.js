@@ -278,7 +278,7 @@ async function assigneePrioritiesFor(db, assigneeIds) {
   return map;
 }
 
-async function createTask({ title, description, notes, requirements = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
+async function createTask({ title, description, notes, requirements = [], satisfiesRequirementIds = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
   pendingAssigneeId = null, pendingAssigneeName = null, departmentApprovals = null,
   isGoldTask = false,
   c2Config = null,
@@ -402,6 +402,14 @@ async function createTask({ title, description, notes, requirements = [], assign
     depth: path.length,
     path,
     subtaskIds: [],
+    // Which of the PARENT's `requirements` this subtask closes, by the caller's
+    // own identifiers. Stored verbatim and never read here: the engine has no
+    // opinion on what a requirement id means, so there is one interpretation of
+    // it and it lives in the client that minted it. Empty on a root task and on
+    // any subtask broken out without naming a requirement.
+    satisfiesRequirementIds: parentTaskId && Array.isArray(satisfiesRequirementIds)
+      ? satisfiesRequirementIds.filter(id => typeof id === "string" && id.trim() !== "")
+      : [],
     // Workflow flags
     confirmedBy: [],
     forwardedBy: null,

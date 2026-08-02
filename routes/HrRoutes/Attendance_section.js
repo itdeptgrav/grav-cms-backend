@@ -10,6 +10,7 @@ const Employee = require("../../models/Employee");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 
 const mongoose = require("mongoose");
+const { recordChange } = require("../../services/changeLog");
 require("../../models/HR_Models/LeaveManagement");
 function getCompanyHoliday() {
   return mongoose.model("CompanyHoliday");
@@ -2042,6 +2043,21 @@ router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
     }
     const settings = await AttendanceSettings.getConfig();
 
+    // bid → date-of-joining. Any entry dated before its employee's DOJ is
+    // overridden to PRE-JOINING below — a not-yet-joined person can't be
+    // absent, on weekly off, or on holiday.
+    const dojDocs = await Employee.find({ dateOfJoining: { $ne: null } })
+      .select(
+        "biometricId basicInfo.biometricId workInfo.biometricId dateOfJoining",
+      )
+      .lean();
+    const dojMap = new Map();
+    for (const e of dojDocs) {
+      const b = String(extractBiometricId(e) || "").toUpperCase();
+      if (b && e.dateOfJoining)
+        dojMap.set(b, new Date(e.dateOfJoining).toISOString().split("T")[0]);
+    }
+
     // ── Inject absent employees not in DailyAttendance ───────────────
     const holidayMap = await loadHolidayMap(date, date);
     const dayOfWeek = new Date(date + "T00:00:00").getDay();
@@ -2119,13 +2135,28 @@ router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
     let employees = await applyMonthlyLatePromotion(dayDoc, settings);
     if (department && department !== "all")
       employees = employees.filter((e) => e.department === department);
+    // Pre-joining override — runs before recomputeSummary so these entries
+    // don't inflate AB/WO/holiday counts for the day.
+    employees = employees.map((e) => {
+      const doj = dojMap.get(String(e.biometricId || "").toUpperCase());
+      if (doj && date < doj)
+        return {
+          ...e,
+          systemPrediction: "PRE-JOINING",
+          hrFinalStatus: null,
+          effectiveStatus: "PRE-JOINING",
+          preJoining: true,
+          attendanceValue: 0,
+          dojStr: doj,
+        };
+      return { ...e, dojStr: doj || null };
+    });
     const summary = recomputeSummary(employees);
     employees = employees.map((e) => ({
       ...e,
-      displayStatus: getDisplayLabel(
-        e.effectiveStatus || e.systemPrediction,
-        settings,
-      ),
+      displayStatus: e.preJoining
+        ? "--"
+        : getDisplayLabel(e.effectiveStatus || e.systemPrediction, settings),
     }));
     res.json({
       success: true,
@@ -2139,6 +2170,36 @@ router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
     });
   } catch (err) {
     console.error("[DAILY]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /hr/attendance/day-range?from=YYYY-MM-DD&to=YYYY-MM-DD
+// One cheap query for a whole year's per-day present counts — powers the overview
+// heatmap (a full-year contribution grid) WITHOUT firing one request per day.
+// Reads the already-synced per-day summaries; never triggers a device sync.
+router.get("/day-range", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const from = String(req.query.from || "").slice(0, 10);
+    const to = String(req.query.to || "").slice(0, 10);
+    if (!from || !to) {
+      return res.status(400).json({ success: false, message: "from and to are required" });
+    }
+    const docs = await DailyAttendance.find({ dateStr: { $gte: from, $lte: to } })
+      .select("dateStr summary holiday")
+      .sort({ dateStr: 1 })
+      .lean();
+
+    const days = docs.map((d) => ({
+      date: d.dateStr,
+      present: d.summary?.presentCount || 0,
+      total: d.summary?.total || 0,
+      holiday: d.holiday?.name ? { name: d.holiday.name, statusCode: d.holiday.statusCode } : null,
+    }));
+
+    res.status(200).json({ success: true, from, to, days });
+  } catch (err) {
+    console.error("[DAY-RANGE]", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -3402,10 +3463,15 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
 
     const emp = dayDoc.employees[empIdx];
     const oldStatus = emp.hrFinalStatus || emp.systemPrediction;
+    // Read before the assignment below overwrites it — the change log needs the
+    // value as it was, and two lines later it is gone.
+    const previousRemarks = emp.hrRemarks || "";
 
     if (hrFinalStatus !== undefined) emp.hrFinalStatus = hrFinalStatus || null;
     if (hrRemarks !== undefined) emp.hrRemarks = hrRemarks || null;
     emp.hrReviewedAt = new Date();
+    // Record WHO edited — the actual signed-in user, not a flat "HR".
+    emp.hrReviewedBy = req.user?.name || req.user?.email || "HR";
 
     const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
     const punchChanges = [];
@@ -3616,6 +3682,26 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     } catch (leaveErr) {
       console.error("[DAY-OVERRIDE] Leave sync error:", leaveErr.message);
     }
+
+    // Who changed this attendance day, and from what to what.
+    //
+    // HR is the first department on the change log. An overridden attendance
+    // day moves leave balances and payroll, so "somebody set this to LAB" was
+    // never a good enough answer — this makes it a name and a time. Never
+    // awaited into the response path: a failed log entry is a gap in history,
+    // a failed save because of it is lost work.
+    recordChange(req, {
+      departmentSlug: "hr",
+      entity: "attendance",
+      entityId: `${biometricId}:${dateStr}`,
+      entityLabel: `${biometricId} on ${dateStr}`,
+      action: "update",
+      summary: `Attendance for ${biometricId} on ${dateStr} set to ${
+        hrFinalStatus || "(cleared)"
+      }`,
+      before: { status: oldStatus, remarks: previousRemarks },
+      after: { status: hrFinalStatus || null, remarks: hrRemarks || "" },
+    });
 
     res.json({
       success: true,
@@ -3842,8 +3928,12 @@ router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
         .json({ success: false, message: "dateStr and updates[] required" });
     let ok = 0,
       fail = 0;
+    const reviewer = req.user?.name || req.user?.email || "HR";
     for (const u of updates) {
-      const set = { "employees.$.hrReviewedAt": new Date() };
+      const set = {
+        "employees.$.hrReviewedAt": new Date(),
+        "employees.$.hrReviewedBy": reviewer,
+      };
       if (u.hrFinalStatus !== undefined)
         set["employees.$.hrFinalStatus"] = u.hrFinalStatus || null;
       if (u.hrRemarks !== undefined)
@@ -3949,6 +4039,14 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       .sort({ dateStr: 1 })
       .lean();
     const byDate = new Map(dayDocs.map((d) => [d.dateStr, d]));
+    // bid → date-of-joining; pre-joining days show "--" and count nothing,
+    // keeping this screen consistent with the Excel export.
+    const dojByBid = new Map();
+    for (const emp of allActive) {
+      const b = String(extractBiometricId(emp) || "").toUpperCase();
+      if (!b || dojByBid.has(b) || !emp.dateOfJoining) continue;
+      dojByBid.set(b, new Date(emp.dateOfJoining).toISOString().split("T")[0]);
+    }
     const employees = [],
       running = new Map();
     const PAID_CODES = [
@@ -4014,7 +4112,17 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           totalAttendance: 0,
         },
       };
+      const dojStr = dojByBid.get(key) || null;
       for (const cal of allDays) {
+        // Pre-joining: "--" cell, nothing counted (no WO/holiday/AB).
+        if (dojStr && cal.dateStr < dojStr) {
+          row.days[cal.dateStr] = {
+            status: "--",
+            isSunday: cal.isSunday,
+            preJoining: true,
+          };
+          continue;
+        }
         if (cal.isFuture) {
           row.days[cal.dateStr] = {
             status: "—",
@@ -4030,6 +4138,39 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         if (cal.isDeclaredHoliday) {
           const hs = cal.holidayStatus,
             didPunch = !!entry && (entry.punchCount || 0) > 0;
+          // An HR/leave override beats the holiday. An approved LWP/LOP on a
+          // festival day is a pay deduction and must read as that status, not
+          // as the holiday.
+          const holidayOverride = entry?.hrFinalStatus || null;
+          if (holidayOverride) {
+            row.days[cal.dateStr] = {
+              status: holidayOverride,
+              displayLabel: getDisplayLabel(holidayOverride, settings),
+              holiday: cal.holiday,
+              punchedOnHoliday: didPunch,
+              netWorkMins: entry?.netWorkMins || 0,
+              otMins: entry?.otMins || 0,
+              punchCount: entry?.punchCount || 0,
+              hrOverride: true,
+            };
+            const _hs_countAs =
+              holidayOverride === "LHD"
+                ? "HD"
+                : holidayOverride === "LAB" || holidayOverride === "EAB"
+                  ? "AB"
+                  : ["P/CL", "P/SL", "P/PL", "P/LWP"].includes(holidayOverride)
+                    ? "P"
+                    : holidayOverride;
+            if (row.totals[_hs_countAs] !== undefined)
+              row.totals[_hs_countAs]++;
+            if (PAID_CODES.includes(holidayOverride))
+              row.totals.totalAttendance++;
+            if (didPunch) {
+              row.totals.totalOtMins += entry.otMins || 0;
+              row.totals.totalNetWorkMins += entry.netWorkMins || 0;
+            }
+            continue;
+          }
           row.days[cal.dateStr] = {
             status: hs,
             holiday: cal.holiday,
@@ -4037,7 +4178,7 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
             netWorkMins: entry?.netWorkMins || 0,
             otMins: entry?.otMins || 0,
             punchCount: entry?.punchCount || 0,
-            hrOverride: !!entry?.hrFinalStatus,
+            hrOverride: false,
           };
           row.totals[hs] = (row.totals[hs] || 0) + 1;
           row.totals.totalAttendance++;
@@ -4050,6 +4191,29 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         }
         if (cal.isSunday && !cal.isWorkingSunday) {
           const didPunch = !!entry && (entry.punchCount || 0) > 0;
+          // Same rule on a weekly off: an explicit HR override wins over WO
+          // even when the employee never punched.
+          if (!didPunch && entry?.hrFinalStatus) {
+            const so = entry.hrFinalStatus;
+            row.days[cal.dateStr] = {
+              status: so,
+              displayLabel: getDisplayLabel(so, settings),
+              isSunday: true,
+              hrOverride: true,
+            };
+            const _so_countAs =
+              so === "LHD"
+                ? "HD"
+                : so === "LAB" || so === "EAB"
+                  ? "AB"
+                  : ["P/CL", "P/SL", "P/PL", "P/LWP"].includes(so)
+                    ? "P"
+                    : so;
+            if (row.totals[_so_countAs] !== undefined)
+              row.totals[_so_countAs]++;
+            if (PAID_CODES.includes(so)) row.totals.totalAttendance++;
+            continue;
+          }
           if (didPunch) {
             let status = entry.systemPrediction;
             const finalStatus = entry.hrFinalStatus || status;
@@ -4191,7 +4355,7 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       };
       for (const emp of employees) {
         const d = emp.days[cal.dateStr];
-        if (!d || !d.status || d.status === "—") continue;
+        if (!d || !d.status || d.status === "—" || d.status === "--") continue;
         const _dts =
           d.status === "LHD"
             ? "HD"
@@ -5245,6 +5409,18 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       department && department !== "all"
         ? allActive.filter((e) => extractDepartment(e) === department)
         : allActive;
+    // bid → date-of-joining. Days before DOJ are rendered as "--" and are
+    // excluded from every per-employee total (WO, holidays, Total Days…) so a
+    // mid-month joiner's sheet matches what they're actually owed.
+    const dojByBid = new Map();
+    for (const emp of allActive) {
+      const bid = String(extractBiometricId(emp) || "").toUpperCase();
+      if (!bid || dojByBid.has(bid) || !emp.dateOfJoining) continue;
+      dojByBid.set(
+        bid,
+        new Date(emp.dateOfJoining).toISOString().split("T")[0],
+      );
+    }
     // Query the attendance docs by date range so this works for any
     // span (single month, last quarter, custom range, etc.).
     const dayDocs = await DailyAttendance.find({
@@ -5319,7 +5495,14 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
           TotalWorking: 0,
         },
       };
+      const dojStr = dojByBid.get(String(key).toUpperCase()) || null;
       for (const cal of allDays) {
+        // Pre-joining days: "--" in the cell, nothing counted — not WO, not
+        // holidays, not absences. The person wasn't on the payroll yet.
+        if (dojStr && cal.dateStr < dojStr) {
+          row.dayCodes[cal.dateStr] = "--";
+          continue;
+        }
         if (cal.isFuture) {
           row.dayCodes[cal.dateStr] = "";
           continue;
@@ -5332,16 +5515,52 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         if (cal.isDeclaredHoliday) {
           const hs = cal.holidayStatus,
             didPunch = !!entry && (entry.punchCount || 0) > 0;
-          sheetCode = didPunch ? "P" : toSheetCode(hs);
-          if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch)
-            row.totals.NHFH++;
-          else if (didPunch) row.totals.P++;
-          if (
-            didPunch &&
-            (entry?.hrFinalStatus ||
-              (entry?.rawPunches || []).some((p) => p.source === "manual"))
-          )
+          // An HR/leave override beats the holiday — an approved LWP/LOP (or
+          // any other final status) on a festival day must export as that
+          // status so the sheet's salary math matches what the UI shows.
+          const holidayOverride = entry?.hrFinalStatus || null;
+          if (holidayOverride) {
+            sheetCode = toSheetCode(holidayOverride) || toSheetCode(hs);
             row.hrOverrides.add(cal.dateStr);
+            if (["P", "P*", "P~", "MP", "WFH"].includes(holidayOverride))
+              row.totals.P++;
+            else if (["AB", "LWP", "LAB", "EAB"].includes(holidayOverride))
+              row.totals.A++;
+            else if (holidayOverride === "HD" || holidayOverride === "LHD")
+              row.totals.HD++;
+            else if (holidayOverride === "CO") row.totals.CO++;
+            else if (holidayOverride === "L-CL") row.totals.CL++;
+            else if (holidayOverride === "L-SL") row.totals.SL++;
+            else if (holidayOverride === "L-EL") row.totals.PL++;
+            else if (holidayOverride === "P/CL") {
+              row.totals.P++;
+              row.totals.CL = (row.totals.CL || 0) + 0.5;
+            } else if (holidayOverride === "P/SL") {
+              row.totals.P++;
+              row.totals.SL = (row.totals.SL || 0) + 0.5;
+            } else if (holidayOverride === "P/PL") {
+              row.totals.P++;
+              row.totals.PL = (row.totals.PL || 0) + 0.5;
+            } else if (holidayOverride === "P/LWP") {
+              row.totals.P++;
+              row.totals.A = (row.totals.A || 0) + 0.5;
+            } else if (holidayOverride === "WO") row.totals.WO++;
+            else {
+              // Unknown override code — fall back to the holiday itself.
+              sheetCode = toSheetCode(hs);
+              row.totals.NHFH++;
+            }
+          } else {
+            sheetCode = didPunch ? "P" : toSheetCode(hs);
+            if (["FH", "NH", "OH", "RH", "PH"].includes(hs) && !didPunch)
+              row.totals.NHFH++;
+            else if (didPunch) row.totals.P++;
+            if (
+              didPunch &&
+              (entry?.rawPunches || []).some((p) => p.source === "manual")
+            )
+              row.hrOverrides.add(cal.dateStr);
+          }
         } else if (cal.isSunday && !cal.isWorkingSunday) {
           // Weekly off counts as WO for EVERY employee, so the WO total is the
           // same across the whole sheet regardless of who punched on a Sunday.
@@ -5444,9 +5663,15 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       // "Total Working Days" = elapsed days minus full absences minus half of
       //   each half-day. row.totals.A already includes the 0.5 contributed by
       //   each P/LWP, so its unpaid half is deducted automatically.
+      // "Total Days" is calendar-wide (31/30 per the month) — the same for
+      // every row. Only "Total Working Days" is DOJ-aware: it starts at the
+      // employee's joining date, then deducts absences and half-days.
+      const empElapsed = dojStr
+        ? allDays.filter((c) => !c.isFuture && c.dateStr >= dojStr).length
+        : elapsedDays;
       row.totals.Total = elapsedDays;
       row.totals.TotalWorking =
-        elapsedDays - row.totals.A - row.totals.HD * 0.5;
+        empElapsed - row.totals.A - row.totals.HD * 0.5;
       return row;
     }
     const processedBids = new Set();
@@ -5733,6 +5958,8 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       "P/SL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
       "P/PL": { font: "FF5C2B9C", fill: "FFEDDBFF" },
       "P/LWP": { font: "FF9C0006", fill: "FFFFE0E0" },
+      // Pre-joining placeholder — muted, no fill, carries no meaning.
+      "--": { font: "FFAAAAAA", fill: null },
       "": { font: "FFAAAAAA", fill: null },
     };
     const colTotals = new Array(totalCols + 1).fill(0);
@@ -6652,7 +6879,7 @@ router.patch(
                     time: newDate,
                     punchType: r.proposedPunchType,
                     source: "miss_punch",
-                    addedBy: req.user?.id,
+                    addedBy: req.user?.name || req.user?.email || req.user?.id,
                     addedAt: new Date(),
                   };
                   if (existingIdx >= 0)
@@ -6695,7 +6922,7 @@ router.patch(
                   time: newDate,
                   punchType: pc.punchType,
                   source: "miss_punch",
-                  addedBy: req.user?.id,
+                  addedBy: req.user?.name || req.user?.email || req.user?.id,
                   addedAt: new Date(),
                 };
                 if (existingIdx >= 0)

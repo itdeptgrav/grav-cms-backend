@@ -6,8 +6,12 @@
 
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 const Requisition = require("../../../../models/CMS_Models/Inventory/Operations/Requisition");
 const Employee = require("../../../../models/Employee");
+const MRF = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
+// READ-ONLY LEGACY fallback — see the write-back block in POST / below.
+const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 
 router.use(EmployeeAuth);
@@ -57,6 +61,7 @@ function cleanItems(items) {
       vendorName: String(raw.vendorName || "").trim(),
       price,
       notes: String(raw.notes || "").trim(),
+      productId: mongoose.Types.ObjectId.isValid(raw.productId) ? raw.productId : null,
     });
   }
 
@@ -159,6 +164,7 @@ router.post("/", async (req, res) => {
       items, department, requiredBy, reason, notes, priority,
       requestedByEmployee, requestedByName, requestedById,
       pettyCashAmount, pettyCashGivenTo, pettyCashGivenToEmployee, pettyCashNote,
+      sourceMrfId, sourceMrfNumber,
     } = req.body;
 
     const { items: cleaned, error } = cleanItems(items);
@@ -221,9 +227,56 @@ router.post("/", async (req, res) => {
       status: "SUBMITTED",
       createdByRef: getActorId(req),
       createdByName: actorName(req),
+      sourceMrfId: mongoose.Types.ObjectId.isValid(sourceMrfId) ? sourceMrfId : null,
+      sourceMrfNumber: String(sourceMrfNumber || "").trim(),
     });
 
     await requisition.save();
+
+    // Mark the specific item(s) this was raised for so the Store screen shows
+    // "Purchase Form Raised" instead of offering the same buttons again with
+    // no memory of it. Best-effort — the requisition itself is already saved
+    // and is the record that matters; a failure here must not undo it.
+    //
+    // `sourceMrfId`/`productId` point at an MRF item going forward; tried
+    // first. RawItemAddRequest is a read-only-legacy fallback for anything
+    // raised against a pre-cutover product request that's still open.
+    const productIds = cleaned.map(it => it.productId).filter(Boolean);
+    if (mongoose.Types.ObjectId.isValid(sourceMrfId) && productIds.length) {
+      try {
+        const mrf = await MRF.findById(sourceMrfId);
+        if (mrf) {
+          let touched = false;
+          for (const pid of productIds) {
+            const item = mrf.items.id(pid);
+            if (!item) continue;
+            item.purchaseFormRaised = true;
+            item.purchaseRequisitionId = requisition._id;
+            item.purchaseRequisitionNumber = requisition.requisitionNumber;
+            item.purchaseFormRaisedAt = new Date();
+            touched = true;
+          }
+          if (touched) await mrf.save();
+        } else {
+          const prDoc = await RawItemAddRequest.findById(sourceMrfId);
+          if (prDoc) {
+            let touched = false;
+            for (const pid of productIds) {
+              const product = prDoc.products.id(pid);
+              if (!product) continue;
+              product.purchaseFormRaised = true;
+              product.purchaseRequisitionId = requisition._id;
+              product.purchaseRequisitionNumber = requisition.requisitionNumber;
+              product.purchaseFormRaisedAt = new Date();
+              touched = true;
+            }
+            if (touched) await prDoc.save();
+          }
+        }
+      } catch (e) {
+        console.error("[Requisition POST /] failed to flag product request", e);
+      }
+    }
 
     res.status(201).json({
       success: true,
@@ -232,6 +285,86 @@ router.post("/", async (req, res) => {
     });
   } catch (e) {
     console.error("[Requisition POST /]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ── PATCH /:id — edit an already-raised purchase form ────────────────────────
+// Same field set and validation as create. Number/source/creator stay fixed —
+// this corrects what was raised, it does not re-raise it under a new identity.
+router.patch("/:id", async (req, res) => {
+  try {
+    const requisition = await Requisition.findById(req.params.id);
+    if (!requisition) return res.status(404).json({ success: false, message: "Requisition not found" });
+    if (["CONVERTED", "CANCELLED"].includes(requisition.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot edit — this purchase form is already ${requisition.status.toLowerCase()}.`,
+      });
+    }
+
+    const {
+      items, department, requiredBy, reason, notes, priority,
+      requestedByEmployee, requestedByName, requestedById,
+      pettyCashAmount, pettyCashGivenTo, pettyCashGivenToEmployee, pettyCashNote,
+    } = req.body;
+
+    const { items: cleaned, error } = cleanItems(items);
+    if (error) return res.status(400).json({ success: false, message: error });
+
+    let resolved = null;
+    if (requestedByEmployee) {
+      resolved = await Employee.findById(requestedByEmployee)
+        .select("firstName middleName lastName name biometricId identityId department")
+        .lean();
+    }
+    const resolvedName = resolved
+      ? ([resolved.firstName, resolved.middleName, resolved.lastName].filter(Boolean).join(" ").trim() || resolved.name || "")
+      : String(requestedByName || "").trim();
+
+    if (pettyCashAmount !== "" && pettyCashAmount !== null && pettyCashAmount !== undefined &&
+      Number(pettyCashAmount) < 0) {
+      return res.status(400).json({ success: false, message: "Petty cash amount cannot be negative" });
+    }
+
+    let cashPerson = null;
+    if (pettyCashGivenToEmployee) {
+      cashPerson = await Employee.findById(pettyCashGivenToEmployee)
+        .select("firstName middleName lastName name").lean();
+    }
+    const cashPersonName = cashPerson
+      ? ([cashPerson.firstName, cashPerson.middleName, cashPerson.lastName].filter(Boolean).join(" ").trim() || cashPerson.name || "")
+      : String(pettyCashGivenTo || "").trim();
+
+    requisition.items = cleaned;
+    requisition.requestedByEmployee = resolved?._id || null;
+    requisition.requestedByName = resolvedName;
+    requisition.requestedById = resolved
+      ? (resolved.biometricId || resolved.identityId || "")
+      : String(requestedById || "").trim();
+    requisition.department = String(department || "").trim() || resolved?.department || "";
+    requisition.requiredBy = requiredBy ? new Date(requiredBy) : null;
+    requisition.reason = String(reason || "").trim();
+    requisition.notes = String(notes || "").trim();
+    requisition.priority = ["LOW", "NORMAL", "HIGH", "URGENT"].includes(priority) ? priority : "NORMAL";
+    requisition.pettyCashAmount =
+      pettyCashAmount === "" || pettyCashAmount === null || pettyCashAmount === undefined ||
+        Number.isNaN(Number(pettyCashAmount))
+        ? null
+        : Number(pettyCashAmount);
+    requisition.pettyCashGivenTo = cashPersonName;
+    requisition.pettyCashGivenToEmployee = cashPerson?._id || null;
+    requisition.pettyCashNote = String(pettyCashNote || "").trim();
+
+    await requisition.save();
+
+    res.json({
+      success: true,
+      message: `${requisition.requisitionNumber} updated`,
+      requisition: requisition.toObject({ virtuals: true }),
+    });
+  } catch (e) {
+    console.error("[Requisition PATCH /:id]", e);
     res.status(500).json({ success: false, message: e.message });
   }
 });

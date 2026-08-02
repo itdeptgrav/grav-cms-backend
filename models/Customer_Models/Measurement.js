@@ -25,6 +25,11 @@ const categoryEntrySchema = new mongoose.Schema(
   {
     categoryName: { type: String, required: true, trim: true },
     measurements: [categoryMeasurementFieldSchema],
+    // Set when this block's values were auto-filled from a saved
+    // MeasurementTemplate rather than typed in by hand — kept even if the
+    // person then edits some values, so "where did this come from" survives.
+    templateId:   { type: mongoose.Schema.Types.ObjectId, ref: "MeasurementTemplate", default: null },
+    templateName: { type: String, default: "", trim: true },
   },
   { _id: false }
 );
@@ -40,6 +45,9 @@ const productMeasurementSchema = new mongoose.Schema(
     measuredAt:  { type: Date, default: Date.now },
     qrGenerated: { type: Boolean, default: false },
     qrGeneratedAt: { type: Date, default: null },
+    // Same provenance note as categoryEntrySchema.templateId above.
+    templateId:   { type: mongoose.Schema.Types.ObjectId, ref: "MeasurementTemplate", default: null },
+    templateName: { type: String, default: "", trim: true },
   },
   { _id: false }
 );
