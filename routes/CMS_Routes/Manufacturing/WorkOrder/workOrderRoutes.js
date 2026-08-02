@@ -644,6 +644,9 @@ router.get("/:id/raw-item-requirement", async (req, res) => {
         variantCombination: rm.rawItemVariantCombination || [],
         unit: rm.unit,
         baseUnit,
+        // BOM breakdown snapshot — see rawMaterialAllocationSchema
+        requiredQuantity: rm.requiredQuantity ?? quantityRequired,
+        allowancePercent: rm.allowancePercent || 0,
         quantityRequired,
         unitCost: rm.unitCost || 0,
         totalCost: rm.totalCost || (rm.unitCost || 0) * quantityRequired,
@@ -662,6 +665,7 @@ router.get("/:id/raw-item-requirement", async (req, res) => {
 
     const variantLabel = (workOrder.variantAttributes || []).map((a) => a.value).join(" / ") || "Default";
     const perPiece = (t) => (workOrder.quantity > 0 ? t.quantityRequired / workOrder.quantity : 0);
+    const perPieceRequired = (t) => (workOrder.quantity > 0 ? t.requiredQuantity / workOrder.quantity : 0);
 
     const perProduct = [
       {
@@ -678,7 +682,10 @@ router.get("/:id/raw-item-requirement", async (req, res) => {
           unit: t.unit,
           baseUnit: t.baseUnit,
           perPieceQty: perPiece(t),
+          perPieceRequiredQty: perPieceRequired(t),
+          allowancePercent: t.allowancePercent,
           quantityRequired: t.quantityRequired,
+          requiredQuantity: t.requiredQuantity,
           unitCost: t.unitCost,
           totalCost: t.totalCost,
         })),
@@ -691,7 +698,10 @@ router.get("/:id/raw-item-requirement", async (req, res) => {
               variantId: t.variantId,
               rawItemName: t.rawItemName,
               perPieceQty: perPiece(t),
+              perPieceRequiredQty: perPieceRequired(t),
+              allowancePercent: t.allowancePercent,
               quantityRequired: t.quantityRequired,
+              requiredQuantity: t.requiredQuantity,
               unit: t.unit,
             })),
           },

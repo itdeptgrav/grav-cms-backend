@@ -168,9 +168,10 @@ function overlapBlockResponse(res, existing) {
 }
 
 // ─── Shared: apply leave + increment balance (replaces old finaliseApproval) ──
-async function finaliseApproval(app, approverId, remarks = "") {
+async function finaliseApproval(app, approverId, remarks = "", approverName = "") {
   app.status = "hr_approved";
   app.hrApprovedBy = approverId;
+  app.hrApprovedByName = approverName || null;
   app.hrApprovedAt = new Date();
   app.hrRemarks = remarks;
   await app.save();
@@ -844,6 +845,7 @@ router.patch("/bulk-approve", EmployeeAuthMiddleware, async (req, res) => {
         app,
         req.user.id,
         "Bulk approved by HR",
+        req.user?.name || req.user?.email || "",
       );
       if (result.applied > 0) attendanceAppliedCount++;
     }
@@ -1423,7 +1425,7 @@ router.patch("/:id/approve", EmployeeAuthMiddleware, async (req, res) => {
       });
     }
 
-    const attendanceResult = await finaliseApproval(app, req.user.id, remarks);
+    const attendanceResult = await finaliseApproval(app, req.user.id, remarks, req.user?.name || req.user?.email || "");
 
     res.json({
       success: true,
@@ -1674,7 +1676,7 @@ async function _notifyEmployeeApproved(app) {
           toDate: app.toDate,
           totalDays: app.totalDays,
           isHalfDay: app.isHalfDay,
-          approvedBy: "HR",
+          approvedBy: app.hrApprovedByName || "HR",
         })
         .catch((e) => console.warn("[HR-APPROVE-EMAIL]", e.message));
     }

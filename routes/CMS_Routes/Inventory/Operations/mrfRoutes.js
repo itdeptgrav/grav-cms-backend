@@ -87,14 +87,12 @@ const buildUnitConversions = mrfUnits.buildUnitConversions;
 const actorName = (req) => req.user?.name || req.user?.firstName || "Store";
 
 /**
- * May the Store act on this product request (match / register / reject)?
- *
- * Approved by the requester's TL, or auto-forwarded because no TL could be
- * resolved. The third case covers requests raised BEFORE TL approval existed:
- * `approvalStatus` defaults to PENDING_TL on those, so a store person who had
- * already started working one would suddenly find it frozen. If the store has
- * already actioned any product on it, that decision was clearly made under the
- * old rules and must stand.
+ * READ-ONLY LEGACY: whether the store could act on a pre-cutover
+ * RawItemAddRequest doc. Product requests are no longer their own thing —
+ * "not in the catalogue" items are just MRF items (itemStatus UNMATCHED),
+ * gated by the ordinary isStoreActionable() above — but this still backs the
+ * legacy GET /product-requests/:id read route below, for anything raised
+ * before this changed.
  */
 function prStoreActionable(doc) {
   if (!doc) return false;
@@ -104,23 +102,7 @@ function prStoreActionable(doc) {
   return (doc.products || []).some(p => p.status && p.status !== "PENDING");
 }
 
-/** Guard for the store's mutating product-request routes. */
-function requirePrApproved(doc, res) {
-  if (prStoreActionable(doc)) return true;
-  res.status(403).json({
-    success: false,
-    message: doc.approvalStatus === "TL_REJECTED"
-      ? `This product request was rejected by ${doc.tlRejectedByName || "the requester's Primary Manager/TL"} — it cannot be actioned.`
-      : `This product request is still awaiting approval from ${doc.approverName || "the requester's Primary Manager/TL"}. You can discuss it in the chat, but it cannot be matched or registered until they approve.`,
-  });
-  return false;
-}
-
-/**
- * An MRF spawned from a product request still needs the requester's TL to
- * approve the issue — the store only decided *which catalogue item* it is.
- * Returns the approver-routing patch plus the requester's biometric id.
- */
+/** Resolves who approves an MRF this route raises on someone's behalf. */
 async function approverPatchFor(employeeId) {
   const mrfApprover = require("../../../../services/mrfApprover.service");
   const emp = await Employee.findById(employeeId)
@@ -490,6 +472,14 @@ function cartesianProduct(arrays) {
   }, [[]]);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// LEGACY — match/register/reject for pre-cutover RawItemAddRequest docs only.
+// Nothing creates a new one of these any more (see createMrfRequest in
+// coworkMrfRoutes.js); a NEW request's not-yet-catalogued items are resolved
+// by the item-scoped /:id/items/:itemId/* routes further down, in place, on
+// the request's own MRF. This trio stays only so a product request that was
+// still open at cutover isn't stranded — delete once none remain PENDING.
+// ═══════════════════════════════════════════════════════════════════════════
 router.patch("/product-requests/:id/match", async (req, res) => {
   try {
     const { rawItemId, productId, requestedQty, unit, variantId, variantCombination } = req.body;
@@ -501,7 +491,14 @@ router.patch("/product-requests/:id/match", async (req, res) => {
 
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
-    if (!requirePrApproved(doc, res)) return;
+    if (!prStoreActionable(doc)) {
+      return res.status(403).json({
+        success: false,
+        message: doc.approvalStatus === "TL_REJECTED"
+          ? `This product request was rejected by ${doc.tlRejectedByName || "the requester's Primary Manager/TL"} — it cannot be actioned.`
+          : `This product request is still awaiting approval from ${doc.approverName || "the requester's Primary Manager/TL"}.`,
+      });
+    }
 
     const product = doc.products.id(productId);
     if (!product) return res.status(404).json({ success: false, message: "Product not found on this request" });
@@ -517,15 +514,14 @@ router.patch("/product-requests/:id/match", async (req, res) => {
 
     // If this product was matched before, it already has a spawned MRF.
     // Editing the match should correct THAT SAME MRF, not retire it and
-    // mint a new number — only safe to do while it's still untouched
-    // (PENDING, nothing issued); block it otherwise.
+    // mint a new number — only safe while nothing has actually been issued.
     const wasRematch = !!product.spawnedMrf;
     let oldMrf = null;
     if (wasRematch) {
       oldMrf = await MRF.findById(product.spawnedMrf);
       if (oldMrf) {
         const anyIssued = oldMrf.items.some(i => (i.issuedQty || 0) > 0);
-        if (anyIssued || oldMrf.status !== "PENDING") {
+        if (anyIssued || !["PENDING", "APPROVED"].includes(oldMrf.status)) {
           return res.status(400).json({
             success: false,
             message: `Cannot re-match — ${oldMrf.mrfNumber} is already ${oldMrf.status.toLowerCase()}${anyIssued ? " with items issued" : ""}. Resolve or cancel it directly instead.`,
@@ -541,17 +537,17 @@ router.patch("/product-requests/:id/match", async (req, res) => {
 
     let mrf;
     if (oldMrf) {
-      // Same MRF id/number — just swap which item it points to.
-      oldMrf.items = builtItems;
+      oldMrf.items = builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }));
       oldMrf.reason = doc.reason || `Matched from product request: ${product.itemName}`;
       oldMrf.priority = doc.priority;
       await oldMrf.save();
       mrf = oldMrf;
     } else {
-      // Route it to the requester's TL just like a directly-raised MRF —
-      // matching an item to the catalogue is not an approval to issue it.
+      // The parent product request already cleared TL approval (or was
+      // auto-forwarded) — matching it to a catalogue item is a Store
+      // decision, not a fresh ask, so the spawned MRF is created already
+      // APPROVED and ready to issue instead of going through TL approval.
       const { patch: approver, requestedForId } = await approverPatchFor(doc.requestedBy);
-      const autoForward = approver.approvalRoute === "AUTO_STORE";
 
       mrf = new MRF({
         requestedFor: doc.requestedBy,
@@ -567,20 +563,23 @@ router.patch("/product-requests/:id/match", async (req, res) => {
         reason: doc.reason || `Matched from product request: ${product.itemName}`,
         priority: doc.priority,
         ...approver,
-        status: autoForward ? "APPROVED" : "PENDING",
-        items: autoForward
-          ? builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }))
-          : builtItems,
-        ...(autoForward ? { approvedAt: new Date() } : {}),
+        status: "APPROVED",
+        items: builtItems.map(i => ({ ...i, itemStatus: "APPROVED" })),
+        approvedAt: new Date(),
+        tlApproved: true,
+        tlApprovedBy: doc.tlApprovedBy || null,
+        tlApprovedByName: doc.tlApprovedByName || "",
+        tlApprovedAt: doc.tlApprovedAt || new Date(),
+        autoForwarded: !!doc.autoForwarded,
       });
       mrf.logEvent({
         action: "CREATED", actorName: actorName(req), actorRole: "store",
-        detail: `Created from product request "${product.itemName}" matched to "${rawItem.name}".`,
+        detail: `Created from legacy product request "${product.itemName}" matched to "${rawItem.name}" — ready to issue.`,
       });
       await mrf.save();
 
-      if (autoForward) mrfNotify.autoForwarded(mrf).catch(() => { });
-      else mrfNotify.submitted(mrf).catch(() => { });
+      if (doc.autoForwarded) mrfNotify.autoForwarded(mrf).catch(() => { });
+      else mrfNotify.tlApproved(mrf).catch(() => { });
     }
 
     product.matchedTo = rawItemId;
@@ -618,7 +617,14 @@ router.patch("/product-requests/:id/approve", async (req, res) => {
 
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
-    if (!requirePrApproved(doc, res)) return;
+    if (!prStoreActionable(doc)) {
+      return res.status(403).json({
+        success: false,
+        message: doc.approvalStatus === "TL_REJECTED"
+          ? `This product request was rejected by ${doc.tlRejectedByName || "the requester's Primary Manager/TL"} — it cannot be actioned.`
+          : `This product request is still awaiting approval from ${doc.approverName || "the requester's Primary Manager/TL"}.`,
+      });
+    }
 
     const product = doc.products.id(productId);
     if (!product) return res.status(404).json({ success: false, message: "Product not found on this request" });
@@ -654,15 +660,11 @@ router.patch("/product-requests/:id/approve", async (req, res) => {
       rawItemId: newRawItem._id,
       requestedQty,
       unit: unit || product.unit,
-      // Carry the requester's own photos and notes onto the new MRF line.
       description: product.notes || "",
       images: product.images || [],
     }]);
 
-    // Registering the product does not approve the issue — the requester's TL
-    // still decides, same as any other MRF.
     const { patch: approver, requestedForId } = await approverPatchFor(doc.requestedBy);
-    const autoForward = approver.approvalRoute === "AUTO_STORE";
 
     const mrf = new MRF({
       requestedFor: doc.requestedBy,
@@ -678,20 +680,23 @@ router.patch("/product-requests/:id/approve", async (req, res) => {
       reason: doc.reason || `Approved from product request: ${product.itemName}`,
       priority: doc.priority,
       ...approver,
-      status: autoForward ? "APPROVED" : "PENDING",
-      items: autoForward
-        ? builtItems.map(i => ({ ...i, itemStatus: "APPROVED" }))
-        : builtItems,
-      ...(autoForward ? { approvedAt: new Date() } : {}),
+      status: "APPROVED",
+      items: builtItems.map(i => ({ ...i, itemStatus: "APPROVED" })),
+      approvedAt: new Date(),
+      tlApproved: true,
+      tlApprovedBy: doc.tlApprovedBy || null,
+      tlApprovedByName: doc.tlApprovedByName || "",
+      tlApprovedAt: doc.tlApprovedAt || new Date(),
+      autoForwarded: !!doc.autoForwarded,
     });
     mrf.logEvent({
       action: "CREATED", actorName: actorName(req), actorRole: "store",
-      detail: `Created from product request "${product.itemName}" after registering it in inventory.`,
+      detail: `Created from legacy product request "${product.itemName}" after registering it in inventory — ready to issue.`,
     });
     await mrf.save();
 
-    if (autoForward) mrfNotify.autoForwarded(mrf).catch(() => { });
-    else mrfNotify.submitted(mrf).catch(() => { });
+    if (doc.autoForwarded) mrfNotify.autoForwarded(mrf).catch(() => { });
+    else mrfNotify.tlApproved(mrf).catch(() => { });
 
     product.status = "ADDED";
     product.matchedTo = newRawItem._id;
@@ -716,12 +721,20 @@ router.patch("/product-requests/:id/approve", async (req, res) => {
     res.status(500).json({ success: false, message: e.message });
   }
 });
+
 router.patch("/product-requests/:id/reject", async (req, res) => {
   try {
     const { note, productId } = req.body;
     const doc = await RawItemAddRequest.findById(req.params.id);
     if (!doc) return res.status(404).json({ success: false, message: "Request not found" });
-    if (!requirePrApproved(doc, res)) return;
+    if (!prStoreActionable(doc)) {
+      return res.status(403).json({
+        success: false,
+        message: doc.approvalStatus === "TL_REJECTED"
+          ? `This product request was rejected by ${doc.tlRejectedByName || "the requester's Primary Manager/TL"} — it cannot be actioned.`
+          : `This product request is still awaiting approval from ${doc.approverName || "the requester's Primary Manager/TL"}.`,
+      });
+    }
 
     if (productId) {
       const product = doc.products.id(productId);
@@ -756,6 +769,193 @@ router.patch("/product-requests/:id/reject", async (req, res) => {
 
     res.json({ success: true, message: "Request rejected", request: doc });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Resolving an UNMATCHED item — the Store links it to the catalogue (or
+// registers it as new) IN PLACE, on this same MRF. No spawned document, no
+// second number, no redirect: the request the store is already looking at
+// is the same one they keep working on.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * PATCH /:id/items/:itemId/match — link an UNMATCHED item (or edit an
+ * already-matched one, as long as nothing has been issued yet) to an
+ * existing catalogue item.
+ */
+router.patch("/:id/items/:itemId/match", async (req, res) => {
+  try {
+    const { rawItemId, variantId, variantCombination } = req.body;
+    if (!rawItemId) return res.status(400).json({ success: false, message: "rawItemId required" });
+
+    const mrf = await MRF.findById(req.params.id);
+    if (!mrf) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!isStoreActionable(mrf)) {
+      return res.status(403).json({ success: false, message: "This request has not been approved yet." });
+    }
+
+    const item = mrf.items.id(req.params.itemId);
+    if (!item) return res.status(404).json({ success: false, message: "Item not found on this request" });
+    const wasRematch = item.itemStatus === "APPROVED";
+    const canMatch = item.itemStatus === "UNMATCHED"
+      || (wasRematch && (item.issuedQty || 0) === 0);
+    if (!canMatch) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot match — this item is already ${item.itemStatus.toLowerCase()}${(item.issuedQty || 0) > 0 ? " with quantity issued" : ""}.`,
+      });
+    }
+
+    const rawItem = await RawItem.findById(rawItemId).select("name sku unit customUnit variants").lean();
+    if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
+    if ((rawItem.variants || []).length > 0 && !variantId) {
+      return res.status(400).json({ success: false, message: "This item has variants — pick one before matching" });
+    }
+
+    // The requester's own unit (set when the request was raised) stays
+    // authoritative — matching decides WHICH catalogue item this is, not a
+    // fresh chance to redefine what unit it's tracked in.
+    item.rawItem = rawItem._id;
+    item.rawItemName = rawItem.name;
+    item.rawItemSku = rawItem.sku || "";
+    item.variantId = variantId || null;
+    item.variantCombination = variantCombination || [];
+    item.baseUnit = rawItem.customUnit || rawItem.unit || "unit";
+    item.itemStatus = "APPROVED";
+    item.category = "";
+    item.attributes = [];
+
+    mrf.logEvent({
+      action: wasRematch ? "ITEM_REMATCHED" : "ITEM_MATCHED", actorName: actorName(req), actorRole: "store",
+      detail: `"${item.rawItemName}" matched to "${rawItem.name}" — ready to issue.`,
+    });
+    await mrf.save();
+
+    NotificationService.sendToUser(mrf.requestedFor, {
+      title: wasRematch ? "Item Re-matched" : "Item Matched",
+      body: `"${rawItem.name}" was found in inventory for your request ${mrf.mrfNumber} — ready to be issued.`,
+      type: "request",
+      url: "/coworking/mrf",
+      tag: `mrf-item-matched-${mrf._id}-${item._id}`,
+    }).catch(() => { });
+
+    res.json({ success: true, message: "Matched to existing item", mrf, wasRematch });
+  } catch (e) {
+    console.error("[Match MRF item]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/**
+ * PATCH /:id/items/:itemId/register — nothing in the catalogue matches; add
+ * it as a new RawItem from what the requester described (name/category/
+ * attributes, carried on the item since it was raised) and link this same
+ * item to it.
+ */
+router.patch("/:id/items/:itemId/register", async (req, res) => {
+  try {
+    const mrf = await MRF.findById(req.params.id);
+    if (!mrf) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!isStoreActionable(mrf)) {
+      return res.status(403).json({ success: false, message: "This request has not been approved yet." });
+    }
+
+    const item = mrf.items.id(req.params.itemId);
+    if (!item) return res.status(404).json({ success: false, message: "Item not found on this request" });
+    if (item.itemStatus !== "UNMATCHED") {
+      return res.status(400).json({ success: false, message: `Cannot register — this item's status is ${item.itemStatus}` });
+    }
+
+    let variants = [];
+    if (item.attributes && item.attributes.length > 0) {
+      const combos = cartesianProduct(item.attributes.map(a => a.values));
+      variants = combos.map(combo => ({
+        combination: combo.map((val, idx) => ({ attribute: item.attributes[idx].name, value: val })),
+        quantity: 0,
+        status: "Out of Stock",
+        sku: `${item.rawItemName.substring(0, 3)}-${combo.join('-')}`.toUpperCase(),
+      }));
+    }
+
+    const newRawItem = new RawItem({
+      name: item.rawItemName,
+      category: item.category || "",
+      unit: item.unit || "unit",
+      customUnit: item.unit || "unit",
+      quantity: 0,
+      status: "Out of Stock",
+      variants,
+      sku: `${item.rawItemName.substring(0, 4)}-${Date.now()}`.toUpperCase(),
+      minStock: 0,
+    });
+    await newRawItem.save();
+
+    item.rawItem = newRawItem._id;
+    item.rawItemSku = newRawItem.sku;
+    item.baseUnit = newRawItem.customUnit || newRawItem.unit;
+    item.itemStatus = "APPROVED";
+    item.category = "";
+    item.attributes = [];
+
+    mrf.logEvent({
+      action: "ITEM_REGISTERED", actorName: actorName(req), actorRole: "store",
+      detail: `"${item.rawItemName}" registered as a new inventory item — ready to issue.`,
+    });
+    await mrf.save();
+
+    NotificationService.sendToUser(mrf.requestedFor, {
+      title: "Item Added to Inventory",
+      body: `"${item.rawItemName}" was added to inventory for your request ${mrf.mrfNumber} — ready to be issued.`,
+      type: "request",
+      url: "/coworking/mrf",
+      tag: `mrf-item-registered-${mrf._id}-${item._id}`,
+    }).catch(() => { });
+
+    res.json({ success: true, message: "Item added to inventory", mrf, rawItem: newRawItem });
+  } catch (e) {
+    console.error("[Register MRF item]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+/** PATCH /:id/items/:itemId/reject — the store can't supply this still-unmatched line at all. */
+router.patch("/:id/items/:itemId/reject", async (req, res) => {
+  try {
+    const { note } = req.body;
+    const mrf = await MRF.findById(req.params.id);
+    if (!mrf) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!isStoreActionable(mrf)) {
+      return res.status(403).json({ success: false, message: "This request has not been approved yet." });
+    }
+
+    const item = mrf.items.id(req.params.itemId);
+    if (!item) return res.status(404).json({ success: false, message: "Item not found on this request" });
+    if (item.itemStatus !== "UNMATCHED") {
+      return res.status(400).json({ success: false, message: `Cannot reject — this item's status is ${item.itemStatus}` });
+    }
+
+    item.itemStatus = "REJECTED";
+    item.storeNotes = note || "";
+
+    mrf.logEvent({
+      action: "ITEM_REJECTED", actorName: actorName(req), actorRole: "store",
+      detail: `"${item.rawItemName}" rejected${note ? `: ${note}` : "."}`,
+    });
+    await mrf.save();
+
+    NotificationService.sendToUser(mrf.requestedFor, {
+      title: "Item Rejected",
+      body: note ? `Reason: ${note}` : `"${item.rawItemName}" on your request ${mrf.mrfNumber} was rejected by the Store.`,
+      type: "request",
+      url: "/coworking/mrf",
+      tag: `mrf-item-rejected-${mrf._id}-${item._id}`,
+    }).catch(() => { });
+
+    res.json({ success: true, message: "Item rejected", mrf });
+  } catch (e) {
+    console.error("[Reject MRF item]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
 });
 
 // ── GET /:id ──────────────────────────────────────────────────────────────────
@@ -1200,6 +1400,11 @@ router.post("/:id/issue", async (req, res) => {
         return res.status(400).json({
           success: false,
           message: `"${mrfItem.rawItemName}" is marked ${mrfItem.itemStatus.toLowerCase()} on this request and cannot be issued.`,
+        });
+      if (!mrfItem.rawItem)
+        return res.status(400).json({
+          success: false,
+          message: `"${mrfItem.rawItemName}" isn't matched to a catalogue item yet — match or register it before issuing.`,
         });
 
       const remaining = Math.max(0, (mrfItem.requestedQty || 0) - (mrfItem.issuedQty || 0));

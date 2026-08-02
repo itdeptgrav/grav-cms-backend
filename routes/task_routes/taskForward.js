@@ -1396,7 +1396,7 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
     // A subtask follows the SAME lifecycle as a standard task — the timer/budget
     // negotiation, priority and review all apply — so it carries the same fields
     // rather than a truncated set that dropped the budget silently.
-    const { title, description, notes, assigneeIds, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
+    const { title, description, notes, assigneeIds, satisfiesRequirementIds, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
@@ -1465,6 +1465,12 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       priority: subtaskPriority,
       assigneePriorities: subtaskAssigneePriorities,
       parentTaskId: req.params.taskId,
+      // The parent requirements this subtask is answerable for. Passed straight
+      // through — the ids are the caller's vocabulary, and the engine stores
+      // them without deciding what they mean. A caller that names none gets an
+      // empty array, which is a subtask that closes no requirement rather than
+      // a rejected request.
+      satisfiesRequirementIds,
       // TL subtasks should NOT show in CEO tree
       createdByTl: requesterRole === "tl",
       createdByCeo: requesterRole === "ceo",

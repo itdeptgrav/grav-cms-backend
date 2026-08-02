@@ -22,6 +22,12 @@ const requisitionItemSchema = new mongoose.Schema(
     price: { type: Number, default: null },
 
     notes: { type: String, trim: true, default: "" },
+
+    // When this row was raised from a specific product on a product request
+    // ("Raise Purchase Form" on one PENDING product), its sub-document id —
+    // lets the store route write `purchaseFormRaised` back onto that exact
+    // product once this requisition is saved.
+    productId: { type: mongoose.Schema.Types.ObjectId, default: null },
   },
   { _id: true }
 );
@@ -91,6 +97,14 @@ const requisitionSchema = new mongoose.Schema(
 
     // If this requisition later became a real PO, keep the link.
     purchaseOrder: { type: mongoose.Schema.Types.ObjectId, ref: "PurchaseOrder", default: null },
+
+    // Which material/product request this was raised from, if any — lets the
+    // store jump straight back to that request from the purchase form (this
+    // can point at either an MRF doc or a product-request doc, both served
+    // from the same /store/dashboard/order-requests/mrf/:id page, so no
+    // strict `ref` is set; the id alone is enough to build that URL).
+    sourceMrfId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    sourceMrfNumber: { type: String, trim: true, default: "" },
 
     createdByRef: { type: mongoose.Schema.Types.ObjectId, default: null },
     createdByName: { type: String, trim: true, default: "" },

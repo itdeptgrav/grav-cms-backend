@@ -26,14 +26,35 @@ const productImageSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// A single named value on an unmatched item ("Colour: Black, Navy") — mirrors
+// RawItem's own attribute shape, so "register as new" can build variants the
+// same way RawItemAddRequest's product.attributes used to.
+const itemAttributeSchema = new mongoose.Schema(
+  {
+    name: { type: String, trim: true, default: "" },
+    values: [{ type: String, trim: true }],
+  },
+  { _id: false }
+);
+
 // ── Per-item sub-doc ──────────────────────────────────────────────────────────
 const mrfItemSchema = new mongoose.Schema(
   {
-    rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+    // Unset until the Store matches this line to a catalogue item (or
+    // registers a new one) — see itemStatus "UNMATCHED" below. `rawItemName`
+    // is required either way: before matching it's the requester's own name
+    // for the thing they want, after matching it's the catalogue name.
+    rawItem: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
     rawItemName: { type: String, trim: true, required: true },
     rawItemSku: { type: String, trim: true, default: "" },
     variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
     variantCombination: [{ type: String, trim: true }],
+
+    // Only meaningful pre-match, on an UNMATCHED line — carried onto the new
+    // RawItem if the Store registers it rather than matching it to an
+    // existing one. Ignored once `rawItem` is set.
+    category: { type: String, trim: true, default: "" },
+    attributes: [itemAttributeSchema],
 
     // Requester-supplied product context (free text — the catalogue record is
     // the source of truth for name/SKU, this is what the requester *meant*).
@@ -55,6 +76,11 @@ const mrfItemSchema = new mongoose.Schema(
     itemStatus: {
       type: String,
       enum: [
+        // TL-approved but `rawItem` isn't resolved yet — the Store must
+        // match it to an existing catalogue item or register it as new
+        // before it can be issued. Never set before TL approval; a
+        // not-yet-decided line (matched or not) is just "PENDING".
+        "UNMATCHED",
         "PENDING", "APPROVED", "PARTIALLY_ISSUED", "ISSUED",
         "PARTIALLY_RETURNED", "RETURNED", "OVERDUE", "REJECTED", "UNFULFILLED",
       ],
@@ -90,7 +116,17 @@ const mrfItemSchema = new mongoose.Schema(
       recordedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
       recordedAt: { type: Date, default: Date.now },
     }],
+    // Also doubles as the store's note when rejecting a still-UNMATCHED line.
     storeNotes: { type: String, trim: true, default: "" },
+
+    // A Purchase Form was raised for THIS line (not stocked, being bought) —
+    // set by the requisition route once the form is saved. Lets the Store
+    // screen show it was already actioned instead of offering the same
+    // buttons again with no memory of it.
+    purchaseFormRaised: { type: Boolean, default: false },
+    purchaseRequisitionId: { type: mongoose.Schema.Types.ObjectId, ref: "Requisition", default: null },
+    purchaseRequisitionNumber: { type: String, trim: true, default: "" },
+    purchaseFormRaisedAt: { type: Date, default: null },
   },
   { _id: true }
 );

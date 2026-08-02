@@ -394,6 +394,10 @@ async function buildEmployeeMeasurementsMap(measurementData, categoryData) {
         quantity: data.quantity || 1,
         measurements: measurementsArray,
         measuredAt: new Date(),
+        // Set when this product's values were auto-filled from a saved
+        // MeasurementTemplate — see components/mpc-measurement "Use Template".
+        templateId: data.templateId || null,
+        templateName: data.templateName || "",
       });
     }
   }
@@ -720,6 +724,8 @@ router.put("/:measurementId", async (req, res) => {
           quantity: data.quantity || 1,
           measurements: measurementsArray,
           measuredAt: new Date(),
+          templateId: data.templateId || null,
+          templateName: data.templateName || "",
         });
       }
 
@@ -1239,6 +1245,8 @@ router.put("/:measurementId/add-employees", async (req, res) => {
           quantity: data.quantity || 1,
           measurements: measurementsArray,
           measuredAt: new Date(),
+          templateId: data.templateId || null,
+          templateName: data.templateName || "",
         });
       }
 
@@ -2399,6 +2407,7 @@ router.get("/:measurementId/export", async (req, res) => {
       "Designation",
       "Gender",
       ...headerMeta.map((h) => h.col),
+      "Measurement Template(s)",
       "Remarks",
     ].join(",");
 
@@ -2439,6 +2448,13 @@ router.get("/:measurementId/export", async (req, res) => {
         return v !== undefined && v !== "" ? v : "-";
       });
 
+      // Which saved MeasurementTemplate(s), if any, filled this employee's
+      // values — distinct names across every product/category block, so a
+      // spreadsheet filter can find "everyone filled from Men's Formal Shirt".
+      const templatesUsed = new Set();
+      (emp.products || []).forEach((p) => { if (p.templateName) templatesUsed.add(p.templateName); });
+      (emp.categoryMeasurements || []).forEach((cm) => { if (cm.templateName) templatesUsed.add(cm.templateName); });
+
       // Escape double-quotes inside quoted fields
       const q = (s) => `"${String(s || "").replace(/"/g, '""')}"`;
 
@@ -2449,6 +2465,7 @@ router.get("/:measurementId/export", async (req, res) => {
         details.designation || "",
         emp.gender || "",
         ...measCells,
+        q([...templatesUsed].join(" | ")),
         q(emp.remarks || ""),
       ].join(",");
     });

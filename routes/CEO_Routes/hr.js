@@ -24,6 +24,10 @@
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
+// Header before cookie: in production the frontend is a different host, so
+// the auth_token cookie is third-party and Safari blocks it outright. The
+// frontend also sends the session as `Authorization: Bearer`. See config/jwt.js.
+const { readToken } = require("../../config/jwt");
 const http = require("http");
 
 const Employee = require("../../models/Employee");
@@ -32,7 +36,7 @@ const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 // ── Auth ─────────────────────────────────────────────────────────────────────
 function ceoAuth(req, res, next) {
     try {
-        const token = req.cookies.auth_token;
+        const token = readToken(req);
         if (!token) return res.status(401).json({ success: false, message: "Authentication required" });
         const decoded = jwt.verify(token, process.env.JWT_SECRET || "grav_clothing_secret_key");
         if (!["ceo", "admin", "hr_manager"].includes(decoded.role)) {

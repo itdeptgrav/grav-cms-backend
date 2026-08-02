@@ -26,6 +26,7 @@ const bcrypt = require("bcryptjs");
 
 const AccessDepartment = require("../../models/Access/AccessDepartment");
 const DeptUser = require("../../models/Access/DeptUser");
+const { recordChange, historyFor, recentFor } = require("../../services/changeLog");
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -739,6 +740,110 @@ const {
   revokeAccountantRole,
   deleteAccountantUser,
 } = require("../../services/accountantAccess");
+
+/* ================================================================== */
+/* DEPARTMENT ROLES — one vocabulary for every department              */
+/* ================================================================== */
+//
+// The accounting module has had owner/approver/editor/viewer for a while and
+// every other department has been all-or-nothing. These three routes are the
+// whole admin surface for fixing that. Underneath, accounting still reads its
+// own Acc_User rows — see services/departmentRoles.js for why — but from here
+// there is one screen, one vocabulary and one shape of answer.
+
+const deptRoles = require("../../services/departmentRoles");
+
+/** GET /api/admin/department-roles/vocabulary */
+router.get("/department-roles/vocabulary", (req, res) => {
+  res.json({ success: true, roles: deptRoles.ROLES });
+});
+
+/** GET /api/admin/department-roles/:slug — everyone holding a role there. */
+router.get("/department-roles/:slug", async (req, res) => {
+  try {
+    const holders = await deptRoles.listRoles(req.params.slug);
+
+    // Which of them are employees, so the UI can say who signs in with an HR
+    // password and who needs one of their own.
+    const emails = holders.map((h) => h.email);
+    const employees = await Employee.find({ email: { $in: emails } }).select("email").lean();
+    const isEmployee = new Set(employees.map((e) => String(e.email).toLowerCase()));
+
+    res.json({
+      success: true,
+      slug: req.params.slug,
+      roles: deptRoles.ROLES,
+      holders: holders.map((h) => ({ ...h, isEmployee: isEmployee.has(h.email) })),
+    });
+  } catch (error) {
+    console.error("[access-admin] list department roles:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/**
+ * PUT /api/admin/department-roles/:slug
+ * body: { email, name?, role, password? }   role: null revokes
+ */
+router.put("/department-roles/:slug", async (req, res) => {
+  try {
+    const { email, name, role, password } = req.body || {};
+    if (!email) return fail(res, 400, "An email address is required");
+
+    const result = await deptRoles.setRole({
+      departmentSlug: req.params.slug,
+      email, name, role: role || null, password,
+      actor: req.admin,
+    });
+
+    audit(req, "department-role", `${req.params.slug}: ${email} -> ${role || "none"}`);
+
+    // The same change, in the log every department will read from.
+    await recordChange(req, {
+      departmentSlug: req.params.slug,
+      entity: "department-role",
+      entityId: email,
+      entityLabel: name || email,
+      action: role ? (result.created ? "create" : "update") : "delete",
+      summary: role
+        ? `${email} set to ${role} in ${req.params.slug}`
+        : `${email} removed from ${req.params.slug}`,
+      before: { role: result.previous ?? null },
+      after: { role: role || null },
+    });
+
+    res.json({
+      success: true,
+      role: result.role,
+      message: role
+        ? `${email} is now ${role}.`
+        : `${email} no longer has a role here.`,
+    });
+  } catch (error) {
+    fail(res, 400, error.message);
+  }
+});
+
+/* ================================================================== */
+/* CHANGE LOG                                                          */
+/* ================================================================== */
+
+/** GET /api/admin/change-log?department=hr&entity=&entityId=&limit= */
+router.get("/change-log", async (req, res) => {
+  try {
+    const { department, entity, entityId, limit } = req.query;
+    const n = Math.min(Number(limit) || 50, 200);
+
+    const entries = entity && entityId
+      ? await historyFor(entity, entityId, n)
+      : await recentFor(department, n);
+
+    res.json({ success: true, entries });
+  } catch (error) {
+    console.error("[access-admin] change log:", error);
+    fail(res, 500, error.message);
+  }
+});
 
 /** GET /api/admin/accountant-roles — the vocabulary, for building a dropdown. */
 router.get("/accountant-roles", (req, res) => {
