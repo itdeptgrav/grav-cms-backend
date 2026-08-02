@@ -174,15 +174,38 @@ async function createResumableSession({ fileName, mimeType, fileSize, origin }) 
     return sessionUrl;
 }
 
+// One Drive API call instead of two — the mimeType comes off the media
+// response's own Content-Type header, so a proxied image view no longer
+// spends double the quota it needs. That matters here specifically: this
+// route has no auth guard (an <img> can't send one) and is the fallback for
+// every Drive image on the site, so it is the one path a quota squeeze shows
+// up on first as an intermittent broken image that reloads fine a moment
+// later.
 async function getDriveFileStream(fileId) {
     const auth = getServiceAccountAuth();
     const drive = google.drive({ version: "v3", auth });
-    const meta = await drive.files.get({ fileId, supportsAllDrives: true, fields: "mimeType" });
-    const stream = await drive.files.get(
-        { fileId, alt: "media", supportsAllDrives: true },
-        { responseType: "stream" }
-    );
-    return { data: stream.data, mimeType: meta.data.mimeType };
+
+    const fetchStream = async () => {
+        const stream = await drive.files.get(
+            { fileId, alt: "media", supportsAllDrives: true },
+            { responseType: "stream" }
+        );
+        const mimeType = stream.headers?.["content-type"] || "application/octet-stream";
+        return { data: stream.data, mimeType };
+    };
+
+    try {
+        return await fetchStream();
+    } catch (e) {
+        // A single retry for a transient Drive error only — rate limit or a
+        // server hiccup on Google's side, not a real 404/403 on the file.
+        const status = e?.code || e?.response?.status;
+        if (status === 429 || status === 500 || status === 503) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            return await fetchStream();
+        }
+        throw e;
+    }
 }
 
 async function finalizeDriveFile(fileId) {
