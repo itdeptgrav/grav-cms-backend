@@ -32,6 +32,15 @@ const measurementTemplateSchema = new mongoose.Schema(
     // show which category this template was built against.
     categoryName: { type: String, required: true, trim: true },
 
+    // Restricts which employees this template gets suggested for on the
+    // measurement-taking pages — "Unisex" means it's offered to everyone,
+    // "Male"/"Female" means only to employees whose registered gender matches.
+    gender: {
+      type: String,
+      enum: ["Male", "Female", "Unisex"],
+      default: "Unisex",
+    },
+
     values: [templateFieldValueSchema],
 
     notes: { type: String, default: "", trim: true },
