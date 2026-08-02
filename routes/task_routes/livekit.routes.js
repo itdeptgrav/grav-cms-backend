@@ -463,12 +463,27 @@ router.get("/public/meeting-info/:token", async (req, res) => {
     const meet = snap.docs[0].data();
     const meetId = snap.docs[0].id;
 
+    // How many are already in the room — same lookup the host's own
+    // `/livekit/info` uses, so a guest sees the same "N in this call" signal
+    // the organiser does, without exposing who they are.
+    let participantCount = 0;
+    if (meet.livekitRoomName && meet.status === "live") {
+      try {
+        const svc = getRoomSvc();
+        const rooms = await svc.listRooms([meet.livekitRoomName]);
+        participantCount = rooms[0]?.numParticipants || 0;
+      } catch {
+        /* LiveKit might not have this room anymore */
+      }
+    }
+
     res.json({
       success: true,
       meetId,
       meetTitle: meet.title || "CoWork Meeting",
       status: meet.status || "scheduled",
       canJoin: meet.publicShareEnabled === true && meet.status !== "ended",
+      participantCount,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
