@@ -739,6 +739,26 @@ router.get("/notifications", verifyCoworkToken, verifyEmployeeToken, async (req,
   }
 });
 
+// ── MARK ONE NOTIFICATION READ ───────────────────────────────────────────────
+// PATCH /cowork/notifications/:notificationId/read
+//
+// MUST stay above /notifications/read-all? No — the paths cannot collide
+// ("read-all" has no second segment). Kept adjacent to it so the pair is read
+// together: this clears one row, that clears the inbox.
+//
+// The recipient check lives in the service, against the stored document, not
+// against anything the client sent.
+router.patch("/notifications/:notificationId/read", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { employeeId } = req.coworkUser;
+    const result = await svc.markNotificationRead(employeeId, req.params.notificationId);
+    res.json(result);
+  } catch (e) {
+    console.error("Error in /notifications/:notificationId/read endpoint:", e);
+    res.status(200).json({ success: false, error: e.message });
+  }
+});
+
 router.patch("/notifications/read-all", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { employeeId } = req.coworkUser;
@@ -791,11 +811,24 @@ router.patch("/employee/:id/update-id", verifyCoworkToken, verifyCeoOrTL, async 
 
     console.log(`[UpdateEmployeeId] ${oldId} → ${newEmployeeId} by ${req.coworkUser.employeeId}`);
 
-    // Notify employee via push
+    // Notify the employee. Push ALONE before — and this is the worst message in
+    // the product to deliver only to a lock screen, because it ends with an
+    // instruction ("log in again") that somebody who missed it will not follow,
+    // on an account whose old id has just stopped working.
+    //
+    // Addressed to the NEW id: the old document has been deleted by this point,
+    // and a notification filed against it would be unreadable by anyone.
     try {
-      const { sendPushToEmployees } = require("../../services/fcmPush.service");
-      await sendPushToEmployees([newEmployeeId], "🆔 Employee ID Updated", `Your CoWork ID is now ${newEmployeeId}. Please log in again.`, { type: "id_updated" });
-    } catch (e) { console.error("[update-id push]", e.message); }
+      await svc.notifyEmployees({
+        recipientIds: [newEmployeeId],
+        type: "id_updated",
+        title: "🆔 Your Cowork ID changed",
+        body: `${req.coworkUser.name} changed your Cowork ID from ${oldId} to ${newEmployeeId}. Sign out and sign in again — the old ID will not work.`,
+        data: { oldId, newEmployeeId },
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.name,
+      });
+    } catch (e) { console.error("[update-id notify]", e.message); }
 
     res.json({ success: true, oldId, newEmployeeId, message: `Employee ID updated from ${oldId} to ${newEmployeeId}.` });
   } catch (e) {
