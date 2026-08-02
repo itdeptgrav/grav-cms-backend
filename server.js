@@ -1528,6 +1528,9 @@ const askAITest = require("./routes/task_routes/askAI.routes");
 console.log("askAI.routes exports:", Object.keys(askAITest));
 app.use("/cowork", askAITest);
 
+// Docs/Sheets AI assistant — one shared service, Gemini Flash-Lite only.
+app.use("/cowork", require("./routes/task_routes/aiAssist.routes"));
+
 const crossOrgRoutes = require("./routes/Customer_Routes/cross-org-assign.js");
 app.use("/api/customer/employees/cross-org", crossOrgRoutes);
 
