@@ -9,12 +9,15 @@ const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewe
 
 router.use(EmployeeAuthMiddleware);
 
-// GET / — list, optionally filtered by category or a name search
+// GET / — list, optionally filtered by category, gender, or a name search.
+// `gender` accepts "Male"/"Female" and also matches "Unisex" templates —
+// pass the employee's own gender to get only templates suggestable to them.
 router.get("/", async (req, res) => {
   try {
-    const { categoryId, search } = req.query;
+    const { categoryId, gender, search } = req.query;
     const filter = { isActive: true };
     if (categoryId) filter.category = categoryId;
+    if (gender === "Male" || gender === "Female") filter.gender = { $in: [gender, "Unisex"] };
     if (search?.trim()) filter.name = { $regex: search.trim(), $options: "i" };
 
     const templates = await MeasurementTemplate.find(filter)
@@ -39,7 +42,7 @@ router.get("/:id", async (req, res) => {
 
 router.post("/", async (req, res) => {
   try {
-    const { name, categoryId, values, notes } = req.body;
+    const { name, categoryId, gender, values, notes } = req.body;
 
     if (!name?.trim()) return res.status(400).json({ success: false, message: "Template name is required" });
     if (!categoryId) return res.status(400).json({ success: false, message: "A measurement category is required" });
@@ -55,6 +58,7 @@ router.post("/", async (req, res) => {
       name: name.trim(),
       category: category._id,
       categoryName: category.name,
+      gender: ["Male", "Female", "Unisex"].includes(gender) ? gender : "Unisex",
       values: cleanValues,
       notes: (notes || "").trim(),
       createdBy: req.user.id,
@@ -68,7 +72,7 @@ router.post("/", async (req, res) => {
 
 router.put("/:id", async (req, res) => {
   try {
-    const { name, categoryId, values, notes, isActive } = req.body;
+    const { name, categoryId, gender, values, notes, isActive } = req.body;
     const template = await MeasurementTemplate.findById(req.params.id);
     if (!template) return res.status(404).json({ success: false, message: "Template not found" });
 
@@ -80,6 +84,8 @@ router.put("/:id", async (req, res) => {
       template.category = category._id;
       template.categoryName = category.name;
     }
+
+    if (["Male", "Female", "Unisex"].includes(gender)) template.gender = gender;
 
     if (Array.isArray(values)) {
       template.values = values
