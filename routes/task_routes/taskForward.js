@@ -564,6 +564,26 @@ router.post("/employee/:employeeId/priority-order", verifyCoworkToken, verifyEmp
       return snaps.length;
     });
 
+    // ── Tell the person whose queue this is ──────────────────────────────────
+    // Priority had NO notification of any kind before this. A manager could
+    // reorder somebody's whole day and the only way that person found out was
+    // by looking. The queue decides what they are supposed to work on next, so
+    // it is the change most worth telling them about, not the least.
+    //
+    // Only when somebody ELSE did it: a person dragging their own list already
+    // knows, and notifying them would make every drag ring their own bell.
+    if (actor !== employeeId) {
+      await _notify({
+        recipientIds: [employeeId],
+        type: "priority_reordered",
+        title: "🔀 Your work was reordered",
+        body: `${req.coworkUser.name || "Your manager"} changed the order of your tasks. ${written} ${written === 1 ? "task" : "tasks"} renumbered — check what is at the top before you carry on.`,
+        data: { employeeId, taskIds: orderedTaskIds, topTaskId: orderedTaskIds[0] || null },
+        senderId: actor,
+        senderName: req.coworkUser.name,
+      });
+    }
+
     res.json({ success: true, renumbered: written });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -1646,6 +1666,18 @@ router.post("/task/:taskId/move-to-folder", verifyCoworkToken, verifyEmployeeTok
     }
     await batch.commit();
 
+    // The assignees keep the task but find it somewhere else. Without this the
+    // work simply disappears from where they last saw it.
+    await _notify({
+      recipientIds: (task.assigneeIds || []).filter(id => id && id !== req.coworkUser.employeeId),
+      type: "task_moved",
+      title: "📁 Task moved",
+      body: `${req.coworkUser.name} moved "${task.title}" into ${folder.title}. The work is unchanged — only where it sits.`,
+      data: { taskId, folderId, folderTitle: folder.title },
+      senderId: req.coworkUser.employeeId,
+      senderName: req.coworkUser.name,
+    });
+
     res.json({ success: true, taskId, folderId });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1682,6 +1714,27 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
     if (requirements !== undefined) updates.requirements = Array.isArray(requirements) ? requirements : [];
 
     await taskRef.update(updates);
+
+    // ── Tell whoever has to DO it ────────────────────────────────────────────
+    // Editing a task that has already started rewrites the brief of work
+    // somebody is part-way through, and they had no way of knowing. Naming
+    // WHICH parts changed matters more than usual here: "the task changed" sends
+    // a person hunting through a description to find a word.
+    const changed = [
+      title !== undefined && "the title",
+      description !== undefined && "the description",
+      requirements !== undefined && "the requirements",
+    ].filter(Boolean);
+    await _notify({
+      recipientIds: (task.assigneeIds || []).filter(id => id && id !== req.coworkUser.employeeId),
+      type: "task_details_edited",
+      title: "✏️ Task details changed",
+      body: `${req.coworkUser.name} changed ${changed.join(", ") || "the details"} of "${updates.title || task.title}"${hasPassedDraft ? " — you have already started this one, so read it again before you carry on." : "."}`,
+      data: { taskId, changed, hasPassedDraft },
+      senderId: req.coworkUser.employeeId,
+      senderName: req.coworkUser.name,
+    });
+
     res.json({ success: true, taskId, title: updates.title, description: updates.description, requirements: updates.requirements });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1716,6 +1769,20 @@ router.post("/task/:taskId/reset-to-draft", verifyCoworkToken, verifyEmployeeTok
       deadlineWindowSecs: admin.firestore.FieldValue.delete(),
       deadlineApprovedBy: admin.firestore.FieldValue.delete(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // The strongest case for a notification in this file: a task somebody had
+    // confirmed, negotiated a deadline for and possibly started is pulled back
+    // to draft with its agreed window deleted. Silently, until now — they would
+    // next open it and find the deadline they argued for simply gone.
+    await _notify({
+      recipientIds: (task.assigneeIds || []).filter(id => id && id !== req.coworkUser.employeeId),
+      type: "task_reset_to_draft",
+      title: "↩️ Task sent back to draft",
+      body: `${req.coworkUser.name} reset "${task.title}" to draft. The agreed deadline has been cleared and it will need confirming again — do not keep working on it yet.`,
+      data: { taskId, previousStatus: task.status },
+      senderId: req.coworkUser.employeeId,
+      senderName: req.coworkUser.name,
     });
 
     res.json({ success: true, taskId, status: "open" });
@@ -1980,17 +2047,22 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
       console.warn("[approve-sender-timer] chat post failed:", chatErr.message);
     }
 
-    // Notify task creator
-    if (task.assignedBy) {
-      try {
-        await sendPushToEmployees(
-          [task.assignedBy],
-          `⏱ Timer Approved · ${task.title}`,
-          `${employeeName} approved the ${_fmtSecs(approvedSecs)} time. Task is ready to start.`,
-          { type: "sender_timer_approved", taskId }
-        );
-      } catch (_) { }
-    }
+    // ── Notify task creator ──────────────────────────────────────────────────
+    // This was `sendPushToEmployees` alone: a phone push and NO durable record,
+    // so the answer to "did they accept my estimate?" reached a locked screen
+    // and then existed nowhere. Anybody with push off, or reading on a desktop,
+    // was never told at all. `_notify` writes the Firestore row the bell reads,
+    // emits the socket event, AND sends the same push — so this keeps what it
+    // had and gains the record it did not.
+    await _notify({
+      recipientIds: [task.assignedBy].filter(Boolean),
+      type: "sender_timer_approved",
+      title: "⏱ Timer approved",
+      body: `${employeeName} approved the ${_fmtSecs(approvedSecs)} you set for "${task.title}". It is ready to start.`,
+      data: { taskId, approvedSecs },
+      senderId: employeeId,
+      senderName: employeeName,
+    });
 
     res.json({ success: true, deadlineWindowSecs: approvedSecs });
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -2050,18 +2122,19 @@ router.post("/task/:taskId/reject-sender-timer", verifyCoworkToken, verifyEmploy
       await taskRef.update({ lastChatAt: admin.firestore.FieldValue.serverTimestamp() });
     } catch (_) { }
 
-    // Notify task creator (sender)
-    if (task.assignedBy) {
-      try {
-        const { sendPushToEmployees } = require("../../services/fcmPush.service");
-        await sendPushToEmployees(
-          [task.assignedBy],
-          `⏱ Timer Rejected · ${task.title}`,
-          `${employeeName} rejected the ${_fmtSecs(task.senderTimerWindowSecs)} time. Reason: ${reason.trim()}`,
-          { type: "sender_timer_rejected", taskId }
-        );
-      } catch (_) { }
-    }
+    // Notify task creator (sender). Push-only before — see the note on
+    // approve-sender-timer above; a rejection with a REASON is the worst of the
+    // two to lose, because the reason is the whole message and a push
+    // notification is not somewhere you can go back and re-read it.
+    await _notify({
+      recipientIds: [task.assignedBy].filter(Boolean),
+      type: "sender_timer_rejected",
+      title: "⏱ Timer rejected",
+      body: `${employeeName} rejected the ${_fmtSecs(task.senderTimerWindowSecs)} you set for "${task.title}". Reason: ${reason.trim()}`,
+      data: { taskId, rejectedSecs: Number(task.senderTimerWindowSecs) || 0, reason: reason.trim() },
+      senderId: employeeId,
+      senderName: employeeName,
+    });
 
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }

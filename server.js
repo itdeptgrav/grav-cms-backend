@@ -1512,6 +1512,17 @@ app.use("/cowork", require("./routes/task_routes/budgetNegotiation.js"));
 // Reference attachments: /cowork/attachments, /cowork/attachments/entity/:id.
 app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
 
+// Document-surface notifications: /cowork/documents/:documentId/notify-member.
+// The documents themselves are written browser-to-Firestore; only the
+// notification comes through the engine, so it cannot be forged.
+app.use("/cowork", require("./routes/task_routes/coworkDocs.routes.js"));
+
+// Announcements for events the new Cowork writes browser-to-Firestore —
+// /cowork/notify-event. The client names WHAT happened and to which record;
+// this composes the words and resolves the recipients, so it cannot be used to
+// put arbitrary text in somebody's inbox.
+app.use("/cowork", require("./routes/task_routes/coworkEvents.routes.js"));
+
 app.use(
   "/api/cowork/notifications",
   require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"),

@@ -20,6 +20,58 @@ const {
     verifyEmployeeToken,
 } = require("../../Middlewear/coworkAuth");
 
+const admin = require("firebase-admin");
+const { v4: _nuuid } = require("uuid");
+const _socket = require("../../config/socketInstance");
+
+/**
+ * Notify — the same three steps `_notify` takes in `taskForward.js`.
+ *
+ * ## Nothing in this file told anybody anything, and this is the file that
+ * ## moves people's scores
+ *
+ * A bleach takes points off somebody's SOP score. Until now it was applied
+ * silently: the person found out by opening `/score` and noticing a number had
+ * changed, if they noticed at all. A deduction nobody is told about cannot be
+ * disputed, which makes the recheck flow below unreachable in practice for
+ * anyone who is not already checking their score daily.
+ *
+ * Failures are logged and swallowed. A notification that cannot be written must
+ * never roll back a deduction that has already been saved to Mongo — the
+ * employee record is the source of truth and it is committed by this point.
+ */
+async function _notify({ recipientIds, type, title, body, data, senderId, senderName }) {
+    const ids = (recipientIds || []).filter(Boolean);
+    if (!ids.length) return;
+    try {
+        const batch = db.batch();
+        ids.forEach(id => {
+            batch.set(db.collection("cowork_notifications").doc(_nuuid()), {
+                recipientEmployeeId: id, type, title, body,
+                data: data || {}, read: false,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+        });
+        await batch.commit();
+        _socket.emitToMany(ids, "new_notification", { type, title, body, data });
+        setImmediate(() => {
+            try {
+                const { sendPushToEmployees } = require("../../services/fcmPush.service");
+                sendPushToEmployees(ids, title, body, { type, ...(data || {}) }).catch(() => { });
+            } catch (_) { }
+        });
+    } catch (e) { console.error("[sop _notify]", e.message); }
+}
+
+/** The primary manager's biometricId, for routing a dispute upward. */
+async function _managerIdOf(employee) {
+    try {
+        if (!employee?.primaryManager) return null;
+        const mgr = await Employee.findById(employee.primaryManager, { biometricId: 1 }).lean();
+        return mgr?.biometricId || null;
+    } catch (_) { return null; }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FOLDER ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -417,6 +469,29 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
             } catch (e) { console.error("[sop_applied]", e.message); }
         }
 
+        // ── Tell the person whose score just moved ──────────────────────────
+        // The single most important notification in the product: points have
+        // been taken off somebody's record by somebody else. It names the rule,
+        // the amount, who applied it and their reason, and it says how to
+        // dispute it — because a deduction you are not told about is one you
+        // cannot contest, and the recheck flow below exists precisely so you
+        // can.
+        await _notify({
+            recipientIds: [targetEmployeeId],
+            type: "sop_bleach_applied",
+            title: `⚠️ ${finalPoints} pts deducted · ${finalSopName}`,
+            body: `${appliedByName} applied "${finalSopName}" (${finalFolderName}) to your record for ${finalPoints} pts.${bleachEntry.description ? ` Reason: ${bleachEntry.description}` : ""} If you think this is wrong, ask for a recheck from your score.`,
+            data: {
+                employeeId: targetEmployeeId,
+                sopName: finalSopName,
+                folderName: finalFolderName,
+                points: finalPoints,
+                taskId: req.body.taskId || null,
+            },
+            senderId: appliedById,
+            senderName: appliedByName,
+        });
+
         res.status(201).json({ success: true, message: `${finalPoints} pts deducted from ${employee.firstName} for "${finalSopName}".` });
     } catch (e) {
         console.error("[sop/bleach]", e.message);
@@ -551,12 +626,21 @@ router.post("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEm
         if (!employee) return res.status(404).json({ error: "Employee not found." });
 
         let found = false;
+        // Captured for the notification below — the entry is reached only
+        // inside this loop, and the notification has to name what is being
+        // disputed rather than "a deduction".
+        let bleachCutBy = null;
+        let bleachSopName = "";
+        let bleachPointsForNote = 0;
         for (const yearRecord of employee.sopPoints) {
             const bleach = yearRecord.bleaches.id(bleachId);
             if (bleach) {
                 if (bleach.recheck?.status === "confirmed") {
                     return res.status(400).json({ error: "This bleach was already confirmed — deduction has been removed." });
                 }
+                bleachCutBy = bleach.cutBy || null;
+                bleachSopName = bleach.sopName || "a deduction";
+                bleachPointsForNote = bleach.points || 0;
                 bleach.recheck = {
                     status: "pending",
                     requestedAt: new Date(),
@@ -574,6 +658,22 @@ router.post("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEm
         if (!found) return res.status(404).json({ error: "Bleach entry not found." });
 
         await employee.save();
+
+        // A dispute waiting in a list nobody is told about is a dispute that
+        // sits there. Routed to the person who APPLIED the deduction and to the
+        // employee's primary manager — the two people entitled to decide it —
+        // rather than broadcast to every TL.
+        const managerId = await _managerIdOf(employee);
+        await _notify({
+            recipientIds: [...new Set([bleachCutBy, managerId].filter(id => id && id !== requesterId))],
+            type: "sop_recheck_requested",
+            title: "🔍 Recheck requested",
+            body: `${employee.firstName || employeeId} asked for a recheck of the ${bleachPointsForNote} pt deduction "${bleachSopName}".${requestNote?.trim() ? ` They said: ${requestNote.trim()}` : ""}`,
+            data: { employeeId, bleachId, sopName: bleachSopName, points: bleachPointsForNote },
+            senderId: requesterId,
+            senderName: employee.firstName || employeeId,
+        });
+
         res.json({ success: true, message: "Recheck request submitted. Awaiting TL/CEO review." });
     } catch (e) {
         console.error("[sop/recheck/POST]", e.message);
@@ -604,6 +704,7 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
 
         let found = false;
         let bleachPoints = 0;
+        let bleachSopName = "";
 
         for (let i = 0; i < employee.sopPoints.length; i++) {
             const bleach = employee.sopPoints[i].bleaches.id(bleachId);
@@ -613,6 +714,7 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
                 }
 
                 bleachPoints = bleach.points;
+                bleachSopName = bleach.sopName || "a deduction";
 
                 bleach.recheck.status = action === "confirm" ? "confirmed" : "rejected";
                 bleach.recheck.reviewedBy = reviewerId;
@@ -637,6 +739,22 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
         const msg = action === "confirm"
             ? `Recheck confirmed — ${bleachPoints} pts reversed back to employee.`
             : `Recheck rejected — deduction of ${bleachPoints} pts stands.`;
+
+        // The person who raised the dispute is the one waiting on the answer,
+        // and it was the one thing this route never sent. Both outcomes are
+        // told, and a rejection carries the reviewer's note: "your dispute was
+        // refused" without a reason is the worst version of this message.
+        await _notify({
+            recipientIds: [employeeId],
+            type: action === "confirm" ? "sop_recheck_confirmed" : "sop_recheck_rejected",
+            title: action === "confirm" ? "✅ Deduction reversed" : "❌ Recheck rejected",
+            body: action === "confirm"
+                ? `${reviewerName} agreed with your recheck of "${bleachSopName}". The ${bleachPoints} pts have been put back on your score.${reviewNote?.trim() ? ` They said: ${reviewNote.trim()}` : ""}`
+                : `${reviewerName} reviewed your recheck of "${bleachSopName}" and the ${bleachPoints} pt deduction stands.${reviewNote?.trim() ? ` Reason: ${reviewNote.trim()}` : ""}`,
+            data: { employeeId, bleachId, sopName: bleachSopName, points: bleachPoints, action },
+            senderId: reviewerId,
+            senderName: reviewerName,
+        });
 
         res.json({ success: true, message: msg });
     } catch (e) {
@@ -949,6 +1067,19 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
 
 
         await employee.save();
+
+        // Points going the other way, and just as unannounced as a deduction.
+        // Worth sending for the same reason: somebody decided your work earned
+        // this, and a reward nobody mentions is one that never lands.
+        await _notify({
+            recipientIds: [targetEmployeeId],
+            type: "sop_goal_credit",
+            title: `⭐ ${absPoints} pts earned · ${componentName || "Goal component"}`,
+            body: `${awardedByName} approved "${componentName || "your goal component"}"${taskTitle ? ` on ${taskTitle}` : ""} on time. ${absPoints} pts have been credited to your score.`,
+            data: { employeeId: targetEmployeeId, taskId: taskId || null, componentId: componentId || null, points: absPoints },
+            senderId: awardedById,
+            senderName: awardedByName,
+        });
 
         // ── Update cowork_c2_scores cache if this is a Gold Task component ───
         const { isC2Band, c2TaskMaxPoints } = req.body;
