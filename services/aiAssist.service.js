@@ -59,6 +59,81 @@ function isConfigured() {
 
 const DOCS_TOOLS = [
   {
+    /**
+     * The whole-document tool, and the reason it exists.
+     *
+     * Every other tool here writes ONE element. Combined with the
+     * one-tool-call-per-reply rule below, that made "write a full letter" /
+     * "draft an SOP" / "write meeting notes" literally unrepresentable: the
+     * model would correctly pick the single most useful step — a heading —
+     * and stop, and the user got a three-word title where they asked for a
+     * page. Observed, not theorised. This tool is the fix: an arbitrarily
+     * long, structured body in a single call, so the safety rule and the
+     * feature stop being in conflict.
+     */
+    name: "insert_blocks",
+    description:
+      "Write a complete multi-part document body at the cursor: headings, paragraphs, lists and tables together, in order. USE THIS whenever the request is for a whole document, letter, report, SOP, email, meeting notes, or any answer that needs more than one paragraph or more than one element. Prefer it over calling create_heading/create_paragraph separately.",
+    parameters: {
+      type: SchemaType.OBJECT,
+      properties: {
+        blocks: {
+          type: SchemaType.ARRAY,
+          description: "The document body, in reading order.",
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              type: {
+                type: SchemaType.STRING,
+                enum: ["heading", "paragraph", "bullets", "numbered", "table", "quote", "divider"],
+                description: "What this block is. 'divider' is a horizontal rule and needs no other field.",
+              },
+              text: {
+                type: SchemaType.STRING,
+                description:
+                  "For heading, paragraph and quote blocks. Supports inline emphasis: **bold**, *italic*, __underline__.",
+              },
+              align: {
+                type: SchemaType.STRING,
+                enum: ["left", "center", "right", "justify"],
+                description: "Text alignment for this block. Omit for normal left-aligned body text.",
+              },
+              color: {
+                type: SchemaType.STRING,
+                description: "Hex colour for this block's text, e.g. #1a3d6d. Omit to use the document's default ink.",
+              },
+              size: {
+                type: SchemaType.INTEGER,
+                description: "Font size in points for this block. Omit to use the document's default.",
+              },
+              level: {
+                type: SchemaType.INTEGER,
+                description: "Heading level, 1 to 4. Only for heading blocks.",
+              },
+              items: {
+                type: SchemaType.ARRAY,
+                items: { type: SchemaType.STRING },
+                description: "For bullets and numbered blocks.",
+              },
+              headers: {
+                type: SchemaType.ARRAY,
+                items: { type: SchemaType.STRING },
+                description: "For table blocks.",
+              },
+              rows: {
+                type: SchemaType.ARRAY,
+                items: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+                description: "For table blocks. Each row must match the header count.",
+              },
+            },
+            required: ["type"],
+          },
+        },
+      },
+      required: ["blocks"],
+    },
+  },
+  {
     name: "insert_text",
     description: "Insert new text at the cursor position. Use for continuing writing, drafting new content, or adding a translation/summary as new text rather than replacing anything.",
     parameters: {
@@ -375,6 +450,11 @@ function systemInstruction(surface, contextSummary) {
 
 Hard rules:
 - Call AT MOST ONE tool per reply. If the request needs more than one step, do the single most useful step and say what else could follow — never chain several tool calls in one turn.
+${surface === "docs"
+    ? `- When the request is for a whole document, letter, report, SOP, email, meeting notes, or anything needing more than one paragraph or element, use insert_blocks and put the ENTIRE body in that one call. Write the real, finished content at a natural length for the request — do not write a title and stop, and do not leave placeholders like [Your Name] unless the user gave you nothing to put there.
+- LAY THE DOCUMENT OUT, do not return a wall of paragraphs. Give it a centred title, section headings, and a divider where a section genuinely ends. Use **bold** for names, dates, figures and key terms inside sentences, and *italic* sparingly for emphasis or an aside. Use a quote block for anything genuinely quoted. Use a table whenever the content is really rows and columns — schedules, deliverables, comparisons.
+- Style with restraint, the way a professional document is styled: at most one accent colour, used only on the title or section headings, and only when the request suggests something branded or formal. Body text carries no colour and no size override. Never colour a whole paragraph. If in doubt, leave the styling off — clean and unstyled beats decorated.`
+    : `- When the request is to build a table or fill a block of cells, use create_table or set_cells and include every row in that one call.`}
 - Only use the tools you were given. Never invent a tool name or an argument that is not in its schema.
 - If the request is ambiguous, destructive-sounding, or you are not confident, reply with plain text asking a clarifying question instead of calling a tool.
 - Work only from the context you were given below. Do not assume content that was not shown to you.
@@ -406,9 +486,16 @@ async function assist({ surface, instruction, contextSummary, history }) {
       tools: [{ functionDeclarations: tools }],
       generationConfig: {
         temperature: 0.3,
-        /* Bounded — a runaway response is both a cost and a review burden the
-           panel cannot reasonably show anyone. */
-        maxOutputTokens: 1024,
+        /**
+         * Still bounded, but a full page of prose does not fit in 1024.
+         *
+         * An A4 page is roughly 500 words ≈ 700 tokens BEFORE the JSON
+         * scaffolding of an `insert_blocks` call, so the old ceiling
+         * truncated exactly the requests this tool exists to serve. 4096 is
+         * about six pages — generous for any single request here, and still
+         * a hard cap rather than an open tap.
+         */
+        maxOutputTokens: 4096,
       },
     });
 
