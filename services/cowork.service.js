@@ -265,6 +265,27 @@ async function updateCoworkGroup(groupId, requestingEmployeeId, { name, descript
   if (name?.trim()) updates.name = name.trim();
   if (description !== undefined) updates.description = description || "";
   await db.collection("cowork_groups").doc(groupId).update(updates);
+
+  // A renamed group is a group people cannot find. Every other membership
+  // event here notifies — added, removed, deleted — and this one did not, so
+  // the group somebody was told they joined as "Dispatch" became "Ops" with no
+  // trace of the two being the same thing.
+  //
+  // Only when the NAME changed: a description edit is not something to ring a
+  // bell for, and treating the two the same is how a group with an active
+  // creator becomes a source of noise.
+  if (updates.name && updates.name !== snap.data().name) {
+    await _notifyMany({
+      recipientIds: (snap.data().memberIds || []).filter(id => id && id !== requestingEmployeeId),
+      type: "group_renamed",
+      title: `✏️ Group renamed · ${updates.name}`,
+      body: `"${snap.data().name}" is now called "${updates.name}".`,
+      data: { groupId, groupName: updates.name, previousName: snap.data().name },
+      senderId: requestingEmployeeId,
+      senderName: "CoWork",
+    });
+  }
+
   return { ...snap.data(), ...updates };
 }
 
@@ -747,6 +768,30 @@ async function setCoworkMeetStatus({ meetId, employeeId, employeeName, status })
 
   const recipients = (meet.participants || []).filter(id => id !== employeeId);
   socket.emitToMany(recipients, "meet_status", { meetId, status, title: meet.title });
+
+  // ── A durable record, not only a socket event ────────────────────────────
+  // The emit above reaches whoever has the app open at that instant and nobody
+  // else. "The meeting you are invited to has started" reaching only the people
+  // already looking at Cowork is the wrong half of the room.
+  //
+  // `live` and `cancelled` only, and that IS the whole list on purpose:
+  // `completed` and `archived` tell people something they either watched happen
+  // or no longer need, and a bell that rings for those is one people stop
+  // reading. The socket event still fires for every status.
+  if (status === "live" || status === "cancelled") {
+    await _notifyMany({
+      recipientIds: recipients,
+      type: status === "live" ? "meet_started" : "meet_cancelled",
+      title: status === "live" ? "🔴 Meeting started" : "🚫 Meeting cancelled",
+      body: status === "live"
+        ? `${employeeName || "The organiser"} started "${meet.title}". Join now.`
+        : `${employeeName || "The organiser"} cancelled "${meet.title}".`,
+      data: { meetId, status, title: meet.title },
+      senderId: employeeId,
+      senderName: employeeName,
+    });
+  }
+
   return { success: true, meetId, status };
 }
 
@@ -1051,6 +1096,42 @@ async function markNotificationsRead(employeeId) {
   }
 }
 
+/**
+ * Mark ONE notification read.
+ *
+ * `markNotificationsRead` above clears the whole inbox, which is the only thing
+ * the engine could do until now — so a person with one meeting reminder they
+ * wanted to keep had to clear forty task updates to dismiss it, or clear
+ * nothing.
+ *
+ * The recipient check is the point of doing this server-side. `notificationId`
+ * arrives from the browser and is a document id in a collection every employee
+ * shares; without the check anyone could mark anyone else's inbox read. The
+ * refusal deliberately does not distinguish "not yours" from "does not exist" —
+ * a 404 on somebody else's id would confirm the id is real.
+ */
+async function markNotificationRead(employeeId, notificationId) {
+  try {
+    if (!employeeId || !notificationId) {
+      return { success: false, error: "employeeId and notificationId are required." };
+    }
+
+    const ref = db.collection("cowork_notifications").doc(String(notificationId));
+    const snap = await ref.get();
+    if (!snap.exists || snap.data().recipientEmployeeId !== employeeId) {
+      return { success: false, error: "Notification not found." };
+    }
+
+    // Already read is success, not an error: two clicks on one row is a normal
+    // thing for a person to do, and the second must not report a failure.
+    if (snap.data().read !== true) await ref.update({ read: true });
+    return { success: true };
+  } catch (error) {
+    console.error("Error in markNotificationRead:", error);
+    return { success: false, error: error.message };
+  }
+}
+
 // ── INTERNAL ──────────────────────────────────────────────
 // Clear event type label for push notification title
 function _buildTitle(type, title) {
@@ -1277,4 +1358,10 @@ module.exports = {
 
   getNotifications,
   markNotificationsRead,
+  markNotificationRead,
+  /* The fan-out, exported so a ROUTE that has no service function of its own
+     can still send one durable notification instead of a bare push. Named
+     without the underscore because from outside this file it is not private —
+     `_notifyMany` stays the internal name every function here already uses. */
+  notifyEmployees: _notifyMany,
 };

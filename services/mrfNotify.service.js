@@ -434,6 +434,26 @@ const prLabel = (doc) => {
   return names.length === 1 ? `"${names[0]}"` : `"${names[0]}" and ${names.length - 1} more`;
 };
 
+/**
+ * A message on a product-request thread.
+ *
+ * The mirror of `chatMessage` for MRFs. Kept here rather than assembled at the
+ * route so the recipient sets and the label come from the same three helpers
+ * every other product-request notification uses — a route building its own
+ * would drift the moment `approverAltIds` changed meaning.
+ */
+async function productRequestChatMessage(doc, message) {
+  return subjectChatMessage(
+    {
+      label: prLabel(doc),
+      requesterIds: prIds(doc),
+      tlIds: prTlIds(doc),
+      url: "/coworking/mrf",
+    },
+    message
+  );
+}
+
 async function productRequestSubmitted(doc) {
   await notifyCowork({
     recipientIds: [prIds(doc)],
@@ -512,4 +532,5 @@ module.exports = {
   chatMessage, subjectChatMessage,
   productRequestSubmitted, productRequestAutoForwarded,
   productRequestTlApproved, productRequestTlRejected,
+  productRequestChatMessage,
 };
