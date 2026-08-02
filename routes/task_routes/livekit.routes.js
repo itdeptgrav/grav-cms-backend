@@ -101,8 +101,9 @@ router.post(
         });
       }
 
-      // Create a new LiveKit room
-      const roomName = `cowork-${meetId}-${Date.now()}`;
+      // meet- prefix so the frontend token route accepts it (it rejects cowork-
+      // rooms, which are the screen-monitoring namespace on the same project).
+      const roomName = `meet-${meetId}`;
       const joinCode = makeJoinCode();
 
       try {

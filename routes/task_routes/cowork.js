@@ -269,9 +269,9 @@ router.get("/employee/my-managers/:employeeId", verifyCoworkToken, verifyEmploye
 
 router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
-    const { name, email, mobile, city, department, role: empRole, employeeId: chosenId } = req.body;
-    if (!name || !email || !mobile || !city || !department) {
-      return res.status(400).json({ error: "All fields required." });
+    const { name, email, mobile = "", city = "", department, role: empRole, employeeId: chosenId } = req.body;
+    if (!name || !email || !department) {
+      return res.status(400).json({ error: "Name, email and department are required." });
     }
 
     // ── VALIDATE chosen biometricId is not already taken in CoWork ────────────
@@ -335,6 +335,75 @@ router.get("/employee/:id", verifyCoworkToken, verifyEmployeeToken, async (req, 
 router.post("/employee/fcm-token", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try { await svc.saveFCMToken(req.coworkUser.employeeId, req.body.token); res.json({ success: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /cowork/admin/hr-employees — HR employees from MongoDB, tagged with hasCoworkAccount.
+// CEO-only: provisioning is an administrative act with permanent side effects.
+router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+  try {
+    const Employee = require("../../models/Employee");
+
+    // Build search/filter
+    const filter = {};
+    if (req.query.search) {
+      const rx = new RegExp(String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { firstName: rx }, { lastName: rx }, { email: rx },
+        { biometricId: rx }, { designation: rx },
+      ];
+    }
+    if (req.query.department && req.query.department !== "all") {
+      filter.department = req.query.department;
+    }
+
+    const [hrEmployees, coworkSnap] = await Promise.all([
+      Employee.find(filter)
+        .select("firstName lastName email department biometricId designation phone")
+        .sort({ firstName: 1 })
+        .limit(500)
+        .lean(),
+      db.collection("cowork_employees").get(),
+    ]);
+
+    // Build sets for cross-reference — a CoWork account exists when the
+    // biometricId matches the Firestore doc id, OR the email matches.
+    const coworkIds = new Set(coworkSnap.docs.map((d) => d.id));
+    const coworkEmails = new Set(
+      coworkSnap.docs
+        .map((d) => (d.data().email || "").toLowerCase())
+        .filter(Boolean),
+    );
+
+    const employees = hrEmployees.map((e) => ({
+      hrId: String(e._id),
+      name: `${e.firstName || ""} ${e.lastName || ""}`.trim() || e.email || "(unnamed)",
+      email: e.email || "",
+      department: e.department || "",
+      designation: e.designation || "",
+      biometricId: e.biometricId || "",
+      phone: e.phone || "",
+      hasCoworkAccount: !!(
+        (e.biometricId && coworkIds.has(e.biometricId)) ||
+        coworkEmails.has((e.email || "").toLowerCase())
+      ),
+    }));
+
+    // Distinct departments from the FULL set (not filtered), for the filter dropdown.
+    const departments = (
+      await Employee.distinct("department", { email: { $exists: true, $ne: "" } })
+    ).filter(Boolean).sort();
+
+    res.json({
+      success: true,
+      employees,
+      departments,
+      total: employees.length,
+      withAccount: employees.filter((e) => e.hasCoworkAccount).length,
+    });
+  } catch (e) {
+    console.error("[admin/hr-employees]", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Group ─────────────────────────────────────────────────
