@@ -23,6 +23,7 @@ const allowedOrigins = [
   "http://10.119.220.161:3000",
   "https://cms.grav.in",
   "https://cowork.grav.in",
+  "https://grav-coworkspace.vercel.app",
   "https://customer.grav.in",
   "http://192.168.1.30:3000",
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
