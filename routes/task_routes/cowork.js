@@ -473,32 +473,24 @@ router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, as
     // ← Force logout — revoke all their tokens instantly
     await auth.revokeRefreshTokens(authUid);
 
-    // Notify employee via email
+    // ── One call, four channels ──────────────────────────────────────────────
+    // This sent a push and an email and wrote NO `cowork_notifications` row, so
+    // being told your password was reset reached a phone and an inbox and never
+    // the app — the same gap direct messages had. `notifyEmployees` is
+    // `_notifyMany`: it writes the row, emits the socket event, pushes AND
+    // emails, so the hand-rolled push and email that used to be here are gone
+    // with it rather than doubling.
     try {
-      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
-      await sendNotificationEmail({
+      await svc.notifyEmployees({
+        recipientIds: [employeeId],
+        type: "password_reset",
+        title: "🔐 Password reset",
+        body: `${req.coworkUser.employeeName || "An administrator"} reset your Cowork password. Sign in again with the new one.`,
+        data: {},
         senderId: req.coworkUser.employeeId,
         senderName: req.coworkUser.employeeName || "Admin",
-        receiverId: employeeId,
-        receiverName: empData.name || employeeId,
-        receiverEmail: empData.email,
-        type: "password_reset",
-        title: "Your CoWork password was reset",
-        body: "Your password has been reset. Please log in with your new password.",
-        data: {},
       });
-    } catch (e) { console.error("[password_reset email]", e.message); }
-
-    // Push notification for password reset
-    try {
-      const { sendPushToEmployees } = require("../../services/fcmPush.service");
-      await sendPushToEmployees(
-        [employeeId],
-        "🔐 Password Reset",
-        "Your CoWork password was reset. Please log in with your new password.",
-        { type: "password_reset" }
-      );
-    } catch (e) { console.error("[password_reset push]", e.message); }
+    } catch (e) { console.error("[password_reset notify]", e.message); }
 
     console.log(`[ResetPassword] ${employeeId} session revoked by ${req.coworkUser.employeeId}`);
     return res.json({
@@ -1005,26 +997,19 @@ router.post("/employee/:employeeId/change-role", verifyCoworkToken, async (req, 
     // ← Force logout — revoke all their tokens instantly
     await auth.revokeRefreshTokens(authUid);
 
-    // Notify employee via push + email
+    // Row, socket, push and email in one — see the password-reset route above
+    // for why the separate push and email calls that used to be here are gone.
     try {
-      const { sendPushToEmployees } = require("../../services/fcmPush.service");
-      await sendPushToEmployees([employeeId], `👤 Role Changed`, `Your CoWork role is now ${role === "tl" ? "Team Lead" : "Employee"}. Please log in again.`, { type: "role_changed" });
-    } catch (e) { console.error("[role_changed push]", e.message); }
-    try {
-      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
-      const empData = empDoc.data();
-      await sendNotificationEmail({
-        senderId: req.coworkUser.employeeId,
-        senderName: req.coworkUser.employeeName || "Admin CEO",
-        receiverId: employeeId,
-        receiverName: empData.name || employeeId,
-        receiverEmail: empData.email,
+      await svc.notifyEmployees({
+        recipientIds: [employeeId],
         type: "role_changed",
-        title: "Your CoWork role has been updated",
-        body: `Your role is now ${role === "tl" ? "Team Lead" : "Employee"}`,
+        title: "👤 Your role changed",
+        body: `${req.coworkUser.employeeName || "An administrator"} set your Cowork role to ${role === "tl" ? "Team Lead" : "Employee"}. Sign in again for it to take effect.`,
         data: { newRole: role },
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.employeeName || "Admin",
       });
-    } catch (e) { console.error("[role_changed email]", e.message); }
+    } catch (e) { console.error("[role_changed notify]", e.message); }
 
     // Invalidate auth cache so new role takes effect immediately
     const { invalidateEmployeeCache } = require("../../Middlewear/coworkAuth");
@@ -1062,25 +1047,18 @@ router.post("/employee/:employeeId/change-department", verifyCoworkToken, async 
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // One call for all four channels — see the password-reset route above.
     try {
-      const { sendPushToEmployees } = require("../../services/fcmPush.service");
-      await sendPushToEmployees([employeeId], "🏢 Department Updated", `Your department is now ${newDept}.`, { type: "department_changed" });
-    } catch (e) { console.error("[department_changed push]", e.message); }
-
-    try {
-      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
-      await sendNotificationEmail({
-        senderId: req.coworkUser.employeeId,
-        senderName: req.coworkUser.name || "Admin CEO",
-        receiverId: employeeId,
-        receiverName: empData.name || employeeId,
-        receiverEmail: empData.email,
+      await svc.notifyEmployees({
+        recipientIds: [employeeId],
         type: "department_changed",
-        title: "Your CoWork department has been updated",
-        body: `Your department is now ${newDept}.`,
+        title: "🏢 Your department changed",
+        body: `${req.coworkUser.name || "An administrator"} moved you${oldDept ? ` from ${oldDept}` : ""} to ${newDept}.`,
         data: { oldDepartment: oldDept, newDepartment: newDept },
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.name || "Admin",
       });
-    } catch (e) { console.error("[department_changed email]", e.message); }
+    } catch (e) { console.error("[department_changed notify]", e.message); }
 
     if (authUid) {
       const { invalidateEmployeeCache } = require("../../Middlewear/coworkAuth");
@@ -1102,31 +1080,27 @@ router.post("/notify-request-response", verifyCoworkToken, async (req, res) => {
     const { recipientId, title, body, type, subject, responseMessage } = req.body;
     if (!recipientId) return res.status(400).json({ error: "recipientId required" });
 
-    // FCM push — works on closed iPhone
+    // ── One call, four channels ──────────────────────────────────────────────
+    // Push and email only before, so this reached a phone and an inbox and
+    // never the app.
+    //
+    // The email never reached the inbox either: it was guarded by
+    // `empDoc.exists()`, called as a FUNCTION. On a firebase-admin
+    // `DocumentSnapshot` `exists` is a property, so that line threw a TypeError
+    // straight into the surrounding `catch`, every time, and the failure was
+    // logged as an email problem rather than a typo. `notifyEmployees` resolves
+    // the recipient itself, so the whole block goes.
     try {
-      const { sendPushToEmployees } = require("../../services/fcmPush.service");
-      await sendPushToEmployees([recipientId], title, body, { type });
-    } catch (e) { console.error("[request response push]", e.message); }
-
-    // Email with cooldown
-    try {
-      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
-      const empDoc = await db.collection("cowork_employees").doc(recipientId).get();
-      if (empDoc.exists() && empDoc.data().email) {
-        const emp = empDoc.data();
-        await sendNotificationEmail({
-          senderId: req.coworkUser.employeeId,
-          senderName: req.coworkUser.employeeName || "CoWork",
-          receiverId: recipientId,
-          receiverName: emp.name || recipientId,
-          receiverEmail: emp.email,
-          type,
-          title,
-          body,
-          data: { subject: subject || "", responseMessage: responseMessage || "" },
-        });
-      }
-    } catch (e) { console.error("[request response email]", e.message); }
+      await svc.notifyEmployees({
+        recipientIds: [recipientId],
+        type,
+        title,
+        body,
+        data: { subject: subject || "", responseMessage: responseMessage || "" },
+        senderId: req.coworkUser.employeeId,
+        senderName: req.coworkUser.employeeName || "CoWork",
+      });
+    } catch (e) { console.error("[request response notify]", e.message); }
 
     res.json({ success: true });
   } catch (e) {
