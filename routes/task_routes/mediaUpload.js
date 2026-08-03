@@ -95,6 +95,29 @@ router.get("/media/view/:fileId", async (req, res) => {
         const stream = await getDriveFileStream(fileId);
         res.setHeader("Content-Type", stream.mimeType || "application/octet-stream");
         res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
+        // ── The filename, which this route never sent ────────────────────────
+        //
+        // Without it the browser names a saved file after the URL's last
+        // segment: the Drive id, no extension. `Requisition_REQ-2608-0001.pdf`
+        // arrived as `1ZzWlYyLN2SU-L9QAmRHXh-VR_ct2JM1V`.
+        //
+        // `inline` rather than `attachment` by default — this route is also the
+        // `<img>` fallback, and `attachment` would stop those rendering. Inline
+        // still gives the browser a name for "Save as". `?download=1` asks for
+        // `attachment` where a real download is intended.
+        if (stream.name) {
+            const disposition = req.query.download ? "attachment" : "inline";
+            // Two forms: a plain ASCII fallback for old clients, and RFC 5987
+            // UTF-8 for anything else. A quote or newline in a Drive filename
+            // would otherwise let the header be split.
+            const ascii = stream.name.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "");
+            res.setHeader(
+                "Content-Disposition",
+                `${disposition}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(stream.name)}`
+            );
+        }
+
         stream.data.pipe(res);
     } catch (e) {
         console.error("[media/view]", e.message);
