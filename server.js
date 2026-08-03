@@ -27,14 +27,17 @@ const allowedOrigins = [
   "https://customer.grav.in",
   "http://192.168.1.30:3000",
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
+  "https://wnpt3pw1-5050.inc1.devtunnels.ms",
   "http://10.99.21.15:3000",
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
   "https://grav-cms-dncs.vercel.app",
   "https://crm.grav.in",
+  "https://wnpt3pw1-3000.inc1.devtunnels.ms",
   "https://customer.rayandcompanies.com",
   "https://rayandcompanies.com",
   "https://work-space-beta-lac.vercel.app",
   "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev",
+  "https://wnpt3pw1-3002.inc1.devtunnels.ms" , 
   "https://grav-cowork-space-main-hazel.vercel.app",
   /**
    * Extra origins from the environment, comma-separated.
@@ -1571,16 +1574,10 @@ app.use("/cowork", require("./routes/task_routes/budgetNegotiation.js"));
 // Reference attachments: /cowork/attachments, /cowork/attachments/entity/:id.
 app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
 
-// Document-surface notifications: /cowork/documents/:documentId/notify-member.
-// The documents themselves are written browser-to-Firestore; only the
-// notification comes through the engine, so it cannot be forged.
-app.use("/cowork", require("./routes/task_routes/coworkDocs.routes.js"));
-
-// Announcements for events the new Cowork writes browser-to-Firestore —
-// /cowork/notify-event. The client names WHAT happened and to which record;
-// this composes the words and resolves the recipients, so it cannot be used to
-// put arbitrary text in somebody's inbox.
-app.use("/cowork", require("./routes/task_routes/coworkEvents.routes.js"));
+// Mindmaps: /cowork/mindmaps. A route rather than a browser-direct write —
+// unlike a document body, a card tree can be malformed in ways that stop it
+// drawing for everybody on the map, and that check has to be unskippable.
+app.use("/cowork", require("./routes/task_routes/coworkMindmaps.js"));
 
 app.use(
   "/api/cowork/notifications",
