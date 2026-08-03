@@ -2,13 +2,22 @@
 
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 const EmployeeMpc = require("../../models/Customer_Models/Employee_Mpc");
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
 const jwt = require("jsonwebtoken");
 const Customer = require("../../models/Customer_Models/Customer");
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
+// This router is mounted twice:
+//   1. /api/customer/employees                          — the customer themselves
+//   2. /api/cms/sales/customers/:customerId/employees   — a sales person acting
+//      on that customer's behalf (see server.js). That mount runs the employee
+//      JWT middleware first and pre-sets req.customerId + req.actingOnBehalf,
+//      so every handler below works unchanged for both audiences.
 const verifyCustomerToken = async (req, res, next) => {
+  // Already scoped by the sales on-behalf mount — don't demand a customer cookie.
+  if (req.customerId && req.actingOnBehalf) return next();
   try {
     const token = req.cookies.customerToken;
     if (!token) {
@@ -121,6 +130,15 @@ router.get("/", verifyCustomerToken, async (req, res) => {
     if (department) filter.department = department;
     if (designation) filter.designation = designation;
 
+    // find()/countDocuments() run through Mongoose, which casts this string to
+    // an ObjectId using the schema. aggregate() does NOT — it goes straight to
+    // the driver, so a string here silently matches nothing. That is why the
+    // Active/Inactive tiles both read 0 on a customer with hundreds of people,
+    // and why the Department/Designation filter dropdowns were always empty.
+    const customerOid = mongoose.Types.ObjectId.isValid(req.customerId)
+      ? new mongoose.Types.ObjectId(req.customerId)
+      : req.customerId;
+
     const [employees, totalCount, statusCounts] = await Promise.all([
       EmployeeMpc.find(filter)
         .select("-__v")
@@ -130,7 +148,7 @@ router.get("/", verifyCustomerToken, async (req, res) => {
         .lean(),
       EmployeeMpc.countDocuments(filter),
       EmployeeMpc.aggregate([
-        { $match: { customerId: req.customerId } },
+        { $match: { customerId: customerOid } },
         { $group: { _id: "$status", count: { $sum: 1 } } },
       ]),
     ]);
@@ -142,7 +160,7 @@ router.get("/", verifyCustomerToken, async (req, res) => {
 
     // Aggregate department/designation list for filter dropdowns
     const deptAgg = await EmployeeMpc.aggregate([
-      { $match: { customerId: req.customerId } },
+      { $match: { customerId: customerOid } },
       {
         $group: {
           _id: { department: "$department", designation: "$designation" },
@@ -964,7 +982,12 @@ router.get("/by-group", verifyCustomerToken, async (req, res) => {
 // Each product entry may now include `productName` — persisted as-is.
 router.patch("/bulk-products", verifyCustomerToken, async (req, res) => {
   try {
-    const { department, designation, employees } = req.body;
+    // removedIds — rows the user deleted in the bulk editor. Previously the
+    // editor just dropped them from its local list and sent the survivors;
+    // this route only ever UPDATES what it is sent, so the deleted person was
+    // left untouched in the database while the UI reported "N updated" and the
+    // row reappeared on the next load.
+    const { department, designation, employees, removedIds } = req.body;
 
     if (!employees || !Array.isArray(employees) || employees.length === 0) {
       return res
@@ -972,7 +995,15 @@ router.patch("/bulk-products", verifyCustomerToken, async (req, res) => {
         .json({ success: false, message: "Employee data is required" });
     }
 
-    const results = { updated: 0, errors: [] };
+    const results = { updated: 0, deleted: 0, errors: [] };
+
+    if (Array.isArray(removedIds) && removedIds.length > 0) {
+      const del = await EmployeeMpc.deleteMany({
+        _id: { $in: removedIds.filter((id) => mongoose.Types.ObjectId.isValid(id)) },
+        customerId: req.customerId, // never delete outside this customer
+      });
+      results.deleted = del.deletedCount || 0;
+    }
 
     for (const [idx, empData] of employees.entries()) {
       const { _id, products } = empData;
@@ -990,17 +1021,46 @@ router.patch("/bulk-products", verifyCustomerToken, async (req, res) => {
         continue;
       }
 
-      await EmployeeMpc.findOneAndUpdate(
-        { _id, customerId: req.customerId },
-        { products: validProducts, updatedBy: req.customerId },
-        { new: true },
-      );
-      results.updated++;
+      // The bulk editor lets you change name/UIN/gender/department/designation
+      // as well as products, and has always POSTed them — but this route only
+      // ever wrote `products`, so every demographic edit made through "Edit by
+      // Dept" / "Edit All" was silently discarded. Each field is applied only
+      // when the caller actually sent it, so a products-only client stays
+      // unaffected.
+      const update = { products: validProducts, updatedBy: req.customerId };
+      if (typeof empData.name === "string" && empData.name.trim())
+        update.name = empData.name.trim();
+      if (typeof empData.uin === "string" && empData.uin.trim())
+        update.uin = empData.uin.trim().toUpperCase();
+      if (empData.gender) update.gender = empData.gender;
+      if (typeof empData.department === "string")
+        update.department = empData.department.trim();
+      if (typeof empData.designation === "string")
+        update.designation = empData.designation.trim();
+
+      try {
+        await EmployeeMpc.findOneAndUpdate(
+          { _id, customerId: req.customerId },
+          update,
+          { new: true, runValidators: true },
+        );
+        results.updated++;
+      } catch (e) {
+        // A duplicate UIN must name the row it came from, not fail the batch.
+        results.errors.push(
+          e?.code === 11000
+            ? `Row ${idx + 1}: UIN "${update.uin}" already exists`
+            : `Row ${idx + 1}: ${e.message}`,
+        );
+      }
     }
+
+    const parts = [`Updated ${results.updated} employees`];
+    if (results.deleted) parts.push(`removed ${results.deleted}`);
 
     res.status(200).json({
       success: true,
-      message: `Updated ${results.updated} employees`,
+      message: parts.join(", "),
       ...results,
     });
   } catch (error) {
