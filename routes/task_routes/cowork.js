@@ -563,20 +563,29 @@ router.post("/direct-message/notify", verifyCoworkToken, verifyEmployeeToken, as
   const { toEmployeeId, text, messageType } = req.body;
   if (!toEmployeeId) return res.status(400).json({ error: "toEmployeeId required" });
   res.json({ success: true }); // respond immediately, don't block on FCM
-  // Fire FCM push async
+  // ── Durable record, so a message reaches the bell and not only the phone ──
+  // This route sent push and email and wrote nothing, so a direct message
+  // existed on a lock screen and in an inbox and NOWHERE in the app: the
+  // notifications list never showed one, and `unreadDm` — which counts
+  // `direct_message` rows — was permanently zero in both apps.
+  //
+  // Written before the push so the row exists by the time somebody taps the
+  // notification and lands on the list.
   try {
-    const { sendPushToEmployees } = require("../../services/fcmPush.service");
-    await sendPushToEmployees([toEmployeeId], `💬 DM · ${req.coworkUser.name}`, (text || "📎 Attachment").slice(0, 80), { type: "direct_message" });
-  } catch (e) { console.error("[dm notify FCM]", e.message); }
-  // Fire email async
-  try {
-    const { sendNotificationEmail } = require("../../services/emailNotifications.service");
-    const empDoc = await db.collection("cowork_employees").doc(toEmployeeId).get();
-    if (empDoc.exists && empDoc.data().email) {
-      const emp = empDoc.data();
-      await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: toEmployeeId, receiverName: emp.name, receiverEmail: emp.email, type: "direct_message", title: req.coworkUser.name, body: (text || "📎 Attachment").slice(0, 80), data: {} });
-    }
-  } catch (e) { console.error("[dm notify email]", e.message); }
+    await svc.notifyEmployees({
+      recipientIds: [toEmployeeId],
+      type: "direct_message",
+      title: `💬 DM · ${req.coworkUser.name}`,
+      body: (text || "📎 Attachment").slice(0, 80),
+      data: { conversationId: [req.coworkUser.employeeId, toEmployeeId].sort().join("_"), senderId: req.coworkUser.employeeId },
+      senderId: req.coworkUser.employeeId,
+      senderName: req.coworkUser.name,
+    });
+  } catch (e) { console.error("[dm notify row]", e.message); }
+  // The push and the email used to be sent here by hand. `notifyEmployees` is
+  // `_notifyMany`, which already does BOTH — plus the socket event — so doing
+  // them again here would deliver every direct message twice on the phone and
+  // twice by email.
 });
 
 router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
@@ -588,19 +597,23 @@ router.post("/group/:groupId/notify", verifyCoworkToken, verifyEmployeeToken, as
     const group = groupDoc.data();
     const recipients = (group.memberIds || []).filter(id => id !== req.coworkUser.employeeId);
     if (!recipients.length) return res.json({ success: true });
-    // Only send push notification + email — do NOT write to Firestore again
-    const { sendPushToEmployees } = require("../../services/fcmPush.service");
-    await sendPushToEmployees(recipients, `👥 ${group.name} · ${req.coworkUser.name}`, (text || "📎 Attachment").slice(0, 80), { type: "group_message", groupId });
-    try {
-      const { sendNotificationEmail } = require("../../services/emailNotifications.service");
-      const empDocs = await Promise.all(recipients.map(id => db.collection("cowork_employees").doc(id).get()));
-      for (const empDoc of empDocs) {
-        if (!empDoc.exists) continue;
-        const emp = empDoc.data();
-        if (!emp.email) continue;
-        await sendNotificationEmail({ senderId: req.coworkUser.employeeId, senderName: req.coworkUser.name, receiverId: emp.employeeId || empDoc.id, receiverName: emp.name, receiverEmail: emp.email, type: "group_message", title: `${req.coworkUser.name} in ${group.name}`, body: (text || "📎 Attachment").slice(0, 80), data: { groupId, groupName: group.name } });
-      }
-    } catch (e) { console.error("[group notify email]", e.message); }
+    // The MESSAGE is not written here — it is already in Firestore, written by
+    // the browser. What was missing is the notification RECORD: this route sent
+    // push and email and nothing else, so a group message reached a phone and
+    // an inbox and never the bell.
+    //
+    // `notifyEmployees` is `_notifyMany` — Firestore row, socket, push AND
+    // email in one. The hand-rolled push and the email loop that used to live
+    // here are gone with it, or every group message would arrive twice.
+    await svc.notifyEmployees({
+      recipientIds: recipients,
+      type: "group_message",
+      title: `👥 ${group.name} · ${req.coworkUser.name}`,
+      body: (text || "📎 Attachment").slice(0, 80),
+      data: { groupId, groupName: group.name, senderId: req.coworkUser.employeeId },
+      senderId: req.coworkUser.employeeId,
+      senderName: req.coworkUser.name,
+    });
     res.json({ success: true });
   } catch (e) {
     console.error("[group notify]", e.message);
