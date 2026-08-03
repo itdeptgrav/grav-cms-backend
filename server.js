@@ -925,6 +925,11 @@ const requirePlatformAdmin = require("./Middlewear/requirePlatformAdmin");
 const accessAdminRoutes = require("./routes/Admin/accessAdmin");
 app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
 
+// The approval queue: an editor's held changes, and the approver's decision on
+// them. Mounted outside any one department's middleware because the queue spans
+// departments; it authenticates the session itself.
+app.use("/api/change-requests", require("./routes/Access/changeRequests"));
+
 // Unauthenticated on purpose — backs the public /onboarding tile grid.
 // Returns names and icons only; never emails, counts or user data.
 const publicDepartmentRoutes = require("./routes/Admin/publicDepartments");
@@ -943,23 +948,35 @@ const ceoSopRoutes = require("./routes/CEO_Routes/ceoSopRoutes");
 
 app.use("/api/ceo/sop", ceoSopRoutes);
 
+// Role enforcement + the editor-needs-approval queue for the whole Sales API.
+// See Middlewear/departmentWriteGuard.js — reads are untouched, and nothing
+// changes at all until an administrator assigns the first Sales role.
+const departmentWrites = require("./Middlewear/departmentWriteGuard");
+const salesWrites = (entity, extra = {}) =>
+  departmentWrites("sales", { entity, ...extra });
+
 const salesSettingsRoutes = require("./routes/CMS_Routes/Sales/salesSettings");
 
-app.use("/api/cms/sales/settings", salesSettingsRoutes);
+// Department settings are owner-shaped, but the same queue applies: an editor
+// may propose a settings change and an approver commits it.
+app.use("/api/cms/sales/settings", salesWrites("sales settings"), salesSettingsRoutes);
 
 // Address/contact block printed on Sales PDFs (quotations, measurement POs,
 // work-order progress). Its own record — independent of the store letterhead.
 app.use(
   "/api/cms/sales/pdf-settings",
+  salesWrites("Sales PDF settings"),
   require("./routes/CMS_Routes/Sales/salesPdfSettingsRoutes")
 );
 
 app.use(
   "/api/cms/crm/call-schedules",
+  salesWrites("call schedule"),
   require("./routes/CMS_Routes/Sales/callSchedule"),
 );
 app.use(
   "/api/cms/crm/settings",
+  salesWrites("CRM settings"),
   require("./routes/CMS_Routes/Sales/crmSettings"),
 );
 
@@ -970,7 +987,7 @@ const customerAuthRoutes = require("./routes/Customer_Routes/auth");
 app.use("/api/customer/auth", customerAuthRoutes);
 
 const salesCustomersRoutes = require("./routes/CMS_Routes/Sales/salesCustomers");
-app.use("/api/cms/sales/customers", salesCustomersRoutes);
+app.use("/api/cms/sales/customers", salesWrites("customer"), salesCustomersRoutes);
 
 const customerRequestsRoutes = require("./routes/Customer_Routes/CustomerRequests.js");
 app.use("/api/customer/requests", customerRequestsRoutes);
@@ -1001,6 +1018,30 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
+// ── Sales acting on a customer's behalf ────────────────────────────────────
+// Same MPC router, scoped to :customerId and gated by the employee JWT instead
+// of the customer cookie. Lets a sales person build a customer's measurement
+// profile cards (add people, assign products, import, export) when the customer
+// can't do it themselves — see grav-cms/app/sales/dashboard/customers/[id]/mpc.
+// Mounted BEFORE the router so req.customerId is already set when its own
+// verifyCustomerToken runs; that middleware short-circuits on req.actingOnBehalf.
+const EmployeeAuthForMpc = require("./Middlewear/EmployeeAuthMiddlewear");
+app.use(
+  "/api/cms/sales/customers/:customerId/employees",
+  EmployeeAuthForMpc,
+  (req, res, next) => {
+    const { customerId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return res.status(400).json({ success: false, message: "Invalid customer id" });
+    }
+    req.customerId = customerId;
+    req.actingOnBehalf = true;
+    req.onBehalfActor = { id: req.user?.id, name: req.user?.name };
+    next();
+  },
+  employeeMpcRoutes,
+);
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
@@ -1017,9 +1058,10 @@ const crmLeadsRoutes = require("./routes/CMS_Routes/Sales/leads");
 const crmContactsRoutes = require("./routes/CMS_Routes/Sales/contacts");
 const crmAccountsRoutes = require("./routes/CMS_Routes/Sales/accounts");
 
-app.use("/api/cms/crm/leads", crmLeadsRoutes);
-app.use("/api/cms/crm/contacts", crmContactsRoutes);
-app.use("/api/cms/crm/accounts", crmAccountsRoutes);
+// CRM belongs to Sales, so it takes the same role + approval guard.
+app.use("/api/cms/crm/leads", salesWrites("lead"), crmLeadsRoutes);
+app.use("/api/cms/crm/contacts", salesWrites("contact"), crmContactsRoutes);
+app.use("/api/cms/crm/accounts", salesWrites("account"), crmAccountsRoutes);
 
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
@@ -1155,17 +1197,26 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
 );
 
+// Role enforcement + the editor-needs-approval queue for the routes PRODUCTION
+// actually owns. Deliberately NOT applied to /api/cms/manufacturing/* at large:
+// cutting-master, QC, packaging-dispatch and production-supervisor all write
+// through those same prefixes, and guarding them as "project-manager" would
+// park a cutting master's save in a production approver's queue. Reads are
+// untouched, and nothing changes until the first Production role is assigned.
+const pmWrites = (entity, extra = {}) =>
+  departmentWrites("project-manager", { entity, ...extra });
+
 const pmRequestsRoutes = require("./routes/CMS_Routes/pm/pmRequestsRoutes");
-app.use("/api/cms/pm/requests", pmRequestsRoutes);
+app.use("/api/cms/pm/requests", pmWrites("production request"), pmRequestsRoutes);
 
 const workOrderTimeline = require("./routes/CMS_Routes/Manufacturing/WorkOrder/workOrderTimeline");
 app.use("/api/cms/manufacturing/work-orders/progress", workOrderTimeline);
 
 const productionDashboardRoutes = require("./routes/CMS_Routes/Production/Dashboard/productionDashboardRoutes");
-app.use("/api/cms/production/dashboard", productionDashboardRoutes);
+app.use("/api/cms/production/dashboard", pmWrites("production dashboard"), productionDashboardRoutes);
 
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
-app.use("/api/cms/production/canvas-layout", productionMachineLayout);
+app.use("/api/cms/production/canvas-layout", pmWrites("machine layout"), productionMachineLayout);
 
 const packagingRoutes = require("./routes/CMS_Routes/Manufacturing/Packaging/packagingRoutes");
 app.use("/api/cms/manufacturing/packaging", packagingRoutes);
@@ -1175,7 +1226,7 @@ const workFlowTrackRoutes = require("./routes/CMS_Routes/Manufacturing/Productio
 app.use("/api/cms/manufacturing/production-tracking", workFlowTrackRoutes);
 
 const ProductionSchedule = require("./routes/CMS_Routes/Production/ProductionSchedule/productionScheduleRoutes.js");
-app.use("/api/cms/manufacturing/production-schedule", ProductionSchedule);
+app.use("/api/cms/manufacturing/production-schedule", pmWrites("production schedule"), ProductionSchedule);
 
 const employeeTrackingRoutes = require("./routes/CMS_Routes/Manufacturing/Manufacturing-Order/employeeTrackingRoutes.js");
 app.use("/api/cms/manufacturing/employee-tracking", employeeTrackingRoutes);
@@ -1189,16 +1240,23 @@ app.use(
 // Mounted BEFORE the catch-all sales routers below, which own `/:requestId/...`
 // patterns at the same prefix and would otherwise be able to shadow this one.
 const salesScheduleRoutes = require("./routes/CMS_Routes/Sales/SalesSchedule/salesScheduleRoutes");
-app.use("/api/cms/sales/sales-schedule", salesScheduleRoutes);
+app.use("/api/cms/sales/sales-schedule", salesWrites("schedule"), salesScheduleRoutes);
 
 const salesRoutes = require("./routes/CMS_Routes/Sales/customerRequests");
-app.use("/api/cms/sales", salesRoutes);
+// `approve-edit` and the customer's own edit-request decisions are exempt: they
+// ARE an approval step, and routing an approval through a second approval queue
+// would deadlock the order. Their own guards still apply inside the router.
+app.use(
+  "/api/cms/sales",
+  salesWrites("purchase order", { exempt: ["/approve-edit", "/edit-request/"] }),
+  salesRoutes,
+);
 
 const salesOverview = require("./routes/CMS_Routes/Sales/dashboard");
 app.use("/api/cms/sales/overview", salesOverview);
 
 const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
-app.use("/api/cms/sales", quotationRoutes);
+app.use("/api/cms/sales", salesWrites("quotation"), quotationRoutes);
 
 // ─── GOOGLE WORKSPACE ROUTES ────────────────────────────────
 const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
