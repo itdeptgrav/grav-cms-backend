@@ -26,13 +26,16 @@ const allowedOrigins = [
   "https://customer.grav.in",
   "http://192.168.1.30:3000",
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
+  "https://wnpt3pw1-5050.inc1.devtunnels.ms",
   "http://10.99.21.15:3000",
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
   "https://grav-cms-dncs.vercel.app",
   "https://crm.grav.in",
+  "https://wnpt3pw1-3000.inc1.devtunnels.ms",
   "https://customer.rayandcompanies.com",
   "https://rayandcompanies.com",
   "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev",
+  "https://wnpt3pw1-3002.inc1.devtunnels.ms" , 
   "https://grav-cowork-space-main-hazel.vercel.app",
   /**
    * Extra origins from the environment, comma-separated.
@@ -1510,6 +1513,11 @@ app.use("/cowork", require("./routes/task_routes/budgetNegotiation.js"));
 
 // Reference attachments: /cowork/attachments, /cowork/attachments/entity/:id.
 app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
+
+// Mindmaps: /cowork/mindmaps. A route rather than a browser-direct write —
+// unlike a document body, a card tree can be malformed in ways that stop it
+// drawing for everybody on the map, and that check has to be unskippable.
+app.use("/cowork", require("./routes/task_routes/coworkMindmaps.js"));
 
 app.use(
   "/api/cowork/notifications",
