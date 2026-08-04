@@ -1551,6 +1551,9 @@ app.use("/cowork", askAITest);
 // Docs/Sheets AI assistant — one shared service, Gemini Flash-Lite only.
 app.use("/cowork", require("./routes/task_routes/aiAssist.routes"));
 
+// Plain-text "improve with AI" for task-form fields (title/description/criteria).
+app.use("/cowork", require("./routes/task_routes/textImprove.routes"));
+
 const crossOrgRoutes = require("./routes/Customer_Routes/cross-org-assign.js");
 app.use("/api/customer/employees/cross-org", crossOrgRoutes);
 
@@ -2347,11 +2350,17 @@ const gracefulShutdown = (signal) => {
 
   server.close(() => {
     console.log("✅ HTTP server closed");
-    mongoose.connection.close(false, () => {
-      console.log("✅ MongoDB connection closed");
-      console.log("👋 Shutdown complete");
-      process.exit(0);
-    });
+    mongoose.connection
+      .close(false)
+      .then(() => {
+        console.log("✅ MongoDB connection closed");
+        console.log("👋 Shutdown complete");
+        process.exit(0);
+      })
+      .catch((err) => {
+        console.error("⚠️  Error closing MongoDB connection:", err);
+        process.exit(1);
+      });
   });
 
   setTimeout(() => {
