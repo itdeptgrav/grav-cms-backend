@@ -23,7 +23,20 @@ const webpush = require("web-push");
 // service. Preferring the same variable keeps the two in agreement.
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
-const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:rakesh.biswal@grav.in";
+// `VAPID_SUBJECT` first, and for the same reason the public key above prefers
+// `VAPID_PUBLIC_KEY`: `web-push` is a singleton shared with
+// NotificationService.js, so whichever file calls `setVapidDetails` last decides
+// the `sub` claim for BOTH. That file reads `VAPID_SUBJECT`; this one read
+// `VAPID_EMAIL`, and the deployment sets the two to DIFFERENT addresses
+// (`mailto:itdeptgrav@gmail.com` vs `mailto:hr@grav.in`) — so which one every
+// push was signed with depended on module load order, and nothing in either
+// file said so.
+//
+// `VAPID_EMAIL` is still honoured, so a deployment that only sets that keeps
+// working. The hard-coded fallback is last and is a personal address; it exists
+// only so an unconfigured dev box does not crash, and it should never be what a
+// deployment actually signs with.
+const VAPID_EMAIL = process.env.VAPID_SUBJECT || process.env.VAPID_EMAIL || "mailto:rakesh.biswal@grav.in";
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
     webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
