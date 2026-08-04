@@ -142,7 +142,19 @@ router.post('/requests/:requestId/quotation/approve', verifyCustomerToken, async
     // Update request status
     request.status = 'quotation_customer_approved';
     request.finalOrderPrice = quotation.grandTotal;
+    request.totalDueAmount = Math.max(0, (quotation.grandTotal || 0) - (request.totalPaidAmount || 0));
     request.updatedAt = new Date();
+
+    // Put it on the sales team's action list — approval alone does not move the
+    // order to production, a sales approval still has to follow.
+    request.quotationNotifications = request.quotationNotifications || [];
+    request.quotationNotifications.push({
+      type: 'sales_approval_required',
+      message: `Customer approved quotation ${quotation.quotationNumber || ''}. Sales approval required to push the order to production.`,
+      relatedId: quotation._id,
+      actionRequired: true,
+      createdAt: new Date(),
+    });
 
     // Add note
     request.notes.push({
@@ -294,6 +306,18 @@ router.post('/requests/:requestId/quotation/payment', verifyCustomerToken, async
       });
     }
 
+    // A customer can only pay against a quotation they have accepted. Sales
+    // recording a payment on their behalf goes through the separate sales-side
+    // record-payment route and is deliberately not gated this way.
+    if (!['customer_approved', 'sales_approved'].includes(quotation.status)) {
+      return res.status(400).json({
+        success: false,
+        message: quotation.status === 'sent_to_customer'
+          ? 'Please approve the quotation before making a payment.'
+          : `Payments cannot be made against a quotation in '${quotation.status}' state.`
+      });
+    }
+
     // Find the payment step
     const paymentStepIndex = quotation.paymentSchedule.findIndex(
       step => step.stepNumber === paymentStepNumber
@@ -317,12 +341,20 @@ router.post('/requests/:requestId/quotation/payment', verifyCustomerToken, async
       });
     }
 
-    // Check if payment exceeds remaining amount
-    const remainingAmount = paymentStep.amount - (paymentStep.paidAmount || 0);
+    // Check if payment exceeds remaining amount. Receipts already submitted and
+    // still awaiting sales approval count against the remainder too, otherwise
+    // a customer can submit the same step several times over while nothing has
+    // been verified yet.
+    const pendingForStep = (quotation.paymentSubmissions || [])
+      .filter(s => s.paymentStepNumber === paymentStepNumber && s.status === 'pending')
+      .reduce((sum, s) => sum + (s.submittedAmount || 0), 0);
+    const remainingAmount = paymentStep.amount - (paymentStep.paidAmount || 0) - pendingForStep;
     if (paymentAmount > remainingAmount) {
       return res.status(400).json({
         success: false,
-        message: `Payment amount exceeds remaining amount of ₹${remainingAmount}`
+        message: pendingForStep > 0
+          ? `You already have ₹${pendingForStep} awaiting approval for this step. Only ₹${Math.max(0, remainingAmount)} can be submitted now.`
+          : `Payment amount exceeds remaining amount of ₹${Math.max(0, remainingAmount)}`
       });
     }
 
@@ -361,6 +393,16 @@ router.post('/requests/:requestId/quotation/payment', verifyCustomerToken, async
 
     request.updatedAt = new Date();
 
+    // Put it on the sales team's action list so the receipt is visibly waiting
+    // for approval on the CMS side instead of sitting silently in an array.
+    request.quotationNotifications = request.quotationNotifications || [];
+    request.quotationNotifications.push({
+      type: 'payment_received',
+      message: `Customer submitted a payment of ₹${paymentAmount} for ${paymentStep.name} (Step ${paymentStepNumber}). Awaiting sales approval.`,
+      actionRequired: true,
+      createdAt: new Date(),
+    });
+
     // Add note
     request.notes.push({
       text: `Payment of ₹${paymentAmount} submitted for ${paymentStep.name} (Step ${paymentStepNumber}). Status: Pending verification.`,
@@ -370,10 +412,17 @@ router.post('/requests/:requestId/quotation/payment', verifyCustomerToken, async
 
     await request.save();
 
+    // Return the saved subdocument (it now has an _id) plus the fresh
+    // submissions list, so the portal can render the pending row immediately.
+    const savedQuotation = request.quotations[0];
+    const savedSubmission =
+      savedQuotation.paymentSubmissions[savedQuotation.paymentSubmissions.length - 1];
+
     res.status(200).json({
       success: true,
-      message: 'Payment submitted successfully. Receipt is pending verification.',
-      submission: paymentSubmission,
+      message: 'Payment submitted successfully. It is now awaiting sales approval.',
+      submission: savedSubmission,
+      submissions: savedQuotation.paymentSubmissions,
       request
     });
 
@@ -414,13 +463,26 @@ router.get('/requests/:requestId/payments', verifyCustomerToken, async (req, res
       paymentSteps: []
     };
 
+    let submissions = [];
+
     if (request.quotations && request.quotations.length > 0) {
       const latestQuotation = request.quotations[request.quotations.length - 1];
-      
+      submissions = latestQuotation.paymentSubmissions || [];
+
+      const pendingFor = (stepNumber) => submissions
+        .filter(s => s.paymentStepNumber === stepNumber && s.status === 'pending')
+        .reduce((sum, s) => sum + (s.submittedAmount || 0), 0);
+
       paymentSummary.totalAmount = latestQuotation.grandTotal;
       paymentSummary.totalPaid = request.totalPaidAmount || 0;
       paymentSummary.totalDue = paymentSummary.totalAmount - paymentSummary.totalPaid;
-      
+      // Submitted but not yet approved by sales — shown separately so the
+      // customer can see their money is registered without it being counted
+      // as paid before anyone has checked it.
+      paymentSummary.totalPendingApproval = submissions
+        .filter(s => s.status === 'pending')
+        .reduce((sum, s) => sum + (s.submittedAmount || 0), 0);
+
       // Process payment steps
       paymentSummary.paymentSteps = latestQuotation.paymentSchedule.map(step => ({
         stepNumber: step.stepNumber,
@@ -430,8 +492,10 @@ router.get('/requests/:requestId/payments', verifyCustomerToken, async (req, res
         dueDate: step.dueDate,
         status: step.status,
         paidAmount: step.paidAmount || 0,
+        pendingApprovalAmount: pendingFor(step.stepNumber),
         remainingAmount: step.amount - (step.paidAmount || 0),
-        paymentReceipts: step.paymentReceipts || []
+        paymentReceipts: step.paymentReceipts || [],
+        submissions: submissions.filter(s => s.paymentStepNumber === step.stepNumber),
       }));
 
       // Collect all receipts
@@ -454,6 +518,7 @@ router.get('/requests/:requestId/payments', verifyCustomerToken, async (req, res
     res.status(200).json({
       success: true,
       paymentSummary,
+      submissions,
       receipts: allReceipts,
       totalReceipts: allReceipts.length
     });
