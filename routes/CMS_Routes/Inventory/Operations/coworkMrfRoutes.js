@@ -941,6 +941,12 @@ router.post("/product-requests/:id/chat", async (req, res) => {
       ...chatSenderFor(req, emp, access.isRequester ? "employee" : undefined),
     })
 
+    // See the note on the MRF chat route below: the notifier existed and was
+    // wired to nothing, so these conversations reached only whoever was
+    // already looking at them.
+    mrfNotify.productRequestChatMessage(doc, message)
+      .catch(e => console.error("[pr chat notify]", e.message))
+
     res.status(201).json({ success: true, message })
   } catch (err) {
     res.status(err.status || 500).json({ success: false, message: err.message })
@@ -1075,6 +1081,13 @@ router.post("/:id/chat", async (req, res) => {
       // raising their own MRF is the requester in that thread.
       ...chatSenderFor(req, emp, access.isRequester ? "employee" : undefined),
     })
+
+    // `mrfNotify.chatMessage` was written for exactly this and wired to
+    // nothing, so an MRF conversation notified nobody: the requester answering
+    // the store's question, or the store answering theirs, reached only whoever
+    // happened to have the thread open. It already addresses the requester and
+    // the TL and excludes the sender, so there is nothing to decide here.
+    mrfNotify.chatMessage(mrf, message).catch(e => console.error("[mrf chat notify]", e.message))
 
     res.status(201).json({ success: true, message })
   } catch (err) {

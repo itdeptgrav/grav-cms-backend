@@ -5,11 +5,11 @@
  *   app.use("/cowork", require("./routes/task_routes/livekit.routes"));
  *
  * ENDPOINTS:
- *   POST /cowork/livekit/start      → CEO/TL starts a meeting, get join code
+ *   POST /cowork/livekit/start      → organiser starts a meeting, get join code
  *   POST /cowork/livekit/join       → Anyone joins with a 6-digit code
  *   POST /cowork/livekit/token      → Get LiveKit token (after code verified)
  *   GET  /cowork/livekit/info/:meetId → Get live room info
- *   POST /cowork/livekit/end        → CEO/TL ends meeting
+ *   POST /cowork/livekit/end        → organiser ends meeting
  */
 
 const express = require("express");
@@ -54,7 +54,7 @@ function makeGuestId() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /cowork/livekit/start
-// CEO or TL starts a meeting → creates LiveKit room + join code
+// The meeting's organiser starts it → creates LiveKit room + join code
 // Body: { meetId }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
@@ -63,13 +63,7 @@ router.post(
   verifyEmployeeToken,
   async (req, res) => {
     try {
-      const { role, employeeId, name } = req.coworkUser;
-
-      if (role !== "ceo" && role !== "tl") {
-        return res
-          .status(403)
-          .json({ error: "Only CEO or TL can start a meeting." });
-      }
+      const { employeeId, name } = req.coworkUser;
 
       const { meetId } = req.body;
       if (!meetId) return res.status(400).json({ error: "meetId required" });
@@ -81,6 +75,14 @@ router.post(
         return res.status(404).json({ error: "Meeting not found" });
 
       const meet = meetDoc.data();
+
+      // Membership decides, not seniority: the organiser opens their own
+      // room regardless of role, same as the rest of Cowork's meeting rules.
+      if (meet.createdBy !== employeeId) {
+        return res
+          .status(403)
+          .json({ error: "Only the meeting's organiser can open the room." });
+      }
 
       // If already live, return existing room info
       if (meet.livekitRoomName && meet.status === "live") {
@@ -101,8 +103,9 @@ router.post(
         });
       }
 
-      // Create a new LiveKit room
-      const roomName = `cowork-${meetId}-${Date.now()}`;
+      // meet- prefix so the frontend token route accepts it (it rejects cowork-
+      // rooms, which are the screen-monitoring namespace on the same project).
+      const roomName = `meet-${meetId}`;
       const joinCode = makeJoinCode();
 
       try {
@@ -296,7 +299,7 @@ router.get(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /cowork/livekit/end
-// CEO/TL ends the meeting
+// The meeting's organiser ends it
 // Body: { meetId }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
@@ -305,13 +308,7 @@ router.post(
   verifyEmployeeToken,
   async (req, res) => {
     try {
-      const { role } = req.coworkUser;
-      if (role !== "ceo" && role !== "tl") {
-        return res
-          .status(403)
-          .json({ error: "Only CEO or TL can end a meeting." });
-      }
-
+      const { employeeId } = req.coworkUser;
       const { meetId } = req.body;
       const meetDoc = await db
         .collection("cowork_scheduled_meets")
@@ -321,6 +318,12 @@ router.post(
         return res.status(404).json({ error: "Meeting not found" });
 
       const meet = meetDoc.data();
+
+      if (meet.createdBy !== employeeId) {
+        return res
+          .status(403)
+          .json({ error: "Only the meeting's organiser can end it." });
+      }
 
       // Delete the LiveKit room
       if (meet.livekitRoomName) {
@@ -359,7 +362,7 @@ router.post(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /cowork/livekit/public-link — CEO/TL creates/fetches the public link
+// POST /cowork/livekit/public-link — the organiser creates/fetches the public link
 // Body: { meetId }
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
@@ -368,12 +371,7 @@ router.post(
   verifyEmployeeToken,
   async (req, res) => {
     try {
-      const { role, employeeId } = req.coworkUser;
-      if (role !== "ceo" && role !== "tl") {
-        return res
-          .status(403)
-          .json({ error: "Only CEO or TL can create a public link." });
-      }
+      const { employeeId } = req.coworkUser;
       const { meetId } = req.body;
       if (!meetId) return res.status(400).json({ error: "meetId required" });
 
@@ -383,6 +381,11 @@ router.post(
         return res.status(404).json({ error: "Meeting not found" });
 
       const meet = meetDoc.data();
+      if (meet.createdBy !== employeeId) {
+        return res.status(403).json({
+          error: "Only the meeting's organiser can create a public link.",
+        });
+      }
       if (meet.status === "ended") {
         return res
           .status(400)
@@ -416,16 +419,22 @@ router.post(
   verifyEmployeeToken,
   async (req, res) => {
     try {
-      const { role } = req.coworkUser;
-      if (role !== "ceo" && role !== "tl") {
-        return res
-          .status(403)
-          .json({ error: "Only CEO or TL can revoke a public link." });
-      }
+      const { employeeId } = req.coworkUser;
       const { meetId } = req.body;
       if (!meetId) return res.status(400).json({ error: "meetId required" });
 
-      await db.collection("cowork_scheduled_meets").doc(meetId).update({
+      const meetRef = db.collection("cowork_scheduled_meets").doc(meetId);
+      const meetDoc = await meetRef.get();
+      if (!meetDoc.exists)
+        return res.status(404).json({ error: "Meeting not found" });
+
+      if (meetDoc.data().createdBy !== employeeId) {
+        return res.status(403).json({
+          error: "Only the meeting's organiser can revoke a public link.",
+        });
+      }
+
+      await meetRef.update({
         publicShareEnabled: false,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -454,12 +463,27 @@ router.get("/public/meeting-info/:token", async (req, res) => {
     const meet = snap.docs[0].data();
     const meetId = snap.docs[0].id;
 
+    // How many are already in the room — same lookup the host's own
+    // `/livekit/info` uses, so a guest sees the same "N in this call" signal
+    // the organiser does, without exposing who they are.
+    let participantCount = 0;
+    if (meet.livekitRoomName && meet.status === "live") {
+      try {
+        const svc = getRoomSvc();
+        const rooms = await svc.listRooms([meet.livekitRoomName]);
+        participantCount = rooms[0]?.numParticipants || 0;
+      } catch {
+        /* LiveKit might not have this room anymore */
+      }
+    }
+
     res.json({
       success: true,
       meetId,
       meetTitle: meet.title || "CoWork Meeting",
       status: meet.status || "scheduled",
       canJoin: meet.publicShareEnabled === true && meet.status !== "ended",
+      participantCount,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

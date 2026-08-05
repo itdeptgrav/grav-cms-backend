@@ -23,16 +23,21 @@ const allowedOrigins = [
   "http://10.119.220.161:3000",
   "https://cms.grav.in",
   "https://cowork.grav.in",
+  "https://grav-coworkspace.vercel.app",
   "https://customer.grav.in",
   "http://192.168.1.30:3000",
   "https://8ks0bflk-3000.inc1.devtunnels.ms",
+  "https://wnpt3pw1-5050.inc1.devtunnels.ms",
   "http://10.99.21.15:3000",
   "https://8ks0bflk-5000.inc1.devtunnels.ms",
   "https://grav-cms-dncs.vercel.app",
   "https://crm.grav.in",
+  "https://wnpt3pw1-3000.inc1.devtunnels.ms",
   "https://customer.rayandcompanies.com",
   "https://rayandcompanies.com",
+  "https://work-space-beta-lac.vercel.app",
   "https://crispy-space-goldfish-4j5x7r94xq6935g75-3000.app.github.dev",
+  "https://wnpt3pw1-3002.inc1.devtunnels.ms" , 
   "https://grav-cowork-space-main-hazel.vercel.app",
   /**
    * Extra origins from the environment, comma-separated.
@@ -1598,6 +1603,11 @@ app.use("/cowork", require("./routes/task_routes/budgetNegotiation.js"));
 // Reference attachments: /cowork/attachments, /cowork/attachments/entity/:id.
 app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
 
+// Mindmaps: /cowork/mindmaps. A route rather than a browser-direct write —
+// unlike a document body, a card tree can be malformed in ways that stop it
+// drawing for everybody on the map, and that check has to be unskippable.
+app.use("/cowork", require("./routes/task_routes/coworkMindmaps.js"));
+
 app.use(
   "/api/cowork/notifications",
   require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"),
@@ -1626,6 +1636,12 @@ app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
 const askAITest = require("./routes/task_routes/askAI.routes");
 console.log("askAI.routes exports:", Object.keys(askAITest));
 app.use("/cowork", askAITest);
+
+// Docs/Sheets AI assistant — one shared service, Gemini Flash-Lite only.
+app.use("/cowork", require("./routes/task_routes/aiAssist.routes"));
+
+// Plain-text "improve with AI" for task-form fields (title/description/criteria).
+app.use("/cowork", require("./routes/task_routes/textImprove.routes"));
 
 const crossOrgRoutes = require("./routes/Customer_Routes/cross-org-assign.js");
 app.use("/api/customer/employees/cross-org", crossOrgRoutes);
@@ -2423,11 +2439,17 @@ const gracefulShutdown = (signal) => {
 
   server.close(() => {
     console.log("✅ HTTP server closed");
-    mongoose.connection.close(false, () => {
-      console.log("✅ MongoDB connection closed");
-      console.log("👋 Shutdown complete");
-      process.exit(0);
-    });
+    mongoose.connection
+      .close(false)
+      .then(() => {
+        console.log("✅ MongoDB connection closed");
+        console.log("👋 Shutdown complete");
+        process.exit(0);
+      })
+      .catch((err) => {
+        console.error("⚠️  Error closing MongoDB connection:", err);
+        process.exit(1);
+      });
   });
 
   setTimeout(() => {

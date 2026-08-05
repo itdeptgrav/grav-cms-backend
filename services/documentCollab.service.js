@@ -1,5 +1,5 @@
 /**
- * Live document collaboration — the Yjs half.
+ * Live collaboration — the Yjs half. Documents, sheets AND mindmaps.
  *
  * ## Why this exists rather than a Google Docs integration
  *
@@ -29,16 +29,51 @@
  *
  * ## The namespace
  *
- * `y-socket.io` claims `/yjs|<room>` via a dynamic namespace. Room names here
- * are the document id, so `/yjs|<documentId>`.
+ * `y-socket.io` claims `/yjs|<room>` via a dynamic namespace, so a room name is
+ * `/yjs|<room>`. A room names a RECORD, and which KIND of record is part of the
+ * name — see `KINDS` below.
  */
 
 const { YSocketIO } = require("y-socket.io/dist/server");
 const Y = require("yjs");
 const { admin, db } = require("../config/firebaseAdmin");
 
-const BODY_COLLECTION = "cowork_document_bodies";
-const DOC_COLLECTION = "cowork_documents";
+/**
+ * What can be collaborated on, and where each kind lives.
+ *
+ * ## Why the kind is in the room name
+ *
+ * The room used to be the document id alone, because documents were the only
+ * thing that collaborated and there was nothing else it could have meant.
+ * Mindmaps are a separate collection with their own membership, so a bare id is
+ * now ambiguous — and the ambiguity is a security problem rather than an
+ * inconvenience: `mayOpen` decides who may join by reading the record, and
+ * Firestore ids are unique per collection rather than across them. A mindmap id
+ * that happened to match a document id would be authorised against THAT
+ * document's member list.
+ *
+ * **Documents keep the bare id, deliberately.** Every document room open right
+ * now is named that way; renaming them would put a client on the old name and a
+ * client on the new one into two different rooms holding two divergent copies of
+ * one document, with nothing to show for it because both halves would work
+ * perfectly on their own. The prefix is only ever added to new kinds.
+ *
+ * Mirrors `lib/rules/workspace/collabRoom.ts` in the Cowork client. The two have
+ * to agree on these strings or a browser opens a room this server will not
+ * authorise.
+ */
+const KINDS = {
+  document: {
+    prefix: "",
+    records: "cowork_documents",
+    bodies: "cowork_document_bodies",
+  },
+  mindmap: {
+    prefix: "mindmap:",
+    records: "cowork_mindmaps",
+    bodies: "cowork_mindmap_bodies",
+  },
+};
 
 /** How long after the last keystroke the state is written. */
 const SAVE_DEBOUNCE_MS = 3000;
@@ -66,27 +101,50 @@ async function identify(handshake) {
 }
 
 /**
- * The document id this namespace is for. `/yjs|<documentId>`.
+ * The room name out of `/yjs|<room>`.
  *
- * Read from the NAMESPACE, never from anything the client sends alongside it.
- * A client-supplied id could name document A while the socket joins document
- * B's room, which would authorise the wrong document entirely.
+ * Read from the NAMESPACE, never from anything the client sends alongside it. A
+ * client-supplied id could name record A while the socket joins record B's room,
+ * which would authorise the wrong record entirely.
  */
-function documentIdOf(namespaceName) {
+function roomNameOf(namespaceName) {
   const at = String(namespaceName || "").indexOf("|");
   return at === -1 ? null : String(namespaceName).slice(at + 1);
 }
 
 /**
- * Whether this Firebase user may open this document.
+ * What a room refers to, or null if it names nothing.
+ *
+ * Null for an empty id rather than a record with an empty id: `mindmap:` is a
+ * malformed room, and `{kind: "mindmap", id: ""}` would send Firestore to look
+ * up the empty document id.
+ *
+ * Mirrors `parseRoom` in `lib/rules/workspace/collabRoom.ts`.
+ */
+function parseRoom(room) {
+  const name = String(room || "");
+  for (const [kind, cfg] of Object.entries(KINDS)) {
+    if (!cfg.prefix) continue;
+    if (name.startsWith(cfg.prefix)) {
+      const id = name.slice(cfg.prefix.length);
+      return id ? { kind, id } : null;
+    }
+  }
+  return name ? { kind: "document", id: name } : null;
+}
+
+/**
+ * Whether this Firebase user may open this record.
  *
  * Resolved through `cowork_employees`, because `memberIds` holds employee ids
  * (`GR0067`) and a Firebase token carries a uid. The two stores are joined by
  * that lookup and by nothing else — the same seam every other Cowork read uses.
  */
-async function mayOpen(decoded, documentId) {
-  if (!documentId) return null;
-  const snap = await db.collection(DOC_COLLECTION).doc(documentId).get();
+async function mayOpen(decoded, room) {
+  if (!room) return null;
+  const cfg = KINDS[room.kind];
+  if (!cfg) return null;
+  const snap = await db.collection(cfg.records).doc(room.id).get();
   if (!snap.exists) return null;
   const doc = snap.data();
   if (doc.deletedAt) return null;
@@ -140,9 +198,11 @@ async function employeeIdOf(decoded) {
   return null;
 }
 
-/** The stored state for a document, or null. */
-async function loadState(documentId) {
-  const snap = await db.collection(BODY_COLLECTION).doc(documentId).get();
+/** The stored state for a record, or null. */
+async function loadState(room) {
+  const cfg = KINDS[room.kind];
+  if (!cfg) return null;
+  const snap = await db.collection(cfg.bodies).doc(room.id).get();
   if (!snap.exists) return null;
   const raw = snap.data();
   if (typeof raw.ydocState !== "string" || !raw.ydocState) return null;
@@ -156,13 +216,18 @@ async function loadState(documentId) {
 /**
  * Write the state.
  *
- * `merge: true` and the HTML is left alone: this server does not render prose,
- * and overwriting `html` with nothing would empty the list preview and the
- * document itself for anybody reading it without a live session.
+ * `merge: true`, and the PROJECTION beside it is left alone. This server does
+ * not render prose and does not lay out a card tree; the browser writes those.
+ * Overwriting a document's `html` with nothing would empty the list preview and
+ * the document itself for anybody reading it without a live session, and
+ * overwriting a mindmap's `nodes` would leave a map that draws nothing — the
+ * REST read (`GET /mindmaps/:id`) returns `nodes`, not the CRDT.
  */
-async function saveState(documentId, ydoc) {
+async function saveState(room, ydoc) {
+  const cfg = KINDS[room.kind];
+  if (!cfg) return;
   const state = Buffer.from(Y.encodeStateAsUpdate(ydoc)).toString("base64");
-  await db.collection(BODY_COLLECTION).doc(documentId).set(
+  await db.collection(cfg.bodies).doc(room.id).set(
     {
       ydocState: state,
       updatedAt: new Date().toISOString(),
@@ -170,8 +235,8 @@ async function saveState(documentId, ydoc) {
     { merge: true },
   );
   await db
-    .collection(DOC_COLLECTION)
-    .doc(documentId)
+    .collection(cfg.records)
+    .doc(room.id)
     .update({ updatedAt: new Date().toISOString() })
     .catch(() => {
       /* The record may have been deleted mid-session. The body write above is
@@ -179,15 +244,22 @@ async function saveState(documentId, ydoc) {
     });
 }
 
-function scheduleSave(documentId, ydoc) {
-  const existing = pendingSaves.get(documentId);
+/**
+ * Debounce a save, keyed by the FULL room name rather than the bare id.
+ *
+ * A document and a mindmap can hold the same id — Firestore ids are unique per
+ * collection, not across them — and keying on the id alone would let one room's
+ * pending save cancel the other's.
+ */
+function scheduleSave(roomName, room, ydoc) {
+  const existing = pendingSaves.get(roomName);
   if (existing) clearTimeout(existing);
   pendingSaves.set(
-    documentId,
+    roomName,
     setTimeout(() => {
-      pendingSaves.delete(documentId);
-      saveState(documentId, ydoc).catch((e) =>
-        console.error("[docs] save failed", documentId, e.message),
+      pendingSaves.delete(roomName);
+      saveState(room, ydoc).catch((e) =>
+        console.error("[collab] save failed", roomName, e.message),
       );
     }, SAVE_DEBOUNCE_MS),
   );
@@ -200,34 +272,62 @@ function scheduleSave(documentId, ydoc) {
  * and touches neither of the two existing `io.on("connection")` handlers.
  */
 function initDocumentCollaboration(io) {
+  /* YSocketIO owns the `/yjs|<room>` namespace and all of the Yjs sync. Create
+     it FIRST, then hang our auth off ITS namespace (`ysocketio.nsp`). */
+  const ysocketio = new YSocketIO(io, { gcEnabled: true });
+  ysocketio.initialize();
+
   /**
-   * Authentication, as our OWN namespace middleware.
+   * Authentication, as middleware on YSocketIO's OWN namespace.
    *
    * NOT `YSocketIO`'s `authenticate` option: that callback is handed only the
    * handshake, and the handshake does not carry the namespace — so there is no
-   * way from inside it to learn WHICH document is being joined. The first
-   * version read `handshake.query.name`, which is never set, so every
-   * connection was refused and the editor silently fell back to single-writer.
-   *
-   * Registered before `initialize()` so it runs first, and it takes the whole
-   * socket — `socket.nsp.name` is the room, from the server's own routing
+   * way from inside it to learn WHICH document is being joined. This takes the
+   * whole socket — `socket.nsp.name` is the room, from the server's own routing
    * rather than from anything the client claims.
+   *
+   * **Why `ysocketio.nsp.use`, and NOT a second `io.of(/^\/yjs\|.*$/)`.** The
+   * previous version registered auth on a separately-created parent namespace
+   * with the same pattern. Socket.IO does not dedupe parent namespaces by
+   * pattern — every `io.of(regex)` is a distinct one — and a connecting client
+   * is routed to the FIRST parent namespace whose pattern matches (`Server.
+   * _checkNamespace`, in insertion order). Registering auth before
+   * `initialize()` therefore placed a namespace carrying the auth middleware but
+   * NO sync handler ahead of YSocketIO's: every `/yjs|*` socket connected,
+   * passed auth and reported itself "live" — then never synced, because the
+   * handler that relays updates and awareness lived on the shadowed second
+   * namespace and never saw the connection. Attaching to `ysocketio.nsp` puts
+   * auth and sync on the one namespace the client actually reaches.
+   *
+   * It runs before any document bytes leave the server: state is emitted from
+   * the namespace's `connection` handler (`startSynchronization`), which fires
+   * only once every middleware — this one included — has called `next()`, so a
+   * refused socket never receives the document.
    */
-  io.of(/^\/yjs\|.*$/).use(async (socket, next) => {
+  ysocketio.nsp.use(async (socket, next) => {
     try {
-      const documentId = documentIdOf(socket.nsp && socket.nsp.name);
-      if (!documentId) return next(new Error("Unauthorized: no document"));
+      const roomName = roomNameOf(socket.nsp && socket.nsp.name);
+      const room = parseRoom(roomName);
+      if (!room) return next(new Error("Unauthorized: no document"));
 
       const decoded = await identify(socket.handshake);
       if (!decoded) return next(new Error("Unauthorized: sign in again"));
 
-      const allowed = await mayOpen(decoded, documentId);
-      if (!allowed) return next(new Error("Unauthorized: not in this document"));
+      const allowed = await mayOpen(decoded, room);
+      if (!allowed)
+        return next(
+          new Error(
+            room.kind === "mindmap"
+              ? "Unauthorized: not in this mindmap"
+              : "Unauthorized: not in this document",
+          ),
+        );
 
       /* Carried so the rest of the session knows who this is without a second
          directory lookup per event. */
       socket.data.employeeId = allowed.employeeId;
-      socket.data.documentId = documentId;
+      socket.data.room = room;
+      socket.data.documentId = room.id;
       socket.data.role = allowed.role;
 
       /**
@@ -241,10 +341,17 @@ function initDocumentCollaboration(io) {
        * over your shoulder" legible rather than invisible.
        */
       if (!MAY_WRITE.has(allowed.role)) {
+        const refusal =
+          room.kind === "mindmap"
+            ? /* The engine's wording for the same refusal, matching
+                 `editRefusal` in `lib/rules/mindmap/access.ts` and the REST
+                 route — one rule must not be described three ways. */
+              "You can view this mindmap but not change it."
+            : "You have view access to this document.";
         socket.use((packet, allow) => {
           const event = Array.isArray(packet) ? String(packet[0] || "") : "";
           if (event === "sync-update" || event === "sync-step-2") {
-            return allow(new Error("You have view access to this document."));
+            return allow(new Error(refusal));
           }
           return allow();
         });
@@ -257,46 +364,54 @@ function initDocumentCollaboration(io) {
     }
   });
 
-  const ysocketio = new YSocketIO(io, { gcEnabled: true });
-
-  ysocketio.initialize();
-
   /* Seed a freshly-opened room from Firestore. Without this the first client to
      connect after a restart starts from an EMPTY document and its first edit
      would propagate that emptiness as the new truth. */
   ysocketio.on("document-loaded", async (doc) => {
-    const documentId = doc.name;
+    const roomName = doc.name;
+    const room = parseRoom(roomName);
+    if (!room) return;
     try {
-      const state = await loadState(documentId);
+      const state = await loadState(room);
       if (state && state.length) Y.applyUpdate(doc, new Uint8Array(state));
-      console.log(`[docs] room ready ${documentId} (${state ? "restored" : "new"})`);
+      console.log(`[collab] room ready ${roomName} (${state ? "restored" : "new"})`);
     } catch (e) {
-      console.error("[docs] load failed", documentId, e.message);
+      console.error("[collab] load failed", roomName, e.message);
     }
   });
 
-  ysocketio.on("document-update", (doc) => scheduleSave(doc.name, doc));
+  ysocketio.on("document-update", (doc) => {
+    const room = parseRoom(doc.name);
+    if (room) scheduleSave(doc.name, room, doc);
+  });
 
   /* The last person left. Saved immediately rather than on the debounce: the
      in-memory document is about to be discarded, and a pending timer would be
      racing its destruction. */
   ysocketio.on("all-document-connections-closed", async (doc) => {
-    const documentId = doc.name;
-    const pending = pendingSaves.get(documentId);
+    const roomName = doc.name;
+    const room = parseRoom(roomName);
+    if (!room) return;
+    const pending = pendingSaves.get(roomName);
     if (pending) {
       clearTimeout(pending);
-      pendingSaves.delete(documentId);
+      pendingSaves.delete(roomName);
     }
     try {
-      await saveState(documentId, doc);
-      console.log(`[docs] room closed and saved ${documentId}`);
+      await saveState(room, doc);
+      console.log(`[collab] room closed and saved ${roomName}`);
     } catch (e) {
-      console.error("[docs] final save failed", documentId, e.message);
+      console.error("[collab] final save failed", roomName, e.message);
     }
   });
 
-  console.log("✅ Document collaboration namespace ready (/yjs|<documentId>)");
+  console.log(
+    "✅ Collaboration namespace ready (/yjs|<documentId> and /yjs|mindmap:<id>)",
+  );
   return ysocketio;
 }
 
-module.exports = { initDocumentCollaboration };
+/* `parseRoom` and `KINDS` are exported for the parity check: they have to agree
+   with `lib/rules/workspace/collabRoom.ts` in the Cowork client, and a mismatch
+   is silent — the browser opens a room this server declines to authorise. */
+module.exports = { initDocumentCollaboration, parseRoom, KINDS };
