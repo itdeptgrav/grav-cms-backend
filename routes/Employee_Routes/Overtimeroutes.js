@@ -2,7 +2,8 @@
 //
 // COMPLETE FIXES:
 //   1. Uses pushToken (not expoPushToken).
-//   2. Notifications routed through utils/sendExpoPush.js + sendWebPush.js.
+//   2. Notifications routed through utils/notifyEmployee.js (mobile + web in
+//      one call). sendWebPush is NOT used here — it double-notified web users.
 //   3. IST date helpers used everywhere.
 //   4. Threshold-based stay-over detection.
 //   5. Cron runs only 6:30 PM – 11:30 PM IST.
@@ -29,31 +30,21 @@ const OvertimeReport = require("../../models/HR_Models/OvertimeReport");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 const {
-  sendExpoPush,
   dateStrIST,
   minsSinceMidnightIST,
 } = require("../../utils/sendExpoPush");
-
-// ── Web push helper (best-effort, never throws) ────────────────────────────
-async function sendWebPushSafely(
-  employeeIds,
-  { title, body, type, url, extra },
-) {
-  try {
-    const { sendWebPushToMany } = require("../../utils/sendWebPush");
-    const ids = Array.isArray(employeeIds) ? employeeIds : [employeeIds];
-    await sendWebPushToMany({
-      employeeIds: ids.map((id) => String(id)).filter(Boolean),
-      title,
-      body,
-      type,
-      url,
-      extra,
-    });
-  } catch (e) {
-    console.warn("[OT-WEBPUSH]", e.message);
-  }
-}
+// Notifications go through utils/notifyEmployee.js, which already fans out to
+// BOTH the Expo native token and the FCM web token in a single call.
+//
+// The old `sendWebPushSafely` helper that used to live here has been removed:
+// paired with sendExpoPush it hit the same fcmToken twice, so every web user
+// got each overtime notification two times.
+const {
+  notifyOvertimeSubmitted,
+  notifyOvertimeApproved,
+  notifyOvertimeRejected,
+  notifyOvertimeReminder,
+} = require("../../utils/notifyEmployee");
 
 const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
@@ -374,24 +365,13 @@ router.post(
         .map((m) => m.managerId)
         .filter(Boolean);
       if (managerIds.length > 0) {
-        const hours = Math.floor(stayOver.stayOverMins / 60);
-        const mins = stayOver.stayOverMins % 60;
-        await sendExpoPush(managerIds, {
-          title: "Overtime Report Submitted",
-          body: `${report.employeeName} stayed late on ${dateStr} (${hours}h ${mins}m extra). Review and approve for ${stayOver.graceMinutes}min grace.`,
-          data: {
-            type: "overtime_report",
-            reportId: report._id.toString(),
-            screen: "Overtime",
-          },
-          channelId: "general",
-        });
-        await sendWebPushSafely(managerIds, {
-          title: "Overtime Report Submitted",
-          body: `${report.employeeName} stayed late on ${dateStr} (${hours}h ${mins}m extra). Review and approve for ${stayOver.graceMinutes}min grace.`,
-          type: "overtime_required",
-          url: "/overtime",
-          extra: { reportId: String(report._id) },
+        // O1 — managers. Fire-and-forget; the response no longer waits on it.
+        notifyOvertimeSubmitted(managerIds, {
+          employeeName: report.employeeName,
+          dateStr,
+          stayOverMins: stayOver.stayOverMins,
+          graceMinutes: stayOver.graceMinutes,
+          reportId: report._id,
         });
 
         report.notificationSentToManager = true;
@@ -535,26 +515,12 @@ router.patch(
         }
       } catch (_) {}
 
-      await sendExpoPush(report.employeeId, {
-        title: "Overtime Approved ✓",
+      // O2 — employee. Fire-and-forget.
+      notifyOvertimeApproved(report.employeeId, {
         body: report.graceApplied
           ? `${report.graceMinutes}min grace applied for ${report.nextDateStr}. You're marked Present.`
           : `Your overtime report for ${report.dateStr} was approved by ${mgrName}.`,
-        data: {
-          type: "overtime_approved",
-          reportId: report._id.toString(),
-          screen: "Overtime",
-        },
-        channelId: "general",
-      });
-      await sendWebPushSafely(report.employeeId, {
-        title: "Overtime Approved ✓",
-        body: report.graceApplied
-          ? `${report.graceMinutes}min grace applied for ${report.nextDateStr}. You're marked Present.`
-          : `Your overtime report for ${report.dateStr} was approved by ${mgrName}.`,
-        type: "overtime_approved",
-        url: "/overtime",
-        extra: { reportId: String(report._id) },
+        reportId: report._id,
       });
 
       res.json({
@@ -609,22 +575,10 @@ router.patch(
         }
       } catch (_) {}
 
-      await sendExpoPush(report.employeeId, {
-        title: "Overtime Report Rejected",
-        body: `Your overtime report for ${report.dateStr} was rejected by ${mgrName}.${report.rejectionReason ? ` Reason: ${report.rejectionReason}` : ""}`,
-        data: {
-          type: "overtime_rejected",
-          reportId: report._id.toString(),
-          screen: "Overtime",
-        },
-        channelId: "general",
-      });
-      await sendWebPushSafely(report.employeeId, {
-        title: "Overtime Report Rejected",
-        body: `Your overtime report for ${report.dateStr} was rejected by ${mgrName}.${report.rejectionReason ? ` Reason: ${report.rejectionReason}` : ""}`,
-        type: "overtime_rejected",
-        url: "/overtime",
-        extra: { reportId: String(report._id) },
+      // O3 — employee. Fire-and-forget.
+      notifyOvertimeRejected(report.employeeId, {
+        body: `Your overtime report for ${report.dateStr} was not approved by ${mgrName}.${report.rejectionReason ? ` Reason: ${report.rejectionReason}` : ""}`,
+        reportId: report._id,
       });
 
       res.json({ success: true, data: report, message: "Rejected" });
@@ -718,26 +672,20 @@ async function detectAndNotifyStayOvers(dateStr, io) {
       // We hold the lock. Send the push.
       const outTime = `${String(Math.floor(outMins / 60)).padStart(2, "0")}:${String(outMins % 60).padStart(2, "0")}`;
       try {
-        const result = await sendExpoPush(emp._id, {
-          title: "⚠️ Overtime Report Pending",
-          body: `You stayed until ${outTime} on ${dateStr}. Submit your OT report to get grace time tomorrow.`,
-          data: {
-            type: "overtime_required",
-            dateStr,
-            screen: "Overtime",
-          },
-          channelId: "general",
-          categoryId: "overtime",
-        });
-        await sendWebPushSafely(emp._id, {
-          title: "⚠️ Overtime Report Pending",
-          body: `You stayed until ${outTime} on ${dateStr}. Submit your OT report to get grace time tomorrow.`,
-          type: "overtime_required",
-          url: "/overtime",
-          extra: { dateStr },
+        // O4 — awaited on purpose: this runs in a cron, outside any request,
+        // and the counter below needs the real send result.
+        //
+        // Two fixes here. The old call passed `categoryId: "overtime"`, which
+        // is not a category the app registers, so the notification rendered
+        // with no action buttons. And it tested `result.queued`, but the
+        // return shape is `{ mobile: { queued } }` — always undefined, so
+        // `notified` never incremented and the socket emit below never ran.
+        const result = await notifyOvertimeReminder(emp._id, {
+          outTime,
+          dateStr,
         });
 
-        if (result.queued > 0) {
+        if (result.mobile.queued > 0 || result.web.sent > 0) {
           notified++;
           if (io) {
             io.to(String(emp._id)).emit("overtime_notification", {
