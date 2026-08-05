@@ -89,7 +89,7 @@ function _breakOverlapSecs(startMs, endMs, dateStr, breaks) {
     return Math.round(overlapMs / 1000);
 }
 
-function _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMs) {
+function _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMs, breakAllowanceMins) {
     const officeStartMs = Date.parse(`${dateStr}T${dayCfg.inTime}:00+05:30`);
     const officeEndMs = Date.parse(`${dateStr}T${dayCfg.outTime}:00+05:30`);
     // Window starts at actual login — never before office start (early login
@@ -101,7 +101,17 @@ function _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMs) {
         : officeStartMs;
     const spanHrs = Math.max(0, (officeEndMs - windowStartMs) / 3600000);
     const breakHrs = _breakOverlapSecs(windowStartMs, officeEndMs, dateStr, breaks) / 3600;
-    return Math.max(0, spanHrs - breakHrs);
+    // The daily break allowance (cowork_settings/office maxBreakMinutesPerDay)
+    // comes off too. It is the personal break time everyone is entitled to
+    // take, so it is time nobody can have a task timer running for, and a
+    // target that ignores it demands hours the policy itself gives away.
+    //
+    // This is NOT the same subtraction as `breaks` above and does not double
+    // count with it: `breaks` are fixed hours the whole office is closed for,
+    // the allowance is personal time taken whenever the person takes it. A
+    // deployment that configures both means both apply.
+    const allowanceHrs = Math.max(0, Number(breakAllowanceMins) || 0) / 60;
+    return Math.max(0, spanHrs - breakHrs - allowanceHrs);
 }
 
 /**
@@ -151,6 +161,12 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
         const officeSnap = await db.collection("cowork_settings").doc("office").get();
         const schedule = officeSnap.exists ? officeSnap.data().schedule : null;
         const breaks = officeSnap.exists ? (officeSnap.data().breaks || []) : [];
+        // Same document, same read — the daily break allowance, which comes off
+        // the target alongside the recurring breaks. 60 is the fallback the rest
+        // of the app already uses for this field (getMaxBreakSecs).
+        const breakAllowanceMins = officeSnap.exists
+            ? (parseFloat(officeSnap.data().maxBreakMinutesPerDay) || 60)
+            : 60;
 
         // ── 3. Load employee — biometricId, NOT the virtual employeeId ─────
         const emp = await Employee.findOne({ biometricId: employeeId });
@@ -321,7 +337,7 @@ async function evaluateTimerSop(employeeId, employeeName, opts = {}) {
             const afterHrs = (afterSecsByDate[dateStr] || 0) / 3600;
 
             const effectiveMinHrs = dailyMinPct > 0
-                ? (dailyMinPct / 100) * _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMsByDate[dateStr])
+                ? (dailyMinPct / 100) * _expectedHrsForDay(dateStr, dayCfg, breaks, firstStartMsByDate[dateStr], breakAllowanceMins)
                 : dailyMinHrs;
 
             const rawShortfallHrs = Math.max(0, effectiveMinHrs - workedHrs);

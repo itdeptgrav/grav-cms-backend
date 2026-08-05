@@ -70,3 +70,4 @@ coverage/
 # ===============================
 .env.docker
 docker-compose.override.yml
+.env.bak-lan

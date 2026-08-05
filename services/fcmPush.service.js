@@ -23,7 +23,20 @@ const webpush = require("web-push");
 // service. Preferring the same variable keeps the two in agreement.
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
-const VAPID_EMAIL = process.env.VAPID_EMAIL || "mailto:rakesh.biswal@grav.in";
+// `VAPID_SUBJECT` first, and for the same reason the public key above prefers
+// `VAPID_PUBLIC_KEY`: `web-push` is a singleton shared with
+// NotificationService.js, so whichever file calls `setVapidDetails` last decides
+// the `sub` claim for BOTH. That file reads `VAPID_SUBJECT`; this one read
+// `VAPID_EMAIL`, and the deployment sets the two to DIFFERENT addresses
+// (`mailto:itdeptgrav@gmail.com` vs `mailto:hr@grav.in`) — so which one every
+// push was signed with depended on module load order, and nothing in either
+// file said so.
+//
+// `VAPID_EMAIL` is still honoured, so a deployment that only sets that keeps
+// working. The hard-coded fallback is last and is a personal address; it exists
+// only so an unconfigured dev box does not crash, and it should never be what a
+// deployment actually signs with.
+const VAPID_EMAIL = process.env.VAPID_SUBJECT || process.env.VAPID_EMAIL || "mailto:rakesh.biswal@grav.in";
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
     webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
@@ -34,7 +47,10 @@ async function sendIOSWebPush(subscriptionJSON, title, body, data = {}) {
         const subscription = typeof subscriptionJSON === "string"
             ? JSON.parse(subscriptionJSON) : subscriptionJSON;
         const payload = JSON.stringify({ title, body, data });
-        await webpush.sendNotification(subscription, payload);
+        // Stated rather than left to the library's own default of four weeks,
+        // so an iPhone holds a notification for the same day the other
+        // platforms do instead of surfacing one from last month.
+        await webpush.sendNotification(subscription, payload, { TTL: 24 * 60 * 60 });
         console.log("[WebPush] ✓ iOS push sent");
         return true;
     } catch (e) {
@@ -123,6 +139,30 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
         if (!fcmTokens.length) return;
         console.log(`[FCM] Sending to ${fcmTokens.length} FCM token(s) total`);
 
+        // ── How long a push may wait for a device that is not reachable ──────
+        //
+        // Was 0 everywhere, meaning "deliver this instant or throw it away".
+        // A phone that was asleep, offline or out of coverage at the moment of
+        // sending never received that notification — not late, never. For a
+        // task reassignment, a deadline decision or a score deduction that is
+        // the wrong trade: those are worth reading an hour later.
+        //
+        // **Three different units, which is why this is computed once here
+        // rather than written inline three times.**
+        //   · Web Push  `TTL`             — seconds, as a string
+        //   · APNs      `apns-expiration` — an ABSOLUTE unix timestamp in
+        //                                   seconds, not a duration. 0 is the
+        //                                   special value meaning "do not
+        //                                   store", which is what made this
+        //                                   drop.
+        //   · Android   `ttl`             — MILLIseconds (firebase-admin's
+        //                                   AndroidConfig), not seconds.
+        //
+        // `Urgency: "high"` and `priority: "high"` are untouched: they govern
+        // how promptly a reachable device is woken, which was never the
+        // problem. This changes only what happens to an UNreachable one.
+        const PUSH_TTL_SECS = 24 * 60 * 60;
+
         const message = {
             // Data-only payload — service worker (onBackgroundMessage) controls display
             // This prevents Chrome from auto-showing AND onBackgroundMessage double-firing
@@ -130,7 +170,7 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
 
             // ── Web Push (Chrome, Firefox, Edge, desktop) ──
             webpush: {
-                headers: { Urgency: "high", TTL: "0" },
+                headers: { Urgency: "high", TTL: String(PUSH_TTL_SECS) },
                 notification: {
                     title,
                     body,
@@ -150,7 +190,10 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
                 headers: {
                     "apns-priority": "10",
                     "apns-push-type": "alert",
-                    "apns-expiration": "0",
+                    // Absolute, not a duration — see PUSH_TTL_SECS above.
+                    "apns-expiration": String(
+                        Math.floor(Date.now() / 1000) + PUSH_TTL_SECS,
+                    ),
                 },
                 payload: {
                     aps: {
@@ -167,7 +210,7 @@ async function sendPushToEmployees(recipientIds, title, body, data = {}) {
             // ── Android (high priority for MIUI, OnePlus, Xiaomi etc.) ──
             android: {
                 priority: "high",
-                ttl: 0, // 0 = deliver NOW or drop — no queuing delay
+                ttl: PUSH_TTL_SECS * 1000, // MILLIseconds here — see above
                 notification: {
                     title,
                     body,
