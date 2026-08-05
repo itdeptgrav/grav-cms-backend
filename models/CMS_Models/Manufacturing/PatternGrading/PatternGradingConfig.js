@@ -146,6 +146,16 @@ const measureGroupSchema = new mongoose.Schema(
       enum: ["keyframe", "rule"],
       default: "keyframe",
     },
+    // How this group's distance is measured/drawn between its two ref nodes.
+    // "auto" keeps the engine's own geometry-based choice; "curve" always
+    // follows the path's own arc (necklines, armholes); "straight" always
+    // measures point-to-point. No single geometric rule suits both, so the
+    // designer states the intent per group.
+    measureMode: {
+      type: String,
+      enum: ["auto", "curve", "straight"],
+      default: "auto",
+    },
     ruleProfile: ruleProfileSchema,
     nestedConditions: { type: [nestedConditionSchema], default: [] },
     loosingEnabled: { type: Boolean, default: false },
