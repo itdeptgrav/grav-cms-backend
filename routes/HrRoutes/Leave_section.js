@@ -14,6 +14,18 @@ const {
 const multer = require("multer");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
 const emailService = require("../../services/emailService");
+// Push notifications — fans out to the mobile app (Expo) and the CMS (FCM) in
+// one call. Fire-and-forget: never awaited, never able to fail a request.
+const {
+  notifyLeaveApproved,
+  notifyLeaveRejected,
+} = require("../../utils/notifyEmployee");
+
+// Days already committed by applications that are filed but not yet approved.
+// Derived on every read, never stored — see utils/leaveReserve.js for why a
+// stateful reserve would have to be refunded on six paths that need no code
+// today. HR sees exactly the number the employee's own app screen sees.
+const { computeReserved } = require("../../utils/leaveReserve");
 
 // Import attendance sync helpers
 const Attendance_section = require("./Attendance_section");
@@ -204,6 +216,12 @@ async function finaliseApproval(app, approverId, remarks = "", approverName = ""
   } catch (e) {
     console.warn("[APPROVE] attendance sync failed:", e.message);
   }
+
+  // L5 / L7 — tell the employee. This is the single funnel for BOTH the
+  // single HR approve (PATCH /:id/approve) and the bulk approve
+  // (PATCH /bulk-approve), so neither can be silent. Fire-and-forget.
+  notifyLeaveApproved(app);
+
   return attendanceResult;
 }
 
@@ -1110,7 +1128,21 @@ router.get(
         CO: 999,
         WFH: 999,
       };
-      res.json({ success: true, data: { ...bal, available } });
+      // `available` keeps its exact meaning — entitlement minus APPROVED days.
+      // Payroll and the apply-time paid/LWP split both read that number, so
+      // deflating it here would cut pay for a leave that was merely requested.
+      // `reserved` is additive disclosure: what is already spoken for by
+      // pending / manager_approved applications.
+      const reserved = await computeReserved(req.params.employeeId, year);
+      const effectiveAvailable = {
+        CL: Math.max(0, available.CL - reserved.CL),
+        SL: Math.max(0, available.SL - reserved.SL),
+        PL: Math.max(0, available.PL - reserved.PL),
+      };
+      res.json({
+        success: true,
+        data: { ...bal, available, reserved, effectiveAvailable },
+      });
     } catch (e) {
       res.status(500).json({ success: false, message: e.message });
     }
@@ -1363,26 +1395,28 @@ router.get("/:id", EmployeeAuthMiddleware, async (req, res) => {
       employeeId: empId,
       year,
     }).lean();
-    const employeeBalance = rawBal
-      ? {
-          entitlement: rawBal.entitlement,
-          consumed: rawBal.consumed,
-          available: {
-            CL: Math.max(
-              0,
-              (rawBal.entitlement.CL || 0) - (rawBal.consumed.CL || 0),
-            ),
-            SL: Math.max(
-              0,
-              (rawBal.entitlement.SL || 0) - (rawBal.consumed.SL || 0),
-            ),
-            PL: Math.max(
-              0,
-              (rawBal.entitlement.PL || 0) - (rawBal.consumed.PL || 0),
-            ),
-          },
-        }
-      : null;
+    let employeeBalance = null;
+    if (rawBal) {
+      const available = {
+        CL: Math.max(0, (rawBal.entitlement.CL || 0) - (rawBal.consumed.CL || 0)),
+        SL: Math.max(0, (rawBal.entitlement.SL || 0) - (rawBal.consumed.SL || 0)),
+        PL: Math.max(0, (rawBal.entitlement.PL || 0) - (rawBal.consumed.PL || 0)),
+      };
+      // Additive only. `available` is unchanged — see the note on
+      // /employee-balance/:employeeId above.
+      const reserved = await computeReserved(empId, year);
+      employeeBalance = {
+        entitlement: rawBal.entitlement,
+        consumed: rawBal.consumed,
+        available,
+        reserved,
+        effectiveAvailable: {
+          CL: Math.max(0, available.CL - reserved.CL),
+          SL: Math.max(0, available.SL - reserved.SL),
+          PL: Math.max(0, available.PL - reserved.PL),
+        },
+      };
+    }
 
     res.json({ success: true, data: { ...app, employeeBalance } });
   } catch (err) {
@@ -1461,6 +1495,9 @@ router.patch("/:id/reject", EmployeeAuthMiddleware, async (req, res) => {
     app.rejectedAt = new Date();
     app.rejectionReason = req.body?.rejectionReason || "";
     await app.save();
+
+    // L6 — push to the employee (mobile + web). Fire-and-forget.
+    notifyLeaveRejected(app, app.rejectionReason);
 
     // Notify employee via email (non-fatal)
     try {
@@ -1662,48 +1699,11 @@ router.patch(
   },
 );
 
-// ─── Email helpers (preserved from original) ──────────────────────────────────
-async function _notifyEmployeeApproved(app) {
-  try {
-    const emp = await Employee.findById(app.employeeId).select("email").lean();
-    if (emp?.email) {
-      emailService
-        .sendLeaveApprovedToEmployee({
-          employeeEmail: emp.email,
-          employeeName: app.employeeName,
-          leaveType: app.leaveType,
-          fromDate: app.fromDate,
-          toDate: app.toDate,
-          totalDays: app.totalDays,
-          isHalfDay: app.isHalfDay,
-          approvedBy: app.hrApprovedByName || "HR",
-        })
-        .catch((e) => console.warn("[HR-APPROVE-EMAIL]", e.message));
-    }
-  } catch (e) {
-    console.warn("[HR-APPROVE-EMAIL]", e.message);
-  }
-}
-
-async function _notifyEmployeeRejected(app, rejectionReason) {
-  try {
-    const emp = await Employee.findById(app.employeeId).select("email").lean();
-    if (emp?.email) {
-      emailService
-        .sendLeaveRejectedToEmployee({
-          employeeEmail: emp.email,
-          employeeName: app.employeeName,
-          leaveType: app.leaveType,
-          fromDate: app.fromDate,
-          toDate: app.toDate,
-          totalDays: app.totalDays,
-          reason: rejectionReason || app.rejectionReason || "Not approved",
-        })
-        .catch((e) => console.warn("[HR-REJECT-EMAIL]", e.message));
-    }
-  } catch (e) {
-    console.warn("[HR-REJECT-EMAIL]", e.message);
-  }
-}
+// NOTE: `_notifyEmployeeApproved` / `_notifyEmployeeRejected` used to live here.
+// Both were dead code — zero call sites repo-wide — and sent email only, which
+// is why HR decisions never reached anyone's phone. Employee notification now
+// happens inline: `notifyLeaveApproved` inside finaliseApproval (covers both
+// single and bulk approve) and `notifyLeaveRejected` in PATCH /:id/reject.
+// The rejection email is still sent inline in that same route.
 
 module.exports = router;

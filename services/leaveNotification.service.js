@@ -1,190 +1,99 @@
 /**
  * services/leaveNotification.service.js
- * Push notification handlers for leave events.
- * Sends FCM web push (background/foreground) to employees and managers.
+ *
+ * DEPRECATED COMPATIBILITY SHIM.
+ *
+ * This file used to send web-only pushes via utils/sendWebPush.js, which is why
+ * leave notifications never reached the mobile app. All four helpers now
+ * delegate to utils/notifyEmployee.js, which fans out to BOTH the Expo native
+ * token and the FCM web token in a single call.
+ *
+ * New code should require utils/notifyEmployee directly:
+ *
+ *   const { notifyLeaveApproved } = require("../utils/notifyEmployee");
+ *
+ * These wrappers exist only so that any caller still on the old names keeps
+ * working — and, critically, stops double-notifying web users. Do NOT add
+ * sendWebPush back here.
+ *
+ * Two historical bugs are fixed by the delegation:
+ *   • notifySecondaryOnPrimaryApproval was declared (employee, application) but
+ *     called with one argument, so `application` was always undefined. It now
+ *     accepts the application as its first argument (and still tolerates the
+ *     old two-argument order).
+ *   • It also filtered managersNotified on `m.status === "pending"`, a field
+ *     that does not exist on the schema, so it always matched zero managers.
+ *     The secondary is now resolved by `m.type === "secondary"`.
  */
 
-const Employee = require("../models/Employee");
-const { sendWebPush, sendWebPushToMany } = require("../utils/sendWebPush");
+"use strict";
 
-/**
- * Notify manager(s) when an employee applies for leave.
- */
+const {
+  notifyLeaveApplied,
+  notifyLeaveSecondaryPending,
+  notifyLeaveApproved,
+  notifyLeaveRejected,
+  notifyLeaveWithdrawn,
+  notifyLeaveEdited,
+  notifyLeaveWithdrawRequested,
+} = require("../utils/notifyEmployee");
+
+/** Employee applied → primary manager. */
 async function notifyManagerOnLeaveApply(employee, application) {
-  try {
-    const managersNotified = application.managersNotified || [];
-    if (!managersNotified.length) return;
-
-    const managerIds = managersNotified.map((m) => m.managerId).filter(Boolean);
-    if (!managerIds.length) return;
-
-    const empName = `${employee.firstName} ${employee.lastName || ""}`.trim();
-    const fromDate = application.fromDate
-      ? new Date(application.fromDate).toLocaleDateString("en-IN", {
-          day: "2-digit",
-          month: "short",
-        })
-      : "—";
-    const toDate = application.toDate
-      ? new Date(application.toDate).toLocaleDateString("en-IN", {
-          day: "2-digit",
-          month: "short",
-        })
-      : "—";
-
-    await sendWebPushToMany({
-      employeeIds: managerIds,
-      title: "🏖️ Leave Application",
-      body: `${empName} has applied for ${application.leaveType || "leave"} from ${fromDate} to ${toDate}.`,
-      type: "leave_applied",
-      url: "/leave",
-      extra: {
-        leaveId: String(application._id || ""),
-        applicantId: String(employee._id || ""),
-      },
-    });
-  } catch (e) {
-    console.error("[LEAVE-NOTIF] notifyManagerOnLeaveApply error:", e.message);
-  }
+  notifyLeaveApplied(application, employee);
 }
 
 /**
- * Notify secondary approver when primary approves (multi-level approval).
+ * Primary approved and a secondary exists → secondary manager.
+ * Accepts (application, primaryManagerName) or the legacy (employee, application).
  */
-async function notifySecondaryOnPrimaryApproval(employee, application) {
-  try {
-    const managersNotified = application.managersNotified || [];
-    // Find managers who haven't approved yet
-    const pendingManagers = managersNotified
-      .filter((m) => m.status === "pending")
-      .map((m) => m.managerId)
-      .filter(Boolean);
-
-    if (!pendingManagers.length) return;
-
-    const empName = `${employee.firstName} ${employee.lastName || ""}`.trim();
-    await sendWebPushToMany({
-      employeeIds: pendingManagers,
-      title: "🏖️ Leave Pending Your Approval",
-      body: `${empName}'s leave application is awaiting your approval.`,
-      type: "leave_applied",
-      url: "/leave",
-    });
-  } catch (e) {
-    console.error(
-      "[LEAVE-NOTIF] notifySecondaryOnPrimaryApproval error:",
-      e.message,
-    );
-  }
+async function notifySecondaryOnPrimaryApproval(arg1, arg2) {
+  const isApplication = arg1 && (arg1.managersNotified || arg1.leaveType);
+  const application = isApplication ? arg1 : arg2;
+  const primaryName = isApplication && typeof arg2 === "string" ? arg2 : "";
+  notifyLeaveSecondaryPending(application, primaryName);
 }
 
 /**
- * Notify employee when their leave is approved or rejected.
- * action: "approved" | "rejected" | "withdrawn" | "cancelled"
+ * Decision → employee.
+ * Supports both historical signatures:
+ *   (employeeId, application, action, reason)
+ *   (application, action, reason)
+ * action: "approved" | "rejected" | "withdrawn" | "cancelled" | "edited"
  */
 async function notifyEmployeeOnLeaveAction(arg1, arg2, arg3, arg4) {
-  try {
-    // Support both signatures:
-    //   (employeeId, application, action, reason)  ← original
-    //   (application, action, managerName)         ← leaveRoutes.js style
-    let employeeId, application, action, reason;
-    if (typeof arg1 === "string" || (arg1 && arg1._bsontype)) {
-      // Called as (employeeId, application, action, reason)
-      employeeId = arg1;
-      application = arg2;
-      action = arg3;
-      reason = arg4;
-    } else {
-      // Called as (application, action, managerName)
-      application = arg1;
-      action = arg2;
-      reason = arg3; // managerName here is treated as reason
-      employeeId = application?.employeeId;
-    }
+  let application, action, reason;
+  if (typeof arg1 === "string" || (arg1 && arg1._bsontype)) {
+    application = arg2;
+    action = arg3;
+    reason = arg4;
+  } else {
+    application = arg1;
+    action = arg2;
+    reason = arg3;
+  }
+  if (!application) return;
 
-    if (!employeeId || !application) return;
-
-    const { sendWebPush } = require("../utils/sendWebPush");
-
-    const actionMap = {
-      approved: { emoji: "✅", verb: "approved", type: "leave_approved" },
-      rejected: { emoji: "❌", verb: "rejected", type: "leave_rejected" },
-      withdrawn: { emoji: "↩️", verb: "withdrawn", type: "leave_withdrawn" },
-      cancelled: { emoji: "🚫", verb: "cancelled", type: "leave_cancelled" },
-      edited: { emoji: "✏️", verb: "edited", type: "leave_applied" },
-    };
-    const { emoji, verb, type } = actionMap[action] || {
-      emoji: "📋",
-      verb: action,
-      type: "leave_applied",
-    };
-
-    const fromDate = application.fromDate
-      ? new Date(application.fromDate).toLocaleDateString("en-IN", {
-          day: "2-digit",
-          month: "short",
-        })
-      : "—";
-
-    let body = `Your ${application.leaveType || "leave"} from ${fromDate} has been ${verb}.`;
-    if (reason && action === "rejected") body += ` Reason: ${reason}`;
-    if (reason && action === "edited") body += ` By: ${reason}`;
-
-    await sendWebPush({
-      employeeId: String(employeeId),
-      title: `${emoji} Leave ${verb.charAt(0).toUpperCase() + verb.slice(1)}`,
-      body,
-      type,
-      url: "/leave",
-      extra: { leaveId: String(application._id || "") },
-    });
-  } catch (e) {
-    console.error(
-      "[LEAVE-NOTIF] notifyEmployeeOnLeaveAction error:",
-      e.message,
-    );
+  switch (action) {
+    case "approved":
+      return notifyLeaveApproved(application);
+    case "rejected":
+      return notifyLeaveRejected(application, reason);
+    case "withdrawn":
+    case "cancelled":
+      return notifyLeaveWithdrawn(application);
+    case "edited":
+      return notifyLeaveEdited(application, reason);
+    default:
+      return notifyLeaveApproved(application);
   }
 }
 
-// Also export a new function for withdraw-request → managers:
+/** Employee requested withdrawal of an approved leave → both managers. */
 async function notifyManagerOnWithdrawRequest(application) {
-  try {
-    const { sendWebPushToMany } = require("../utils/sendWebPush");
-    const managerIds = (application.managersNotified || [])
-      .map((m) => m.managerId)
-      .filter(Boolean);
-    if (!managerIds.length) return;
-
-    const fromDate = application.fromDate
-      ? new Date(application.fromDate).toLocaleDateString("en-IN", {
-          day: "2-digit",
-          month: "short",
-        })
-      : "—";
-    const toDate = application.toDate
-      ? new Date(application.toDate).toLocaleDateString("en-IN", {
-          day: "2-digit",
-          month: "short",
-        })
-      : "—";
-
-    await sendWebPushToMany({
-      employeeIds: managerIds,
-      title: "↩️ Leave Withdrawal Request",
-      body: `${application.employeeName || "An employee"} requested withdrawal of ${application.leaveType || "leave"} (${fromDate} → ${toDate}). Please review.`,
-      type: "leave_withdrawn",
-      url: "/leave",
-      extra: { leaveId: String(application._id || "") },
-    });
-  } catch (e) {
-    console.error(
-      "[LEAVE-NOTIF] notifyManagerOnWithdrawRequest error:",
-      e.message,
-    );
-  }
+  notifyLeaveWithdrawRequested(application);
 }
 
-// Update module.exports to include the new helper:
 module.exports = {
   notifyManagerOnLeaveApply,
   notifySecondaryOnPrimaryApproval,
