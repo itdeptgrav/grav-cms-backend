@@ -782,9 +782,6 @@ router.get("/order-requests/:id/issuance-summary", async (req, res) => {
       }
     }
 
-    if (!Object.keys(bomMap).length)
-      return res.json({ success: true, items: [], summary: { totalItems: 0, notIssued: 0, partial: 0, met: 0, overIssued: 0 }, issuanceCount: 0 });
-
     // 2. Enrich with unitConversions + nativeUnit from RawItem docs
     const uniqueRawIds = [...new Set(Object.values(bomMap).map(b => b.rawItemId).filter(Boolean))];
     const rawDocs      = await RawItem.find({ _id: { $in: uniqueRawIds } })
@@ -803,15 +800,51 @@ router.get("/order-requests/:id/issuance-summary", async (req, res) => {
     }
 
     // 3. Aggregate issued qty from StockIssuance (convert nativeQty → BOM unit)
+    //    A store person is not restricted to the BOM when issuing/returning —
+    //    the search box in the Issue/Return Stock modal covers the whole raw
+    //    item catalogue. Anything issued against this order that never matches
+    //    a `bomMap` key is a real assignment the store made for this order that
+    //    the BOM comparison above has no row for; it goes into `extrasMap`
+    //    instead of being dropped, so it is not just invisible money moved
+    //    outside the model.
     const issuances = await StockIssuance.find({ manufacturingOrder: id })
       .populate("performedBy", "name").lean();
+
+    const extrasMap = {};
 
     for (const iso of issuances) {
       for (const itm of (iso.items || [])) {
         const riId = itm.rawItem?.toString() || "";
         const rvId = itm.variantId?.toString() || "";
         const key  = `${riId}|${rvId}`;
-        if (!bomMap[key]) continue;
+
+        if (!bomMap[key]) {
+          // No BOM unit to convert into here, so the extra is tracked purely
+          // in the raw item's own native unit — everything on the issuance
+          // record already carries that (`nativeQty`/`nativeUnit`).
+          if (!extrasMap[key]) {
+            extrasMap[key] = {
+              rawItemId: riId, variantId: rvId || null,
+              rawItemName: itm.rawItemName || "", rawItemSku: itm.rawItemSku || "",
+              variantCombination: itm.variantCombination || [],
+              unit: itm.nativeUnit || itm.issuedUnit || "",
+              totalIssued: 0, issuanceHistory: [],
+            };
+          }
+          const ex = extrasMap[key];
+          const nativeQty = itm.nativeQty || 0;
+          const signedQty = iso.direction === "debit" ? nativeQty : -nativeQty;
+          ex.totalIssued += signedQty;
+          ex.issuanceHistory.push({
+            direction: iso.direction, date: iso.createdAt,
+            performedBy: iso.performedBy?.name || "System",
+            reason: iso.reason || "",
+            issuedQty: itm.issuedQty, issuedUnit: itm.issuedUnit,
+            nativeQty: itm.nativeQty, nativeUnit: itm.nativeUnit,
+            convertedBomQty: signedQty,
+          });
+          continue;
+        }
 
         const b          = bomMap[key];
         const nativeUnit = b.nativeUnit || b.unit;
@@ -876,8 +909,21 @@ router.get("/order-requests/:id/issuance-summary", async (req, res) => {
     const rank = { over_issued: 0, partial: 1, not_issued: 2, met: 3 };
     items.sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
 
+    // Items assigned to this order outside the BOM — same shape as `items`
+    // minus what only makes sense against a requirement (no required/remaining/
+    // status), so the tab can list them without a fake "not_issued" badge.
+    const extraItems = Object.values(extrasMap)
+      .map(ex => ({
+        rawItemId: ex.rawItemId, variantId: ex.variantId,
+        rawItemName: ex.rawItemName, rawItemSku: ex.rawItemSku,
+        variantCombination: ex.variantCombination,
+        unit: ex.unit, totalIssued: ex.totalIssued,
+        issuanceHistory: ex.issuanceHistory,
+      }))
+      .sort((a, b) => a.rawItemName.localeCompare(b.rawItemName));
+
     return res.json({
-      success: true, items,
+      success: true, items, extraItems,
       summary: {
         totalItems:  items.length,
         notIssued:   items.filter(i => i.status === "not_issued").length,
