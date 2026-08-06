@@ -1146,6 +1146,51 @@ class CustomerEmailService {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // 7. COWORK SHARE INVITE
+  //    Sent when a Cowork employee shares a document, sheet or mindmap with
+  //    somebody outside the organisation. The recipient has no Cowork
+  //    account — the link in this email is their entire way in.
+  // ─────────────────────────────────────────────────────────────────────────
+  async sendShareInviteEmail({ toEmail, toName, inviterName, targetKind, targetTitle, role, acceptUrl }) {
+    try {
+      const apiKey = process.env.BREVO_API_KEY;
+      if (!apiKey) return { success: false, reason: "no_api_key" };
+
+      const s = await getSettings();
+      const noun = targetKind === "mindmap" ? "mindmap" : "document";
+      const roleLabel = role === "editor" ? "edit" : "view";
+      const title = `You've been invited to a Cowork ${noun}`;
+      const subject = `${inviterName} shared "${targetTitle}" with you on Cowork`;
+
+      const html = layout(title, `
+        <h1 class="title">${title}</h1>
+        <p>Hi${toName ? ` ${toName}` : ""},</p>
+        <p style="color:#374151;">
+          <strong>${inviterName}</strong> invited you to ${roleLabel} the ${noun}
+          <strong>"${targetTitle}"</strong> on Cowork. You do not need a Cowork
+          account to open it.
+        </p>
+        <div class="info-box">
+          ${infoRow(noun.charAt(0).toUpperCase() + noun.slice(1), targetTitle)}
+          ${infoRow("Invited by", inviterName)}
+          ${infoRow("Your access", role === "editor" ? "Can edit" : "Can view")}
+        </div>
+        <p style="text-align:center;"><a href="${acceptUrl}" class="btn">Open ${noun} &rarr;</a></p>
+        <div class="box-blue">This link is personal to ${toEmail} and expires in 7 days.</div>
+      `, s);
+
+      const text = `${title}\n\n${inviterName} invited you to ${roleLabel} the ${noun} "${targetTitle}" on Cowork.\n\nOpen it: ${acceptUrl}\n\nThis link is personal to ${toEmail} and expires in 7 days.`;
+
+      const res = await brevoSend(apiKey, toEmail, toName, subject, html, text, "cowork_share_invite");
+      console.log(`[CustomerEmailService] shareInvite sent to ${toEmail} for ${targetKind} ${targetTitle}:`, res.messageId);
+      return { success: true, messageId: res.messageId };
+    } catch (err) {
+      console.error("[CustomerEmailService] sendShareInviteEmail:", err.response?.data || err.message);
+      return { success: false, error: err.response?.data?.message || err.message };
+    }
+  }
+
   // ── Stubs (future implementation) ────────────────────────────────────────
   async sendOrderConfirmationEmail(orderData) { return { success: true }; }
   async sendMeasurementReminderEmail(customerData) { return { success: true }; }

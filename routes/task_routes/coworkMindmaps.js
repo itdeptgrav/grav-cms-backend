@@ -624,4 +624,17 @@ router.put(
   },
 );
 
+/**
+ * `validateNodes` attached to the router function rather than exported via a
+ * second name — `server.js` mounts this file's return value directly as
+ * `app.use("/cowork", require(...))`, so `module.exports` has to stay the
+ * router. A property on the router (a function, so it can carry one) is a
+ * factored-out validator without a second require path or a mount-site
+ * change: `coworkExternalShare.routes.js` reads
+ * `require("./coworkMindmaps.js").validateNodes` and gets the exact function
+ * an employee's own save runs through, not a re-implementation of it that
+ * could drift.
+ */
+router.validateNodes = validateNodes;
+
 module.exports = router;
