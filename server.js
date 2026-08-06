@@ -1642,6 +1642,11 @@ app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 
 app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
 
+// The verbatim transcript — exact words, original language preserved, a
+// separate capability from the summary above. Mounted after it because it
+// requires meetingSummary.routes's additive `.helpers` export.
+app.use("/cowork", require("./routes/task_routes/meetingTranscript.routes"));
+
 app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
 
 // Fix: askAI.routes exports an object, use .router
