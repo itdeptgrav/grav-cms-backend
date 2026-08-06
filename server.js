@@ -1046,6 +1046,25 @@ app.use(
   employeeMpcRoutes,
 );
 
+// Department -> product assignment rules for the same sales-on-behalf
+// customer profile ("Department" tab next to MPC). Separate router (no
+// customer self-service mount) — sales-only.
+const salesDepartmentRulesRoutes = require("./routes/CMS_Routes/Sales/salesDepartmentRules");
+app.use(
+  "/api/cms/sales/customers/:customerId/department-rules",
+  EmployeeAuthForMpc,
+  (req, res, next) => {
+    const { customerId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return res.status(400).json({ success: false, message: "Invalid customer id" });
+    }
+    req.customerId = customerId;
+    req.onBehalfActor = { id: req.user?.id, name: req.user?.name };
+    next();
+  },
+  salesDepartmentRulesRoutes,
+);
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
