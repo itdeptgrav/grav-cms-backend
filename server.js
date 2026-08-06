@@ -1297,6 +1297,12 @@ app.use("/api/hr/leaves", hrLeaveRoutes);
 app.use("/api/hr/policy", require("./routes/HrRoutes/policyRoutes"));
 app.use("/api/hr/sop", require("./routes/HrRoutes/hrSopRoutes"));
 
+// HR-issued letters (appointment / offer / warning / experience / relieving /
+// salary certificate). HR generates here; the employee sees nothing until HR
+// explicitly RELEASES a row — the employee half lives at
+// /api/employee/documents and never projects an unreleased row.
+app.use("/api/hr/documents", require("./routes/HrRoutes/EmployeeDocuments_section"));
+
 app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
 
 // Employee Leave Routes (employee side — apply, balance, calendar, manager actions)
@@ -1317,6 +1323,29 @@ app.use("/api/hr/payslip", payslipRouter);
 
 const empAttendance = require("./routes/Employee_Routes/employeeAttendance");
 app.use("/api/employee/attendance", empAttendance);
+
+// Employee's own performance, for the mobile app. Scoped to the caller's own
+// token — unlike /hr/performance/:employeeId, which takes an arbitrary id and
+// is for HR only.
+const empPerformance = require("./routes/Employee_Routes/performance");
+app.use("/api/employee/performance", empPerformance);
+
+// Daily/weekly/monthly standings for the app. Ranks on positive signal only
+// (present + on time) — it never exposes a colleague's absences or SOP record.
+const empLeaderboard = require("./routes/Employee_Routes/leaderboard");
+app.use("/api/employee/leaderboard", empLeaderboard);
+
+// Attendance regularization for the app. Shares the RegularizationRequest
+// model with HR, but scoped to the caller's own token.
+const empRegularize = require("./routes/Employee_Routes/regularization");
+app.use("/api/employee/regularizations", empRegularize);
+
+// HR-issued letters, employee side. Two INDEPENDENT states live behind the
+// EmployeeDocument model: HR generates a document, and HR separately RELEASES
+// it. Nothing unreleased is reachable through these routes — not in a list and
+// not by guessing an _id. The HR half mounts at /api/hr/documents.
+const empDocuments = require("./routes/Employee_Routes/documents");
+app.use("/api/employee/documents", empDocuments);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACCOUNTANT DEPARTMENT ROUTES — ALL 20 ENDPOINTS (17 legacy + 3 sub-account)

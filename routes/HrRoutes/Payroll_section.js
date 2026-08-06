@@ -8,8 +8,9 @@ const PayrollSettings = require("../../models/HR_Models/Payrollsettings");
 const Employee = require("../../models/Employee");
 const SalaryConfig = require("../../models/Salaryconfig");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
-const { Expo } = require("expo-server-sdk");
-const expo = new Expo();
+// Push notifications — single fan-out to mobile (Expo) + web (FCM).
+// Fire-and-forget: never awaited, never able to fail the payroll request.
+const { notifyPayslipPublished } = require("../../utils/notifyEmployee");
 const {
   CompanyHoliday,
   LeaveBalance,
@@ -662,291 +663,13 @@ async function loadMonthContext(month, year) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  HELPER: Send push notifications for payroll events
-//  *** EXTRACTED & FIXED — single source of truth for push logic ***
+//  NOTE: `sendPayrollPushNotifications` used to live here (~285 lines).
+//  It was a hand-rolled duplicate of utils/sendExpoPush.js — same Expo
+//  chunking, same FCM send, same stale-token cleanup. Payroll notifications
+//  now go through utils/notifyEmployee.js like every other domain, so there is
+//  one fan-out to maintain instead of two. Its `type: "generated"` branch was
+//  dead code: the only caller (PATCH /mark-paid) always passed "paid".
 // ═══════════════════════════════════════════════════════════════════════════
-
-async function sendPayrollPushNotifications(
-  month,
-  year,
-  type = "generated",
-  employeeIdFilter = null,
-) {
-  const result = {
-    mobile: { sent: 0, failed: 0 },
-    web: { sent: 0, failed: 0 },
-    total: 0,
-    sent: 0,
-    failed: 0,
-    error: null,
-  };
-
-  try {
-    const baseQuery = {
-      $and: [
-        { $or: [{ status: "active" }, { isActive: true }] },
-        {
-          $or: [
-            { pushToken: { $exists: true, $nin: [null, ""] } },
-            { fcmToken: { $exists: true, $nin: [null, ""] } },
-          ],
-        },
-      ],
-    };
-    if (employeeIdFilter && employeeIdFilter.length > 0) {
-      baseQuery._id = { $in: employeeIdFilter };
-    }
-
-    console.log(
-      `[PAYROLL-PUSH-${type.toUpperCase()}] ── Querying employees...`,
-    );
-
-    const empWithTokens = await Employee.find(baseQuery)
-      .select("pushToken fcmToken firstName lastName profilePhoto")
-      .lean();
-
-    console.log(
-      `[PAYROLL-PUSH-${type.toUpperCase()}] Found ${empWithTokens.length} employee(s) with tokens`,
-    );
-
-    if (empWithTokens.length === 0) {
-      console.warn(
-        `[PAYROLL-PUSH-${type.toUpperCase()}] ❌ No employees with any push token`,
-      );
-      return result;
-    }
-
-    const buildTitle = () =>
-      type === "paid" ? "Salary Credited" : "Payslip Generated";
-    const buildBody = (emp) =>
-      type === "paid"
-        ? `Hi ${emp.firstName}, your salary for ${MONTH_NAMES[month]} ${year} has been credited to your account. Tap to view your payslip.`
-        : `Hi ${emp.firstName}, your payslip for ${MONTH_NAMES[month]} ${year} has been processed. Open the app to view details.`;
-
-    // ─── MOBILE (Expo) — unchanged ──────────────────────────────────────
-    const expoMessages = [];
-    const invalidMobileIds = [];
-    for (const emp of empWithTokens) {
-      if (!emp.pushToken) continue;
-      if (!Expo.isExpoPushToken(emp.pushToken)) {
-        invalidMobileIds.push(emp._id);
-        continue;
-      }
-      expoMessages.push({
-        to: emp.pushToken,
-        sound: "default",
-        title: buildTitle(),
-        body: buildBody(emp),
-        data: {
-          type: "payroll",
-          month: String(month),
-          year: String(year),
-          screen: "Salary",
-          url: "/salary",
-          profilePhoto: emp.profilePhoto?.url || null,
-        },
-        categoryId: "payroll",
-        channelId: "payroll",
-        priority: "high",
-        badge: 1,
-      });
-    }
-
-    if (expoMessages.length > 0) {
-      console.log(
-        `[PAYROLL-PUSH-${type.toUpperCase()}] Sending ${expoMessages.length} mobile push(es)...`,
-      );
-      const chunks = expo.chunkPushNotifications(expoMessages);
-      const staleMobile = [];
-      for (const chunk of chunks) {
-        try {
-          const receipts = await expo.sendPushNotificationsAsync(chunk);
-          for (let i = 0; i < receipts.length; i++) {
-            const r = receipts[i];
-            if (r.status === "ok") {
-              result.mobile.sent++;
-              console.log(
-                `[PAYROLL-PUSH-${type.toUpperCase()}] ✓ Mobile OK → ${chunk[i].to.substring(0, 35)}...`,
-              );
-            } else {
-              result.mobile.failed++;
-              console.warn(
-                `[PAYROLL-PUSH-${type.toUpperCase()}] ✗ Mobile FAIL: ${r.message || JSON.stringify(r.details)}`,
-              );
-              if (r.details?.error === "DeviceNotRegistered") {
-                const stale = empWithTokens.find(
-                  (e) => e.pushToken === chunk[i].to,
-                );
-                if (stale) staleMobile.push(stale._id);
-              }
-            }
-          }
-        } catch (chunkErr) {
-          console.error(
-            `[PAYROLL-PUSH-${type.toUpperCase()}] CHUNK ERROR:`,
-            chunkErr.message,
-          );
-          result.mobile.failed += chunk.length;
-        }
-      }
-      if (staleMobile.length > 0) {
-        await Employee.updateMany(
-          { _id: { $in: staleMobile } },
-          { $set: { pushToken: null } },
-        ).catch((e) =>
-          console.warn("[PAYROLL-PUSH] Mobile cleanup error:", e.message),
-        );
-      }
-    }
-    if (invalidMobileIds.length > 0) {
-      await Employee.updateMany(
-        { _id: { $in: invalidMobileIds } },
-        { $set: { pushToken: null } },
-      ).catch((e) =>
-        console.warn("[PAYROLL-PUSH] Invalid mobile cleanup error:", e.message),
-      );
-    }
-
-    // ─── WEB (FCM multicast) — canonical cross-platform payload ─────────
-    const webEmps = empWithTokens.filter((e) => e.fcmToken);
-    if (webEmps.length > 0) {
-      console.log(
-        `[PAYROLL-PUSH-${type.toUpperCase()}] Sending ${webEmps.length} web push(es)...`,
-      );
-
-      let messaging = null;
-      let admin = null;
-      try {
-        messaging = require("../../config/firebaseAdmin").messaging;
-        admin = require("firebase-admin");
-      } catch (e) {
-        console.warn("[PAYROLL-PUSH] firebaseAdmin not available:", e.message);
-      }
-
-      if (messaging) {
-        // Group employees by token so we can map errors back to employee IDs
-        const tokens = webEmps.map((e) => e.fcmToken);
-        const empByToken = Object.fromEntries(
-          webEmps.map((e) => [e.fcmToken, e]),
-        );
-
-        // Title/body need to be personalised per employee → send each individually.
-        // This is a few more requests but gives each user their name in the body.
-        const staleWeb = [];
-        for (const emp of webEmps) {
-          const dataPayload = {
-            title: buildTitle(),
-            body: buildBody(emp),
-            type: "payroll",
-            month: String(month),
-            year: String(year),
-            screen: "Salary",
-            url: "/salary",
-          };
-
-          try {
-            await messaging.send({
-              token: emp.fcmToken,
-              data: dataPayload,
-              webpush: {
-                headers: { Urgency: "high", TTL: "0" },
-                notification: {
-                  title: dataPayload.title,
-                  body: dataPayload.body,
-                  icon: emp.profilePhoto?.url || "/icon.png",
-                  badge: "/icon.png",
-                  requireInteraction: false,
-                  vibrate: [200, 100, 200],
-                  tag: `grav-payroll-${month}-${year}-${Date.now()}`,
-                  renotify: true,
-                  data: dataPayload,
-                },
-                fcmOptions: { link: "/salary" },
-              },
-              apns: {
-                headers: {
-                  "apns-priority": "10",
-                  "apns-push-type": "alert",
-                  "apns-expiration": "0",
-                },
-                payload: {
-                  aps: {
-                    alert: { title: dataPayload.title, body: dataPayload.body },
-                    badge: 1,
-                    sound: "default",
-                    "mutable-content": 1,
-                    "content-available": 1,
-                  },
-                  ...dataPayload,
-                },
-              },
-              android: {
-                priority: "high",
-                ttl: 0,
-                notification: {
-                  title: dataPayload.title,
-                  body: dataPayload.body,
-                  icon: "ic_notification",
-                  color: "#111827",
-                  sound: "default",
-                  channelId: "grav_payroll",
-                  priority: "max",
-                  defaultSound: true,
-                  defaultVibrateTimings: true,
-                },
-              },
-            });
-            result.web.sent++;
-            console.log(
-              `[PAYROLL-PUSH-${type.toUpperCase()}] ✓ Web OK → ${emp.firstName}`,
-            );
-          } catch (err) {
-            result.web.failed++;
-            const code = err.errorInfo?.code || err.code || "";
-            console.warn(
-              `[PAYROLL-PUSH-${type.toUpperCase()}] ✗ Web FAIL → ${emp.firstName}: ${code} ${err.message}`,
-            );
-            if (
-              code === "messaging/registration-token-not-registered" ||
-              code === "messaging/invalid-registration-token" ||
-              code === "messaging/invalid-argument" ||
-              code === "messaging/third-party-auth-error"
-            ) {
-              staleWeb.push(emp._id);
-            }
-          }
-        }
-        if (staleWeb.length > 0) {
-          await Employee.updateMany(
-            { _id: { $in: staleWeb } },
-            { $set: { fcmToken: null } },
-          ).catch((e) =>
-            console.warn("[PAYROLL-PUSH] Web cleanup error:", e.message),
-          );
-          console.log(
-            `[PAYROLL-PUSH-${type.toUpperCase()}] Cleaned ${staleWeb.length} stale web token(s)`,
-          );
-        }
-      }
-    }
-
-    result.total = result.mobile.sent + result.web.sent;
-    result.sent = result.total;
-    result.failed = result.mobile.failed + result.web.failed;
-
-    console.log(
-      `[PAYROLL-PUSH-${type.toUpperCase()}] ══ DONE: ${result.mobile.sent} mobile, ${result.web.sent} web, ${result.failed} failed ══`,
-    );
-  } catch (pushErr) {
-    console.error(
-      `[PAYROLL-PUSH-${type.toUpperCase()}] ❌ CRITICAL ERROR:`,
-      pushErr.message,
-    );
-    result.error = pushErr.message;
-  }
-
-  return result;
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  ROUTES
@@ -1938,8 +1661,10 @@ router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
 
     await Payroll.updateOne({ month, year }, { $set: { status: "paid" } });
 
-    // *** FIXED: Use the extracted helper with corrected query ***
-    let pushResult = { sent: 0, failed: 0 };
+    // P1 — payslip published. Dispatched, not awaited: marking a whole
+    // month's payroll paid must not hang (or fail) behind a few hundred
+    // push sends. Per-recipient outcomes are logged under [SEND-PUSH].
+    let pushResult = { sent: 0, failed: 0, dispatched: false, recipients: 0 };
     if (result.modifiedCount > 0) {
       // Get employee IDs from paid items to target notifications
       const paidItems = await PayrollItem.find({ month, year, status: "paid" })
@@ -1947,12 +1672,13 @@ router.patch("/mark-paid", EmployeeAuthMiddlewear, async (req, res) => {
         .lean();
       const employeeIds = paidItems.map((i) => i.employeeId);
 
-      pushResult = await sendPayrollPushNotifications(
-        month,
-        year,
-        "paid",
-        employeeIds,
-      );
+      notifyPayslipPublished(employeeIds, month, year);
+      pushResult = {
+        sent: 0,
+        failed: 0,
+        dispatched: true,
+        recipients: employeeIds.length,
+      };
     } else {
       console.log(
         `[PAYROLL-MARK-PAID] No items were modified (already paid or no processed items)`,
