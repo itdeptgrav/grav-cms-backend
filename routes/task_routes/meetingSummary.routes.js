@@ -1101,3 +1101,26 @@ router.get(
 );
 
 module.exports = router;
+
+/**
+ * Additive export of the conveyor-belt pipeline's low-level pieces, for
+ * meetingTranscript.routes.js (the verbatim-transcript feature) to reuse
+ * instead of carrying a fourth copy of the Drive→Gemini-File-API upload
+ * dance that this file and askAI.routes.js already each have their own
+ * version of.
+ *
+ * A plain property on the exported router, not a change to the export
+ * shape — `require("./meetingSummary.routes")` still returns a working
+ * Express router exactly as before; this only adds `.helpers` to it.
+ * Nothing above this line was touched to produce it.
+ */
+router.helpers = {
+  GEMINI_BASE,
+  GEMINI_UPLOAD_BASE,
+  MODELS_TO_TRY,
+  getDriveClient,
+  streamDriveToGeminiFileAPI,
+  waitForFileActive,
+  deleteGeminiFile,
+  callGemini,
+};
