@@ -1587,6 +1587,812 @@ router.post("/requests/:requestId/add-employees-batch", async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHANGE A PERSON'S MPC INFORMATION ON A LIVE PO
+// ═══════════════════════════════════════════════════════════════════════════════
+// Person-wise (measurement_conversion) POs only. Lets sales edit, on an order
+// that may already be in production:
+//   • the person's identity  — name / UIN / department / designation / gender
+//   • the person's product assignment — swap a product, change qty, add or drop
+//     a product entirely.
+//
+// A product-assignment edit has to fan out across every downstream document,
+// because each one denormalises the person→product→qty triple:
+//     EmployeeMpc.products            (the person master)
+//     Measurement.employeeMeasurements[].products   (the MPC sheet)
+//     CustomerRequest.items[].variants[].quantity   (PO line quantities)
+//     CustomerRequest.quotations[0].items[]         (priced quotation lines)
+//     WorkOrder.quantity + rawMaterials + estimatedCost
+//     EmployeeProductionProgress   (per-person unit range on each WO)
+//
+// Nothing here is allowed to invalidate work the shop floor has already done:
+// units that are completed, packaged or dispatched pin the range and a change
+// that would strand them is rejected with an explicit reason rather than
+// silently clamped.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const prodKey = (productId, variantId) =>
+  `${productId?.toString()}::${variantId ? variantId.toString() : "noVar"}`;
+
+const attrsMatchLoose = (a = [], b = []) => {
+  if (!a?.length || !b?.length) return false;
+  if (a.length !== b.length) return false;
+  return a.every((x) => b.some((y) => y.name === x.name && y.value === x.value));
+};
+
+// Raw materials on a WO are a BOM snapshot scaled to the WO quantity. When the
+// quantity moves, rescale from the per-unit figures implied by the old quantity
+// so the store's allocation targets stay consistent.
+function rescaleWorkOrderRawMaterials(wo, oldQty) {
+  const newQty = wo.quantity;
+  if (wo.rawMaterials?.length && oldQty > 0 && newQty !== oldQty) {
+    for (const rm of wo.rawMaterials) {
+      const perUnitRequired = (rm.requiredQuantity || 0) / oldQty;
+      const perUnitQty = (rm.quantityRequired || 0) / oldQty;
+      const perUnitCost = (rm.totalCost || 0) / oldQty;
+      rm.requiredQuantity = parseFloat((perUnitRequired * newQty).toFixed(4));
+      rm.quantityRequired = parseFloat((perUnitQty * newQty).toFixed(4));
+      rm.totalCost = parseFloat((perUnitCost * newQty).toFixed(2));
+    }
+  }
+  wo.estimatedCost = (wo.rawMaterials || []).reduce((s, rm) => s + (rm.totalCost || 0), 0);
+}
+
+const barcodesFor = (woNumber, unitStart, unitEnd) => {
+  const out = [];
+  for (let u = unitStart; u <= unitEnd; u++) out.push(`${woNumber}-${u.toString().padStart(3, "0")}`);
+  return out;
+};
+
+// Re-plan one person's unit range on a WO to `newQty`.
+//   shrink — keep unitStart, pull unitEnd in. Refuses if a completed or
+//            packaged unit sits beyond the new end. Leaves a numbering gap,
+//            which is harmless: unit numbers are labels, not a dense sequence.
+//   grow   — extend in place when the person already owns the tail of the WO;
+//            otherwise relocate the whole range to the tail, which is only safe
+//            while no unit of theirs has been touched.
+function replanUnitRange(progress, newQty, woMaxUnitEnd, woNumber) {
+  const oldQty = progress.totalUnits || 0;
+  if (newQty === oldQty) return { ok: true, changed: false, maxUnitEnd: woMaxUnitEnd };
+
+  const completedMax = Math.max(0, ...(progress.completedUnitNumbers || [0]));
+  const packaged = progress.packagedUnits || 0;
+
+  if (newQty < oldQty) {
+    const newEnd = progress.unitStart + newQty - 1;
+    if (completedMax > newEnd) {
+      return { ok: false, reason: `unit ${completedMax} is already completed — cannot reduce below ${completedMax - progress.unitStart + 1}` };
+    }
+    if (packaged > newQty) {
+      return { ok: false, reason: `${packaged} unit(s) already packaged — cannot reduce below ${packaged}` };
+    }
+    progress.unitEnd = newEnd;
+    progress.totalUnits = newQty;
+  } else {
+    if (progress.unitEnd === woMaxUnitEnd) {
+      progress.unitEnd = progress.unitStart + newQty - 1;
+      progress.totalUnits = newQty;
+      woMaxUnitEnd = progress.unitEnd;
+    } else if ((progress.completedUnits || 0) === 0 && packaged === 0 && !progress.isDispatched) {
+      progress.unitStart = woMaxUnitEnd + 1;
+      progress.unitEnd = woMaxUnitEnd + newQty;
+      progress.totalUnits = newQty;
+      woMaxUnitEnd = progress.unitEnd;
+    } else {
+      return { ok: false, reason: "units are already in production and sit mid-sequence — increase not possible without re-planning the work order" };
+    }
+  }
+
+  progress.assignedBarcodeIds = barcodesFor(woNumber, progress.unitStart, progress.unitEnd);
+  progress.completionPercentage = progress.totalUnits > 0
+    ? Math.min(100, Math.round(((progress.completedUnits || 0) / progress.totalUnits) * 100))
+    : 0;
+  progress.isFullyPackaged = (progress.packagedUnits || 0) >= progress.totalUnits;
+  return { ok: true, changed: true, maxUnitEnd: woMaxUnitEnd };
+}
+
+// Build a work order for a single product/variant that the PO did not carry
+// before. Same shape as the ones createWorkOrdersAndProgress emits, so the
+// shop floor cannot tell them apart.
+async function createWorkOrderForVariant(request, stockItem, variantData, quantity, userId) {
+  const operations = (stockItem.operations || []).map((op) => ({
+    operationType: op.type || op.name || op.operationType,
+    operationCode: op.operationCode || op.code || "",
+    plannedTimeSeconds: op.totalSeconds || op.durationSeconds || 0,
+    status: "pending",
+  }));
+
+  const rawMaterials = (variantData.rawItems || []).map((rawItem) => ({
+    rawItemId: rawItem.rawItemId,
+    name: rawItem.rawItemName,
+    sku: rawItem.rawItemSku,
+    rawItemVariantId: rawItem.variantId || null,
+    rawItemVariantCombination: rawItem.variantCombination || [],
+    requiredQuantity: (rawItem.requiredQuantity ?? rawItem.quantity ?? 0) * quantity,
+    allowancePercent: rawItem.allowancePercent || 0,
+    quantityRequired: (rawItem.quantity || 0) * quantity,
+    quantityAllocated: 0,
+    quantityIssued: 0,
+    unit: rawItem.unit,
+    unitCost: rawItem.unitCost,
+    totalCost: (rawItem.totalCost || 0) * quantity,
+    allocationStatus: "not_allocated",
+  }));
+
+  const workOrder = new WorkOrder({
+    customerRequestId: request._id,
+    stockItemId: stockItem._id,
+    stockItemName: stockItem.name,
+    stockItemReference: stockItem.reference || "",
+    variantId: variantData._id.toString(),
+    variantAttributes: variantData.attributes || [],
+    quantity,
+    customerId: request.customerId,
+    customerName: request.customerInfo?.name,
+    priority: request.priority,
+    status: "pending",
+    operations,
+    rawMaterials,
+    timeline: {
+      plannedStartDate: null, plannedEndDate: null, actualStartDate: null,
+      actualEndDate: null, scheduledStartDate: null, scheduledEndDate: null,
+    },
+    specialInstructions: [],
+    estimatedCost: rawMaterials.reduce((t, rm) => t + (rm.totalCost || 0), 0),
+    actualCost: 0,
+    createdBy: userId,
+  });
+  await workOrder.save();
+  return workOrder;
+}
+
+// Rebuild the quotation's priced lines from the (already updated) request items,
+// then roll the totals up onto the request. Mirrors the arithmetic in
+// POST /requests/:requestId/quotation so both paths agree to the paisa.
+async function recalcQuotationFromRequestItems(request) {
+  const quotation = request.quotations?.[0];
+  if (!quotation) return null;
+
+  const before = quotation.grandTotal || 0;
+  // Lines opened at zero because the catalogue carries no price for that
+  // product. Reported back so the merchandiser is told to set a rate rather
+  // than shipping a quotation with a free garment on it.
+  const unpricedItems = [];
+
+  // A product that has just joined the PO has no priced line yet — open one at
+  // the catalogue rate so the customer sees what they are being charged.
+  for (const item of request.items) {
+    const pid = (item.stockItemId?._id || item.stockItemId)?.toString();
+    const hasLine = (quotation.items || []).some(
+      (qi) => (qi.stockItemId?._id || qi.stockItemId)?.toString() === pid
+    );
+    if (hasLine) continue;
+
+    const stockItem = await StockItem.findById(pid).select("name reference hsnCode baseSalesPrice quantityOnHand status").lean();
+    const unitPrice = Number(stockItem?.baseSalesPrice) || 0;
+    if (unitPrice <= 0) unpricedItems.push(item.stockItemName || stockItem?.name || "product");
+    quotation.items.push({
+      stockItemId: item.stockItemId?._id || item.stockItemId,
+      itemName: item.stockItemName || stockItem?.name || "",
+      itemCode: item.stockItemReference || stockItem?.reference || "",
+      hsnCode: stockItem?.hsnCode || "",
+      description: "",
+      quantity: item.totalQuantity || 0,
+      unitPrice,
+      discountPercentage: 0,
+      discountAmount: 0,
+      gstPercentage: getGSTPercentage(unitPrice),
+      attributes: item.variants?.[0]?.attributes || [],
+      stockInfo: { quantityOnHand: stockItem?.quantityOnHand || 0, status: stockItem?.status || "Unknown" },
+    });
+  }
+
+  const countByStockItem = new Map();
+  for (const qi of quotation.items || []) {
+    const pid = (qi.stockItemId?._id || qi.stockItemId)?.toString();
+    countByStockItem.set(pid, (countByStockItem.get(pid) || 0) + 1);
+  }
+
+  for (const qi of quotation.items || []) {
+    const pid = (qi.stockItemId?._id || qi.stockItemId)?.toString();
+    const reqItem = request.items.find(
+      (i) => (i.stockItemId?._id || i.stockItemId)?.toString() === pid
+    );
+    if (!reqItem) { qi.quantity = 0; continue; }
+
+    // One quotation line per product → it carries the product's whole quantity.
+    // Several lines (size/colour split) → match the line back to its variant.
+    if (countByStockItem.get(pid) === 1) {
+      qi.quantity = reqItem.totalQuantity || 0;
+    } else {
+      const variant = (reqItem.variants || []).find((v) => attrsMatchLoose(qi.attributes, v.attributes));
+      if (variant) qi.quantity = variant.quantity || 0;
+    }
+
+    const unitPrice = parseFloat(qi.unitPrice) || 0;
+    const gstPercentage = qi.gstPercentage != null ? parseFloat(qi.gstPercentage) : getGSTPercentage(unitPrice);
+    const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(qi.quantity, unitPrice, gstPercentage);
+    const discountPercentage = parseFloat(qi.discountPercentage) || 0;
+    const discountAmount = priceBeforeGST * (discountPercentage / 100);
+    const discountedBase = priceBeforeGST - discountAmount;
+    const discountedGST = discountedBase * (gstPercentage / 100);
+
+    qi.gstPercentage = gstPercentage;
+    qi.discountAmount = parseFloat(discountAmount.toFixed(2));
+    qi.priceBeforeGST = discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST;
+    qi.gstAmount = discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount;
+    qi.priceIncludingGST = discountPercentage > 0 ? parseFloat((discountedBase + discountedGST).toFixed(2)) : priceIncludingGST;
+  }
+
+  quotation.items = (quotation.items || []).filter((qi) => (qi.quantity || 0) > 0);
+
+  const subtotalBeforeGST = quotation.items.reduce((s, i) => s + (i.priceBeforeGST || 0), 0);
+  const totalDiscount = quotation.items.reduce((s, i) => s + (i.discountAmount || 0), 0);
+  const totalGST = quotation.items.reduce((s, i) => s + (i.gstAmount || 0), 0);
+  const shipping = parseFloat(quotation.shippingCharges) || 0;
+  const customTotal = (quotation.customAdditionalCharges || []).reduce((s, c) => s + (Number(c.amount) || 0), 0);
+  const grandTotal = subtotalBeforeGST + totalGST + shipping + customTotal;
+
+  quotation.subtotalBeforeGST = parseFloat(subtotalBeforeGST.toFixed(2));
+  quotation.totalDiscount = parseFloat(totalDiscount.toFixed(2));
+  quotation.totalGST = parseFloat(totalGST.toFixed(2));
+  quotation.grandTotal = parseFloat(grandTotal.toFixed(2));
+  quotation.updatedAt = new Date();
+
+  request.taxSummary = { totalGST, sgst: totalGST / 2, cgst: totalGST / 2, igst: 0 };
+  request.finalOrderPrice = quotation.grandTotal;
+
+  // Shrinking an order the customer has already paid for can drive the balance
+  // below zero, and `totalDueAmount` is `min: 0` — writing the negative throws a
+  // validation error that aborts the entire change and rolls the edit back. The
+  // balance is clamped and the excess reported separately as a credit, so the
+  // money owed back is surfaced rather than quietly rounded away.
+  const rawDue = quotation.grandTotal - (request.totalPaidAmount || 0);
+  request.totalDueAmount = parseFloat(Math.max(0, rawDue).toFixed(2));
+  const overpaid = rawDue < 0 ? parseFloat(Math.abs(rawDue).toFixed(2)) : 0;
+
+  return { before: parseFloat(before.toFixed(2)), after: quotation.grandTotal, unpricedItems, overpaid };
+}
+
+// What the change modal needs to render: the person as they stand today, plus
+// the products they can be moved onto — those already on this PO first (no new
+// work order needed), then the rest of the catalogue.
+router.get("/requests/:requestId/person/:employeeId/edit-context", async (req, res) => {
+  try {
+    const { requestId, employeeId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(requestId) || !mongoose.Types.ObjectId.isValid(employeeId)) {
+      return res.status(400).json({ success: false, message: "Invalid id" });
+    }
+
+    const request = await CustomerRequest.findById(requestId).lean();
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (request.requestType !== "measurement_conversion" || !request.measurementId) {
+      return res.status(400).json({ success: false, message: "Available only for person-wise (measurement) POs" });
+    }
+
+    const measurement = await Measurement.findById(request.measurementId).select("employeeMeasurements organizationId").lean();
+    if (!measurement) return res.status(404).json({ success: false, message: "Measurement not found" });
+
+    const entry = (measurement.employeeMeasurements || []).find((e) => e.employeeId?.toString() === employeeId);
+    if (!entry) return res.status(404).json({ success: false, message: "Person is not part of this PO" });
+
+    const mpc = await EmployeeMpc.findById(employeeId).lean();
+
+    const poStockItemIds = (request.items || []).map((i) => (i.stockItemId?._id || i.stockItemId)?.toString()).filter(Boolean);
+    const poSet = new Set(poStockItemIds);
+
+    const stockItems = await StockItem.find({})
+      .select("name reference hsnCode genderCategory baseSalesPrice images additionalNames variants")
+      .lean();
+
+    // The picker shows a thumbnail, the gender category and any alias the product
+    // is known by, so a merchandiser can tell two same-named garments apart —
+    // "Modi Jacket (Female)" and "Modi Jacket (Male)" are different work orders.
+    const firstImage = (s) =>
+      s.images?.[0] || (s.variants || []).map((v) => v.images?.[0]).find(Boolean) || null;
+
+    const catalogue = stockItems.map((s) => ({
+      _id: s._id,
+      name: s.name,
+      reference: s.reference || "",
+      genderCategory: s.genderCategory || "",
+      baseSalesPrice: s.baseSalesPrice || 0,
+      image: firstImage(s),
+      aliases: (s.additionalNames || [])
+        .map((a) => (typeof a === "string" ? a : a?.name))
+        .filter(Boolean),
+      inPO: poSet.has(s._id.toString()),
+      variants: (s.variants || []).map((v) => ({
+        variantId: v._id,
+        sku: v.sku || "",
+        attributes: v.attributes || [],
+        image: v.images?.[0] || null,
+      })),
+    }));
+    catalogue.sort((a, b) => (b.inPO ? 1 : 0) - (a.inPO ? 1 : 0) || (a.name || "").localeCompare(b.name || ""));
+
+    // Per-product production state — the modal greys out what can no longer move.
+    const progressDocs = await EmployeeProductionProgress.find({
+      manufacturingOrderId: request._id,
+      employeeId,
+    }).lean();
+    const workOrders = await WorkOrder.find({ customerRequestId: request._id })
+      .select("_id workOrderNumber stockItemId variantId status quantity")
+      .lean();
+    const woById = new Map(workOrders.map((w) => [w._id.toString(), w]));
+
+    const productionByKey = {};
+    for (const p of progressDocs) {
+      const wo = woById.get(p.workOrderId?.toString());
+      if (!wo) continue;
+      productionByKey[prodKey(wo.stockItemId, wo.variantId)] = {
+        workOrderNumber: wo.workOrderNumber,
+        workOrderStatus: wo.status,
+        unitStart: p.unitStart,
+        unitEnd: p.unitEnd,
+        totalUnits: p.totalUnits,
+        completedUnits: p.completedUnits || 0,
+        packagedUnits: p.packagedUnits || 0,
+        isDispatched: !!p.isDispatched,
+      };
+    }
+
+    res.json({
+      success: true,
+      person: {
+        employeeId,
+        name: mpc?.name ?? entry.employeeName,
+        uin: mpc?.uin ?? entry.employeeUIN,
+        gender: mpc?.gender ?? entry.gender,
+        department: mpc?.department || "",
+        designation: mpc?.designation || "",
+      },
+      products: (entry.products || []).map((p) => ({
+        key: prodKey(p.productId, p.variantId),
+        productId: p.productId?.toString() || null,
+        productName: p.productName || "",
+        variantId: p.variantId?.toString() || null,
+        quantity: p.quantity || 1,
+        production: productionByKey[prodKey(p.productId, p.variantId)] || null,
+      })),
+      catalogue,
+      hasWorkOrders: workOrders.length > 0,
+    });
+  } catch (err) {
+    console.error("person edit-context error:", err);
+    res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+router.put("/requests/:requestId/person/:employeeId", async (req, res) => {
+  try {
+    const { requestId, employeeId } = req.params;
+    const { person, products } = req.body || {};
+
+    if (!mongoose.Types.ObjectId.isValid(requestId) || !mongoose.Types.ObjectId.isValid(employeeId)) {
+      return res.status(400).json({ success: false, message: "Invalid id" });
+    }
+    if (!person && !Array.isArray(products)) {
+      return res.status(400).json({ success: false, message: "Nothing to change — send `person` and/or `products`" });
+    }
+
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (request.requestType !== "measurement_conversion" || !request.measurementId) {
+      return res.status(400).json({ success: false, message: "Available only for person-wise (measurement) POs" });
+    }
+
+    const measurement = await Measurement.findById(request.measurementId);
+    if (!measurement) return res.status(404).json({ success: false, message: "Measurement not found" });
+
+    const entry = (measurement.employeeMeasurements || []).find((e) => e.employeeId?.toString() === employeeId);
+    if (!entry) return res.status(404).json({ success: false, message: "Person is not part of this PO" });
+
+    const mpc = await EmployeeMpc.findById(employeeId);
+    if (!mpc) return res.status(404).json({ success: false, message: "Employee master record not found" });
+
+    const personChanges = [];
+    const productChanges = [];
+    const blocked = [];
+
+    // ── 1. Identity ─────────────────────────────────────────────────────────
+    if (person && typeof person === "object") {
+      const trim = (v) => (typeof v === "string" ? v.trim() : v);
+
+      if (person.uin !== undefined && trim(person.uin) && trim(person.uin).toUpperCase() !== (mpc.uin || "")) {
+        const clash = await EmployeeMpc.findOne({
+          _id: { $ne: mpc._id },
+          customerId: mpc.customerId,
+          uin: trim(person.uin).toUpperCase(),
+        }).select("_id name").lean();
+        if (clash) {
+          return res.status(409).json({
+            success: false,
+            message: `UIN ${trim(person.uin).toUpperCase()} already belongs to ${clash.name} in this organisation`,
+          });
+        }
+      }
+
+      for (const field of ["name", "uin", "gender", "department", "designation"]) {
+        if (person[field] === undefined) continue;
+        const next = trim(person[field]);
+        if (field === "gender" && next && !["Male", "Female"].includes(next)) {
+          return res.status(400).json({ success: false, message: "gender must be Male or Female" });
+        }
+        if ((field === "name" || field === "uin" || field === "gender") && !next) continue; // required-ish: don't blank out
+        const prev = mpc[field] || "";
+        mpc[field] = next;
+        if ((mpc[field] || "") !== prev) personChanges.push({ field, from: prev, to: mpc[field] || "" });
+      }
+    }
+
+    // ── 2. Product assignment ───────────────────────────────────────────────
+    let priceMovement = null;
+    let itemsTouched = false;
+
+    if (Array.isArray(products)) {
+      const desired = new Map();
+      for (const raw of products) {
+        const pid = (raw?.productId || "").toString();
+        if (!mongoose.Types.ObjectId.isValid(pid)) {
+          return res.status(400).json({ success: false, message: `Invalid productId: ${pid}` });
+        }
+        const qty = Number(raw.quantity);
+        if (!Number.isInteger(qty) || qty < 1) {
+          return res.status(400).json({ success: false, message: "Each product needs an integer quantity of at least 1" });
+        }
+        const vid = raw.variantId && mongoose.Types.ObjectId.isValid(raw.variantId) ? raw.variantId.toString() : null;
+        const k = prodKey(pid, vid);
+        // Same product+variant listed twice — fold the quantities together.
+        const existing = desired.get(k);
+        desired.set(k, {
+          productId: pid,
+          variantId: vid,
+          quantity: (existing?.quantity || 0) + qty,
+          productName: (raw.productName || existing?.productName || "").trim(),
+        });
+      }
+
+      const current = new Map();
+      for (const p of entry.products || []) {
+        if (!p.productId) continue;
+        current.set(prodKey(p.productId, p.variantId), p);
+      }
+
+      const allWOs = await WorkOrder.find({ customerRequestId: request._id });
+      const hasWorkOrders = allWOs.length > 0;
+      const touchedWOs = new Map(); // id -> qty before this request
+      const woMaxUnit = new Map();  // id -> highest unitEnd currently allocated
+
+      const loadWoMaxUnit = async (wo) => {
+        const id = wo._id.toString();
+        if (woMaxUnit.has(id)) return woMaxUnit.get(id);
+        const last = await EmployeeProductionProgress.find({ workOrderId: wo._id })
+          .select("unitEnd").sort({ unitEnd: -1 }).limit(1).lean();
+        const max = last[0]?.unitEnd || 0;
+        woMaxUnit.set(id, max);
+        return max;
+      };
+
+      const markTouched = (wo) => {
+        const id = wo._id.toString();
+        if (!touchedWOs.has(id)) touchedWOs.set(id, wo.quantity || 0);
+      };
+
+      const DEAD_WO_STATUSES = ["completed", "cancelled", "forwarded"];
+
+      // `liveOnly` matters when units are being ADDED. Emptying a work order
+      // cancels it rather than deleting it, so a person who is swapped off a
+      // product and later swapped back would otherwise match that dead order and
+      // be refused forever. Hiding dead orders from a pure addition lets a fresh
+      // one be created instead. Reductions still see every order, so an existing
+      // progress row is always found and reported against honestly.
+      const findWO = (pid, vid, { liveOnly = false } = {}) => {
+        const pool = liveOnly ? allWOs.filter((w) => !DEAD_WO_STATUSES.includes(w.status)) : allWOs;
+        const byVariant = vid ? pool.find((w) => w.stockItemId?.toString() === pid && w.variantId === vid) : null;
+        if (byVariant) return byVariant;
+        return pool.find((w) => w.stockItemId?.toString() === pid) || null;
+      };
+
+      // Request item + variant this person's units land on. Creates the item /
+      // variant when the person is being moved onto a product the PO doesn't
+      // carry yet.
+      const resolveRequestSlot = async (pid, vid, wo) => {
+        let item = request.items.find((i) => (i.stockItemId?._id || i.stockItemId)?.toString() === pid);
+        let stockItem = null;
+
+        if (!item) {
+          stockItem = await StockItem.findById(pid);
+          if (!stockItem) return { error: "Product not found in catalogue" };
+          item = {
+            stockItemId: stockItem._id,
+            stockItemName: stockItem.name,
+            stockItemReference: stockItem.reference || "",
+            variants: [],
+            totalQuantity: 0,
+            totalEstimatedPrice: 0,
+          };
+          request.items.push(item);
+          item = request.items[request.items.length - 1];
+        }
+
+        let variant = null;
+        if (vid) variant = (item.variants || []).find((v) => v.variantId?.toString() === vid);
+        if (!variant && wo?.variantAttributes?.length) {
+          variant = (item.variants || []).find((v) => attrsMatchLoose(wo.variantAttributes, v.attributes));
+        }
+        if (!variant && !vid && item.variants?.length) variant = item.variants[0];
+
+        // A brand-new variant line has no price history to divide, so seed the
+        // per-unit rate from the catalogue.
+        let unitPriceHint = 0;
+        if (!variant) {
+          if (!stockItem) stockItem = await StockItem.findById(pid);
+          const sv = vid ? (stockItem?.variants || []).find((v) => v._id.toString() === vid) : (stockItem?.variants || [])[0];
+          unitPriceHint = Number(stockItem?.baseSalesPrice) || 0;
+          item.variants.push({
+            variantId: sv?._id || vid || null,
+            attributes: sv?.attributes || [],
+            quantity: 0,
+            specialInstructions: [],
+            estimatedPrice: 0,
+          });
+          variant = item.variants[item.variants.length - 1];
+        }
+
+        return { item, variant, unitPriceHint };
+      };
+
+      const keys = new Set([...current.keys(), ...desired.keys()]);
+
+      for (const key of keys) {
+        const now = current.get(key);
+        const next = desired.get(key);
+        const oldQty = now?.quantity || 0;
+        const newQty = next?.quantity || 0;
+        const pid = (next?.productId || now?.productId)?.toString();
+        const vid = next?.variantId || now?.variantId?.toString() || null;
+        const label = next?.productName || now?.productName || "product";
+
+        if (oldQty === newQty) {
+          if (now && next?.productName && next.productName !== now.productName) now.productName = next.productName;
+          continue;
+        }
+
+        const delta = newQty - oldQty;
+        let wo = hasWorkOrders ? findWO(pid, vid, { liveOnly: oldQty === 0 }) : null;
+
+        // Moving somebody onto a product this PO has never carried, on an order
+        // that is already on the shop floor: the product needs a work order of
+        // its own or the units would be invisible to production.
+        let woIsNew = false;
+        if (!wo && hasWorkOrders && newQty > 0) {
+          const stockItem = await StockItem.findById(pid);
+          if (!stockItem) { blocked.push({ key, product: label, reason: "product not found in catalogue" }); continue; }
+          const variantData = (vid && stockItem.variants?.find((v) => v._id.toString() === vid)) || stockItem.variants?.[0];
+          if (!variantData) { blocked.push({ key, product: label, reason: "product has no variant to manufacture" }); continue; }
+          // Built at the final quantity, so its BOM snapshot is scaled correctly
+          // from the outset — the delta pass below must therefore skip it.
+          wo = await createWorkOrderForVariant(request, stockItem, variantData, newQty, req.user?.id);
+          allWOs.push(wo);
+          woIsNew = true;
+        }
+
+        // ── Guard rails on the work order ──────────────────────────────────
+        if (wo) {
+          if (["completed", "cancelled", "forwarded"].includes(wo.status)) {
+            blocked.push({ key, product: label, reason: `work order ${wo.workOrderNumber} is ${wo.status}` });
+            continue;
+          }
+          const projected = (wo.quantity || 0) + delta;
+          if (projected < (wo.packagedQuantity || 0) || projected < (wo.dispatchedQuantity || 0)) {
+            blocked.push({ key, product: label, reason: `work order ${wo.workOrderNumber} already has packaged/dispatched units above the new quantity` });
+            continue;
+          }
+        }
+
+        // ── Production progress for this person on this WO ──────────────────
+        let progress = null;
+        if (wo) {
+          progress = await EmployeeProductionProgress.findOne({ workOrderId: wo._id, employeeId: mpc._id });
+        }
+
+        if (newQty === 0) {
+          if (progress) {
+            if ((progress.completedUnits || 0) > 0 || (progress.packagedUnits || 0) > 0 || progress.isDispatched) {
+              blocked.push({ key, product: label, reason: "units are already completed / packaged / dispatched — cannot remove" });
+              continue;
+            }
+            await EmployeeProductionProgress.deleteOne({ _id: progress._id });
+          }
+        } else if (progress) {
+          const max = await loadWoMaxUnit(wo);
+          const outcome = replanUnitRange(progress, newQty, max, wo.workOrderNumber);
+          if (!outcome.ok) { blocked.push({ key, product: label, reason: outcome.reason }); continue; }
+          woMaxUnit.set(wo._id.toString(), outcome.maxUnitEnd);
+          await progress.save();
+        } else if (wo) {
+          // New product for this person on an existing WO — take the tail.
+          const max = await loadWoMaxUnit(wo);
+          const unitStart = max + 1;
+          const unitEnd = max + newQty;
+          woMaxUnit.set(wo._id.toString(), unitEnd);
+          await EmployeeProductionProgress.findOneAndUpdate(
+            { workOrderId: wo._id, employeeId: mpc._id },
+            {
+              $set: {
+                measurementId: measurement._id,
+                manufacturingOrderId: request._id,
+                employeeName: mpc.name,
+                employeeUIN: mpc.uin,
+                gender: mpc.gender,
+                unitStart, unitEnd, totalUnits: newQty,
+                assignedBarcodeIds: barcodesFor(wo.workOrderNumber, unitStart, unitEnd),
+                completedUnits: 0, completedUnitNumbers: [], completionPercentage: 0,
+                lastSyncedAt: new Date(),
+              },
+            },
+            { upsert: true, new: true }
+          );
+        }
+
+        // ── Work order quantity ────────────────────────────────────────────
+        if (wo && !woIsNew) {
+          markTouched(wo);
+          wo.quantity = (wo.quantity || 0) + delta;
+        }
+
+        // ── Request item / variant quantity + estimated price ───────────────
+        const slot = await resolveRequestSlot(pid, vid, wo);
+        if (slot.error) { blocked.push({ key, product: label, reason: slot.error }); continue; }
+        const { item, variant, unitPriceHint } = slot;
+
+        const beforeVariantQty = variant.quantity || 0;
+        const perUnitPrice = beforeVariantQty > 0 && variant.estimatedPrice
+          ? variant.estimatedPrice / beforeVariantQty
+          : unitPriceHint;
+
+        variant.quantity = beforeVariantQty + delta;
+        item.totalQuantity = (item.totalQuantity || 0) + delta;
+
+        const newVariantPrice = parseFloat((perUnitPrice * variant.quantity).toFixed(2));
+        item.totalEstimatedPrice = parseFloat(
+          (((item.totalEstimatedPrice || 0) - (variant.estimatedPrice || 0)) + newVariantPrice).toFixed(2)
+        );
+        variant.estimatedPrice = newVariantPrice;
+        itemsTouched = true;
+
+        // A variant that no longer carries any units is dead weight on the PO.
+        if (variant.quantity <= 0) {
+          item.variants = (item.variants || []).filter((v) => v !== variant && (v.quantity || 0) > 0);
+        }
+
+        productChanges.push({ product: label, from: oldQty, to: newQty, workOrder: wo?.workOrderNumber || null });
+      }
+
+      // Drop request items that ended up with nothing on them.
+      request.items = request.items.filter((i) => (i.totalQuantity || 0) > 0 && (i.variants || []).length > 0);
+
+      // ── Apply the accepted changes to the two person-level records ───────
+      // A blocked line keeps whatever it had before, so the person record can
+      // never drift away from the work orders that were actually adjusted.
+      const blockedKeys = new Set(blocked.map((b) => b.key));
+      const finalProducts = [];
+      for (const [key, want] of desired) {
+        if (blockedKeys.has(key)) {
+          const keep = current.get(key);
+          if (keep) finalProducts.push(keep);
+          continue;
+        }
+        finalProducts.push({
+          productId: want.productId,
+          variantId: want.variantId,
+          quantity: want.quantity,
+          productName: want.productName,
+        });
+      }
+      // Anything blocked from removal has to stay on the person.
+      for (const [key, had] of current) {
+        if (desired.has(key)) continue;
+        if (blockedKeys.has(key)) finalProducts.push(had);
+      }
+
+      mpc.products = finalProducts.map((p) => ({
+        productId: p.productId,
+        variantId: p.variantId || undefined,
+        quantity: p.quantity,
+        productName: p.productName || "",
+      }));
+
+      entry.products = finalProducts.map((p) => {
+        const prior = current.get(prodKey(p.productId, p.variantId));
+        return {
+          productId: p.productId,
+          productName: p.productName || prior?.productName || "",
+          variantId: p.variantId || null,
+          variantName: prior?.variantName || "Default",
+          quantity: p.quantity,
+          // Measurements taken against this product survive a pure quantity
+          // change; a swap to a different product legitimately starts blank.
+          measurements: prior?.measurements || [],
+          measuredAt: prior?.measuredAt || new Date(),
+          qrGenerated: prior?.qrGenerated || false,
+          templateId: prior?.templateId,
+          templateName: prior?.templateName,
+        };
+      });
+      entry.noProductAssigned = entry.products.length === 0;
+
+      // ── Persist the touched work orders ─────────────────────────────────
+      for (const [woId, oldQty] of touchedWOs) {
+        const wo = allWOs.find((w) => w._id.toString() === woId);
+        if (!wo) continue;
+        if (wo.quantity <= 0) {
+          // Nobody is left on this work order — retire it rather than leaving a
+          // zero-quantity order on the shop floor. `status: "cancelled"` is what
+          // every other reader of a WorkOrder actually checks to know it's dead
+          // (see the guard a few lines up: `["completed","cancelled","forwarded"]`)
+          // — the schema's own `quantity: { min: 1 }` means the field can never
+          // legitimately hold 0, cancelled or not, so the last real quantity is
+          // kept as a record of what this order was for rather than zeroed out.
+          // `oldQty` is safe as a floor here: it was read from an already-saved
+          // WorkOrder, which the same schema constraint guarantees was >= 1.
+          await EmployeeProductionProgress.deleteMany({ workOrderId: wo._id });
+          wo.status = "cancelled";
+          wo.quantity = oldQty > 0 ? oldQty : 1;
+        } else {
+          rescaleWorkOrderRawMaterials(wo, oldQty);
+        }
+        await wo.save();
+      }
+    }
+
+    // ── 3. Push identity onto the denormalised copies ───────────────────────
+    if (personChanges.length) {
+      entry.employeeName = mpc.name;
+      entry.employeeUIN = mpc.uin;
+      entry.gender = mpc.gender;
+      await EmployeeProductionProgress.updateMany(
+        { manufacturingOrderId: request._id, employeeId: mpc._id },
+        { $set: { employeeName: mpc.name, employeeUIN: mpc.uin, gender: mpc.gender } }
+      );
+    }
+
+    // ── 4. Re-price ─────────────────────────────────────────────────────────
+    if (itemsTouched) priceMovement = await recalcQuotationFromRequestItems(request);
+
+    await mpc.save();
+    measurement.markModified("employeeMeasurements");
+    await measurement.save();
+    request.markModified("items");
+    if (itemsTouched) request.markModified("quotations");
+    request.updatedBy = req.user?.id;
+    request.updatedAt = new Date();
+    await request.save();
+
+    const parts = [];
+    if (personChanges.length) parts.push(`${personChanges.length} detail(s) updated`);
+    if (productChanges.length) parts.push(`${productChanges.length} product change(s) applied`);
+    if (blocked.length) parts.push(`${blocked.length} blocked`);
+
+    res.json({
+      success: true,
+      message: parts.length ? parts.join(" · ") : "No changes were needed",
+      personChanges,
+      productChanges,
+      blocked,
+      priceMovement,
+    });
+  } catch (err) {
+    console.error("change person error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while changing the person's information",
+      error: process.env.NODE_ENV === "development" ? err.message : undefined,
+    });
+  }
+});
+
 router.put("/payment-submissions/:submissionId/status", async (req, res) => {
   try {
     const { submissionId } = req.params;

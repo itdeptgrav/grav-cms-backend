@@ -1661,6 +1661,18 @@ app.use("/cowork", require("./routes/task_routes/coworkAttachments.js"));
 // drawing for everybody on the map, and that check has to be unskippable.
 app.use("/cowork", require("./routes/task_routes/coworkMindmaps.js"));
 
+// Document notifications and version history: /cowork/documents/:id/*.
+// (Was written but never mounted — the notify-member route it already
+// carried was unreachable dead code until this line; version history is the
+// first thing that made that gap actually load-bearing.)
+app.use("/cowork", require("./routes/task_routes/coworkDocs.routes.js"));
+
+// External sharing: /cowork/share/*. Invite/list/revoke are owner-only and
+// Firebase-authenticated; /cowork/share/accept and /cowork/share/guest/* carry
+// no Firebase auth at all — a person with no Cowork account reaches them with
+// a guest bearer token this route family issues itself.
+app.use("/cowork", require("./routes/task_routes/coworkExternalShare.routes.js"));
+
 app.use(
   "/api/cowork/notifications",
   require("./routes/CMS_Routes/Inventory/Operations/coworkNotificationRoutes"),
@@ -1682,6 +1694,11 @@ app.use("/cowork", require("./routes/task_routes/pmpRoutes"));
 app.use("/cowork", require("./routes/task_routes/livekit.routes"));
 
 app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
+
+// The verbatim transcript — exact words, original language preserved, a
+// separate capability from the summary above. Mounted after it because it
+// requires meetingSummary.routes's additive `.helpers` export.
+app.use("/cowork", require("./routes/task_routes/meetingTranscript.routes"));
 
 app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
 

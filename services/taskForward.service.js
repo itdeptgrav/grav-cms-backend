@@ -242,8 +242,6 @@ async function _buildPath(parentTaskId) {
  * reshuffling a queue because somebody was given more work would move tasks a
  * manager had deliberately ordered.
  */
-const { isBudgetSettled } = require("./activePriority");
-
 const _CLOSED_STATUS = new Set(["done", "cancelled"]);
 const _CLOSED_REVIEW = new Set(["completed", "approved", "tl_approved", "ceo_approved"]);
 
@@ -258,9 +256,22 @@ async function nextActiveRankFor(db, employeeId) {
     if (t.isDeleted) return;
     if (_CLOSED_STATUS.has(t.status)) return;
     if (_CLOSED_REVIEW.has(t.completionStatus)) return;
-    // A task whose time budget is still being agreed is not in the queue, so it
-    // must not push the next task's rank up and leave a gap that never closes.
-    if (!isBudgetSettled(t)) return;
+    // A task whose budget is still being agreed STILL OCCUPIES ITS RANK.
+    //
+    // This used to skip them, on the reasoning that unsettled work is not in the
+    // queue and so must not push the next rank up and leave a gap. The gap it
+    // avoided is harmless — the client derives gap-free display positions from
+    // the queue, so a hole in the stored numbers is never seen. What it caused
+    // is not: assign two tasks to somebody before they accept the first, which
+    // is an entirely ordinary morning, and the second one skips the first
+    // entirely, so both are stored at rank 1. Two tasks at the same rank have no
+    // defined order, and the deadline chain is laid out in rank order — so the
+    // collision decides somebody's due dates by whatever order Firestore
+    // happened to return.
+    //
+    // A rank is a slot in a person's work, not a certificate that the hours are
+    // agreed. Handing somebody a second task takes the next slot whether or not
+    // they have accepted the first.
     const stored = (t.assigneePriorities || {})[employeeId];
     const rank = Number(typeof stored === "number" ? stored : t.priority);
     if (Number.isFinite(rank) && rank > highest) highest = rank;
