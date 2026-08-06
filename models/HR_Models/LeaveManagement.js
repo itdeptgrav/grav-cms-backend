@@ -256,7 +256,18 @@ const regularizationRequestSchema = new mongoose.Schema(
       required: true,
     },
     reason: { type: String, required: true },
-    requestedStatus: { type: String },
+
+    // What the day SHOULD have been. Constrained to the subset an employee may
+    // legitimately ask for: every value here is a member of STATUS_ENUM in
+    // Dailyattendance.js. Leave codes (L-CL/L-SL/L-EL), absence codes
+    // (AB/LAB/EAB/LWP), rest codes (WO/PH/FH/NH/OH/RH) and half-leave codes
+    // (P/CL…) are deliberately absent — those move through the leave module or
+    // an HR day-override, never through regularization.
+    requestedStatus: {
+      type: String,
+      enum: ["P", "P*", "P~", "HD", "WFH", "CO", null],
+      default: null,
+    },
 
     proposedPunchType: {
       type: String,
@@ -269,6 +280,17 @@ const regularizationRequestSchema = new mongoose.Schema(
       enum: ["add", "replace", "remove", null],
       default: null,
     },
+
+    // Wall-clock IST times for the day being regularized. Stored as Date,
+    // materialised from the "HH:mm" wire value via parseTimeOnDateIST(t, dateStr).
+    // These are what miss_punch / forgot_punch actually needs; proposedPunches[]
+    // is the more general (and rarely used) form and its punchType enum is
+    // ["in","out"] only, so it cannot express lunch/tea punches either.
+    //
+    // Both were read by the applier long before this declaration existed, which
+    // meant mongoose strict mode silently dropped every write of them.
+    proposedInTime: { type: Date, default: null },
+    proposedOutTime: { type: Date, default: null },
     proposedPunches: [
       {
         punchType: { type: String, enum: ["in", "out"] },
@@ -330,6 +352,19 @@ const regularizationRequestSchema = new mongoose.Schema(
     hrApprovedByName: { type: String, default: null },
     hrApprovedAt: { type: Date },
     hrRemarks: { type: String },
+
+    // Who took the FINAL decision that reached hr_approved. A secondary (or
+    // solo primary) manager finalises app-filed requests, and a manager is an
+    // Employee — writing that id into hrApprovedBy would point an
+    // "HRDepartment" ref at the wrong collection, so the chain gets its own
+    // pair of fields.
+    finalApprovedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Employee",
+      default: null,
+    },
+    finalApprovedByName: { type: String, default: null },
+
     rejectedBy: { type: mongoose.Schema.Types.ObjectId },
     rejectedAt: { type: Date },
     rejectionReason: { type: String },
@@ -344,6 +379,9 @@ const regularizationRequestSchema = new mongoose.Schema(
 regularizationRequestSchema.index({ employeeId: 1, status: 1 });
 regularizationRequestSchema.index({ status: 1, department: 1 });
 regularizationRequestSchema.index({ dateStr: 1 });
+// Backs the manager queue: every approver-facing query is
+// managersNotified.managerId + status.
+regularizationRequestSchema.index({ "managersNotified.managerId": 1, status: 1 });
 const RegularizationRequest = mongoose.model(
   "RegularizationRequest",
   regularizationRequestSchema,
