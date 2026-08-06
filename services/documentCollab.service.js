@@ -81,6 +81,32 @@ const SAVE_DEBOUNCE_MS = 3000;
 const pendingSaves = new Map();
 
 /**
+ * Version checkpoints — a snapshot of `ydocState` a person can restore to.
+ *
+ * ## Why this piggybacks on `saveState` rather than running on its own timer
+ *
+ * `saveState` already computes `Y.encodeStateAsUpdate(ydoc)` on every debounced
+ * save, which is the one expensive part of a checkpoint (walking the whole
+ * CRDT). Doing it again on a separate interval would double that cost for no
+ * reason; gating an EXTRA write behind the same call this file makes anyway is
+ * free by comparison — one more Firestore `set`, only every so often.
+ *
+ * Documents and sheets share `cowork_document_bodies` (see `KINDS.document`
+ * above), so both get checkpoints for free; mindmaps do not, since their body
+ * collection is separate and nothing here writes into it.
+ */
+const CHECKPOINT_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * Last checkpoint time per room, in memory only — matching `pendingSaves`
+ * above. A process restart loses the clock and the next save simply
+ * checkpoints again immediately, which is the safe direction to be wrong in:
+ * the alternative (persisting the clock) would need its own store for a fact
+ * that only ever gates a "would be nice" snapshot, never correctness.
+ */
+const lastCheckpointAt = new Map();
+
+/**
  * Who is connecting, or null.
  *
  * Reads the token from `auth.token` — the handshake's own field — rather than
@@ -223,7 +249,7 @@ async function loadState(room) {
  * overwriting a mindmap's `nodes` would leave a map that draws nothing — the
  * REST read (`GET /mindmaps/:id`) returns `nodes`, not the CRDT.
  */
-async function saveState(room, ydoc) {
+async function saveState(room, ydoc, roomName) {
   const cfg = KINDS[room.kind];
   if (!cfg) return;
   const state = Buffer.from(Y.encodeStateAsUpdate(ydoc)).toString("base64");
@@ -242,6 +268,48 @@ async function saveState(room, ydoc) {
       /* The record may have been deleted mid-session. The body write above is
          what matters; failing here must not lose it. */
     });
+
+  await maybeCheckpoint(room, roomName ?? room.id, state);
+}
+
+/**
+ * Write a version checkpoint, if enough time has passed since the last one
+ * for THIS room.
+ *
+ * Documents only (`room.kind === "document"`, which — see `KINDS` above —
+ * also covers sheets, sharing the same body collection). Mindmaps have no
+ * version history surface and no `versions` subcollection to write into.
+ *
+ * Best-effort: a failed checkpoint must not be treated as a failed save. The
+ * `ydocState` write above already landed; a missed snapshot is a smaller loss
+ * than the caller believing the whole save failed and retrying a keystroke
+ * that was, in fact, already persisted.
+ */
+async function maybeCheckpoint(room, roomName, ydocStateBase64) {
+  if (room.kind !== "document") return;
+  const now = Date.now();
+  const last = lastCheckpointAt.get(roomName) ?? 0;
+  if (now - last < CHECKPOINT_INTERVAL_MS) return;
+  lastCheckpointAt.set(roomName, now);
+  try {
+    const cfg = KINDS[room.kind];
+    await db
+      .collection(cfg.bodies)
+      .doc(room.id)
+      .collection("versions")
+      .add({
+        ydocState: ydocStateBase64,
+        createdAt: new Date().toISOString(),
+        /* Nobody in particular — this is the shared room's own clock ticking,
+           not one person's save. The manual "Save version now" route (see
+           `coworkDocs.routes.js`) stamps the person who asked for it instead. */
+        authorId: null,
+        authorName: "Autosaved",
+        label: null,
+      });
+  } catch (e) {
+    console.error("[collab] checkpoint failed", roomName, e.message);
+  }
 }
 
 /**
@@ -258,7 +326,7 @@ function scheduleSave(roomName, room, ydoc) {
     roomName,
     setTimeout(() => {
       pendingSaves.delete(roomName);
-      saveState(room, ydoc).catch((e) =>
+      saveState(room, ydoc, roomName).catch((e) =>
         console.error("[collab] save failed", roomName, e.message),
       );
     }, SAVE_DEBOUNCE_MS),
@@ -398,7 +466,7 @@ function initDocumentCollaboration(io) {
       pendingSaves.delete(roomName);
     }
     try {
-      await saveState(room, doc);
+      await saveState(room, doc, roomName);
       console.log(`[collab] room closed and saved ${roomName}`);
     } catch (e) {
       console.error("[collab] final save failed", roomName, e.message);
