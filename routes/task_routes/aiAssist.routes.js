@@ -10,7 +10,7 @@
  *   `/cowork` route (see Middlewear/coworkAuth.js).
  *
  *   Body: {
- *     surface: "docs" | "sheets",
+ *     surface: "docs" | "sheets" | "mindmap",
  *     instruction: string,
  *     context: { summary: string },
  *     history?: { role: "user" | "assistant", text: string }[]
@@ -48,8 +48,8 @@ router.post("/ai/assist", verifyCoworkToken, verifyEmployeeToken, async (req, re
     const body = req.body || {};
 
     const surface = body.surface;
-    if (surface !== "docs" && surface !== "sheets") {
-      return res.status(400).json({ error: 'surface must be "docs" or "sheets".' });
+    if (surface !== "docs" && surface !== "sheets" && surface !== "mindmap") {
+      return res.status(400).json({ error: 'surface must be "docs", "sheets", or "mindmap".' });
     }
 
     const instruction = typeof body.instruction === "string" ? body.instruction.trim() : "";
