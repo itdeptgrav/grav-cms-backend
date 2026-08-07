@@ -123,11 +123,7 @@ io.on("connection", (socket) => {
 const { initDocumentCollaboration } = require("./services/documentCollab.service");
 initDocumentCollaboration(io);
 
-/* WebRTC signaling for screen-share monitoring. Adds its own /presence-signal
-   namespace with its own JWT handshake auth — see the service for why. Also
-   leaves the connection handlers above untouched. */
-const { initPresenceSignal } = require("./services/presenceSignal.service");
-initPresenceSignal(io);
+
 
 // Make io accessible to routes
 app.set("io", io);
