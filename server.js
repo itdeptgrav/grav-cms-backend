@@ -19,6 +19,7 @@ const allowedOrigins = [
   "http://localhost:8081",
   "http://localhost:3001",
   "http://localhost:3002",
+  "http://localhost:50787",
   "https://grav-cms.vercel.app",
   "http://10.119.220.161:3000",
   "https://cms.grav.in",
@@ -121,6 +122,12 @@ io.on("connection", (socket) => {
    leaves the two connection handlers above untouched. */
 const { initDocumentCollaboration } = require("./services/documentCollab.service");
 initDocumentCollaboration(io);
+
+/* WebRTC signaling for screen-share monitoring. Adds its own /presence-signal
+   namespace with its own JWT handshake auth — see the service for why. Also
+   leaves the connection handlers above untouched. */
+const { initPresenceSignal } = require("./services/presenceSignal.service");
+initPresenceSignal(io);
 
 // Make io accessible to routes
 app.set("io", io);
