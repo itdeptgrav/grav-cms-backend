@@ -785,7 +785,7 @@ router.patch("/product-requests/:id/reject", async (req, res) => {
  */
 router.patch("/:id/items/:itemId/match", async (req, res) => {
   try {
-    const { rawItemId, variantId, variantCombination } = req.body;
+    const { rawItemId, variantId, variantCombination, requestedQty } = req.body;
     if (!rawItemId) return res.status(400).json({ success: false, message: "rawItemId required" });
 
     const mrf = await MRF.findById(req.params.id);
@@ -810,6 +810,21 @@ router.patch("/:id/items/:itemId/match", async (req, res) => {
     if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
     if ((rawItem.variants || []).length > 0 && !variantId) {
       return res.status(400).json({ success: false, message: "This item has variants — pick one before matching" });
+    }
+
+    // The store confirming the match is also the point where a genuinely
+    // wrong quantity the requester typed can be corrected — optional, and
+    // never below what's already issued (can't happen on an UNMATCHED item,
+    // but a re-match keeps the same floor for safety).
+    if (requestedQty !== undefined && requestedQty !== null && requestedQty !== "") {
+      const q = parseFloat(requestedQty);
+      if (!Number.isFinite(q) || q <= 0) {
+        return res.status(400).json({ success: false, message: "Quantity must be a positive number" });
+      }
+      if (q < (item.issuedQty || 0)) {
+        return res.status(400).json({ success: false, message: `Cannot set quantity below the ${item.issuedQty} ${item.unit} already issued` });
+      }
+      item.requestedQty = q;
     }
 
     // The requester's own unit (set when the request was raised) stays
