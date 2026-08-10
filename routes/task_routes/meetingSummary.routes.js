@@ -664,9 +664,11 @@ router.post(
   async (req, res) => {
     // Track all uploaded Gemini files — cleaned up on success AND failure
     const uploadedGeminiFiles = [];
+    /* Declared out here so the `finally` below can release the lock — it is a
+       sibling block of the try and cannot see anything declared inside it. */
+    const { meetId } = req.params;
 
     try {
-      const { meetId } = req.params;
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey)
         return res
@@ -1019,6 +1021,23 @@ router.post(
         });
       }
       return res.status(500).json({ error: e.message });
+    } finally {
+      // ── Release the lock however we leave ──────────────────────────────
+      // The success path and the catch each released it, but an early
+      // `return` from inside the try reaches NEITHER. Two of them do exactly
+      // that: "No audio recordings found" (404) and the Gemini-upload 400.
+      //
+      // So asking for a summary of a meeting that was never recorded — the
+      // ordinary mistake — left the lock held, and every later attempt on
+      // that meeting was refused with "Summary generation already in
+      // progress. Please wait." for the full ten-minute timeout, INCLUDING
+      // after a recording had been made. The one error a person can act on
+      // was followed by ten minutes of an error they cannot.
+      //
+      // `finally` runs on every exit, so this cannot drift out of step with
+      // the returns above again.
+      processingLocks.delete(meetId);
+      processingLockTimestamps.delete(meetId);
     }
   },
 );
@@ -1101,26 +1120,3 @@ router.get(
 );
 
 module.exports = router;
-
-/**
- * Additive export of the conveyor-belt pipeline's low-level pieces, for
- * meetingTranscript.routes.js (the verbatim-transcript feature) to reuse
- * instead of carrying a fourth copy of the Drive→Gemini-File-API upload
- * dance that this file and askAI.routes.js already each have their own
- * version of.
- *
- * A plain property on the exported router, not a change to the export
- * shape — `require("./meetingSummary.routes")` still returns a working
- * Express router exactly as before; this only adds `.helpers` to it.
- * Nothing above this line was touched to produce it.
- */
-router.helpers = {
-  GEMINI_BASE,
-  GEMINI_UPLOAD_BASE,
-  MODELS_TO_TRY,
-  getDriveClient,
-  streamDriveToGeminiFileAPI,
-  waitForFileActive,
-  deleteGeminiFile,
-  callGemini,
-};
