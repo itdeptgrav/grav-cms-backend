@@ -1120,3 +1120,19 @@ router.get(
 );
 
 module.exports = router;
+
+/**
+ * Additive export — the Drive → Gemini File API → generateContent plumbing,
+ * shared with meetingTranscript.routes.js rather than copied a third time.
+ * Attached to the router (which is a function, so it takes properties fine)
+ * so `require(...)` keeps returning a mountable router unchanged.
+ */
+module.exports.helpers = {
+  MODELS_TO_TRY,
+  getDriveClient,
+  getDriveFileMeta,
+  streamDriveToGeminiFileAPI,
+  waitForFileActive,
+  deleteGeminiFile,
+  callGemini,
+};
