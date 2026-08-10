@@ -1209,21 +1209,22 @@ router.post("/:id/submit", salesAuth, async (req, res) => {
   }
 });
 
-// POST /api/cms/crm/leads/:id/approve — HOD/admin approves a submitted
-// Prospect AS an Active Lead. The ONLY path from Prospect to Active Lead.
-// Optional `assignedTo` lets the HOD assign a different owner IN the approval
-// action only (by default the creator, already assignedTo, stays owner). Uses
-// the same create-Activity-then-flip-then-rollback reliability pattern the old
-// activate path used — a Prospect can never become an Active Lead with no
-// first Activity, and a failed flip never leaves an orphaned Activity.
+// POST /api/cms/crm/leads/:id/approve — approves a submitted Prospect AS an
+// Active Lead. The ONLY path from Prospect to Active Lead.
+// Optional `assignedTo` lets the approver assign a different owner IN the
+// approval action only (by default the creator, already assignedTo, stays
+// owner). Uses the same create-Activity-then-flip-then-rollback reliability
+// pattern the old activate path used — a Prospect can never become an Active
+// Lead with no first Activity, and a failed flip never leaves an orphaned
+// Activity.
+//
+// NOT restricted to HOD/admin. Was gated by isSalesManager(); removed at the
+// CEO's explicit request — any authenticated Sales CRM user (still gated by
+// `salesAuth` above) may approve. reject/return-for-info below are untouched.
 router.post("/:id/approve", salesAuth, async (req, res) => {
   try {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
-    // HOD/admin only — enforced on the backend, per the spec.
-    if (!(await isSalesManager(req.user))) {
-      return res.status(403).json({ success: false, message: "Only a HOD or admin can approve a Prospect as an Active Lead." });
-    }
 
     const before = lead.toObject();
     try {
