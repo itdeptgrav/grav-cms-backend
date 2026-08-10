@@ -38,7 +38,7 @@ const SLUG_RE = /^[a-z0-9-]+$/;
 const EDITABLE = [
   "name", "description", "iconUrl", "iconAlt", "accentColor",
   "dashboardPath", "loginRedirect", "showOnOnboarding", "sortOrder",
-  "capabilities", "isActive",
+  "capabilities", "isActive", "externalBaseUrl",
 ];
 
 /** Additionally editable, but only on departments this system did not seed. */
@@ -719,6 +719,129 @@ router.post("/employees/:id/set-password", async (req, res) => {
     });
   } catch (error) {
     console.error("[access-admin] set employee password:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/**
+ * PATCH /api/admin/employees/:id/set-email
+ *
+ * Give an employee with no email on file one, so they stop being a dead end —
+ * today "no email" just disables the department picker and set-password
+ * button on their row with no way out.
+ */
+router.patch("/employees/:id/set-email", async (req, res) => {
+  try {
+    const employee = await Employee.findById(req.params.id)
+      .select("firstName lastName email")
+      .lean();
+    if (!employee) return fail(res, 404, "Employee not found");
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return fail(res, 400, "Enter a valid email address");
+    }
+
+    if (await Employee.exists({ email, _id: { $ne: employee._id } })) {
+      return fail(res, 409, "Another employee already uses that email address");
+    }
+
+    // updateOne, not .save() — same salary pre-save-hook landmine as set-password.
+    await Employee.updateOne({ _id: employee._id }, { $set: { email } });
+
+    audit(req, "employee.set-email", `${employee.firstName || req.params.id} → ${email}`);
+    res.json({ success: true, message: "Email saved.", email });
+  } catch (error) {
+    console.error("[access-admin] set employee email:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/* ================================================================== */
+/* COWORK ACCOUNT — link/provision, alongside the "cowork" department  */
+/* ================================================================== */
+//
+// Holding the "cowork" AccessDepartment (via accessDepartmentId or
+// additionalDepartmentIds, same as any other department) is the ACCESS
+// grant, but CoWork's identity lives in Firestore/Firebase, not in this
+// database — a grant alone does nothing until an account exists there too.
+// These two routes are what make a grant usable: check whether a
+// cowork_employees doc / Firebase Auth user exists for this employee, and
+// create one if not, wrapping the same createCoworkEmployee the legacy
+// CoWork employee-creation screen uses.
+
+/** GET /api/admin/employees/:id/cowork-account */
+router.get("/employees/:id/cowork-account", async (req, res) => {
+  try {
+    const employee = await Employee.findById(req.params.id)
+      .select("firstName lastName email biometricId")
+      .lean();
+    if (!employee) return fail(res, 404, "Employee not found");
+    if (!employee.biometricId) {
+      return res.json({ success: true, exists: false, reason: "NO_BIOMETRIC_ID" });
+    }
+
+    const { db } = require("../../config/firebaseAdmin");
+    const snap = await db.collection("cowork_employees").doc(employee.biometricId).get();
+    if (!snap.exists) return res.json({ success: true, exists: false });
+
+    const data = snap.data();
+    res.json({
+      success: true,
+      exists: true,
+      account: {
+        employeeId: snap.id,
+        role: data.role || "employee",
+        hasAuthUid: Boolean(data.authUid),
+        passwordChanged: Boolean(data.passwordChanged),
+      },
+    });
+  } catch (error) {
+    console.error("[access-admin] cowork-account status:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/** POST /api/admin/employees/:id/cowork-account — provision one. */
+router.post("/employees/:id/cowork-account", async (req, res) => {
+  try {
+    const employee = await Employee.findById(req.params.id)
+      .select("firstName lastName email phone department biometricId")
+      .lean();
+    if (!employee) return fail(res, 404, "Employee not found");
+    if (!employee.email) {
+      return fail(res, 400, "This employee has no email address — set one first.");
+    }
+    if (!employee.biometricId) {
+      return fail(res, 400, "This employee has no biometric ID on file, so a CoWork account cannot be linked to their HR record.");
+    }
+
+    const { db } = require("../../config/firebaseAdmin");
+    const existing = await db.collection("cowork_employees").doc(employee.biometricId).get();
+    if (existing.exists) {
+      return fail(res, 409, "This employee already has a CoWork account.");
+    }
+
+    const { createCoworkEmployee } = require("../../services/cowork.service");
+    const name = `${employee.firstName || ""} ${employee.lastName || ""}`.trim() || employee.email;
+    const result = await createCoworkEmployee({
+      name,
+      email: employee.email,
+      mobile: employee.phone || "",
+      city: "",
+      department: employee.department || "",
+      role: req.body?.role === "tl" ? "tl" : "employee",
+      employeeId: employee.biometricId,
+    });
+
+    audit(req, "employee.cowork-provision", `${employee.email} → ${result.employeeId}`);
+    res.status(201).json({
+      success: true,
+      message: "CoWork account created.",
+      account: { employeeId: result.employeeId, role: result.role, tempPassword: result.tempPassword },
+    });
+  } catch (error) {
+    console.error("[access-admin] provision cowork account:", error);
     fail(res, 500, error.message);
   }
 });

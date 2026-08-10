@@ -72,6 +72,14 @@ const accessDepartmentSchema = new mongoose.Schema(
     dashboardPath: { type: String, required: true, trim: true },
     loginRedirect: { type: String, trim: true },
 
+    // Set only on the "cowork" department. CoWork is a separate app on its own
+    // origin (dev port varies, prod is cowork.grav.in), so onboarding cannot
+    // route to it with a Next.js path the way every other department does —
+    // it needs a real base URL to hand the browser off to after the SSO
+    // bridge mints a token. Admin-editable so a dev/staging/prod URL doesn't
+    // need a code change; see routes/auth/deptAuth.js's cowork-sso route.
+    externalBaseUrl: { type: String, trim: true },
+
     // Whether the tile appears on the public onboarding page. Off for the
     // platform-admin row, and useful for staging a department before anyone
     // can see it.
