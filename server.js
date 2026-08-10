@@ -1025,6 +1025,39 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
+// Department -> product assignment rules, customer self-service. Same
+// router the sales on-behalf mount below uses (routes/CMS_Routes/Sales/
+// salesDepartmentRules.js is generic over req.customerId/req.onBehalfActor)
+// — this mount just authenticates the customer's OWN cookie instead of an
+// employee JWT, mirroring Employee_Mpc.js's own verifyCustomerToken.
+const salesDepartmentRulesRoutesForCustomer = require("./routes/CMS_Routes/Sales/salesDepartmentRules");
+app.use(
+  "/api/customer/department-rules",
+  (req, res, next) => {
+    try {
+      const jwt = require("jsonwebtoken");
+      const token = req.cookies.customerToken;
+      if (!token) {
+        return res
+          .status(401)
+          .json({ success: false, message: "Access denied. Please sign in." });
+      }
+      const decoded = jwt.verify(
+        token,
+        process.env.JWT_SECRET || "grav_clothing_secret_key_2024",
+      );
+      req.customerId = decoded.id;
+      req.onBehalfActor = { id: decoded.id, name: decoded.name || "" };
+      next();
+    } catch (error) {
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid token. Please sign in again." });
+    }
+  },
+  salesDepartmentRulesRoutesForCustomer,
+);
+
 // ── Sales acting on a customer's behalf ────────────────────────────────────
 // Same MPC router, scoped to :customerId and gated by the employee JWT instead
 // of the customer cookie. Lets a sales person build a customer's measurement
@@ -1047,6 +1080,26 @@ app.use(
     next();
   },
   employeeMpcRoutes,
+);
+
+// Department -> product assignment rules for the same sales-on-behalf
+// customer profile ("Department" tab next to MPC). Same router as the
+// customer self-service mount above (/api/customer/department-rules) —
+// just gated by the employee JWT + :customerId param instead.
+const salesDepartmentRulesRoutes = require("./routes/CMS_Routes/Sales/salesDepartmentRules");
+app.use(
+  "/api/cms/sales/customers/:customerId/department-rules",
+  EmployeeAuthForMpc,
+  (req, res, next) => {
+    const { customerId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return res.status(400).json({ success: false, message: "Invalid customer id" });
+    }
+    req.customerId = customerId;
+    req.onBehalfActor = { id: req.user?.id, name: req.user?.name };
+    next();
+  },
+  salesDepartmentRulesRoutes,
 );
 
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
