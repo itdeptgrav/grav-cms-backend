@@ -62,12 +62,21 @@ const SalesAuthMiddlewear = (req, res, next) => {
     }
 
     // ── Attach user to request (mirrors EmployeeAuthMiddlewear shape) ───────
+    // `email` (Draft Lead chunk) — the JWT already carries it (routes/login.js
+    // signs `email: user.email || ""` into every token), this middleware just
+    // wasn't reading it. Needed so a GET handler can resolve the caller's
+    // Sales DEPARTMENT role the same way Middlewear/departmentWriteGuard.js's
+    // seedIdentity already does for writes — that guard never runs for reads
+    // at all (GET/HEAD/OPTIONS pass instantly), so without this, "is this
+    // caller a Sales manager" would be unanswerable on a read. See
+    // services/salesAccess.js.
     req.user = {
       id: decoded.id,
       role: decoded.role,
       employeeId: decoded.employeeId,
       userType: decoded.userType,
       name: decoded.name || "",
+      email: decoded.email || "",
     };
 
     next();

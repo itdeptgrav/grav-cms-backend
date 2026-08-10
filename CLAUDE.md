@@ -2,6 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Shared AI collaboration workflow
+
+Claude Code is responsible for:
+
+- Reading the relevant documents under `docs/product/` and `docs/decisions/`, plus `docs/tasks/current-task.md`, before coding.
+- Implementing only the work defined in `docs/tasks/current-task.md`.
+- Reusing the existing architecture and established project patterns.
+- Preserving unrelated and uncommitted changes.
+- Running the verification relevant to the active task, subject to the repository safety guidance below.
+- Updating `docs/handoff/latest-implementation.md` with the implementation and verification results.
+- Stopping after the active task instead of starting the next task.
+- Not committing changes unless the user explicitly requests a commit.
+
+If the active task conflicts with durable product or architecture guidance, stop and report the conflict rather than expanding scope.
+
 ## What this is
 
 The single Express backend for the whole GRAV Clothing platform. Everything else talks to it:
