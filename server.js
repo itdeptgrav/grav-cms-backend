@@ -1167,14 +1167,6 @@ app.use(
   require("./routes/CMS_Routes/Sales/enquiries"),
 );
 
-// Costing requests — the Sales → Merchandising + Industrial Engineering costing
-// hand-off that backs a Cowork costing sheet, raised from an Enquiry. Records the
-// link + status; grav-cms provisions the sheet itself (Cowork Firestore).
-app.use(
-  "/api/cms/crm/costing-requests",
-  require("./routes/CMS_Routes/Sales/costingRequests"),
-);
-
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
