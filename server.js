@@ -1111,6 +1111,14 @@ app.use(
   require("./routes/CMS_Routes/Sales/enquiries"),
 );
 
+// Costing requests — the Sales → Merchandising + Industrial Engineering costing
+// hand-off that backs a Cowork costing sheet, raised from an Enquiry. Records the
+// link + status; grav-cms provisions the sheet itself (Cowork Firestore).
+app.use(
+  "/api/cms/crm/costing-requests",
+  require("./routes/CMS_Routes/Sales/costingRequests"),
+);
+
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
 app.use("/api/cms/units", unitsRoutes);
@@ -1692,6 +1700,10 @@ app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
 app.use("/cowork", require("./routes/task_routes/meetingTranscript.routes"));
 
 app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
+
+// Music recommendation engine — application-owned autoplay + suggested videos
+// for the Cowork music player. See MUSIC_RECOMMENDATION_ENGINE_NOTES.md.
+app.use("/cowork/music", require("./routes/music/recommendations.routes"));
 
 // Fix: askAI.routes exports an object, use .router
 const askAITest = require("./routes/task_routes/askAI.routes");

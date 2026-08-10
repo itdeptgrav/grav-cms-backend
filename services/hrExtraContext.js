@@ -17,7 +17,7 @@ const AttendanceSettings = require("../models/HR_Models/Attendancesettings");
 const PayrollSettings = require("../models/HR_Models/Payrollsettings");
 const { Payroll, PayrollItem } = require("../models/HR_Models/Payroll");
 const { CompanyHoliday, LeaveConfig } = require("../models/HR_Models/LeaveManagement");
-const { fullName, resolveEmployeeByQuery, istDateStr, istNow } = require("./hrEmployeeContext");
+const { fullName, resolveEmployeeByQuery, resolveSelfEmployee, istDateStr, istNow } = require("./hrEmployeeContext");
 
 const MAX_ROWS = 50;
 
@@ -247,13 +247,68 @@ async function buildPayrollContext() {
 // Returns one employee's monthly payroll figures. Bank account details are
 // deliberately excluded. Plain (comma-free) numbers appear in `readable` so the
 // grounding guard can verify every amount the model states.
-async function buildSalaryContext({ query, month, year } = {}) {
-  const emp = await resolveEmployeeByQuery(query);
+async function buildSalaryContext({ query, month, year, user, self, annual } = {}) {
+  // Self-queries ("how much did I earn") resolve to the LOGGED-IN user's own
+  // record via their identity — never a guess from the sentence. If the signed-in
+  // account has no employee record (e.g. the CEO login), say so plainly instead of
+  // surfacing someone else's payslip.
+  let emp = null;
+  if (self && user) {
+    emp = await resolveSelfEmployee(user);
+    if (!emp) {
+      return {
+        found: false,
+        note:
+          "Your signed-in account is not linked to an employee payroll record, so there is no personal salary to report for you.",
+        self: true,
+      };
+    }
+  }
+  if (!emp) emp = await resolveEmployeeByQuery(query);
   if (!emp) return { found: false, note: "No employee matching that name or ID was found in HR records." };
 
-  const filter = { biometricId: emp.biometricId };
   const m = Number(month);
   const y = Number(year);
+
+  // ANNUAL view: a whole-year total ("how much did I earn this year") — sum every
+  // payslip in the year, not just the latest month (the old behaviour, which
+  // reported a single month for a yearly question).
+  if (annual || (y >= 2000 && !(m >= 1 && m <= 12))) {
+    const yr = y >= 2000 ? y : istNow().getUTCFullYear();
+    const slips = await PayrollItem.find({ biometricId: emp.biometricId, year: yr })
+      .sort({ month: 1 })
+      .lean()
+      .catch(() => []);
+    if (!slips.length) {
+      return {
+        found: false,
+        employee: { name: fullName(emp), employeeId: emp.biometricId },
+        note: `No payroll runs found for ${yr}.`,
+        self: Boolean(self),
+      };
+    }
+    const netOf = (p) => Math.round(p.roundedNetPay || p.netPay || 0);
+    const grossOf = (p) => Math.round((p.earnings && p.earnings.grossEarnings) || 0);
+    const totalNet = slips.reduce((s, p) => s + netOf(p), 0);
+    const totalGross = slips.reduce((s, p) => s + grossOf(p), 0);
+    const name = slips[0].employeeName || fullName(emp);
+    const months = slips.map((p) => ({ period: `${String(p.month).padStart(2, "0")}/${p.year}`, netPay: netOf(p) }));
+    return {
+      found: true,
+      annual: true,
+      year: yr,
+      employee: { name, employeeId: emp.biometricId },
+      monthsPaid: slips.length,
+      totalNetPay: totalNet,
+      totalGross,
+      months,
+      readable:
+        `${name}'s total earnings for ${yr}: NET PAY ${amt(totalNet)} across ${slips.length} months ` +
+        `(${months.map((mm) => `${mm.period} ${amt(mm.netPay)}`).join(", ")}); total gross ${amt(totalGross)}. (All amounts in INR.)`,
+    };
+  }
+
+  const filter = { biometricId: emp.biometricId };
   if (m >= 1 && m <= 12) filter.month = m;
   if (y >= 2000) filter.year = y;
 
