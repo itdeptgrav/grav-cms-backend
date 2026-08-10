@@ -1397,7 +1397,105 @@ router.post("/change-password", async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* POST /api/auth/cowork-sso — hand off into the standalone CoWork app */
+/* ------------------------------------------------------------------ */
+//
+// CoWork lives on its own origin with its own Firebase-based sign-in
+// (grav-cms-38f45, same project as this backend's service account). This
+// mints a Firebase custom token for the caller's already-linked CoWork
+// account so onboarding can hand the browser off without asking for a
+// second password. It does not create anything — see the
+// /employees/:id/cowork-account routes in routes/Admin/accessAdmin.js for
+// provisioning a CoWork account that does not exist yet.
+router.post("/cowork-sso", async (req, res) => {
+  try {
+    const token =
+      req.cookies?.[COOKIE_NAME] ||
+      (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    if (!token) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+
+    const decoded = verifyToken(token);
+    if (decoded.v !== 2 || decoded.subject !== "employee") {
+      return res.status(403).json({
+        success: false,
+        message: "CoWork sign-in is only available to employee accounts.",
+      });
+    }
+
+    const employee = await Employee.findById(decoded.id);
+    if (!employee || employee.isActive === false || employee.status === "inactive") {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const allowed = await resolveEmployeeDepartments(employee);
+    const coworkDept = allowed.find((d) => d.slug === "cowork");
+    if (!coworkDept) {
+      return res.status(403).json({
+        success: false,
+        code: "NO_COWORK_ACCESS",
+        message: "You do not have CoWork access. Ask an administrator to grant it.",
+      });
+    }
+
+    if (!coworkDept.externalBaseUrl) {
+      return res.status(500).json({
+        success: false,
+        code: "NOT_CONFIGURED",
+        message: "CoWork access is granted, but no CoWork URL has been set up yet. Ask an administrator to configure it on the CoWork department.",
+      });
+    }
+
+    const biometricId = employee.biometricId;
+    if (!biometricId) {
+      return res.status(409).json({
+        success: false,
+        code: "NO_BIOMETRIC_ID",
+        message: "Your HR record has no biometric ID on file, so a CoWork account cannot be linked yet.",
+      });
+    }
+
+    const { db, auth: firebaseAuth } = require("../../config/firebaseAdmin");
+    let coworkDoc = await db.collection("cowork_employees").doc(biometricId).get();
+    if (!coworkDoc.exists) {
+      const alt = await db.collection("cowork_employees")
+        .where("employeeId", "==", biometricId).limit(1).get();
+      if (!alt.empty) coworkDoc = alt.docs[0];
+    }
+    if (!coworkDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        code: "NO_COWORK_ACCOUNT",
+        message: "No CoWork account exists for you yet. Ask an administrator to create one.",
+      });
+    }
+
+    const coworkData = coworkDoc.data();
+    if (!coworkData.authUid) {
+      return res.status(409).json({
+        success: false,
+        code: "NO_AUTH_UID",
+        message: "Your CoWork account is not fully set up. Ask an administrator to fix it.",
+      });
+    }
+
+    const customToken = await firebaseAuth.createCustomToken(coworkData.authUid);
+
+    res.json({
+      success: true,
+      token: customToken,
+      redirectBaseUrl: coworkDept.externalBaseUrl,
+    });
+  } catch (error) {
+    console.error("[auth] cowork-sso error:", error);
+    res.status(401).json({ success: false, message: "Invalid or expired session" });
+  }
+});
+
 module.exports = router;
 module.exports.verifyToken = verifyToken;
+module.exports.resolveEmployeeDepartments = resolveEmployeeDepartments;
 module.exports.signToken = signToken;
 module.exports.buildTokenPayload = buildTokenPayload;
