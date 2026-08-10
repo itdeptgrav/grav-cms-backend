@@ -908,6 +908,18 @@ const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
 app.use("/api/hr/overview", hrOverviewRoutes);
 
+// The page-scoped HR AI panels (/api/hr/ai/overview-assistant and
+// /api/hr/ai/daily-attendance-assistant) were removed — there is now ONE central
+// GRAV assistant for the whole CMS. HR data is reached through its permission-
+// gated tools instead of per-page endpoints.
+
+// Central GRAV assistant — ONE assistant for the whole CMS, available to any
+// authenticated employee. HR (and later Sales/Accounting) expose their data to
+// it as permission-gated tools; the HR routes above now run through this same
+// service. Conversation is keyed by user, not route.
+const gravAssistantRoutes = require("./routes/ai/assistant");
+app.use("/api/ai", gravAssistantRoutes);
+
 app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
 
 app.use("/api/hr", hrProfileRoutes);
@@ -1066,6 +1078,38 @@ const crmAccountsRoutes = require("./routes/CMS_Routes/Sales/accounts");
 app.use("/api/cms/crm/leads", salesWrites("lead"), crmLeadsRoutes);
 app.use("/api/cms/crm/contacts", salesWrites("contact"), crmContactsRoutes);
 app.use("/api/cms/crm/accounts", salesWrites("account"), crmAccountsRoutes);
+
+// CRM Step 01 — customer-account foundation (sites, departments, addresses,
+// typed account relationships, internal account team, activity timeline) plus
+// the controlled lookup values the frontend reads for its dropdowns. Same
+// Sales role + approval guard as the rest of CRM.
+app.use("/api/cms/crm/sites", salesWrites("CRM site"), require("./routes/CMS_Routes/Sales/sites"));
+app.use("/api/cms/crm/departments", salesWrites("CRM department"), require("./routes/CMS_Routes/Sales/departments"));
+app.use("/api/cms/crm/addresses", salesWrites("CRM address"), require("./routes/CMS_Routes/Sales/addresses"));
+app.use("/api/cms/crm/account-relationships", salesWrites("account relationship"), require("./routes/CMS_Routes/Sales/accountRelationships"));
+app.use("/api/cms/crm/account-team", salesWrites("account team"), require("./routes/CMS_Routes/Sales/accountTeam"));
+app.use("/api/cms/crm/activities", salesWrites("CRM activity"), require("./routes/CMS_Routes/Sales/activities"));
+app.use("/api/cms/crm/lookups", require("./routes/CMS_Routes/Sales/crmLookups"));
+
+// Sales Journey — the connected commercial lifecycle record (Account →
+// Retention). Same Sales role + approval guard as the rest of CRM: an editor's
+// "Start Journey" is held as a ChangeRequest and answered 202 rather than
+// creating a record. Only the Journey itself lives here; the seven later
+// lifecycle modules are not implemented.
+app.use(
+  "/api/cms/crm/sales-journeys",
+  salesWrites("sales journey"),
+  require("./routes/CMS_Routes/Sales/salesJourneys"),
+);
+
+// Enquiry / RFQ — the opportunity record inside a Journey's Enquiry stage.
+// Its own module (own collection + reference), lazily created on first open.
+// Mounted plainly: the route file applies salesAuth per-endpoint and writes
+// directly (operational sales data edited frequently, not approval-gated).
+app.use(
+  "/api/cms/crm/enquiries",
+  require("./routes/CMS_Routes/Sales/enquiries"),
+);
 
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");

@@ -1,0 +1,20 @@
+# Local speech-to-text sidecar for the GRAV assistant (services/ai/stt_server.py).
+# Runs faster-whisper 100% offline -- audio never leaves the machine.
+#
+# One-time setup (isolated venv, kept OUT of the ros2 conda env):
+#   python3 -m venv ~/.grav-stt-venv
+#   ~/.grav-stt-venv/bin/pip install -r services/ai/requirements-stt.txt
+#
+# The backend auto-starts the server on boot (services/ai/sttSidecar.js); it
+# looks for the interpreter at ~/.grav-stt-venv/bin/python by default. Override
+# with GRAV_STT_PYTHON / GRAV_STT_MODEL / GRAV_STT_PORT if your setup differs.
+#
+# Model: small.en is the default (good accuracy, fast on Apple Silicon). Bump to
+# medium.en via GRAV_STT_MODEL if you want higher accuracy on hard audio.
+
+faster-whisper==1.2.1
+# pulled in transitively, pinned here for a reproducible sidecar:
+ctranslate2==4.8.1
+av==18.0.0
+onnxruntime==1.28.0
+tokenizers==0.23.1

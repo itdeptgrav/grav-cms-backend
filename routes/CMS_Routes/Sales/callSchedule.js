@@ -1,10 +1,37 @@
 // routes/CMS_Routes/Sales/callSchedule.js
+//
+// POST /:id/complete's Lead-facing behaviour was revised for Lead Chunk 1
+// compatibility (review): a completed call against a Lead now always logs
+// through the shared CRMActivity model (leadId-owned) instead of appending
+// to the embedded `lead.activities[]` — existing embedded entries from
+// before this chunk remain fully readable, nothing migrates or deletes them.
+// An optional `newLeadStage` is routed through
+// services/leadQualification.js, the SAME shared service leads.js uses, so
+// it can never assign `proposal_sent`/`negotiation`/`won` or fake a
+// conversion, and `stage`/`qualificationState` cannot drift out of sync with
+// what leads.js would produce for the same request. If the requested stage
+// is no longer valid, the call itself still completes — only the stage
+// portion is skipped, reported back via `leadUpdate.applied === false`.
 const express = require("express");
 const router = express.Router();
 const CallSchedule = require("../../../models/CMS_Models/Sales/CallSchedule");
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
+const Activity = require("../../../models/CMS_Models/Sales/Activity");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
+const { recordChange } = require("../../../services/changeLog");
+const { applyLegacyStageChange } = require("../../../services/leadQualification");
+const { LEGACY_LEAD_STAGE_TO_QUALIFICATION } = require("../../../constants/crm");
+
+const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
+
+// Lead correction chunk: moving a Lead's canonical qualificationState to
+// "contacted" now requires a genuinely successful two-way contact — this
+// call-schedule flow has its own, richer outcome vocabulary (CallSchedule.js)
+// rather than the Lead-activity ACTIVITY_OUTCOME_CODES, so "successful"
+// is judged against THAT vocabulary here: any outcome other than one where
+// the call plainly never connected.
+const CALL_OUTCOMES_WITHOUT_CONTACT = new Set(["no_answer", "busy", "wrong_number", "voicemail"]);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -163,7 +190,10 @@ router.patch("/:id", salesAuth, async (req, res) => {
 });
 
 // ─── POST /api/cms/crm/call-schedules/:id/complete ────────────────────────────
-// Mark a call as completed, record outcome, and optionally update lead stage.
+// Mark a call as completed, record outcome, and optionally move the Lead's
+// qualification state. See the file header for the Lead Chunk 1 compatibility
+// notes — this no longer writes to the embedded lead.activities[], and no
+// longer assigns proposal/negotiation/won or fakes a conversion.
 router.post("/:id/complete", salesAuth, async (req, res) => {
   try {
     const {
@@ -172,6 +202,7 @@ router.post("/:id/complete", salesAuth, async (req, res) => {
       callDurationActual,
       newLeadStage,
       nextFollowUpAt,
+      reason,
     } = req.body;
 
     const schedule = await CallSchedule.findById(req.params.id);
@@ -183,46 +214,102 @@ router.post("/:id/complete", salesAuth, async (req, res) => {
     schedule.feedbackNotes      = feedbackNotes;
     schedule.callDurationActual = callDurationActual;
     schedule.nextFollowUpAt     = nextFollowUpAt;
-
-    if (newLeadStage) schedule.newLeadStage = newLeadStage;
-
+    // `newLeadStage` is deliberately NOT set here. It is only persisted
+    // below, in a second small save, and only once the Lead transition has
+    // actually succeeded — a rejected value (e.g. "won") must never be
+    // recorded as if it took effect.
     await schedule.save();
 
-    // ── Update lead stage if requested ────────────────────────────────────
-    if (newLeadStage && schedule.entityType === "lead" && schedule.entityId) {
+    let leadUpdate = null;
+
+    if (schedule.entityType === "lead" && schedule.entityId) {
       const lead = await Lead.findById(schedule.entityId);
       if (lead) {
-        const prevStage = lead.stage;
-        lead.stage = newLeadStage;
-        if (newLeadStage === "won") {
-          lead.probability = 100;
-          lead.convertedToCustomer = true;
-          lead.convertedAt = new Date();
-        }
+        // Captured before ANY field below is touched — lastContactedAt,
+        // nextFollowUpAt and the qualification transition are all mutated
+        // on this same in-memory document, so a `before` taken after any of
+        // them would already reflect the change it's supposed to be "before".
+        const before = lead.toObject();
+
+        // Every completed call becomes a shared CRMActivity, owned by the
+        // Lead — never a new lead.activities[] entry. Existing embedded
+        // entries from before this chunk are untouched and remain readable.
+        const callActivity = await Activity.create({
+          leadId: lead._id,
+          activityType: "call",
+          subject: `Call completed — ${outcome || "completed"}`,
+          description: feedbackNotes || "",
+          status: "completed",
+          completedAt: new Date(),
+          outcome,
+          ownerId: req.user?.id,
+          ownerName: req.user?.name || "Sales",
+          createdBy: actor(req),
+          updatedBy: actor(req),
+        });
+        await recordChange(req, {
+          departmentSlug: "sales",
+          entity: "crm-activity",
+          entityId: callActivity._id,
+          entityLabel: callActivity.subject,
+          action: "create",
+          summary: `Call logged for Lead ${lead.leadId}`,
+          after: callActivity.toObject(),
+        });
+
         lead.lastContactedAt = new Date();
         if (nextFollowUpAt) lead.nextFollowUpAt = new Date(nextFollowUpAt);
 
-        lead.activities.push({
-          type:            "call",
-          title:           `Call completed — ${outcome || "completed"}`,
-          description:     feedbackNotes || "",
-          performedByName: req.user?.name || "Sales",
-          performedBy:     req.user?.id,
-          completedAt:     new Date(),
-          outcome:         outcome,
-        });
-
-        if (newLeadStage !== prevStage) {
-          lead.activities.push({
-            type:            "status_change",
-            title:           `Stage: ${prevStage} → ${newLeadStage}`,
-            performedByName: req.user?.name || "Sales",
-            performedBy:     req.user?.id,
-            completedAt:     new Date(),
-          });
+        if (newLeadStage && newLeadStage !== lead.stage) {
+          try {
+            const targetState = LEGACY_LEAD_STAGE_TO_QUALIFICATION[newLeadStage];
+            const context =
+              targetState === "contacted"
+                ? { hasSuccessfulContact: Boolean(outcome) && !CALL_OUTCOMES_WITHOUT_CONTACT.has(outcome) }
+                : {};
+            applyLegacyStageChange(lead, {
+              stage: newLeadStage,
+              reason: reason || feedbackNotes,
+              actor: actor(req),
+              context,
+            });
+            leadUpdate = { applied: true, stage: null, qualificationState: null };
+          } catch (err) {
+            // The call itself still completes — only the stage request is
+            // rejected (e.g. "won"/"negotiation"/"proposal_sent", or an
+            // invalid transition from the Lead's current state).
+            leadUpdate = { applied: false, message: err.message };
+          }
         }
 
+        // Exactly one save for whatever changed above (lastContactedAt
+        // always; nextFollowUpAt and the qualification state if requested
+        // and, for the latter, only if the transition actually applied).
         await lead.save();
+
+        if (leadUpdate?.applied) {
+          leadUpdate.stage = lead.stage;
+          leadUpdate.qualificationState = lead.qualificationState;
+          // Only now, once the transition is known to have succeeded, is it
+          // recorded on the CallSchedule.
+          schedule.newLeadStage = newLeadStage;
+          await schedule.save();
+        }
+
+        // One Lead audit call, always — lastContactedAt changed unconditionally
+        // in this branch, so there is always something to record.
+        await recordChange(req, {
+          departmentSlug: "sales",
+          entity: "lead",
+          entityId: lead._id,
+          entityLabel: `${lead.firstName} ${lead.lastName || ""}`.trim(),
+          action: "update",
+          summary: leadUpdate?.applied
+            ? `Stage (via call completion): ${before.stage} → ${newLeadStage}`
+            : "Updated via call completion",
+          before,
+          after: lead.toObject(),
+        });
       }
     }
 
@@ -234,7 +321,7 @@ router.post("/:id/complete", salesAuth, async (req, res) => {
       });
     }
 
-    res.json({ success: true, schedule });
+    res.json({ success: true, schedule, leadUpdate });
   } catch (err) {
     console.error("[call-schedules] POST /:id/complete", err);
     res.status(400).json({ success: false, message: err.message });
