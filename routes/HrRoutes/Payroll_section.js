@@ -97,6 +97,40 @@ function calendarDaysSinceDOJ(dateOfJoining, month, year) {
   return Math.floor((endOfMonth - doj) / msPerDay) + 1;
 }
 
+// ── ESI eligibility ──────────────────────────────────────────────────────────
+//  Eligibility is a property of the EMPLOYEE'S WAGE RATE, not of how much they
+//  happened to earn in one month. It must therefore be tested against the FULL
+//  monthly basic (employee.salary.basic), exactly like the Employee form's own
+//  pre-save calculation in models/Employee.js does.
+//
+//  Testing it against the prorated `basicEarned` was a real bug: an employee on
+//  a ₹25,000 basic (well over the ₹21,000 ceiling, correctly shown as "Not
+//  applicable" in the Employee form) who was paid for only 12 of 31 days earned
+//  a basic of ₹9,678 — under the ceiling — and so silently became ESI-liable
+//  for that one month. Mid-month joiners and anyone with LOP were affected;
+//  full-month employees on the same salary were not, which is why it looked
+//  arbitrary across the list.
+//
+//  The contribution AMOUNT stays on the earned basic — contributions are on
+//  wages actually paid — but whether there is a contribution at all is decided
+//  by the full basic. Both figures are returned so callers never re-derive one
+//  without the other.
+function computeEsi(fullBasic, basicEarned, salaryCfg) {
+  const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
+  const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
+  const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
+
+  const rateBasic = Number(fullBasic) || 0;
+  const earned = Number(basicEarned) || 0;
+  const applicable = rateBasic > 0 && rateBasic <= esiLimit && earned > 0;
+
+  return {
+    applicable,
+    esic: applicable ? Math.ceil(earned * eeEsicPct) : 0,
+    erEsic: applicable ? Math.ceil(earned * erEsicPct) : 0,
+  };
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENGINE
 // ═════════════════════════════════════════════════════════════════════════════
@@ -470,8 +504,6 @@ function computeEmployeePayroll(employee, ctx) {
 
   const epfCap = salaryCfg?.epfCapAmount ?? 1800;
   const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
-  const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
-  const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
   // EPF — respect the HR per-employee override stored on the employee's
   // salary. When epfOverride is set, the HR-entered monthly EPF is treated as
@@ -485,8 +517,8 @@ function computeEmployeePayroll(employee, ctx) {
   const epf = epfOverridden
     ? Math.round(overrideEpfFull * earnedRatio)
     : Math.round(Math.min(basicEarned * eepfPct, epfCap));
-  const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
-  const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
+  // Eligibility on the FULL basic, amount on the earned basic — see computeEsi.
+  const { esic, erEsic } = computeEsi(fullBasic, basicEarned, salaryCfg);
   const pt =
     settings.ptEnabled && settings.ptForBasic
       ? settings.ptForBasic(basicEarned)
@@ -592,9 +624,7 @@ function computeEmployeePayroll(employee, ctx) {
       providentFund: epf,
       employerPF: epf,
       esic: esic,
-      employerESIC: esiApplicable
-        ? Math.ceil(basicEarned * ((salaryCfg?.erEsicPct ?? 3.25) / 100))
-        : 0,
+      employerESIC: erEsic,
       professionalTax: pt,
       incomeTax: 0,
       loanDeduction: 0,
@@ -1293,9 +1323,6 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
 
     const epfCap = salaryCfg?.epfCapAmount ?? 1800;
     const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
-    const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
-    const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
-    const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
     // EPF — respect the employee's HR override. When set, prorate the stored
     // full-month EPF by the earned-gross ratio; otherwise statutory on basic.
@@ -1305,9 +1332,8 @@ router.patch("/item/:id/override", EmployeeAuthMiddlewear, async (req, res) => {
     const epf = epfOverridden
       ? Math.round(overrideEpfFull * earnedRatio)
       : Math.round(Math.min(basicEarned * eepfPct, epfCap));
-    const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
-    const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
-    const erEsic = esiApplicable ? Math.ceil(basicEarned * erEsicPct) : 0;
+    // Eligibility on the full basic, not the prorated one — see computeEsi.
+    const { esic, erEsic } = computeEsi(fullBasic, basicEarned, salaryCfg);
     const pt =
       settings.ptEnabled && settings.ptForBasic
         ? settings.ptForBasic(basicEarned)
@@ -1544,9 +1570,6 @@ router.patch(
       // Statutory deductions recomputed on the NEW earned basic.
       const epfCap = salaryCfg?.epfCapAmount ?? 1800;
       const eepfPct = (salaryCfg?.eepfPct ?? 12) / 100;
-      const eeEsicPct = (salaryCfg?.eeEsicPct ?? 0.75) / 100;
-      const erEsicPct = (salaryCfg?.erEsicPct ?? 3.25) / 100;
-      const esiLimit = salaryCfg?.esiWageLimit ?? 21000;
 
       // EPF — respect the employee's HR override. When set, prorate the stored
       // full-month EPF by the earned-gross ratio; otherwise statutory on basic.
@@ -1556,9 +1579,10 @@ router.patch(
       const epf = epfOverridden
         ? Math.round(overrideEpfFull * earnedRatio)
         : Math.round(Math.min(basicEarned * eepfPct, epfCap));
-      const esiApplicable = basicEarned > 0 && basicEarned <= esiLimit;
-      const esic = esiApplicable ? Math.ceil(basicEarned * eeEsicPct) : 0;
-      const erEsic = esiApplicable ? Math.ceil(basicEarned * erEsicPct) : 0;
+      // Eligibility is re-tested against the employee's CURRENT full basic, so
+      // a recalculate is what clears a stale ESIC that an earlier run wrote on
+      // the prorated basic (or that a since-raised salary made inapplicable).
+      const { esic, erEsic } = computeEsi(fullBasic, basicEarned, salaryCfg);
       const pt =
         ctxSettings.ptEnabled && ctxSettings.ptForBasic
           ? ctxSettings.ptForBasic(basicEarned)
