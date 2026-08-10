@@ -770,30 +770,83 @@ router.patch("/employees/:id/set-email", async (req, res) => {
 // create one if not, wrapping the same createCoworkEmployee the legacy
 // CoWork employee-creation screen uses.
 
+/**
+ * How a CoWork account is found for an employee, in priority order.
+ *
+ * 1. `employee.coworkEmployeeId` — an explicit link, set by an admin picking
+ *    one on the access page, or written automatically the moment an email
+ *    match below succeeds. Exact and authoritative; nothing else is even
+ *    consulted once this is set.
+ * 2. Email match. Works for the common case where the same address was used
+ *    to register both accounts.
+ *
+ * What this replaced — `cowork_employees.doc(employee.biometricId)` — only
+ * ever worked for accounts this app itself created. An account made earlier
+ * through the legacy CoWork employee-creation screen, or by hand, keeps
+ * whatever ID and email it was given at the time, which routinely differs
+ * from the HR record for the same person: verified against live data, where
+ * one employee's CMS login was pramodbiswal@gmail.com and their real,
+ * working CoWork account was biswalpramod3.1415@gmail.com under doc id
+ * GR0108. Neither the old doc-ID lookup nor a same-email assumption finds
+ * that pairing — only an explicit link does, which is why step 1 exists at
+ * all rather than relying on step 2 alone.
+ */
+async function findCoworkAccount(employee) {
+  const { db } = require("../../config/firebaseAdmin");
+  if (employee.coworkEmployeeId) {
+    const doc = await db.collection("cowork_employees").doc(employee.coworkEmployeeId).get();
+    if (doc.exists) return doc;
+  }
+  const email = String(employee.email || "").trim().toLowerCase();
+  if (!email) return null;
+  const snap = await db.collection("cowork_employees").where("email", "==", email).limit(1).get();
+  return snap.empty ? null : snap.docs[0];
+}
+
+/** GET /api/admin/cowork-accounts — every CoWork account, for the link picker. */
+router.get("/cowork-accounts", async (req, res) => {
+  try {
+    const { db } = require("../../config/firebaseAdmin");
+    const snap = await db.collection("cowork_employees").orderBy("name").get();
+    res.json({
+      success: true,
+      accounts: snap.docs.map((doc) => {
+        const d = doc.data();
+        return { employeeId: doc.id, name: d.name || doc.id, email: d.email || "", role: d.role || "employee" };
+      }),
+    });
+  } catch (error) {
+    console.error("[access-admin] list cowork accounts:", error);
+    fail(res, 500, error.message);
+  }
+});
+
 /** GET /api/admin/employees/:id/cowork-account */
 router.get("/employees/:id/cowork-account", async (req, res) => {
   try {
     const employee = await Employee.findById(req.params.id)
-      .select("firstName lastName email biometricId")
+      .select("firstName lastName email coworkEmployeeId")
       .lean();
     if (!employee) return fail(res, 404, "Employee not found");
-    if (!employee.biometricId) {
-      return res.json({ success: true, exists: false, reason: "NO_BIOMETRIC_ID" });
-    }
 
-    const { db } = require("../../config/firebaseAdmin");
-    const snap = await db.collection("cowork_employees").doc(employee.biometricId).get();
-    if (!snap.exists) return res.json({ success: true, exists: false });
+    const doc = await findCoworkAccount(employee);
+    if (!doc) return res.json({ success: true, exists: false });
 
-    const data = snap.data();
+    const data = doc.data();
     res.json({
       success: true,
       exists: true,
       account: {
-        employeeId: snap.id,
+        employeeId: doc.id,
+        name: data.name || doc.id,
+        email: data.email || "",
         role: data.role || "employee",
         hasAuthUid: Boolean(data.authUid),
         passwordChanged: Boolean(data.passwordChanged),
+        // Whether this is an explicit link or was found by matching email
+        // this request — the UI shows the two differently, since the
+        // latter is a guess that held today and the former cannot drift.
+        linked: employee.coworkEmployeeId === doc.id,
       },
     });
   } catch (error) {
@@ -802,24 +855,65 @@ router.get("/employees/:id/cowork-account", async (req, res) => {
   }
 });
 
-/** POST /api/admin/employees/:id/cowork-account — provision one. */
+/**
+ * POST /api/admin/employees/:id/cowork-account
+ *
+ * Three ways in, tried in order:
+ *   1. Body carries `coworkEmployeeId` — an explicit pick from the link
+ *      picker. Verified to exist, then linked. No email involved at all.
+ *   2. No explicit pick, but an account shares this employee's email —
+ *      linked automatically.
+ *   3. Neither — a brand new CoWork account is created and linked.
+ *
+ * All three end by writing `Employee.coworkEmployeeId`, so every future
+ * lookup (including the CoWork sign-in bridge) is a direct id read and
+ * never depends on the two emails still agreeing.
+ */
 router.post("/employees/:id/cowork-account", async (req, res) => {
   try {
     const employee = await Employee.findById(req.params.id)
       .select("firstName lastName email phone department biometricId")
       .lean();
     if (!employee) return fail(res, 404, "Employee not found");
-    if (!employee.email) {
-      return fail(res, 400, "This employee has no email address — set one first.");
-    }
-    if (!employee.biometricId) {
-      return fail(res, 400, "This employee has no biometric ID on file, so a CoWork account cannot be linked to their HR record.");
-    }
 
     const { db } = require("../../config/firebaseAdmin");
-    const existing = await db.collection("cowork_employees").doc(employee.biometricId).get();
-    if (existing.exists) {
-      return fail(res, 409, "This employee already has a CoWork account.");
+    const explicitId = String(req.body?.coworkEmployeeId || "").trim();
+
+    if (explicitId) {
+      const doc = await db.collection("cowork_employees").doc(explicitId).get();
+      if (!doc.exists) return fail(res, 404, "That CoWork account no longer exists.");
+      await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: doc.id } });
+      audit(req, "employee.cowork-link", `${employee.email || req.params.id} → ${doc.id} (explicit)`);
+      return res.json({
+        success: true,
+        message: `Linked to ${doc.data().name || doc.id}'s existing CoWork account.`,
+        account: { employeeId: doc.id, role: doc.data().role || "employee", linked: true },
+      });
+    }
+
+    if (!employee.email) {
+      return fail(res, 400, "This employee has no email address — set one first, or pick a CoWork account to link explicitly.");
+    }
+
+    // Somebody may already hold a CoWork account under this email — created
+    // before the CMS↔CoWork link existed, or through the legacy
+    // employee-creation screen. Link to it rather than creating a second
+    // Firestore doc pointing at the same Firebase Auth user.
+    const email = String(employee.email).trim().toLowerCase();
+    const existing = await db.collection("cowork_employees").where("email", "==", email).limit(1).get();
+    if (!existing.empty) {
+      const doc = existing.docs[0];
+      await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: doc.id } });
+      audit(req, "employee.cowork-link", `${employee.email} → existing account ${doc.id} (by email)`);
+      return res.json({
+        success: true,
+        message: "This email already had a CoWork account — linked it, no new account created.",
+        account: { employeeId: doc.id, role: doc.data().role || "employee", linked: true },
+      });
+    }
+
+    if (!employee.biometricId) {
+      return fail(res, 400, "This employee has no biometric ID on file, so a new CoWork account cannot be linked to their HR record.");
     }
 
     const { createCoworkEmployee } = require("../../services/cowork.service");
@@ -834,6 +928,7 @@ router.post("/employees/:id/cowork-account", async (req, res) => {
       employeeId: employee.biometricId,
     });
 
+    await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: result.employeeId } });
     audit(req, "employee.cowork-provision", `${employee.email} → ${result.employeeId}`);
     res.status(201).json({
       success: true,

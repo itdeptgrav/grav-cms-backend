@@ -1430,9 +1430,26 @@ router.post("/cowork-sso", async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const allowed = await resolveEmployeeDepartments(employee);
-    const coworkDept = allowed.find((d) => d.slug === "cowork");
+    // Found by `externalBaseUrl` being SET, not by slug or name. A department
+    // is identified as "the CoWork one" by what it DOES (opens an external
+    // app via this bridge), never by an admin having typed an exact string —
+    // an admin renaming "CoWork" to "Co-Workspace" (a real case this was
+    // debugged against) must not silently break sign-in.
+    const coworkDept = await AccessDepartment.findOne({
+      isActive: true,
+      externalBaseUrl: { $nin: [null, ""] },
+    });
     if (!coworkDept) {
+      return res.status(500).json({
+        success: false,
+        code: "NOT_CONFIGURED",
+        message: "CoWork is not configured yet. Ask an administrator to set its app URL on the Access Control page.",
+      });
+    }
+
+    const holdsIt = (await resolveEmployeeDepartments(employee))
+      .some((d) => String(d._id) === String(coworkDept._id));
+    if (!holdsIt) {
       return res.status(403).json({
         success: false,
         code: "NO_COWORK_ACCESS",
@@ -1440,35 +1457,52 @@ router.post("/cowork-sso", async (req, res) => {
       });
     }
 
-    if (!coworkDept.externalBaseUrl) {
-      return res.status(500).json({
-        success: false,
-        code: "NOT_CONFIGURED",
-        message: "CoWork access is granted, but no CoWork URL has been set up yet. Ask an administrator to configure it on the CoWork department.",
-      });
-    }
-
-    const biometricId = employee.biometricId;
-    if (!biometricId) {
-      return res.status(409).json({
-        success: false,
-        code: "NO_BIOMETRIC_ID",
-        message: "Your HR record has no biometric ID on file, so a CoWork account cannot be linked yet.",
-      });
-    }
-
+    // Resolving the CoWork account: the explicit link first, then email.
+    //
+    // `employee.coworkEmployeeId` — set by an admin on the access page, or
+    // written automatically the first time an email match succeeds — is
+    // authoritative and exact. Without it, this used to assume the
+    // cowork_employees doc ID equalled biometricId, true only for accounts
+    // this app itself created, or that the account's email equalled the
+    // CMS login email, true only when nobody registered the two under
+    // different addresses. In practice both assumptions break: an account
+    // made through the legacy CoWork employee-creation screen keeps
+    // whatever ID and email it was given then, which can differ from HR's
+    // record for the same person — verified against live data, where one
+    // employee's CMS login was pramodbiswal@gmail.com and their CoWork
+    // account, existing and fully working, was
+    // biswalpramod3.1415@gmail.com under doc id GR0108. Neither lookup
+    // found it; the person correctly held CoWork access and correctly had
+    // a working account, and was told no account existed. That is why the
+    // explicit link is checked first and is the one thing that cannot be
+    // fooled by an email mismatch.
     const { db, auth: firebaseAuth } = require("../../config/firebaseAdmin");
-    let coworkDoc = await db.collection("cowork_employees").doc(biometricId).get();
-    if (!coworkDoc.exists) {
-      const alt = await db.collection("cowork_employees")
-        .where("employeeId", "==", biometricId).limit(1).get();
-      if (!alt.empty) coworkDoc = alt.docs[0];
+
+    let coworkDoc = null;
+    if (employee.coworkEmployeeId) {
+      const linked = await db.collection("cowork_employees").doc(employee.coworkEmployeeId).get();
+      if (linked.exists) coworkDoc = linked;
     }
-    if (!coworkDoc.exists) {
+
+    if (!coworkDoc) {
+      const email = String(employee.email || "").trim().toLowerCase();
+      if (email) {
+        const match = await db.collection("cowork_employees").where("email", "==", email).limit(1).get();
+        if (!match.empty) {
+          coworkDoc = match.docs[0];
+          // Found by email this once — persist it, so every future sign-in
+          // resolves instantly and stops depending on the two emails still
+          // agreeing.
+          await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: coworkDoc.id } });
+        }
+      }
+    }
+
+    if (!coworkDoc) {
       return res.status(404).json({
         success: false,
         code: "NO_COWORK_ACCOUNT",
-        message: "No CoWork account exists for you yet. Ask an administrator to create one.",
+        message: "No CoWork account is linked to your CMS account yet. Ask an administrator to link or create one on the Access Control page.",
       });
     }
 

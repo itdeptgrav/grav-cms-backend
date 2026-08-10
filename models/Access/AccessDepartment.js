@@ -144,6 +144,14 @@ accessDepartmentSchema.methods.toPublicTile = function () {
     // signed-in user clicking their own department landed on a 404. It is not
     // sensitive: it is a route anyone can already type.
     dashboardPath: this.resolveRedirect(),
+    // Set only on a department that opens an external app (CoWork today) via
+    // the SSO bridge rather than a switch-department JWT re-mint. The portal
+    // uses ITS PRESENCE — not the department's slug or name, which an admin
+    // can freely rename ("Co-Workspace", "Team Workspace", anything) — to
+    // decide whether a tile takes the SSO branch. Not sensitive: it is the
+    // same login-redirect address dashboardPath already exposes for every
+    // other department.
+    externalBaseUrl: this.externalBaseUrl || "",
   };
 };
 
