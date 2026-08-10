@@ -45,6 +45,30 @@ function monthFromMessage(message) {
   return undefined;
 }
 
+// "how much did I earn", "my salary", "what's my pay" — a question about the
+// SIGNED-IN user's own pay. Matched narrowly so "how much did Ian earn" (a name)
+// does not count.
+function isSelfQuery(message) {
+  const s = String(message || "");
+  return /\b(my|mine|myself)\b/i.test(s) || /\bdid i\b|\bi (earn|earned|make|made|get|got)\b|\bam i paid\b|\bdo i (earn|make|get)\b/i.test(s);
+}
+
+// "this year" / "annual" / a year with no month -> whole-year total, not one month.
+function isAnnualQuery(message) {
+  return /\b(this year|the year|per year|annual|annually|yearly| y-?t-?d|year[- ]to[- ]date|whole year|entire year|full year|this financial year|for \d{4}|in \d{4})\b/i.test(
+    String(message || ""),
+  );
+}
+function yearFromMessage(message) {
+  const s = String(message || "");
+  const m = s.match(/\b(20\d{2})\b/);
+  if (m) return Number(m[1]);
+  const curYear = istNow().getUTCFullYear();
+  if (/\blast year\b/i.test(s)) return curYear - 1;
+  if (/\b(this year|the year|annual|yearly|ytd|year to date)\b/i.test(s)) return curYear;
+  return undefined;
+}
+
 // The account is authorised for HR tools when the shared resolver said so.
 const hrAuthorised = (user) => Boolean(user && user.hrAccess && user.hrAccess.allowed === true);
 
@@ -387,24 +411,37 @@ registerTool({
 registerTool({
   name: "hr_salary",
   description:
-    "ONE specific employee's monthly SALARY / payslip for authorised HR & CEO: basic, gross, allowances, deductions (PF, ESIC, tax) and net pay for a given month. Use this for a single named person's salary. Bank account details are NOT included. Sensitive; read-only.",
+    "SALARY / payslip for authorised HR & CEO. Works for a NAMED employee's monthly pay (basic, gross, allowances, deductions, net pay) AND for the signed-in user's OWN pay when they ask about themselves ('how much did I earn', 'my salary') — leave employeeName EMPTY for a self-question. For a whole-year total ('this year', 'annual'), it returns the year's total across all months. Bank details excluded. Sensitive; read-only.",
   permission: hrAuthorised,
   parameters: {
     type: "object",
     properties: {
-      ...P_EMPLOYEE,
-      month: { type: "integer", description: "Month number 1-12 (e.g. June = 6). Omit for the latest processed month." },
+      employeeName: {
+        type: "string",
+        description:
+          "The employee's name or ID. LEAVE EMPTY when the user asks about their OWN pay ('how much did I earn', 'my salary') — the signed-in identity is used instead of a name.",
+      },
+      month: { type: "integer", description: "Month number 1-12 (e.g. June = 6). Omit for the latest processed month, or for a whole-year total." },
       year: { type: "integer", description: "Year, e.g. 2026. Omit for the current/latest." },
     },
-    required: ["employeeName"],
   },
   matches: (msg) =>
-    /\b(salary|salaries|payslip|pay slip|pay-slip|take[- ]?home|net pay|gross pay|ctc|earnings|wage|wages|how much (is|does|was).*(paid|earn|salary))\b/i.test(msg),
-  provideContext: async ({ message, args }) => ({
-    salary: await buildSalaryContext({
-      query: (args && args.employeeName) || message,
-      month: (args && args.month) || monthFromMessage(message),
-      year: args && args.year,
-    }),
-  }),
+    /\b(salary|salaries|payslip|pay slip|pay-slip|take[- ]?home|net pay|gross pay|ctc|earnings|wage|wages|how much (is|does|was|did).*(paid|earn|salary)|did i earn|my (pay|salary|earnings))\b/i.test(msg),
+  provideContext: async ({ user, message, args }) => {
+    const monthArg = (args && args.month) || monthFromMessage(message);
+    // A first-person question is about the signed-in user — even if the model
+    // also guessed a name, the pronoun wins so "I" can't become someone else.
+    const self = isSelfQuery(message);
+    const annual = isAnnualQuery(message) && !monthArg; // a year total, unless a month is named
+    return {
+      salary: await buildSalaryContext({
+        user,
+        self,
+        annual,
+        query: (args && args.employeeName) || message,
+        month: monthArg,
+        year: (args && args.year) || yearFromMessage(message),
+      }),
+    };
+  },
 });

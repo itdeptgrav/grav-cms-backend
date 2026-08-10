@@ -1120,3 +1120,12 @@ router.get(
 );
 
 module.exports = router;
+
+module.exports.helpers = {
+  MODELS_TO_TRY,
+  getDriveClient,
+  streamDriveToGeminiFileAPI,
+  waitForFileActive,
+  deleteGeminiFile,
+  callGemini,
+};

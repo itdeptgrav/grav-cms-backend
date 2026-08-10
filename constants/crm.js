@@ -544,6 +544,29 @@ const COUNTRIES = [
   pair("NP", "Nepal"),
 ];
 
+// ── Enquiry costing request (Sales → Merchandising + Industrial Engineering) ──
+// The cross-department costing/RFQ request that backs one Cowork costing sheet.
+// Sales raises it; merchandiser + IE fill the sheet; Sales reads the Master and
+// keys the indicative price. Reused at Cost & Quote for the formal quote.
+const COSTING_REQUEST_STATUSES = [
+  pair("requested", "Requested"),
+  pair("in_progress", "In progress"),
+  pair("returned", "Returned"),
+  pair("cancelled", "Cancelled"),
+];
+// requested → in_progress → returned is the forward path; cancel from either
+// open state; a returned request can be reopened for another costing round.
+const COSTING_REQUEST_STATUS_TRANSITIONS = {
+  requested: ["in_progress", "cancelled"],
+  in_progress: ["returned", "cancelled"],
+  returned: ["in_progress", "cancelled"],
+  cancelled: [],
+};
+const COSTING_REQUEST_PURPOSES = [
+  pair("enquiry_indicative", "Indicative (Enquiry)"),
+  pair("cost_quote_formal", "Formal quote (Cost & Quote)"),
+];
+
 const codes = (list) => list.map((x) => x.code);
 const labelMap = (list) => Object.fromEntries(list.map((x) => [x.code, x.label]));
 
@@ -868,6 +891,11 @@ module.exports = {
   GST_TREATMENT_CODES: codes(GST_TREATMENTS),
   FREIGHT_ARRANGEMENT_CODES: codes(FREIGHT_ARRANGEMENTS),
   ENQUIRY_STATUS_CODES: codes(ENQUIRY_STATUSES),
+  COSTING_REQUEST_STATUSES,
+  COSTING_REQUEST_STATUS_CODES: codes(COSTING_REQUEST_STATUSES),
+  COSTING_REQUEST_STATUS_TRANSITIONS,
+  COSTING_REQUEST_PURPOSES,
+  COSTING_REQUEST_PURPOSE_CODES: codes(COSTING_REQUEST_PURPOSES),
   ENQUIRY_STATUS_TRANSITIONS,
   ENQUIRY_SOURCE_CODES: codes(ENQUIRY_SOURCES),
   ENQUIRY_LOST_REASON_CODES: codes(ENQUIRY_LOST_REASONS),
@@ -933,6 +961,8 @@ module.exports = {
     enquiry_priority: ENQUIRY_PRIORITIES,
     customer_seriousness: CUSTOMER_SERIOUSNESS,
     enquiry_reference_type: ENQUIRY_REFERENCE_TYPES,
+    costing_request_status: COSTING_REQUEST_STATUSES,
+    costing_request_purpose: COSTING_REQUEST_PURPOSES,
     credit_status: CREDIT_STATUSES,
     site_type: SITE_TYPES,
     address_type: ADDRESS_TYPES,
