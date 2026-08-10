@@ -142,6 +142,19 @@ describe("GET /enquiries/by-journey/:journeyRef — get-or-create", () => {
     expect(body.enquiry.contact?.jobTitle).toBe("Purchase Manager");
   });
 
+  test("a lead-converted enquiry opens at 'qualified' (no funnel re-walk); a direct one opens at 'new'", async () => {
+    // From a lead → already contacted + requirement gathered → qualified.
+    const fromLead = await makeJourney();
+    await Lead.create({ leadId: "LEAD-2026-8030", company: "ITC Hotels", conversion: { journeyId: fromLead.journey._id } });
+    const led = await call(`/by-journey/${fromLead.journey.journeyId}`);
+    expect(led.body.enquiry.status).toBe("qualified");
+
+    // No lead (direct RFQ) → full funnel from the start.
+    const direct = await makeJourney();
+    const rfq = await call(`/by-journey/${direct.journey.journeyId}`);
+    expect(rfq.body.enquiry.status).toBe("new");
+  });
+
   test("404 for an unknown journey", async () => {
     const { status } = await call(`/by-journey/SJ-2026-9999`);
     expect(status).toBe(404);
@@ -351,6 +364,29 @@ describe("PATCH /enquiries/:id — header edits", () => {
     expect(body.enquiry.references[0].url).toBe("https://pin.it/abc");
     expect(body.enquiry.references[1].type).toBe("other");
     expect(body.enquiry.references[1].note).toContain("couriered");
+  });
+
+  test("opportunity size mirrors onto the journey's expectedValue, marked estimated (confirmed=false)", async () => {
+    const { journey } = await makeJourney();
+    const { body: got } = await call(`/by-journey/${journey.journeyId}`);
+    const id = got.enquiry._id;
+
+    await call(`/${id}`, { method: "PATCH", body: { opportunitySize: 2000000, pricingCurrency: "inr" } });
+    const j = await SalesJourney.findById(journey._id).lean();
+    expect(j.expectedValue.amount).toBe(2000000);
+    expect(j.expectedValue.currency).toBe("INR");
+    expect(j.expectedValue.confirmed).toBe(false);
+  });
+
+  test("does NOT overwrite an already-confirmed journey value (a firmer Cost & Quote number outranks the estimate)", async () => {
+    const { journey } = await makeJourney();
+    // Simulate a later stage having confirmed a firm value.
+    await SalesJourney.findByIdAndUpdate(journey._id, { expectedValue: { amount: 3500000, currency: "INR", confirmed: true } });
+    const { body: got } = await call(`/by-journey/${journey.journeyId}`);
+    await call(`/${got.enquiry._id}`, { method: "PATCH", body: { opportunitySize: 2000000 } });
+    const j = await SalesJourney.findById(journey._id).lean();
+    expect(j.expectedValue.amount).toBe(3500000); // unchanged
+    expect(j.expectedValue.confirmed).toBe(true);
   });
 
   test("ignores an invalid status value", async () => {

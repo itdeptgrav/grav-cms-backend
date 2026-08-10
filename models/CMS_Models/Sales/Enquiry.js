@@ -109,6 +109,20 @@ const enquirySchema = new mongoose.Schema(
           trims: { type: String, trim: true },
           specialConstruction: { type: String, trim: true },
           existingUniform: { type: String, trim: true }, // existing garment details / what they wear now
+
+          // Reference images — what the garment should look like, so Merchandising
+          // + Industrial Engineering can cost it. Uploaded to Google Drive via
+          // /api/upload-to-drive (file made public), previewed inline.
+          images: [
+            new mongoose.Schema(
+              {
+                fileId: { type: String, trim: true },
+                name: { type: String, trim: true },
+                url: { type: String, trim: true }, // Drive view/thumbnail URL
+              },
+              { _id: false },
+            ),
+          ],
         },
         { _id: true },
       ),
