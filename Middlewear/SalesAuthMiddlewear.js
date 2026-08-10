@@ -77,6 +77,15 @@ const SalesAuthMiddlewear = (req, res, next) => {
       userType: decoded.userType,
       name: decoded.name || "",
       email: decoded.email || "",
+      // Dropped before, and it matters here specifically: an org-level admin
+      // browsing INTO the Sales department gets `role` overwritten to Sales'
+      // own legacy literal (deptAuth.js's buildTokenPayload, `adoptDeptRole`)
+      // so existing per-department checks keep working — but that means
+      // `role` alone can no longer answer "is this an admin" once they are
+      // inside a department. `isAdmin` is signed into the token unconditionally
+      // (buildTokenPayload's `isAdmin: Boolean(user.isAdmin)`) precisely so
+      // callers who need the org-level fact still can. See services/salesAccess.js.
+      isAdmin: Boolean(decoded.isAdmin),
     };
 
     next();

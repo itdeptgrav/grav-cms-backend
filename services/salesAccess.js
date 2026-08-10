@@ -24,9 +24,16 @@ const { roleAtLeast } = require("../models/Access/DepartmentRole");
 
 const ORG_LEVEL_MANAGER_ROLES = new Set(["admin", "ceo"]);
 
-/** @param {{role?:string, departmentRole?:string, email?:string}} user */
+/** @param {{role?:string, isAdmin?:boolean, departmentRole?:string, email?:string}} user */
 async function isSalesManager(user) {
   if (!user) return false;
+  // Checked before `role`, not folded into ORG_LEVEL_MANAGER_ROLES: an
+  // org-level admin browsing INTO Sales carries `role` overwritten to Sales'
+  // own legacy literal (e.g. "sales"), not "admin"/"ceo" — see
+  // deptAuth.js's buildTokenPayload (`adoptDeptRole`). `role` alone cannot
+  // answer "is this an admin" once inside a department; `isAdmin` can,
+  // because it is signed into the token unconditionally.
+  if (user.isAdmin) return true;
   if (ORG_LEVEL_MANAGER_ROLES.has(user.role)) return true;
   if (user.departmentRole) return roleAtLeast(user.departmentRole, "approver");
   if (!user.email) return false;

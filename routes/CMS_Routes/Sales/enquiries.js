@@ -22,8 +22,11 @@ const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
+const Employee = require("../../../models/Employee");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { createWithRef } = require("../../../services/enquiryRef");
+const { createSheet, SHARE_ROLES } = require("../../../services/coworkSheets.service");
+const { buildCostingWorkbook } = require("../../../services/sheetTemplates");
 const { ENQUIRY_STATUS_CODES, ENQUIRY_STATUS_TRANSITIONS, ENQUIRY_SOURCE_CODES, ENQUIRY_LOST_REASON_CODES, ENQUIRY_PRIORITY_CODES, CUSTOMER_SERIOUSNESS_CODES, ENQUIRY_REFERENCE_TYPE_CODES } = require("../../../constants/crm");
 
 const express = require("express");
@@ -251,6 +254,203 @@ router.patch("/:id", salesAuth, async (req, res) => {
   } catch (err) {
     console.error("[enquiries] PATCH /:id", err);
     return res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/cowork-employees
+// The "assign to" candidate list for a new costing sheet — every CoWork
+// employee, so the picker can suggest people the same way CoWork's own
+// ShareMenu does (Cowork/lib/legacy/employees.ts listMembers(), unrestricted
+// to CEO/TL). Queried directly against Firestore rather than proxying that
+// route: it requires a Firebase ID token, which a CMS session does not
+// carry, and grav-backend already holds the Admin SDK credential for this
+// same project — see services/coworkSheets.service.js's own header for why
+// that's the established pattern here, not a workaround.
+router.get("/cowork-employees", salesAuth, async (req, res) => {
+  try {
+    const { db } = require("../../../config/firebaseAdmin");
+    const snap = await db.collection("cowork_employees").get();
+    const employees = snap.docs
+      .map((d) => {
+        const x = d.data();
+        return { employeeId: d.id, name: x.name || d.id, email: x.email || "", role: x.role || "employee" };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return res.json({ success: true, employees });
+  } catch (err) {
+    console.error("[enquiries] GET /cowork-employees", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/costing-sheet
+// Create a CoWork costing sheet for one product on this enquiry, pre-filled
+// from what the enquiry already knows about it, and share it with whoever
+// the salesperson picked. Creating again for the same product REPLACES the
+// costingSheets entry (a fresh CoWork document each time) rather than
+// editing the old one in place — the old sheet is not deleted from CoWork,
+// just unlinked here, since somebody may still have it open.
+router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = String(req.body?.productName || "").trim();
+    if (!productName) return res.status(400).json({ success: false, message: "productName is required." });
+    const product = (enquiry.products || []).find((p) => p.product === productName);
+    if (!product) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+
+    // The creator must be a real employee with a CoWork account already
+    // linked — the same link Access Control's "CoWork account" control
+    // establishes (Employee.coworkEmployeeId). Without it there is no
+    // CoWork identity to make the sheet's owner, and minting one here would
+    // bypass the admin-driven linking flow entirely.
+    const me = req.user?.id ? await Employee.findById(req.user.id).select("coworkEmployeeId name email").lean() : null;
+    if (!me?.coworkEmployeeId) {
+      return res.status(409).json({
+        success: false,
+        code: "NO_COWORK_ACCOUNT",
+        message: "Your account isn't linked to a CoWork identity yet. Ask an administrator to link it on the Access Control page.",
+      });
+    }
+
+    // Who else to share it with. Client sends [{employeeId, name, role}];
+    // role defaults to "editor" (same default CoWork's own ShareMenu uses)
+    // and anything outside owner/editor/viewer is rejected rather than
+    // silently coerced.
+    const shareWith = Array.isArray(req.body?.shareWith)
+      ? req.body.shareWith
+          .filter((m) => m && m.employeeId && m.employeeId !== me.coworkEmployeeId)
+          .map((m) => {
+            const role = SHARE_ROLES.has(m.role) ? m.role : "editor";
+            return { employeeId: String(m.employeeId), name: m.name || "", role };
+          })
+      : [];
+    for (const m of shareWith) {
+      if (!SHARE_ROLES.has(m.role)) return res.status(400).json({ success: false, message: `Unknown share role: ${m.role}` });
+    }
+
+    const title = String(req.body?.title || `Costing — ${productName}`).trim();
+    const workbook = buildCostingWorkbook({
+      enquiry: { enquiryId: enquiry.enquiryId, customerName: (await decorate(enquiry)).customerName, enquiryDate: enquiry.enquiryDate },
+      product,
+    });
+
+    const { documentId } = await createSheet({
+      title,
+      creatorEmployeeId: me.coworkEmployeeId,
+      shareWith,
+      workbook,
+    });
+
+    const entry = {
+      productName,
+      documentId,
+      title,
+      createdAt: new Date(),
+      createdBy: actor(req),
+      members: [
+        { employeeId: me.coworkEmployeeId, name: me.name || "", role: "owner" },
+        ...shareWith,
+      ],
+    };
+    enquiry.costingSheets = [...(enquiry.costingSheets || []).filter((s) => s.productName !== productName), entry];
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    return res.status(201).json({ success: true, costingSheet: entry, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/costing-sheet", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PATCH /api/cms/crm/enquiries/:id/costing-sheet/members
+// Add (or change the role of) one OR MORE people on an ALREADY-CREATED
+// costing sheet, in one request — the multi-person case: a sales person
+// assigning a whole team to a sheet at once, not just at creation time.
+// Accepts either `{members:[{employeeId,name,role}, ...]}` or a single
+// `{employeeId,name,role}` for convenience. Writes the CoWork document's
+// real member list (services/coworkSheets.service.js's setMembers) and
+// mirrors the same change into this enquiry's denormalised snapshot in one
+// request, so the two never disagree.
+router.patch("/:id/costing-sheet/members", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = String(req.body?.productName || "").trim();
+    if (!productName) return res.status(400).json({ success: false, message: "productName is required." });
+
+    const raw = Array.isArray(req.body?.members)
+      ? req.body.members
+      : req.body?.employeeId
+        ? [{ employeeId: req.body.employeeId, name: req.body.name, role: req.body.role }]
+        : [];
+    if (!raw.length) return res.status(400).json({ success: false, message: "At least one member is required." });
+
+    const additions = raw.map((m) => ({
+      employeeId: String(m?.employeeId || "").trim(),
+      name: m?.name || "",
+      role: m?.role,
+    }));
+    for (const m of additions) {
+      if (!m.employeeId) return res.status(400).json({ success: false, message: "Every member needs an employeeId." });
+      if (!SHARE_ROLES.has(m.role)) return res.status(400).json({ success: false, message: `Unknown share role: ${m.role}` });
+    }
+
+    const sheet = (enquiry.costingSheets || []).find((s) => s.productName === productName);
+    if (!sheet) return res.status(404).json({ success: false, message: "No costing sheet exists yet for that product." });
+
+    const { setMembers } = require("../../../services/coworkSheets.service");
+    await setMembers(sheet.documentId, additions);
+
+    // Mirror into the denormalised snapshot: replace an existing entry for
+    // each added employee, or append.
+    const addedIds = new Set(additions.map((m) => m.employeeId));
+    const nextMembers = [...(sheet.members || []).filter((m) => !addedIds.has(m.employeeId)), ...additions];
+    enquiry.costingSheets = enquiry.costingSheets.map((s) =>
+      s.productName === productName ? { ...(s.toObject ? s.toObject() : s), members: nextMembers } : s,
+    );
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    return res.json({ success: true, costingSheet: nextMembers, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] PATCH /:id/costing-sheet/members", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/costing-sheet/:productName/data
+// The read-only "showcase" view — the actual cell content of a costing
+// sheet, so the CMS can render it as a real table right on the enquiry page
+// instead of sending the sales person over to CoWork. The DATA still only
+// ever comes from CoWork (whoever was added to the sheet fills it in over
+// there); this route just reads what they wrote. No SSO/embed handoff
+// needed — unlike opening the live editor, reading the content server-side
+// via the Admin SDK doesn't require the viewer's own CoWork identity, so
+// anyone who can see this enquiry can see its costing.
+router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("costingSheets").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = decodeURIComponent(req.params.productName);
+    const sheet = (enquiry.costingSheets || []).find((s) => s.productName === productName);
+    if (!sheet) return res.status(404).json({ success: false, message: "No costing sheet exists yet for that product." });
+
+    const { getSheetBody } = require("../../../services/coworkSheets.service");
+    const body = await getSheetBody(sheet.documentId);
+    if (!body) return res.status(404).json({ success: false, message: "The costing sheet's content could not be found." });
+
+    return res.json({ success: true, workbook: body.workbook, updatedAt: body.updatedAt });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/costing-sheet/:productName/data", err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 

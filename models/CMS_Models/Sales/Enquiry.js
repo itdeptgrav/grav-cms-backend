@@ -114,6 +114,45 @@ const enquirySchema = new mongoose.Schema(
       ),
     ],
 
+    // ── Costing sheets (CoWork bridge) — top-level, keyed by PRODUCT NAME ───
+    // Not embedded on the product row above, and not keyed by that row's
+    // _id: routes/CMS_Routes/Sales/enquiries.js's sanitizeProducts() rebuilds
+    // the entire `products` array from client input on every "Save
+    // requirement" (Chunk 2), which reassigns a fresh _id to every row and
+    // carries through only its own known field list. A pointer stored on or
+    // keyed by that row would be silently orphaned the next time somebody
+    // edited a quantity. Product NAME survives that rewrite — it's the field
+    // a requirement edit actually preserves — so it is what this joins on.
+    // If a product is later renamed, its costing sheet is not auto-migrated;
+    // the sheet itself still exists in CoWork and isn't lost, just no longer
+    // linked from this row until someone re-links it.
+    //
+    // The sheet's cell content and live collaboration state live entirely in
+    // CoWork (Firestore cowork_documents/cowork_document_bodies, kind:
+    // "sheet") — this is only the pointer plus a denormalised membership
+    // snapshot so the CMS can render without a round trip to CoWork on every
+    // list view. Source of truth for membership stays the CoWork document
+    // itself — see services/coworkSheets.service.js.
+    costingSheets: [
+      new mongoose.Schema(
+        {
+          productName: { type: String, trim: true, required: true },
+          documentId: { type: String, trim: true, required: true }, // cowork_documents doc id
+          title: { type: String, trim: true },
+          createdAt: { type: Date, default: Date.now },
+          createdBy: actorRef(),
+          members: [
+            {
+              employeeId: { type: String, trim: true },
+              name: { type: String, trim: true },
+              role: { type: String, trim: true, enum: ["owner", "editor", "viewer"] },
+            },
+          ],
+        },
+        { _id: false },
+      ),
+    ],
+
     // ── Indicative pricing (Chunk 4) ────────────────────────────────────────
     // INDICATIVE only — NOT the formal quote (that's the Cost & Quote stage).
     // `targetPrice` is what the customer says their budget is; `estimatedPrice
