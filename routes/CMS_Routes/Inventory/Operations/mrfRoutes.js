@@ -827,15 +827,23 @@ router.patch("/:id/items/:itemId/match", async (req, res) => {
       item.requestedQty = q;
     }
 
-    // The requester's own unit (set when the request was raised) stays
-    // authoritative — matching decides WHICH catalogue item this is, not a
-    // fresh chance to redefine what unit it's tracked in.
+    // The matched product's own unit wins, not whatever the requester typed —
+    // a request raised as "2 pc" against a product actually stocked in "Mtr"
+    // has to be tracked in Mtr from here on, or every stock/issued comparison
+    // downstream compares two different units as if they were the same
+    // number. (Previously the requester's unit was kept "authoritative" on
+    // the theory that matching only decides WHICH item this is — but the
+    // unit is a property of the item too, not a free-standing fact the
+    // requester gets to fix in advance of knowing what it would be matched
+    // to.)
+    const matchedUnit = rawItem.customUnit || rawItem.unit || "unit";
     item.rawItem = rawItem._id;
     item.rawItemName = rawItem.name;
     item.rawItemSku = rawItem.sku || "";
     item.variantId = variantId || null;
     item.variantCombination = variantCombination || [];
-    item.baseUnit = rawItem.customUnit || rawItem.unit || "unit";
+    item.unit = matchedUnit;
+    item.baseUnit = matchedUnit;
     item.itemStatus = "APPROVED";
     item.category = "";
     item.attributes = [];
