@@ -127,6 +127,27 @@ function tokenScore(token, parts) {
  * Tries an exact (substring) match first, then a fuzzy match tolerant of typos
  * and mishearings. Active employees are preferred. Returns the lean doc or null.
  */
+// Resolve the LOGGED-IN user to their own employee record — for "how much did I
+// earn" style self-queries. Uses the identity from the JWT (employeeId/email),
+// NEVER a guess from the sentence, so "I"/"my" can't resolve to someone else.
+// Returns null when the signed-in account has no employee record (e.g. the CEO
+// login) — the caller then says "no record for you" rather than another person's.
+async function resolveSelfEmployee(user) {
+  if (!user) return null;
+  const or = [];
+  if (user.employeeId) or.push({ biometricId: new RegExp(`^${escapeRe(user.employeeId)}$`, "i") });
+  if (user.email) {
+    const rx = new RegExp(`^${escapeRe(user.email)}$`, "i");
+    or.push({ email: rx }, { workEmail: rx }, { personalEmail: rx });
+  }
+  if (!or.length) return null;
+  const e = await Employee.findOne({ $or: or }).lean().catch(() => null);
+  return e || null;
+}
+function escapeRe(s) {
+  return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function resolveEmployeeByQuery(query) {
   const q = String(query || "").trim();
   if (!q) return null;
@@ -365,6 +386,7 @@ async function buildEmployeeLookup({ query, date } = {}) {
 module.exports = {
   buildEmployeeLookup,
   resolveEmployeeByQuery,
+  resolveSelfEmployee,
   // shared helpers
   fullName,
   leaveHistoryFor,

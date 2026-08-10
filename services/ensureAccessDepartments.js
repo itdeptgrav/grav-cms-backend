@@ -44,6 +44,14 @@ const DEPARTMENTS = [
     legacyModel: "SalesDepartment", legacyCollection: "salesdepartments",
     legacyUserType: "sales", dashboardPath: "/sales/dashboard",
     description: "Customer requests, quotations and orders." },
+  // Merchandising — the app holding what was pulled out of the Sales nav:
+  // Purchase Orders / PI, Customers, and Products & BOM. No legacy collection of
+  // its own (no legacy merchandiser logins exist), so it only registers the
+  // department + onboarding tile; a platform admin can open it today.
+  { key: "merchandiser", slug: "merchandiser", name: "Merchandising", sortOrder: 45,
+    legacyModel: null, legacyCollection: "merchandiserdepartments",
+    legacyUserType: "merchandiser", dashboardPath: "/merchandiser/dashboard",
+    description: "Purchase orders & PI, customers, and products & BOM." },
   { key: "accountant", slug: "accountant", name: "Accounting", sortOrder: 50,
     legacyModel: "Acc_Department", legacyCollection: "acc_departments",
     legacyUserType: "accountant", dashboardPath: "/accountant/",

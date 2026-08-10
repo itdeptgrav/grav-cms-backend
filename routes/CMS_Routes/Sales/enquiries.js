@@ -92,6 +92,19 @@ function sanitizeProducts(input) {
         const v = p[f];
         if (v != null && String(v).trim()) out[f] = String(v).trim();
       }
+      // Reference images (Drive) — keep up to 8, dropping entries with neither a
+      // fileId nor a URL. Trusted shape: { fileId, name, url }.
+      if (Array.isArray(p.images)) {
+        const imgs = p.images
+          .filter((im) => im && (String(im.fileId || "").trim() || String(im.url || "").trim()))
+          .slice(0, 8)
+          .map((im) => ({
+            fileId: String(im.fileId || "").trim() || undefined,
+            name: String(im.name || "").trim() || undefined,
+            url: String(im.url || "").trim() || undefined,
+          }));
+        if (imgs.length) out.images = imgs;
+      }
       return out;
     });
 }
@@ -179,7 +192,11 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
         // left blank for them to capture.
         estimatedPriceMin: lead?.estimatedUnitPrice || undefined,
         estimatedPriceMax: lead?.estimatedUnitPrice || undefined,
-        status: "new",
+        // Smart start: an enquiry converted FROM a lead has already been
+        // contacted and had its requirement gathered (that's what let the lead
+        // convert), so it opens at "qualified" rather than re-walking the funnel.
+        // A direct RFQ (no lead) starts at "new" and runs the full funnel.
+        status: lead ? "qualified" : "new",
         createdBy: actor(req),
         updatedBy: actor(req),
       });
@@ -250,6 +267,24 @@ router.patch("/:id", salesAuth, async (req, res) => {
 
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    // Stage-progressive deal value: the enquiry's opportunity size is the
+    // INDICATIVE value at this stage, so mirror it onto the journey's
+    // expectedValue with confirmed=false (the header/board reads one number,
+    // labelled "estimated"). A firmer number from Cost & Quote later sets
+    // confirmed=true and outranks this — so we never overwrite a confirmed value.
+    if ("opportunitySize" in body) {
+      const journey = await SalesJourney.findById(enquiry.journeyId).select("expectedValue");
+      if (journey && !journey.expectedValue?.confirmed) {
+        journey.expectedValue = {
+          amount: enquiry.opportunitySize,
+          currency: (enquiry.pricingCurrency || "INR").toUpperCase(),
+          confirmed: false,
+        };
+        await journey.save();
+      }
+    }
+
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id", err);
