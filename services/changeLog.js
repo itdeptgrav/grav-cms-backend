@@ -107,4 +107,41 @@ async function recentFor(departmentSlug, limit = 50) {
     .lean();
 }
 
-module.exports = { recordChange, historyFor, recentFor, diff, actorFrom };
+/**
+ * History for a PARENT record plus everything logged against its children —
+ * e.g. an account's own field edits AND the contacts/sites/relationships/team/
+ * activities created or changed underneath it. Those sub-entity log rows don't
+ * carry the parent's id as `entityId` (that's the sub-record's own id), so the
+ * parent id is matched inside the stored `before`/`after` snapshot instead —
+ * both as a string and as an ObjectId, since Mixed fields don't auto-cast.
+ *
+ * @param {string} parentEntity        e.g. "crm-account"
+ * @param {string} parentId
+ * @param {string[]} childEntities     e.g. ["crm-contact", "crm-site", ...]
+ * @param {string|string[]} parentKeys the field name(s) on the child that hold
+ *                                      the parent id — most children use one
+ *                                      key ("accountId"), but a relationship
+ *                                      is symmetric and needs to match on
+ *                                      either "fromAccountId" or "toAccountId".
+ */
+async function historyForWithChildren(parentEntity, parentId, childEntities, parentKeys, limit = 100) {
+  const mongoose = require("mongoose");
+  let oid = null;
+  try { oid = new mongoose.Types.ObjectId(parentId); } catch { /* not a valid ObjectId string */ }
+
+  const parentMatch = { entity: parentEntity, entityId: String(parentId) };
+  const keys = Array.isArray(parentKeys) ? parentKeys : [parentKeys];
+  const childKeyMatches = [];
+  for (const key of keys) {
+    childKeyMatches.push({ [`after.${key}`]: String(parentId) }, { [`before.${key}`]: String(parentId) });
+    if (oid) childKeyMatches.push({ [`after.${key}`]: oid }, { [`before.${key}`]: oid });
+  }
+  const childMatch = { entity: { $in: childEntities }, $or: childKeyMatches };
+
+  return ChangeLog.find({ $or: [parentMatch, childMatch] })
+    .sort({ createdAt: -1 })
+    .limit(Math.min(limit, 200))
+    .lean();
+}
+
+module.exports = { recordChange, historyFor, historyForWithChildren, recentFor, diff, actorFrom };

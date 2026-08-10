@@ -1401,3 +1401,6 @@ module.exports = router;
 module.exports.verifyToken = verifyToken;
 module.exports.signToken = signToken;
 module.exports.buildTokenPayload = buildTokenPayload;
+// Exported so a shared permission resolver can decide HR-tool access from the
+// SAME department grants used at login — not a second, drifting copy.
+module.exports.resolveEmployeeDepartments = resolveEmployeeDepartments;
