@@ -2338,25 +2338,34 @@ function getDisplayLabel(rawStatus, settings) {
 // 1. GET /employee-detail
 // ─────────────────────────────────────────────────────────────────────────────
 
-router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
-  try {
-    const { date, department } = req.query;
-    if (!date)
-      return res.status(400).json({ success: false, message: "date required" });
-    let dayDoc = await DailyAttendance.findOne({ dateStr: date }).lean();
-    if (!dayDoc) {
-      syncDay(date).catch((e) => console.warn("[BG-SYNC]", e.message));
-      return res.json({
-        success: true,
-        data: [],
-        count: 0,
-        summary: null,
-        unmatchedPunches: [],
-        synced: false,
-        message: "No data yet. Syncing in background — refresh in a moment.",
-      });
-    }
-    const settings = await AttendanceSettings.getConfig();
+// ─────────────────────────────────────────────────────────────────────────────
+// getDailyAttendance(date, department)
+//
+// The full daily-attendance computation, factored out of the GET /daily handler
+// so other server-side callers (e.g. the read-only Daily Attendance AI
+// assistant) can obtain the SAME records, statuses and summary the HR page
+// shows — through the exact same calculation/status logic — without a second,
+// drifting copy. The route below is now a thin wrapper over this. Behaviour is
+// unchanged: same query params, same returned shape.
+// ─────────────────────────────────────────────────────────────────────────────
+async function getDailyAttendance(date, department) {
+  if (!date) {
+    return { success: false, status: 400, message: "date required" };
+  }
+  let dayDoc = await DailyAttendance.findOne({ dateStr: date }).lean();
+  if (!dayDoc) {
+    syncDay(date).catch((e) => console.warn("[BG-SYNC]", e.message));
+    return {
+      success: true,
+      data: [],
+      count: 0,
+      summary: null,
+      unmatchedPunches: [],
+      synced: false,
+      message: "No data yet. Syncing in background — refresh in a moment.",
+    };
+  }
+  const settings = await AttendanceSettings.getConfig();
 
     // bid → date-of-joining. Any entry dated before its employee's DOJ is
     // overridden to PRE-JOINING below — a not-yet-joined person can't be
@@ -2466,23 +2475,33 @@ router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
         };
       return { ...e, dojStr: doj || null };
     });
-    const summary = recomputeSummary(employees);
-    employees = employees.map((e) => ({
-      ...e,
-      displayStatus: e.preJoining
-        ? "--"
-        : getDisplayLabel(e.effectiveStatus || e.systemPrediction, settings),
-    }));
-    res.json({
-      success: true,
-      data: employees,
-      count: employees.length,
-      summary,
-      unmatchedPunches: dayDoc.unmatchedPunches || [],
-      holiday: dayDoc.holiday || null,
-      syncedAt: dayDoc.syncedAt,
-      synced: true,
-    });
+  const summary = recomputeSummary(employees);
+  employees = employees.map((e) => ({
+    ...e,
+    displayStatus: e.preJoining
+      ? "--"
+      : getDisplayLabel(e.effectiveStatus || e.systemPrediction, settings),
+  }));
+  return {
+    success: true,
+    data: employees,
+    count: employees.length,
+    summary,
+    unmatchedPunches: dayDoc.unmatchedPunches || [],
+    holiday: dayDoc.holiday || null,
+    syncedAt: dayDoc.syncedAt,
+    synced: true,
+  };
+}
+
+router.get("/daily", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const { date, department } = req.query;
+    const result = await getDailyAttendance(date, department);
+    if (result.success === false && result.status) {
+      return res.status(result.status).json({ success: false, message: result.message });
+    }
+    return res.json(result);
   } catch (err) {
     console.error("[DAILY]", err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -8133,3 +8152,6 @@ module.exports.syncTodayOnly = syncTodayOnly;
 // the SAME policy HR configures here (designation lists, department
 // categories) rather than a second, drifting copy of the rules.
 module.exports.resolveEmployeeType = resolveEmployeeType;
+// Exported so the read-only Daily Attendance AI assistant builds its context
+// from the SAME computation the HR daily page uses, rather than a second copy.
+module.exports.getDailyAttendance = getDailyAttendance;

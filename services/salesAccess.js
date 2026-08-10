@@ -1,0 +1,37 @@
+// services/salesAccess.js
+//
+// "Is this caller a Sales MANAGER" — one answer, reused everywhere the Draft
+// Lead chunk needs it (draft visibility, activation authorization). There is
+// no existing server-side equivalent: departmentWriteGuard resolves this for
+// WRITES via requireDepartmentRole, but explicitly skips every GET/HEAD/OPTIONS
+// ("reads are never touched" — see its own header), so a plain list/detail
+// read has never needed to know the caller's department role until now.
+//
+// Three ways a caller counts as a manager, cheapest first:
+//   1. Org-level role (admin/ceo, from SalesAuthMiddlewear's req.user.role) —
+//      always a manager, no DB lookup.
+//   2. req.user.departmentRole, if some earlier middleware already resolved it
+//      (departmentWriteGuard's requireDepartmentRole sets this on a WRITE
+//      request) — reuse it rather than looking it up twice in one request.
+//   3. A live lookup: services/departmentRoles.getRole("sales", email), which
+//      is the SAME store departmentWriteGuard itself reads from — one
+//      vocabulary, not a second opinion. Requires req.user.email, which
+//      SalesAuthMiddlewear now attaches (see that file's own comment).
+"use strict";
+
+const { getRole } = require("./departmentRoles");
+const { roleAtLeast } = require("../models/Access/DepartmentRole");
+
+const ORG_LEVEL_MANAGER_ROLES = new Set(["admin", "ceo"]);
+
+/** @param {{role?:string, departmentRole?:string, email?:string}} user */
+async function isSalesManager(user) {
+  if (!user) return false;
+  if (ORG_LEVEL_MANAGER_ROLES.has(user.role)) return true;
+  if (user.departmentRole) return roleAtLeast(user.departmentRole, "approver");
+  if (!user.email) return false;
+  const role = await getRole("sales", user.email);
+  return Boolean(role) && roleAtLeast(role, "approver");
+}
+
+module.exports = { isSalesManager };
