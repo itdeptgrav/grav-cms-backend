@@ -42,9 +42,58 @@ const socket = require("../../config/socketInstance");
 const router = express.Router();
 
 const DOCUMENTS = "cowork_documents";
+const DOCUMENT_BODIES = "cowork_document_bodies";
+const VERSIONS = "versions";
 
 /** The roles the document surface recognises. `null` means "removed". */
 const ROLES = ["owner", "editor", "viewer"];
+
+/**
+ * This person's role in the document, tolerating the pre-roles shape.
+ *
+ * Mirrors `roleOf` in `services/documentCollab.service.js` and `readMembers`
+ * in the frontend's `lib/rules/documents/access.ts` — all three have to agree,
+ * or somebody refused here could still write through the collaboration socket,
+ * or the reverse.
+ */
+function _roleOf(doc, employeeId) {
+  if (Array.isArray(doc.members) && doc.members.length) {
+    const found = doc.members.find((m) => m && m.employeeId === employeeId);
+    return found ? found.role || "viewer" : null;
+  }
+  const ids = Array.isArray(doc.memberIds) ? doc.memberIds : [];
+  if (!ids.includes(employeeId)) return null;
+  return doc.createdById === employeeId ? "owner" : "editor";
+}
+
+const MAY_WRITE = new Set(["owner", "editor"]);
+
+/**
+ * Load a document and check membership (and optionally write access) in one
+ * place, so every version route asks the same question the same way.
+ *
+ * A document that does not exist and one the caller is not a member of answer
+ * identically — `{ status: 404 }` — for the same reason `getDocument` on the
+ * frontend repository does: a distinguishable refusal would confirm a real
+ * document id to somebody with no access to it.
+ */
+async function _loadDocumentForMember(documentId, employeeId, { requireWrite = false } = {}) {
+  const snap = await db.collection(DOCUMENTS).doc(String(documentId)).get();
+  if (!snap.exists) return { error: { status: 404, message: "Document not found." } };
+  const doc = snap.data();
+  if (doc.deletedAt) return { error: { status: 404, message: "Document not found." } };
+  const role = _roleOf(doc, employeeId);
+  if (!role) return { error: { status: 404, message: "Document not found." } };
+  if (requireWrite && !MAY_WRITE.has(role)) {
+    return {
+      error: {
+        status: 403,
+        message: "You have view access to this document. Ask an owner for editing access.",
+      },
+    };
+  }
+  return { doc, role };
+}
 
 /**
  * Write the notification, emit it, push it.
@@ -150,6 +199,147 @@ router.post(
       res.json({ success: true, notified: true });
     } catch (e) {
       console.error("Error in /documents/:documentId/notify-member:", e);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// ── VERSION HISTORY ──────────────────────────────────────────────────────────
+//
+// A checkpoint is a snapshot of `cowork_document_bodies/{id}.ydocState` — the
+// same base64 Yjs blob `documentCollab.service.js` already computes on every
+// debounced save (see `maybeCheckpoint` there for the automatic side of this;
+// these three routes are the manual side, plus reading and restoring).
+
+// POST /cowork/documents/:documentId/versions — save a checkpoint now.
+// Body: { label? }
+router.post(
+  "/documents/:documentId/versions",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { documentId } = req.params;
+      const { employeeId: actor, name: actorName } = req.coworkUser;
+      const rawLabel = req.body && typeof req.body.label === "string" ? req.body.label.trim() : "";
+      const label = rawLabel ? rawLabel.slice(0, 200) : null;
+
+      const gate = await _loadDocumentForMember(documentId, actor, { requireWrite: true });
+      if (gate.error) return res.status(gate.error.status).json({ error: gate.error.message });
+
+      /* Copies whatever is currently stored rather than taking Yjs bytes from
+         the request — the client has no business uploading CRDT state of its
+         own, and the debounced live save already keeps this field fresh. */
+      const bodySnap = await db.collection(DOCUMENT_BODIES).doc(String(documentId)).get();
+      const ydocState = bodySnap.exists ? bodySnap.data().ydocState : null;
+      if (typeof ydocState !== "string" || !ydocState) {
+        return res.status(400).json({ error: "This document has no saved content yet to check-point." });
+      }
+
+      const ref = db.collection(DOCUMENT_BODIES).doc(String(documentId)).collection(VERSIONS).doc();
+      const createdAt = new Date().toISOString();
+      const authorName = actorName || "Someone";
+      await ref.set({ ydocState, createdAt, authorId: actor, authorName, label });
+
+      res.json({ version: { id: ref.id, createdAt, authorId: actor, authorName, label } });
+    } catch (e) {
+      console.error("Error in POST /documents/:documentId/versions:", e);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// GET /cowork/documents/:documentId/versions — list, newest first.
+// Any member may look, including a viewer — reading history is not editing.
+router.get(
+  "/documents/:documentId/versions",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { documentId } = req.params;
+      const { employeeId: actor } = req.coworkUser;
+
+      const gate = await _loadDocumentForMember(documentId, actor);
+      if (gate.error) return res.status(gate.error.status).json({ error: gate.error.message });
+
+      const snap = await db
+        .collection(DOCUMENT_BODIES)
+        .doc(String(documentId))
+        .collection(VERSIONS)
+        .orderBy("createdAt", "desc")
+        .limit(200)
+        .get();
+
+      const versions = snap.docs.map((d) => {
+        const v = d.data() || {};
+        return {
+          id: d.id,
+          createdAt: typeof v.createdAt === "string" ? v.createdAt : null,
+          authorId: typeof v.authorId === "string" ? v.authorId : null,
+          authorName: typeof v.authorName === "string" ? v.authorName : "Someone",
+          label: typeof v.label === "string" ? v.label : null,
+        };
+      });
+
+      res.json({ versions });
+    } catch (e) {
+      console.error("Error in GET /documents/:documentId/versions:", e);
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// POST /cowork/documents/:documentId/versions/:versionId/restore
+//
+// Replaces the document, outright — not a merge. Every connected client's
+// live Yjs doc picks this up the normal way it picks up any other change to
+// `ydocState`: on its next fresh sync (a room already live in memory keeps
+// running on what it has until everybody leaves and it reloads from
+// Firestore — the same story any other out-of-band write to `ydocState`
+// would have, and not something a REST route can reach into a running
+// `y-socket.io` room to force).
+router.post(
+  "/documents/:documentId/versions/:versionId/restore",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { documentId, versionId } = req.params;
+      const { employeeId: actor } = req.coworkUser;
+
+      const gate = await _loadDocumentForMember(documentId, actor, { requireWrite: true });
+      if (gate.error) return res.status(gate.error.status).json({ error: gate.error.message });
+
+      const versionSnap = await db
+        .collection(DOCUMENT_BODIES)
+        .doc(String(documentId))
+        .collection(VERSIONS)
+        .doc(String(versionId))
+        .get();
+      if (!versionSnap.exists) return res.status(404).json({ error: "That version no longer exists." });
+      const version = versionSnap.data() || {};
+      if (typeof version.ydocState !== "string" || !version.ydocState) {
+        return res.status(400).json({ error: "That version has no content to restore." });
+      }
+
+      const now = new Date().toISOString();
+      await db.collection(DOCUMENT_BODIES).doc(String(documentId)).set(
+        { ydocState: version.ydocState, updatedAt: now },
+        { merge: true },
+      );
+      await db
+        .collection(DOCUMENTS)
+        .doc(String(documentId))
+        .update({ updatedAt: now })
+        .catch(() => {
+          /* The record may have been deleted mid-request. The body write above
+             is what matters; failing here must not lose it. */
+        });
+
+      res.json({ success: true, restoredAt: now });
+    } catch (e) {
+      console.error("Error in POST /documents/:documentId/versions/:versionId/restore:", e);
       res.status(500).json({ error: e.message });
     }
   },

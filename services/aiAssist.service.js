@@ -1,8 +1,8 @@
 /**
  * services/aiAssist.service.js
  *
- * The Gemini side of the workspace AI assistant — Docs and Sheets, one model,
- * one call shape.
+ * The Gemini side of the workspace AI assistant — Docs, Sheets and Mindmaps,
+ * one model, one call shape.
  *
  * ── What this owns, and what it deliberately does not ──────────────────────
  *
@@ -437,16 +437,99 @@ const SHEETS_TOOLS = [
       required: ["title"],
     },
   },
+  {
+    name: "flag_outliers",
+    description:
+      "Highlight specific cells as outliers/anomalies within a range, each with a short reason — a reviewable, undoable markup rather than a plain-text answer. Prefer this over replying in text whenever the request is to find anomalies, outliers, or unusual values in a range.",
+    parameters: {
+      type: SchemaType.OBJECT,
+      properties: {
+        range: { type: SchemaType.STRING, description: "The range that was analysed, e.g. A1:D20." },
+        flags: {
+          type: SchemaType.ARRAY,
+          description: "The cells being flagged, each inside `range`.",
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              ref: { type: SchemaType.STRING, description: "e.g. B4" },
+              reason: { type: SchemaType.STRING, description: "One short sentence: why this cell stands out." },
+            },
+            required: ["ref", "reason"],
+          },
+        },
+      },
+      required: ["range", "flags"],
+    },
+  },
+];
+
+// ── Mindmap tool declarations ────────────────────────────────────────────
+
+/** Kept in step with the frontend's own re-enforcement in `lib/rules/mindmap/aiTools.ts` — the system instruction below is a request, not the enforcement. */
+const MAX_REORGANIZE_MOVES = 20;
+
+const MINDMAP_TOOLS = [
+  {
+    name: "add_child_nodes",
+    description:
+      "Expand one existing card into several new child cards underneath it. Use this whenever the request is to expand, brainstorm, break down, or add ideas under a card.",
+    parameters: {
+      type: SchemaType.OBJECT,
+      properties: {
+        parentId: {
+          type: SchemaType.STRING,
+          description: "The id of the existing card the new cards attach under. Must be an id shown in the context below — never invented.",
+        },
+        children: {
+          type: SchemaType.ARRAY,
+          description: "The new cards, in the order they should appear.",
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              title: { type: SchemaType.STRING, description: "Short card title — a few words, not a sentence." },
+              description: { type: SchemaType.STRING, description: "Optional longer note for the card." },
+            },
+            required: ["title"],
+          },
+        },
+      },
+      required: ["parentId", "children"],
+    },
+  },
+  {
+    name: "reorganize_nodes",
+    description:
+      "Move one or more existing cards to a different parent card — for clustering related ideas together or fixing a card that landed under the wrong parent. Every id must already exist in the map.",
+    parameters: {
+      type: SchemaType.OBJECT,
+      properties: {
+        moves: {
+          type: SchemaType.ARRAY,
+          description: `Which cards move where. At most ${MAX_REORGANIZE_MOVES} moves in one call.`,
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              nodeId: { type: SchemaType.STRING, description: "The card being moved. Must be an id shown in the context below." },
+              newParentId: { type: SchemaType.STRING, description: "The card it moves under. Must be an id shown in the context below." },
+            },
+            required: ["nodeId", "newParentId"],
+          },
+        },
+      },
+      required: ["moves"],
+    },
+  },
 ];
 
 /**
- * The rules Gemini answers under, common to both surfaces plus a per-surface
+ * The rules Gemini answers under, common to all surfaces plus a per-surface
  * addendum. The negative instructions matter more than the positive ones —
  * see `lib/help/gemini.ts` in the frontend repo for the same principle
  * applied to a different assistant.
  */
 function systemInstruction(surface, contextSummary) {
-  const shared = `You are the writing/spreadsheet assistant embedded in Cowork's ${surface === "docs" ? "document" : "sheet"} editor.
+  const surfaceNoun = surface === "docs" ? "document" : surface === "sheets" ? "spreadsheet" : "mindmap";
+  const shared = `You are the writing/spreadsheet/mindmap assistant embedded in Cowork's ${surfaceNoun} editor.
 
 Hard rules:
 - Call AT MOST ONE tool per reply. If the request needs more than one step, do the single most useful step and say what else could follow — never chain several tool calls in one turn.
@@ -454,7 +537,13 @@ ${surface === "docs"
     ? `- When the request is for a whole document, letter, report, SOP, email, meeting notes, or anything needing more than one paragraph or element, use insert_blocks and put the ENTIRE body in that one call. Write the real, finished content at a natural length for the request — do not write a title and stop, and do not leave placeholders like [Your Name] unless the user gave you nothing to put there.
 - LAY THE DOCUMENT OUT, do not return a wall of paragraphs. Give it a centred title, section headings, and a divider where a section genuinely ends. Use **bold** for names, dates, figures and key terms inside sentences, and *italic* sparingly for emphasis or an aside. Use a quote block for anything genuinely quoted. Use a table whenever the content is really rows and columns — schedules, deliverables, comparisons.
 - Style with restraint, the way a professional document is styled: at most one accent colour, used only on the title or section headings, and only when the request suggests something branded or formal. Body text carries no colour and no size override. Never colour a whole paragraph. If in doubt, leave the styling off — clean and unstyled beats decorated.`
-    : `- When the request is to build a table or fill a block of cells, use create_table or set_cells and include every row in that one call.`}
+    : surface === "sheets"
+      ? `- When the request is to build a table or fill a block of cells, use create_table or set_cells and include every row in that one call.
+- When the request is to find anomalies, outliers, or unusual/unexpected values or trends in a range, prefer flag_outliers over a plain-text answer — it gives the user something to review and apply, not just a description.`
+      : `- When the request is to expand, brainstorm, or break down a card, use add_child_nodes with 3 to 7 children unless the user asked for a specific count.
+- Every id you use (parentId, nodeId, newParentId) MUST be one of the ids shown in the context below — never invent one.
+- Never propose more than ${MAX_REORGANIZE_MOVES} moves in a single reorganize_nodes call. If more than that would genuinely help, do the most useful ${MAX_REORGANIZE_MOVES} and say what else could follow.
+- The context below names which card, if any, is currently selected. When the user's instruction doesn't name a card explicitly (e.g. "add some children" or "expand this"), operate on the selected card as the implicit parent/target. If nothing is selected and none was named, ask which card they mean instead of guessing.`}
 - Only use the tools you were given. Never invent a tool name or an argument that is not in its schema.
 - If the request is ambiguous, destructive-sounding, or you are not confident, reply with plain text asking a clarifying question instead of calling a tool.
 - Work only from the context you were given below. Do not assume content that was not shown to you.
@@ -476,7 +565,7 @@ async function assist({ surface, instruction, contextSummary, history }) {
     return { ok: false, reason: "not_configured", message: "The assistant is not configured." };
   }
 
-  const tools = surface === "docs" ? DOCS_TOOLS : SHEETS_TOOLS;
+  const tools = surface === "docs" ? DOCS_TOOLS : surface === "sheets" ? SHEETS_TOOLS : MINDMAP_TOOLS;
 
   try {
     const client = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -556,4 +645,4 @@ async function withOneRetry(fn) {
   }
 }
 
-module.exports = { assist, isConfigured, DOCS_TOOLS, SHEETS_TOOLS, MODEL };
+module.exports = { assist, isConfigured, DOCS_TOOLS, SHEETS_TOOLS, MINDMAP_TOOLS, MODEL };

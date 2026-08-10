@@ -11,6 +11,12 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 
 const mongoose = require("mongoose");
 const { recordChange } = require("../../services/changeLog");
+// Push notifications — one fan-out to mobile (Expo) + web (FCM).
+// Fire-and-forget: never awaited, never able to fail an HR decision.
+const {
+  notifyRegularizationApproved,
+  notifyRegularizationRejected,
+} = require("../../utils/notifyEmployee");
 require("../../models/HR_Models/LeaveManagement");
 function getCompanyHoliday() {
   return mongoose.model("CompanyHoliday");
@@ -1804,6 +1810,315 @@ async function applyLeaveToAttendance(leaveApp) {
   );
   return { applied, skipped, missingDays };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  REGULARIZATION → ATTENDANCE
+//
+//  The single place an approved regularization is written onto
+//  DailyAttendance.employees[i]. It used to live inline inside
+//  PATCH /regularizations/:id/hr-approve; the app's manager chain finalises the
+//  same requests, so it had to become callable from both. There is exactly one
+//  implementation — do not grow a second one alongside /punch-correction, which
+//  recomputes by different (and older) rules.
+//
+//  Callers keep the status change even when this reports applied:false. A
+//  regularization for a day that has no attendance row has nothing defensible
+//  to write, and unlike leave there is no sane synthetic row to invent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Accepts a Date, an ISO string, or a bare "HH:mm" and lands on a real Date. */
+const regDateOnDay = (v, dateStr) => {
+  if (!v) return null;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  const s = String(v);
+  if (/^([01]\d|2[0-3]):([0-5]\d)$/.test(s))
+    return parseTimeOnDateIST(s, dateStr);
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+};
+
+/**
+ * Apply an approved regularization to the employee's attendance row.
+ *
+ * @param {Document} r  a live (non-lean) RegularizationRequest mongoose doc
+ * @param {{id: string, name: string}} actor  who approved — manager or HR user
+ * @returns {Promise<{applied: boolean, skipped: string|null, punchChanges: Array}>}
+ */
+async function applyRegularizationToAttendance(r, actor = {}) {
+  const punchChanges = [];
+  const out = (applied, skipped) => ({ applied, skipped, punchChanges });
+
+  if (!r) return out(false, "no_request");
+  // Idempotent: a retry, a double-tap, or HR re-approving must not stack a
+  // second punch onto the same day.
+  if (r.appliedToAttendance === true) return out(false, "already_applied");
+
+  const bid = String(r.biometricId || "").toUpperCase();
+  if (!bid) return out(false, "no_biometric_id");
+
+  // A regularization exists precisely BECAUSE the day is wrong, and the most
+  // common wrong-ness is that nothing was recorded at all — the device missed
+  // the punch, so the sync never wrote a row. Refusing to apply in that case
+  // ("no_attendance_row") made the feature fail on the exact scenario it was
+  // built for: the request was approved but the attendance never changed.
+  //
+  // So the row is created when absent, mirroring applyLeaveToAttendance, which
+  // has injected missing employee rows since it was written.
+  let dayDoc = await DailyAttendance.findOne({ dateStr: r.dateStr });
+  if (!dayDoc) {
+    dayDoc = new DailyAttendance({ dateStr: r.dateStr, employees: [] });
+  }
+
+  let idx = (dayDoc.employees || []).findIndex((e) => e.biometricId === bid);
+  if (idx === -1) {
+    // Seeded as absent with no punches: the regularization below is what
+    // supplies the real times/status, and starting from AB means that if it
+    // only fills one punch the day still reads honestly.
+    dayDoc.employees.push({
+      employeeDbId: r.employeeId,
+      biometricId: bid,
+      employeeName: r.employeeName || "",
+      department: r.department || "",
+      designation: r.designation || "",
+      employeeType: "executive",
+      isGhost: false,
+      matchMethod: "regularization-injected",
+      rawPunches: [],
+      punchCount: 0,
+      inTime: null,
+      finalOut: null,
+      netWorkMins: 0,
+      otMins: 0,
+      lateMins: 0,
+      hasMissPunch: false,
+      isLate: false,
+      isEarlyDeparture: false,
+      hasOT: false,
+      totalSpanMins: 0,
+      lunchBreakMins: 0,
+      teaBreakMins: 0,
+      totalBreakMins: 0,
+      attendanceValue: 0,
+      systemPrediction: "AB",
+      hrFinalStatus: null,
+    });
+    idx = dayDoc.employees.length - 1;
+  }
+
+  const emp = dayDoc.employees[idx];
+
+  // Never overwrite a week-off or a holiday — same guard applyLeaveToAttendance
+  // has carried since it was written.
+  if (["WO", "FH", "NH", "OH", "RH", "PH"].includes(emp.systemPrediction))
+    return out(false, "rest_day");
+
+  const actorLabel = actor.name || actor.id || "system";
+  const punchFieldMap = {
+    in: "inTime",
+    lunch_out: "lunchOut",
+    lunch_in: "lunchIn",
+    tea_out: "teaOut",
+    tea_in: "teaIn",
+    out: "finalOut",
+  };
+
+  const upsertRawPunch = (punchType, when) => {
+    const entry = {
+      time: when,
+      punchType,
+      source: "miss_punch",
+      addedBy: actorLabel,
+      addedAt: new Date(),
+    };
+    const existingIdx = (emp.rawPunches || []).findIndex(
+      (p) => p.punchType === punchType,
+    );
+    if (existingIdx >= 0)
+      emp.rawPunches[existingIdx] = {
+        ...emp.rawPunches[existingIdx],
+        ...entry,
+      };
+    else emp.rawPunches = [...(emp.rawPunches || []), entry];
+  };
+
+  const proposedIn = regDateOnDay(r.proposedInTime, r.dateStr);
+  const proposedOut = regDateOnDay(r.proposedOutTime, r.dateStr);
+
+  if (proposedIn) {
+    const oldT = emp.inTime ? fmtTimeIST12(emp.inTime) : "—";
+    emp.inTime = proposedIn;
+    upsertRawPunch("in", proposedIn);
+    punchChanges.push({
+      punchType: "in",
+      action: "modify",
+      oldTime: oldT,
+      newTime: fmtTimeIST12(proposedIn),
+    });
+  }
+  if (proposedOut) {
+    const oldT = emp.finalOut ? fmtTimeIST12(emp.finalOut) : "—";
+    emp.finalOut = proposedOut;
+    upsertRawPunch("out", proposedOut);
+    punchChanges.push({
+      punchType: "out",
+      action: "modify",
+      oldTime: oldT,
+      newTime: fmtTimeIST12(proposedOut),
+    });
+  }
+
+  // Legacy / HR-filed singular-punch form. The app never writes these — it uses
+  // proposedInTime / proposedOutTime — but rows created before that exist.
+  if (r.proposedPunchType && r.proposedPunchAction) {
+    const fieldName = punchFieldMap[r.proposedPunchType];
+    if (fieldName) {
+      const oldT = emp[fieldName] ? fmtTimeIST12(emp[fieldName]) : "—";
+      if (r.proposedPunchAction === "remove") {
+        emp[fieldName] = null;
+        emp.rawPunches = (emp.rawPunches || []).filter(
+          (p) => p.punchType !== r.proposedPunchType,
+        );
+        punchChanges.push({
+          punchType: r.proposedPunchType,
+          action: "remove",
+          oldTime: oldT,
+          newTime: "removed",
+        });
+      } else if (r.proposedPunchTime) {
+        const newDate = regDateOnDay(r.proposedPunchTime, r.dateStr);
+        if (newDate) {
+          emp[fieldName] = newDate;
+          upsertRawPunch(r.proposedPunchType, newDate);
+          punchChanges.push({
+            punchType: r.proposedPunchType,
+            action: r.proposedPunchAction,
+            oldTime: oldT,
+            newTime: fmtTimeIST12(newDate),
+          });
+        }
+      }
+    }
+  }
+
+  for (const pc of r.proposedPunches || []) {
+    const fieldName = punchFieldMap[pc.punchType];
+    if (!fieldName) continue;
+    const oldT = emp[fieldName] ? fmtTimeIST12(emp[fieldName]) : "—";
+    if (pc.action === "remove") {
+      emp[fieldName] = null;
+      emp.rawPunches = (emp.rawPunches || []).filter(
+        (p) => p.punchType !== pc.punchType,
+      );
+      punchChanges.push({
+        punchType: pc.punchType,
+        action: "remove",
+        oldTime: oldT,
+        newTime: "removed",
+      });
+    } else if (pc.punchTime) {
+      const newDate = regDateOnDay(pc.punchTime, r.dateStr);
+      if (!newDate) continue;
+      emp[fieldName] = newDate;
+      upsertRawPunch(pc.punchType, newDate);
+      punchChanges.push({
+        punchType: pc.punchType,
+        action: pc.action,
+        oldTime: oldT,
+        newTime: fmtTimeIST12(newDate),
+      });
+    }
+  }
+
+  emp.rawPunches = (emp.rawPunches || [])
+    .filter((p) => p.time)
+    .sort((a, b) => new Date(a.time) - new Date(b.time))
+    .map((p, i) => ({ ...p, seq: i + 1 }));
+  emp.punchCount = emp.rawPunches.length;
+
+  // Recompute only when a punch actually moved. A pure wrong_status request has
+  // nothing new to derive from, and recomputing would churn the day for nothing.
+  if (punchChanges.length > 0) {
+    const settings = await AttendanceSettings.getConfig();
+    const shift = settings.shifts[emp.employeeType] || settings.shifts.executive;
+    const shiftStart = hhmmMins(shift.start),
+      shiftEnd = hhmmMins(shift.end),
+      inMins = minsOf(emp.inTime),
+      outMins = minsOf(emp.finalOut);
+    const totalSpanMins =
+      emp.inTime && emp.finalOut
+        ? Math.round((emp.finalOut - emp.inTime) / 60000)
+        : 0;
+    const lunchBreakMins =
+      emp.lunchOut && emp.lunchIn
+        ? Math.max(0, Math.round((emp.lunchIn - emp.lunchOut) / 60000))
+        : 0;
+    const teaBreakMins =
+      emp.teaOut && emp.teaIn
+        ? Math.max(0, Math.round((emp.teaIn - emp.teaOut) / 60000))
+        : 0;
+    const totalBreakMins = lunchBreakMins + teaBreakMins,
+      netWorkMins = Math.max(0, totalSpanMins - totalBreakMins);
+    const effectiveGrace =
+      (shift.lateGraceMins || 0) + (emp.appliedExtraGraceMins || 0);
+    const lateMins =
+      inMins != null ? Math.max(0, inMins - (shiftStart + effectiveGrace)) : 0;
+    const earlyDepartureMins =
+      outMins != null ? Math.max(0, shiftEnd - outMins) : 0;
+    let otMins = 0;
+    if (emp.employeeType === "operator" && outMins != null) {
+      const over = outMins - shiftEnd - (shift.otGraceMins || 0);
+      if (over > 0) otMins = over;
+    }
+    emp.totalSpanMins = totalSpanMins;
+    emp.lunchBreakMins = lunchBreakMins;
+    emp.teaBreakMins = teaBreakMins;
+    emp.totalBreakMins = totalBreakMins;
+    emp.netWorkMins = netWorkMins;
+    emp.lateMins = lateMins;
+    emp.lateDisplay = fmtLateMins(lateMins);
+    emp.isLate = lateMins > 0;
+    emp.earlyDepartureMins = earlyDepartureMins;
+    emp.isEarlyDeparture = earlyDepartureMins > 0;
+    emp.otMins = otMins;
+    emp.hasOT = otMins > 0;
+    emp.hasMissPunch = !(emp.inTime && emp.finalOut);
+    if (!emp.inTime) emp.systemPrediction = "AB";
+    else if (!emp.finalOut) emp.systemPrediction = "MP";
+    else if (
+      emp.employeeType === "operator"
+        ? netWorkMins < (shift.halfDayThresholdMins || 390)
+        : totalSpanMins <= (shift.halfDayThresholdMins || 450)
+    )
+      emp.systemPrediction = "HD";
+    else if (lateMins > 0) emp.systemPrediction = "P*";
+    else if (earlyDepartureMins > 0) emp.systemPrediction = "P~";
+    else emp.systemPrediction = "P";
+  }
+
+  // Order matters: punches → recompute → hrFinalStatus → attendanceValue.
+  // getAttendanceValue prefers hrFinalStatus, so a requested status decides the
+  // payroll weight even though systemPrediction was just recomputed underneath.
+  if (r.requestedStatus) emp.hrFinalStatus = r.requestedStatus;
+  emp.hrRemarks = r.hrRemarks || `Regularized (${r.type})`;
+  emp.hrReviewedAt = new Date();
+  emp.hrReviewedBy = actorLabel;
+  emp.attendanceValue = getAttendanceValue(
+    emp.hrFinalStatus || emp.systemPrediction,
+  );
+
+  dayDoc.markModified("employees");
+  await dayDoc.save();
+
+  // The caller owns saving `r` — it has other fields in flight.
+  r.appliedToAttendance = true;
+  r.appliedAt = new Date();
+
+  console.log(
+    `[REG-APPLY] ${bid} ${r.dateStr} (${r.type}): ${punchChanges.length} punch change(s), status=${emp.hrFinalStatus || emp.systemPrediction}`,
+  );
+  return out(true, null);
+}
+
 async function applyApprovedLeavesForDate(dateStr) {
   // All hr_approved leaves that overlap this date
   // Include withdraw_pending so leave still shows in attendance until withdrawal is approved
@@ -6615,7 +6930,7 @@ router.get("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       department,
       from,
       to,
-      requestType,
+      type,
       employeeId,
       page = 1,
       limit = 50,
@@ -6623,7 +6938,9 @@ router.get("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
     const filter = {};
     if (status && status !== "all") filter.status = status;
     if (department && department !== "all") filter.department = department;
-    if (requestType && requestType !== "all") filter.requestType = requestType;
+    // `requestType` was never a field on the schema — this filter matched zero
+    // rows. The real discriminator is `type`.
+    if (type && type !== "all") filter.type = type;
     if (employeeId) filter.employeeId = employeeId;
     if (from || to) {
       filter.dateStr = {};
@@ -6649,15 +6966,14 @@ router.get("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       hr_approved: all.filter((a) => a.status === "hr_approved").length,
       hr_rejected: all.filter((a) => a.status === "hr_rejected").length,
       cancelled: all.filter((a) => a.status === "cancelled").length,
+      // Keyed off the real `type` field and its actual enum. late_arrival and
+      // early_departure were never members of it — they always counted 0.
       byType: {
-        miss_punch: all.filter((a) => a.requestType === "miss_punch").length,
-        late_arrival: all.filter((a) => a.requestType === "late_arrival")
-          .length,
-        early_departure: all.filter((a) => a.requestType === "early_departure")
-          .length,
-        wrong_status: all.filter((a) => a.requestType === "wrong_status")
-          .length,
-        other: all.filter((a) => a.requestType === "other").length,
+        miss_punch: all.filter((a) => a.type === "miss_punch").length,
+        forgot_punch: all.filter((a) => a.type === "forgot_punch").length,
+        wrong_status: all.filter((a) => a.type === "wrong_status").length,
+        client_visit: all.filter((a) => a.type === "client_visit").length,
+        other: all.filter((a) => a.type === "other").length,
       },
     };
     res.json({
@@ -6693,13 +7009,12 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       employeeName,
       department,
       designation,
-      requestType,
+      type,
       dateStr,
       reason,
       proposedInTime,
       proposedOutTime,
-      proposedStatus,
-      proposedRemarks,
+      requestedStatus,
       documentUrl,
       documentFileId,
       documentFileName,
@@ -6745,15 +7060,18 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       employeeName,
       department,
       designation,
-      requestType: requestType || "miss_punch",
+      type: type || "miss_punch",
       dateStr,
       reason,
-      proposedInTime: proposedInTime || null,
-      proposedOutTime: proposedOutTime || null,
-      proposedStatus: proposedStatus || null,
-      proposedRemarks: proposedRemarks || null,
+      // Times arrive as "HH:mm" and are materialised onto the day in IST here,
+      // so the applier never has to guess what a bare string meant.
+      proposedInTime: regDateOnDay(proposedInTime, dateStr),
+      proposedOutTime: regDateOnDay(proposedOutTime, dateStr),
+      requestedStatus: requestedStatus || null,
       proposedPunchType: req.body.proposedPunchType || null,
-      proposedPunchTime: req.body.proposedPunchTime || null,
+      proposedPunchTime: req.body.proposedPunchTime
+        ? regDateOnDay(req.body.proposedPunchTime, dateStr)
+        : null,
       proposedPunchAction: req.body.proposedPunchAction || null,
       proposedPunches: Array.isArray(req.body.proposedPunches)
         ? req.body.proposedPunches
@@ -6777,42 +7095,11 @@ router.post("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
-router.patch(
-  "/regularizations/:id/manager-decision",
-  EmployeeAuthMiddlewear,
-  async (req, res) => {
-    try {
-      const { managerId, managerName, type, decision, remarks } = req.body;
-      if (!["approved", "rejected"].includes(decision))
-        return res.status(400).json({
-          success: false,
-          message: "decision must be approved or rejected",
-        });
-      const r = await getRegularizationRequest().findById(req.params.id);
-      if (!r)
-        return res.status(404).json({ success: false, message: "Not found" });
-      if (!["pending", "manager_approved"].includes(r.status))
-        return res.status(400).json({
-          success: false,
-          message: `Cannot record manager decision on status ${r.status}`,
-        });
-      r.managerDecisions.push({
-        managerId,
-        managerName,
-        type: type || "primary",
-        decision,
-        remarks: remarks || "",
-        decidedAt: new Date(),
-      });
-      if (decision === "rejected") r.status = "manager_rejected";
-      else r.status = "manager_approved";
-      await r.save();
-      res.json({ success: true, data: r });
-    } catch (err) {
-      res.status(500).json({ success: false, message: err.message });
-    }
-  },
-);
+// PATCH /regularizations/:id/manager-decision was deleted here. It read the
+// approver's identity straight out of req.body, never checked managersNotified
+// membership, enforced no primary→secondary order, and sat behind
+// EmployeeAuthMiddlewear so an app manager could not call it anyway. The chain
+// now lives at PATCH /api/employee/regularizations/manager/:id/approve|reject.
 
 router.patch(
   "/regularizations/:id/hr-approve",
@@ -6822,233 +7109,40 @@ router.patch(
       const r = await getRegularizationRequest().findById(req.params.id);
       if (!r)
         return res.status(404).json({ success: false, message: "Not found" });
-      if (r.status === "hr_approved")
-        return res
-          .status(400)
-          .json({ success: false, message: "Already approved" });
+
+      // Only an undecided request can be finalised. Without this gate HR could
+      // approve a request no manager has ever seen, or resurrect a rejected one.
+      if (!["pending", "manager_approved"].includes(r.status))
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_TRANSITION",
+          message: `Cannot approve — ${r.status}`,
+        });
+
       r.status = "hr_approved";
       r.hrApprovedBy = req.user.id;
+      r.hrApprovedByName = req.user.name || req.user.email || null;
       r.hrApprovedAt = new Date();
       r.hrRemarks = req.body?.remarks || "";
-      const punchChanges = [];
-      const bid = r.biometricId;
-      if (bid) {
-        const dayDoc = await DailyAttendance.findOne({ dateStr: r.dateStr });
-        if (dayDoc) {
-          const idx = (dayDoc.employees || []).findIndex(
-            (e) => e.biometricId === bid,
-          );
-          if (idx !== -1) {
-            const emp = dayDoc.employees[idx];
-            const punchFieldMap = {
-              in: "inTime",
-              lunch_out: "lunchOut",
-              lunch_in: "lunchIn",
-              tea_out: "teaOut",
-              tea_in: "teaIn",
-              out: "finalOut",
-            };
-            if (r.proposedInTime) {
-              const oldT = emp.inTime ? fmtTimeIST12(emp.inTime) : "—";
-              emp.inTime = parseTimeOnDateIST(r.proposedInTime, r.dateStr);
-              punchChanges.push({
-                punchType: "in",
-                action: "modify",
-                oldTime: oldT,
-                newTime: fmtTimeIST12(emp.inTime),
-              });
-            }
-            if (r.proposedOutTime) {
-              const oldT = emp.finalOut ? fmtTimeIST12(emp.finalOut) : "—";
-              emp.finalOut = parseTimeOnDateIST(r.proposedOutTime, r.dateStr);
-              punchChanges.push({
-                punchType: "out",
-                action: "modify",
-                oldTime: oldT,
-                newTime: fmtTimeIST12(emp.finalOut),
-              });
-            }
-            if (r.proposedPunchType && r.proposedPunchAction) {
-              const fieldName = punchFieldMap[r.proposedPunchType];
-              if (fieldName) {
-                const oldT = emp[fieldName]
-                  ? fmtTimeIST12(emp[fieldName])
-                  : "—";
-                if (r.proposedPunchAction === "remove") {
-                  emp[fieldName] = null;
-                  emp.rawPunches = (emp.rawPunches || []).filter(
-                    (p) => p.punchType !== r.proposedPunchType,
-                  );
-                  punchChanges.push({
-                    punchType: r.proposedPunchType,
-                    action: "remove",
-                    oldTime: oldT,
-                    newTime: "removed",
-                  });
-                } else if (r.proposedPunchTime) {
-                  const newDate = parseTimeOnDateIST(
-                    r.proposedPunchTime,
-                    r.dateStr,
-                  );
-                  emp[fieldName] = newDate;
-                  const existingIdx = (emp.rawPunches || []).findIndex(
-                    (p) => p.punchType === r.proposedPunchType,
-                  );
-                  const entry = {
-                    time: newDate,
-                    punchType: r.proposedPunchType,
-                    source: "miss_punch",
-                    addedBy: req.user?.name || req.user?.email || req.user?.id,
-                    addedAt: new Date(),
-                  };
-                  if (existingIdx >= 0)
-                    emp.rawPunches[existingIdx] = {
-                      ...emp.rawPunches[existingIdx],
-                      ...entry,
-                    };
-                  else emp.rawPunches = [...(emp.rawPunches || []), entry];
-                  punchChanges.push({
-                    punchType: r.proposedPunchType,
-                    action: r.proposedPunchAction,
-                    oldTime: oldT,
-                    newTime: fmtTimeIST12(newDate),
-                  });
-                }
-              }
-            }
-            for (const pc of r.proposedPunches || []) {
-              const fieldName = punchFieldMap[pc.punchType];
-              if (!fieldName) continue;
-              const oldT = emp[fieldName] ? fmtTimeIST12(emp[fieldName]) : "—";
-              if (pc.action === "remove") {
-                emp[fieldName] = null;
-                emp.rawPunches = (emp.rawPunches || []).filter(
-                  (p) => p.punchType !== pc.punchType,
-                );
-                punchChanges.push({
-                  punchType: pc.punchType,
-                  action: "remove",
-                  oldTime: oldT,
-                  newTime: "removed",
-                });
-              } else if (pc.punchTime) {
-                const newDate = parseTimeOnDateIST(pc.punchTime, r.dateStr);
-                emp[fieldName] = newDate;
-                const existingIdx = (emp.rawPunches || []).findIndex(
-                  (p) => p.punchType === pc.punchType,
-                );
-                const entry = {
-                  time: newDate,
-                  punchType: pc.punchType,
-                  source: "miss_punch",
-                  addedBy: req.user?.name || req.user?.email || req.user?.id,
-                  addedAt: new Date(),
-                };
-                if (existingIdx >= 0)
-                  emp.rawPunches[existingIdx] = {
-                    ...emp.rawPunches[existingIdx],
-                    ...entry,
-                  };
-                else emp.rawPunches = [...(emp.rawPunches || []), entry];
-                punchChanges.push({
-                  punchType: pc.punchType,
-                  action: pc.action,
-                  oldTime: oldT,
-                  newTime: fmtTimeIST12(newDate),
-                });
-              }
-            }
-            emp.rawPunches = (emp.rawPunches || [])
-              .filter((p) => p.time)
-              .sort((a, b) => new Date(a.time) - new Date(b.time))
-              .map((p, i) => ({ ...p, seq: i + 1 }));
-            emp.punchCount = emp.rawPunches.length;
-            if (
-              r.proposedInTime ||
-              r.proposedOutTime ||
-              r.proposedPunchType ||
-              (r.proposedPunches || []).length > 0
-            ) {
-              const settings = await AttendanceSettings.getConfig();
-              const shift =
-                settings.shifts[emp.employeeType] || settings.shifts.executive;
-              const shiftStart = hhmmMins(shift.start),
-                shiftEnd = hhmmMins(shift.end),
-                inMins = minsOf(emp.inTime),
-                outMins = minsOf(emp.finalOut);
-              const totalSpanMins =
-                emp.inTime && emp.finalOut
-                  ? Math.round((emp.finalOut - emp.inTime) / 60000)
-                  : 0;
-              const lunchBreakMins =
-                emp.lunchOut && emp.lunchIn
-                  ? Math.max(
-                      0,
-                      Math.round((emp.lunchIn - emp.lunchOut) / 60000),
-                    )
-                  : 0;
-              const teaBreakMins =
-                emp.teaOut && emp.teaIn
-                  ? Math.max(0, Math.round((emp.teaIn - emp.teaOut) / 60000))
-                  : 0;
-              const totalBreakMins = lunchBreakMins + teaBreakMins,
-                netWorkMins = Math.max(0, totalSpanMins - totalBreakMins);
-              const effectiveGrace =
-                (shift.lateGraceMins || 0) + (emp.appliedExtraGraceMins || 0);
-              const lateMins =
-                inMins != null
-                  ? Math.max(0, inMins - (shiftStart + effectiveGrace))
-                  : 0;
-              const earlyDepartureMins =
-                outMins != null ? Math.max(0, shiftEnd - outMins) : 0;
-              let otMins = 0;
-              if (emp.employeeType === "operator" && outMins != null) {
-                const over = outMins - shiftEnd - (shift.otGraceMins || 0);
-                if (over > 0) otMins = over;
-              }
-              emp.totalSpanMins = totalSpanMins;
-              emp.lunchBreakMins = lunchBreakMins;
-              emp.teaBreakMins = teaBreakMins;
-              emp.totalBreakMins = totalBreakMins;
-              emp.netWorkMins = netWorkMins;
-              emp.lateMins = lateMins;
-              emp.lateDisplay = fmtLateMins(lateMins);
-              emp.isLate = lateMins > 0;
-              emp.earlyDepartureMins = earlyDepartureMins;
-              emp.isEarlyDeparture = earlyDepartureMins > 0;
-              emp.otMins = otMins;
-              emp.hasOT = otMins > 0;
-              emp.hasMissPunch = !(emp.inTime && emp.finalOut);
-              if (!emp.inTime) emp.systemPrediction = "AB";
-              else if (!emp.finalOut) emp.systemPrediction = "MP";
-              else if (
-                emp.employeeType === "operator"
-                  ? netWorkMins < (shift.halfDayThresholdMins || 390)
-                  : totalSpanMins <= (shift.halfDayThresholdMins || 450)
-              )
-                emp.systemPrediction = "HD";
-              else if (lateMins > 0) emp.systemPrediction = "P*";
-              else if (earlyDepartureMins > 0) emp.systemPrediction = "P~";
-              else emp.systemPrediction = "P";
-            }
-            if (r.proposedStatus) emp.hrFinalStatus = r.proposedStatus;
-            emp.hrRemarks = r.hrRemarks || `Regularized (${r.requestType})`;
-            emp.hrReviewedAt = new Date();
-            emp.attendanceValue = getAttendanceValue(
-              emp.hrFinalStatus || emp.systemPrediction,
-            );
-            dayDoc.markModified("employees");
-            await dayDoc.save();
-            r.appliedToAttendance = true;
-            r.appliedAt = new Date();
-          }
-        }
-      }
+
+      // One implementation, shared with the app's manager chain.
+      const applyRes = await applyRegularizationToAttendance(r, {
+        id: req.user.id,
+        name: req.user.name || req.user.email,
+      });
       await r.save();
+
+      notifyRegularizationApproved(r); // R5 — employee
+
       res.json({
         success: true,
         data: r,
-        message: "Approved and applied to attendance",
+        applied: applyRes.applied,
+        skipped: applyRes.skipped,
+        punchChanges: applyRes.punchChanges,
+        message: applyRes.applied
+          ? "Approved and applied to attendance"
+          : `Approved, but nothing was applied to attendance (${applyRes.skipped})`,
       });
     } catch (err) {
       console.error("[REG-APPROVE]", err.message);
@@ -7070,6 +7164,9 @@ router.patch(
       r.rejectedAt = new Date();
       r.rejectionReason = req.body?.rejectionReason || "";
       await r.save();
+
+      notifyRegularizationRejected(r, r.rejectionReason); // R6 — employee
+
       res.json({ success: true, data: r });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });
@@ -8043,6 +8140,11 @@ router.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports = router;
 module.exports.applyLeaveToAttendance = applyLeaveToAttendance;
 module.exports.applyApprovedLeavesForDate = applyApprovedLeavesForDate;
+// Consumed by routes/Employee_Routes/regularization.js — the app's manager
+// chain finalises regularizations, and it must write attendance through the
+// same function HR does.
+module.exports.applyRegularizationToAttendance = applyRegularizationToAttendance;
+module.exports.parseTimeOnDateIST = parseTimeOnDateIST;
 module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
 module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
 module.exports.syncTodayOnly = syncTodayOnly;

@@ -3,13 +3,23 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const multer = require("multer");
+// Push notifications — every leave event goes through utils/notifyEmployee.js,
+// which fans out to the mobile app (Expo) and the CMS (FCM) in one call and
+// never throws, never rejects and never blocks the response.
 const {
-  notifyManagerOnLeaveApply,
-  notifySecondaryOnPrimaryApproval,
-  notifyEmployeeOnLeaveAction,
-  notifyManagerOnWithdrawRequest,
-} = require("../../services/leaveNotification.service");
+  notifyLeaveApplied,
+  notifyLeaveSecondaryPending,
+  notifyLeaveApproved,
+  notifyLeaveRejected,
+  notifyLeaveWithdrawRequested,
+  notifyLeaveWithdrawn,
+  notifyLeaveEdited,
+  notifyEmployee,
+} = require("../../utils/notifyEmployee");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
+// Derived (never stored) reservation held by pending / manager_approved
+// applications. See utils/leaveReserve.js for why this is not a schema field.
+const { computeReserved } = require("../../utils/leaveReserve");
 
 // Email service — used to notify HR when a leave reaches final manager approval.
 // Wrapped in try/catch so missing env vars / disabled emails never crash the route.
@@ -22,14 +32,6 @@ try {
     e.message,
   );
 }
-
-// sendExpoPush — used to push notify the primary manager when a quick-apply
-// leave gets classified by the secondary manager. Wrapped so it can't crash.
-let sendExpoPush = async () => {};
-try {
-  sendExpoPush =
-    require("../../utils/sendExpoPush").sendExpoPush || sendExpoPush;
-} catch (_) {}
 
 const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
@@ -180,6 +182,46 @@ function overlapBlockResponse(res, existing) {
   });
 }
 
+function fmtDays(n) {
+  return `${n} day${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * 400 for an application that asks for more paid days than the employee has
+ * left on the YEARLY axis once days held by not-yet-approved applications are
+ * taken out. This is what stops an employee double-applying against the same
+ * days: the first request already reserved them, so the second is refused
+ * instead of silently being born as LWP.
+ *
+ * Monthly caps (maxCLPerMonth / maxLeaveDaysPerMonth) are a separate axis and
+ * deliberately NOT enforced here — those still split the excess into LWP,
+ * exactly as before.
+ */
+function insufficientBalanceResponse(
+  res,
+  { leaveType, requested, entitled, consumed, reserved },
+) {
+  const remaining = Math.max(0, entitled - consumed - reserved);
+  const held =
+    reserved > 0
+      ? ` ${fmtDays(reserved)} of your ${leaveType} is held by a request that is still awaiting approval.`
+      : "";
+  return res.status(400).json({
+    success: false,
+    code: "INSUFFICIENT_BALANCE",
+    message: `You have ${fmtDays(remaining)} of ${leaveType} left, but this request is for ${fmtDays(requested)}.${held} Apply for LOP if you need the extra days unpaid.`,
+    balance: {
+      leaveType,
+      requested,
+      entitlement: entitled,
+      consumed,
+      reserved,
+      available: Math.max(0, entitled - consumed),
+      effectiveAvailable: remaining,
+    },
+  });
+}
+
 // IST "today" string for quick-apply
 function todayIST() {
   const istNow = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -242,6 +284,16 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
       SL: Math.max(0, le.SL - bal.consumed.SL),
       PL: Math.max(0, le.PL - bal.consumed.PL),
     };
+    // Days already committed by applications the employee has filed but that
+    // are not approved yet. Derived on every read, never stored, so nothing
+    // can strand a reservation. `available` keeps its old meaning
+    // (entitlement − consumed); `effectiveAvailable` is what the app shows.
+    const reserved = await computeReserved(id, year);
+    const effectiveAvailable = {
+      CL: Math.max(0, av.CL - reserved.CL),
+      SL: Math.max(0, av.SL - reserved.SL),
+      PL: Math.max(0, av.PL - reserved.PL),
+    };
     res.json({
       success: true,
       data: {
@@ -249,6 +301,8 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
         available: av,
         entitlement: bal.entitlement,
         consumed: bal.consumed,
+        reserved,
+        effectiveAvailable,
         config: {
           initialWaitingDays: config.initialWaitingDays,
           clPerYear: config.clPerYear,
@@ -514,12 +568,7 @@ router.patch(
       a.cancelledAt = new Date();
       a.hrRemarks = `Withdrawal approved by manager`;
       await a.save();
-      notifyEmployeeOnLeaveAction(
-        String(a.employeeId),
-        a,
-        "withdrawn",
-        "Manager approved your withdrawal; balance restored.",
-      ).catch((e) => console.warn("[PUSH-WITHDRAW-APPROVE]", e.message));
+      notifyLeaveWithdrawn(a); // L9 — fire-and-forget
 
       try {
         const io = req.app.get("io");
@@ -572,13 +621,17 @@ router.patch(
       a.hrRemarks = `Withdrawal rejected by manager: ${req.body.remarks || ""}`;
       await a.save();
 
-      notifyEmployeeOnLeaveAction(
-        String(a.employeeId),
-        a,
-        "rejected",
-        req.body.remarks ||
-          "Manager rejected withdrawal — leave remains active",
-      ).catch((e) => console.warn("[PUSH-WITHDRAW-REJECT]", e.message));
+      // Withdrawal refused — the leave itself stays approved, so this is a
+      // "your withdrawal request was declined" message, not a leave rejection.
+      notifyEmployee(a.employeeId, {
+        title: "Withdrawal not approved",
+        body:
+          req.body.remarks ||
+          `Your request to withdraw ${a.leaveType} for ${a.fromDate} was declined — the leave still stands.`,
+        kind: "leave",
+        screen: "Leave",
+        id: a._id,
+      });
 
       try {
         const io = req.app.get("io");
@@ -1052,10 +1105,8 @@ router.post("/quick-apply", AllEmployeeAppMiddleware, async (req, res) => {
       },
     });
 
-    // Notify managers — same hook as regular apply
-    notifyManagerOnLeaveApply(emp, app).catch((e) =>
-      console.warn("[QUICK-APPLY-PUSH]", e.message),
-    );
+    // L1 — notify the primary manager. Same hook as regular apply.
+    notifyLeaveApplied(app, emp);
 
     // Socket event tagged so the primary manager's UI can highlight it
     try {
@@ -1253,15 +1304,14 @@ router.patch(
             (m) => m.type === "secondary",
           );
           if (sec?.managerId) {
-            await sendExpoPush(sec.managerId, {
-              title: `Leave classified as ${resolvedType}`,
-              body: `${app.employeeName} — ${app.totalDays} day(s) on ${app.fromDate}. Awaiting your approval.`,
-              data: {
-                type: "leave_ready_for_secondary",
-                applicationId: app._id.toString(),
-                screen: "Leave",
-              },
-              channelId: "general",
+            // L2 (quick-apply variant) — the classification carries extra
+            // context worth surfacing, so this keeps its own copy.
+            notifyEmployee(sec.managerId, {
+              title: "Leave needs your approval",
+              body: `${mgrName} classified ${app.employeeName}'s leave as ${resolvedType} — ${app.totalDays} day(s) on ${app.fromDate}. It's waiting on you.`,
+              kind: "leave",
+              screen: "Leave",
+              id: app._id,
             });
             const io = req.app.get("io");
             if (io) {
@@ -1359,12 +1409,7 @@ router.patch(
       } catch (_) {}
 
       // Notify employee
-      notifyEmployeeOnLeaveAction(
-        String(app.employeeId),
-        app,
-        "approved",
-        `Approved by ${mgrName}`,
-      ).catch(() => {});
+      notifyLeaveApproved(app); // L3
 
       return res.json({
         success: true,
@@ -1483,6 +1528,14 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       });
     }
 
+    // Days this employee has already committed with applications that are
+    // filed but not approved yet. Derived, never stored. LOP never touches a
+    // bucket, so it needs no lookup.
+    const reserved =
+      leaveType === "LOP"
+        ? { CL: 0, SL: 0, PL: 0 }
+        : await computeReserved(req.user.id, year);
+
     // ── LOP ──
     if (leaveType === "LOP") {
       const mn = [];
@@ -1520,9 +1573,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         status: "pending",
       });
 
-      notifyManagerOnLeaveApply(emp, app).catch((e) =>
-        console.warn("[PUSH]", e.message),
-      );
+      notifyLeaveApplied(app, emp); // L1 — primary manager
 
       return res.status(201).json({
         success: true,
@@ -1547,7 +1598,18 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         emp.biometricId,
         config,
       );
-      const availableSL = Math.max(0, config.slPerYear - bal.consumed.SL);
+      const availableSL = Math.max(
+        0,
+        config.slPerYear - bal.consumed.SL - reserved.SL,
+      );
+      if (totalDays > availableSL)
+        return insufficientBalanceResponse(res, {
+          leaveType: "SL",
+          requested: totalDays,
+          entitled: config.slPerYear,
+          consumed: bal.consumed.SL,
+          reserved: reserved.SL,
+        });
       const paidDays = Math.min(totalDays, availableSL);
       const lwpDays = Math.max(0, totalDays - paidDays);
       const rd = totalDays > config.slDocumentThreshold;
@@ -1587,9 +1649,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         status: "pending",
       });
 
-      notifyManagerOnLeaveApply(emp, app).catch((e) =>
-        console.warn("[PUSH]", e.message),
-      );
+      notifyLeaveApplied(app, emp); // L1 — primary manager
 
       let msg = "Sick Leave application submitted.";
       if (lwpDays > 0)
@@ -1608,6 +1668,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
           leaveType: "SL",
           availableBalance: availableSL,
           effectiveAvailable: availableSL,
+          reserved: reserved.SL,
         },
       });
     }
@@ -1627,8 +1688,16 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
     };
     const availableBalance = Math.max(
       0,
-      le[leaveType] - bal.consumed[leaveType],
+      le[leaveType] - bal.consumed[leaveType] - reserved[leaveType],
     );
+    if (totalDays > availableBalance)
+      return insufficientBalanceResponse(res, {
+        leaveType,
+        requested: totalDays,
+        entitled: le[leaveType],
+        consumed: bal.consumed[leaveType],
+        reserved: reserved[leaveType],
+      });
 
     let effectiveAvailable = availableBalance;
     if (leaveType === "CL") {
@@ -1740,9 +1809,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
           });
       }
     } catch (_) {}
-    notifyManagerOnLeaveApply(emp, app).catch((e) =>
-      console.warn("[PUSH]", e.message),
-    );
+    notifyLeaveApplied(app, emp); // L1 — primary manager
 
     let msg = "Leave application submitted successfully";
     if (lwpDays > 0)
@@ -1759,6 +1826,7 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         leaveType,
         availableBalance,
         effectiveAvailable,
+        reserved: reserved[leaveType] || 0,
       },
     });
   } catch (err) {
@@ -1843,9 +1911,7 @@ router.patch("/:id/cancel", AllEmployeeAppMiddleware, async (req, res) => {
             })),
           )}`,
       );
-      notifyManagerOnWithdrawRequest(a).catch((e) =>
-        console.warn("[PUSH-WITHDRAW-REQ]", e.message),
-      );
+      notifyLeaveWithdrawRequested(a); // L8 — both managers
 
       try {
         const io = req.app.get("io");
@@ -2154,12 +2220,7 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
 
     await a.save();
 
-    notifyEmployeeOnLeaveAction(
-      String(a.employeeId),
-      a,
-      "edited",
-      mgrName,
-    ).catch((e) => console.warn("[PUSH-EDIT]", e.message));
+    notifyLeaveEdited(a, mgrName);
 
     res.json({
       success: true,
@@ -2266,7 +2327,10 @@ router.patch(
               });
           }
         } catch (_) {}
-        notifySecondaryOnPrimaryApproval(a).catch(() => {});
+        // L2 — secondary manager. Previously called a helper with the wrong
+        // arity that filtered on a non-existent `managersNotified.status`
+        // field, so it always no-oped.
+        notifyLeaveSecondaryPending(a, mgr?.managerName);
         return res.json({
           success: true,
           data: a,
@@ -2426,12 +2490,7 @@ router.patch(
             timestamp: new Date().toISOString(),
           });
       } catch (_) {}
-      notifyEmployeeOnLeaveAction(
-        String(a.employeeId),
-        a,
-        "approved",
-        `Approved by ${mgr?.managerName || "Manager"}`,
-      ).catch((e) => console.warn("[PUSH-APPROVE]", e.message));
+      notifyLeaveApproved(a); // L3 — employee
       res.json({
         success: true,
         data: a,
@@ -2462,6 +2521,16 @@ router.patch(
       const mgr = a.managersNotified.find(
         (m) => String(m.managerId) === req.user.id,
       );
+      // Without this guard an already-approved application could be rejected:
+      // the days deducted from `consumed` at final approval would never be
+      // refunded, and the reservation was already released. Only a live
+      // application can be rejected. Mirrors Leave_section.js's HR reject.
+      if (!["pending", "manager_approved"].includes(a.status))
+        return res.status(400).json({
+          success: false,
+          code: "NOT_REJECTABLE",
+          message: `Cannot reject — ${a.status}`,
+        });
       a.managerDecisions.push({
         managerId: req.user.id,
         managerName: mgr?.managerName || "",
@@ -2489,12 +2558,7 @@ router.patch(
             timestamp: new Date().toISOString(),
           });
       } catch (_) {}
-      notifyEmployeeOnLeaveAction(
-        String(a.employeeId),
-        a,
-        "rejected",
-        remarks || `Rejected by ${mgr?.managerName || "Manager"}`,
-      ).catch((e) => console.warn("[PUSH-REJECT]", e.message));
+      notifyLeaveRejected(a, remarks); // L4 — employee
 
       res.json({ success: true, data: a, message: "Rejected" });
     } catch (e) {
