@@ -129,6 +129,7 @@ function buildCostingSummarySheet({ enquiry, product, rawMaterialTotalRef, sheet
   const specRows = [
     ["Product", product?.product],
     ["Quantity", product?.quantity != null ? String(product.quantity) : ""],
+    ["Description", product?.note],
     ["Gender", product?.gender],
     ["Colour", product?.colour],
     ["Fabric preference", product?.fabricPreference],
@@ -146,6 +147,25 @@ function buildCostingSummarySheet({ enquiry, product, rawMaterialTotalRef, sheet
     cells[ref(0, r)] = label;
     cells[ref(1, r)] = String(value);
     r += 1;
+  }
+
+  // ── Reference images — a plain URL per image, not an embed. CoWork's
+  // sheet cells are text (Cowork/lib/rules/sheets/grid.ts's CellMap is
+  // Record<A1ref, string>) with no image-cell type, so there is nowhere in
+  // this format to actually place a picture; a URL anyone can open is the
+  // honest version of "put the image on the sheet" until CoWork's own grid
+  // grows a real image cell type. One row per image, so Merchandising & IE
+  // don't have to hunt through the enquiry page for them.
+  const images = Array.isArray(product?.images) ? product.images : [];
+  if (images.length) {
+    cells[ref(0, r)] = images.length === 1 ? "Reference image" : "Reference images";
+    styles[ref(0, r)] = HEAD_STYLE;
+    for (const img of images) {
+      const url = img?.url || (img?.fileId ? `https://drive.google.com/file/d/${img.fileId}/view` : "");
+      if (!url) continue;
+      cells[ref(1, r)] = url;
+      r += 1;
+    }
   }
 
   // ── Raw items cost, pulled from the BOM tab rather than re-entered ───

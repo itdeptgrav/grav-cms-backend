@@ -193,4 +193,55 @@ async function getSheetBody(documentId) {
   return { workbook, updatedAt: data.updatedAt || null };
 }
 
-module.exports = { createSheet, setMembers, getSheet, getSheetBody, SHARE_ROLES };
+/**
+ * Write an edited workbook back — the CMS DOES now edit a sheet (11 Aug
+ * 2026, explicit request; the header comment above predates this and is
+ * kept for the create-path reasoning, which still holds). Same write CoWork's
+ * own SheetGrid.tsx does on save: overwrite `cells` with the new
+ * JSON-stringified workbook, bump `updatedAt` on both the body and the
+ * `cowork_documents` record, and set `lastEditedById` there so the CMS's own
+ * "Last edited by" line (getSheet) stays accurate.
+ *
+ * WHAT THIS DOES **NOT** GUARD AGAINST: the header comment's "live
+ * collaboration (Yjs) is not replicated" caveat is exactly the risk here —
+ * if someone has this sheet open in CoWork itself while this write lands,
+ * their session's own Yjs persistence can still overwrite what THIS just
+ * wrote, or this write can land in the middle of theirs, with no merge.
+ * `expectedUpdatedAt` (optimistic concurrency: reject if the document's
+ * `updatedAt` has moved since the CMS last read it) catches the common
+ * case — two people editing minutes apart — but is a size-of-the-check-
+ * window race, not a lock, so it cannot catch true simultaneous edits.
+ * There is no safe way to fully close that from the CMS side without
+ * replicating Yjs, which is out of scope here.
+ *
+ * @param {string} documentId
+ * @param {import("./sheetTemplates").Workbook} workbook
+ * @param {string} editedByEmployeeId — coworkEmployeeId of whoever saved, from the CMS side
+ * @param {string} [expectedUpdatedAt] — the body doc's `updatedAt` the CMS loaded before editing; omit to skip the conflict check
+ * @returns {Promise<{updatedAt:string}>}
+ * @throws {Error & {code:"CONFLICT"}} if expectedUpdatedAt is stale
+ */
+async function updateSheetBody(documentId, workbook, editedByEmployeeId, expectedUpdatedAt) {
+  const bodyRef = db.collection(DOCUMENT_BODY_COLLECTION).doc(documentId);
+  const bodySnap = await bodyRef.get();
+  if (!bodySnap.exists) throw new Error("Sheet body not found");
+
+  if (expectedUpdatedAt && bodySnap.data().updatedAt && bodySnap.data().updatedAt !== expectedUpdatedAt) {
+    const err = new Error("This sheet changed since you opened it. Refresh and try again.");
+    err.code = "CONFLICT";
+    throw err;
+  }
+
+  const now = new Date().toISOString();
+  await bodyRef.update({ cells: JSON.stringify(workbook), updatedAt: now });
+
+  const docRef = db.collection(DOCUMENT_COLLECTION).doc(documentId);
+  const docSnap = await docRef.get();
+  if (docSnap.exists) {
+    await docRef.update({ lastEditedById: editedByEmployeeId || null, updatedAt: now });
+  }
+
+  return { updatedAt: now };
+}
+
+module.exports = { createSheet, setMembers, getSheet, getSheetBody, updateSheetBody, SHARE_ROLES };
