@@ -17,15 +17,26 @@
 //   3. Raw cookie header parse      — fallback if cookie-parser not running
 //
 // ALLOWED ROLES:
-//   "sales" | "admin" | "ceo"
+//   "sales" | "admin" | "ceo" | "project_manager" | "merchandiser"
 //   Add more roles to ALLOWED_ROLES if other departments need CRM read access.
+//
+// "merchandiser" added 11 Aug 2026: the Merchandiser dashboard
+// (app/merchandiser/**) reuses these SAME Sales pages — customers,
+// customer-requests (Purchase Orders/PI), stock-items (Products & BOM),
+// settings — via AutoDashboardLayout (see components/AutoDashboardLayout.js).
+// Browsing into the Merchandiser department adopts its AccessDepartment's
+// legacyRole, "merchandiser" (routes/auth/deptAuth.js's buildTokenPayload:
+// `role: dept.legacyRole || dept.slug`), which this allowlist did not
+// recognise — every one of those pages 403'd for anyone in Merchandiser,
+// and since the frontend fetches only check `res.ok`, that surfaced as
+// silent empty states ("No customers found") rather than a visible error.
 
 const jwt = require("jsonwebtoken");
 
 const SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
 
 // Roles that are allowed to access the CRM (Leads / Contacts / Accounts)
-const ALLOWED_ROLES = ["sales", "admin", "ceo", "project_manager"];
+const ALLOWED_ROLES = ["sales", "admin", "ceo", "project_manager", "merchandiser"];
 
 const SalesAuthMiddlewear = (req, res, next) => {
   try {
