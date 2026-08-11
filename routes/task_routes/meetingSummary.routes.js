@@ -1602,6 +1602,35 @@ async function renderTranscriptDocx(transcript, result, mode, meetId) {
   return Packer.toBuffer(doc);
 }
 
+/**
+ * The Drive → Gemini File API pipeline, shared with meetingTranscript.routes.
+ *
+ * **Restoring this, and why it must not be tidied away again.** It was added
+ * with the verbatim-transcript route (0722697) so that route could reuse this
+ * one's upload plumbing instead of carrying a fourth copy of it, and a later
+ * cleanup of this file removed it. Nothing here referenced it, so it read as
+ * dead code — but `meetingTranscript.routes.js` destructures these six names at
+ * require time, so its absence was not a degraded feature: `require` returned a
+ * router with no `.helpers`, the destructure threw `TypeError: Cannot
+ * destructure property 'MODELS_TO_TRY' of 'summaryHelpers' as it is undefined`,
+ * and server.js could not finish loading. **The whole backend refused to
+ * start.**
+ *
+ * A plain property on the exported router, not a change to the export shape —
+ * `require("./meetingSummary.routes")` still returns a working Express router
+ * exactly as before; this only adds `.helpers` to it.
+ */
+router.helpers = {
+  GEMINI_BASE,
+  GEMINI_UPLOAD_BASE,
+  MODELS_TO_TRY,
+  getDriveClient,
+  streamDriveToGeminiFileAPI,
+  waitForFileActive,
+  deleteGeminiFile,
+  callGemini,
+};
+
 module.exports = router;
 
 
