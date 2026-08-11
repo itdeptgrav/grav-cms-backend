@@ -365,28 +365,40 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
       db.collection("cowork_employees").get(),
     ]);
 
-    // Build sets for cross-reference — a CoWork account exists when the
-    // biometricId matches the Firestore doc id, OR the email matches.
-    const coworkIds = new Set(coworkSnap.docs.map((d) => d.id));
-    const coworkEmails = new Set(
+    // Cross-reference — a CoWork account exists when the biometricId matches the
+    // Firestore doc id, OR the email matches.
+    //
+    // Maps rather than Sets, because WHICH document matched is the useful part
+    // and it was being thrown away: the caller learned that an account exists
+    // and not what it is called, so an admin surface could show "Linked" and
+    // then had nothing to address that account BY. Anything acting on an
+    // existing account — resetting a password, for one — needs its id.
+    const coworkById = new Map(coworkSnap.docs.map((d) => [d.id, d.id]));
+    const coworkByEmail = new Map(
       coworkSnap.docs
-        .map((d) => (d.data().email || "").toLowerCase())
-        .filter(Boolean),
+        .map((d) => [(d.data().email || "").toLowerCase(), d.id])
+        .filter(([email]) => email),
     );
 
-    const employees = hrEmployees.map((e) => ({
-      hrId: String(e._id),
-      name: `${e.firstName || ""} ${e.lastName || ""}`.trim() || e.email || "(unnamed)",
-      email: e.email || "",
-      department: e.department || "",
-      designation: e.designation || "",
-      biometricId: e.biometricId || "",
-      phone: e.phone || "",
-      hasCoworkAccount: !!(
-        (e.biometricId && coworkIds.has(e.biometricId)) ||
-        coworkEmails.has((e.email || "").toLowerCase())
-      ),
-    }));
+    const employees = hrEmployees.map((e) => {
+      const coworkEmployeeId =
+        (e.biometricId && coworkById.get(e.biometricId)) ||
+        coworkByEmail.get((e.email || "").toLowerCase()) ||
+        null;
+      return {
+        hrId: String(e._id),
+        name: `${e.firstName || ""} ${e.lastName || ""}`.trim() || e.email || "(unnamed)",
+        email: e.email || "",
+        department: e.department || "",
+        designation: e.designation || "",
+        biometricId: e.biometricId || "",
+        phone: e.phone || "",
+        hasCoworkAccount: !!coworkEmployeeId,
+        // The `cowork_employees` document id — what every other CoWork route
+        // takes as `:id`. Null for somebody who has no account yet.
+        coworkEmployeeId,
+      };
+    });
 
     // Distinct departments from the FULL set (not filtered), for the filter dropdown.
     const departments = (
