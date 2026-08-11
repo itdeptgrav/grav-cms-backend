@@ -249,6 +249,27 @@ router.patch("/:id", salesAuth, async (req, res) => {
     // Products is an array — sanitize rather than trust the raw body.
     if ("products" in body) {
       enquiry.products = sanitizeProducts(body.products) || [];
+
+      // costingSheets is keyed by product NAME (see its own schema comment —
+      // sanitizeProducts above discards every product's _id on every save,
+      // so name was the one thing that survives a routine edit... except a
+      // rename of the product itself, which is exactly a name changing.
+      // Without this, renaming "Blazer" to "Blazer V2" left the costing
+      // sheet keyed to the now-nonexistent "Blazer" — still alive in Mongo
+      // and CoWork, just unreachable from this enquiry's product list, so
+      // it silently vanished from the UI. `renames` (optional; sent by the
+      // Requirement panel when it detects a same-position name change) lets
+      // the sheet follow the rename instead. Only applied when `to` is
+      // actually a product on the new list — never rename onto nothing.
+      const renames = Array.isArray(body.renames) ? body.renames : [];
+      if (renames.length && enquiry.costingSheets?.length) {
+        const newNames = new Set(enquiry.products.map((p) => p.product));
+        for (const { from, to } of renames) {
+          if (!from || !to || from === to || !newNames.has(to)) continue;
+          const sheet = enquiry.costingSheets.find((s) => s.productName === from);
+          if (sheet) sheet.productName = to;
+        }
+      }
     }
     // References likewise.
     if ("references" in body) {
@@ -478,13 +499,71 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
     const sheet = (enquiry.costingSheets || []).find((s) => s.productName === productName);
     if (!sheet) return res.status(404).json({ success: false, message: "No costing sheet exists yet for that product." });
 
-    const { getSheetBody } = require("../../../services/coworkSheets.service");
-    const body = await getSheetBody(sheet.documentId);
+    const { getSheetBody, getSheet } = require("../../../services/coworkSheets.service");
+    const [body, doc] = await Promise.all([
+      getSheetBody(sheet.documentId),
+      getSheet(sheet.documentId),
+    ]);
     if (!body) return res.status(404).json({ success: false, message: "The costing sheet's content could not be found." });
 
-    return res.json({ success: true, workbook: body.workbook, updatedAt: body.updatedAt });
+    // "Who did what" the sheet's own record actually carries — CoWork has no
+    // cell-level change log to show, only who created it and who most
+    // recently touched it. Real, not invented: employeeIds only, resolved to
+    // names on the client against the costingSheets.members list it already
+    // has (same people, no extra lookup needed here).
+    return res.json({
+      success: true,
+      workbook: body.workbook,
+      updatedAt: body.updatedAt,
+      createdById: doc?.createdById || null,
+      lastEditedById: doc?.lastEditedById || null,
+    });
   } catch (err) {
     console.error("[enquiries] GET /:id/costing-sheet/:productName/data", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PATCH /api/cms/crm/enquiries/:id/costing-sheet/:productName/data
+// Save an edit made directly on the CMS's costing-sheet table (11 Aug 2026,
+// explicit request — this used to be read-only by design; see
+// services/coworkSheets.service.js's updateSheetBody for why that changed
+// and, importantly, what it still can't fully protect against: this is NOT
+// a safe concurrent editor. CoWork's own live collaboration (Yjs) is not
+// replicated here, so a save from here can still collide with someone
+// editing the same sheet in CoWork at the same moment. `expectedUpdatedAt`
+// (send back whatever GET .../data last returned) catches the ordinary
+// case — two edits minutes apart — as a real 409, not a silent overwrite.
+router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("costingSheets").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = decodeURIComponent(req.params.productName);
+    const sheet = (enquiry.costingSheets || []).find((s) => s.productName === productName);
+    if (!sheet) return res.status(404).json({ success: false, message: "No costing sheet exists yet for that product." });
+
+    const workbook = req.body?.workbook;
+    if (!workbook || !Array.isArray(workbook.sheets)) {
+      return res.status(400).json({ success: false, message: "A valid workbook (with a sheets array) is required." });
+    }
+
+    const me = await Employee.findById(req.user.id).select("coworkEmployeeId");
+    if (!me?.coworkEmployeeId) {
+      return res.status(409).json({ success: false, code: "NO_COWORK_ACCOUNT", message: "Your account isn't linked to a CoWork identity yet. Ask an administrator to link it on the Access Control page." });
+    }
+
+    const { updateSheetBody } = require("../../../services/coworkSheets.service");
+    try {
+      const { updatedAt } = await updateSheetBody(sheet.documentId, workbook, me.coworkEmployeeId, req.body?.expectedUpdatedAt);
+      return res.json({ success: true, updatedAt });
+    } catch (err) {
+      if (err.code === "CONFLICT") return res.status(409).json({ success: false, code: "CONFLICT", message: err.message });
+      throw err;
+    }
+  } catch (err) {
+    console.error("[enquiries] PATCH /:id/costing-sheet/:productName/data", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
