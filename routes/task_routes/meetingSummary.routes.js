@@ -564,6 +564,207 @@ function parseResponse(text) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /cowork/audio/test-gemini  — no auth, for debugging
+/**
+ * A failure the caller should report as itself rather than as a 500.
+ *
+ * The gather step below has two outcomes a person can act on — nothing was
+ * recorded, and nothing could be read from Drive — and both used to be written
+ * as `res.status(...)` inside the summary handler. Lifting the block out means
+ * they have to travel, so they travel as errors carrying their own status.
+ */
+class PipelineError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/**
+ * Everything a meeting's audio must become before Gemini can be asked anything
+ * about it: found, uploaded, and ACTIVE.
+ *
+ * Lifted out of the summary handler so the transcript can ask the same question
+ * of the same files. It is not a rewrite — the Drive union-scan that rescues
+ * rejoin `(1).webm` files, the one-file-at-a-time conveyor that keeps RAM flat,
+ * and the skip-and-continue on a bad file are the summary's own, unchanged.
+ * Two features reading the same recordings must not hold two opinions about
+ * which recordings there are.
+ *
+ * Appends to `uploadedGeminiFiles` rather than returning them, so the caller
+ * keeps ownership of cleanup: those files have to be deleted from Gemini
+ * storage on failure as well as success, and only the caller knows when it is
+ * done with them.
+ */
+async function gatherMeetingAudio(meetId, apiKey, uploadedGeminiFiles) {
+  // ── Get audio records from Firestore ──────────────────────────────
+  const snap = await db
+    .collection("meeting_audio_recordings")
+    .where("meetId", "==", meetId)
+    .get();
+
+  if (snap.empty) {
+    throw new PipelineError(
+      404,
+      "No audio recordings found for this meeting. Record a meeting first.",
+    );
+  }
+
+  const recordings = snap.docs.map((d) => d.data());
+  console.log(
+    `\n[Pipeline] 🚀 Firestore has ${recordings.length} recording row(s) for meet: ${meetId}`,
+  );
+
+  const drive = getDriveClient();
+
+  // ── BELT-AND-BRACES: also scan Drive folder for ANY (1)/(2)/... files ──
+  // If a user rejoined and a Firestore row was overwritten, the (1).webm
+  // file is still in Drive. We union-merge Drive scan results with
+  // Firestore rows, keyed by driveFileId, so NO audio file is missed.
+  try {
+    const recordingsByDriveId = new Map(
+      recordings
+        .filter((r) => r.driveFileId)
+        .map((r) => [r.driveFileId, r]),
+    );
+
+    // Navigate to the meeting folder: CoWork Audio Recording / meeting / {meetId}
+    const findFolder = async (name, parentId) => {
+      const q = parentId
+        ? `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`
+        : `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+      const resp = await drive.files.list({
+        q,
+        fields: "files(id,name)",
+        pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      });
+      return resp.data.files?.[0]?.id || null;
+    };
+
+    const rootId = await findFolder("CoWork Audio Recording", null);
+    if (rootId) {
+      const mtgRootId = await findFolder("meeting", rootId);
+      if (mtgRootId) {
+        const meetFolderId = await findFolder(meetId, mtgRootId);
+        if (meetFolderId) {
+          const filesResp = await drive.files.list({
+            q: `'${meetFolderId}' in parents and trashed=false and (mimeType contains 'audio' or name contains '.webm' or name contains '.mp4' or name contains '.ogg')`,
+            fields: "files(id,name,mimeType,size)",
+            pageSize: 500,
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+          });
+          const driveFiles = filesResp.data.files || [];
+          console.log(
+            `[Pipeline] 🗂️  Drive folder scan found ${driveFiles.length} audio file(s) in meet ${meetId}`,
+          );
+
+          for (const f of driveFiles) {
+            if (recordingsByDriveId.has(f.id)) continue; // already covered by Firestore
+
+            // Parse filename: E015_RakeshBiswal_audio_M042 (1).webm
+            const m = f.name.match(/^([A-Za-z0-9]+)_([A-Za-z0-9]+)_audio_/);
+            const employeeId = m ? m[1] : "Unknown";
+            const employeeName = m
+              ? m[2].replace(/([A-Z])/g, " $1").trim()
+              : f.name;
+
+            const syntheticRec = {
+              meetId,
+              employeeId,
+              employeeName,
+              firstName: employeeName.split(" ")[0],
+              fileName: f.name,
+              mimeType: f.mimeType || "audio/webm",
+              driveFileId: f.id,
+              driveViewUrl: `https://drive.google.com/file/d/${f.id}/view`,
+              status: "uploaded",
+              isSynthetic: true, // flag — not from Firestore
+            };
+            recordings.push(syntheticRec);
+            console.log(
+              `[Pipeline] ➕ Picked up extra Drive file: ${f.name}`,
+            );
+          }
+        }
+      }
+    }
+  } catch (scanErr) {
+    console.warn(
+      `[Pipeline] ⚠️  Drive folder scan failed (continuing with Firestore rows only): ${scanErr.message}`,
+    );
+  }
+
+  console.log(`[Pipeline] 📦 TOTAL files to process: ${recordings.length}`);
+  const participantNames = [];
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ██████████████████  CONVEYOR BELT  ████████████████████████████████
+  //
+  //  File 1: Drive Download → Gemini Upload → Poll ACTIVE → ✅
+  //  File 2: Drive Download → Gemini Upload → Poll ACTIVE → ✅
+  //  File N: ...
+  //
+  //  RAM stays at ~60MB CONSTANT — regardless of number of files
+  //  No 19MB limit — Gemini File API supports up to 2GB per file
+  // ═══════════════════════════════════════════════════════════════════
+
+  for (let i = 0; i < recordings.length; i++) {
+    const rec = recordings[i];
+    console.log(
+      `\n[Pipeline] ── File ${i + 1}/${recordings.length}: ${rec.fileName} ──`,
+    );
+
+    try {
+      const mimeType = rec.mimeType || "audio/webm";
+      const displayName = `${meetId}_${rec.employeeName || rec.employeeId}_${Date.now()}`;
+
+      // BELT STEP 1+2: Drive stream → Gemini File API upload
+      const geminiFile = await streamDriveToGeminiFileAPI(
+        drive,
+        rec.driveFileId,
+        mimeType,
+        displayName,
+        apiKey,
+      );
+
+      // BELT STEP 3: Wait until Gemini marks file as ACTIVE
+      await waitForFileActive(geminiFile.geminiName, apiKey);
+
+      // Collect file reference for batch generateContent call
+      uploadedGeminiFiles.push(geminiFile);
+      participantNames.push(
+        rec.employeeName || rec.firstName || rec.employeeId,
+      );
+
+      console.log(`[Pipeline] ✅ File ${i + 1} ready in Gemini Storage`);
+
+      // Small courtesy pause between files
+      if (i < recordings.length - 1) await sleep(500);
+    } catch (e) {
+      // Non-fatal: log and skip this file, continue with rest
+      console.error(
+        `[Pipeline] ⚠️  Skipping ${rec.fileName}: ${e.message}`,
+      );
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (uploadedGeminiFiles.length === 0) {
+    throw new PipelineError(
+      400,
+      "Could not upload any audio files to Gemini File API. Check Drive permissions.",
+    );
+  }
+
+  /* `recordings` travels back too: the caller builds its speech timeline and
+     its audioFiles record from the same rows, and re-reading them would risk a
+     different answer than the one the files were uploaded from. */
+  return { participantNames, recordings };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/audio/test-gemini", async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -722,168 +923,12 @@ router.post(
         );
       }
 
-      // ── Get audio records from Firestore ──────────────────────────────
-      const snap = await db
-        .collection("meeting_audio_recordings")
-        .where("meetId", "==", meetId)
-        .get();
-
-      if (snap.empty) {
-        return res.status(404).json({
-          error:
-            "No audio recordings found for this meeting. Record a meeting first.",
-        });
-      }
-
-      const recordings = snap.docs.map((d) => d.data());
-      console.log(
-        `\n[Pipeline] 🚀 Firestore has ${recordings.length} recording row(s) for meet: ${meetId}`,
+      // ── Find, upload and activate every recording for this meeting ────
+      const { participantNames, recordings } = await gatherMeetingAudio(
+        meetId,
+        apiKey,
+        uploadedGeminiFiles,
       );
-
-      const drive = getDriveClient();
-
-      // ── BELT-AND-BRACES: also scan Drive folder for ANY (1)/(2)/... files ──
-      // If a user rejoined and a Firestore row was overwritten, the (1).webm
-      // file is still in Drive. We union-merge Drive scan results with
-      // Firestore rows, keyed by driveFileId, so NO audio file is missed.
-      try {
-        const recordingsByDriveId = new Map(
-          recordings
-            .filter((r) => r.driveFileId)
-            .map((r) => [r.driveFileId, r]),
-        );
-
-        // Navigate to the meeting folder: CoWork Audio Recording / meeting / {meetId}
-        const findFolder = async (name, parentId) => {
-          const q = parentId
-            ? `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`
-            : `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-          const resp = await drive.files.list({
-            q,
-            fields: "files(id,name)",
-            pageSize: 1,
-            supportsAllDrives: true,
-            includeItemsFromAllDrives: true,
-          });
-          return resp.data.files?.[0]?.id || null;
-        };
-
-        const rootId = await findFolder("CoWork Audio Recording", null);
-        if (rootId) {
-          const mtgRootId = await findFolder("meeting", rootId);
-          if (mtgRootId) {
-            const meetFolderId = await findFolder(meetId, mtgRootId);
-            if (meetFolderId) {
-              const filesResp = await drive.files.list({
-                q: `'${meetFolderId}' in parents and trashed=false and (mimeType contains 'audio' or name contains '.webm' or name contains '.mp4' or name contains '.ogg')`,
-                fields: "files(id,name,mimeType,size)",
-                pageSize: 500,
-                supportsAllDrives: true,
-                includeItemsFromAllDrives: true,
-              });
-              const driveFiles = filesResp.data.files || [];
-              console.log(
-                `[Pipeline] 🗂️  Drive folder scan found ${driveFiles.length} audio file(s) in meet ${meetId}`,
-              );
-
-              for (const f of driveFiles) {
-                if (recordingsByDriveId.has(f.id)) continue; // already covered by Firestore
-
-                // Parse filename: E015_RakeshBiswal_audio_M042 (1).webm
-                const m = f.name.match(/^([A-Za-z0-9]+)_([A-Za-z0-9]+)_audio_/);
-                const employeeId = m ? m[1] : "Unknown";
-                const employeeName = m
-                  ? m[2].replace(/([A-Z])/g, " $1").trim()
-                  : f.name;
-
-                const syntheticRec = {
-                  meetId,
-                  employeeId,
-                  employeeName,
-                  firstName: employeeName.split(" ")[0],
-                  fileName: f.name,
-                  mimeType: f.mimeType || "audio/webm",
-                  driveFileId: f.id,
-                  driveViewUrl: `https://drive.google.com/file/d/${f.id}/view`,
-                  status: "uploaded",
-                  isSynthetic: true, // flag — not from Firestore
-                };
-                recordings.push(syntheticRec);
-                console.log(
-                  `[Pipeline] ➕ Picked up extra Drive file: ${f.name}`,
-                );
-              }
-            }
-          }
-        }
-      } catch (scanErr) {
-        console.warn(
-          `[Pipeline] ⚠️  Drive folder scan failed (continuing with Firestore rows only): ${scanErr.message}`,
-        );
-      }
-
-      console.log(`[Pipeline] 📦 TOTAL files to process: ${recordings.length}`);
-      const participantNames = [];
-
-      // ═══════════════════════════════════════════════════════════════════
-      // ██████████████████  CONVEYOR BELT  ████████████████████████████████
-      //
-      //  File 1: Drive Download → Gemini Upload → Poll ACTIVE → ✅
-      //  File 2: Drive Download → Gemini Upload → Poll ACTIVE → ✅
-      //  File N: ...
-      //
-      //  RAM stays at ~60MB CONSTANT — regardless of number of files
-      //  No 19MB limit — Gemini File API supports up to 2GB per file
-      // ═══════════════════════════════════════════════════════════════════
-
-      for (let i = 0; i < recordings.length; i++) {
-        const rec = recordings[i];
-        console.log(
-          `\n[Pipeline] ── File ${i + 1}/${recordings.length}: ${rec.fileName} ──`,
-        );
-
-        try {
-          const mimeType = rec.mimeType || "audio/webm";
-          const displayName = `${meetId}_${rec.employeeName || rec.employeeId}_${Date.now()}`;
-
-          // BELT STEP 1+2: Drive stream → Gemini File API upload
-          const geminiFile = await streamDriveToGeminiFileAPI(
-            drive,
-            rec.driveFileId,
-            mimeType,
-            displayName,
-            apiKey,
-          );
-
-          // BELT STEP 3: Wait until Gemini marks file as ACTIVE
-          await waitForFileActive(geminiFile.geminiName, apiKey);
-
-          // Collect file reference for batch generateContent call
-          uploadedGeminiFiles.push(geminiFile);
-          participantNames.push(
-            rec.employeeName || rec.firstName || rec.employeeId,
-          );
-
-          console.log(`[Pipeline] ✅ File ${i + 1} ready in Gemini Storage`);
-
-          // Small courtesy pause between files
-          if (i < recordings.length - 1) await sleep(500);
-        } catch (e) {
-          // Non-fatal: log and skip this file, continue with rest
-          console.error(
-            `[Pipeline] ⚠️  Skipping ${rec.fileName}: ${e.message}`,
-          );
-        }
-      }
-
-      // ═══════════════════════════════════════════════════════════════════
-
-      if (uploadedGeminiFiles.length === 0) {
-        return res.status(400).json({
-          error:
-            "Could not upload any audio files to Gemini File API. Check Drive permissions.",
-        });
-      }
 
       console.log(
         `\n[Pipeline] 🎯 ${uploadedGeminiFiles.length}/${recordings.length} file(s) ready — sending to Gemini...`,
@@ -1020,7 +1065,10 @@ router.post(
             "Gemini API key suspended or invalid. Create a new key at aistudio.google.com.",
         });
       }
-      return res.status(500).json({ error: e.message });
+      /* "No audio recordings found" is a 404 the person can act on. Before the
+         gather step was shared it WAS one; letting it fall through to 500 here
+         would turn an instruction into a server fault. */
+      return res.status(e.status || 500).json({ error: e.message });
     } finally {
       // ── Release the lock however we leave ──────────────────────────────
       // The success path and the catch each released it, but an early
@@ -1119,9 +1167,462 @@ router.get(
   },
 );
 
-module.exports = router;
+// ─────────────────────────────────────────────────────────────────────────────
+// TRANSCRIPT — the words, as opposed to a reading of them
+//
+// The summary above paraphrases, reorders and translates by design; that is
+// what makes it useful and what makes it unsuitable as a record. These two
+// routes answer the other question — what was actually said — and they run on
+// exactly the same audio, through `gatherMeetingAudio`, so the two can never
+// disagree about which recordings a meeting has.
+//
+// Two modes, kept as two stored results rather than one toggled at read time:
+//   · verbatim  — the exact words, in whatever language they were spoken
+//   · translate — rendered into English, marking WHICH lines were translated
+// Generating one never discards the other.
+// ─────────────────────────────────────────────────────────────────────────────
 
-module.exports.helpers = {
+const TRANSCRIPT_COLLECTION = "meeting_transcripts_gemini";
+
+/**
+ * The instruction, per mode.
+ *
+ * Both insist on `[unclear]` over a guess. A transcript that quietly invents a
+ * plausible sentence is worse than one with a gap in it: the gap can be checked
+ * against the recording, the invention cannot be told from the truth.
+ */
+function buildTranscriptPrompt(mode, participantNames, timeline) {
+  const who = participantNames.length
+    ? `The speakers are: ${participantNames.join(", ")}.`
+    : "Speaker names are not known; label them Speaker 1, Speaker 2, and so on.";
+
+  const order = timeline.length
+    ? `\n\nSpeaking order, taken from each participant's own microphone (seconds from the start of the meeting):\n${timeline
+        .map((t) => `  ${t.start}-${t.end}s ${t.name}`)
+        .join("\n")}\nUse this to attribute lines. Where it disagrees with what you hear, trust what you hear.`
+    : "";
+
+  const common = `${who}${order}
+
+Each audio file is ONE participant's own microphone for the whole meeting, so the same moment appears in several files. Produce ONE combined transcript in time order, not one per file.
+
+Return ONLY lines in exactly this format, one utterance per line, and nothing else — no preamble, no headings, no markdown, no code fences:
+
+[start-end] Speaker Name: text
+
+start and end are whole seconds from the beginning of the meeting. For example:
+
+[0-4] Rakesh Biswal: Good morning, shall we start?
+[5-9] Pramod Biswal: Yes, I have the numbers ready.
+
+Where you cannot make out what was said, write [unclear] in place of those words. Never guess at words you cannot hear, and never drop a line because it is hard.`;
+
+  if (mode === "translate") {
+    return `${common}
+
+Render every line in ENGLISH. Where a line was originally spoken in another language, translate it and append the marker <<T>> at the very end of that line. Lines already in English get no marker. Do not silently blend the two — the marker is the point: a reader must be able to tell which words are the speaker's own and which are yours.
+
+[0-4] Rakesh Biswal: Good morning, shall we start?
+[5-9] Pramod Biswal: It will be done by tomorrow. <<T>>`;
+  }
+
+  return `${common}
+
+Transcribe VERBATIM, in the language each line was actually spoken in. Do not translate. Do not tidy grammar, remove filler words, or turn speech into prose — if somebody says "um, so, yeah, we can, we can do that", write that.`;
+}
+
+/**
+ * Parse the model's lines into utterances.
+ *
+ * Counts what it could NOT parse rather than dropping it silently: a transcript
+ * that lost a third of its lines to a formatting wobble should say so on
+ * screen, not merely look short.
+ */
+function parseTranscript(text, mode) {
+  const lines = String(text || "")
+    .replace(/```[a-z]*\n?/gi, "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const utterances = [];
+  let unparsedLineCount = 0;
+
+  for (const line of lines) {
+    /* [12-18] Name: words — the seconds, the speaker, the rest. */
+    const m = /^\[\s*(\d+)\s*[-–]\s*(\d+)\s*\]\s*([^:]{1,60}?)\s*:\s*(.*)$/.exec(
+      line,
+    );
+    if (!m) {
+      unparsedLineCount++;
+      continue;
+    }
+    let body = m[4].trim();
+    const translated = /<<T>>\s*$/.test(body);
+    if (translated) body = body.replace(/<<T>>\s*$/, "").trim();
+    if (!body) {
+      unparsedLineCount++;
+      continue;
+    }
+    const start = Number(m[1]);
+    const end = Number(m[2]);
+    utterances.push({
+      start: Number.isFinite(start) ? start : 0,
+      end: Number.isFinite(end) ? Math.max(end, start) : start,
+      speaker: m[3].trim() || "Unknown",
+      text: body,
+      needsReview: /\[unclear\]/i.test(body),
+      ...(mode === "translate" ? { translated } : {}),
+    });
+  }
+
+  utterances.sort((a, b) => a.start - b.start || a.end - b.end);
+  return { utterances, unparsedLineCount, createdAtMs: Date.now() };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /cowork/audio/transcript/:meetId — whatever has been generated so far
+// ─────────────────────────────────────────────────────────────────────────────
+router.get(
+  "/audio/transcript/:meetId",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { meetId } = req.params;
+      const doc = await db.collection(TRANSCRIPT_COLLECTION).doc(meetId).get();
+      /* 404 reads as "nothing generated yet" to the panel, which is why this is
+         not an empty object: absence and "generated but empty" are different
+         things, and the panel draws them differently. */
+      if (!doc.exists)
+        return res.status(404).json({ error: "No transcript yet" });
+      return res.json({ success: true, transcript: doc.data() });
+    } catch (e) {
+      console.error("[Transcript GET] Error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /cowork/audio/transcript/:meetId?mode=verbatim|translate[&force=true]
+// ─────────────────────────────────────────────────────────────────────────────
+router.post(
+  "/audio/transcript/:meetId",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    const uploadedGeminiFiles = [];
+    const { meetId } = req.params;
+    const mode = req.query.mode === "translate" ? "translate" : "verbatim";
+    const lockKey = `${meetId}:${mode}`;
+
+    try {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey)
+        return res
+          .status(500)
+          .json({ error: "GEMINI_API_KEY not set in .env" });
+
+      /* Locked per MODE, not per meeting: transcribing the verbatim version
+         must not refuse somebody asking for the translated one. */
+      if (processingLocks.has(lockKey)) {
+        const age = Date.now() - (processingLockTimestamps.get(lockKey) || 0);
+        if (age < LOCK_TIMEOUT_MS)
+          return res.status(429).json({
+            error: "Transcript generation already in progress. Please wait.",
+          });
+        processingLocks.delete(lockKey);
+        processingLockTimestamps.delete(lockKey);
+      }
+      processingLocks.add(lockKey);
+      processingLockTimestamps.set(lockKey, Date.now());
+
+      const ref = db.collection(TRANSCRIPT_COLLECTION).doc(meetId);
+      const existing = await ref.get();
+      const force = req.query.force === "true";
+      if (existing.exists && !force && existing.data()[mode]) {
+        return res.json({
+          success: true,
+          transcript: existing.data(),
+          cached: true,
+        });
+      }
+
+      const { participantNames, recordings } = await gatherMeetingAudio(
+        meetId,
+        apiKey,
+        uploadedGeminiFiles,
+      );
+
+      /* The same speaking order the summary builds, for the same reason: each
+         participant's own mute/unmute log is the only reliable evidence of who
+         was talking when. */
+      const timeline = [];
+      for (const rec of recordings) {
+        const name = rec.employeeName || rec.firstName || rec.employeeId;
+        for (const iv of rec.speechIntervals || []) {
+          if (!iv || typeof iv.startMs !== "number") continue;
+          timeline.push({
+            name,
+            start: Math.round(iv.startMs / 1000),
+            end: Math.round((iv.endMs ?? iv.startMs) / 1000),
+          });
+        }
+      }
+      timeline.sort((a, b) => a.start - b.start);
+
+      const text = await callGemini(
+        apiKey,
+        uploadedGeminiFiles,
+        buildTranscriptPrompt(mode, participantNames, timeline),
+      );
+      const result = parseTranscript(text, mode);
+
+      /* Merged, never overwritten: generating the translation must not delete
+         the verbatim transcript somebody may be reading. */
+      await ref.set(
+        {
+          meetId,
+          participantNames,
+          audioFileCount: uploadedGeminiFiles.length,
+          pipeline: "gemini-file-api",
+          [mode]: result,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      console.log(
+        `[Transcript] ${meetId} ${mode}: ${result.utterances.length} line(s), ${result.unparsedLineCount} unparsed`,
+      );
+
+      const saved = await ref.get();
+      return res.json({
+        success: true,
+        transcript: saved.data(),
+        cached: false,
+      });
+    } catch (e) {
+      console.error("[Transcript POST] Error:", e.message);
+      if (e.message?.includes("403") || e.message?.includes("suspended"))
+        return res.status(403).json({
+          error:
+            "Gemini API key suspended or invalid. Create a new key at aistudio.google.com.",
+        });
+      return res.status(e.status || 500).json({ error: e.message });
+    } finally {
+      /* Same lesson as the summary route: an early `return` reaches neither the
+         success path nor the catch, so the release lives here. */
+      processingLocks.delete(lockKey);
+      processingLockTimestamps.delete(lockKey);
+      if (uploadedGeminiFiles.length > 0) {
+        const apiKey = process.env.GEMINI_API_KEY;
+        await Promise.all(
+          uploadedGeminiFiles.map((f) =>
+            deleteGeminiFile(f.geminiName, apiKey).catch(() => {}),
+          ),
+        );
+      }
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /cowork/audio/transcript/:meetId/download?mode=verbatim|translate
+//
+// The same shape as the summary download above: read what was stored, render
+// it, stream it. `mode` decides WHICH of the two documents, so the file matches
+// the tab the reader has open rather than being one fixed export.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get(
+  "/audio/transcript/:meetId/download",
+  verifyCoworkToken,
+  verifyEmployeeToken,
+  async (req, res) => {
+    try {
+      const { meetId } = req.params;
+      const mode = req.query.mode === "translate" ? "translate" : "verbatim";
+
+      const snap = await db.collection(TRANSCRIPT_COLLECTION).doc(meetId).get();
+      const result = snap.exists ? snap.data()[mode] : null;
+      if (!result) {
+        return res.status(404).json({
+          error: `No ${mode === "translate" ? "translated" : "verbatim"} transcript yet. Generate it first.`,
+        });
+      }
+
+      const t = snap.data();
+      const buffer = await renderTranscriptDocx(t, result, mode, meetId);
+
+      const suffix = mode === "translate" ? "Translated" : "Verbatim";
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      );
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="Meeting_Transcript_${suffix}_${meetId}.docx"`,
+      );
+      res.setHeader("Content-Length", buffer.length);
+      return res.send(buffer);
+    } catch (e) {
+      console.error("[TranscriptDocx] Error:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+/**
+ * The transcript as a Word document.
+ *
+ * Deliberately plainer than the summary's: this is a record, so it keeps the
+ * order, the timestamps and the speakers, and writes the two markers as TEXT.
+ * On screen "unclear" is a highlight and "translated" is a tint; in a file
+ * that leaves the building, a reader has neither, and a translated line that
+ * does not say so reads as the speaker's own words.
+ */
+async function renderTranscriptDocx(transcript, result, mode, meetId) {
+  const {
+    Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
+    WidthType, ShadingType, VerticalAlign, AlignmentType,
+  } = require("docx");
+
+  const CONTENT_W = 9746;
+  const W_TIME = 1100;
+  const W_WHO = 2100;
+  const W_TEXT = CONTENT_W - W_TIME - W_WHO;
+
+  const mmss = (s) => {
+    const n = Number(s);
+    if (!Number.isFinite(n) || n < 0) return "";
+    return `${Math.floor(n / 60)}:${String(Math.floor(n % 60)).padStart(2, "0")}`;
+  };
+
+  const cell = (children, width, shading) =>
+    new TableCell({
+      children,
+      width: { size: width, type: WidthType.DXA },
+      shading: shading ? { type: ShadingType.CLEAR, fill: shading } : undefined,
+      verticalAlign: VerticalAlign.TOP,
+      margins: { top: 80, bottom: 80, left: 120, right: 120 },
+    });
+
+  const utterances = Array.isArray(result.utterances) ? result.utterances : [];
+  const unclear = utterances.filter((u) => u && u.needsReview).length;
+
+  const head = [
+    new Paragraph({
+      spacing: { after: 80 },
+      children: [
+        new TextRun({ text: "CoWork Meeting Transcript", bold: true, size: 28, color: "0D47A1" }),
+      ],
+    }),
+    new Paragraph({
+      spacing: { after: 40 },
+      children: [
+        new TextRun({
+          text:
+            mode === "translate"
+              ? "Translated to English — lines marked [translated] were spoken in another language"
+              : "Verbatim — the exact words, in the language they were spoken",
+          size: 18,
+          color: "5F6368",
+        }),
+      ],
+    }),
+    new Paragraph({
+      spacing: { after: 40 },
+      children: [
+        new TextRun({
+          text: `Meeting ${meetId}  ·  ${utterances.length} line(s)${unclear ? `  ·  ${unclear} marked unclear` : ""}${
+            result.unparsedLineCount ? `  ·  ${result.unparsedLineCount} line(s) could not be read` : ""
+          }`,
+          size: 17,
+          color: "5F6368",
+        }),
+      ],
+    }),
+    new Paragraph({
+      spacing: { after: 240 },
+      children: [
+        new TextRun({
+          text: `Participants: ${(transcript.participantNames || []).join(", ") || "not recorded"}`,
+          size: 17,
+          color: "5F6368",
+        }),
+      ],
+    }),
+  ];
+
+  const rows = [
+    new TableRow({
+      tableHeader: true,
+      children: [
+        cell([new Paragraph({ children: [new TextRun({ text: "Time", bold: true, size: 18, color: "FFFFFF" })] })], W_TIME, "1A73E8"),
+        cell([new Paragraph({ children: [new TextRun({ text: "Speaker", bold: true, size: 18, color: "FFFFFF" })] })], W_WHO, "1A73E8"),
+        cell([new Paragraph({ children: [new TextRun({ text: "What was said", bold: true, size: 18, color: "FFFFFF" })] })], W_TEXT, "1A73E8"),
+      ],
+    }),
+    ...utterances.map((u, i) => {
+      const zebra = i % 2 === 1 ? "F8F9FA" : undefined;
+      const runs = [new TextRun({ text: String(u?.text ?? ""), size: 19, color: "202124" })];
+      if (u?.needsReview)
+        runs.push(new TextRun({ text: "  [unclear]", bold: true, size: 16, color: "F29900" }));
+      if (mode === "translate" && u?.translated)
+        runs.push(new TextRun({ text: "  [translated]", italics: true, size: 16, color: "5F6368" }));
+      return new TableRow({
+        children: [
+          cell([new Paragraph({ children: [new TextRun({ text: mmss(u?.start), size: 17, color: "5F6368" })] })], W_TIME, zebra),
+          cell([new Paragraph({ children: [new TextRun({ text: String(u?.speaker ?? "Unknown"), bold: true, size: 18, color: "0D47A1" })] })], W_WHO, zebra),
+          cell([new Paragraph({ children: runs })], W_TEXT, zebra),
+        ],
+      });
+    }),
+  ];
+
+  const body = utterances.length
+    ? new Table({ width: { size: CONTENT_W, type: WidthType.DXA }, rows })
+    : new Paragraph({
+        alignment: AlignmentType.LEFT,
+        children: [
+          new TextRun({ text: "No lines were captured for this meeting in this mode.", italics: true, size: 19, color: "5F6368" }),
+        ],
+      });
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: { page: { margin: { top: 1080, bottom: 1080, left: 1080, right: 1080 } } },
+        children: [...head, body],
+      },
+    ],
+  });
+
+  return Packer.toBuffer(doc);
+}
+
+/**
+ * The Drive → Gemini File API pipeline, shared with meetingTranscript.routes.
+ *
+ * **Restoring this, and why it must not be tidied away again.** It was added
+ * with the verbatim-transcript route (0722697) so that route could reuse this
+ * one's upload plumbing instead of carrying a fourth copy of it, and a later
+ * cleanup of this file removed it. Nothing here referenced it, so it read as
+ * dead code — but `meetingTranscript.routes.js` destructures these six names at
+ * require time, so its absence was not a degraded feature: `require` returned a
+ * router with no `.helpers`, the destructure threw `TypeError: Cannot
+ * destructure property 'MODELS_TO_TRY' of 'summaryHelpers' as it is undefined`,
+ * and server.js could not finish loading. **The whole backend refused to
+ * start.**
+ *
+ * A plain property on the exported router, not a change to the export shape —
+ * `require("./meetingSummary.routes")` still returns a working Express router
+ * exactly as before; this only adds `.helpers` to it.
+ */
+router.helpers = {
+  GEMINI_BASE,
+  GEMINI_UPLOAD_BASE,
   MODELS_TO_TRY,
   getDriveClient,
   streamDriveToGeminiFileAPI,
@@ -1129,3 +1630,6 @@ module.exports.helpers = {
   deleteGeminiFile,
   callGemini,
 };
+
+module.exports = router;
+
