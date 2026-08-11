@@ -110,6 +110,9 @@ function normaliseGroup(g) {
     baseFullInches: Number(g.baseFullInches) || 0,
     measurementOffset: Number(g.measurementOffset) || 0,
     gradingMode: g.gradingMode || (g.ruleProfile?.enabled ? "rule" : "keyframe"),
+    measureMode: ["auto", "curve", "straight"].includes(g.measureMode)
+      ? g.measureMode
+      : "auto",
     ruleProfile: g.ruleProfile || null,
     loosingEnabled: Boolean(g.loosingEnabled),
     loosingValueInches: Number(g.loosingValueInches) || 0,
@@ -574,7 +577,7 @@ router.post(
       const { stockItemId, sizeName, groupId } = req.params;
       const {
         keyframes, groupName, partKey, multiplier, ref1, ref2, color, ruleProfile,
-        assignedSize, baseFullInches, targetFullInches, measurementOffset, gradingMode,
+        assignedSize, baseFullInches, targetFullInches, measurementOffset, gradingMode, measureMode,
         loosingEnabled, loosingValueInches, loosingSide, loosingValueRef1Inches, loosingValueRef2Inches, conditionsFollowLoosing, nestedConditions,
       } = req.body;
 
@@ -596,7 +599,7 @@ router.post(
           if (groupIndex === -1) {
             const newGroup = normaliseGroup({
               groupId, groupName, partKey, multiplier, ref1, ref2, color, ruleProfile,
-              assignedSize, baseFullInches, targetFullInches, measurementOffset, gradingMode,
+              assignedSize, baseFullInches, targetFullInches, measurementOffset, gradingMode, measureMode,
               loosingEnabled, loosingValueInches, loosingSide, loosingValueRef1Inches, loosingValueRef2Inches, conditionsFollowLoosing,
               nestedConditions: nestedConditions || [],
               keyframes: [],
@@ -616,6 +619,7 @@ router.post(
           g.targetFullInches = Number(targetFullInches) || g.targetFullInches || 0;
           g.measurementOffset = Number(measurementOffset) || g.measurementOffset || 0;
           g.gradingMode = gradingMode || g.gradingMode || "keyframe";
+          g.measureMode = measureMode || g.measureMode || "auto";
           g.loosingEnabled = Boolean(loosingEnabled);
           g.loosingValueInches = Number(loosingValueInches) || 0;
           if (["ref1", "ref2", "both"].includes(loosingSide)) g.loosingSide = loosingSide;
@@ -1413,12 +1417,23 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
           // The effective employee value: actual measurement > designer fallback > null
           const effectiveEmpVal = empVal !== null ? empVal : fallbackVal;
 
-          // ── Check keyframe coverage ──
+          // ── Check keyframe / rule coverage ──
           // Collect all targetFullInches values from this group's keyframes
           const keyframes = group.keyframes || [];
           const kfValues = keyframes.map(kf => kf.targetFullInches).filter(v => v != null && !isNaN(v));
           const baseVal = group.baseFullInches || 0;
           const hasKeyframes = kfValues.length > 0;
+
+          // Mirrors resolveGroupGradingMode() in grav-cms's lib/patternGradingEngine.js —
+          // a group explicitly set to "rule", or one with an enabled ruleProfile and no
+          // keyframes, grades from its ruleProfile alone and has no keyframe range to be
+          // "outside of". Previously this block only ever recognized keyframe coverage, so
+          // every rule-only group (the common case once a designer stops hand-recording
+          // keyframes) was flagged "grading cannot be applied" even though it applies fine.
+          const explicitGradingMode = String(group.gradingMode || "").toLowerCase();
+          const isRuleMode =
+            explicitGradingMode === "rule" ||
+            (explicitGradingMode !== "keyframe" && !!group.ruleProfile?.enabled && !hasKeyframes);
 
           // The grading range is from baseFullInches through all keyframe targets
           let gradingMin = baseVal;
@@ -1433,7 +1448,9 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
           let gradingApplicable = true;
           let gradingWarning = null;
 
-          if (effectiveEmpVal !== null && hasKeyframes) {
+          if (isRuleMode) {
+            // Rule mode grades from the ruleProfile directly — no keyframe range to fall outside of.
+          } else if (effectiveEmpVal !== null && hasKeyframes) {
             if (effectiveEmpVal < gradingMin || effectiveEmpVal > gradingMax) {
               gradingApplicable = false;
               gradingWarning = `Employee ${cleanPartKey} (${effectiveEmpVal}") is outside the graded range (${gradingMin}" – ${gradingMax}"). No grading applied.`;
@@ -1458,6 +1475,7 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
             // New fields for grading status
             hasKeyframes,
             keyframeCount: kfValues.length,
+            gradingMode: isRuleMode ? "rule" : "keyframe",
             gradingMin,
             gradingMax,
             gradingApplicable,
