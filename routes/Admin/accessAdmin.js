@@ -672,11 +672,16 @@ router.patch("/employees/:id", async (req, res) => {
     // Assigning access has nothing to do with salary, so it should not be
     // running salary code at all.
     const employee = await Employee.findById(req.params.id)
-      .select("firstName lastName email accessDepartmentId")
+      .select("firstName lastName email accessDepartmentId additionalDepartmentIds")
+      .populate("accessDepartmentId", "name")
+      .populate("additionalDepartmentIds", "name")
       .lean();
     if (!employee) return fail(res, 404, "Employee not found");
 
     const { accessDepartmentId, additionalDepartmentIds } = req.body || {};
+    const displayName = employee.firstName || employee.email;
+    const oldPrimaryName = employee.accessDepartmentId?.name || null;
+    const oldExtraNames = (employee.additionalDepartmentIds || []).map((d) => d.name);
 
     // Extra departments, set independently of the primary. Sent as an array;
     // an empty array clears them.
@@ -689,7 +694,10 @@ router.patch("/employees/:id", async (req, res) => {
       // The primary is never duplicated into the extras — it is already granted.
       const extras = valid
         .map((d) => d._id)
-        .filter((id) => String(id) !== String(accessDepartmentId || employee.accessDepartmentId));
+        .filter((id) => String(id) !== String(accessDepartmentId || employee.accessDepartmentId?._id));
+      const extraNames = valid
+        .filter((d) => extras.some((id) => String(id) === String(d._id)))
+        .map((d) => d.name);
 
       await Employee.updateOne(
         { _id: employee._id },
@@ -697,6 +705,24 @@ router.patch("/employees/:id", async (req, res) => {
       );
 
       audit(req, "employee.extra-departments", `${employee.email} → ${extras.length} extra`);
+
+      // Who granted/revoked which "also" departments, and when — this is the
+      // record People & Roles' history panel reads. Kept on the employee's
+      // email as `entityId`, the same key department-role changes already use
+      // (see PUT /department-roles/:slug above), so a person's whole access
+      // history — primary, extras, and any module role — reads as one
+      // timeline instead of three that each need their own lookup.
+      await recordChange(req, {
+        entity: "employee-department-extra",
+        entityId: employee.email,
+        entityLabel: displayName,
+        action: "update",
+        summary: extraNames.length
+          ? `${displayName} also granted: ${extraNames.join(", ")}`
+          : `${displayName}'s extra departments cleared`,
+        before: { extra: oldExtraNames },
+        after: { extra: extraNames },
+      });
 
       if (accessDepartmentId === undefined) {
         return res.json({
@@ -719,6 +745,15 @@ router.patch("/employees/:id", async (req, res) => {
       );
 
       audit(req, "employee.assign", `${employee.email} → ${dept.name}`);
+      await recordChange(req, {
+        entity: "employee-department",
+        entityId: employee.email,
+        entityLabel: displayName,
+        action: "update",
+        summary: `${displayName}'s primary department set to ${dept.name}`,
+        before: { department: oldPrimaryName },
+        after: { department: dept.name },
+      });
       return res.json({
         success: true,
         message: `${employee.firstName || employee.email} can now sign in to ${dept.name}.`,
@@ -732,6 +767,15 @@ router.patch("/employees/:id", async (req, res) => {
     );
 
     audit(req, "employee.revoke", employee.email);
+    await recordChange(req, {
+      entity: "employee-department",
+      entityId: employee.email,
+      entityLabel: displayName,
+      action: "update",
+      summary: `${displayName}'s primary department removed`,
+      before: { department: oldPrimaryName },
+      after: { department: null },
+    });
     res.json({
       success: true,
       message:
