@@ -1295,19 +1295,34 @@ router.post("/change-password", async (req, res) => {
     const decoded = verifyToken(token);
     const { currentPassword, newPassword } = req.body || {};
 
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ success: false, message: "Current and new password are required" });
+    if (!newPassword) {
+      return res.status(400).json({ success: false, message: "A new password is required" });
     }
     if (String(newPassword).length < 8) {
       return res.status(400).json({ success: false, message: "The new password must be at least 8 characters" });
     }
-    if (String(newPassword) === String(currentPassword)) {
+    if (currentPassword && String(newPassword) === String(currentPassword)) {
       return res.status(400).json({ success: false, message: "The new password must be different from the current one" });
     }
 
     const wrong = () =>
       res.status(401).json({ success: false, message: "Current password is incorrect" });
 
+    /**
+     * Onboarding's self-service card (the common path — the portal everybody
+     * already lands on signed in) no longer collects the current password at
+     * all: asking someone to re-type the password they used thirty seconds
+     * ago to reach this exact screen was the friction being removed. The
+     * still-valid session (the token this route already required above) is
+     * what stands in for it.
+     *
+     * That is a real, deliberate trade: whoever holds a valid session token —
+     * a stolen one, or a shared machine left signed in — can now change the
+     * password without proving they know the old one, where before they
+     * could not. Anywhere `currentPassword` IS sent (a caller can still send
+     * it), it is still checked, so this only relaxes the check for callers
+     * who choose not to ask for it.
+     */
     /* ---- employee ------------------------------------------------- */
     if (decoded.subject === "employee") {
       const Employee = require("../../models/Employee");
@@ -1319,11 +1334,13 @@ router.post("/change-password", async (req, res) => {
       const employee = await Employee.findById(decoded.id);
       if (!employee) return res.status(401).json({ success: false, message: "Unauthorized" });
 
-      // The same matcher login uses, so someone still on a derived default
-      // (Firstname@MMDDYYYY, or the phone-based one) can set a real password
-      // without an administrator having to reset it for them first.
-      const { ok } = await matchesEmployeePassword(employee, currentPassword);
-      if (!ok) return wrong();
+      if (currentPassword) {
+        // The same matcher login uses, so someone still on a derived default
+        // (Firstname@MMDDYYYY, or the phone-based one) can set a real password
+        // without an administrator having to reset it for them first.
+        const { ok } = await matchesEmployeePassword(employee, currentPassword);
+        if (!ok) return wrong();
+      }
 
       // updateOne, not save() — the Employee pre-save hook re-encrypts salary
       // fields, and on a document loaded for this purpose that has repeatedly
@@ -1354,8 +1371,10 @@ router.post("/change-password", async (req, res) => {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
 
-      const ok = await accUser.checkPassword(currentPassword);
-      if (!ok) return wrong();
+      if (currentPassword) {
+        const ok = await accUser.checkPassword(currentPassword);
+        if (!ok) return wrong();
+      }
 
       await accUser.setPassword(String(newPassword));
       // Every other accounting session for this person dies with the old one.
@@ -1375,8 +1394,10 @@ router.post("/change-password", async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const ok = await user.verifyPassword(currentPassword);
-    if (!ok) return wrong();
+    if (currentPassword) {
+      const ok = await user.verifyPassword(currentPassword);
+      if (!ok) return wrong();
+    }
 
     await user.setPassword(newPassword);   // bumps tokenVersion → other sessions die
     await user.save();
