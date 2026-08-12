@@ -72,6 +72,58 @@ async function _managerIdOf(employee) {
     } catch (_) { return null; }
 }
 
+/** The same lookup, from a biometricId rather than a loaded document. */
+async function _managerIdFor(biometricId) {
+    if (!biometricId) return null;
+    const emp = await Employee.findOne({ biometricId }, { primaryManager: 1 }).lean();
+    return emp ? _managerIdOf(emp) : null;
+}
+
+/**
+ * May this caller decide things for that person?
+ *
+ * **The reporting line, not a role.** A conduct rule is written by a manager
+ * and approved by THEIR manager; a breach is applied by the employee's OWN
+ * manager. Both questions are the same question — "am I the person one step
+ * above them" — and it is asked of the line rather than of a job title, so a
+ * team lead cannot rule on somebody who does not report to them and a manager
+ * two departments away cannot either.
+ *
+ * The CEO passes because the CEO is above everybody by construction, and an
+ * administrator passes because the line cannot always answer: somebody at the
+ * top has nobody above them, and a named approver can leave. Without that,
+ * rules written by the most senior manager could never be approved by anyone.
+ */
+async function _mayDecideFor(caller, subjectBiometricId) {
+    if (!caller) return false;
+    if (caller.role === "ceo" || caller.role === "admin") return true;
+    if (!subjectBiometricId) return false;
+    if (caller.employeeId === subjectBiometricId) return false; /* Never yourself. */
+    return (await _managerIdFor(subjectBiometricId)) === caller.employeeId;
+}
+
+/**
+ * Does anybody report to this person?
+ *
+ * **A rule is written by a manager, and a manager is somebody with reports** —
+ * not somebody with a particular job title. The old gate was role-based, which
+ * both excluded managers who are not team leads and let a team lead write rules
+ * for a department they have nothing to do with.
+ */
+async function _isManager(biometricId) {
+    if (!biometricId) return false;
+    const me = await Employee.findOne({ biometricId }, { _id: 1 }).lean();
+    if (!me) return false;
+    return (await Employee.countDocuments({ primaryManager: me._id })) > 0;
+}
+
+/** What a breach costs, preferring the percentage over the legacy point count. */
+function _costOf(sop) {
+    const pct = Number(sop?.percent);
+    if (Number.isFinite(pct) && pct > 0) return pct;
+    return Number(sop?.points) || 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FOLDER ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -251,20 +303,44 @@ router.get("/all-categories", verifyCoworkToken, verifyEmployeeToken, async (req
 });
 
 // POST /cowork/sop
-router.post("/", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+router.post("/", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
         const { role, employeeId, name: userName } = req.coworkUser;
-        const { name, points, description, department, folderId, severity } = req.body;
+        const { name, description, department, folderId, severity } = req.body;
+        /**
+         * **A percentage, not a point count.** C1, C2 and C4 are percentages
+         * and C3 is subtracted from their average, so a rule's cost is "five
+         * percent off", and `percent` is what a caller should send. `points`
+         * is still accepted so an older client keeps working, and both are
+         * written so that every reader — including quarters already scored —
+         * finds what it expects.
+         */
+        const cost = Number(req.body.percent ?? req.body.points);
+
+        /* Written by a manager — somebody with reports — rather than by a job
+           title. The CEO and an administrator may write one too. */
+        if (
+            role !== "ceo" &&
+            role !== "admin" &&
+            !(await _isManager(employeeId))
+        ) {
+            return res.status(403).json({
+                error: "Only a manager can write a conduct rule — it is approved by your own manager before it applies to anybody.",
+            });
+        }
 
         if (severity && !VALID_SEVERITIES.includes(severity)) {
             return res.status(400).json({ error: "Invalid severity tag." });
         }
 
-        if (!name || !points || !description || !department) {
-            return res.status(400).json({ error: "name, points, description, department are required." });
+        if (!name || !cost || !description || !department) {
+            return res.status(400).json({ error: "name, percent, description, department are required." });
         }
-        if (isNaN(points) || Number(points) < 0.5) {
-            return res.status(400).json({ error: "Points must be at least 0.5." });
+        if (isNaN(cost) || cost <= 0) {
+            return res.status(400).json({ error: "The cut must be a percentage above zero." });
+        }
+        if (cost > 100) {
+            return res.status(400).json({ error: "A single rule cannot cut more than 100%." });
         }
 
         if (role === "tl") {
@@ -281,14 +357,53 @@ router.post("/", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
             if (folder) { folderName = folder.name; resolvedFolderId = folder._id; }
         }
 
+        /**
+         * **The approver is the writer's own primary manager, named now.**
+         *
+         * Stamped at creation rather than looked up when somebody opens the
+         * queue, so the decision belongs to one person who can be told about
+         * it — and so a reorganisation months later cannot quietly move a
+         * pending rule to somebody who was never asked.
+         *
+         * Nobody above them means nobody in the line can approve it, and it
+         * waits for an administrator instead of being approved by default. A
+         * rule that takes points off people is not something to nod through
+         * because its author happens to sit at the top.
+         */
+        const approverId = await _managerIdFor(employeeId);
+        let approverName = null;
+        if (approverId) {
+            const mgr = await Employee.findOne({ biometricId: approverId }, { firstName: 1, lastName: 1 }).lean();
+            approverName = mgr ? `${mgr.firstName || ""} ${mgr.lastName || ""}`.trim() : null;
+        }
+
         const sop = await Sop.create({
-            name: name.trim(), points: Number(points), severity: severity || null,
+            name: name.trim(),
+            percent: cost, points: cost,
+            severity: severity || null,
             description: description.trim(), department: department.trim(), folderId: resolvedFolderId, folderName,
             createdBy: employeeId, createdByName: userName,
             createdByRole: role === "ceo" ? "ceo" : "tl",
-            status: role === "ceo" ? "approved" : "pending",
-            ...(role === "ceo" && { approvedBy: employeeId, approvedByName: userName, approvedAt: new Date() }),
+            /* Always pending — including for the CEO. The rule that a conduct
+               policy is reviewed by somebody other than its author is the whole
+               point of having an approval step, and self-approval was how that
+               became a formality. An administrator clears the CEO's. */
+            status: "pending",
+            approverId, approverName,
         });
+
+        /* A queue nobody is told about is a queue that sits. */
+        if (approverId) {
+            await _notify({
+                recipientIds: [approverId],
+                type: "sop_approval_requested",
+                title: `📋 Conduct rule to approve · ${cost}%`,
+                body: `${userName} wrote "${sop.name}" for ${sop.department} — a ${cost}% cut when it is breached. It does not apply to anybody until you approve it.`,
+                data: { sopId: String(sop._id), percent: cost },
+                senderId: employeeId,
+                senderName: userName,
+            });
+        }
 
         res.status(201).json({ success: true, sop });
     } catch (e) {
@@ -361,17 +476,69 @@ router.delete("/:id", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
 });
 
 // PATCH /cowork/sop/:id/approve
-router.patch("/:id/approve", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+/**
+ * **Decided by the writer's own primary manager — not by role.**
+ *
+ * This was CEO-only, which made every conduct rule in the company wait on one
+ * person and told a manager nothing about the rules their own team lead was
+ * writing. The line already answers "who is accountable for this person's
+ * judgement": it is the manager one step above them.
+ *
+ * An administrator may also decide, because the line runs out at the top and a
+ * named approver can leave — see `_mayDecideFor`. Nobody approves their own,
+ * whatever their role.
+ */
+async function _decideSop(req, res, decision) {
+    const { employeeId, name, role } = req.coworkUser;
+    const sop = await Sop.findById(req.params.id);
+    if (!sop) return res.status(404).json({ error: "SOP not found." });
+    if (sop.status !== "pending") {
+        return res.status(400).json({ error: `This rule was already ${sop.status}.` });
+    }
+    if (sop.createdBy === employeeId) {
+        return res.status(403).json({ error: "You cannot approve a rule you wrote yourself." });
+    }
+
+    const named = sop.approverId && sop.approverId === employeeId;
+    const allowed = named || (await _mayDecideFor(req.coworkUser, sop.createdBy));
+    if (!allowed) {
+        return res.status(403).json({
+            error: "Only the author's own manager, or an administrator, can decide this rule.",
+        });
+    }
+
+    sop.status = decision === "approve" ? "approved" : "rejected";
+    if (decision === "approve") {
+        sop.approvedBy = employeeId;
+        sop.approvedByName = name;
+        sop.approvedAt = new Date();
+    } else {
+        sop.rejectedReason = String(req.body?.reason || "").trim();
+    }
+    await sop.save();
+
+    /* The author hears either way. A rule that was quietly rejected is one
+       somebody keeps expecting to be able to apply. */
+    await _notify({
+        recipientIds: [sop.createdBy].filter((id) => id && id !== employeeId),
+        type: decision === "approve" ? "sop_approved" : "sop_rejected",
+        title: decision === "approve" ? `✅ Rule approved · ${sop.name}` : `❌ Rule rejected · ${sop.name}`,
+        body:
+            decision === "approve"
+                ? `${name} approved "${sop.name}". It can now be applied, and cuts ${_costOf(sop)}% when it is.`
+                : `${name} rejected "${sop.name}".${sop.rejectedReason ? ` They said: ${sop.rejectedReason}` : ""}`,
+        data: { sopId: String(sop._id) },
+        senderId: employeeId,
+        senderName: name,
+    });
+
+    res.json({ success: true, sop });
+    void role;
+}
+
+router.patch("/:id/approve", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
-        const { employeeId, name } = req.coworkUser;
-        const sop = await Sop.findById(req.params.id);
-        if (!sop) return res.status(404).json({ error: "SOP not found." });
-
-        sop.status = "approved";
-        sop.approvedBy = employeeId; sop.approvedByName = name; sop.approvedAt = new Date();
-        await sop.save();
-
-        res.json({ success: true, sop });
+        await _decideSop(req, res, "approve");
     } catch (e) {
         console.error("[sop/approve]", e.message);
         res.status(500).json({ error: e.message });
@@ -379,23 +546,44 @@ router.patch("/:id/approve", verifyCoworkToken, verifyCeoToken, async (req, res)
 });
 
 // PATCH /cowork/sop/:id/reject
-router.patch("/:id/reject", verifyCoworkToken, verifyCeoToken, async (req, res) => {
+router.patch("/:id/reject", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
-        const sop = await Sop.findById(req.params.id);
-        if (!sop) return res.status(404).json({ error: "SOP not found." });
-
-        sop.status = "rejected";
-        await sop.save();
-
-        res.json({ success: true, sop });
+        await _decideSop(req, res, "reject");
     } catch (e) {
         console.error("[sop/reject]", e.message);
         res.status(500).json({ error: e.message });
     }
 });
 
+/**
+ * GET /cowork/sop/pending-approvals — the rules waiting on THIS person.
+ *
+ * Addressed rather than filtered on the client: a list every senior person can
+ * see is a list nobody owns, and the decision here belongs to exactly one
+ * manager. An administrator sees the ones the line cannot answer — the rules
+ * whose author has nobody above them — plus their own.
+ */
+router.get("/pending-approvals", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+    try {
+        const { employeeId, role } = req.coworkUser;
+        const mine = await Sop.find({ status: "pending", approverId: employeeId })
+            .sort({ createdAt: -1 })
+            .lean();
+        const orphaned =
+            role === "ceo" || role === "admin"
+                ? await Sop.find({ status: "pending", $or: [{ approverId: null }, { approverId: "" }] })
+                      .sort({ createdAt: -1 })
+                      .lean()
+                : [];
+        res.json({ success: true, sops: [...mine, ...orphaned] });
+    } catch (e) {
+        console.error("[sop/pending-approvals]", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // POST /cowork/sop/bleach
-router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+router.post("/bleach", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
         const { role, employeeId: appliedById, name: appliedByName } = req.coworkUser;
         const { targetEmployeeId, sopId, description, manualPoints, manualSopName } = req.body;
@@ -411,19 +599,34 @@ router.post("/bleach", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
         if (sopId && !sop) return res.status(404).json({ error: "SOP not found." });
         if (sopId && sop.status !== "approved") return res.status(400).json({ error: "Only approved SOPs can be applied." });
 
-        const finalPoints = sop ? sop.points : Number(manualPoints);
+        const finalPoints = sop ? _costOf(sop) : Number(manualPoints);
         const finalSopName = sop ? sop.name : (manualSopName || "Manual Deduction");
         const finalFolderName = sop ? (sop.folderName || "Uncategorized") : "Task Event";
 
         const employee = await Employee.findOne({ biometricId: targetEmployeeId });
         if (!employee) return res.status(404).json({ error: "Employee not found." });
 
-        if (role === "tl") {
-            const me = await Employee.findOne({ biometricId: appliedById }, { department: 1 }).lean();
-            if (!me || me.department !== employee.department) {
-                return res.status(403).json({ error: "TL can only bleach employees in their own department." });
+        /**
+         * **Their own manager, or an administrator.**
+         *
+         * It was any team lead in the same department, which let somebody who
+         * has never worked with a person take points off their record. Conduct
+         * is a judgement about how somebody works, and the person accountable
+         * for that judgement is the one they report to.
+         *
+         * `taskId` marks an entry the ENGINE raised from a task event rather
+         * than a person deciding — that path has no manager to check and is
+         * left to the existing role gate.
+         */
+        if (!req.body.taskId) {
+            const may = await _mayDecideFor(req.coworkUser, targetEmployeeId);
+            if (!may) {
+                return res.status(403).json({
+                    error: "Only their own primary manager, or an administrator, can apply a conduct rule to this person.",
+                });
             }
         }
+        void role;
 
         const today = new Date().toISOString().split("T")[0];
         const year = new Date().getFullYear();
@@ -545,16 +748,32 @@ router.get("/bleach/:employeeId", verifyCoworkToken, verifyEmployeeToken, async 
     }
 });
 
+/**
+ * Whose disputes does this person settle?
+ *
+ * **The people who report to them, and nobody else.** The two recheck queues
+ * below used to be addressed by role — CEO or team lead, a lead seeing their
+ * whole department — while the decision itself is gated by `_mayDecideFor`,
+ * which asks the reporting line. The two disagreed in both directions: a
+ * manager who is not a lead could decide a dispute they could never see, and a
+ * lead saw disputes belonging to people who do not report to them and would be
+ * refused on submitting. A queue you cannot act on is worse than no queue.
+ *
+ * Returns `null` for "everybody" — administrators and the CEO, who stand in
+ * where the line runs out.
+ */
+async function _subjectFilterFor(caller) {
+    if (caller.role === "ceo" || caller.role === "admin") return null;
+    const me = await Employee.findOne({ biometricId: caller.employeeId }, { _id: 1 }).lean();
+    if (!me) return { biometricId: { $in: [] } };
+    return { primaryManager: me._id };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /cowork/sop/recheck/pending-list
-router.get("/recheck/pending-list", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+router.get("/recheck/pending-list", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
-        const { role, employeeId } = req.coworkUser;
-        let filter = {};
-        if (role === "tl") {
-            const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
-            if (me) filter.department = me.department;
-        }
+        const filter = (await _subjectFilterFor(req.coworkUser)) || {};
         const employees = await Employee.find(filter, { biometricId: 1, firstName: 1, lastName: 1, department: 1, sopPoints: 1 }).lean();
         const result = [];
         employees.forEach(emp => {
@@ -584,16 +803,11 @@ router.get("/recheck/pending-list", verifyCoworkToken, verifyCeoOrTL, async (req
 });
 
 // GET /cowork/sop/recheck/pending-count
-router.get("/recheck/pending-count", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+router.get("/recheck/pending-count", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
-        const { role, employeeId } = req.coworkUser;
-        let filter = {};
-
-        if (role === "tl") {
-            const me = await Employee.findOne({ biometricId: employeeId }, { department: 1 }).lean();
-            if (me) filter.department = me.department;
-        }
-
+        /* Same audience as the list above — the badge and the queue it opens
+           must never disagree about how many there are. */
+        const filter = (await _subjectFilterFor(req.coworkUser)) || {};
         const employees = await Employee.find(filter, { sopPoints: 1 }).lean();
         let count = 0;
         employees.forEach(emp => {
@@ -682,7 +896,10 @@ router.post("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEm
 });
 
 // PATCH /cowork/sop/bleach/:employeeId/:bleachId/recheck
-router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+/* `verifyEmployeeToken` rather than `verifyCeoOrTL`: `_mayDecideFor` below is
+   the real gate, and the role middleware in front of it turned away the exact
+   people it names — a primary manager who holds no lead title. */
+router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
         const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
         const { employeeId, bleachId } = req.params;
@@ -695,12 +912,16 @@ router.patch("/bleach/:employeeId/:bleachId/recheck", verifyCoworkToken, verifyC
         const employee = await Employee.findOne({ biometricId: employeeId });
         if (!employee) return res.status(404).json({ error: "Employee not found." });
 
-        if (role === "tl") {
-            const me = await Employee.findOne({ biometricId: reviewerId }, { department: 1 }).lean();
-            if (!me || me.department !== employee.department) {
-                return res.status(403).json({ error: "TL can only review rechecks of their own department." });
-            }
+        /* The same line that applies a rule decides a dispute about it — their
+           own primary manager, or an administrator. A department-wide gate let
+           somebody uninvolved settle an argument about a colleague's record. */
+        if (!(await _mayDecideFor(req.coworkUser, employeeId))) {
+            return res.status(403).json({
+                error: "Only their own primary manager, or an administrator, can decide this recheck.",
+            });
         }
+        void role;
+        void reviewerId;
 
         let found = false;
         let bleachPoints = 0;
