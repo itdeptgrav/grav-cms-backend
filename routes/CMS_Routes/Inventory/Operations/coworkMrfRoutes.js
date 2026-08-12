@@ -64,9 +64,16 @@ async function resolveEmployee(biometricId) {
 
 const MAX_IMAGES_PER_ITEM = 5
 
-// Product images arrive as already-uploaded Cloudinary results from the
-// client. Only the fields we render are kept — anything else the client sends
-// is dropped rather than persisted blindly.
+// Product images arrive as already-uploaded results from the client —
+// `publicId` from the old Cloudinary path, `fileId` from the Google Drive
+// path the Cowork uploader (components/features/mrf/MrfPhotoUploader.tsx)
+// uses now. Both are kept: `publicId` so an image attached before the switch
+// still round-trips unchanged, `fileId` because it is what lets the frontend
+// render a Drive image reliably (lh3 CDN, then the backend's own byte proxy)
+// instead of the bare `url` alone, which 404s on the CDN until Google indexes
+// a just-uploaded file and has no fallback when it does. Only the fields we
+// render are kept — anything else the client sends is dropped rather than
+// persisted blindly.
 function cleanImages(images) {
   if (!Array.isArray(images)) return []
   return images
@@ -75,6 +82,7 @@ function cleanImages(images) {
     .map(im => ({
       url: im.url.trim(),
       publicId: String(im.publicId || "").trim(),
+      fileId: String(im.fileId || "").trim(),
       name: String(im.name || "").trim().slice(0, 120),
     }))
 }
