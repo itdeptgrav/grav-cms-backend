@@ -2,6 +2,42 @@
 
 ---
 
+## Call recordings on the Sales customer record
+
+> **Synced phone-call recordings surface on the customer they belong to, matched
+> by phone number or by the name the call was saved under, with the audio and an
+> AI summary in place.** Both Sales customer surfaces get it: the CRM account
+> workspace and the portal-customer page. Nothing committed.
+
+### Backend (`grav-cms-backend`)
+
+| File | Purpose |
+|---|---|
+| `services/callRecordingMatch.service.js` | **New.** Pure matching helpers. `phoneKey` normalises any number to its last 10 digits (`+91 98765 43210`, `098765-43210`, `9876543210` → one key). `nameKey` lowercases, flattens punctuation and strips legal suffixes (`Mayfair Exports Pvt. Ltd.` → `mayfair exports`); org names additionally yield their leading brand word as a key when it is ≥5 chars, so a contact saved as "Mayfair Textiles" matches. Person names are whole-phrase only — "Rahul" is not an identity. `buildRecordingFilter` returns the Mongo `$or` (indexed `normalizedPhone` clause + a raw-`phoneNumber` digit-tail regex for un-backfilled rows + name regexes); `annotateMatches` applies the strict whole-word rule in memory and stamps each row `matchedBy: "phone" \| "name"`. |
+| `models/CallRecording.js` | Added `normalizedPhone` (maintained by a pre-save hook calling `phoneKey`) + index; added `aiSummary` / `aiSummaryModel` / `aiSummaryAt`, kept **separate** from the device's own `summary` so the two are never confused or overwritten. |
+| `services/callSummary.service.js` | **New.** Gemini (`gemini-flash-lite-latest`, matching `aiAssist.service.js`) turns a transcript into a short sales-readable summary — one opening line, "Discussed:" bullets, "Next step:". Returns a typed result, never throws for a provider failure; quota is reported distinctly from a connection failure. Deliberately does **not** transcribe audio: no transcript → it says so and stops. |
+| `routes/CMS_Routes/Sales/callRecordings.js` | **New**, `salesAuth` per handler. `GET /` (`?accountId=` or `?customerId=`) resolves the customer's numbers and names — for a CRM account that includes every contact person's `phone`/`mobile`/`whatsapp` — and returns matched recordings with `matchedBy`/`matchedOn`. `GET /:id/audio` proxies the Drive file so audio stays behind the Sales session (the uploader makes each file link-public; a raw Drive URL would be permanently replayable by anyone who saw it once). `POST /:id/summarize` generates and stores the AI summary, idempotent unless `force`. |
+| `server.js` | One mount at `/api/cms/crm/call-recordings`, **without** `salesWrites()` — nothing here creates a business record, and holding a "summarise" click for an approver would be nonsense. |
+| `backfill_call_recording_phones.js` | **New**, optional. Fills `normalizedPhone` on pre-existing rows. Idempotent; changes no results (the regex fallback already covers them), only the query plan. |
+
+The Android app's upload endpoint (`/api/recordings`, shared-API-key gated) is untouched.
+
+### Frontend (`grav-cms`)
+
+| File | Purpose |
+|---|---|
+| `components/sales/CallRecordingsPanel.js` | **New.** Self-fetching panel: call list (direction, time, duration, number), expandable row with audio, AI summary, the recorder app's own summary shown separately, collapsed transcript, and notes. A name match is always labelled "Name match" with the name it matched on — a fuzzy join is never presented as fact. Audio is fetched as a credentialed blob rather than set as an `<audio src>`, because a cross-origin `src` sends no cookies and would 401 silently in dev. |
+| `app/sales/dashboard/accounts/[id]/_sections/CallRecordingsSection.js` + `page.js` | New "Calls" tab in the account workspace, next to Activities. |
+| `app/sales/dashboard/customers/[id]/page.js` | New "Calls" tab; needs no `fetchTabData` branch since the panel fetches its own data. |
+
+### Verification
+
+- Matcher exercised directly against a fixture set: exact number in three formats → `phone`; "Mayfair Textiles" and `call_20250612_mayfair.m4a` → `name`; **"May Flower" and "Rahul Verma" correctly excluded**; empty identity → `null` filter (the caller returns no recordings rather than every call in the company).
+- All new/changed backend modules `require` cleanly; all changed frontend files parse.
+- **Not verified in a browser:** no logged-in Sales session or seeded recordings were available in this environment, so the rendered tabs, the audio proxy end-to-end, and a live Gemini summary have not been exercised.
+
+---
+
 ## Global GRAV Assistant — Chunk 2: global text overlay
 
 > **One GRAV assistant overlay, mounted once in the root shell, available on the

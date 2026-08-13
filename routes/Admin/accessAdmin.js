@@ -69,6 +69,66 @@ function audit(req, action, detail) {
 
 const fail = (res, code, message) => res.status(code).json({ success: false, message });
 
+/**
+ * Catch a near-duplicate department name before it becomes a live bug.
+ *
+ * This is the exact shape of a real incident: "Merchandiser" already existed
+ * (isSystem, the real `/merchandiser/dashboard`), an admin later typed
+ * "Merchantiser" — one letter off, an easy typo — as a brand-new department
+ * through this same form. The slug-collision check a few lines below did not
+ * catch it, because "merchantiser" and "merchandiser" are different slugs. The
+ * new department was created, looked plausible in every list, and an employee
+ * assigned to it got "Not your department" forever, because nothing routes to
+ * a hand-typed dashboard path that doesn't exist. The department page had no
+ * way to tell them the one they meant was already sitting right there.
+ *
+ * Levenshtein edit distance over the normalized (lowercase, non-alphanumeric
+ * stripped) name catches exactly this: a one- or two-character slip reads as
+ * "the same word", a genuinely different name does not. Two unrelated short
+ * words can occasionally land within the threshold by coincidence — that is
+ * why this WARNS (see `POSSIBLE_DUPLICATE` below) instead of refusing outright;
+ * an admin who really does mean two different departments confirms once and
+ * moves on.
+ */
+function normalizeDeptName(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j++) {
+      row[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1]
+        : 1 + Math.min(prev[j - 1], prev[j], row[j - 1]);
+    }
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+/** Existing active departments whose name is suspiciously close to `name`. */
+async function findSimilarDepartments(name) {
+  const target = normalizeDeptName(name);
+  if (target.length < 4) return []; // too short for edit-distance to mean anything
+  const existing = await AccessDepartment.find({ isActive: true }).select("name slug").lean();
+  return existing
+    .filter((d) => {
+      const other = normalizeDeptName(d.name);
+      if (!other) return false;
+      // Scales with length: a 1-character slip on a 12-letter word ("Merchantiser"
+      // vs "Merchandiser") should catch; two totally different 4-letter words
+      // should not just because 4 is a small number.
+      const threshold = Math.max(1, Math.floor(Math.max(target.length, other.length) * 0.2));
+      return levenshtein(target, other) <= threshold;
+    })
+    .map((d) => ({ name: d.name, slug: d.slug }));
+}
+
 /* ================================================================== */
 /* DEPARTMENTS                                                        */
 /* ================================================================== */
@@ -134,6 +194,24 @@ router.post("/departments", async (req, res) => {
 
     if (await AccessDepartment.exists({ $or: [{ key: finalKey }, { slug: finalSlug }] })) {
       return fail(res, 409, "A department with that key or slug already exists");
+    }
+
+    if (!req.body.confirmDuplicate) {
+      const similar = await findSimilarDepartments(name);
+      if (similar.length) {
+        return res.status(409).json({
+          success: false,
+          code: "POSSIBLE_DUPLICATE",
+          similar,
+          message:
+            similar.length === 1
+              ? `"${similar[0].name}" already exists and looks a lot like "${name}" — ` +
+                `probably the same department. Grant access to it instead, or confirm ` +
+                `to create "${name}" as a separate one anyway.`
+              : `These already exist and look a lot like "${name}": ` +
+                `${similar.map((s) => `"${s.name}"`).join(", ")}. Confirm to create it anyway.`,
+        });
+      }
     }
 
     const dept = await AccessDepartment.create({
@@ -594,11 +672,16 @@ router.patch("/employees/:id", async (req, res) => {
     // Assigning access has nothing to do with salary, so it should not be
     // running salary code at all.
     const employee = await Employee.findById(req.params.id)
-      .select("firstName lastName email accessDepartmentId")
+      .select("firstName lastName email accessDepartmentId additionalDepartmentIds")
+      .populate("accessDepartmentId", "name")
+      .populate("additionalDepartmentIds", "name")
       .lean();
     if (!employee) return fail(res, 404, "Employee not found");
 
     const { accessDepartmentId, additionalDepartmentIds } = req.body || {};
+    const displayName = employee.firstName || employee.email;
+    const oldPrimaryName = employee.accessDepartmentId?.name || null;
+    const oldExtraNames = (employee.additionalDepartmentIds || []).map((d) => d.name);
 
     // Extra departments, set independently of the primary. Sent as an array;
     // an empty array clears them.
@@ -611,7 +694,10 @@ router.patch("/employees/:id", async (req, res) => {
       // The primary is never duplicated into the extras — it is already granted.
       const extras = valid
         .map((d) => d._id)
-        .filter((id) => String(id) !== String(accessDepartmentId || employee.accessDepartmentId));
+        .filter((id) => String(id) !== String(accessDepartmentId || employee.accessDepartmentId?._id));
+      const extraNames = valid
+        .filter((d) => extras.some((id) => String(id) === String(d._id)))
+        .map((d) => d.name);
 
       await Employee.updateOne(
         { _id: employee._id },
@@ -619,6 +705,24 @@ router.patch("/employees/:id", async (req, res) => {
       );
 
       audit(req, "employee.extra-departments", `${employee.email} → ${extras.length} extra`);
+
+      // Who granted/revoked which "also" departments, and when — this is the
+      // record People & Roles' history panel reads. Kept on the employee's
+      // email as `entityId`, the same key department-role changes already use
+      // (see PUT /department-roles/:slug above), so a person's whole access
+      // history — primary, extras, and any module role — reads as one
+      // timeline instead of three that each need their own lookup.
+      await recordChange(req, {
+        entity: "employee-department-extra",
+        entityId: employee.email,
+        entityLabel: displayName,
+        action: "update",
+        summary: extraNames.length
+          ? `${displayName} also granted: ${extraNames.join(", ")}`
+          : `${displayName}'s extra departments cleared`,
+        before: { extra: oldExtraNames },
+        after: { extra: extraNames },
+      });
 
       if (accessDepartmentId === undefined) {
         return res.json({
@@ -641,6 +745,15 @@ router.patch("/employees/:id", async (req, res) => {
       );
 
       audit(req, "employee.assign", `${employee.email} → ${dept.name}`);
+      await recordChange(req, {
+        entity: "employee-department",
+        entityId: employee.email,
+        entityLabel: displayName,
+        action: "update",
+        summary: `${displayName}'s primary department set to ${dept.name}`,
+        before: { department: oldPrimaryName },
+        after: { department: dept.name },
+      });
       return res.json({
         success: true,
         message: `${employee.firstName || employee.email} can now sign in to ${dept.name}.`,
@@ -654,6 +767,15 @@ router.patch("/employees/:id", async (req, res) => {
     );
 
     audit(req, "employee.revoke", employee.email);
+    await recordChange(req, {
+      entity: "employee-department",
+      entityId: employee.email,
+      entityLabel: displayName,
+      action: "update",
+      summary: `${displayName}'s primary department removed`,
+      before: { department: oldPrimaryName },
+      after: { department: null },
+    });
     res.json({
       success: true,
       message:
