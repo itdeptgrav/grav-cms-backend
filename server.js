@@ -1149,6 +1149,12 @@ app.use("/api/cms/crm/account-relationships", salesWrites("account relationship"
 app.use("/api/cms/crm/account-team", salesWrites("account team"), require("./routes/CMS_Routes/Sales/accountTeam"));
 app.use("/api/cms/crm/activities", salesWrites("CRM activity"), require("./routes/CMS_Routes/Sales/activities"));
 app.use("/api/cms/crm/lookups", require("./routes/CMS_Routes/Sales/crmLookups"));
+// Call recordings, read-only for Sales (matched to a customer by phone/name).
+// No salesWrites() guard on purpose: nothing here creates a business record —
+// the only write is an AI summary annotation, which an approval queue would
+// only get in the way of. The Android app's upload endpoint stays separate at
+// /api/recordings.
+app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callRecordings"));
 
 // Sales Journey — the connected commercial lifecycle record (Account →
 // Retention). Same Sales role + approval guard as the rest of CRM: an editor's
