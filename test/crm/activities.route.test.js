@@ -163,3 +163,36 @@ describe("PATCH /activities/:id — Account-scoped, whitelist hardening", () => 
     expect(toLead.body.activity.accountId).toBe(acc._id.toString());
   });
 });
+
+describe("Journey tag — journeyRef/stage on an Account-owned activity", () => {
+  test("create accepts journeyRef + stage and stores them; the activity stays Account-owned", async () => {
+    const acc = await Account.create({ companyName: "Journey Tag Co" });
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: {
+        accountId: acc._id.toString(),
+        journeyRef: "SJ-2026-0004",
+        stage: "enquiry",
+        activityType: "call",
+        subject: "Discussed indicative pricing",
+      },
+    });
+    expect(status).toBe(201);
+    expect(body.activity.accountId).toBe(acc._id.toString());
+    expect(body.activity.journeyRef).toBe("SJ-2026-0004");
+    expect(body.activity.stage).toBe("enquiry");
+    expect(body.activity.leadId).toBeUndefined();
+  });
+
+  test("GET ?journeyRef= returns only that journey's activities, not the Account's others", async () => {
+    const acc = await Account.create({ companyName: "Two Journeys Co" });
+    await call("/", { method: "POST", body: { accountId: acc._id.toString(), journeyRef: "SJ-2026-0004", stage: "account", activityType: "note", subject: "For A" } });
+    await call("/", { method: "POST", body: { accountId: acc._id.toString(), journeyRef: "SJ-2026-0009", stage: "account", activityType: "note", subject: "For B" } });
+    await call("/", { method: "POST", body: { accountId: acc._id.toString(), activityType: "note", subject: "Untagged" } });
+
+    const onlyA = await call(`/?accountId=${acc._id.toString()}&journeyRef=SJ-2026-0004`);
+    expect(onlyA.status).toBe(200);
+    const subjects = onlyA.body.activities.map((a) => a.subject);
+    expect(subjects).toEqual(["For A"]);
+  });
+});
