@@ -30,13 +30,24 @@ const svc = require("../../services/coworkAttachment.service");
 
 const router = express.Router();
 
-/* In memory, nothing touches disk. The cap is enforced twice — here, so a
-   large body is rejected before it is buffered, and again in the service,
-   which is the boundary a non-HTTP caller would cross. */
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: svc.MAX_BYTES },
-});
+/**
+ * In memory, nothing touches disk. **No size cap** — withdrawn on the owner's
+ * instruction; `svc.MAX_BYTES` is null and the service's own check is disabled
+ * with it, so a limit here would be the only one left and would contradict it.
+ *
+ * `limits` is omitted entirely rather than set to `Infinity`: multer treats a
+ * missing key as no limit, and a numeric Infinity is the kind of value that
+ * reads as a bug to whoever finds it next.
+ *
+ * **What this does not remove.** `memoryStorage` holds the whole file in the
+ * Node process's RAM until it has been forwarded to Drive, so a very large
+ * upload is bounded by the server's memory rather than by any rule — and this
+ * process serves the whole CMS, not only Cowork. If files big enough to matter
+ * start arriving, the fix is the resumable direct-to-Drive path that
+ * `mediaUpload.js` already implements (the browser uploads straight to Google
+ * and the backend never sees the bytes), not a cap put back here.
+ */
+const upload = multer({ storage: multer.memoryStorage() });
 
 /**
  * Which task an attachment hangs off, whatever it is attached to.
