@@ -2034,16 +2034,23 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
     // Office-hours-aware dueDate — consumes only WORKING time (skips off
     // days and breaks) instead of raw wall-clock addition, so a 4h task
     // approved at 5:15pm doesn't land due 9:15pm the same night.
+    //
+    // Anchored by the owner's rule, not at the press: the clock starts when
+    // the assignee first came online at/after the task was given (cross-dept:
+    // when the hours were granted). Same resolver as the budget-negotiation
+    // accept, so both accept surfaces produce one deadline for one task.
+    const { resolveAcceptanceAnchor } = require("../../services/officeDeadline.service");
+    const anchor = await resolveAcceptanceAnchor(task);
     let dueDate;
     try {
       const officeSnap = await db.collection("cowork_settings").doc("office").get();
       const _sched = officeSnap.exists ? officeSnap.data().schedule : null;
       const _brks = officeSnap.exists ? (officeSnap.data().breaks || []) : [];
       console.log("[approve-sender-timer] office doc exists:", officeSnap.exists, "| schedule days:", _sched ? Object.keys(_sched).length : 0);
-      dueDate = _addWorkingSecsIST(Date.now(), approvedSecs, _sched, _brks);
+      dueDate = _addWorkingSecsIST(anchor.anchorMs, approvedSecs, _sched, _brks);
     } catch (e) {
       console.error("[approve-sender-timer OFFICE CALC FAILED]", e.message);
-      dueDate = new Date(Date.now() + approvedSecs * 1000 + 6 * 3600000).toISOString(); // BRANDED PROBE: +6h marks this exact fallback
+      dueDate = new Date(anchor.anchorMs + approvedSecs * 1000 + 6 * 3600000).toISOString(); // BRANDED PROBE: +6h marks this exact fallback
     }
 
     await taskRef.update({
@@ -2051,6 +2058,8 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
       deadlineWindowSecs: approvedSecs,
       originalWindowSecs: approvedSecs,
       dueDate,
+      clockStartsAtMs: anchor.anchorMs,
+      clockStartsAtSource: anchor.source,
       senderTimerApprovedBy: employeeId,
       senderTimerApprovedByName: employeeName,
       senderTimerApprovedAt: admin.firestore.FieldValue.serverTimestamp(),

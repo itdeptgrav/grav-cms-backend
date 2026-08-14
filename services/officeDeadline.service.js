@@ -133,9 +133,110 @@ function readMs(value) {
   return null;
 }
 
+/**
+ * Where a task's clock starts when its budget is accepted.
+ *
+ * **The owner's rule: whoever causes the delay bears it** (DEADLINE_START_RULE
+ * in the Cowork repo). Three cases, in order:
+ *
+ *  · `hours_granted` — a cross-department grant recorded `tlHoursSetAt*`. The
+ *    assignee could do nothing before the grant, so the wait was never theirs.
+ *  · `first_online` — a normal task. The assignee had the task and its proposed
+ *    hours the whole time, so the clock runs from the first PROVABLE moment
+ *    they were online at or after it was given: their current duty session's
+ *    start, floored at the task's creation. Sitting on an acceptance while
+ *    online no longer buys a later deadline — T019 was given at 10:41:54,
+ *    its assignee online from 10:56:20, accepted 12:01:42, and the old
+ *    acceptance anchor handed the 1h05m of sitting back as extra deadline.
+ *  · `acceptance` — nothing provable. Not online now, or the current session
+ *    began after the moment being asked about. The press itself is the first
+ *    moment presence can be demonstrated, so it is the honest floor — and it
+ *    is exactly the old behaviour, so nothing here ever produces a LATER
+ *    deadline than before.
+ *
+ * Pure and clock-free so the rule is testable; `nowMs` is the acceptance
+ * instant. Passing a PAST acceptance replays the rule as it stood then: the
+ * session-start guard `<= nowMs` then also proves the session spanned that
+ * acceptance, which is what makes the same function serve the backfill.
+ *
+ * The result may lie in the past and the deadline it produces may already be
+ * gone. That is the rule working — the task is simply Overdue — and the owner
+ * has said so explicitly. Never clamp it to now.
+ */
+function acceptanceAnchorMs({
+  tlHoursSetMs,
+  createdMs,
+  dutyMode,
+  dutySessionStartMs,
+  nowMs,
+}) {
+  if (Number.isFinite(tlHoursSetMs) && tlHoursSetMs > 0) {
+    return { anchorMs: tlHoursSetMs, source: "hours_granted" };
+  }
+  if (
+    dutyMode === "online" &&
+    Number.isFinite(dutySessionStartMs) &&
+    dutySessionStartMs > 0 &&
+    dutySessionStartMs <= nowMs &&
+    Number.isFinite(createdMs) &&
+    createdMs > 0
+  ) {
+    /* Online since before the task existed → the clock starts with the task;
+       came online after it was given → starts when they arrived. */
+    return { anchorMs: Math.max(createdMs, dutySessionStartMs), source: "first_online" };
+  }
+  return { anchorMs: nowMs, source: "acceptance" };
+}
+
+/**
+ * The anchor for one task, from live data. Read OUTSIDE any transaction.
+ *
+ * Reads the ASSIGNEE's duty document — never the caller's: an assignor
+ * accepting the assignee's counter still starts the assignee's clock.
+ */
+async function resolveAcceptanceAnchor(task, nowMs = Date.now()) {
+  const tlHoursSetMs = readMs(task.tlHoursSetAtMs) ?? readMs(task.tlHoursSetAt);
+  const createdMs = readMs(task.createdAtISO) ?? readMs(task.createdAt);
+  const assignee = (task.assigneeIds || [])[0] || null;
+
+  let dutyMode = null;
+  let dutySessionStartMs = null;
+  if (assignee && !Number.isFinite(tlHoursSetMs)) {
+    try {
+      const { db } = require("../config/firebaseAdmin");
+      const snap = await db
+        .collection("cowork_duty_status")
+        .doc(String(assignee))
+        .get();
+      if (snap.exists) {
+        const d = snap.data();
+        dutyMode = d.mode ?? null;
+        /* `updatedAt` is written only on a mode change, so while the mode is
+           online it IS the session start — the same reading the Cowork
+           frontend's `queueAnchorMs` uses. */
+        dutySessionStartMs = readMs(d.updatedAt);
+      }
+    } catch (e) {
+      /* An unreadable duty doc costs the first_online refinement, never the
+         acceptance. */
+      console.warn("[officeDeadline] duty read failed:", e.message);
+    }
+  }
+
+  return acceptanceAnchorMs({
+    tlHoursSetMs,
+    createdMs,
+    dutyMode,
+    dutySessionStartMs,
+    nowMs,
+  });
+}
+
 module.exports = {
   addWorkingSecsIST,
   readOfficeCalendar,
   computeWorkingDeadline,
   readMs,
+  acceptanceAnchorMs,
+  resolveAcceptanceAnchor,
 };

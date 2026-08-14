@@ -34,6 +34,7 @@ const {
   addWorkingSecsIST,
   readOfficeCalendar,
   readMs,
+  resolveAcceptanceAnchor,
 } = require("./officeDeadline.service");
 const { resolvePrimaryManagerApprover } = require("./primaryManager.service");
 
@@ -331,6 +332,17 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
      so acceptance has to admit them too — otherwise the turn handed to them by
      a counter is one they would be refused on. */
   const pre = await approverPreread(ref);
+  /* The clock's start, resolved out here for the same reason as the calendar:
+     it reads the assignee's duty document, and a transaction must finish its
+     reads before its first write. Keyed to the assignee it was resolved for so
+     a reassignment between this read and the write is noticed, not inherited. */
+  const preSnap = await ref.get();
+  const preAnchor = preSnap.exists
+    ? {
+        forAssignee: partiesOf(preSnap.data()).assignee,
+        ...(await resolveAcceptanceAnchor(preSnap.data())),
+      }
+    : null;
 
   return firestore().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -374,12 +386,23 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
      * they were given by exactly how long the two sides took to agree. Only the
      * DURATION changes when the budget does.
      *
-     * No recorded anchor means this task never went through the
-     * cross-department grant, and acceptance itself is when the work becomes
-     * real — which is what the other approve paths already use.
+     * No recorded grant means this is a NORMAL task, and there the owner's
+     * rule is: the clock starts when the assignee first came online at or
+     * after the task was given — never at acceptance, which rewarded sitting
+     * on a task with a later deadline (see `acceptanceAnchorMs`). The
+     * pre-read is trusted only if the task still belongs to the assignee it
+     * was resolved for; otherwise the acceptance moment is the honest floor.
      */
-    const anchorMs =
-      readMs(task.tlHoursSetAtMs) ?? readMs(task.tlHoursSetAt) ?? Date.now();
+    const grantMs =
+      readMs(task.tlHoursSetAtMs) ?? readMs(task.tlHoursSetAt);
+    const normalAnchor =
+      preAnchor &&
+      String(partiesOf(task).assignee || "") ===
+        String(preAnchor.forAssignee || "")
+        ? preAnchor
+        : { anchorMs: Date.now(), source: "acceptance" };
+    const anchorMs = grantMs ?? normalAnchor.anchorMs;
+    const anchorSource = grantMs ? "hours_granted" : normalAnchor.source;
     const dueDate = addWorkingSecsIST(
       anchorMs,
       secs,
@@ -410,6 +433,12 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
          hour to two went on being scored at half its true size. */
       etcHours: secs / 3600,
       dueDate,
+      /* The clock's start, stamped ONCE and kept. Presence history does not
+         exist, so an anchor recomputed later would silently move with the
+         assignee's next session — a deadline must be re-derivable from the
+         record that set it. `source` names which branch of the rule fired. */
+      clockStartsAtMs: anchorMs,
+      clockStartsAtSource: anchorSource,
       /* A leftover `fixedDeadline` from the sender's create outranks `dueDate`
          in the read precedence, so leaving it would discard everything above. */
       fixedDeadline: null,
