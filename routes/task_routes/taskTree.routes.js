@@ -14,6 +14,7 @@ const express = require("express");
 const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 const svc = require("../../services/taskForward.service");
+const { isTaskHead } = require("./_taskHead");
 const { db, admin } = require("../../config/firebaseAdmin");
 const { v4: _nuuid } = require("uuid");
 const _socket = require("../../config/socketInstance");
@@ -987,7 +988,12 @@ router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, asyn
     try {
         const { reworkReason, waiveDeduction } = req.body;
         const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
-        if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can rework tasks." });
+        // The person who ASSIGNED this task may send it back. Was a role-string
+        // test, which refused a primary manager on work they created — see
+        // _taskHead.js. Kept identical to the copy in taskForward.js.
+        if (!(await isTaskHead(req.params.taskId, reviewerId, role))) {
+            return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can send it back for rework." });
+        }
         const result = await svc.reworkTask({
             taskId: req.params.taskId,
             reviewerId, reviewerName,
@@ -1008,7 +1014,10 @@ router.post("/task/:taskId/extension-deduction", verifyCoworkToken, verifyEmploy
     try {
         let { waiveDeduction, newDeadline } = req.body; // ← const → let
         const { role } = req.coworkUser;
-        if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can set deduction." });
+        // Part of the same review as rework, so gated the same way.
+        if (!(await isTaskHead(req.params.taskId, req.coworkUser.employeeId, role))) {
+            return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can set the deduction." });
+        }
 
         const { db: _db, admin: _admin } = require("../../config/firebaseAdmin");
         const ref = _db.collection("cowork_tasks").doc(req.params.taskId);
@@ -1481,7 +1490,11 @@ router.post("/task/:taskId/review-deadline-extension", verifyCoworkToken, verify
 
         const { db, admin } = require("../../config/firebaseAdmin");
         const { role } = req.coworkUser;
-        if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO/TL can review extensions" });
+        // An extension moves a date the ASSIGNER committed to, so the assigner
+        // decides it. Same rule as rework and deduction.
+        if (!(await isTaskHead(taskId, req.coworkUser.employeeId, role))) {
+            return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can review extensions" });
+        }
 
         const taskRef = db.collection("cowork_tasks").doc(taskId);
         const snap = await taskRef.get();
@@ -1602,7 +1615,7 @@ router.post("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeTo
         const canEdit =
             task.assigneeIds?.includes(employeeId) ||
             task.assignedBy === employeeId ||
-            (task.confirmedBy || []).includes(employeeId) ||
+            task.originalAssignedBy === employeeId ||
             ["ceo", "tl"].includes(role);
         if (!canEdit) return res.status(403).json({ error: "Not allowed" });
 

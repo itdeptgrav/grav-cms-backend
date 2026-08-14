@@ -1242,9 +1242,13 @@ router.post("/goal-credit", verifyCoworkToken, verifyEmployeeToken, async (req, 
                 return res.status(404).json({ error: "Task not found" });
             }
             const t = taskSnap.data();
+            /* `assignedBy` only. NOT `confirmedBy` — that is written as
+               `arrayUnion(assigneeIds[0])`, so it holds the ASSIGNEE, and
+               counting it here would let somebody approve and credit their own
+               goal steps. See routes/task_routes/_taskHead.js. */
             const isHead =
                 t.assignedBy === awardedById ||
-                (t.confirmedBy || []).includes(awardedById);
+                t.originalAssignedBy === awardedById;
             if (!isHead) {
                 return res.status(403).json({ error: "Only this goal's head can approve its steps." });
             }
