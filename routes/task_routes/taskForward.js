@@ -16,6 +16,7 @@ const { getTaskReviewOwner } = require("../../services/taskReviewOwner.service")
 const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 const svc = require("../../services/taskForward.service");
+const { isTaskHead } = require("./_taskHead");
 const { db, admin } = require("../../config/firebaseAdmin");
 const { v4: _nuuid } = require("uuid");
 const _socket = require("../../config/socketInstance");
@@ -1825,7 +1826,14 @@ router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, asyn
   try {
     const { reworkReason, waiveDeduction, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
-    if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can rework tasks." });
+    // The person who ASSIGNED this task may send it back. Was `role ===
+    // "employee"` → refuse, which asked about a role string rather than about
+    // this task: a primary manager carries `role: "employee"` here, so the
+    // person who created and assigned the work could APPROVE a submission but
+    // not send it back — the two halves of one decision, split apart.
+    if (!(await isTaskHead(req.params.taskId, reviewerId, role))) {
+      return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can send it back for rework." });
+    }
     const result = await svc.reworkTask({
       taskId: req.params.taskId,
       reviewerId, reviewerName,
@@ -1847,8 +1855,13 @@ router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, asyn
 router.post("/task/:taskId/extension-deduction", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     let { waiveDeduction, newDeadline } = req.body; // ← const → let
-    const { role } = req.coworkUser;
-    if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can set deduction." });
+    const { role, employeeId } = req.coworkUser;
+    // Same rule as rework: this task's assigner, or a TL/CEO. Waiving is part
+    // of the same review, so it must not be gated more tightly than the
+    // decision it belongs to.
+    if (!(await isTaskHead(req.params.taskId, employeeId, role))) {
+      return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can set the deduction." });
+    }
 
     const { db: _db, admin: _admin } = require("../../config/firebaseAdmin");
     const ref = _db.collection("cowork_tasks").doc(req.params.taskId);
@@ -2357,8 +2370,13 @@ router.post("/task/:taskId/review-deadline-extension", verifyCoworkToken, verify
       return res.status(400).json({ error: "newDate required for approve/counter" });
 
     const { db, admin } = require("../../config/firebaseAdmin");
-    const { role } = req.coworkUser;
-    if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO/TL can review extensions" });
+    const { role, employeeId } = req.coworkUser;
+    // An extension moves a date the ASSIGNER committed to, so the assigner is
+    // exactly who should decide it — not whoever happens to hold a "tl" role
+    // string. Same rule as rework and deduction.
+    if (!(await isTaskHead(taskId, employeeId, role))) {
+      return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can review extensions" });
+    }
 
     const taskRef = db.collection("cowork_tasks").doc(taskId);
     const snap = await taskRef.get();
@@ -2481,7 +2499,7 @@ router.post("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeTo
     const canEdit =
         task.assigneeIds?.includes(employeeId) ||
         task.assignedBy === employeeId ||
-        (task.confirmedBy || []).includes(employeeId) ||
+        task.originalAssignedBy === employeeId ||
         ["ceo", "tl"].includes(role);
     if (!canEdit) return res.status(403).json({ error: "Not allowed" });
 
@@ -2597,7 +2615,7 @@ router.post("/task/:taskId/goal-activity/:activityId/request-report", verifyCowo
     const canRequest =
       ["ceo", "tl"].includes(role) ||
       task.assignedBy === employeeId ||
-      (task.confirmedBy || []).includes(employeeId);
+      task.originalAssignedBy === employeeId;
     if (!canRequest) return res.status(403).json({ error: "Only this goal's head can request a report" });
 
     const activities = task.goalActivities || [];
