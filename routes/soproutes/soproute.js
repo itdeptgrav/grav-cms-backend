@@ -63,11 +63,24 @@ async function _notify({ recipientIds, type, title, body, data, senderId, sender
     } catch (e) { console.error("[sop _notify]", e.message); }
 }
 
-/** The primary manager's biometricId, for routing a dispute upward. */
+/**
+ * The primary manager's biometricId, for routing a dispute upward.
+ *
+ * **`primaryManager` is a SUB-DOCUMENT, not an id.** The schema is
+ * `{ managerId, managerName }` (`models/Employee.js`), and every other route in
+ * this codebase reads `primaryManager.managerId` — `employeeAuth.js:396`,
+ * `leaveRoutes.js:411`. These C3 helpers read the object itself, which made
+ * `findById` look up nothing and `countDocuments` match nothing.
+ *
+ * That one mistake broke all four C3 acts: nobody could write a rule (the
+ * manager test was always false), a written rule had no named approver, nobody
+ * could approve or apply one, and the disputes queue was always empty.
+ */
 async function _managerIdOf(employee) {
     try {
-        if (!employee?.primaryManager) return null;
-        const mgr = await Employee.findById(employee.primaryManager, { biometricId: 1 }).lean();
+        const managerId = employee?.primaryManager?.managerId;
+        if (!managerId) return null;
+        const mgr = await Employee.findById(managerId, { biometricId: 1 }).lean();
         return mgr?.biometricId || null;
     } catch (_) { return null; }
 }
@@ -114,7 +127,13 @@ async function _isManager(biometricId) {
     if (!biometricId) return false;
     const me = await Employee.findOne({ biometricId }, { _id: 1 }).lean();
     if (!me) return false;
-    return (await Employee.countDocuments({ primaryManager: me._id })) > 0;
+    /* `primaryManager.managerId`, not `primaryManager` — see `_managerIdOf`.
+       Matching the sub-document against an ObjectId found nobody, so this
+       answered false for every manager in the company and only the CEO and
+       administrators could write a conduct rule. */
+    return (
+        (await Employee.countDocuments({ "primaryManager.managerId": me._id })) > 0
+    );
 }
 
 /** What a breach costs, preferring the percentage over the legacy point count. */
@@ -766,7 +785,9 @@ async function _subjectFilterFor(caller) {
     if (caller.role === "ceo" || caller.role === "admin") return null;
     const me = await Employee.findOne({ biometricId: caller.employeeId }, { _id: 1 }).lean();
     if (!me) return { biometricId: { $in: [] } };
-    return { primaryManager: me._id };
+    /* The sub-document's id — see `_managerIdOf`. Matching `primaryManager`
+       itself found nobody, so a manager's disputes queue was always empty. */
+    return { "primaryManager.managerId": me._id };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1181,7 +1202,16 @@ router.get("/task-suggestions", verifyCoworkToken, verifyCeoOrTL, async (req, re
 //
 // The credit entry is stored in bleaches with isCredit:true for history display.
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+// Was `verifyCeoOrTL`, which refused anyone whose stored role is not literally
+// "ceo" or "tl". The person who approves a goal step is the head OF THAT GOAL —
+// the one who assigned it — and a manager here is a reporting relationship, not
+// a role string: `role: "employee"` is what an ordinary primary manager carries.
+// So a manager was refused on a step of a goal they had assigned themselves.
+//
+// The middleware is shared by many other SOP routes and is deliberately NOT
+// changed. The check moves into the handler instead, where the task is in hand
+// and the real question — "are you this goal's head?" — can actually be asked.
+router.post("/goal-credit", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
     try {
         const { role, employeeId: awardedById, name: awardedByName } = req.coworkUser;
         const {
@@ -1197,6 +1227,27 @@ router.post("/goal-credit", verifyCoworkToken, verifyCeoOrTL, async (req, res) =
 
         if (!targetEmployeeId) {
             return res.status(400).json({ error: "targetEmployeeId is required." });
+        }
+
+        // ── Who may credit this step ──────────────────────────────────────────
+        // The goal's own head, or a CEO/TL. Read from the task rather than from
+        // the caller's role, so the answer is about THIS goal.
+        if (!["ceo", "tl"].includes(role)) {
+            if (!taskId) {
+                return res.status(403).json({ error: "Only this goal's head can approve its steps." });
+            }
+            const { db: _db } = require("../../config/firebaseAdmin");
+            const taskSnap = await _db.collection("cowork_tasks").doc(String(taskId)).get();
+            if (!taskSnap.exists) {
+                return res.status(404).json({ error: "Task not found" });
+            }
+            const t = taskSnap.data();
+            const isHead =
+                t.assignedBy === awardedById ||
+                (t.confirmedBy || []).includes(awardedById);
+            if (!isHead) {
+                return res.status(403).json({ error: "Only this goal's head can approve its steps." });
+            }
         }
         if (!points || Number(points) <= 0) {
             return res.status(400).json({ error: "points must be > 0." });
