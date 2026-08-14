@@ -1591,8 +1591,19 @@ router.post("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeTo
         const task = snap.data();
         if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
 
-        // Only assignee can save activities
-        const canEdit = task.assigneeIds?.includes(employeeId) || ["ceo", "tl"].includes(role);
+        // Who may save the roadmap: an assignee, the person who ASSIGNED the
+        // goal, anyone who confirmed it, or a CEO/TL. Kept identical to the copy
+        // in taskForward.js — two routes answer this path and they must agree.
+        //
+        // `assignedBy` was missing and that was the bug. The roadmap is built by
+        // the head of the goal, but the only head this recognised was the ROLE
+        // STRING "tl"/"ceo"; a manager stored as "employee" was refused on a
+        // goal they created themselves. Widened, not replaced.
+        const canEdit =
+            task.assigneeIds?.includes(employeeId) ||
+            task.assignedBy === employeeId ||
+            (task.confirmedBy || []).includes(employeeId) ||
+            ["ceo", "tl"].includes(role);
         if (!canEdit) return res.status(403).json({ error: "Not allowed" });
 
         if (!Array.isArray(activities)) return res.status(400).json({ error: "activities must be an array" });
