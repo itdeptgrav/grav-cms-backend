@@ -13,8 +13,24 @@
 const COWORK_FOLDER_NAME = "Cowork Attachments";
 const COLLECTION = "cowork_attachments";
 
-/** 50 MB. Matches the voucher service's multer cap. */
-const MAX_BYTES = 50 * 1024 * 1024;
+/**
+ * No size cap on a Cowork attachment — removed on the owner's instruction.
+ *
+ * It was 50 MB, matching the voucher service's multer cap. Nothing about the
+ * STORAGE required it: these go to Google Drive through a service account, and
+ * Drive takes files far larger than this ever allowed. The cap was a policy
+ * choice and the owner has withdrawn it.
+ *
+ * `null` rather than `Infinity` or a very large number, so a caller that
+ * forgets to handle "no cap" fails loudly on a null comparison instead of
+ * silently enforcing a limit nobody chose.
+ *
+ * **What still bounds an upload, and is not this file's to change:** the route
+ * uses `multer.memoryStorage()`, so the whole file is held in the Node
+ * process's RAM while it is being forwarded to Drive. That is a property of
+ * the transport, not a rule — see the note in `coworkAttachments.js`.
+ */
+const MAX_BYTES = null;
 
 /**
  * What may be stored, keyed by the type read from the FILE'S OWN BYTES.
