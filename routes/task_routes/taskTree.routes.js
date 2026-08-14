@@ -1411,6 +1411,25 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
         const { proposedDate, reason } = req.body;
         if (!proposedDate) return res.status(400).json({ error: "proposedDate required" });
 
+        // ── How much time is being ASKED FOR, in seconds ──────────────────────
+        // Ported from the copy in taskForward.js, which had it and this one did
+        // not. Both files register `/cowork` and taskForward wins on mount
+        // order, so this route is dormant — until somebody reorders the mounts,
+        // at which point every extension silently loses its amounts again.
+        //
+        // The record used to carry only a date. That is enough to move a
+        // deadline and useless for answering "how much longer did they ask
+        // for?" — the amount can only be recovered by differencing against the
+        // window in force, and approving the request overwrites exactly that.
+        //
+        // Stored at REQUEST time and never recomputed: previous + added = total,
+        // all three, so a granted extension still says what it added years
+        // later. Optional, so an older client that sends only a date works.
+        const _num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
+        const previousWindowSecs = _num(req.body.previousWindowSecs);
+        const addedSecs = _num(req.body.addedSecs);
+        const proposedWindowSecs = _num(req.body.proposedWindowSecs) || (previousWindowSecs + addedSecs);
+
         const { db, admin } = require("../../config/firebaseAdmin");
         const taskRef = db.collection("cowork_tasks").doc(taskId);
         const snap = await taskRef.get();
@@ -1449,6 +1468,11 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
         await taskRef.update({
             deadlineExtRequest: {
                 proposedDate,
+                // The three figures, so the amount survives approval overwriting
+                // the window it was measured against.
+                previousWindowSecs,
+                addedSecs,
+                proposedWindowSecs,
                 reason: reason || "",
                 requestedBy: req.coworkUser.employeeId,
                 requestedByName: req.coworkUser.name,
