@@ -90,6 +90,15 @@ const employeeSchema = new mongoose.Schema({
   identityId: { type: String, sparse: true },
   needsToOperate: { type: Boolean, default: false },
 
+  // The explicit link to a Firestore cowork_employees doc, set by an admin
+  // on the access page (or opportunistically when one is found by matching
+  // email). NOT assumed equal to biometricId or email — CoWork accounts
+  // created before this link existed carry whatever id/email they were
+  // given at the time, which routinely differs from the HR record's own.
+  // See routes/auth/deptAuth.js's /cowork-sso route, the one place this is
+  // read to decide who somebody signs in to CoWork as.
+  coworkEmployeeId: { type: String, trim: true },
+
   department: { type: String },
   departmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Department" },
 

@@ -15,12 +15,23 @@ const returnEntrySchema = new mongoose.Schema(
 );
 
 // ── Product image attached by the requester ──────────────────────────────────
-// Uploaded to Cloudinary from the cowork side before the MRF is submitted, so
-// the TL and the Store Person both see exactly which product is being asked for.
+// Uploaded from the cowork side before the MRF is submitted, so the TL and the
+// Store Person both see exactly which product is being asked for.
+//
+// `publicId` (Cloudinary) and `fileId` (Google Drive) are both kept, not one
+// replacing the other: the cowork uploader moved from Cloudinary to Drive
+// (components/features/mrf/MrfPhotoUploader.tsx), so an MRF raised before that
+// switch still carries `publicId` and one raised after carries `fileId` —
+// dropping the field this schema didn't yet have would have silently thrown
+// away every new upload's ability to render reliably. Without `fileId`
+// specifically, a freshly uploaded photo has only its bare `url` to render
+// from, which 404s until Google's CDN indexes the file and has no fallback —
+// exactly the "uploaded image is not showing" bug this was added to fix.
 const productImageSchema = new mongoose.Schema(
   {
     url: { type: String, trim: true, required: true },
     publicId: { type: String, trim: true, default: "" },
+    fileId: { type: String, trim: true, default: "" },
     name: { type: String, trim: true, default: "" },
   },
   { _id: false }

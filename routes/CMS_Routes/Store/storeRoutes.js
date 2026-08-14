@@ -73,10 +73,29 @@ router.get("/order-requests", async (req, res) => {
 
     const statsMap = new Map(woStats.map((s) => [s._id.toString(), s]));
 
+    // ── Aggregate raw-material issuance per PO ──
+    // What the store list actually needs to answer is "has anything been
+    // handed out for this order yet", not the work-order verification count
+    // (that lives on the detail page's own Work Orders tab already). A debit
+    // StockIssuance is a real material handover; credits (returns) don't
+    // count as "issued".
+    const issuanceStats = await StockIssuance.aggregate([
+      { $match: { manufacturingOrder: { $in: requestIds }, direction: "debit" } },
+      {
+        $group: {
+          _id: "$manufacturingOrder",
+          issuanceCount: { $sum: 1 },
+          issuedLineCount: { $sum: { $size: "$items" } },
+        },
+      },
+    ]);
+    const issuanceMap = new Map(issuanceStats.map((s) => [s._id.toString(), s]));
+
     // ── Enrich + filter ──
     let enriched = requests.map((r) => {
       const s = statsMap.get(r._id.toString()) || { totalWOs: 0, verifiedWOs: 0, totalQty: 0 };
       const isFullyVerified = s.totalWOs > 0 && s.verifiedWOs === s.totalWOs;
+      const iss = issuanceMap.get(r._id.toString()) || { issuanceCount: 0, issuedLineCount: 0 };
       return {
         _id: r._id,
         requestId: r.requestId,
@@ -95,6 +114,9 @@ router.get("/order-requests", async (req, res) => {
         verificationProgress:
           s.totalWOs > 0 ? Math.round((s.verifiedWOs / s.totalWOs) * 100) : 0,
         isFullyVerified,
+        hasIssuance: iss.issuanceCount > 0,
+        issuanceCount: iss.issuanceCount,
+        issuedLineCount: iss.issuedLineCount,
         pmApproved: !!r.pmApproved,
         pmRejected: !!r.pmRejected,
         pmRejectionNote: r.pmRejectionNote || "",

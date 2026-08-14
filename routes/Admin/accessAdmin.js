@@ -38,7 +38,7 @@ const SLUG_RE = /^[a-z0-9-]+$/;
 const EDITABLE = [
   "name", "description", "iconUrl", "iconAlt", "accentColor",
   "dashboardPath", "loginRedirect", "showOnOnboarding", "sortOrder",
-  "capabilities", "isActive",
+  "capabilities", "isActive", "externalBaseUrl",
 ];
 
 /** Additionally editable, but only on departments this system did not seed. */
@@ -68,6 +68,66 @@ function audit(req, action, detail) {
 }
 
 const fail = (res, code, message) => res.status(code).json({ success: false, message });
+
+/**
+ * Catch a near-duplicate department name before it becomes a live bug.
+ *
+ * This is the exact shape of a real incident: "Merchandiser" already existed
+ * (isSystem, the real `/merchandiser/dashboard`), an admin later typed
+ * "Merchantiser" — one letter off, an easy typo — as a brand-new department
+ * through this same form. The slug-collision check a few lines below did not
+ * catch it, because "merchantiser" and "merchandiser" are different slugs. The
+ * new department was created, looked plausible in every list, and an employee
+ * assigned to it got "Not your department" forever, because nothing routes to
+ * a hand-typed dashboard path that doesn't exist. The department page had no
+ * way to tell them the one they meant was already sitting right there.
+ *
+ * Levenshtein edit distance over the normalized (lowercase, non-alphanumeric
+ * stripped) name catches exactly this: a one- or two-character slip reads as
+ * "the same word", a genuinely different name does not. Two unrelated short
+ * words can occasionally land within the threshold by coincidence — that is
+ * why this WARNS (see `POSSIBLE_DUPLICATE` below) instead of refusing outright;
+ * an admin who really does mean two different departments confirms once and
+ * moves on.
+ */
+function normalizeDeptName(name) {
+  return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j++) {
+      row[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1]
+        : 1 + Math.min(prev[j - 1], prev[j], row[j - 1]);
+    }
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+/** Existing active departments whose name is suspiciously close to `name`. */
+async function findSimilarDepartments(name) {
+  const target = normalizeDeptName(name);
+  if (target.length < 4) return []; // too short for edit-distance to mean anything
+  const existing = await AccessDepartment.find({ isActive: true }).select("name slug").lean();
+  return existing
+    .filter((d) => {
+      const other = normalizeDeptName(d.name);
+      if (!other) return false;
+      // Scales with length: a 1-character slip on a 12-letter word ("Merchantiser"
+      // vs "Merchandiser") should catch; two totally different 4-letter words
+      // should not just because 4 is a small number.
+      const threshold = Math.max(1, Math.floor(Math.max(target.length, other.length) * 0.2));
+      return levenshtein(target, other) <= threshold;
+    })
+    .map((d) => ({ name: d.name, slug: d.slug }));
+}
 
 /* ================================================================== */
 /* DEPARTMENTS                                                        */
@@ -134,6 +194,24 @@ router.post("/departments", async (req, res) => {
 
     if (await AccessDepartment.exists({ $or: [{ key: finalKey }, { slug: finalSlug }] })) {
       return fail(res, 409, "A department with that key or slug already exists");
+    }
+
+    if (!req.body.confirmDuplicate) {
+      const similar = await findSimilarDepartments(name);
+      if (similar.length) {
+        return res.status(409).json({
+          success: false,
+          code: "POSSIBLE_DUPLICATE",
+          similar,
+          message:
+            similar.length === 1
+              ? `"${similar[0].name}" already exists and looks a lot like "${name}" — ` +
+                `probably the same department. Grant access to it instead, or confirm ` +
+                `to create "${name}" as a separate one anyway.`
+              : `These already exist and look a lot like "${name}": ` +
+                `${similar.map((s) => `"${s.name}"`).join(", ")}. Confirm to create it anyway.`,
+        });
+      }
     }
 
     const dept = await AccessDepartment.create({
@@ -594,11 +672,16 @@ router.patch("/employees/:id", async (req, res) => {
     // Assigning access has nothing to do with salary, so it should not be
     // running salary code at all.
     const employee = await Employee.findById(req.params.id)
-      .select("firstName lastName email accessDepartmentId")
+      .select("firstName lastName email accessDepartmentId additionalDepartmentIds")
+      .populate("accessDepartmentId", "name")
+      .populate("additionalDepartmentIds", "name")
       .lean();
     if (!employee) return fail(res, 404, "Employee not found");
 
     const { accessDepartmentId, additionalDepartmentIds } = req.body || {};
+    const displayName = employee.firstName || employee.email;
+    const oldPrimaryName = employee.accessDepartmentId?.name || null;
+    const oldExtraNames = (employee.additionalDepartmentIds || []).map((d) => d.name);
 
     // Extra departments, set independently of the primary. Sent as an array;
     // an empty array clears them.
@@ -611,7 +694,10 @@ router.patch("/employees/:id", async (req, res) => {
       // The primary is never duplicated into the extras — it is already granted.
       const extras = valid
         .map((d) => d._id)
-        .filter((id) => String(id) !== String(accessDepartmentId || employee.accessDepartmentId));
+        .filter((id) => String(id) !== String(accessDepartmentId || employee.accessDepartmentId?._id));
+      const extraNames = valid
+        .filter((d) => extras.some((id) => String(id) === String(d._id)))
+        .map((d) => d.name);
 
       await Employee.updateOne(
         { _id: employee._id },
@@ -619,6 +705,24 @@ router.patch("/employees/:id", async (req, res) => {
       );
 
       audit(req, "employee.extra-departments", `${employee.email} → ${extras.length} extra`);
+
+      // Who granted/revoked which "also" departments, and when — this is the
+      // record People & Roles' history panel reads. Kept on the employee's
+      // email as `entityId`, the same key department-role changes already use
+      // (see PUT /department-roles/:slug above), so a person's whole access
+      // history — primary, extras, and any module role — reads as one
+      // timeline instead of three that each need their own lookup.
+      await recordChange(req, {
+        entity: "employee-department-extra",
+        entityId: employee.email,
+        entityLabel: displayName,
+        action: "update",
+        summary: extraNames.length
+          ? `${displayName} also granted: ${extraNames.join(", ")}`
+          : `${displayName}'s extra departments cleared`,
+        before: { extra: oldExtraNames },
+        after: { extra: extraNames },
+      });
 
       if (accessDepartmentId === undefined) {
         return res.json({
@@ -641,6 +745,15 @@ router.patch("/employees/:id", async (req, res) => {
       );
 
       audit(req, "employee.assign", `${employee.email} → ${dept.name}`);
+      await recordChange(req, {
+        entity: "employee-department",
+        entityId: employee.email,
+        entityLabel: displayName,
+        action: "update",
+        summary: `${displayName}'s primary department set to ${dept.name}`,
+        before: { department: oldPrimaryName },
+        after: { department: dept.name },
+      });
       return res.json({
         success: true,
         message: `${employee.firstName || employee.email} can now sign in to ${dept.name}.`,
@@ -654,6 +767,15 @@ router.patch("/employees/:id", async (req, res) => {
     );
 
     audit(req, "employee.revoke", employee.email);
+    await recordChange(req, {
+      entity: "employee-department",
+      entityId: employee.email,
+      entityLabel: displayName,
+      action: "update",
+      summary: `${displayName}'s primary department removed`,
+      before: { department: oldPrimaryName },
+      after: { department: null },
+    });
     res.json({
       success: true,
       message:
@@ -719,6 +841,224 @@ router.post("/employees/:id/set-password", async (req, res) => {
     });
   } catch (error) {
     console.error("[access-admin] set employee password:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/**
+ * PATCH /api/admin/employees/:id/set-email
+ *
+ * Give an employee with no email on file one, so they stop being a dead end —
+ * today "no email" just disables the department picker and set-password
+ * button on their row with no way out.
+ */
+router.patch("/employees/:id/set-email", async (req, res) => {
+  try {
+    const employee = await Employee.findById(req.params.id)
+      .select("firstName lastName email")
+      .lean();
+    if (!employee) return fail(res, 404, "Employee not found");
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return fail(res, 400, "Enter a valid email address");
+    }
+
+    if (await Employee.exists({ email, _id: { $ne: employee._id } })) {
+      return fail(res, 409, "Another employee already uses that email address");
+    }
+
+    // updateOne, not .save() — same salary pre-save-hook landmine as set-password.
+    await Employee.updateOne({ _id: employee._id }, { $set: { email } });
+
+    audit(req, "employee.set-email", `${employee.firstName || req.params.id} → ${email}`);
+    res.json({ success: true, message: "Email saved.", email });
+  } catch (error) {
+    console.error("[access-admin] set employee email:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/* ================================================================== */
+/* COWORK ACCOUNT — link/provision, alongside the "cowork" department  */
+/* ================================================================== */
+//
+// Holding the "cowork" AccessDepartment (via accessDepartmentId or
+// additionalDepartmentIds, same as any other department) is the ACCESS
+// grant, but CoWork's identity lives in Firestore/Firebase, not in this
+// database — a grant alone does nothing until an account exists there too.
+// These two routes are what make a grant usable: check whether a
+// cowork_employees doc / Firebase Auth user exists for this employee, and
+// create one if not, wrapping the same createCoworkEmployee the legacy
+// CoWork employee-creation screen uses.
+
+/**
+ * How a CoWork account is found for an employee, in priority order.
+ *
+ * 1. `employee.coworkEmployeeId` — an explicit link, set by an admin picking
+ *    one on the access page, or written automatically the moment an email
+ *    match below succeeds. Exact and authoritative; nothing else is even
+ *    consulted once this is set.
+ * 2. Email match. Works for the common case where the same address was used
+ *    to register both accounts.
+ *
+ * What this replaced — `cowork_employees.doc(employee.biometricId)` — only
+ * ever worked for accounts this app itself created. An account made earlier
+ * through the legacy CoWork employee-creation screen, or by hand, keeps
+ * whatever ID and email it was given at the time, which routinely differs
+ * from the HR record for the same person: verified against live data, where
+ * one employee's CMS login was pramodbiswal@gmail.com and their real,
+ * working CoWork account was biswalpramod3.1415@gmail.com under doc id
+ * GR0108. Neither the old doc-ID lookup nor a same-email assumption finds
+ * that pairing — only an explicit link does, which is why step 1 exists at
+ * all rather than relying on step 2 alone.
+ */
+async function findCoworkAccount(employee) {
+  const { db } = require("../../config/firebaseAdmin");
+  if (employee.coworkEmployeeId) {
+    const doc = await db.collection("cowork_employees").doc(employee.coworkEmployeeId).get();
+    if (doc.exists) return doc;
+  }
+  const email = String(employee.email || "").trim().toLowerCase();
+  if (!email) return null;
+  const snap = await db.collection("cowork_employees").where("email", "==", email).limit(1).get();
+  return snap.empty ? null : snap.docs[0];
+}
+
+/** GET /api/admin/cowork-accounts — every CoWork account, for the link picker. */
+router.get("/cowork-accounts", async (req, res) => {
+  try {
+    const { db } = require("../../config/firebaseAdmin");
+    const snap = await db.collection("cowork_employees").orderBy("name").get();
+    res.json({
+      success: true,
+      accounts: snap.docs.map((doc) => {
+        const d = doc.data();
+        return { employeeId: doc.id, name: d.name || doc.id, email: d.email || "", role: d.role || "employee" };
+      }),
+    });
+  } catch (error) {
+    console.error("[access-admin] list cowork accounts:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/** GET /api/admin/employees/:id/cowork-account */
+router.get("/employees/:id/cowork-account", async (req, res) => {
+  try {
+    const employee = await Employee.findById(req.params.id)
+      .select("firstName lastName email coworkEmployeeId")
+      .lean();
+    if (!employee) return fail(res, 404, "Employee not found");
+
+    const doc = await findCoworkAccount(employee);
+    if (!doc) return res.json({ success: true, exists: false });
+
+    const data = doc.data();
+    res.json({
+      success: true,
+      exists: true,
+      account: {
+        employeeId: doc.id,
+        name: data.name || doc.id,
+        email: data.email || "",
+        role: data.role || "employee",
+        hasAuthUid: Boolean(data.authUid),
+        passwordChanged: Boolean(data.passwordChanged),
+        // Whether this is an explicit link or was found by matching email
+        // this request — the UI shows the two differently, since the
+        // latter is a guess that held today and the former cannot drift.
+        linked: employee.coworkEmployeeId === doc.id,
+      },
+    });
+  } catch (error) {
+    console.error("[access-admin] cowork-account status:", error);
+    fail(res, 500, error.message);
+  }
+});
+
+/**
+ * POST /api/admin/employees/:id/cowork-account
+ *
+ * Three ways in, tried in order:
+ *   1. Body carries `coworkEmployeeId` — an explicit pick from the link
+ *      picker. Verified to exist, then linked. No email involved at all.
+ *   2. No explicit pick, but an account shares this employee's email —
+ *      linked automatically.
+ *   3. Neither — a brand new CoWork account is created and linked.
+ *
+ * All three end by writing `Employee.coworkEmployeeId`, so every future
+ * lookup (including the CoWork sign-in bridge) is a direct id read and
+ * never depends on the two emails still agreeing.
+ */
+router.post("/employees/:id/cowork-account", async (req, res) => {
+  try {
+    const employee = await Employee.findById(req.params.id)
+      .select("firstName lastName email phone department biometricId")
+      .lean();
+    if (!employee) return fail(res, 404, "Employee not found");
+
+    const { db } = require("../../config/firebaseAdmin");
+    const explicitId = String(req.body?.coworkEmployeeId || "").trim();
+
+    if (explicitId) {
+      const doc = await db.collection("cowork_employees").doc(explicitId).get();
+      if (!doc.exists) return fail(res, 404, "That CoWork account no longer exists.");
+      await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: doc.id } });
+      audit(req, "employee.cowork-link", `${employee.email || req.params.id} → ${doc.id} (explicit)`);
+      return res.json({
+        success: true,
+        message: `Linked to ${doc.data().name || doc.id}'s existing CoWork account.`,
+        account: { employeeId: doc.id, role: doc.data().role || "employee", linked: true },
+      });
+    }
+
+    if (!employee.email) {
+      return fail(res, 400, "This employee has no email address — set one first, or pick a CoWork account to link explicitly.");
+    }
+
+    // Somebody may already hold a CoWork account under this email — created
+    // before the CMS↔CoWork link existed, or through the legacy
+    // employee-creation screen. Link to it rather than creating a second
+    // Firestore doc pointing at the same Firebase Auth user.
+    const email = String(employee.email).trim().toLowerCase();
+    const existing = await db.collection("cowork_employees").where("email", "==", email).limit(1).get();
+    if (!existing.empty) {
+      const doc = existing.docs[0];
+      await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: doc.id } });
+      audit(req, "employee.cowork-link", `${employee.email} → existing account ${doc.id} (by email)`);
+      return res.json({
+        success: true,
+        message: "This email already had a CoWork account — linked it, no new account created.",
+        account: { employeeId: doc.id, role: doc.data().role || "employee", linked: true },
+      });
+    }
+
+    if (!employee.biometricId) {
+      return fail(res, 400, "This employee has no biometric ID on file, so a new CoWork account cannot be linked to their HR record.");
+    }
+
+    const { createCoworkEmployee } = require("../../services/cowork.service");
+    const name = `${employee.firstName || ""} ${employee.lastName || ""}`.trim() || employee.email;
+    const result = await createCoworkEmployee({
+      name,
+      email: employee.email,
+      mobile: employee.phone || "",
+      city: "",
+      department: employee.department || "",
+      role: req.body?.role === "tl" ? "tl" : "employee",
+      employeeId: employee.biometricId,
+    });
+
+    await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: result.employeeId } });
+    audit(req, "employee.cowork-provision", `${employee.email} → ${result.employeeId}`);
+    res.status(201).json({
+      success: true,
+      message: "CoWork account created.",
+      account: { employeeId: result.employeeId, role: result.role, tempPassword: result.tempPassword },
+    });
+  } catch (error) {
+    console.error("[access-admin] provision cowork account:", error);
     fail(res, 500, error.message);
   }
 });
