@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+
+
 // UPDATE THIS CONNECTION STRING
 const MONGO_URI = 'mongodb+srv://soumya:soumya@cluster0.nffihha.mongodb.net/';
 
