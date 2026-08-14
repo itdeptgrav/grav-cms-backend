@@ -19,6 +19,7 @@ const allowedOrigins = [
   "http://localhost:8081",
   "http://localhost:3001",
   "http://localhost:3002",
+  "http://localhost:50787",
   "https://grav-cms.vercel.app",
   "http://10.119.220.161:3000",
   "https://cms.grav.in",
@@ -121,6 +122,8 @@ io.on("connection", (socket) => {
    leaves the two connection handlers above untouched. */
 const { initDocumentCollaboration } = require("./services/documentCollab.service");
 initDocumentCollaboration(io);
+
+
 
 // Make io accessible to routes
 app.set("io", io);
@@ -908,6 +911,21 @@ const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
 app.use("/api/hr/overview", hrOverviewRoutes);
 
+// The page-scoped HR AI panels (/api/hr/ai/overview-assistant and
+// /api/hr/ai/daily-attendance-assistant) were removed — there is now ONE central
+// GRAV assistant for the whole CMS. HR data is reached through its permission-
+// gated tools instead of per-page endpoints.
+
+// Central GRAV assistant — ONE assistant for the whole CMS, available to any
+// authenticated employee. HR (and later Sales/Accounting) expose their data to
+// it as permission-gated tools; the HR routes above now run through this same
+// service. Conversation is keyed by user, not route.
+const gravAssistantRoutes = require("./routes/ai/assistant");
+app.use("/api/ai", gravAssistantRoutes);
+
+// PersonalCallRecorder Android app → call recording sync (metadata → Mongo, audio → Drive)
+app.use("/api/recordings", require("./routes/callRecordings"));
+
 app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
 
 app.use("/api/hr", hrProfileRoutes);
@@ -1022,6 +1040,39 @@ const employeeMpcRoutes = require("./routes/Customer_Routes/Employee_Mpc");
 // Use the routes
 app.use("/api/customer/employees", employeeMpcRoutes);
 
+// Department -> product assignment rules, customer self-service. Same
+// router the sales on-behalf mount below uses (routes/CMS_Routes/Sales/
+// salesDepartmentRules.js is generic over req.customerId/req.onBehalfActor)
+// — this mount just authenticates the customer's OWN cookie instead of an
+// employee JWT, mirroring Employee_Mpc.js's own verifyCustomerToken.
+const salesDepartmentRulesRoutesForCustomer = require("./routes/CMS_Routes/Sales/salesDepartmentRules");
+app.use(
+  "/api/customer/department-rules",
+  (req, res, next) => {
+    try {
+      const jwt = require("jsonwebtoken");
+      const token = req.cookies.customerToken;
+      if (!token) {
+        return res
+          .status(401)
+          .json({ success: false, message: "Access denied. Please sign in." });
+      }
+      const decoded = jwt.verify(
+        token,
+        process.env.JWT_SECRET || "grav_clothing_secret_key_2024",
+      );
+      req.customerId = decoded.id;
+      req.onBehalfActor = { id: decoded.id, name: decoded.name || "" };
+      next();
+    } catch (error) {
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid token. Please sign in again." });
+    }
+  },
+  salesDepartmentRulesRoutesForCustomer,
+);
+
 // ── Sales acting on a customer's behalf ────────────────────────────────────
 // Same MPC router, scoped to :customerId and gated by the employee JWT instead
 // of the customer cookie. Lets a sales person build a customer's measurement
@@ -1046,6 +1097,26 @@ app.use(
   employeeMpcRoutes,
 );
 
+// Department -> product assignment rules for the same sales-on-behalf
+// customer profile ("Department" tab next to MPC). Same router as the
+// customer self-service mount above (/api/customer/department-rules) —
+// just gated by the employee JWT + :customerId param instead.
+const salesDepartmentRulesRoutes = require("./routes/CMS_Routes/Sales/salesDepartmentRules");
+app.use(
+  "/api/cms/sales/customers/:customerId/department-rules",
+  EmployeeAuthForMpc,
+  (req, res, next) => {
+    const { customerId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(customerId)) {
+      return res.status(400).json({ success: false, message: "Invalid customer id" });
+    }
+    req.customerId = customerId;
+    req.onBehalfActor = { id: req.user?.id, name: req.user?.name };
+    next();
+  },
+  salesDepartmentRulesRoutes,
+);
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
@@ -1066,6 +1137,44 @@ const crmAccountsRoutes = require("./routes/CMS_Routes/Sales/accounts");
 app.use("/api/cms/crm/leads", salesWrites("lead"), crmLeadsRoutes);
 app.use("/api/cms/crm/contacts", salesWrites("contact"), crmContactsRoutes);
 app.use("/api/cms/crm/accounts", salesWrites("account"), crmAccountsRoutes);
+
+// CRM Step 01 — customer-account foundation (sites, departments, addresses,
+// typed account relationships, internal account team, activity timeline) plus
+// the controlled lookup values the frontend reads for its dropdowns. Same
+// Sales role + approval guard as the rest of CRM.
+app.use("/api/cms/crm/sites", salesWrites("CRM site"), require("./routes/CMS_Routes/Sales/sites"));
+app.use("/api/cms/crm/departments", salesWrites("CRM department"), require("./routes/CMS_Routes/Sales/departments"));
+app.use("/api/cms/crm/addresses", salesWrites("CRM address"), require("./routes/CMS_Routes/Sales/addresses"));
+app.use("/api/cms/crm/account-relationships", salesWrites("account relationship"), require("./routes/CMS_Routes/Sales/accountRelationships"));
+app.use("/api/cms/crm/account-team", salesWrites("account team"), require("./routes/CMS_Routes/Sales/accountTeam"));
+app.use("/api/cms/crm/activities", salesWrites("CRM activity"), require("./routes/CMS_Routes/Sales/activities"));
+app.use("/api/cms/crm/lookups", require("./routes/CMS_Routes/Sales/crmLookups"));
+// Call recordings, read-only for Sales (matched to a customer by phone/name).
+// No salesWrites() guard on purpose: nothing here creates a business record —
+// the only write is an AI summary annotation, which an approval queue would
+// only get in the way of. The Android app's upload endpoint stays separate at
+// /api/recordings.
+app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callRecordings"));
+
+// Sales Journey — the connected commercial lifecycle record (Account →
+// Retention). Same Sales role + approval guard as the rest of CRM: an editor's
+// "Start Journey" is held as a ChangeRequest and answered 202 rather than
+// creating a record. Only the Journey itself lives here; the seven later
+// lifecycle modules are not implemented.
+app.use(
+  "/api/cms/crm/sales-journeys",
+  salesWrites("sales journey"),
+  require("./routes/CMS_Routes/Sales/salesJourneys"),
+);
+
+// Enquiry / RFQ — the opportunity record inside a Journey's Enquiry stage.
+// Its own module (own collection + reference), lazily created on first open.
+// Mounted plainly: the route file applies salesAuth per-endpoint and writes
+// directly (operational sales data edited frequently, not approval-gated).
+app.use(
+  "/api/cms/crm/enquiries",
+  require("./routes/CMS_Routes/Sales/enquiries"),
+);
 
 // Inventory Routes
 const unitsRoutes = require("./routes/CMS_Routes/Inventory/Configurations/units");
@@ -1648,6 +1757,10 @@ app.use("/cowork", require("./routes/task_routes/meetingSummary.routes"));
 app.use("/cowork", require("./routes/task_routes/meetingTranscript.routes"));
 
 app.use("/cowork", require("./routes/task_routes/audioRecording.routes")(io));
+
+// Music recommendation engine — application-owned autoplay + suggested videos
+// for the Cowork music player. See MUSIC_RECOMMENDATION_ENGINE_NOTES.md.
+app.use("/cowork/music", require("./routes/music/recommendations.routes"));
 
 // Fix: askAI.routes exports an object, use .router
 const askAITest = require("./routes/task_routes/askAI.routes");

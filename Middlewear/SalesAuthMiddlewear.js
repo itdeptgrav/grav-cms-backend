@@ -17,15 +17,26 @@
 //   3. Raw cookie header parse      — fallback if cookie-parser not running
 //
 // ALLOWED ROLES:
-//   "sales" | "admin" | "ceo"
+//   "sales" | "admin" | "ceo" | "project_manager" | "merchandiser"
 //   Add more roles to ALLOWED_ROLES if other departments need CRM read access.
+//
+// "merchandiser" added 11 Aug 2026: the Merchandiser dashboard
+// (app/merchandiser/**) reuses these SAME Sales pages — customers,
+// customer-requests (Purchase Orders/PI), stock-items (Products & BOM),
+// settings — via AutoDashboardLayout (see components/AutoDashboardLayout.js).
+// Browsing into the Merchandiser department adopts its AccessDepartment's
+// legacyRole, "merchandiser" (routes/auth/deptAuth.js's buildTokenPayload:
+// `role: dept.legacyRole || dept.slug`), which this allowlist did not
+// recognise — every one of those pages 403'd for anyone in Merchandiser,
+// and since the frontend fetches only check `res.ok`, that surfaced as
+// silent empty states ("No customers found") rather than a visible error.
 
 const jwt = require("jsonwebtoken");
 
 const SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
 
 // Roles that are allowed to access the CRM (Leads / Contacts / Accounts)
-const ALLOWED_ROLES = ["sales", "admin", "ceo", "project_manager"];
+const ALLOWED_ROLES = ["sales", "admin", "ceo", "project_manager", "merchandiser"];
 
 const SalesAuthMiddlewear = (req, res, next) => {
   try {
@@ -62,12 +73,30 @@ const SalesAuthMiddlewear = (req, res, next) => {
     }
 
     // ── Attach user to request (mirrors EmployeeAuthMiddlewear shape) ───────
+    // `email` (Draft Lead chunk) — the JWT already carries it (routes/login.js
+    // signs `email: user.email || ""` into every token), this middleware just
+    // wasn't reading it. Needed so a GET handler can resolve the caller's
+    // Sales DEPARTMENT role the same way Middlewear/departmentWriteGuard.js's
+    // seedIdentity already does for writes — that guard never runs for reads
+    // at all (GET/HEAD/OPTIONS pass instantly), so without this, "is this
+    // caller a Sales manager" would be unanswerable on a read. See
+    // services/salesAccess.js.
     req.user = {
       id: decoded.id,
       role: decoded.role,
       employeeId: decoded.employeeId,
       userType: decoded.userType,
       name: decoded.name || "",
+      email: decoded.email || "",
+      // Dropped before, and it matters here specifically: an org-level admin
+      // browsing INTO the Sales department gets `role` overwritten to Sales'
+      // own legacy literal (deptAuth.js's buildTokenPayload, `adoptDeptRole`)
+      // so existing per-department checks keep working — but that means
+      // `role` alone can no longer answer "is this an admin" once they are
+      // inside a department. `isAdmin` is signed into the token unconditionally
+      // (buildTokenPayload's `isAdmin: Boolean(user.isAdmin)`) precisely so
+      // callers who need the org-level fact still can. See services/salesAccess.js.
+      isAdmin: Boolean(decoded.isAdmin),
     };
 
     next();

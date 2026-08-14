@@ -1295,19 +1295,34 @@ router.post("/change-password", async (req, res) => {
     const decoded = verifyToken(token);
     const { currentPassword, newPassword } = req.body || {};
 
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ success: false, message: "Current and new password are required" });
+    if (!newPassword) {
+      return res.status(400).json({ success: false, message: "A new password is required" });
     }
     if (String(newPassword).length < 8) {
       return res.status(400).json({ success: false, message: "The new password must be at least 8 characters" });
     }
-    if (String(newPassword) === String(currentPassword)) {
+    if (currentPassword && String(newPassword) === String(currentPassword)) {
       return res.status(400).json({ success: false, message: "The new password must be different from the current one" });
     }
 
     const wrong = () =>
       res.status(401).json({ success: false, message: "Current password is incorrect" });
 
+    /**
+     * Onboarding's self-service card (the common path — the portal everybody
+     * already lands on signed in) no longer collects the current password at
+     * all: asking someone to re-type the password they used thirty seconds
+     * ago to reach this exact screen was the friction being removed. The
+     * still-valid session (the token this route already required above) is
+     * what stands in for it.
+     *
+     * That is a real, deliberate trade: whoever holds a valid session token —
+     * a stolen one, or a shared machine left signed in — can now change the
+     * password without proving they know the old one, where before they
+     * could not. Anywhere `currentPassword` IS sent (a caller can still send
+     * it), it is still checked, so this only relaxes the check for callers
+     * who choose not to ask for it.
+     */
     /* ---- employee ------------------------------------------------- */
     if (decoded.subject === "employee") {
       const Employee = require("../../models/Employee");
@@ -1319,11 +1334,13 @@ router.post("/change-password", async (req, res) => {
       const employee = await Employee.findById(decoded.id);
       if (!employee) return res.status(401).json({ success: false, message: "Unauthorized" });
 
-      // The same matcher login uses, so someone still on a derived default
-      // (Firstname@MMDDYYYY, or the phone-based one) can set a real password
-      // without an administrator having to reset it for them first.
-      const { ok } = await matchesEmployeePassword(employee, currentPassword);
-      if (!ok) return wrong();
+      if (currentPassword) {
+        // The same matcher login uses, so someone still on a derived default
+        // (Firstname@MMDDYYYY, or the phone-based one) can set a real password
+        // without an administrator having to reset it for them first.
+        const { ok } = await matchesEmployeePassword(employee, currentPassword);
+        if (!ok) return wrong();
+      }
 
       // updateOne, not save() — the Employee pre-save hook re-encrypts salary
       // fields, and on a document loaded for this purpose that has repeatedly
@@ -1354,8 +1371,10 @@ router.post("/change-password", async (req, res) => {
         return res.status(401).json({ success: false, message: "Unauthorized" });
       }
 
-      const ok = await accUser.checkPassword(currentPassword);
-      if (!ok) return wrong();
+      if (currentPassword) {
+        const ok = await accUser.checkPassword(currentPassword);
+        if (!ok) return wrong();
+      }
 
       await accUser.setPassword(String(newPassword));
       // Every other accounting session for this person dies with the old one.
@@ -1375,8 +1394,10 @@ router.post("/change-password", async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const ok = await user.verifyPassword(currentPassword);
-    if (!ok) return wrong();
+    if (currentPassword) {
+      const ok = await user.verifyPassword(currentPassword);
+      if (!ok) return wrong();
+    }
 
     await user.setPassword(newPassword);   // bumps tokenVersion → other sessions die
     await user.save();
@@ -1397,7 +1418,142 @@ router.post("/change-password", async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* POST /api/auth/cowork-sso — hand off into the standalone CoWork app */
+/* ------------------------------------------------------------------ */
+//
+// CoWork lives on its own origin with its own Firebase-based sign-in
+// (grav-cms-38f45, same project as this backend's service account). This
+// mints a Firebase custom token for the caller's already-linked CoWork
+// account so onboarding can hand the browser off without asking for a
+// second password. It does not create anything — see the
+// /employees/:id/cowork-account routes in routes/Admin/accessAdmin.js for
+// provisioning a CoWork account that does not exist yet.
+router.post("/cowork-sso", async (req, res) => {
+  try {
+    const token =
+      req.cookies?.[COOKIE_NAME] ||
+      (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    if (!token) {
+      return res.status(401).json({ success: false, message: "Not authenticated" });
+    }
+
+    const decoded = verifyToken(token);
+    if (decoded.v !== 2 || decoded.subject !== "employee") {
+      return res.status(403).json({
+        success: false,
+        message: "CoWork sign-in is only available to employee accounts.",
+      });
+    }
+
+    const employee = await Employee.findById(decoded.id);
+    if (!employee || employee.isActive === false || employee.status === "inactive") {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    // Found by `externalBaseUrl` being SET, not by slug or name. A department
+    // is identified as "the CoWork one" by what it DOES (opens an external
+    // app via this bridge), never by an admin having typed an exact string —
+    // an admin renaming "CoWork" to "Co-Workspace" (a real case this was
+    // debugged against) must not silently break sign-in.
+    const coworkDept = await AccessDepartment.findOne({
+      isActive: true,
+      externalBaseUrl: { $nin: [null, ""] },
+    });
+    if (!coworkDept) {
+      return res.status(500).json({
+        success: false,
+        code: "NOT_CONFIGURED",
+        message: "CoWork is not configured yet. Ask an administrator to set its app URL on the Access Control page.",
+      });
+    }
+
+    const holdsIt = (await resolveEmployeeDepartments(employee))
+      .some((d) => String(d._id) === String(coworkDept._id));
+    if (!holdsIt) {
+      return res.status(403).json({
+        success: false,
+        code: "NO_COWORK_ACCESS",
+        message: "You do not have CoWork access. Ask an administrator to grant it.",
+      });
+    }
+
+    // Resolving the CoWork account: the explicit link first, then email.
+    //
+    // `employee.coworkEmployeeId` — set by an admin on the access page, or
+    // written automatically the first time an email match succeeds — is
+    // authoritative and exact. Without it, this used to assume the
+    // cowork_employees doc ID equalled biometricId, true only for accounts
+    // this app itself created, or that the account's email equalled the
+    // CMS login email, true only when nobody registered the two under
+    // different addresses. In practice both assumptions break: an account
+    // made through the legacy CoWork employee-creation screen keeps
+    // whatever ID and email it was given then, which can differ from HR's
+    // record for the same person — verified against live data, where one
+    // employee's CMS login was pramodbiswal@gmail.com and their CoWork
+    // account, existing and fully working, was
+    // biswalpramod3.1415@gmail.com under doc id GR0108. Neither lookup
+    // found it; the person correctly held CoWork access and correctly had
+    // a working account, and was told no account existed. That is why the
+    // explicit link is checked first and is the one thing that cannot be
+    // fooled by an email mismatch.
+    const { db, auth: firebaseAuth } = require("../../config/firebaseAdmin");
+
+    let coworkDoc = null;
+    if (employee.coworkEmployeeId) {
+      const linked = await db.collection("cowork_employees").doc(employee.coworkEmployeeId).get();
+      if (linked.exists) coworkDoc = linked;
+    }
+
+    if (!coworkDoc) {
+      const email = String(employee.email || "").trim().toLowerCase();
+      if (email) {
+        const match = await db.collection("cowork_employees").where("email", "==", email).limit(1).get();
+        if (!match.empty) {
+          coworkDoc = match.docs[0];
+          // Found by email this once — persist it, so every future sign-in
+          // resolves instantly and stops depending on the two emails still
+          // agreeing.
+          await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: coworkDoc.id } });
+        }
+      }
+    }
+
+    if (!coworkDoc) {
+      return res.status(404).json({
+        success: false,
+        code: "NO_COWORK_ACCOUNT",
+        message: "No CoWork account is linked to your CMS account yet. Ask an administrator to link or create one on the Access Control page.",
+      });
+    }
+
+    const coworkData = coworkDoc.data();
+    if (!coworkData.authUid) {
+      return res.status(409).json({
+        success: false,
+        code: "NO_AUTH_UID",
+        message: "Your CoWork account is not fully set up. Ask an administrator to fix it.",
+      });
+    }
+
+    const customToken = await firebaseAuth.createCustomToken(coworkData.authUid);
+
+    res.json({
+      success: true,
+      token: customToken,
+      redirectBaseUrl: coworkDept.externalBaseUrl,
+    });
+  } catch (error) {
+    console.error("[auth] cowork-sso error:", error);
+    res.status(401).json({ success: false, message: "Invalid or expired session" });
+  }
+});
+
 module.exports = router;
 module.exports.verifyToken = verifyToken;
+module.exports.resolveEmployeeDepartments = resolveEmployeeDepartments;
 module.exports.signToken = signToken;
 module.exports.buildTokenPayload = buildTokenPayload;
+// Exported so a shared permission resolver can decide HR-tool access from the
+// SAME department grants used at login — not a second, drifting copy.
+module.exports.resolveEmployeeDepartments = resolveEmployeeDepartments;

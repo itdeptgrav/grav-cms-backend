@@ -785,7 +785,7 @@ router.patch("/product-requests/:id/reject", async (req, res) => {
  */
 router.patch("/:id/items/:itemId/match", async (req, res) => {
   try {
-    const { rawItemId, variantId, variantCombination } = req.body;
+    const { rawItemId, variantId, variantCombination, requestedQty } = req.body;
     if (!rawItemId) return res.status(400).json({ success: false, message: "rawItemId required" });
 
     const mrf = await MRF.findById(req.params.id);
@@ -812,15 +812,38 @@ router.patch("/:id/items/:itemId/match", async (req, res) => {
       return res.status(400).json({ success: false, message: "This item has variants — pick one before matching" });
     }
 
-    // The requester's own unit (set when the request was raised) stays
-    // authoritative — matching decides WHICH catalogue item this is, not a
-    // fresh chance to redefine what unit it's tracked in.
+    // The store confirming the match is also the point where a genuinely
+    // wrong quantity the requester typed can be corrected — optional, and
+    // never below what's already issued (can't happen on an UNMATCHED item,
+    // but a re-match keeps the same floor for safety).
+    if (requestedQty !== undefined && requestedQty !== null && requestedQty !== "") {
+      const q = parseFloat(requestedQty);
+      if (!Number.isFinite(q) || q <= 0) {
+        return res.status(400).json({ success: false, message: "Quantity must be a positive number" });
+      }
+      if (q < (item.issuedQty || 0)) {
+        return res.status(400).json({ success: false, message: `Cannot set quantity below the ${item.issuedQty} ${item.unit} already issued` });
+      }
+      item.requestedQty = q;
+    }
+
+    // The matched product's own unit wins, not whatever the requester typed —
+    // a request raised as "2 pc" against a product actually stocked in "Mtr"
+    // has to be tracked in Mtr from here on, or every stock/issued comparison
+    // downstream compares two different units as if they were the same
+    // number. (Previously the requester's unit was kept "authoritative" on
+    // the theory that matching only decides WHICH item this is — but the
+    // unit is a property of the item too, not a free-standing fact the
+    // requester gets to fix in advance of knowing what it would be matched
+    // to.)
+    const matchedUnit = rawItem.customUnit || rawItem.unit || "unit";
     item.rawItem = rawItem._id;
     item.rawItemName = rawItem.name;
     item.rawItemSku = rawItem.sku || "";
     item.variantId = variantId || null;
     item.variantCombination = variantCombination || [];
-    item.baseUnit = rawItem.customUnit || rawItem.unit || "unit";
+    item.unit = matchedUnit;
+    item.baseUnit = matchedUnit;
     item.itemStatus = "APPROVED";
     item.category = "";
     item.attributes = [];
