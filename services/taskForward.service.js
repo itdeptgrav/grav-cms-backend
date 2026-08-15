@@ -246,12 +246,28 @@ const _CLOSED_STATUS = new Set(["done", "cancelled"]);
 const _CLOSED_REVIEW = new Set(["completed", "approved", "tl_approved", "ceo_approved"]);
 
 async function nextActiveRankFor(db, employeeId) {
-  const snap = await db.collection("cowork_tasks")
-    .where("assigneeIds", "array-contains", employeeId)
-    .get();
+  // TWO reads, because Firestore cannot OR across fields — the same pairing
+  // the frontend's #activeQueueOf uses. A cross-department task still at the
+  // gate holds its person in `pendingAssigneeId` with EMPTY `assigneeIds`, so
+  // the array-contains query alone cannot see it. That blindness is how two
+  // tasks created minutes apart both stored rank 3: the second count ran while
+  // the first task was still gated, saw the same queue, and picked the same
+  // number. The comment below already states the rule — a gated task OCCUPIES
+  // its slot — this makes the query able to see what the rule counts.
+  const [mine, held] = await Promise.all([
+    db.collection("cowork_tasks")
+      .where("assigneeIds", "array-contains", employeeId)
+      .get(),
+    db.collection("cowork_tasks")
+      .where("pendingAssigneeId", "==", employeeId)
+      .get()
+      .catch(() => null),
+  ]);
+  const docs = new Map();
+  for (const d of [...mine.docs, ...(held ? held.docs : [])]) docs.set(d.id, d);
 
   let highest = 0;
-  snap.forEach((doc) => {
+  docs.forEach((doc) => {
     const t = doc.data() || {};
     if (t.isDeleted) return;
     if (_CLOSED_STATUS.has(t.status)) return;
