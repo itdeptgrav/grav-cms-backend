@@ -192,6 +192,33 @@ function assertTurn(negotiation, employeeId) {
  * the task being reassigned underneath it rather than hand the decision to the
  * previous assignee's manager.
  */
+/**
+ * The deadline of the project this task sits under, or null.
+ *
+ * Null for an ordinary task, for an unreadable parent, and for a parent that
+ * has no deadline of its own — all three mean "no ceiling", which is the safe
+ * direction: a missing figure must never shorten somebody's deadline.
+ *
+ * Field precedence matches the frontend's `readDueAtMs` exactly. Reading them
+ * in a different order here would let the engine cap against one date while the
+ * page displays another.
+ */
+async function readParentDeadlineMs(task) {
+  const parentId = task && task.parentTaskId ? String(task.parentTaskId) : "";
+  if (!parentId) return null;
+  try {
+    const snap = await firestore().collection("cowork_tasks").doc(parentId).get();
+    if (!snap.exists) return null;
+    const p = snap.data();
+    return (
+      readMs(p.fixedDeadline) ?? readMs(p.deadline) ?? readMs(p.dueDate) ?? null
+    );
+  } catch (e) {
+    console.error("[budget] parent deadline unreadable:", e.message);
+    return null;
+  }
+}
+
 async function approverPreread(ref) {
   const snap = await ref.get();
   if (!snap.exists) throw new BudgetError("NOT_FOUND", "Task not found.");
@@ -343,6 +370,23 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
         ...(await resolveAcceptanceAnchor(preSnap.data())),
       }
     : null;
+  /**
+   * **The project's deadline, which this subtask may not outlive.**
+   * OWNER DECISION, 16 Aug 2026.
+   *
+   * Read out here for the same reason as the calendar and the anchor: a
+   * transaction must finish its reads before its first write, and the parent is
+   * not part of this transaction's contended state.
+   *
+   * This is the check that actually guarantees the rule. The create form warns
+   * on a PROJECTION — inside a reporting line the deadline does not exist until
+   * this moment, and it is anchored to when the assignee first came online, so
+   * a budget that looked safe when it was set can land past the parent by the
+   * time it is accepted. Null for an ordinary task, which caps nothing.
+   */
+  const parentDueAtMs = preSnap.exists
+    ? await readParentDeadlineMs(preSnap.data())
+    : null;
 
   return firestore().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -403,12 +447,22 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
         : { anchorMs: Date.now(), source: "acceptance" };
     const anchorMs = grantMs ?? normalAnchor.anchorMs;
     const anchorSource = grantMs ? "hours_granted" : normalAnchor.source;
-    const dueDate = addWorkingSecsIST(
+    const earned = addWorkingSecsIST(
       anchorMs,
       secs,
       calendar.schedule,
       calendar.breaks,
     );
+    /* Clamped rather than refused. The assignee did not choose this budget and
+       refusing their acceptance would strand them with a task they cannot take;
+       the project's date is the honest ceiling, and `deadlineCappedToParent`
+       records that it bit so the page can say why the date is earlier than the
+       budget implies. */
+    const cappedMs =
+      parentDueAtMs !== null && Date.parse(earned) > parentDueAtMs
+        ? parentDueAtMs
+        : null;
+    const dueDate = cappedMs === null ? earned : new Date(cappedMs).toISOString();
 
     tx.update(ref, {
       budgetNegotiation: {
@@ -439,6 +493,9 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
          record that set it. `source` names which branch of the rule fired. */
       clockStartsAtMs: anchorMs,
       clockStartsAtSource: anchorSource,
+      /* True when the project's deadline cut this short — see above. Stored so
+         the task can explain a date that is earlier than its own budget. */
+      deadlineCappedToParent: cappedMs !== null,
       /* A leftover `fixedDeadline` from the sender's create outranks `dueDate`
          in the read precedence, so leaving it would discard everything above. */
       fixedDeadline: null,

@@ -18,7 +18,15 @@ const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../.
 const svc = require("../../services/taskForward.service");
 const { isTaskHead } = require("./_taskHead");
 const { db, admin } = require("../../config/firebaseAdmin");
+const {
+  capBreach,
+  capRefusalBody,
+  raisedParentDueAt,
+  readParentDeadline,
+} = require("../../services/parentDeadlineCap.service");
+const { readMs: readInstantMs } = require("../../services/officeDeadline.service");
 const { v4: _nuuid } = require("uuid");
+
 const _socket = require("../../config/socketInstance");
 
 // ── Local notify helper (saves to Firestore + FCM push) ──────────────────────
@@ -1437,7 +1445,7 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
     // A subtask follows the SAME lifecycle as a standard task — the timer/budget
     // negotiation, priority and review all apply — so it carries the same fields
     // rather than a truncated set that dropped the budget silently.
-    const { title, description, notes, assigneeIds, satisfiesRequirementIds, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
+    const { title, description, notes, assigneeIds, satisfiesRequirementIds, requirements, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
@@ -1512,6 +1520,12 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       // empty array, which is a subtask that closes no requirement rather than
       // a rejected request.
       satisfiesRequirementIds,
+      // The subtask's OWN acceptance criteria — a different thing from the
+      // claims above, and dropped on this route until 16 Aug 2026. The create
+      // route has always read it; this one did not, so criteria typed into the
+      // subtask form were discarded while the same field on an ordinary task
+      // saved correctly.
+      requirements: Array.isArray(requirements) ? requirements : [],
       // TL subtasks should NOT show in CEO tree
       createdByTl: requesterRole === "tl",
       createdByCeo: requesterRole === "ceo",
@@ -2410,7 +2424,49 @@ router.post("/task/:taskId/review-deadline-extension", verifyCoworkToken, verify
       update["deadlineExtRequest.counterDate"] = newDate;
     }
 
-    await taskRef.update(update);
+    /**
+     * **A subtask may not be extended past the project it belongs to.**
+     * OWNER DECISION, 16 Aug 2026: refused, UNLESS the project moves too.
+     *
+     * A flat refusal would be a dead end — the approver believes the time is
+     * warranted, and the only remedy would be a second action on a different
+     * task they may not think to take. So the refusal carries the remedy, and
+     * `raiseParent` takes it in the same press.
+     *
+     * Both writes go in ONE batch. Moving the child first and failing on the
+     * parent would leave exactly the state this rule exists to forbid, with
+     * nothing on screen to say it had happened.
+     *
+     * Rejections skip all of this: refusing an extension cannot breach a cap.
+     */
+    const granted = action === "approve" || action === "counter";
+    const grantedMs = granted ? readInstantMs(update.fixedDeadline) : null;
+    const parentInfo = granted ? await readParentDeadline(task) : null;
+
+    const breach = parentInfo
+      ? capBreach({ grantedMs, parentDueAtMs: parentInfo.dueAtMs })
+      : { breached: false, overshootSecs: 0 };
+
+    if (breach.breached) {
+      const { overshootSecs } = breach;
+      if (!req.body.raiseParent) {
+        return res
+          .status(409)
+          .json(capRefusalBody({ parent: parentInfo, overshootSecs }));
+      }
+      /* Granted WITH the project moved by the same amount, so the two still
+         agree — the approver was told that is what they were doing. */
+      const batch = db.batch();
+      batch.update(taskRef, update);
+      batch.update(db.collection("cowork_tasks").doc(parentInfo.taskId), {
+        [parentInfo.field]: raisedParentDueAt({ parent: parentInfo, overshootSecs }),
+        parentDeadlineRaisedBy: overshootSecs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await batch.commit();
+    } else {
+      await taskRef.update(update);
+    }
 
     // Notify assignees about extension review result
     try {
