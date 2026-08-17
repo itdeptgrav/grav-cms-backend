@@ -1124,7 +1124,33 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
     // Notifications: only assignees, NOT the CEO/creator (task.assignedBy)
     // CEO created the task so they're always in assignedBy — they don't need
     // a notification for every message sent in their own assigned tasks
-    const notifyIds = (task.assigneeIds || []).filter(id => id !== senderId);
+    /**
+     * **Everyone the task is between, not the assignees alone.**
+     * Reported 17 Aug 2026: "no web push notifications" on task chat.
+     *
+     * This read `assigneeIds` only. On the ordinary task — one assignee — the
+     * assignee IS the whole list, so when THEY sent a message the filter
+     * removed the only recipient and `notifyIds` came out empty: nobody was
+     * told, and the manager waiting for that reply never heard it. Messages
+     * only ever notified in one direction, and the direction that mattered
+     * least.
+     *
+     * The people a task is between are the ones its own chat is for: whoever
+     * it was given to, whoever assigned it, whoever it was forwarded from, and
+     * anybody still holding it pending. Deduplicated, and the sender is always
+     * removed — you do not get a push for your own message.
+     */
+    const notifyIds = [
+      ...new Set(
+        [
+          ...(task.assigneeIds || []),
+          ...(task.pendingAssigneeId ? [task.pendingAssigneeId] : []),
+          task.assignedBy,
+          task.originalAssignedBy,
+          task.forwardedBy,
+        ].filter((id) => id && id !== senderId),
+      ),
+    ];
     if (notifyIds.length) {
       await _notifyMany({
         recipientIds: notifyIds,

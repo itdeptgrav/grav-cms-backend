@@ -1725,6 +1725,9 @@ const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-sc
 app.use("/api/barcode-devices", barcodeScannerRoutes);
 
 app.use("/cowork", require("./routes/task_routes/taskForward.js"));
+/* Per-tab "what is new since you last looked" — server-side so reading on
+   one device clears the badge on every other. */
+app.use("/cowork", require("./routes/task_routes/taskTabSeen.routes.js"));
 // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
 app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 
