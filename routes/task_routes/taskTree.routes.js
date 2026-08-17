@@ -1227,7 +1227,7 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
         // same rule as the budget-negotiation accept, so the two accept
         // surfaces cannot hand out different deadlines for one task.
         const { resolveAcceptanceAnchor } = require("../../services/officeDeadline.service");
-        const anchor = await resolveAcceptanceAnchor(task);
+        const anchor = await resolveAcceptanceAnchor(task, Date.now(), taskId);
         let dueDate;
         try {
             const officeSnap = await db.collection("cowork_settings").doc("office").get();
@@ -1242,6 +1242,8 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
             status: "deadline_approved",
             clockStartsAtMs: anchor.anchorMs,
             clockStartsAtSource: anchor.source,
+            queuedAfterTaskId: anchor.queuedAfterTaskId ?? null,
+            queuedAfterTitle: anchor.queuedAfterTitle ?? null,
             deadlineWindowSecs: approvedSecs,
             originalWindowSecs: approvedSecs,
             dueDate,

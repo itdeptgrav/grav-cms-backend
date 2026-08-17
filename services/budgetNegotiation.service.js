@@ -367,7 +367,9 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
   const preAnchor = preSnap.exists
     ? {
         forAssignee: partiesOf(preSnap.data()).assignee,
-        ...(await resolveAcceptanceAnchor(preSnap.data())),
+        /* The task's own id, so the queue-ahead rule can exclude it from its
+           own queue — without it the task waits for itself. */
+        ...(await resolveAcceptanceAnchor(preSnap.data(), Date.now(), String(taskId))),
       }
     : null;
   /**
@@ -445,8 +447,20 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
         String(preAnchor.forAssignee || "")
         ? preAnchor
         : { anchorMs: Date.now(), source: "acceptance" };
-    const anchorMs = grantMs ?? normalAnchor.anchorMs;
-    const anchorSource = grantMs ? "hours_granted" : normalAnchor.source;
+    /* The LATER of the two, not the grant alone. `preAnchor` may already have
+       been pushed past the grant by the work queued ahead of this task — see
+       `resolveAcceptanceAnchor` — and taking `grantMs` unconditionally would
+       throw that away, leaving one accept surface chaining and the other not.
+       Both intents survive a max: never before the hours were granted, and
+       never before the higher-priority work above it finishes. */
+    const anchorMs =
+      grantMs != null
+        ? Math.max(grantMs, normalAnchor.anchorMs ?? grantMs)
+        : normalAnchor.anchorMs;
+    const anchorSource =
+      grantMs != null && anchorMs === grantMs
+        ? "hours_granted"
+        : normalAnchor.source;
     const earned = addWorkingSecsIST(
       anchorMs,
       secs,

@@ -2054,7 +2054,7 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
     // when the hours were granted). Same resolver as the budget-negotiation
     // accept, so both accept surfaces produce one deadline for one task.
     const { resolveAcceptanceAnchor } = require("../../services/officeDeadline.service");
-    const anchor = await resolveAcceptanceAnchor(task);
+    const anchor = await resolveAcceptanceAnchor(task, Date.now(), taskId);
     let dueDate;
     try {
       const officeSnap = await db.collection("cowork_settings").doc("office").get();
@@ -2074,6 +2074,10 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
       dueDate,
       clockStartsAtMs: anchor.anchorMs,
       clockStartsAtSource: anchor.source,
+      /* Which task it is queued behind, where the priority rule moved the
+         start — see resolveAcceptanceAnchor. Null on the ordinary path. */
+      queuedAfterTaskId: anchor.queuedAfterTaskId ?? null,
+      queuedAfterTitle: anchor.queuedAfterTitle ?? null,
       senderTimerApprovedBy: employeeId,
       senderTimerApprovedByName: employeeName,
       senderTimerApprovedAt: admin.firestore.FieldValue.serverTimestamp(),

@@ -16,6 +16,7 @@ const { admin, db, messaging } = require("../config/firebaseAdmin");
 const {
   computeWorkingDeadline,
   readMs: readInstantMs,
+  rechainQueueFor,
 } = require("./officeDeadline.service");
 const c1Svc = require("./c1Service");
 const socket = require("../config/socketInstance");
@@ -698,9 +699,81 @@ async function setActiveTaskBudget({ taskId, employeeId, employeeName, hoursValu
   // first and the one the queue plans against. senderTimerWindowSecs is left
   // alone: it records what was originally proposed, and overwriting it would
   // erase the fact that the budget ever changed.
+  /**
+   * **The deadline follows the budget.** Reported 17 Aug 2026.
+   *
+   * This wrote the window and nothing else, so a granted extension raised the
+   * budget and left the date alone: T062 went to a 2-hour budget from a 13:23
+   * start and kept a 15:00 deadline, when its own arithmetic says 15:23. The
+   * two figures sit beside each other on the task panel — "00:00:00 of
+   * 01:50:00" above "17 Aug · 15:00 IST" — and disagreed.
+   *
+   * Counted from the STORED anchor, never a fresh one. `clockStartsAtMs` was
+   * stamped once when the clock started and is deliberately never recomputed:
+   * re-resolving it here would move the start every time somebody adjusted the
+   * hours, and a deadline whose origin drifts cannot be checked by the person
+   * measured against it.
+   *
+   * Left alone in two cases: a task carrying a fixed calendar date has no
+   * budget-derived deadline to move, and a task with no stamped anchor has
+   * nothing honest to count from — better the date it has than one invented
+   * from `now`.
+   */
+  const anchorMs = readInstantMs(task.clockStartsAtMs);
+  const currentDueMs = readInstantMs(task.dueDate);
+  const deltaSecs = secs - previousSecs;
+  let dueDate = null;
+  if (!task.fixedDeadline && Number.isFinite(anchorMs)) {
+    try {
+      /**
+       * **The granted time is ADDED to the deadline you already have.**
+       * OWNER DECISION, 17 Aug 2026.
+       *
+       * This recomputed `anchor + budget` outright, which quietly took back
+       * time a task was already carrying: T062 stood at 16:30 on a 3:00
+       * budget anchored at 13:23, though 13:23 + 3:00 is 16:23 — seven
+       * minutes of slack from an older formula. Granting ten more minutes
+       * then produced 16:33 rather than 16:40, so a +10 grant read as +3.
+       *
+       * Ten minutes granted means ten minutes later. The delta is walked
+       * through office hours, so a grant near closing still lands on the next
+       * working morning rather than at night.
+       */
+      if (!Number.isFinite(currentDueMs)) {
+        /* No date yet: the anchor is the only honest place to count from. */
+        dueDate = await computeWorkingDeadline({ startMs: anchorMs, windowSecs: secs });
+      } else if (deltaSecs > 0) {
+        dueDate = await computeWorkingDeadline({
+          startMs: currentDueMs,
+          windowSecs: deltaSecs,
+        });
+      }
+      /* Unchanged or REDUCED leaves `dueDate` null and writes nothing. A
+         background recompute must never shorten a commitment somebody is
+         already working to: a smaller budget is a decision about hours, and
+         taking the date away with it is a second decision nobody made here. */
+
+      /* A subtask may not outlive its project — OWNER DECISION 16 Aug 2026.
+         Clamped rather than refused: the budget change is the manager's and
+         stands; the project's date is the ceiling the child is measured by. */
+      if (dueDate !== null) {
+        const { readParentDeadline } = require("./parentDeadlineCap.service");
+        const parent = await readParentDeadline(task);
+        if (parent && Date.parse(dueDate) > parent.dueAtMs) {
+          dueDate = new Date(parent.dueAtMs).toISOString();
+        }
+      }
+    } catch (e) {
+      /* An unreadable calendar costs the recalculation, never the budget. */
+      console.warn("[setActiveTaskBudget] deadline recompute failed:", e.message);
+      dueDate = null;
+    }
+  }
+
   await ref.update({
     deadlineWindowSecs: secs,
     etcHours: secs / 3600,
+    ...(dueDate ? { dueDate } : {}),
     budgetSetBy: employeeId,
     budgetSetByName: employeeName || "",
     budgetSetAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -708,6 +781,36 @@ async function setActiveTaskBudget({ taskId, employeeId, employeeName, hoursValu
   });
 
   // Posted by the route, as above.
+
+  /**
+   * **The tasks below it follow.** Reported 17 Aug 2026.
+   *
+   * T062 (P1) and T063 (P2) were chained correctly when T063 was created —
+   * T062 was due 15:00, so T063 anchored there. T062's budget then grew and
+   * its deadline moved to 16:30 while T063 kept its 15:00 anchor: thirty
+   * minutes of real room for two hours of work.
+   *
+   * Distinct from the "decided once" rule, which is about NEW work arriving
+   * above somebody and still stands. Here the chain was already agreed and the
+   * link above it moved; leaving it stale protects nobody. `rechainQueueFor`
+   * only ever pushes LATER, so nothing becomes harder to meet.
+   *
+   * Detached, like the other cascades: a queue walk must not make the manager
+   * wait on their own press, and a failure in it must not fail the budget that
+   * has already been written.
+   */
+  setImmediate(() => {
+    rechainQueueFor(targetId)
+      .then((moved) => {
+        if (moved.length) {
+          console.log(
+            `[rechain] ${moved.length} task(s) moved behind ${taskId}:`,
+            moved.map((m) => `${m.taskId} -> ${m.to}`).join(", "),
+          );
+        }
+      })
+      .catch((e) => console.error("[rechain]", e.message));
+  });
 
   await _notifyMany({
     recipientIds: [targetId].filter((id) => id && id !== employeeId),
