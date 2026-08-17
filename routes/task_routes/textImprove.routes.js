@@ -69,8 +69,15 @@ router.post("/ai/improve-text", verifyCoworkToken, verifyEmployeeToken, async (r
     const outcome = await improveText({ text, mode, instruction, surface });
 
     if (!outcome.ok) {
+      /* `bad_key` joins `not_configured` at 503: a rejected credential is this
+         server being misconfigured, not the upstream being broken, and 502
+         told the browser console the opposite. */
       const status =
-        outcome.reason === "not_configured" ? 503 : outcome.reason === "quota" ? 429 : 502;
+        outcome.reason === "not_configured" || outcome.reason === "bad_key"
+          ? 503
+          : outcome.reason === "quota"
+            ? 429
+            : 502;
       return res.status(status).json({ error: outcome.message, reason: outcome.reason });
     }
 
