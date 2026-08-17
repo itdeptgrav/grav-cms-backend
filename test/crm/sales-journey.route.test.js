@@ -102,14 +102,14 @@ const validBody = (accountId, over = {}) => ({
 /* ── Create ───────────────────────────────────────────────────────────────── */
 
 describe("POST /sales-journeys", () => {
-  test("creates a Journey at the Account stage with a server-assigned reference", async () => {
+  test("creates a Journey at the Enquiry stage with a server-assigned reference", async () => {
     const acc = await activeAccount();
     const { status, body } = await call("", { method: "POST", body: validBody(acc._id) });
 
     expect(status).toBe(201);
     expect(body.success).toBe(true);
     expect(body.journey.reference).toMatch(/^SJ-\d{4}-\d{4}$/);
-    expect(body.journey.currentStage).toBe("account");
+    expect(body.journey.currentStage).toBe("enquiry");
     expect(body.journey.currentStageState).toBe("inProgress");
     expect(body.journey.risk).toBe("onTrack");
     // The customer is RESOLVED from the Account, never copied in by the client.
@@ -145,7 +145,7 @@ describe("POST /sales-journeys", () => {
     });
 
     expect(body.journey.reference).not.toBe("SJ-1900-0001");
-    expect(body.journey.currentStage).toBe("account");
+    expect(body.journey.currentStage).toBe("enquiry");
     expect(body.journey.stageStates.production).toBe("notStarted");
 
     const saved = await SalesJourney.findOne({ journeyId: body.journey.reference }).lean();
@@ -278,7 +278,8 @@ describe("GET /sales-journeys", () => {
     const { accA } = await seed();
     expect((await call(`?scope=team&accountId=${accA._id}`)).body.journeys).toHaveLength(1);
     expect((await call("?scope=team&businessType=repeat")).body.journeys).toHaveLength(1);
-    expect((await call("?scope=team&stage=account")).body.journeys).toHaveLength(2);
+    // New journeys start at Enquiry (the "account" stage was removed).
+    expect((await call("?scope=team&stage=enquiry")).body.journeys).toHaveLength(2);
     expect((await call("?scope=team&stage=production")).body.journeys).toHaveLength(0);
   });
 
@@ -409,7 +410,7 @@ describe("POST /sales-journeys with sourceLeadId — the Lead conversion bridge"
     });
 
     expect(status).toBe(201);
-    expect(body.journey.currentStage).toBe("account");
+    expect(body.journey.currentStage).toBe("enquiry");
 
     const updated = await Lead.findById(lead._id).lean();
     expect(updated.qualificationState).toBe("converted");
@@ -576,10 +577,10 @@ describe("POST /sales-journeys/:journeyId/stage", () => {
     const { status, body } = await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" } });
 
     expect(status).toBe(200);
-    expect(body.journey.currentStage).toBe("enquiry");
+    expect(body.journey.currentStage).toBe("styleSample");
     expect(body.journey.currentStageState).toBe("inProgress");
-    expect(body.journey.stageStates.account).toBe("complete");
-    expect(body.journey.stageStates.enquiry).toBe("inProgress");
+    expect(body.journey.stageStates.enquiry).toBe("complete");
+    expect(body.journey.stageStates.styleSample).toBe("inProgress");
     expect(recordChange).toHaveBeenCalledTimes(1);
   });
 
@@ -593,7 +594,7 @@ describe("POST /sales-journeys/:journeyId/stage", () => {
     // An admin (org-level manager) may move anyone's Journey.
     const allowed = await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" }, user: ADMIN });
     expect(allowed.status).toBe(200);
-    expect(allowed.body.journey.currentStage).toBe("enquiry");
+    expect(allowed.body.journey.currentStage).toBe("styleSample");
   });
 
   test("setState sets a working state on the current stage", async () => {
@@ -603,7 +604,7 @@ describe("POST /sales-journeys/:journeyId/stage", () => {
       body: { action: "setState", toState: "waitingCustomer" },
     });
     expect(status).toBe(200);
-    expect(body.journey.stageStates.account).toBe("waitingCustomer");
+    expect(body.journey.stageStates.enquiry).toBe("waitingCustomer");
     expect(body.journey.waitingOn).toBe("customer");
   });
 
@@ -624,7 +625,7 @@ describe("POST /sales-journeys/:journeyId/stage", () => {
 
     const blocked = await call(`/${ref}/stage`, { method: "POST", body: { action: "block", reason: "Awaiting client GST details" } });
     expect(blocked.status).toBe(200);
-    expect(blocked.body.journey.stageStates.account).toBe("blocked");
+    expect(blocked.body.journey.stageStates.enquiry).toBe("blocked");
 
     const cannotAdvance = await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" } });
     expect(cannotAdvance.status).toBe(400);
@@ -633,28 +634,28 @@ describe("POST /sales-journeys/:journeyId/stage", () => {
 
   test("reopen sends a completed stage back and moves the pointer to it", async () => {
     const ref = await startJourney();
-    await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" } }); // account -> enquiry
+    await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" } }); // enquiry -> styleSample
 
     const reopened = await call(`/${ref}/stage`, {
       method: "POST",
-      body: { action: "reopen", stage: "account", reason: "Billing entity changed" },
+      body: { action: "reopen", stage: "enquiry", reason: "Requirement changed" },
     });
     expect(reopened.status).toBe(200);
-    expect(reopened.body.journey.currentStage).toBe("account");
-    expect(reopened.body.journey.stageStates.account).toBe("reopened");
+    expect(reopened.body.journey.currentStage).toBe("enquiry");
+    expect(reopened.body.journey.stageStates.enquiry).toBe("reopened");
 
     // A stage that isn't complete cannot be reopened.
     const notComplete = await call(`/${ref}/stage`, {
       method: "POST",
-      body: { action: "reopen", stage: "enquiry", reason: "x" },
+      body: { action: "reopen", stage: "styleSample", reason: "x" },
     });
     expect(notComplete.status).toBe(400);
   });
 
   test("advancing off the final stage, and unknown actions, are clean 400s", async () => {
     const ref = await startJourney();
-    // Walk to the last stage (7 advances: account → … → retention).
-    for (let i = 0; i < 7; i++) {
+    // Walk to the last stage (6 advances: enquiry → … → retention).
+    for (let i = 0; i < 6; i++) {
       const r = await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" } });
       expect(r.status).toBe(200);
     }
@@ -671,29 +672,9 @@ describe("POST /sales-journeys/:journeyId/stage", () => {
     expect(status).toBe(404);
   });
 
-  test("Account → Enquiry is refused until the account is complete, then allowed", async () => {
-    // A bare account: no contact, no role, no location, no owner, no profile.
-    const acc = await activeAccount();
-    const created = await call("", { method: "POST", body: validBody(acc._id), user: OWNER });
-    expect(created.status).toBe(201);
-    const ref = created.body.journey.reference;
-
-    const blocked = await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" } });
-    expect(blocked.status).toBe(400);
-    expect(blocked.body.message).toMatch(/isn't ready for an Enquiry|Primary contact|Business role/i);
-
-    // Complete the foundation, then the same advance succeeds.
-    await Account.updateOne(
-      { _id: acc._id },
-      { $set: { roles: ["uniform_client"], assignedToName: "Owner Person", "garmentSalesProfile.businessModels": ["uniforms"] } },
-    );
-    await Contact.create({ accountId: acc._id, firstName: "Priya", lastName: "Nair", isPrimary: true });
-    await Site.create({ accountId: acc._id, name: "Head office", siteType: "head_office" });
-
-    const ok = await call(`/${ref}/stage`, { method: "POST", body: { action: "advance" } });
-    expect(ok.status).toBe(200);
-    expect(ok.body.journey.currentStage).toBe("enquiry");
-  });
+  // (Removed 13 Aug 2026: the "Account → Enquiry is refused until the account is
+  // complete" gate no longer exists — "account" is not a journey stage. The
+  // customer is set up on the Active Lead before conversion.)
 });
 
 /* ── Pure planner ───────────────────────────────────────────────────────────
@@ -719,19 +700,6 @@ describe("planStageTransition (service)", () => {
     ).toThrow(/final stage/i);
   });
 
-  test("account gate: advance is refused when context says the account isn't ready", () => {
-    const journey = { currentStage: "account", stageStates: { account: "inProgress" } };
-    expect(() =>
-      planStageTransition(journey, {
-        action: "advance",
-        context: { accountReadiness: { ready: false, missing: [{ label: "Primary contact" }] } },
-      }),
-    ).toThrow(/Primary contact/i);
-    // Ready context (or no context) lets the same move through.
-    expect(
-      planStageTransition(journey, { action: "advance", context: { accountReadiness: { ready: true, missing: [] } } }).set
-        .currentStage,
-    ).toBe("enquiry");
-    expect(planStageTransition(journey, { action: "advance" }).set.currentStage).toBe("enquiry");
-  });
+  // (Removed 13 Aug 2026: the account-readiness gate no longer exists — "account"
+  // is not a journey stage; the customer is set up on the Active Lead.)
 });

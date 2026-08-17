@@ -147,12 +147,32 @@ const enquirySchema = new mongoose.Schema(
     // snapshot so the CMS can render without a round trip to CoWork on every
     // list view. Source of truth for membership stays the CoWork document
     // itself — see services/coworkSheets.service.js.
+    // A product now has ONE SHEET PER CONTRIBUTOR, not one sheet (17 Aug 2026).
+    // CoWork's roles are whole-document, so the only way to say "the
+    // merchandiser owns the materials and the industrial engineer owns the
+    // operations" is to give each of them their own document. `part` says which
+    // half a row is, and (productName, part) is the key.
+    //
+    //   raw        → the merchandiser's raw-materials sheet
+    //   operations → the industrial engineer's operations sheet
+    //   combined   → a pre-split two-tab sheet. Rows written before the split
+    //                have no `part` at all and default to this, so the costings
+    //                already out there keep resolving without a migration.
     costingSheets: [
       new mongoose.Schema(
         {
           productName: { type: String, trim: true, required: true },
+          part: { type: String, trim: true, enum: ["raw", "operations", "combined"], default: "combined" },
           documentId: { type: String, trim: true, required: true }, // cowork_documents doc id
           title: { type: String, trim: true },
+          // Whose sheet this is — the one person expected to fill it in, held
+          // separately from `members` because "has access" and "is responsible
+          // for it" are different questions and the second one is the one Sales
+          // chases.
+          assignee: {
+            employeeId: { type: String, trim: true },
+            name: { type: String, trim: true },
+          },
           createdAt: { type: Date, default: Date.now },
           createdBy: actorRef(),
           members: [
@@ -166,6 +186,65 @@ const enquirySchema = new mongoose.Schema(
         { _id: false },
       ),
     ],
+
+    // The CustomerRequest this enquiry's quotation / proforma invoice lives on.
+    //
+    // It is also the ONLY reliable route from a journey to its production: work
+    // orders carry `customerRequestId`, so without this link the CMS has to
+    // guess by matching the customer's NAME, which breaks on a rename and on
+    // two similarly-named accounts. Recorded the first time the quotation is
+    // opened, and back-filled by the production route when it has to resolve
+    // one itself, so the guess happens at most once per enquiry.
+    customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: null, index: true },
+
+
+    // ── Off-schedule dispatch asks (17 Aug 2026) ────────────────────────────
+    //
+    // ON-SCHEDULE DISPATCH IS NOT SALES' JOB. The dispatch team works the
+    // schedule themselves and needs nothing from this app. The one thing only
+    // Sales knows is when a CUSTOMER wants some of the order early — a manager
+    // needs eight shirts for an inspection on Friday — and that is an exception
+    // to the schedule, so it is a REQUEST with a reason, not a dispatch.
+    //
+    // `reason` is required and free text. A dropdown of canned reasons would
+    // turn "why are we breaking the schedule" into a shrug, and dispatch has to
+    // read a sentence to decide.
+    earlyDispatchRequests: [
+      new mongoose.Schema(
+        {
+          pieces: { type: Number, required: true, min: 1 },
+          reason: { type: String, required: true, trim: true },
+          neededBy: { type: Date, default: null },
+          status: {
+            type: String,
+            enum: ["requested", "accepted", "declined", "dispatched"],
+            default: "requested",
+          },
+          requestedAt: { type: Date, default: Date.now },
+          requestedBy: actorRef(),
+          decidedAt: { type: Date, default: null },
+          decidedBy: actorRef(),
+          decisionNote: { type: String, trim: true, default: "" },
+        },
+        { timestamps: false },
+      ),
+    ],
+
+    // Who this enquiry's costings go to. Chosen once and reused for every
+    // product on the enquiry, overridable per product at creation — a costing
+    // team is a standing arrangement, not a per-sheet decision, and re-picking
+    // the same two people for each of five products is how the wrong person
+    // ends up on one of them.
+    costingTeam: {
+      merchandiser: {
+        employeeId: { type: String, trim: true },
+        name: { type: String, trim: true },
+      },
+      industrialEngineer: {
+        employeeId: { type: String, trim: true },
+        name: { type: String, trim: true },
+      },
+    },
 
     // ── Indicative pricing (Chunk 4) ────────────────────────────────────────
     // INDICATIVE only — NOT the formal quote (that's the Cost & Quote stage).

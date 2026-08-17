@@ -43,16 +43,14 @@ const mongoose = require("mongoose");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
-const Site = require("../../../models/CMS_Models/Sales/Site");
-const Address = require("../../../models/CMS_Models/Sales/Address");
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
 const { createWithRef } = require("../../../services/salesJourneyRef");
+const { closingVerdictForJourney } = require("../../../services/closingVerdict");
 const { assertLeadConvertible, deriveLegacyStage } = require("../../../services/leadQualification");
 const { planStageTransition, JourneyTransitionError } = require("../../../services/salesJourneyProgress");
-const { computeAccountEnquiryReadiness } = require("../../../services/accountReadiness");
 const { isSalesManager } = require("../../../services/salesAccess");
 const {
   canViewCredit,
@@ -216,6 +214,11 @@ function detailDto(j) {
   const p = j.parties || {};
   return {
     ...summaryDto(j),
+    // Where this order came from. Null for walk-in and repeat business that
+    // never had a lead — the field is optional by design.
+    sourceLead: j.leadId
+      ? { id: String(j.leadId._id || j.leadId), ref: j.leadRef || null }
+      : null,
     primaryContact: j.primaryContactId
       ? {
           id: String(j.primaryContactId._id || j.primaryContactId),
@@ -512,6 +515,12 @@ router.post("/", salesAuth, async (req, res) => {
       // cannot start a Journey at Production.
       createdBy: actor(req),
       updatedBy: actor(req),
+      // The reverse half of the Lead → Journey bridge. The Lead already records
+      // the Journey (the `links` append below), but nothing recorded the Lead on
+      // the JOURNEY — so from an order you could not name the lead that won it
+      // without scanning every lead's links for this journey's id. `sourceLead`
+      // is already resolved and validated above, so this costs nothing.
+      ...(sourceLead ? { leadId: sourceLead._id, leadRef: sourceLead.leadId || undefined } : {}),
       ...(targetDate ? { targetDate: { label: String(b.targetDate?.label || "Target").trim(), date: targetDate } } : {}),
       ...(expectedAmount !== undefined
         ? {
@@ -666,6 +675,73 @@ router.post("/", salesAuth, async (req, res) => {
    never even reaches here: salesWrites() at the mount has already answered 202
    and held it as a ChangeRequest.) */
 
+// PATCH /api/cms/crm/sales-journeys/:journeyId/po
+// Record the customer's purchase order against the journey. This is what makes
+// "do not start production without a PO" checkable at all — before it, nothing
+// anywhere held a PO, so the PO/Contract stage could complete on nothing.
+router.patch("/:journeyId/po", salesAuth, async (req, res) => {
+  try {
+    const journey = await SalesJourney.findOne({ journeyId: req.params.journeyId, isActive: true });
+    if (!journey) {
+      return res.status(404).json({ success: false, message: `No Sales Journey matches ${req.params.journeyId}.` });
+    }
+    const isOwner = String(journey.ownerId) === String(req.user?.id);
+    if (!isOwner && !(await isSalesManager(req.user))) {
+      return res.status(403).json({
+        success: false,
+        message: "Only this Journey's owner or a Sales manager can record the PO.",
+      });
+    }
+
+    const b = req.body || {};
+    const number = String(b.number || "").trim();
+    if (!number) throw new ValidationError("The customer's PO number is required.");
+
+    let poDate;
+    if (b.date) {
+      poDate = new Date(b.date);
+      if (Number.isNaN(poDate.getTime())) throw new ValidationError("PO date is not a valid date.");
+    }
+    let amount;
+    if (b.amount !== undefined && b.amount !== null && b.amount !== "") {
+      amount = Number(b.amount);
+      if (!Number.isFinite(amount) || amount < 0) throw new ValidationError("PO amount must be a positive number.");
+    }
+
+    const before = journey.toObject();
+    journey.po = {
+      number,
+      ...(poDate ? { date: poDate } : {}),
+      ...(amount !== undefined ? { amount } : {}),
+      currency: String(b.currency || journey.po?.currency || "INR").trim().toUpperCase(),
+      ...(b.file?.name || b.file?.url
+        ? { file: { name: String(b.file.name || "").trim(), url: String(b.file.url || "").trim() } }
+        : {}),
+      recordedAt: new Date(),
+      recordedBy: { employeeId: req.user?.employeeId || "", name: req.user?.name || "" },
+    };
+    journey.updatedBy = actor(req);
+    await journey.save();
+
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-sales-journey",
+      entityId: journey._id,
+      entityLabel: journey.journeyId,
+      action: "update",
+      summary: `Sales Journey ${journey.journeyId} PO recorded (${number})`,
+      before,
+      after: journey.toObject(),
+    });
+
+    const saved = await SalesJourney.findById(journey._id).populate(POPULATE_DETAIL).lean({ virtuals: false });
+    return res.json({ success: true, journey: stripJourneyCommercial(detailDto(saved), req.user) });
+  } catch (err) {
+    const status = err instanceof ValidationError || err.name === "ValidationError" ? 400 : 500;
+    return res.status(status).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/:journeyId/stage", salesAuth, async (req, res) => {
   try {
     const journey = await SalesJourney.findOne({ journeyId: req.params.journeyId, isActive: true });
@@ -683,29 +759,29 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
 
     const b = req.body || {};
 
-    // Account → Enquiry is a real, server-enforced gate: the customer
-    // foundation must be complete before this Journey can leave the Account
-    // stage. The rule (services/accountReadiness.js) is DB-dependent, so we
-    // load the account bundle here and hand the planner the verdict as context
-    // — the same caller-computes-facts/planner-enforces split the Lead
-    // qualification gate uses. Only worth loading when actually advancing off
-    // the Account stage.
+    // The old Account → Enquiry readiness gate was removed on 13 Aug 2026:
+    // "account" is no longer a journey stage (the customer is set up on the
+    // Active Lead before conversion), so there is no account bundle to load or
+    // verdict to hand the planner.
+    //
+    // Closing is the one transition that DOES get a verdict. It is the moment
+    // money and delivery are declared settled, and until now the only thing
+    // stopping a close with unmet checks was a disabled button on one screen —
+    // which any direct API call walked straight past. Computed only for `close`
+    // so no other transition pays for the four queries behind it.
     let context;
-    if (String(b.action || "").trim() === "advance" && journey.currentStage === "account" && journey.accountId) {
-      const accId = journey.accountId;
-      const [account, contacts, sites, addresses] = await Promise.all([
-        Account.findById(accId).select("roles assignedToName garmentSalesProfile.businessModels").lean(),
-        Contact.countDocuments({ accountId: accId, isActive: true }),
-        Site.countDocuments({ accountId: accId, isActive: true }),
-        Address.countDocuments({ accountId: accId, isActive: true }),
-      ]);
+    if (b.action === "close") {
+      const closing = await closingVerdictForJourney(journey._id);
+      if (closing) context = { closing };
+    } else if (b.action === "advance") {
+      // Only the Production gate needs anything, and it needs one boolean plus
+      // who is asking. `poOnFile` is derived here rather than trusted from the
+      // client for the obvious reason.
       context = {
-        accountReadiness: computeAccountEnquiryReadiness({
-          account,
-          contacts: { length: contacts },
-          sites: { length: sites },
-          addresses: { length: addresses },
-        }),
+        poOnFile: Boolean(journey.po?.number),
+        isManager: isOwner ? await isSalesManager(req.user) : true,
+        overrideReason: b.overrideReason || b.reason || "",
+        actor: { employeeId: req.user?.employeeId || "", name: req.user?.name || "" },
       };
     }
 
@@ -720,6 +796,11 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
 
     const before = journey.toObject();
     for (const [path, value] of Object.entries(plan.set)) journey.set(path, value);
+    // Array appends come back separately — see the planner's note on why this is
+    // not a $push inside `set`.
+    if (plan.append) {
+      journey[plan.append.path] = [...(journey[plan.append.path] || []), plan.append.value];
+    }
     journey.updatedBy = actor(req);
     await journey.save();
 
