@@ -1597,6 +1597,82 @@ async function _reviewFlow(task) {
   return "tl_final";
 }
 
+
+/** A time as the reader would say it — "17:59", or "tomorrow 09:45". */
+function _istShort(iso, nowMs = Date.now()) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const opts = { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false };
+  const time = d.toLocaleTimeString("en-GB", opts);
+  const day = (x) => new Date(x).toLocaleDateString("en-GB", { timeZone: "Asia/Kolkata" });
+  if (day(d) === day(nowMs)) return time;
+  const tomorrow = day(nowMs + 86400000);
+  if (day(d) === tomorrow) return `tomorrow ${time}`;
+  return `${d.toLocaleDateString("en-GB", { timeZone: "Asia/Kolkata", day: "numeric", month: "short" })} ${time}`;
+}
+
+/**
+ * Tell people whose deadline moved because somebody else's work did.
+ *
+ * OWNER DECISION, 18 Aug 2026. The queue re-chains silently, which is fine
+ * when a date moves out and not fine when it comes in: somebody who planned
+ * around 18:19 and is now due 17:59 has lost twenty minutes and would find out
+ * by missing it.
+ *
+ * **Two channels, deliberately different volumes.** Every move writes a system
+ * message on the task itself — that is the permanent record of why a date
+ * changed, and it interrupts nobody. Only a move that takes time AWAY also
+ * sends a notification. One submission can re-chain four tasks, and four
+ * pushes for four dates that all got easier is how people learn to ignore
+ * notifications.
+ *
+ * **It names the cause.** "Deadline moved" on its own reads like a system
+ * fault; "task 123 above this was handed in early" is something the reader can
+ * check and, if it looks wrong, argue with.
+ *
+ * Never allowed to cost the thing it reports: the deadlines are already
+ * written by the time this runs.
+ */
+async function _announceQueueShifts({ moved, employeeId, causeTaskId, causeTitle, causeReason, actorId, actorName }) {
+  for (const row of moved || []) {
+    /* Nothing to announce for a task that had no deadline before, or for the
+       task whose own event caused all this. */
+    if (!row.from || row.from === row.to) continue;
+    if (causeTaskId && row.taskId === causeTaskId) continue;
+
+    const earlier = Date.parse(row.to) < Date.parse(row.from);
+    const because = causeTitle ? ` — “${causeTitle}” above this ${causeReason}` : "";
+    const when = `${_istShort(row.to)} (was ${_istShort(row.from)})`;
+
+    try {
+      await sendTaskChat({
+        taskId: row.taskId,
+        senderId: actorId,
+        senderName: actorName,
+        text: `⏱ Deadline moved to ${when}${because}.`,
+        messageType: "system",
+      });
+    } catch (e) {
+      console.warn("[queueShift] chat failed for", row.taskId, e.message);
+    }
+
+    if (!earlier || !employeeId) continue;
+    try {
+      await _notifyMany({
+        recipientIds: [employeeId],
+        type: "deadline_moved_earlier",
+        title: `⏱ Less time · ${row.title}`,
+        body: `Now due ${when}${because}.`,
+        data: { taskId: row.taskId, taskTitle: row.title, from: row.from, to: row.to, causeTaskId },
+        senderId: actorId,
+        senderName: actorName,
+      });
+    } catch (e) {
+      console.warn("[queueShift] notify failed for", row.taskId, e.message);
+    }
+  }
+}
+
 // ═════════════════════════════════════════════════════════
 //  12. SUBMIT COMPLETION REQUEST (employee)
 // ═════════════════════════════════════════════════════════
@@ -1612,6 +1688,42 @@ async function submitCompletionRequest({ taskId, employeeId, employeeName, messa
   const submission = { submittedBy: employeeId, submittedByName: employeeName, message, imageUrls, pdfAttachments, submittedAt: new Date().toISOString() };
 
   await ref.update({ completionStatus: "submitted", completionSubmission: submission, reviewFlow: flow, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+  /**
+   * **Handing work in frees the queue behind it, now rather than eventually.**
+   * OWNER DECISION, 18 Aug 2026.
+   *
+   * This is the moment the person stops working on the task — they are waiting
+   * on a reviewer — so everything queued below it can start earlier. The walk
+   * already knew how to work that out; nothing was calling it here, so the
+   * correction only arrived if some later event happened to re-chain the
+   * queue.
+   *
+   * Reported with real data: T071 (P1, due 17:58) was handed in at 17:38, and
+   * T072 (P2, 21 min) sat at 18:19 — T071's DEADLINE plus 21 minutes — when
+   * its honest finish was 17:59.
+   *
+   * Never allowed to cost the submission: the work is already recorded by this
+   * point, and a queue that re-chains late is recoverable where a submission
+   * that failed to save is not.
+   */
+  try {
+    const { rechainQueueFor } = require("./officeDeadline.service");
+    for (const id of task.assigneeIds || []) {
+      const moved = await rechainQueueFor(id);
+      await _announceQueueShifts({
+        moved,
+        employeeId: id,
+        causeTaskId: taskId,
+        causeTitle: task.title,
+        causeReason: "was handed in",
+        actorId: employeeId,
+        actorName: employeeName,
+      });
+    }
+  } catch (e) {
+    console.warn("[submitCompletionRequest] queue re-chain failed:", e.message);
+  }
 
   const attachments = [
     ...imageUrls.map(url => ({ type: "image", url, name: "Proof" })),
@@ -1830,7 +1942,7 @@ function reworkHistoryEntry(
   ];
 }
 
-async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
+async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds, reworkPriority = null }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1911,8 +2023,31 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
       newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
     }
 
+    /**
+     * **Where the rework sits in the person's queue — the reviewer's call.**
+     * OWNER DECISION, 18 Aug 2026.
+     *
+     * A rejection puts work back on somebody who has already moved on to the
+     * next thing, and only the reviewer knows whether this rework matters more
+     * than what they are doing now. Until this, the rework silently kept its
+     * old rank and nothing behind it moved at all.
+     *
+     * Optional on purpose. A reviewer who does not care, or a client that
+     * never sends it, leaves the rank exactly as it was — losing a rejection
+     * because a priority picker failed would be far worse than a queue in a
+     * slightly wrong order.
+     */
+    const reworkUpdate = {};
+    const wantedRank = Number(reworkPriority);
+    if (Number.isFinite(wantedRank) && wantedRank > 0) {
+      const perAssignee = { ...(task.assigneePriorities || {}) };
+      for (const id of task.assigneeIds || []) perAssignee[id] = wantedRank;
+      reworkUpdate.assigneePriorities = perAssignee;
+      reworkUpdate.priority = wantedRank;
+    }
+
     await ref.update({ completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
-      completionStatus: "tl_rejected", tlReview, status: "in_progress", [deadlineField]: newDeadline, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      completionStatus: "tl_rejected", tlReview, status: "in_progress", [deadlineField]: newDeadline, ...reworkUpdate, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
     await sendTaskChat({ taskId, senderId: reviewerId, senderName: reviewerName, text: `❌ ${reviewerName} rejected.\n📝 Reason: ${rejectionReason.trim()}`, messageType: "system" });
 
     if (submitterId) {
@@ -1965,6 +2100,37 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
   const finalStatus = approved
     ? (flow === "tl_final" ? "tl_final_approved" : flow === "ceo_direct" ? "ceo_approved" : "tl_approved")
     : "tl_rejected";
+  /**
+   * **Either outcome changes the queue, so both re-chain.**
+   *
+   * An approval takes the task out of the queue altogether, so the work below
+   * it can start earlier. A rejection puts it back in, at whatever priority
+   * the reviewer chose, so the work below it moves out. One call after the
+   * decision is written covers both, rather than a copy in each branch that
+   * could drift apart.
+   *
+   * Never allowed to cost the review: that is already saved by this point, and
+   * a queue that re-chains late is recoverable where a review that failed to
+   * save is not.
+   */
+  try {
+    const { rechainQueueFor } = require("./officeDeadline.service");
+    for (const id of task.assigneeIds || []) {
+      const moved = await rechainQueueFor(id);
+      await _announceQueueShifts({
+        moved,
+        employeeId: id,
+        causeTaskId: taskId,
+        causeTitle: task.title,
+        causeReason: "was reviewed",
+        actorId: reviewerId,
+        actorName: reviewerName,
+      });
+    }
+  } catch (e) {
+    console.warn("[reviewCompletion] queue re-chain failed:", e.message);
+  }
+
   return { success: true, taskId, approved, completionStatus: finalStatus, reviewFlow: flow };
 }
 
@@ -1974,7 +2140,7 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
 // ═════════════════════════════════════════════════════════
 //  C1 REWORK — TL sends task back for rework (-0.2 per occurrence)
 // ═════════════════════════════════════════════════════════
-async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiveDeduction = false, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds}) {
+async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiveDeduction = false, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds, reworkPriority = null }) {
   const ref = db.collection("cowork_tasks").doc(taskId);
   const doc = await ref.get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -2058,10 +2224,35 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
   // What exactly failed — enforced here, not only in the browser.
   const _reworkReqs = validateReworkRequirements(task, reworkRequirements, await claimedParentRequirementTexts(task));
   const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, reworkReason, reworkNote, reworkAttachments, reworkAttachmentIds);
+
+  /**
+   * **Where the returned work sits in the person's queue — the reviewer's
+   * call.** OWNER DECISION, 18 Aug 2026.
+   *
+   * Sending work back puts it on somebody who has already moved on to the next
+   * thing, and only the reviewer knows whether this rework outranks what they
+   * are doing now. Until this, it silently kept its old rank and nothing
+   * behind it moved at all.
+   *
+   * Optional on purpose. A reviewer who does not care, or a client that never
+   * sends it, leaves the rank exactly as it was — losing a rework because a
+   * priority picker failed would be far worse than a queue in a slightly wrong
+   * order.
+   */
+  const _wantedRank = Number(reworkPriority);
+  const _rankUpdate = {};
+  if (Number.isFinite(_wantedRank) && _wantedRank > 0) {
+    const perAssignee = { ...(task.assigneePriorities || {}) };
+    for (const id of task.assigneeIds || []) perAssignee[id] = _wantedRank;
+    _rankUpdate.assigneePriorities = perAssignee;
+    _rankUpdate.priority = _wantedRank;
+  }
+
   await ref.update({
     completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
       completionStatus: null,
     status: "in_progress",
+    ..._rankUpdate,
     [deadlineField]: newDeadline,
     "c1.reworksReceived": currentReworks + 1,
     reworkHistory: admin.firestore.FieldValue.arrayUnion({
@@ -2078,6 +2269,32 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
+  /**
+   * The rest of that person's queue now chains behind wherever this landed.
+   * Each assignee is walked separately because a queue belongs to a person,
+   * not to a task.
+   *
+   * Never allowed to cost the rework: it is already written by this point, and
+   * a queue that re-chains late is recoverable where a rework that failed to
+   * save is not.
+   */
+  try {
+    const { rechainQueueFor } = require("./officeDeadline.service");
+    for (const id of task.assigneeIds || []) {
+      const moved = await rechainQueueFor(id);
+      await _announceQueueShifts({
+        moved,
+        employeeId: id,
+        causeTaskId: taskId,
+        causeTitle: task.title,
+        causeReason: "was sent back for rework",
+        actorId: reviewerId,
+        actorName: reviewerName,
+      });
+    }
+  } catch (e) {
+    console.warn("[reworkTask] queue re-chain failed:", e.message);
+  }
 
   await sendTaskChat({
     taskId, senderId: reviewerId, senderName: reviewerName,

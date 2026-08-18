@@ -201,6 +201,49 @@ function acceptanceAnchorMs({
  */
 const TERMINAL_STATUSES = ["done", "cancelled", "tl_final_approved", "ceo_approved"];
 
+/**
+ * Has this task been handed in and is now waiting on somebody else?
+ *
+ * It is NOT terminal — the manager can still send it back, so it keeps its
+ * place in the queue and its score is still open. But the person is no longer
+ * working on it, which is a different question and the one the queue cares
+ * about.
+ */
+function isAwaitingReview(task) {
+  return (
+    !TERMINAL_STATUSES.includes(task.status) &&
+    task.completionStatus === "submitted"
+  );
+}
+
+/**
+ * When this task stopped occupying its assignee — the value everything BELOW
+ * it in the queue should chain from.
+ *
+ * OWNER DECISION, 18 Aug 2026. Reported: A is due 2pm and handed in at 1pm; B
+ * is two hours and came out due 4pm, as though the person sat idle until A's
+ * deadline. They did not — they were free at 1pm, and B's honest finish is
+ * 3pm.
+ *
+ * **Submission, not the deadline.** The old reading was wrong in both
+ * directions, which is what gives it away: finishing an hour early bought the
+ * person nothing, and handing in half an hour LATE still started the next task
+ * at the old deadline, so B inherited a deadline it never had a chance to
+ * meet. The moment the work left their hands is the only honest answer to
+ * both.
+ *
+ * A task still being worked on has no such moment yet, so its deadline stands
+ * — it is the best estimate available, and it is what the engine has always
+ * used.
+ */
+function effectiveEndMs(task) {
+  if (isAwaitingReview(task)) {
+    const handedOver = readMs(task.completionSubmission?.submittedAt);
+    if (Number.isFinite(handedOver)) return handedOver;
+  }
+  return readMs(task.dueDate);
+}
+
 /** This person's rank on this task — legacy's own precedence. */
 function rankOf(task, employeeId) {
   const per = task.assigneePriorities || {};
@@ -283,7 +326,9 @@ async function queueAheadEndMs(task, taskId, employeeId, nowMs) {
      */
     if (other.fixedDeadline || other.hasTimer === false) return;
 
-    const end = readMs(other.dueDate);
+    /* Submitted work stops occupying the person at the moment it was handed
+       over, not at the deadline it was given — see `effectiveEndMs`. */
+    const end = effectiveEndMs(other);
     if (!Number.isFinite(end)) return;
     if (latestMs === null || end > latestMs) {
       latestMs = end;
@@ -422,24 +467,52 @@ async function rechainQueueFor(employeeId, opts = {}) {
     .where("assigneeIds", "array-contains", String(employeeId))
     .get();
 
+  /**
+   * `opts.simulate` turns this walk into the answer to "what would happen if I
+   * sent this back at that priority?" — the rejection screen asks it on every
+   * keystroke of the priority picker, so it must never write.
+   *
+   * The task being sent back is currently sitting in `submitted`, which the
+   * walk otherwise skips. Under the simulation it is active work again, with
+   * the rank the manager is considering and the leftover budget the rework
+   * rule will give it.
+   */
+  const sim = opts.simulate || null;
+  if (sim && !opts.dryRun) {
+    throw new Error("simulate requires dryRun — a preview must not write.");
+  }
+
   const live = [];
   snap.forEach((doc) => {
     const t = doc.data();
+    const simulated = sim && doc.id === String(sim.taskId);
     if (TERMINAL_STATUSES.includes(t.status)) return;
     if (t.fixedDeadline || t.hasTimer === false) return;
-    const anchorMs = readMs(t.clockStartsAtMs);
-    const secs =
-      Number(t.deadlineWindowSecs) || Number(t.senderTimerWindowSecs) || 0;
+    const anchorMs = simulated ? sim.startMs : readMs(t.clockStartsAtMs);
+    const secs = simulated
+      ? Number(sim.secs) || 0
+      : Number(t.deadlineWindowSecs) || Number(t.senderTimerWindowSecs) || 0;
     if (!Number.isFinite(anchorMs) || secs <= 0) return;
     live.push({
       ref: doc.ref,
       id: doc.id,
       title: t.title || doc.id,
-      rank: rankOf(t, employeeId),
+      rank: simulated ? Number(sim.rank) : rankOf(t, employeeId),
       createdMs: readMs(t.createdAtISO) ?? readMs(t.createdAt) ?? 0,
       anchorMs,
       secs,
       dueMs: readMs(t.dueDate),
+      /* Already handed in and waiting on a reviewer. Two consequences below:
+         everything under it chains from THIS instead of its deadline, and its
+         own deadline is left alone. */
+      /* Under a simulation the task being sent back is active work again,
+         so it is walked and given a deadline rather than skipped. */
+      awaitingReview: simulated ? false : isAwaitingReview(t),
+      handedOverMs: simulated ? null : effectiveEndMs(t),
+      isRework: Boolean(simulated),
+      /* Where the stored anchor came from. `after_priority_work` means THIS
+         walk wrote it on a previous run — see the anchor decision below. */
+      anchorSource: t.clockStartsAtSource ?? null,
       parentTaskId: t.parentTaskId || null,
       raw: t,
     });
@@ -455,8 +528,51 @@ async function rechainQueueFor(employeeId, opts = {}) {
   let previousEndMs = null;
 
   for (const task of live) {
+    /**
+     * **A task already handed in is not recomputed.**
+     *
+     * Its deadline is finished business: the rework rule measures the time it
+     * did not use as `deadline − submittedAt`, so moving that deadline later
+     * would silently hand the rework time nobody earned. It still occupies its
+     * place in the queue — the reviewer can send it back — and everything
+     * under it chains from when it was handed over.
+     */
+    if (task.awaitingReview) {
+      if (Number.isFinite(task.handedOverMs)) previousEndMs = task.handedOverMs;
+      continue;
+    }
+
+    /**
+     * **A stored anchor that this walk wrote is not evidence — it is this
+     * walk's own previous answer.** OWNER DECISION, 18 Aug 2026.
+     *
+     * Reported with real data: T069 (P3, due 17:21) was handed in at 17:02,
+     * and T070 (P4, 30 min) stayed at 17:51 instead of moving to 17:32. The
+     * handover was being read correctly; what blocked it was `Math.max`
+     * comparing the new answer against T070's stored anchor of 17:21 — a value
+     * a PREVIOUS run of this same walk had written from T069's old deadline.
+     * The chain was defending its own stale output, so it could never correct
+     * itself downward.
+     *
+     * `clockStartsAtSource` already records which of the two a stored anchor
+     * is, so the distinction is exact rather than a blanket loosening:
+     *
+     * - `after_priority_work` — written here. Recomputed from the queue.
+     * - anything else (`first_online`, `hours_granted`, `acceptance`) — a real
+     *   statement that the person could not have started before that moment,
+     *   which still wins over the queue.
+     *
+     * With nothing ahead there is no queue answer to use, so the stored value
+     * stands whatever its source: the task's true anchor was overwritten and
+     * cannot be recovered.
+     */
+    const anchorIsQueueDerived = task.anchorSource === "after_priority_work";
     const anchorMs =
-      previousEndMs === null ? task.anchorMs : Math.max(task.anchorMs, previousEndMs);
+      previousEndMs === null
+        ? task.anchorMs
+        : anchorIsQueueDerived
+          ? previousEndMs
+          : Math.max(task.anchorMs, previousEndMs);
     let dueIso = addWorkingSecsIST(
       anchorMs,
       task.secs,
@@ -480,12 +596,43 @@ async function rechainQueueFor(employeeId, opts = {}) {
     const dueMs = Date.parse(dueIso);
     /* Written only when it moves LATER. Equal dates and earlier ones are both
        left alone — the second deliberately, so a queue that emptied does not
-       shorten commitments people are already working to. */
-    if (
+       shorten commitments people are already working to.
+
+       The task being sent back is exempt: it is being handed a fresh budget
+       from this moment, so its new deadline IS the answer even when that is
+       earlier than the one it carried. */
+    const movesLater =
       Number.isFinite(dueMs) &&
       (task.dueMs === null || dueMs > task.dueMs) &&
-      anchorMs > task.anchorMs
-    ) {
+      anchorMs > task.anchorMs;
+
+    /**
+     * A queue-derived anchor is recomputed in BOTH directions — that is the
+     * whole point of distinguishing it. The protection it loses is one it was
+     * never entitled to: it was this walk's own arithmetic, not a promise the
+     * task had any independent claim to.
+     *
+     * **But only when the ANCHOR actually moved.** Found on live data: T066
+     * carries a queue anchor of 10:05:39 and a 195-minute budget, which would
+     * make it due 13:21 — yet its stored deadline is 15:30, put there by
+     * something this walk knows nothing about, an extension or a negotiated
+     * budget. The task above it had not been handed over, so its anchor was
+     * still right and nothing about it should have moved; without this
+     * condition the walk would have overwritten that 15:30 with a time
+     * already two hours in the past, and the task would have gone instantly
+     * overdue for a reason nobody could explain.
+     *
+     * So the trigger is the anchor changing, never a disagreement between the
+     * stored deadline and what this walk would compute — that disagreement is
+     * somebody else's decision, not a fault to correct.
+     */
+    const correctsItself =
+      anchorIsQueueDerived &&
+      Number.isFinite(dueMs) &&
+      anchorMs !== task.anchorMs &&
+      dueMs !== task.dueMs;
+
+    if (movesLater || correctsItself || task.isRework) {
       if (!opts.dryRun) {
         await task.ref.update({
           clockStartsAtMs: anchorMs,
@@ -496,15 +643,55 @@ async function rechainQueueFor(employeeId, opts = {}) {
       moved.push({
         taskId: task.id,
         title: task.title,
+        rank: task.rank,
+        isRework: Boolean(task.isRework),
         from: task.dueMs === null ? null : new Date(task.dueMs).toISOString(),
         to: dueIso,
       });
+    } else if (opts.reportAll) {
+      /* A preview has to show the rows that DON'T move too — "Task C is
+         untouched" is half of what the manager is deciding between. */
+      moved.push({
+        taskId: task.id,
+        title: task.title,
+        rank: task.rank,
+        isRework: false,
+        from: task.dueMs === null ? null : new Date(task.dueMs).toISOString(),
+        to: task.dueMs === null ? dueIso : new Date(task.dueMs).toISOString(),
+      });
     }
 
-    previousEndMs = Math.max(dueMs, task.dueMs ?? dueMs);
+    /* The task that follows chains from where THIS one now ends. Taking the
+       later of old and new would keep a corrected deadline's old value alive
+       and push everything below it out again — undoing the correction one row
+       further down. */
+    previousEndMs = anchorIsQueueDerived
+      ? dueMs
+      : Math.max(dueMs, task.dueMs ?? dueMs);
   }
 
   return moved;
+}
+
+/**
+ * The time a rework will be given, in seconds.
+ *
+ * **This mirrors the rule in `taskForward.service.js`, it does not replace
+ * it.** That rule is the one that actually writes the deadline on rejection —
+ * due 6:00 handed in at 5:00 gives the rework the whole unused hour, not the
+ * fifteen minutes that were left when the reviewer got to it — and it is not
+ * being changed. This exists so the rejection SCREEN can show the same number
+ * before the manager commits, and it is read from the same two fields so the
+ * two cannot drift apart.
+ *
+ * Null when the task carries no deadline or was never submitted, which is the
+ * caller's signal that there is nothing to preview.
+ */
+function reworkLeftoverSecs(task) {
+  const dueMs = readMs(task.dueDate) ?? readMs(task.fixedDeadline);
+  const submittedMs = readMs(task.completionSubmission?.submittedAt);
+  if (!Number.isFinite(dueMs) || !Number.isFinite(submittedMs)) return null;
+  return Math.max(0, Math.round((dueMs - submittedMs) / 1000));
 }
 
 module.exports = {
@@ -517,5 +704,8 @@ module.exports = {
   resolveAcceptanceAnchor,
   queueAheadEndMs,
   rankOf,
+  isAwaitingReview,
+  effectiveEndMs,
+  reworkLeftoverSecs,
   TERMINAL_STATUSES,
 };
