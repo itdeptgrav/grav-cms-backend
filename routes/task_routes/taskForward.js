@@ -16,8 +16,17 @@ const { getTaskReviewOwner } = require("../../services/taskReviewOwner.service")
 const router = express.Router();
 const { verifyCoworkToken, verifyCeoToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 const svc = require("../../services/taskForward.service");
+const { isTaskHead } = require("./_taskHead");
 const { db, admin } = require("../../config/firebaseAdmin");
+const {
+  capBreach,
+  capRefusalBody,
+  raisedParentDueAt,
+  readParentDeadline,
+} = require("../../services/parentDeadlineCap.service");
+const { readMs: readInstantMs } = require("../../services/officeDeadline.service");
 const { v4: _nuuid } = require("uuid");
+
 const _socket = require("../../config/socketInstance");
 
 // ── Local notify helper (saves to Firestore + FCM push) ──────────────────────
@@ -65,23 +74,15 @@ async function getEmployeeInfo(employeeId) {
   return snap.data();
 }
 
+// Moved to `services/primaryManager.service.js` — the budget negotiation needs
+// the same lookup to route an hours request to the person who manages the
+// assignee, and a permission lookup with two copies is a permission lookup with
+// two answers. The name is kept so every caller here is untouched.
 async function _getPrimaryManagerApprover(employeeId) {
-  try {
-    const Employee = require("../../models/Employee");
-    const hrEmp = await Employee.findOne({ biometricId: employeeId })
-      .populate("primaryManager.managerId", "firstName middleName lastName biometricId")
-      .lean();
-    const mgr = hrEmp?.primaryManager?.managerId;
-    const mgrBiometricId = mgr?.biometricId;
-    if (!mgrBiometricId) return null;
-    const cwSnap = await db.collection("cowork_employees").doc(mgrBiometricId).get();
-    if (!cwSnap.exists) return null;
-    const cw = cwSnap.data();
-    return { approverId: cw.employeeId, approverName: cw.name, source: "primary_manager" };
-  } catch (e) {
-    console.warn("[_getPrimaryManagerApprover]", e.message);
-    return null;
-  }
+  const {
+    resolvePrimaryManagerApprover,
+  } = require("../../services/primaryManager.service");
+  return resolvePrimaryManagerApprover(employeeId);
 }
 
 // The routing rule now lives in `services/taskReviewOwner.service.js`, which
@@ -1361,14 +1362,42 @@ router.post("/task/:taskId/department-tl-set-hours", verifyCoworkToken, verifyEm
     // arrayUnion here is also what first makes the task visible to the
     // assignee on the cross-department path — it's a no-op if they were
     // already present (the no-gate deadline-mode path).
+    // ── The deadline is set HERE, from THIS moment ────────────────────────────
+    //
+    // Granting the hours is what makes the work real, so the window runs from
+    // the grant. It was previously never computed on this path at all: the task
+    // kept whatever date the SENDER's create wrote, hours or days earlier,
+    // which is time the assignee was never given and could not have used. A
+    // manager granting two hours at 14:30 means 16:30, not a date chosen before
+    // anyone knew who would do the work.
+    //
+    // The anchor is also kept as a plain number. The budget negotiation
+    // re-derives this deadline from this exact instant if the window is later
+    // renegotiated, and a `serverTimestamp()` sentinel cannot be read back
+    // inside the write that sets it.
+    const { computeWorkingDeadline } = require("../../services/officeDeadline.service");
+    const anchorMs = Date.now();
+    const dueDate = await computeWorkingDeadline({ startMs: anchorMs, windowSecs: secs });
+
     await taskRef.update({
       status: "open",
       hasTimer: true,
       senderTimerWindowSecs: secs,
+      /* The granted figure in the fields the product reads as AGREED, not
+         merely offered — the same three the other approve paths write. */
+      deadlineWindowSecs: secs,
+      originalWindowSecs: Number(task.originalWindowSecs) || secs,
       etcHours: secs / 3600,
+      dueDate,
+      /* This task is on a timer now, and a `fixedDeadline` left over from the
+         sender's create SHADOWS everything computed above: the read precedence
+         is `fixedDeadline ?? deadline ?? dueDate`, so the granted window could
+         never move the date anybody actually saw. */
+      fixedDeadline: null,
       tlHoursSetBy: employeeId,
       tlHoursSetByName: name,
       tlHoursSetAt: admin.firestore.FieldValue.serverTimestamp(),
+      tlHoursSetAtMs: anchorMs,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       assigneeIds: admin.firestore.FieldValue.arrayUnion(targetId),
     });
@@ -1416,7 +1445,7 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
     // A subtask follows the SAME lifecycle as a standard task — the timer/budget
     // negotiation, priority and review all apply — so it carries the same fields
     // rather than a truncated set that dropped the budget silently.
-    const { title, description, notes, assigneeIds, satisfiesRequirementIds, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
+    const { title, description, notes, assigneeIds, satisfiesRequirementIds, requirements, priority, hasTimer, senderTimerWindowSecs, fixedDeadline, isSelfAssigned, approverId, approverName } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
     if (!assigneeIds?.length) return res.status(400).json({ error: "assigneeIds required" });
 
@@ -1491,6 +1520,12 @@ router.post("/task/:taskId/subtask", verifyCoworkToken, verifyEmployeeToken, asy
       // empty array, which is a subtask that closes no requirement rather than
       // a rejected request.
       satisfiesRequirementIds,
+      // The subtask's OWN acceptance criteria — a different thing from the
+      // claims above, and dropped on this route until 16 Aug 2026. The create
+      // route has always read it; this one did not, so criteria typed into the
+      // subtask form were discarded while the same field on an ordinary task
+      // saved correctly.
+      requirements: Array.isArray(requirements) ? requirements : [],
       // TL subtasks should NOT show in CEO tree
       createdByTl: requesterRole === "tl",
       createdByCeo: requesterRole === "ceo",
@@ -1805,7 +1840,14 @@ router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, asyn
   try {
     const { reworkReason, waiveDeduction, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
     const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
-    if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can rework tasks." });
+    // The person who ASSIGNED this task may send it back. Was `role ===
+    // "employee"` → refuse, which asked about a role string rather than about
+    // this task: a primary manager carries `role: "employee"` here, so the
+    // person who created and assigned the work could APPROVE a submission but
+    // not send it back — the two halves of one decision, split apart.
+    if (!(await isTaskHead(req.params.taskId, reviewerId, role))) {
+      return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can send it back for rework." });
+    }
     const result = await svc.reworkTask({
       taskId: req.params.taskId,
       reviewerId, reviewerName,
@@ -1827,8 +1869,13 @@ router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, asyn
 router.post("/task/:taskId/extension-deduction", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     let { waiveDeduction, newDeadline } = req.body; // ← const → let
-    const { role } = req.coworkUser;
-    if (role === "employee") return res.status(403).json({ error: "Only TL/CEO can set deduction." });
+    const { role, employeeId } = req.coworkUser;
+    // Same rule as rework: this task's assigner, or a TL/CEO. Waiving is part
+    // of the same review, so it must not be gated more tightly than the
+    // decision it belongs to.
+    if (!(await isTaskHead(req.params.taskId, employeeId, role))) {
+      return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can set the deduction." });
+    }
 
     const { db: _db, admin: _admin } = require("../../config/firebaseAdmin");
     const ref = _db.collection("cowork_tasks").doc(req.params.taskId);
@@ -2001,16 +2048,23 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
     // Office-hours-aware dueDate — consumes only WORKING time (skips off
     // days and breaks) instead of raw wall-clock addition, so a 4h task
     // approved at 5:15pm doesn't land due 9:15pm the same night.
+    //
+    // Anchored by the owner's rule, not at the press: the clock starts when
+    // the assignee first came online at/after the task was given (cross-dept:
+    // when the hours were granted). Same resolver as the budget-negotiation
+    // accept, so both accept surfaces produce one deadline for one task.
+    const { resolveAcceptanceAnchor } = require("../../services/officeDeadline.service");
+    const anchor = await resolveAcceptanceAnchor(task, Date.now(), taskId);
     let dueDate;
     try {
       const officeSnap = await db.collection("cowork_settings").doc("office").get();
       const _sched = officeSnap.exists ? officeSnap.data().schedule : null;
       const _brks = officeSnap.exists ? (officeSnap.data().breaks || []) : [];
       console.log("[approve-sender-timer] office doc exists:", officeSnap.exists, "| schedule days:", _sched ? Object.keys(_sched).length : 0);
-      dueDate = _addWorkingSecsIST(Date.now(), approvedSecs, _sched, _brks);
+      dueDate = _addWorkingSecsIST(anchor.anchorMs, approvedSecs, _sched, _brks);
     } catch (e) {
       console.error("[approve-sender-timer OFFICE CALC FAILED]", e.message);
-      dueDate = new Date(Date.now() + approvedSecs * 1000 + 6 * 3600000).toISOString(); // BRANDED PROBE: +6h marks this exact fallback
+      dueDate = new Date(anchor.anchorMs + approvedSecs * 1000 + 6 * 3600000).toISOString(); // BRANDED PROBE: +6h marks this exact fallback
     }
 
     await taskRef.update({
@@ -2018,6 +2072,12 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
       deadlineWindowSecs: approvedSecs,
       originalWindowSecs: approvedSecs,
       dueDate,
+      clockStartsAtMs: anchor.anchorMs,
+      clockStartsAtSource: anchor.source,
+      /* Which task it is queued behind, where the priority rule moved the
+         start — see resolveAcceptanceAnchor. Null on the ordinary path. */
+      queuedAfterTaskId: anchor.queuedAfterTaskId ?? null,
+      queuedAfterTitle: anchor.queuedAfterTitle ?? null,
       senderTimerApprovedBy: employeeId,
       senderTimerApprovedByName: employeeName,
       senderTimerApprovedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2337,8 +2397,13 @@ router.post("/task/:taskId/review-deadline-extension", verifyCoworkToken, verify
       return res.status(400).json({ error: "newDate required for approve/counter" });
 
     const { db, admin } = require("../../config/firebaseAdmin");
-    const { role } = req.coworkUser;
-    if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO/TL can review extensions" });
+    const { role, employeeId } = req.coworkUser;
+    // An extension moves a date the ASSIGNER committed to, so the assigner is
+    // exactly who should decide it — not whoever happens to hold a "tl" role
+    // string. Same rule as rework and deduction.
+    if (!(await isTaskHead(taskId, employeeId, role))) {
+      return res.status(403).json({ error: "Only this task's assigner, or a TL/CEO, can review extensions" });
+    }
 
     const taskRef = db.collection("cowork_tasks").doc(taskId);
     const snap = await taskRef.get();
@@ -2363,7 +2428,49 @@ router.post("/task/:taskId/review-deadline-extension", verifyCoworkToken, verify
       update["deadlineExtRequest.counterDate"] = newDate;
     }
 
-    await taskRef.update(update);
+    /**
+     * **A subtask may not be extended past the project it belongs to.**
+     * OWNER DECISION, 16 Aug 2026: refused, UNLESS the project moves too.
+     *
+     * A flat refusal would be a dead end — the approver believes the time is
+     * warranted, and the only remedy would be a second action on a different
+     * task they may not think to take. So the refusal carries the remedy, and
+     * `raiseParent` takes it in the same press.
+     *
+     * Both writes go in ONE batch. Moving the child first and failing on the
+     * parent would leave exactly the state this rule exists to forbid, with
+     * nothing on screen to say it had happened.
+     *
+     * Rejections skip all of this: refusing an extension cannot breach a cap.
+     */
+    const granted = action === "approve" || action === "counter";
+    const grantedMs = granted ? readInstantMs(update.fixedDeadline) : null;
+    const parentInfo = granted ? await readParentDeadline(task) : null;
+
+    const breach = parentInfo
+      ? capBreach({ grantedMs, parentDueAtMs: parentInfo.dueAtMs })
+      : { breached: false, overshootSecs: 0 };
+
+    if (breach.breached) {
+      const { overshootSecs } = breach;
+      if (!req.body.raiseParent) {
+        return res
+          .status(409)
+          .json(capRefusalBody({ parent: parentInfo, overshootSecs }));
+      }
+      /* Granted WITH the project moved by the same amount, so the two still
+         agree — the approver was told that is what they were doing. */
+      const batch = db.batch();
+      batch.update(taskRef, update);
+      batch.update(db.collection("cowork_tasks").doc(parentInfo.taskId), {
+        [parentInfo.field]: raisedParentDueAt({ parent: parentInfo, overshootSecs }),
+        parentDeadlineRaisedBy: overshootSecs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await batch.commit();
+    } else {
+      await taskRef.update(update);
+    }
 
     // Notify assignees about extension review result
     try {
@@ -2448,8 +2555,21 @@ router.post("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeTo
     const task = snap.data();
     if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
 
-    // Only assignee can save activities
-    const canEdit = task.assigneeIds?.includes(employeeId) || ["ceo", "tl"].includes(role);
+    // Who may save the roadmap: an assignee, the person who ASSIGNED the goal,
+    // anyone who confirmed it, or a CEO/TL.
+    //
+    // `assignedBy` was missing and that was the bug. The roadmap is built by the
+    // head of the goal — that is what both this app and the old one offer them —
+    // but the only head this gate recognised was the ROLE STRING "tl"/"ceo". A
+    // manager whose role is stored as "employee", which is how the reporting
+    // line is actually modelled here, was refused on a goal they created and
+    // assigned themselves. Widened, not replaced: every case that passed before
+    // still passes.
+    const canEdit =
+        task.assigneeIds?.includes(employeeId) ||
+        task.assignedBy === employeeId ||
+        task.originalAssignedBy === employeeId ||
+        ["ceo", "tl"].includes(role);
     if (!canEdit) return res.status(403).json({ error: "Not allowed" });
 
     if (!Array.isArray(activities)) return res.status(400).json({ error: "activities must be an array" });
@@ -2467,26 +2587,45 @@ router.post("/task/:taskId/goal-activities", verifyCoworkToken, verifyEmployeeTo
 
     await taskRef.update(updateData);
 
-    // ── Email: notify CEO/TL when Y does Final Submit ──
+    /**
+     * ── Email: the roadmap has been handed over ──
+     *
+     * **To the ASSIGNEE — the person who now has to do the work.**
+     *
+     * This notified `assignedBy` and the approvers, and the comment above it
+     * read "notify CEO/TL when Y does Final Submit" — written for a flow where
+     * the ASSIGNEE submits. But the button has always been shown only to the
+     * head (`canEdit = isHead` in the old `GoalTask.jsx`), so in practice the
+     * head submitted and the head was emailed about their own action, while the
+     * person who had to act on it was never told. The two halves disagreed;
+     * this is the half that was wrong — owner decision.
+     */
     if (submitted === true && !task.goalActivitiesSubmitted) {
       try {
         const { sendNotificationEmail } = require("../../services/emailNotifications.service");
         const { db: _db } = require("../../config/firebaseAdmin");
-        // Get all head employees (CEO/TL) to notify
-        const headIds = [task.assignedBy, ...(task.confirmedBy || [])].filter(Boolean);
-        const uniqueHeads = [...new Set(headIds)];
+        /* Pending first: a goal handed over before its assignment clears is
+           still handed to somebody, and `assigneeIds` is empty until then. */
+        const recipientIds = [
+          ...(task.assigneeIds || []),
+          task.pendingAssigneeId,
+        ].filter(Boolean);
+        const uniqueRecipients = [...new Set(recipientIds)];
         const submitter = await _db.collection("cowork_employees").doc(employeeId).get();
         const submitterName = submitter.exists ? submitter.data().name : "Employee";
-        for (const headId of uniqueHeads) {
-          const headDoc = await _db.collection("cowork_employees").doc(headId).get();
-          if (!headDoc.exists || !headDoc.data().email) continue;
-          const head = headDoc.data();
+        for (const recipientId of uniqueRecipients) {
+          /* Never to the person who pressed the button. A head who is also an
+             assignee of their own goal does not need telling. */
+          if (recipientId === employeeId) continue;
+          const personDoc = await _db.collection("cowork_employees").doc(recipientId).get();
+          if (!personDoc.exists || !personDoc.data().email) continue;
+          const person = personDoc.data();
           await sendNotificationEmail({
             senderId: employeeId, senderName: submitterName,
-            receiverId: headId, receiverName: head.name, receiverEmail: head.email,
+            receiverId: recipientId, receiverName: person.name, receiverEmail: person.email,
             type: "goal_final_submit",
-            title: `Goal roadmap submitted: ${task.title}`,
-            body: `${submitterName} submitted the activity roadmap for "${task.title}"`,
+            title: `Your roadmap is ready: ${task.title}`,
+            body: `${submitterName} set out the steps for "${task.title}". Each step has its own deadline, and earns its points when it is approved having been handed in on time.`,
             data: {
               taskTitle: task.title,
               taskId,
@@ -2530,7 +2669,6 @@ router.post("/task/:taskId/goal-activity/:activityId/request-report", verifyCowo
   try {
     const { taskId, activityId } = req.params;
     const { role, name: requesterName, employeeId } = req.coworkUser;
-    if (!["ceo", "tl"].includes(role)) return res.status(403).json({ error: "Only CEO or TL can request reports" });
 
     const { db, admin } = require("../../config/firebaseAdmin");
     const taskRef = db.collection("cowork_tasks").doc(taskId);
@@ -2538,6 +2676,16 @@ router.post("/task/:taskId/goal-activity/:activityId/request-report", verifyCowo
     if (!snap.exists) return res.status(404).json({ error: "Task not found" });
     const task = snap.data();
     if (!task.isGoal) return res.status(400).json({ error: "Not a goal task" });
+
+    // The goal's own head, or a CEO/TL. Moved BELOW the task read on purpose:
+    // the role string alone cannot answer "are you this goal's head", and a
+    // manager here carries `role: "employee"` — see the same fix on
+    // /goal-activities and /sop/goal-credit.
+    const canRequest =
+      ["ceo", "tl"].includes(role) ||
+      task.assignedBy === employeeId ||
+      task.originalAssignedBy === employeeId;
+    if (!canRequest) return res.status(403).json({ error: "Only this goal's head can request a report" });
 
     const activities = task.goalActivities || [];
     const idx = activities.findIndex(a => a.id === activityId);

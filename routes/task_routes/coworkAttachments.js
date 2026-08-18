@@ -30,13 +30,24 @@ const svc = require("../../services/coworkAttachment.service");
 
 const router = express.Router();
 
-/* In memory, nothing touches disk. The cap is enforced twice — here, so a
-   large body is rejected before it is buffered, and again in the service,
-   which is the boundary a non-HTTP caller would cross. */
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: svc.MAX_BYTES },
-});
+/**
+ * In memory, nothing touches disk. **No size cap** — withdrawn on the owner's
+ * instruction; `svc.MAX_BYTES` is null and the service's own check is disabled
+ * with it, so a limit here would be the only one left and would contradict it.
+ *
+ * `limits` is omitted entirely rather than set to `Infinity`: multer treats a
+ * missing key as no limit, and a numeric Infinity is the kind of value that
+ * reads as a bug to whoever finds it next.
+ *
+ * **What this does not remove.** `memoryStorage` holds the whole file in the
+ * Node process's RAM until it has been forwarded to Drive, so a very large
+ * upload is bounded by the server's memory rather than by any rule — and this
+ * process serves the whole CMS, not only Cowork. If files big enough to matter
+ * start arriving, the fix is the resumable direct-to-Drive path that
+ * `mediaUpload.js` already implements (the browser uploads straight to Google
+ * and the backend never sees the bytes), not a cap put back here.
+ */
+const upload = multer({ storage: multer.memoryStorage() });
 
 /**
  * Which task an attachment hangs off, whatever it is attached to.
@@ -187,13 +198,32 @@ router.get(
       }
 
       const { stream, meta } = await svc.streamAttachment(record.storageFileId);
-      res.setHeader("Content-Type", record.mimeType || meta.mimeType || "application/octet-stream");
-      /* `inline` so images and PDFs can be previewed; the filename is the
-         sanitised one, never the client's original string. */
+      const mimeType =
+        record.mimeType || meta.mimeType || "application/octet-stream";
+      res.setHeader("Content-Type", mimeType);
+      /**
+       * **`inline` only for types that are safe to RENDER.**
+       *
+       * Every file type may now be uploaded — the allow-list was withdrawn on
+       * the owner's instruction. That decision is about what may be STORED. It
+       * is not a decision to render arbitrary types in the browser, and this
+       * header is where the difference lives: an uploaded HTML file served
+       * `inline` as `text/html` from this origin runs its author's JavaScript
+       * inside whoever opens it, with that person's session. So images and PDFs
+       * still preview, and everything else downloads. The file is intact either
+       * way; only how the browser greets it changes.
+       *
+       * The type comes from the SNIFF taken at upload, not from the client's
+       * label — otherwise an HTML file announced as `image/png` would preview.
+       */
+      const disposition = svc.mayRenderInline(mimeType) ? "inline" : "attachment";
       res.setHeader(
         "Content-Disposition",
-        `inline; filename="${svc.safeName(record.originalName)}"`,
+        `${disposition}; filename="${svc.safeName(record.originalName)}"`,
       );
+      /* Belt and braces: stops a browser second-guessing the type above and
+         rendering something we said was a download. */
+      res.setHeader("X-Content-Type-Options", "nosniff");
       /* PRIVATE, and never cached by a shared proxy — this response is
          specific to one authenticated person. */
       res.setHeader("Cache-Control", "private, no-store");

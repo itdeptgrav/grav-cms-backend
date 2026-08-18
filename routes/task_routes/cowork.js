@@ -269,9 +269,53 @@ router.get("/employee/my-managers/:employeeId", verifyCoworkToken, verifyEmploye
 
 router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
   try {
-    const { name, email, mobile = "", city = "", department, role: empRole, employeeId: chosenId } = req.body;
-    if (!name || !email || !department) {
-      return res.status(400).json({ error: "Name, email and department are required." });
+    const { city = "", role: empRole, employeeId: chosenId } = req.body;
+    let { name, email, mobile = "", department } = req.body;
+
+    // ── Fill anything the caller left blank FROM HR ───────────────────────────
+    //
+    // The admin picked this person out of the HR directory; their name,
+    // department and address are already recorded there. Demanding them again
+    // from the payload — and refusing outright when one arrived blank — is what
+    // made provisioning fail for people HR describes perfectly well, because HR
+    // keeps the address under `email` OR `personalEmail` and the panel was only
+    // ever sending the first.
+    //
+    // So read HR here rather than trusting what the client carried: whatever
+    // the caller sends still wins, and every gap is answered from the record
+    // the admin was looking at when they pressed the button.
+    let hrRecord = null;
+    if (chosenId) {
+      const Employee = require("../../models/Employee");
+      hrRecord = await Employee.findOne({ biometricId: chosenId })
+        .select("firstName middleName lastName email personalEmail department phone")
+        .lean();
+      if (hrRecord) {
+        name = name || [hrRecord.firstName, hrRecord.middleName, hrRecord.lastName]
+          .filter(Boolean).join(" ").trim();
+        email = email || hrRecord.email || hrRecord.personalEmail || "";
+        department = department || hrRecord.department || "";
+        mobile = mobile || hrRecord.phone || "";
+      }
+    }
+
+    // Name the field that is actually missing. The old message listed all three
+    // every time, so an admin read "department" as the problem for somebody
+    // whose department HR has always held — and had nowhere to go from there.
+    const missing = [
+      !name && "name",
+      !email && "email address",
+      !department && "department",
+    ].filter(Boolean);
+    if (missing.length) {
+      const listed = missing.length === 1
+        ? missing[0]
+        : `${missing.slice(0, -1).join(", ")} and ${missing[missing.length - 1]}`;
+      return res.status(400).json({
+        error: hrRecord
+          ? `HR has no ${listed} for this employee. Add ${missing.length === 1 ? "it" : "them"} in the HR system, then try again.`
+          : `Creating an account needs a name, an email address and a department. Missing: ${listed}.`,
+      });
     }
 
     // ── VALIDATE chosen biometricId is not already taken in CoWork ────────────
@@ -348,7 +392,8 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
     if (req.query.search) {
       const rx = new RegExp(String(req.query.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
       filter.$or = [
-        { firstName: rx }, { lastName: rx }, { email: rx },
+        { firstName: rx }, { middleName: rx }, { lastName: rx },
+        { email: rx }, { personalEmail: rx },
         { biometricId: rx }, { designation: rx },
       ];
     }
@@ -358,7 +403,7 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
 
     const [hrEmployees, coworkSnap] = await Promise.all([
       Employee.find(filter)
-        .select("firstName lastName email department biometricId designation phone")
+        .select("firstName middleName lastName email personalEmail department biometricId designation jobTitle phone")
         .sort({ firstName: 1 })
         .limit(500)
         .lean(),
@@ -381,29 +426,57 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
     );
 
     const employees = hrEmployees.map((e) => {
+      // HR records ONE address per person but under either of two fields, and
+      // fills whichever it was given: `email` is the work address, and roughly
+      // half the directory has none, carrying a personal one instead. Reading
+      // only the first is what made this panel show a blank where an address
+      // plainly exists in HR, offer "Add" anyway, and then refuse the create
+      // with "Name, email and department are required" — naming a department
+      // that was never missing and an email HR was holding all along.
+      const email = e.email || e.personalEmail || "";
+      const name = [e.firstName, e.middleName, e.lastName]
+        .filter(Boolean).join(" ").trim();
+
       const coworkEmployeeId =
         (e.biometricId && coworkById.get(e.biometricId)) ||
         coworkByEmail.get((e.email || "").toLowerCase()) ||
+        // Somebody provisioned from their personal address is the SAME person.
+        // Missing that match offers to create a second account for them.
+        coworkByEmail.get((e.personalEmail || "").toLowerCase()) ||
         null;
+
+      // What HR genuinely does not hold. A Firebase login is keyed on an email
+      // address, so somebody HR has none for cannot be provisioned from here at
+      // all — and the caller needs to know that BEFORE the button, not as a red
+      // refusal after it. Empty means the row is ready to add.
+      const missingInHr = [
+        !name && "name",
+        !email && "email",
+        !e.department && "department",
+      ].filter(Boolean);
+
       return {
         hrId: String(e._id),
-        name: `${e.firstName || ""} ${e.lastName || ""}`.trim() || e.email || "(unnamed)",
-        email: e.email || "",
+        name: name || email || "(unnamed)",
+        email,
         department: e.department || "",
-        designation: e.designation || "",
+        designation: e.designation || e.jobTitle || "",
         biometricId: e.biometricId || "",
         phone: e.phone || "",
         hasCoworkAccount: !!coworkEmployeeId,
         // The `cowork_employees` document id — what every other CoWork route
         // takes as `:id`. Null for somebody who has no account yet.
         coworkEmployeeId,
+        missingInHr,
       };
     });
 
-    // Distinct departments from the FULL set (not filtered), for the filter dropdown.
-    const departments = (
-      await Employee.distinct("department", { email: { $exists: true, $ne: "" } })
-    ).filter(Boolean).sort();
+    // Distinct departments from the FULL set (not filtered), for the filter
+    // dropdown. Not narrowed to people who have a work address: the rows below
+    // are not narrowed that way either, so doing it here hid whole departments
+    // whose employees are all listed and all addressable.
+    const departments = (await Employee.distinct("department"))
+      .filter(Boolean).sort();
 
     res.json({
       success: true,
@@ -411,6 +484,9 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
       departments,
       total: employees.length,
       withAccount: employees.filter((e) => e.hasCoworkAccount).length,
+      missingDetails: employees.filter(
+        (e) => !e.hasCoworkAccount && e.missingInHr.length,
+      ).length,
     });
   } catch (e) {
     console.error("[admin/hr-employees]", e.message);

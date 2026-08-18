@@ -13,6 +13,11 @@
  */
 
 const { admin, db, messaging } = require("../config/firebaseAdmin");
+const {
+  computeWorkingDeadline,
+  readMs: readInstantMs,
+  rechainQueueFor,
+} = require("./officeDeadline.service");
 const c1Svc = require("./c1Service");
 const socket = require("../config/socketInstance");
 const { v4: uuidv4 } = require("uuid");
@@ -246,12 +251,28 @@ const _CLOSED_STATUS = new Set(["done", "cancelled"]);
 const _CLOSED_REVIEW = new Set(["completed", "approved", "tl_approved", "ceo_approved"]);
 
 async function nextActiveRankFor(db, employeeId) {
-  const snap = await db.collection("cowork_tasks")
-    .where("assigneeIds", "array-contains", employeeId)
-    .get();
+  // TWO reads, because Firestore cannot OR across fields — the same pairing
+  // the frontend's #activeQueueOf uses. A cross-department task still at the
+  // gate holds its person in `pendingAssigneeId` with EMPTY `assigneeIds`, so
+  // the array-contains query alone cannot see it. That blindness is how two
+  // tasks created minutes apart both stored rank 3: the second count ran while
+  // the first task was still gated, saw the same queue, and picked the same
+  // number. The comment below already states the rule — a gated task OCCUPIES
+  // its slot — this makes the query able to see what the rule counts.
+  const [mine, held] = await Promise.all([
+    db.collection("cowork_tasks")
+      .where("assigneeIds", "array-contains", employeeId)
+      .get(),
+    db.collection("cowork_tasks")
+      .where("pendingAssigneeId", "==", employeeId)
+      .get()
+      .catch(() => null),
+  ]);
+  const docs = new Map();
+  for (const d of [...mine.docs, ...(held ? held.docs : [])]) docs.set(d.id, d);
 
   let highest = 0;
-  snap.forEach((doc) => {
+  docs.forEach((doc) => {
     const t = doc.data() || {};
     if (t.isDeleted) return;
     if (_CLOSED_STATUS.has(t.status)) return;
@@ -678,9 +699,81 @@ async function setActiveTaskBudget({ taskId, employeeId, employeeName, hoursValu
   // first and the one the queue plans against. senderTimerWindowSecs is left
   // alone: it records what was originally proposed, and overwriting it would
   // erase the fact that the budget ever changed.
+  /**
+   * **The deadline follows the budget.** Reported 17 Aug 2026.
+   *
+   * This wrote the window and nothing else, so a granted extension raised the
+   * budget and left the date alone: T062 went to a 2-hour budget from a 13:23
+   * start and kept a 15:00 deadline, when its own arithmetic says 15:23. The
+   * two figures sit beside each other on the task panel — "00:00:00 of
+   * 01:50:00" above "17 Aug · 15:00 IST" — and disagreed.
+   *
+   * Counted from the STORED anchor, never a fresh one. `clockStartsAtMs` was
+   * stamped once when the clock started and is deliberately never recomputed:
+   * re-resolving it here would move the start every time somebody adjusted the
+   * hours, and a deadline whose origin drifts cannot be checked by the person
+   * measured against it.
+   *
+   * Left alone in two cases: a task carrying a fixed calendar date has no
+   * budget-derived deadline to move, and a task with no stamped anchor has
+   * nothing honest to count from — better the date it has than one invented
+   * from `now`.
+   */
+  const anchorMs = readInstantMs(task.clockStartsAtMs);
+  const currentDueMs = readInstantMs(task.dueDate);
+  const deltaSecs = secs - previousSecs;
+  let dueDate = null;
+  if (!task.fixedDeadline && Number.isFinite(anchorMs)) {
+    try {
+      /**
+       * **The granted time is ADDED to the deadline you already have.**
+       * OWNER DECISION, 17 Aug 2026.
+       *
+       * This recomputed `anchor + budget` outright, which quietly took back
+       * time a task was already carrying: T062 stood at 16:30 on a 3:00
+       * budget anchored at 13:23, though 13:23 + 3:00 is 16:23 — seven
+       * minutes of slack from an older formula. Granting ten more minutes
+       * then produced 16:33 rather than 16:40, so a +10 grant read as +3.
+       *
+       * Ten minutes granted means ten minutes later. The delta is walked
+       * through office hours, so a grant near closing still lands on the next
+       * working morning rather than at night.
+       */
+      if (!Number.isFinite(currentDueMs)) {
+        /* No date yet: the anchor is the only honest place to count from. */
+        dueDate = await computeWorkingDeadline({ startMs: anchorMs, windowSecs: secs });
+      } else if (deltaSecs > 0) {
+        dueDate = await computeWorkingDeadline({
+          startMs: currentDueMs,
+          windowSecs: deltaSecs,
+        });
+      }
+      /* Unchanged or REDUCED leaves `dueDate` null and writes nothing. A
+         background recompute must never shorten a commitment somebody is
+         already working to: a smaller budget is a decision about hours, and
+         taking the date away with it is a second decision nobody made here. */
+
+      /* A subtask may not outlive its project — OWNER DECISION 16 Aug 2026.
+         Clamped rather than refused: the budget change is the manager's and
+         stands; the project's date is the ceiling the child is measured by. */
+      if (dueDate !== null) {
+        const { readParentDeadline } = require("./parentDeadlineCap.service");
+        const parent = await readParentDeadline(task);
+        if (parent && Date.parse(dueDate) > parent.dueAtMs) {
+          dueDate = new Date(parent.dueAtMs).toISOString();
+        }
+      }
+    } catch (e) {
+      /* An unreadable calendar costs the recalculation, never the budget. */
+      console.warn("[setActiveTaskBudget] deadline recompute failed:", e.message);
+      dueDate = null;
+    }
+  }
+
   await ref.update({
     deadlineWindowSecs: secs,
     etcHours: secs / 3600,
+    ...(dueDate ? { dueDate } : {}),
     budgetSetBy: employeeId,
     budgetSetByName: employeeName || "",
     budgetSetAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -688,6 +781,36 @@ async function setActiveTaskBudget({ taskId, employeeId, employeeName, hoursValu
   });
 
   // Posted by the route, as above.
+
+  /**
+   * **The tasks below it follow.** Reported 17 Aug 2026.
+   *
+   * T062 (P1) and T063 (P2) were chained correctly when T063 was created —
+   * T062 was due 15:00, so T063 anchored there. T062's budget then grew and
+   * its deadline moved to 16:30 while T063 kept its 15:00 anchor: thirty
+   * minutes of real room for two hours of work.
+   *
+   * Distinct from the "decided once" rule, which is about NEW work arriving
+   * above somebody and still stands. Here the chain was already agreed and the
+   * link above it moved; leaving it stale protects nobody. `rechainQueueFor`
+   * only ever pushes LATER, so nothing becomes harder to meet.
+   *
+   * Detached, like the other cascades: a queue walk must not make the manager
+   * wait on their own press, and a failure in it must not fail the budget that
+   * has already been written.
+   */
+  setImmediate(() => {
+    rechainQueueFor(targetId)
+      .then((moved) => {
+        if (moved.length) {
+          console.log(
+            `[rechain] ${moved.length} task(s) moved behind ${taskId}:`,
+            moved.map((m) => `${m.taskId} -> ${m.to}`).join(", "),
+          );
+        }
+      })
+      .catch((e) => console.error("[rechain]", e.message));
+  });
 
   await _notifyMany({
     recipientIds: [targetId].filter((id) => id && id !== employeeId),
@@ -1001,7 +1124,33 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
     // Notifications: only assignees, NOT the CEO/creator (task.assignedBy)
     // CEO created the task so they're always in assignedBy — they don't need
     // a notification for every message sent in their own assigned tasks
-    const notifyIds = (task.assigneeIds || []).filter(id => id !== senderId);
+    /**
+     * **Everyone the task is between, not the assignees alone.**
+     * Reported 17 Aug 2026: "no web push notifications" on task chat.
+     *
+     * This read `assigneeIds` only. On the ordinary task — one assignee — the
+     * assignee IS the whole list, so when THEY sent a message the filter
+     * removed the only recipient and `notifyIds` came out empty: nobody was
+     * told, and the manager waiting for that reply never heard it. Messages
+     * only ever notified in one direction, and the direction that mattered
+     * least.
+     *
+     * The people a task is between are the ones its own chat is for: whoever
+     * it was given to, whoever assigned it, whoever it was forwarded from, and
+     * anybody still holding it pending. Deduplicated, and the sender is always
+     * removed — you do not get a push for your own message.
+     */
+    const notifyIds = [
+      ...new Set(
+        [
+          ...(task.assigneeIds || []),
+          ...(task.pendingAssigneeId ? [task.pendingAssigneeId] : []),
+          task.assignedBy,
+          task.originalAssignedBy,
+          task.forwardedBy,
+        ].filter((id) => id && id !== senderId),
+      ),
+    ];
     if (notifyIds.length) {
       await _notifyMany({
         recipientIds: notifyIds,
@@ -1378,20 +1527,39 @@ async function deleteTask({ taskId, deletedBy }) {
 //  Returns: "tl_then_ceo" | "ceo_direct" | "tl_final"
 // ═════════════════════════════════════════════════════════
 async function _reviewFlow(task) {
-  // ── Fast path: use stored fields (new tasks have all these) ──────────────
+  /**
+   * **One step: the assigner of record reviews, and their approval is FINAL.**
+   * OWNER DECISION, 16 Aug 2026.
+   *
+   * This used to escalate by ROLE STRING: an assigner whose
+   * `cowork_employees.role` read "employee" got the two-stage "safe default"
+   * (their approval, then the CEO's), so their approval credited nothing —
+   * while a "tl" assigner's identical approval completed the task. The rest of
+   * the product routes every decision by the primary-manager relationship and
+   * stopped consulting role strings months ago; this was the last place they
+   * still decided anything, and it made the same press mean two different
+   * things depending on a label.
+   *
+   * `ceo_direct` survives only because the CEO who created a task directly IS
+   * its assigner — same rule, and the review record lands in `ceoReview` where
+   * the rest of the engine expects a CEO's decision.
+   *
+   * `tl_then_ceo` is never DERIVED any more. It still exists as a stored value
+   * on submissions made before this date; `reviewCompletion` maps those to
+   * final at decision time, so the rule change reaches work already in flight.
+   */
   const rootRole = task.rootCreatedByRole || task.assignedByRole;
 
   if (rootRole === "tl") return "tl_final";
-
   if (rootRole === "ceo") {
     if (!task.parentTaskId && !task.forwardedBy) return "ceo_direct";
-    return "tl_then_ceo";
+    return "tl_final";
   }
 
   // Legacy flags (old tasks may have these)
   if (task.createdByTl === true) return "tl_final";
   if (task.createdByCeo === true && !task.forwardedBy) return "ceo_direct";
-  if (task.createdByCeo === true && task.forwardedBy) return "tl_then_ceo";
+  if (task.createdByCeo === true && task.forwardedBy) return "tl_final";
 
   // ── Fallback: query Firestore for old tasks without stored flow fields ────
   // For old tasks, just check the IMMEDIATE assignedBy's role.
@@ -1416,7 +1584,7 @@ async function _reviewFlow(task) {
 
         if (assignerRole === "tl") return "tl_final";
         if (assignerRole === "ceo") {
-          return task.parentTaskId ? "tl_then_ceo" : "ceo_direct";
+          return task.parentTaskId ? "tl_final" : "ceo_direct";
         }
       }
     } catch (e) {
@@ -1424,7 +1592,9 @@ async function _reviewFlow(task) {
     }
   }
 
-  return "tl_then_ceo"; // safe default
+  // The assigner reviews and their approval is final — see the note above.
+  // The old "safe default" here was the two-stage escalation.
+  return "tl_final";
 }
 
 // ═════════════════════════════════════════════════════════
@@ -1503,10 +1673,76 @@ async function submitCompletionRequest({ taskId, employeeId, employeeName, messa
  * re-point a historical rework at a different criterion — a record of what was
  * asked for must not change meaning afterwards.
  */
-function validateReworkRequirements(task, selected) {
-  const available = Array.isArray(task.requirements)
+/**
+ * The PARENT requirement texts this subtask is answerable for.
+ *
+ * Resolved from the parent document by the ids the subtask stores, never from
+ * anything the caller sent — that is what keeps `validateReworkRequirements` a
+ * whitelist rather than a free-text field.
+ *
+ * The ids are POSITIONAL — `<parentId>#req-<n>`, where n indexes the parent's
+ * `requirements` array — which is the scheme the frontend mapper synthesises.
+ * An id that does not parse, or points past the end, contributes nothing rather
+ * than an empty string: a blank entry in the whitelist would let a caller send
+ * "" and have it accepted.
+ *
+ * Empty for an ordinary task, an unreadable parent, or a parent with no
+ * requirements. All three mean "nothing extra is selectable", which leaves the
+ * original behaviour exactly as it was.
+ */
+async function claimedParentRequirementTexts(task) {
+  const parentId = task && task.parentTaskId ? String(task.parentTaskId) : "";
+  const ids = Array.isArray(task && task.satisfiesRequirementIds)
+    ? task.satisfiesRequirementIds
+    : [];
+  if (!parentId || ids.length === 0) return [];
+  try {
+    const snap = await db.collection("cowork_tasks").doc(parentId).get();
+    if (!snap.exists) return [];
+    const reqs = Array.isArray(snap.data().requirements)
+      ? snap.data().requirements
+      : [];
+    return ids
+      .map((id) => {
+        const m = /#req-(\d+)$/.exec(String(id));
+        if (!m) return null;
+        const text = reqs[Number(m[1])];
+        return typeof text === "string" && text.trim() ? text.trim() : null;
+      })
+      .filter(Boolean);
+  } catch (e) {
+    console.error("[rework] parent requirements unreadable:", e.message);
+    return [];
+  }
+}
+
+function validateReworkRequirements(task, selected, alsoAvailable = []) {
+  const own = Array.isArray(task.requirements)
     ? task.requirements.filter((r) => typeof r === "string" && r.trim() !== "")
     : [];
+
+  /**
+   * **The PARENT requirements this subtask claims count too.**
+   * OWNER DECISION, 16 Aug 2026.
+   *
+   * A subtask exists to answer its parent's requirements, so "you have not
+   * satisfied 44" is exactly the feedback a reviewer needs to give — and it was
+   * the one thing they could not say. The whitelist held only the task's own
+   * criteria, so a reviewer who ticked a project requirement had it silently
+   * dropped, and ticking ONLY project requirements produced "Select at least
+   * one completion requirement that needs changes" over a screen where they had
+   * plainly selected two.
+   *
+   * Still a whitelist, and that matters: the texts are resolved from the PARENT
+   * document by the ids this subtask actually claims, never taken from the
+   * request. The property the original comment protects — that a caller cannot
+   * write arbitrary text into a task's history under the reviewer's name — is
+   * unchanged.
+   */
+  const available = [
+    ...own,
+    ...alsoAvailable.filter((r) => typeof r === "string" && r.trim() !== ""),
+  ];
 
   // A task with no acceptance criteria cannot have one selected. Refusing the
   // rework would strand the reviewer with no way to return the work at all,
@@ -1601,7 +1837,12 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
   const task = doc.data();
   if (task.completionStatus !== "submitted") throw new Error("No pending submission.");
 
-  const flow = task.reviewFlow || await _reviewFlow(task);
+  /* A submission made BEFORE 16 Aug 2026 carries "tl_then_ceo" stamped at
+     submit time. The rule changed under it: the assigner's approval is final
+     for everyone now, so the stored two-stage value is read as final rather
+     than sending one more task into a stage nobody completes. */
+  const storedFlow = task.reviewFlow === "tl_then_ceo" ? "tl_final" : task.reviewFlow;
+  const flow = storedFlow || await _reviewFlow(task);
   const submitterId = task.completionSubmission?.submittedBy;
 
   if (approved) {
@@ -1654,7 +1895,7 @@ async function reviewCompletion({ taskId, reviewerId, reviewerName, approved, re
     // ── Rejected (all flows) — back to in_progress ────────────────────────
     if (!rejectionReason?.trim()) throw new Error("Rejection reason required.");
     // What exactly failed. Enforced server-side — see `validateReworkRequirements`.
-    const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+    const _reworkReqs = validateReworkRequirements(task, reworkRequirements, await claimedParentRequirementTexts(task));
     const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
     const tlReview = { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: false, rejectionReason: rejectionReason.trim(), reviewedAt: new Date().toISOString() };
 
@@ -1746,16 +1987,76 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
   const deadlineField = isDeadlineMode ? "fixedDeadline" : "dueDate";
   const currentDeadline = task[deadlineField] || null;
 
+  /**
+   * **Rework hands back the time that was left at submission.** OWNER
+   * DECISION, 16 Aug 2026 — settled after two rewrites the same day.
+   *
+   * The window is `deadline − submittedAt`, run from this moment. Finish an
+   * hour early and you get an hour to correct it; finish with a minute to spare
+   * and you get a minute. The time you saved is yours to spend on the fix.
+   *
+   * It was briefly rewritten to a flat hour, then to the task's whole budget.
+   * The brief said "a fresh hour INSTEAD of the remaining time" but its example
+   * — deadline 18:00, submitted 17:00, sent back 17:45, due 18:45 — has a
+   * leftover of exactly one hour, so it could not tell the two apart. A second
+   * case with four minutes left settled it at 12:23, which is only the leftover.
+   *
+   * Two things are KEPT from those rewrites and were not in the original:
+   *
+   * 1. **The gate.** Only when the submission actually beat its deadline. A
+   *    late one makes the subtraction NEGATIVE, so the original produced a
+   *    deadline BEFORE the rework — instantly overdue, timer blocked, on work
+   *    nobody had started. A late submission now keeps its date and needs an
+   *    extension, which is the cost of having been late.
+   * 2. **Office time.** `computeWorkingDeadline` walks the working calendar,
+   *    the same walk every other deadline in the engine uses, so four minutes
+   *    left at 5:58 against a 6:00 close finishes tomorrow morning rather than
+   *    at 6:02 with nobody at a desk. The original added raw milliseconds to a
+   *    snapped start.
+   *
+   * The test is on the SUBMISSION, never on the review. A reviewer who takes
+   * three hours to look at an on-time submission must not thereby cost the
+   * worker time they had earned; the only thing they controlled was when they
+   * handed it in.
+   */
+  const submittedAtMs = readInstantMs(task.completionSubmission?.submittedAt);
+  const currentDeadlineMs = readInstantMs(currentDeadline);
+  const onTime =
+    currentDeadlineMs !== null &&
+    submittedAtMs !== null &&
+    submittedAtMs <= currentDeadlineMs;
+
   let newDeadline = currentDeadline;
-  const submittedAtISO = task.completionSubmission?.submittedAt || null;
-  if (currentDeadline && submittedAtISO) {
-    const leftoverMs = new Date(currentDeadline).getTime() - new Date(submittedAtISO).getTime();
-    const snappedNow = await _snapToNextWorkingMoment(new Date());
-    newDeadline = new Date(snappedNow.getTime() + leftoverMs).toISOString();
+  /* Recorded on the history row so the task page can say WHY a deadline did
+     not move. "It stayed the same" and "you were late, so it stayed the same"
+     are the same pixels and very different facts. */
+  let deadlineHeldReason = null;
+  if (onTime) {
+    /**
+     * **The time they had left when they handed it in.**
+     *
+     * Non-negative by construction — `onTime` is the same statement as this
+     * subtraction being positive, which is what makes the gate load-bearing
+     * rather than decorative. Floored to whole seconds: rounding up would hand
+     * back a fraction nobody had.
+     */
+    const leftoverSecs = Math.floor(
+      (currentDeadlineMs - submittedAtMs) / 1000,
+    );
+    newDeadline = await computeWorkingDeadline({
+      startMs: Date.now(),
+      windowSecs: leftoverSecs,
+    });
+  } else if (currentDeadlineMs === null) {
+    deadlineHeldReason = "no_deadline";
+  } else if (submittedAtMs === null) {
+    deadlineHeldReason = "no_submission";
+  } else {
+    deadlineHeldReason = "submitted_late";
   }
 
   // What exactly failed — enforced here, not only in the browser.
-  const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+  const _reworkReqs = validateReworkRequirements(task, reworkRequirements, await claimedParentRequirementTexts(task));
   const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, reworkReason, reworkNote, reworkAttachments, reworkAttachmentIds);
   await ref.update({
     completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
@@ -1771,6 +2072,8 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
       sentBackAt: new Date().toISOString(),
       previousDeadline: currentDeadline,
       newDeadline,
+      /* Null when the clock was reset. See `deadlineHeldReason` above. */
+      deadlineHeldReason,
     }),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
@@ -1843,7 +2146,7 @@ async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved,
   } else {
     if (!rejectionReason?.trim()) throw new Error("Rejection reason required.");
     // What exactly failed. Enforced server-side — see `validateReworkRequirements`.
-    const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+    const _reworkReqs = validateReworkRequirements(task, reworkRequirements, await claimedParentRequirementTexts(task));
     const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
     await ref.update({
       completionRequirementsFailed: _reworkReqs, reworkHistory: _reworkHistory,
@@ -2251,7 +2554,7 @@ async function approveDeadline({ taskId, approverId, approverName, approved, rej
     socket.emitToMany(task.assigneeIds || [], "deadline_approved", { taskId, dueDate: newDueDate });
   } else {
     if (!rejectionReason?.trim()) throw new Error("Rejection reason is required.");
-    const _reworkReqs = validateReworkRequirements(task, reworkRequirements);
+    const _reworkReqs = validateReworkRequirements(task, reworkRequirements, await claimedParentRequirementTexts(task));
     const _reworkHistory = reworkHistoryEntry(task, reviewerId, reviewerName, _reworkReqs, rejectionReason, reworkNote, reworkAttachments, reworkAttachmentIds);
     // ── Roll deadlineWindowSecs back to what it was before this proposal ──
     // proposeDeadline wrote the new proposed total into deadlineWindowSecs so
