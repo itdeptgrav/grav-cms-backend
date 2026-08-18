@@ -82,7 +82,10 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: "50mb" }));
+// `verify` stashes the raw request body so the WhatsApp webhook can validate
+// Meta's X-Hub-Signature-256 HMAC (which must be computed over the exact bytes
+// Meta sent, not the re-serialized JSON). Harmless for every other route.
+app.use(express.json({ limit: "50mb", verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 
@@ -1174,6 +1177,13 @@ app.use("/api/cms/crm/addresses", salesWrites("CRM address"), require("./routes/
 app.use("/api/cms/crm/account-relationships", salesWrites("account relationship"), require("./routes/CMS_Routes/Sales/accountRelationships"));
 app.use("/api/cms/crm/account-team", salesWrites("account team"), require("./routes/CMS_Routes/Sales/accountTeam"));
 app.use("/api/cms/crm/activities", salesWrites("CRM activity"), require("./routes/CMS_Routes/Sales/activities"));
+// WhatsApp Cloud API webhook — PUBLIC (Meta calls it; no session/auth). This is
+// the "Callback URL" you register in Meta: https://<backend>/api/whatsapp/webhook
+// The authenticated CRM-side WhatsApp API (conversations, send) is separate.
+app.use("/api/whatsapp/webhook", require("./routes/CMS_Routes/Sales/whatsappWebhook"));
+// Authenticated CRM-side WhatsApp API (conversations, thread, send, start). Not
+// behind the Sales write-guard — sending a WhatsApp reply isn't a held change.
+app.use("/api/cms/crm/whatsapp", require("./routes/CMS_Routes/Sales/whatsapp"));
 app.use("/api/cms/crm/lookups", require("./routes/CMS_Routes/Sales/crmLookups"));
 // Call recordings, read-only for Sales (matched to a customer by phone/name).
 // No salesWrites() guard on purpose: nothing here creates a business record —
@@ -1200,6 +1210,14 @@ app.use(
 app.use(
   "/api/cms/crm/enquiries",
   require("./routes/CMS_Routes/Sales/enquiries"),
+);
+
+// SampleStyle — the shared record between the Sales journey "Style & Sample"
+// stage and the R&D / Sampling app. Mounted plainly (salesAuth per-endpoint;
+// the two approval gates are enforced inside the route file).
+app.use(
+  "/api/cms/crm/sample-styles",
+  require("./routes/CMS_Routes/Sales/sampleStyles"),
 );
 
 // Inventory Routes

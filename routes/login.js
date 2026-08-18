@@ -148,6 +148,11 @@ router.post("/login", async (req, res) => {
     if (user.role === "project_manager")
       redirectPath = "/project-manager/dashboard";
     if (user.role === "sales") redirectPath = "/sales/dashboard";
+    if (user.role === "merchandiser") redirectPath = "/merchandiser/dashboard";
+    // R&D's role literal comes from the department slug, which has appeared in
+    // more than one spelling — all of them land on the same app.
+    if (["rnd", "research_development", "research-development"].includes(user.role))
+      redirectPath = "/research-development/dashboard";
     if (user.role === "mpc-measurement")
       redirectPath = "/mpc-measurement/dashboard";
     if (user.role === "cutting_master")

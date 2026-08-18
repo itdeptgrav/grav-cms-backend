@@ -7,11 +7,39 @@
 // createSheet() JSON.stringifies into cowork_document_bodies/{id}.cells.
 //
 // Format follows the "BOM Inquiry Cost" workbook supplied as the reference —
-// two tabs: a raw-items BOM (filled in during costing) and an Inquiry
-// Costing summary (buyer/product info known today, pre-filled; costs filled
-// in as the BOM is worked out). Only the STRUCTURE is templated — category
-// rows, headers, formulas — never the reference file's own example vendor
-// rows, which belonged to a different, unrelated product.
+// a raw-items BOM (filled in during costing) and an Inquiry Costing summary
+// (buyer/product info known today, pre-filled; costs filled in as the BOM is
+// worked out). Only the STRUCTURE is templated — category rows, headers,
+// formulas — never the reference file's own example vendor rows, which
+// belonged to a different, unrelated product.
+//
+// ─── ONE WORKBOOK PER CONTRIBUTOR (17 Aug 2026) ──────────────────────────────
+//
+// The costing used to be one document with those two tabs, shared with both the
+// merchandiser and the industrial engineer. That cannot express who owns what:
+// CoWork's roles are WHOLE-DOCUMENT (owner|editor|viewer, see
+// coworkSheets.service.js's SHARE_ROLES) — there is no per-tab or per-range
+// permission, so "merch fills the materials, IE fills the operations" was a
+// convention nothing enforced, and either one could overwrite the other's work.
+//
+// So a costing is now TWO documents, one per contributor:
+//
+//   buildRawMaterialsWorkbook()  → the merchandiser is its editor
+//   buildOperationsWorkbook()    → the industrial engineer is its editor
+//
+// Each carries the same buyer/product context block, because each now stands on
+// its own in CoWork and whoever opens it needs the spec without going to find
+// the other one.
+//
+// WHAT THE SPLIT COSTS: the old summary tab pulled the raw-material total
+// across tabs with `='Raw Items Detail'!G17`. A formula cannot reach into
+// another DOCUMENT, so that line is gone and neither sheet computes total FOB.
+// The CMS composes both sheets and totals them (lib/salesJourney/costingModel
+// on the front end) — which is the right home for it anyway, since only the CMS
+// knows both documents exist.
+//
+// buildCostingWorkbook() (the old combined two-tab workbook) is kept for the
+// costings created before this, which are still live documents in CoWork.
 "use strict";
 
 /** A1-style column letters for 0-based column index (0 -> "A", 26 -> "AA"). */
@@ -44,67 +72,17 @@ const RAW_ITEM_CATEGORIES = [
 const HEAD_STYLE = { bold: true };
 const TITLE_STYLE = { bold: true, size: 14 };
 
-function buildRawItemsSheet() {
-  const cells = {};
-  const styles = {};
+/**
+ * Buyer info + product specification + reference images, written from `r`
+ * downwards. Extracted verbatim from the summary tab so that every sheet a
+ * contributor opens carries the same context — a split costing means the IE
+ * never sees the merchandiser's sheet, and vice versa.
+ *
+ * @returns {number} the next free row.
+ */
+function writeContextBlock(cells, styles, { enquiry, product }, startRow) {
+  let r = startRow;
 
-  cells[ref(0, 1)] = "Raw Items Details";
-  styles[ref(0, 1)] = TITLE_STYLE;
-
-  const headerRow = 3;
-  const headers = ["Sl no", "Category", "Raw item", "Variant / Vendor", "Unit cost", "Consumption (with allowance)", "Total cost"];
-  headers.forEach((h, i) => {
-    cells[ref(i, headerRow)] = h;
-    styles[ref(i, headerRow)] = HEAD_STYLE;
-  });
-
-  // One category label row + one blank entry row per category, so the
-  // person costing it has a clear place to type each raw item without
-  // guessing the layout. Total cost is a formula from the start — filling
-  // in unit cost and consumption is all that's needed for it to compute.
-  let row = headerRow + 1;
-  const totalCostCells = [];
-  for (const category of RAW_ITEM_CATEGORIES) {
-    cells[ref(1, row)] = category;
-    styles[ref(1, row)] = HEAD_STYLE;
-    row += 1;
-
-    const dataRow = row;
-    cells[ref(0, dataRow)] = String(totalCostCells.length + 1);
-    cells[ref(6, dataRow)] = `=${ref(4, dataRow)}*${ref(5, dataRow)}`;
-    totalCostCells.push(ref(6, dataRow));
-    row += 1;
-  }
-
-  row += 1;
-  cells[ref(1, row)] = "Total Raw Material Cost";
-  styles[ref(1, row)] = HEAD_STYLE;
-  cells[ref(6, row)] = `=SUM(${totalCostCells[0]}:${totalCostCells[totalCostCells.length - 1]})`;
-  styles[ref(6, row)] = HEAD_STYLE;
-  const rawMaterialTotalRef = ref(6, row);
-
-  return {
-    id: "sheet-1",
-    name: "Raw Items Detail",
-    cells,
-    styles,
-    rows: 200,
-    cols: 26,
-    rawMaterialTotalRef, // returned for the summary tab's cross-sheet formula, not part of the schema
-  };
-}
-
-function buildCostingSummarySheet({ enquiry, product, rawMaterialTotalRef, sheetOneName }) {
-  const cells = {};
-  const styles = {};
-
-  cells[ref(0, 1)] = "Grav Clothing Pvt Ltd";
-  styles[ref(0, 1)] = TITLE_STYLE;
-  cells[ref(0, 2)] = "Inquiry Costing";
-  styles[ref(0, 2)] = HEAD_STYLE;
-
-  // ── Buyer info — known the moment an enquiry exists ──────────────────
-  let r = 4;
   cells[ref(0, r)] = "Buyer Info";
   styles[ref(0, r)] = HEAD_STYLE;
   r += 1;
@@ -168,6 +146,144 @@ function buildCostingSummarySheet({ enquiry, product, rawMaterialTotalRef, sheet
     }
   }
 
+  return r;
+}
+
+/**
+ * The raw-items BOM table.
+ *
+ * `context` is optional and only supplied for the standalone (split) sheet —
+ * omitting it reproduces the combined workbook's first tab exactly, cell for
+ * cell, which is what the pre-split costings out there already contain.
+ */
+function buildRawItemsSheet(context = null) {
+  const cells = {};
+  const styles = {};
+
+  let headerRow = 3;
+  if (context) {
+    cells[ref(0, 1)] = "Grav Clothing Pvt Ltd";
+    styles[ref(0, 1)] = TITLE_STYLE;
+    cells[ref(0, 2)] = "Raw Materials Costing — Merchandising";
+    styles[ref(0, 2)] = HEAD_STYLE;
+    headerRow = writeContextBlock(cells, styles, context, 4) + 1;
+  } else {
+    cells[ref(0, 1)] = "Raw Items Details";
+    styles[ref(0, 1)] = TITLE_STYLE;
+  }
+
+  const headers = ["Sl no", "Category", "Raw item", "Variant / Vendor", "Unit cost", "Consumption (with allowance)", "Total cost"];
+  headers.forEach((h, i) => {
+    cells[ref(i, headerRow)] = h;
+    styles[ref(i, headerRow)] = HEAD_STYLE;
+  });
+
+  // One category label row + one blank entry row per category, so the
+  // person costing it has a clear place to type each raw item without
+  // guessing the layout. Total cost is a formula from the start — filling
+  // in unit cost and consumption is all that's needed for it to compute.
+  let row = headerRow + 1;
+  const totalCostCells = [];
+  for (const category of RAW_ITEM_CATEGORIES) {
+    cells[ref(1, row)] = category;
+    styles[ref(1, row)] = HEAD_STYLE;
+    row += 1;
+
+    const dataRow = row;
+    cells[ref(0, dataRow)] = String(totalCostCells.length + 1);
+    cells[ref(6, dataRow)] = `=${ref(4, dataRow)}*${ref(5, dataRow)}`;
+    totalCostCells.push(ref(6, dataRow));
+    row += 1;
+  }
+
+  row += 1;
+  cells[ref(1, row)] = "Total Raw Material Cost";
+  styles[ref(1, row)] = HEAD_STYLE;
+  cells[ref(6, row)] = `=SUM(${totalCostCells[0]}:${totalCostCells[totalCostCells.length - 1]})`;
+  styles[ref(6, row)] = HEAD_STYLE;
+  const rawMaterialTotalRef = ref(6, row);
+
+  return {
+    id: "sheet-1",
+    name: "Raw Items Detail",
+    cells,
+    styles,
+    rows: 200,
+    cols: 26,
+    rawMaterialTotalRef, // returned for the summary tab's cross-sheet formula, not part of the schema
+  };
+}
+
+/**
+ * The industrial engineer's sheet: the same context, then operations.
+ *
+ * It deliberately stops at "Total Operation Cost". Total FOB would need the
+ * raw-material total, which now lives in a different CoWork document and no
+ * formula can reach it — so the sheet says what it knows and the CMS adds the
+ * two together. Claiming an FOB here that silently excluded materials would be
+ * worse than not showing one.
+ *
+ * The tab keeps the name "Inquiry Costing" so one reader
+ * (lib/salesJourney/costingModel) parses split and combined sheets alike.
+ */
+function buildOperationsSheet({ enquiry, product }) {
+  const cells = {};
+  const styles = {};
+
+  cells[ref(0, 1)] = "Grav Clothing Pvt Ltd";
+  styles[ref(0, 1)] = TITLE_STYLE;
+  cells[ref(0, 2)] = "Operation Costing — Industrial Engineering";
+  styles[ref(0, 2)] = HEAD_STYLE;
+
+  let r = writeContextBlock(cells, styles, { enquiry, product }, 4) + 1;
+
+  cells[ref(0, r)] = "Operation Cost";
+  styles[ref(0, r)] = HEAD_STYLE;
+  r += 1;
+
+  const opHeaderRow = r;
+  cells[ref(0, opHeaderRow)] = "Sl";
+  cells[ref(1, opHeaderRow)] = "Operation Details";
+  cells[ref(2, opHeaderRow)] = "SAM";
+  cells[ref(3, opHeaderRow)] = "Cost Per Mint";
+  cells[ref(4, opHeaderRow)] = "CMP";
+  [0, 1, 2, 3, 4].forEach((c) => { styles[ref(c, opHeaderRow)] = HEAD_STYLE; });
+  r += 1;
+
+  // A few blank costed rows rather than one: an operation breakdown is
+  // normally several lines, and a person who has to discover "add a row"
+  // before they can start tends to put everything on the one row that exists.
+  const first = r;
+  for (let i = 0; i < 6; i += 1) {
+    cells[ref(0, r)] = String(i + 1);
+    cells[ref(4, r)] = `=${ref(2, r)}*${ref(3, r)}`;
+    r += 1;
+  }
+  const last = r - 1;
+
+  r += 1;
+  cells[ref(0, r)] = "Total Operation Cost";
+  styles[ref(0, r)] = HEAD_STYLE;
+  cells[ref(4, r)] = `=SUM(${ref(4, first)}:${ref(4, last)})`;
+  styles[ref(4, r)] = HEAD_STYLE;
+  r += 2;
+
+  cells[ref(0, r)] = "Total FOB (raw materials + operations) is worked out in the CMS, which holds both sheets.";
+
+  return { id: "sheet-1", name: "Inquiry Costing", cells, styles, rows: 200, cols: 26 };
+}
+
+function buildCostingSummarySheet({ enquiry, product, rawMaterialTotalRef, sheetOneName }) {
+  const cells = {};
+  const styles = {};
+
+  cells[ref(0, 1)] = "Grav Clothing Pvt Ltd";
+  styles[ref(0, 1)] = TITLE_STYLE;
+  cells[ref(0, 2)] = "Inquiry Costing";
+  styles[ref(0, 2)] = HEAD_STYLE;
+
+  let r = writeContextBlock(cells, styles, { enquiry, product }, 4);
+
   // ── Raw items cost, pulled from the BOM tab rather than re-entered ───
   r += 1;
   const rmHeaderRow = r;
@@ -212,15 +328,41 @@ function buildCostingSummarySheet({ enquiry, product, rawMaterialTotalRef, sheet
 }
 
 /**
- * Build the full two-tab costing workbook for one enquiry product.
+ * The merchandiser's standalone workbook — context + the raw-items BOM.
  *
  * @param {object} p
  * @param {{enquiryId?:string, customerName?:string, accountName?:string, enquiryDate?:string|Date}} p.enquiry
- * @param {{product?:string, quantity?:number, gender?:string, colour?:string,
- *   fabricPreference?:string, fabricComposition?:string, gsm?:string,
- *   fit?:string, sizeRange?:string, trims?:string, logo?:boolean,
- *   embroidery?:boolean, printing?:boolean, brandingPlacement?:string,
- *   specialConstruction?:string}} p.product
+ * @param {object} p.product
+ * @returns {{sheets: object[], activeId: string}}
+ */
+function buildRawMaterialsWorkbook({ enquiry, product }) {
+  const { rawMaterialTotalRef, ...sheet } = buildRawItemsSheet({ enquiry, product });
+  return { sheets: [sheet], activeId: sheet.id };
+}
+
+/**
+ * The industrial engineer's standalone workbook — context + operations.
+ *
+ * @param {object} p
+ * @param {{enquiryId?:string, customerName?:string, accountName?:string, enquiryDate?:string|Date}} p.enquiry
+ * @param {object} p.product
+ * @returns {{sheets: object[], activeId: string}}
+ */
+function buildOperationsWorkbook({ enquiry, product }) {
+  const sheet = buildOperationsSheet({ enquiry, product });
+  return { sheets: [sheet], activeId: sheet.id };
+}
+
+/**
+ * The original combined two-tab workbook.
+ *
+ * Kept because the costings created before the split are real CoWork documents
+ * people still have open — the CMS has to keep reading and writing them in the
+ * shape they were made in. Nothing creates a new one.
+ *
+ * @param {object} p
+ * @param {{enquiryId?:string, customerName?:string, accountName?:string, enquiryDate?:string|Date}} p.enquiry
+ * @param {object} p.product
  * @returns {{sheets: object[], activeId: string}} a Workbook, ready to
  *   JSON.stringify into cowork_document_bodies/{id}.cells.
  */
@@ -240,4 +382,9 @@ function buildCostingWorkbook({ enquiry, product }) {
   };
 }
 
-module.exports = { buildCostingWorkbook };
+module.exports = {
+  buildCostingWorkbook,
+  buildRawMaterialsWorkbook,
+  buildOperationsWorkbook,
+  RAW_ITEM_CATEGORIES,
+};

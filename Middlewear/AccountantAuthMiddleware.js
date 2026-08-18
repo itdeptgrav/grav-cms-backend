@@ -4,7 +4,6 @@
 // (with or without cookie-parser) and Bearer headers. Has a DEV BYPASS
 // flag for local debugging.
 //
-
 // HISTORY:
 //   This file is the LEGACY entry-point. The newer sub-account system
 //   (organization + roles: owner/approver/editor/viewer) lives in

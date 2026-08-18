@@ -80,15 +80,17 @@ describe("journey reference generation", () => {
 });
 
 describe("journey schema defaults and validation", () => {
-  test("a new journey starts at Account, in progress, on track", async () => {
+  test("a new journey starts at Enquiry, in progress, on track", async () => {
     const acc = await Account.create({ companyName: "Defaults Co" });
     const j = await createWithRef(SalesJourney, journeyPayload(acc._id));
 
-    expect(j.currentStage).toBe("account");
+    // "account" is no longer a stage — Enquiry is the first stage now.
+    expect(j.currentStage).toBe("enquiry");
     expect(j.risk).toBe("onTrack");
-    expect(j.stageStates.account).toBe("inProgress");
-    // Selecting an Account does NOT complete the Account stage.
-    expect(j.stageStates.account).not.toBe("complete");
+    expect(j.stageStates.enquiry).toBe("inProgress");
+    expect(j.stageStates.enquiry).not.toBe("complete");
+    // The legacy "account" state still exists in the schema but starts idle.
+    expect(j.stageStates.account).toBe("notStarted");
   });
 
   test("every later stage starts notStarted, and all eight exist", async () => {
@@ -97,7 +99,9 @@ describe("journey schema defaults and validation", () => {
 
     for (const code of SALES_JOURNEY_STAGE_CODES) {
       expect(j.stageStates[code]).toBeDefined();
-      if (code !== "account") expect(j.stageStates[code]).toBe("notStarted");
+      // Enquiry is the one in progress on a fresh journey; everything else
+      // (including the retired "account" state) is notStarted.
+      if (code !== "enquiry") expect(j.stageStates[code]).toBe("notStarted");
     }
     expect(SALES_JOURNEY_STAGE_CODES).toHaveLength(8);
   });
@@ -130,12 +134,12 @@ describe("journey schema defaults and validation", () => {
     expect(j.currentStageState).toBe("inProgress");
     expect(j.waitingOn).toBeNull();
 
-    j.stageStates.account = "waitingCustomer";
+    j.stageStates.enquiry = "waitingCustomer";
     await j.save();
     expect(j.currentStageState).toBe("waitingCustomer");
     expect(j.waitingOn).toBe("customer");
 
-    j.stageStates.account = "waitingInternal";
+    j.stageStates.enquiry = "waitingInternal";
     await j.save();
     expect(j.waitingOn).toBe("internal");
 
@@ -280,8 +284,10 @@ describe("query shapes the Hub depends on", () => {
     const mine = new mongoose.Types.ObjectId();
     const theirs = new mongoose.Types.ObjectId();
 
-    await createWithRef(SalesJourney, journeyPayload(accA._id, { ownerId: mine, name: "Mine A" }));
-    await createWithRef(SalesJourney, journeyPayload(accA._id, { ownerId: theirs, name: "Theirs A", risk: "atRisk" }));
+    // New journeys default to "enquiry"; set distinct stages so the stage
+    // filter is a real test (not just the default on every row).
+    await createWithRef(SalesJourney, journeyPayload(accA._id, { ownerId: mine, name: "Mine A", currentStage: "styleSample" }));
+    await createWithRef(SalesJourney, journeyPayload(accA._id, { ownerId: theirs, name: "Theirs A", risk: "atRisk", currentStage: "costQuote" }));
     await createWithRef(SalesJourney, journeyPayload(accB._id, { ownerId: mine, name: "Mine B", currentStage: "enquiry" }));
 
     expect(await SalesJourney.countDocuments({ isActive: true, accountId: accA._id })).toBe(2);
@@ -294,20 +300,20 @@ describe("query shapes the Hub depends on", () => {
     const acc = await Account.create({ companyName: "State Co" });
     const j = await createWithRef(SalesJourney, journeyPayload(acc._id));
 
-    // Waiting on the customer at Account.
-    j.stageStates.account = "waitingCustomer";
+    // Waiting on the customer at Enquiry (the first stage).
+    j.stageStates.enquiry = "waitingCustomer";
     await j.save();
     expect(
-      await SalesJourney.countDocuments({ currentStage: "account", "stageStates.account": "waitingCustomer" }),
+      await SalesJourney.countDocuments({ currentStage: "enquiry", "stageStates.enquiry": "waitingCustomer" }),
     ).toBe(1);
 
     // A later stage carrying the same value must NOT match while the journey
-    // is still on Account — otherwise the Hub's status filter lies.
+    // is still on Enquiry — otherwise the Hub's status filter lies.
     const j2 = await createWithRef(SalesJourney, journeyPayload(acc._id, { name: "Other" }));
     j2.stageStates.shipment = "waitingCustomer";
     await j2.save();
     expect(
-      await SalesJourney.countDocuments({ currentStage: "account", "stageStates.account": "waitingCustomer" }),
+      await SalesJourney.countDocuments({ currentStage: "enquiry", "stageStates.enquiry": "waitingCustomer" }),
     ).toBe(1);
   });
 
