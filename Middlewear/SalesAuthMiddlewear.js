@@ -38,7 +38,16 @@ const SECRET = process.env.JWT_SECRET || "grav_clothing_secret_key";
 // Roles that are allowed to access the CRM (Leads / Contacts / Accounts)
 const ALLOWED_ROLES = ["sales", "admin", "ceo", "project_manager", "merchandiser"];
 
-const SalesAuthMiddlewear = (req, res, next) => {
+// R&D role literals. deptAuth's buildTokenPayload mints `role` from
+// `dept.legacyRole || dept.slug`, and the R&D department has been seen under
+// more than one slug spelling, so all three are accepted rather than betting on
+// one. R&D is deliberately NOT added to ALLOWED_ROLES above: that list gates the
+// whole CRM — leads, contacts, accounts — and R&D has no business in any of it.
+// It is granted per-route via `SalesAuthMiddlewear.withRoles(...)`.
+const RND_ROLES = ["rnd", "research_development", "research-development"];
+
+// Factory, so a route group can widen the role list without widening the CRM's.
+const makeSalesAuth = (allowed) => (req, res, next) => {
   try {
     // ── 1. Cookie (standard — cookie-parser present) ───────────────────────
     let token = req.cookies?.auth_token;
@@ -65,10 +74,10 @@ const SalesAuthMiddlewear = (req, res, next) => {
     const decoded = jwt.verify(token, SECRET);
 
     // ── Role check ──────────────────────────────────────────────────────────
-    if (!ALLOWED_ROLES.includes(decoded.role)) {
+    if (!allowed.includes(decoded.role)) {
       return res.status(403).json({
         success: false,
-        message: `Access denied. Sales CRM requires role: ${ALLOWED_ROLES.join(" or ")}. Your role: ${decoded.role}.`,
+        message: `Access denied. Requires role: ${allowed.join(" or ")}. Your role: ${decoded.role}.`,
       });
     }
 
@@ -122,5 +131,17 @@ const SalesAuthMiddlewear = (req, res, next) => {
     });
   }
 };
+
+const SalesAuthMiddlewear = makeSalesAuth(ALLOWED_ROLES);
+
+/**
+ * Same guard, with extra roles allowed for this route group only.
+ *   router.use(SalesAuthMiddlewear.withRoles(SalesAuthMiddlewear.RND_ROLES))
+ */
+SalesAuthMiddlewear.withRoles = (...extra) =>
+  makeSalesAuth([...ALLOWED_ROLES, ...extra.flat()]);
+SalesAuthMiddlewear.ALLOWED_ROLES = ALLOWED_ROLES;
+SalesAuthMiddlewear.RND_ROLES = RND_ROLES;
+SalesAuthMiddlewear.isRnd = (role) => RND_ROLES.includes(role);
 
 module.exports = SalesAuthMiddlewear;

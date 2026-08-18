@@ -116,33 +116,122 @@ function planStageTransition(journey = {}, input = {}) {
       if (currentState === "blocked") {
         throw new JourneyTransitionError(`${labelOf(current)} is blocked — resolve the block before moving forward.`);
       }
-      // Account → Enquiry gate. The customer foundation must be complete before
-      // an Enquiry can be raised (see services/accountReadiness.js). Enforced
-      // here, not just behind a disabled frontend button, so NO caller can
-      // advance a hollow Account. Only applied when leaving the Account stage
-      // and the route actually supplied the readiness fact.
-      if (current === "account" && context.accountReadiness && !context.accountReadiness.ready) {
-        const missing = (context.accountReadiness.missing || []).map((m) => m.label).join("; ");
-        throw new JourneyTransitionError(
-          `The customer account isn't ready for an Enquiry yet — missing: ${missing || "required details"}.`,
-        );
-      }
+      // (The old Account → Enquiry readiness gate was removed on 13 Aug 2026:
+      // "account" is no longer a journey stage. The customer is set up on the
+      // Active Lead before conversion, so there is no hollow-account state to
+      // guard here.)
       const ni = nextApplicableIndex(currentIdx, states);
       if (ni === -1) {
         throw new JourneyTransitionError(`${labelOf(current)} is the final stage — there is nothing after it.`);
       }
       const next = STAGE_ORDER[ni];
+
+      // ── The one hard prerequisite: nothing enters Production without a PO ──
+      //
+      // Every other transition stays permissive on purpose. This one is not,
+      // because it commits factory capacity and buys fabric against a price
+      // nobody has signed — the only stage move whose cost cannot be walked
+      // back by editing a record.
+      //
+      // It IS overridable, by a Sales manager with a written reason ("customer
+      // confirmed on call, PO to follow Monday"). A gate with no override gets
+      // defeated by someone typing a fake PO number, which costs you both the
+      // control and the truth; an override that is recorded gives you something
+      // better than prevention — a list of every time the rule was bent.
+      const missing = [];
+      if (next === "production" && context.poOnFile === false) missing.push("customer PO");
+
+      if (missing.length) {
+        const reason = String(context.overrideReason || "").trim();
+        if (!reason) {
+          throw new JourneyTransitionError(
+            `${labelOf(next)} needs the ${missing.join(" and ")} on file. `
+            + "Record it first, or a Sales manager can proceed with a written reason.",
+          );
+        }
+        if (!context.isManager) {
+          throw new JourneyTransitionError(
+            `Only a Sales manager can start ${labelOf(next)} without the ${missing.join(" and ")}.`,
+          );
+        }
+      }
+
       const set = {
         currentStage: next,
         [`stageStates.${current}`]: "complete",
       };
+      // Returned SEPARATELY from `set`, not as a $push inside it: the route
+      // applies set with journey.set(path, value), so a mongo operator key would
+      // be written as a literal field called "$push".
+      const append = missing.length
+        ? {
+            path: "advancedWithoutPrerequisites",
+            value: {
+              stage: next,
+              missing,
+              reason: String(context.overrideReason || "").trim(),
+              at: new Date(),
+              by: context.actor || {},
+            },
+          }
+        : null;
       // Only open the next stage if it hasn't already been worked — a stage
       // that is complete (advancing again after a reopen) or notApplicable is
       // left as it is.
       if (states[next] === "notStarted" || states[next] === "reopened") {
         set[`stageStates.${next}`] = "inProgress";
       }
-      return { set, summary: `advanced ${labelOf(current)} → ${labelOf(next)}` };
+      return {
+        set,
+        ...(append ? { append } : {}),
+        summary: append
+          ? `advanced ${labelOf(current)} → ${labelOf(next)} WITHOUT ${missing.join(" and ")}`
+          : `advanced ${labelOf(current)} → ${labelOf(next)}`,
+      };
+    }
+
+    // ── close ────────────────────────────────────────────────────────────
+    //
+    // Closing the order was routed through `advance`, and Retention is the LAST
+    // stage — so advance hit "there is nothing after it" and threw. The close
+    // button could not work at all. Closing is its own verb: it completes the
+    // final stage rather than moving to a next one.
+    //
+    // The financial gate: `context.closing` carries the closing report's verdict
+    // ({canClose, blockers, checklist}). When the caller supplies it, this
+    // REFUSES a close with unmet checks — the UI's disabled button is not a
+    // control, since anything hitting the API directly bypasses it. When it is
+    // absent the close proceeds, which is deliberate for now: the route does not
+    // yet assemble the verdict, and failing closed would leave no way to close
+    // an order at all. Wiring that assembly is the remaining half of this fix.
+    case "close": {
+      if (currentIdx !== STAGE_ORDER.length - 1) {
+        throw new JourneyTransitionError(
+          `Only ${labelOf(STAGE_ORDER[STAGE_ORDER.length - 1])} can be closed — this Journey is on ${labelOf(current)}.`,
+        );
+      }
+      if (currentState === "blocked") {
+        throw new JourneyTransitionError(`${labelOf(current)} is blocked — resolve the block before closing.`);
+      }
+      if (currentState === "complete") {
+        throw new JourneyTransitionError("This order is already closed.");
+      }
+      const verdict = context.closing;
+      if (verdict && verdict.canClose === false) {
+        const n = verdict.blockers;
+        throw new JourneyTransitionError(
+          typeof n === "number"
+            ? `${n} closing ${n === 1 ? "check is" : "checks are"} unmet — the order cannot be closed yet.`
+            : "The closing checks are not met — the order cannot be closed yet.",
+        );
+      }
+      return {
+        set: {
+          [`stageStates.${current}`]: "complete",
+          closedAt: new Date(),
+        },
+        summary: `closed the order at ${labelOf(current)}`,
+      };
     }
 
     case "setState": {
@@ -194,7 +283,7 @@ function planStageTransition(journey = {}, input = {}) {
 
     default:
       throw new JourneyTransitionError(
-        `"${action || "(none)"}" is not a stage action. Use one of: advance, setState, block, reopen.`,
+        `"${action || "(none)"}" is not a stage action. Use one of: advance, close, setState, block, reopen.`,
       );
   }
 }

@@ -45,6 +45,18 @@ const activitySchema = new mongoose.Schema(
     // accountId for a Lead-timeline activity; never set alongside a Lead's
     // resulting Account before Chunk 5's conversion bridge exists.
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: "Lead", index: true },
+    // Journey TAG, not an owner. An activity logged from a Sales Journey stage
+    // is still Account-owned (accountId set) — journeyRef/stage only record which
+    // journey and stage it was logged from, so the journey's action panel can
+    // show just its own timeline while the activity still rolls up on the
+    // Account. Never a third owner: the exactly-one-of(accountId, leadId)
+    // invariant below is untouched.
+    //
+    // It stores the journey's human REFERENCE (SJ-YYYY-NNNN), not a Mongo _id —
+    // that reference is the journey's stable identifier everywhere (routes, the
+    // adapter DTO's `id`), and the frontend never sees the raw _id.
+    journeyRef: { type: String, trim: true, index: true },
+    stage: { type: String, trim: true },
     contactId: { type: mongoose.Schema.Types.ObjectId, ref: "CRMContact" },
 
     activityType: { type: String, enum: ACTIVITY_TYPE_CODES, required: true },
