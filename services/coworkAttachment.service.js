@@ -38,7 +38,7 @@ const admin = require("firebase-admin");
 const {
   sniffMimeType,
   safeName,
-  ALLOWED,
+  mayRenderInline,
   MAX_BYTES,
   COLLECTION,
   COWORK_FOLDER_NAME,
@@ -82,7 +82,41 @@ function getServiceAccountAuth() {
       "Attachment storage is not configured on this server.",
     );
   }
-  const credentials = JSON.parse(raw);
+  let credentials;
+  try {
+    credentials = JSON.parse(raw);
+  } catch {
+    throw new AttachmentError(
+      "STORAGE_NOT_CONFIGURED",
+      "GOOGLE_SERVICE_ACCOUNT_KEY is not valid JSON.",
+    );
+  }
+
+  /**
+   * **The private key's newlines, restored.**
+   *
+   * The key is a PEM: real line breaks are part of its syntax. Carried inside a
+   * one-line env var it is written `\n`, and `JSON.parse` turns those into real
+   * newlines — provided nothing escaped them a second time on the way in. A
+   * dashboard, a CI secret store or a shell that re-escapes leaves literal
+   * backslash-n pairs in the string, and OpenSSL rejects the result with
+   * `error:1E08010C:DECODER routines::unsupported` — which surfaces to the
+   * person uploading a file as a bare 400 with nothing to act on.
+   *
+   * Idempotent: a correctly escaped key has already become real newlines by
+   * here and contains no `\n` pairs left to replace.
+   */
+  if (typeof credentials.private_key === "string") {
+    credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+  }
+
+  if (!credentials.client_email || !credentials.private_key) {
+    throw new AttachmentError(
+      "STORAGE_NOT_CONFIGURED",
+      "GOOGLE_SERVICE_ACCOUNT_KEY is missing client_email or private_key.",
+    );
+  }
+
   return new google.auth.GoogleAuth({
     credentials,
     scopes: ["https://www.googleapis.com/auth/drive"],
@@ -162,10 +196,13 @@ async function uploadAttachment({
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw new Error("No file was received.");
   }
-  if (buffer.length > MAX_BYTES) {
+  /* No size cap — withdrawn on the owner's instruction. `MAX_BYTES` is null
+     now, and the check is guarded rather than deleted so restoring a cap is a
+     one-line change in `coworkAttachmentRules.js` and not a re-edit here. */
+  if (MAX_BYTES !== null && buffer.length > MAX_BYTES) {
     throw new AttachmentError(
       "FILE_TOO_LARGE",
-      "That file is larger than the 50 MB limit.",
+      `That file is larger than the ${Math.round(MAX_BYTES / (1024 * 1024))} MB limit.`,
     );
   }
   if (!uploadedBy) throw new Error("An attachment needs an uploader.");
@@ -173,13 +210,20 @@ async function uploadAttachment({
     throw new Error("An attachment must belong to something.");
   }
 
-  const mimeType = sniffMimeType(buffer, declaredType);
-  if (!mimeType || !ALLOWED.has(mimeType)) {
-    throw new AttachmentError(
-      "UNSUPPORTED_TYPE",
-      "That file type is not allowed. Accepted: PDF, Word, Excel, PowerPoint, PNG, JPG, WEBP, TXT and CSV.",
-    );
-  }
+  /**
+   * **Every type is accepted** — the allow-list was withdrawn on the owner's
+   * instruction. A `.zip`, an `.mp4`, a `.psd` all store and all come back.
+   *
+   * The sniff is KEPT even though nothing is refused by it. It reads the type
+   * from the file's own leading bytes, and the client's `mimetype` and filename
+   * are both attacker-controlled — so this is what the download route later
+   * decides `inline` versus `attachment` from. Trusting the client's label
+   * there would let a `.png` that is really HTML be served as a page.
+   *
+   * `application/octet-stream` where the bytes say nothing recognisable: an
+   * unknown type is a download, never a render.
+   */
+  const mimeType = sniffMimeType(buffer, declaredType) || "application/octet-stream";
 
   const auth = getServiceAccountAuth();
   const drive = google.drive({ version: "v3", auth });
@@ -318,7 +362,7 @@ module.exports = {
   deleteAttachment,
   sniffMimeType,
   safeName,
-  ALLOWED,
+  mayRenderInline,
   MAX_BYTES,
   COLLECTION,
 };

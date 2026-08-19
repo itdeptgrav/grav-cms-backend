@@ -89,6 +89,32 @@ app.use(express.json({ limit: "50mb", verify: (req, _res, buf) => { req.rawBody 
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(cookieParser());
 
+/**
+ * Private Cowork attachments need a Drive service account. Say so at boot if it
+ * is absent — and carry on.
+ *
+ * Every other Cowork feature works without it, so refusing to start would turn
+ * one missing credential into a total outage of the whole CMS. The upload and
+ * download routes already answer 503 with a clear reason when storage is not
+ * configured; this only makes the cause visible in the terminal at boot rather
+ * than at the moment somebody's upload fails.
+ *
+ * Deliberately `console.warn` and deliberately no `process.exit` or `throw`.
+ */
+try {
+  const { storageConfigured } = require("./services/coworkAttachment.service");
+  if (!storageConfigured()) {
+    console.warn(
+      "Private attachment storage is disabled because GOOGLE_SERVICE_ACCOUNT_KEY is missing. Cowork will start; attachment upload and download will answer 503 until it is set.",
+    );
+  }
+} catch (e) {
+  console.warn(
+    "Private attachment storage could not be checked at boot:",
+    e.message,
+  );
+}
+
 // Create HTTP server
 const server = http.createServer(app);
 console.log("Drive key loaded:", !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
@@ -1717,6 +1743,9 @@ const barcodeScannerRoutes = require("./routes/Barcode_Scanner_Device/barcode-sc
 app.use("/api/barcode-devices", barcodeScannerRoutes);
 
 app.use("/cowork", require("./routes/task_routes/taskForward.js"));
+/* Per-tab "what is new since you last looked" — server-side so reading on
+   one device clears the badge on every other. */
+app.use("/cowork", require("./routes/task_routes/taskTabSeen.routes.js"));
 // Media upload (images → Cloudinary, PDFs → Google Drive, voice → Cloudinary)
 app.use("/cowork", require("./routes/task_routes/mediaUpload.js"));
 

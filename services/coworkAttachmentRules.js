@@ -13,8 +13,24 @@
 const COWORK_FOLDER_NAME = "Cowork Attachments";
 const COLLECTION = "cowork_attachments";
 
-/** 50 MB. Matches the voucher service's multer cap. */
-const MAX_BYTES = 50 * 1024 * 1024;
+/**
+ * No size cap on a Cowork attachment — removed on the owner's instruction.
+ *
+ * It was 50 MB, matching the voucher service's multer cap. Nothing about the
+ * STORAGE required it: these go to Google Drive through a service account, and
+ * Drive takes files far larger than this ever allowed. The cap was a policy
+ * choice and the owner has withdrawn it.
+ *
+ * `null` rather than `Infinity` or a very large number, so a caller that
+ * forgets to handle "no cap" fails loudly on a null comparison instead of
+ * silently enforcing a limit nobody chose.
+ *
+ * **What still bounds an upload, and is not this file's to change:** the route
+ * uses `multer.memoryStorage()`, so the whole file is held in the Node
+ * process's RAM while it is being forwarded to Drive. That is a property of
+ * the transport, not a rule — see the note in `coworkAttachments.js`.
+ */
+const MAX_BYTES = null;
 
 /**
  * What may be stored, keyed by the type read from the FILE'S OWN BYTES.
@@ -23,20 +39,36 @@ const MAX_BYTES = 50 * 1024 * 1024;
  * used for nothing here except the display name. A `.pdf` that is actually an
  * HTML document would otherwise be stored and later served as a PDF.
  */
-const ALLOWED = new Set([
+/**
+ * **No type is refused any more** — withdrawn on the owner's instruction.
+ *
+ * `ALLOWED` was the upload gate: anything not in it was rejected. It is now the
+ * list of types that may be shown INLINE in the browser, which is a different
+ * job and the only one that still needs a list.
+ *
+ * Why the list did not simply get deleted: the download route serves an
+ * attachment with its own `Content-Type` and `Content-Disposition: inline`, so
+ * that images and PDFs can be previewed. With the upload gate gone, an
+ * uploaded HTML file would be served as `text/html`, inline, from this origin —
+ * the uploader's JavaScript running inside whoever opened it, with their
+ * session. Allowing every type to be STORED is the owner's decision; serving
+ * every type inline was never part of it, and is not required by it.
+ *
+ * So anything outside this list downloads instead of rendering. A `.zip`, an
+ * `.mp4`, a `.psd` all upload and all come back intact — they just arrive as a
+ * file rather than as a page.
+ */
+const INLINE_SAFE = new Set([
   "application/pdf",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.ms-excel",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.ms-powerpoint",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   "image/png",
   "image/jpeg",
   "image/webp",
-  "text/plain",
-  "text/csv",
 ]);
+
+/** Whether this type may be rendered in the browser rather than downloaded. */
+function mayRenderInline(mimeType) {
+  return INLINE_SAFE.has(String(mimeType || "").toLowerCase());
+}
 
 const startsWith = (buf, bytes) =>
   buf.length >= bytes.length && bytes.every((b, i) => buf[i] === b);
@@ -126,7 +158,9 @@ function safeName(name) {
 module.exports = {
   sniffMimeType,
   safeName,
-  ALLOWED,
+  /* Was `ALLOWED`, the upload gate. Now the inline-render list — see above. */
+  INLINE_SAFE,
+  mayRenderInline,
   MAX_BYTES,
   COLLECTION,
   COWORK_FOLDER_NAME,

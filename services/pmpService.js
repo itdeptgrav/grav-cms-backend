@@ -131,6 +131,20 @@ async function computeC1ForQuarter(employeeId, quarter, year) {
             reworksReceived: Number(t.c1.reworksReceived) || 0,
             c1Status: t.c1.c1Status,
             isRejected: t.c1.isRejected || false,
+            /* What each event COST, from the engine's own scorer — see
+               `taskScoreBreakdown`. Sent so the score page can put a figure
+               beside each reason instead of showing only the total, and so it
+               never derives one from config the scorer does not apply:
+               `c1ExtensionDeduction` is set to 0.3 and charged as 0. */
+            scoreBreakdown: c1Svc.taskScoreBreakdown(cfg, {
+                deadlinesMissed: Number(t.c1.deadlinesMissed) || 0,
+                extensionsFiled: Number(t.c1.extensionsFiled) || 0,
+                reworksReceived: Number(t.c1.reworksReceived) || 0,
+                isRejected: t.c1.isRejected || false,
+            }),
+            /* The figure the deductions came off, so the row can show the
+               whole sum rather than a total and some negatives. */
+            baseScore: Number(cfg.c1BaseScore) || 0,
         })),
     };
 }
