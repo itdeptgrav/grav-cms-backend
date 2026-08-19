@@ -2308,8 +2308,34 @@ async function reworkTask({ taskId, reviewerId, reviewerName, reworkReason, waiv
       recipientIds: [submitterId],
       type: "task_rework",
       title: `🔄 Rework Required · ${task.title}`,
-      body: `Reason: ${reworkReason || "Check task for details"}`,
-      data: { taskId, taskTitle: task.title, reason: reworkReason },
+      /**
+       * **How long they have, in the notification itself.**
+       * OWNER DECISION, 18 Aug 2026.
+       *
+       * "Rework required" alone makes somebody open the task to find out
+       * whether they have twenty minutes or none — and the answer is not
+       * obvious even then, because the time given is what was UNUSED at
+       * submission, not what is left against the old deadline.
+       *
+       * The late case is the one that most needs saying: a submission that
+       * missed its deadline earns no reset, so the task comes back already
+       * overdue and its timer will not start until somebody grants an
+       * extension. Discovering that by pressing an inert Play button is the
+       * worst way to learn it.
+       */
+      body:
+        deadlineHeldReason === "submitted_late"
+          ? `Reason: ${reworkReason || "Check task for details"} — the deadline has NOT been reset, because this was handed in late. You will need more time granted before you can start.`
+          : newDeadline
+            ? `Reason: ${reworkReason || "Check task for details"} — you have until ${_istShort(newDeadline)}, the time that was left when you handed it in.`
+            : `Reason: ${reworkReason || "Check task for details"}`,
+      data: {
+        taskId,
+        taskTitle: task.title,
+        reason: reworkReason,
+        newDeadline,
+        deadlineHeldReason,
+      },
       senderId: reviewerId, senderName: reviewerName,
     });
   }
