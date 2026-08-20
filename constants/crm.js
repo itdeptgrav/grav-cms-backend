@@ -824,6 +824,74 @@ const LEAD_QUALIFICATION_TO_LEGACY_STAGE = {
   converted: "won",
 };
 
+// ── Sample & Style (R&D / Sampling ↔ Sales journey "Style & Sample" stage) ────
+// ONE SampleStyle record per journey product. R&D owns two production jobs
+// (tech sheet, sample); each is followed by a Sales approval gate. The R&D app
+// and the Sales journey stage both map their own wording onto this canonical
+// vocabulary — that's how the two apps stay separate yet talk to one record.
+//
+// Materials are the Merchandiser's upstream input (R&D can't start the tech
+// sheet until they're selected). techSheet/sample each carry a small state
+// machine: R&D moves it forward to `submitted`; Sales resolves the gate to
+// `approved` or bounces it back (`changes` / `rejected`).
+const SAMPLE_MATERIALS_STATUSES = [
+  pair("pending", "Awaiting materials"),
+  pair("selected", "Materials selected"),
+];
+const SAMPLE_TECHSHEET_STATUSES = [
+  pair("pending", "Not started"),
+  pair("in_progress", "In progress"),
+  pair("submitted", "With Sales"),
+  pair("approved", "Approved"),
+  pair("changes", "Changes requested"),
+];
+const SAMPLE_TECHSHEET_TRANSITIONS = {
+  pending: ["in_progress"],
+  in_progress: ["submitted"],
+  submitted: ["approved", "changes"],
+  changes: ["in_progress"],
+  approved: [],
+};
+const SAMPLE_SAMPLING_STATUSES = [
+  pair("not_started", "Not started"),
+  pair("in_progress", "In progress"),
+  pair("submitted", "With Sales"),
+  pair("approved", "Approved"),
+  pair("rejected", "Rejected"),
+];
+const SAMPLE_SAMPLING_TRANSITIONS = {
+  not_started: ["in_progress"],
+  in_progress: ["submitted"],
+  submitted: ["approved", "rejected"],
+  rejected: ["in_progress"],
+  approved: [],
+};
+const SAMPLE_ROUND_TYPES = [
+  pair("proto", "Proto"),
+  pair("fit", "Fit"),
+  pair("sms", "SMS (Salesman)"),
+  pair("size_set", "Size set"),
+  pair("pp", "Pre-production (PP)"),
+];
+const SAMPLE_STYLE_STATUSES = [
+  pair("active", "Active"),
+  pair("completed", "Completed"),
+  pair("cancelled", "Cancelled"),
+];
+
+// Routing position — the coarse WORK stage a style is in, moved like a kanban
+// card in the Sales "Style & Sample" stage. A style is created at `brief` (just
+// carried from the enquiry — sitting there, sent nowhere yet); Sales sends it
+// to the Merchandiser (`materials`), who selects fabric/trims and sends it on
+// to `rnd` for tech sheet + sampling. Nothing advances automatically. The R&D
+// app only lists styles at `rnd`; within `rnd` the finer Tech sheet / Sampling
+// / Done columns are derived from the phase statuses, not stored here.
+const SAMPLE_STYLE_STAGES = [
+  pair("brief", "Brief"),
+  pair("materials", "Materials"),
+  pair("rnd", "With R&D"),
+];
+
 module.exports = {
   ACCOUNT_ROLES,
   ACCOUNT_STATUSES,
@@ -862,6 +930,22 @@ module.exports = {
   SALES_JOURNEY_STAGE_STATE_CODES: codes(SALES_JOURNEY_STAGE_STATES),
   SALES_JOURNEY_RISK_CODES: codes(SALES_JOURNEY_RISKS),
   SALES_JOURNEY_BUSINESS_TYPE_CODES: codes(SALES_JOURNEY_BUSINESS_TYPES),
+
+  // Sample & Style (R&D / Sampling ↔ Sales journey Style & Sample stage)
+  SAMPLE_MATERIALS_STATUSES,
+  SAMPLE_MATERIALS_STATUS_CODES: codes(SAMPLE_MATERIALS_STATUSES),
+  SAMPLE_TECHSHEET_STATUSES,
+  SAMPLE_TECHSHEET_STATUS_CODES: codes(SAMPLE_TECHSHEET_STATUSES),
+  SAMPLE_TECHSHEET_TRANSITIONS,
+  SAMPLE_SAMPLING_STATUSES,
+  SAMPLE_SAMPLING_STATUS_CODES: codes(SAMPLE_SAMPLING_STATUSES),
+  SAMPLE_SAMPLING_TRANSITIONS,
+  SAMPLE_ROUND_TYPES,
+  SAMPLE_ROUND_TYPE_CODES: codes(SAMPLE_ROUND_TYPES),
+  SAMPLE_STYLE_STATUSES,
+  SAMPLE_STYLE_STATUS_CODES: codes(SAMPLE_STYLE_STATUSES),
+  SAMPLE_STYLE_STAGES,
+  SAMPLE_STYLE_STAGE_CODES: codes(SAMPLE_STYLE_STAGES),
 
   // Lead capture status (Draft Lead chunk) — see the block comment above.
   LEAD_CAPTURE_STATUSES,

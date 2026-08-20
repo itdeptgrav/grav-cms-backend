@@ -38,7 +38,7 @@ const admin = require("firebase-admin");
 const {
   sniffMimeType,
   safeName,
-  ALLOWED,
+  mayRenderInline,
   MAX_BYTES,
   COLLECTION,
   COWORK_FOLDER_NAME,
@@ -210,13 +210,20 @@ async function uploadAttachment({
     throw new Error("An attachment must belong to something.");
   }
 
-  const mimeType = sniffMimeType(buffer, declaredType);
-  if (!mimeType || !ALLOWED.has(mimeType)) {
-    throw new AttachmentError(
-      "UNSUPPORTED_TYPE",
-      "That file type is not allowed. Accepted: PDF, Word, Excel, PowerPoint, PNG, JPG, WEBP, TXT and CSV.",
-    );
-  }
+  /**
+   * **Every type is accepted** — the allow-list was withdrawn on the owner's
+   * instruction. A `.zip`, an `.mp4`, a `.psd` all store and all come back.
+   *
+   * The sniff is KEPT even though nothing is refused by it. It reads the type
+   * from the file's own leading bytes, and the client's `mimetype` and filename
+   * are both attacker-controlled — so this is what the download route later
+   * decides `inline` versus `attachment` from. Trusting the client's label
+   * there would let a `.png` that is really HTML be served as a page.
+   *
+   * `application/octet-stream` where the bytes say nothing recognisable: an
+   * unknown type is a download, never a render.
+   */
+  const mimeType = sniffMimeType(buffer, declaredType) || "application/octet-stream";
 
   const auth = getServiceAccountAuth();
   const drive = google.drive({ version: "v3", auth });
@@ -355,7 +362,7 @@ module.exports = {
   deleteAttachment,
   sniffMimeType,
   safeName,
-  ALLOWED,
+  mayRenderInline,
   MAX_BYTES,
   COLLECTION,
 };

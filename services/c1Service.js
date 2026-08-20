@@ -55,6 +55,40 @@ async function getC1Config() {
 // calculateTaskScore — single task score
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The same arithmetic, itemised — what each event actually COST.
+ *
+ * Added 17 Aug 2026. The score page listed "Missed the deadline" with no
+ * figure beside it, so a person could see that something had cost them and
+ * not how much; the only number on the row was the total.
+ *
+ * **Derived here, beside `calculateTaskScore`, and never on the screen.** The
+ * multipliers are not the config values: `calculateTaskScore` applies
+ * `0 * extensionsFiled`, so `c1ExtensionDeduction` is configured (0.3 at the
+ * time of writing) and charged as nothing. A page that read the config would
+ * report a deduction the engine never took. These two functions must be read
+ * and changed together, which is why they sit together.
+ *
+ * Only events that actually happened are returned, so an empty array means a
+ * clean task rather than missing data.
+ */
+function taskScoreBreakdown(cfg, { deadlinesMissed = 0, extensionsFiled = 0, reworksReceived = 0, isRejected = false }) {
+    if (isRejected) {
+        return [{ event: "rejected", count: 1, points: -Math.abs(Number(cfg.c1RejectScore) || 0) }];
+    }
+    const items = [];
+    const push = (event, count, per) => {
+        if (count > 0) items.push({ event, count, points: +(-Math.abs(per) * count).toFixed(2) });
+    };
+    push("deadline", deadlinesMissed, Number(cfg.c1DeadlineDeduction) || 0);
+    push("rework", reworksReceived, Number(cfg.c1ReworkDeduction) || 0);
+    /* Zero, deliberately — mirrors `0 * extensionsFiled` in the scorer. The
+       count is still reported so the page can say an extension was filed and
+       cost nothing, rather than silently omitting an event that happened. */
+    push("extension", extensionsFiled, 0);
+    return items;
+}
+
 function calculateTaskScore(cfg, { deadlinesMissed = 0, extensionsFiled = 0, reworksReceived = 0, rejectionsReceived = 0, isRejected = false }) {
     if (isRejected) return +Number(cfg.c1RejectScore).toFixed(2);
     return +Math.max(0,
@@ -455,6 +489,7 @@ async function writeDeadlineDeduction({ employeeId, taskId, taskTitle, reviewerI
 module.exports = {
     getC1Config,
     calculateTaskScore,
+    taskScoreBreakdown,
     calculateQualityRate,
     calculateC1Net,
     computeAndStoreTaskScore,

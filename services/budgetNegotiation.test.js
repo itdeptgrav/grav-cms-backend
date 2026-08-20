@@ -103,3 +103,63 @@ test("the stored state literals are not renamed", () => {
   assert.match(src, /const WAITING_FOR_ASSIGNOR = "WAITING_FOR_ASSIGNOR";/);
   assert.match(src, /const WAITING_FOR_ASSIGNEE = "WAITING_FOR_ASSIGNEE";/);
 });
+
+/* ── A subtask may not outlive its project ────────────────────────────────── */
+
+test("acceptance caps the deadline at the project's, and records that it did", () => {
+  /**
+   * OWNER DECISION, 16 Aug 2026. The create form warns on a PROJECTION —
+   * inside a reporting line the deadline does not exist until acceptance, and
+   * it is anchored to when the assignee first came online, so a budget that
+   * looked safe when it was set can land past the parent by the time it is
+   * taken. This is the check that actually guarantees the rule.
+   *
+   * Clamped rather than refused: the assignee did not choose the budget, and
+   * refusing their acceptance would strand them with a task they cannot take.
+   */
+  const src = require("node:fs")
+    .readFileSync(require.resolve("./budgetNegotiation.service.js"), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  assert.match(src, /async function readParentDeadlineMs\(/);
+  /* The parent is read BEFORE the transaction — a transaction must finish its
+     reads before its first write. Scoped to `acceptBudgetProposal`, because
+     other functions in this file open transactions of their own earlier. */
+  const fnAt = src.indexOf("async function acceptBudgetProposal(");
+  assert.ok(fnAt > 0, "acceptBudgetProposal is gone");
+  const fn = src.slice(fnAt);
+  const readAt = fn.indexOf("readParentDeadlineMs(preSnap.data())");
+  const txAt = fn.indexOf("runTransaction");
+  assert.ok(readAt > 0, "the parent deadline is never read on the accept path");
+  assert.ok(
+    readAt < txAt,
+    "the parent is read inside the transaction — that write would fail",
+  );
+  assert.match(src, /Date\.parse\(earned\) > parentDueAtMs/);
+  assert.match(src, /deadlineCappedToParent: cappedMs !== null/);
+});
+
+test("the parent deadline is read in the same precedence the frontend uses", () => {
+  /* Reading them in a different order would let the engine cap against one
+     date while the page displays another. */
+  const src = require("node:fs").readFileSync(
+    require.resolve("./budgetNegotiation.service.js"),
+    "utf8",
+  );
+  assert.match(
+    src,
+    /readMs\(p\.fixedDeadline\) \?\? readMs\(p\.deadline\) \?\? readMs\(p\.dueDate\)/,
+  );
+});
+
+test("a missing parent deadline caps nothing", () => {
+  /* Null for an ordinary task, an unreadable parent, or a parent with no date.
+     All three mean "no ceiling" — a missing figure must never shorten
+     somebody's deadline. */
+  const src = require("node:fs")
+    .readFileSync(require.resolve("./budgetNegotiation.service.js"), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.match(src, /if \(!parentId\) return null;/);
+  assert.match(src, /parentDueAtMs !== null && Date\.parse\(earned\) > parentDueAtMs/);
+});

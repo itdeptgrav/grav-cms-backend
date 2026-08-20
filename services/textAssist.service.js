@@ -183,13 +183,41 @@ async function improveText({ text, mode, instruction, surface }) {
     }
     return { ok: true, text: out, model: MODEL };
   } catch (e) {
-    const quota = /429|quota|rate.?limit/i.test(e.message || "");
+    const detail = String(e && e.message ? e.message : e);
+
+    /**
+     * The real error, once. Reported 17 Aug 2026: every failure said "could
+     * not reach Gemini", so a REJECTED KEY looked like a network outage and
+     * the only way to learn otherwise was to call Google by hand. Swallowing
+     * the cause is what made a five-minute fix take an investigation.
+     */
+    console.error("[textAssist] Gemini call failed:", detail);
+
+    const quota = /\b429\b|quota|rate.?limit|RESOURCE_EXHAUSTED/i.test(detail);
+    if (quota) {
+      return {
+        ok: false,
+        reason: "quota",
+        message: "The assistant has hit its rate limit. Try again in a moment.",
+      };
+    }
+
+    /* 401/403 is a CREDENTIAL fault, not an upstream one: Google answered, and
+       what it said was no. Naming the file and the place to get a key beats
+       "could not reach", which sends somebody to check their network. */
+    if (/\b401\b|\b403\b|UNAUTHENTICATED|PERMISSION_DENIED|API_KEY_INVALID|invalid authentication/i.test(detail)) {
+      return {
+        ok: false,
+        reason: "bad_key",
+        message:
+          "Google rejected the assistant's API key. Set a valid GEMINI_API_KEY (from aistudio.google.com) in the server's .env and restart it.",
+      };
+    }
+
     return {
       ok: false,
-      reason: quota ? "quota" : "failed",
-      message: quota
-        ? "The assistant has hit its rate limit. Try again in a moment."
-        : "The assistant could not reach Gemini.",
+      reason: "failed",
+      message: "The assistant could not reach Gemini.",
     };
   }
 }

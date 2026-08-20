@@ -34,6 +34,7 @@ const {
   addWorkingSecsIST,
   readOfficeCalendar,
   readMs,
+  resolveAcceptanceAnchor,
 } = require("./officeDeadline.service");
 const { resolvePrimaryManagerApprover } = require("./primaryManager.service");
 
@@ -191,6 +192,33 @@ function assertTurn(negotiation, employeeId) {
  * the task being reassigned underneath it rather than hand the decision to the
  * previous assignee's manager.
  */
+/**
+ * The deadline of the project this task sits under, or null.
+ *
+ * Null for an ordinary task, for an unreadable parent, and for a parent that
+ * has no deadline of its own — all three mean "no ceiling", which is the safe
+ * direction: a missing figure must never shorten somebody's deadline.
+ *
+ * Field precedence matches the frontend's `readDueAtMs` exactly. Reading them
+ * in a different order here would let the engine cap against one date while the
+ * page displays another.
+ */
+async function readParentDeadlineMs(task) {
+  const parentId = task && task.parentTaskId ? String(task.parentTaskId) : "";
+  if (!parentId) return null;
+  try {
+    const snap = await firestore().collection("cowork_tasks").doc(parentId).get();
+    if (!snap.exists) return null;
+    const p = snap.data();
+    return (
+      readMs(p.fixedDeadline) ?? readMs(p.deadline) ?? readMs(p.dueDate) ?? null
+    );
+  } catch (e) {
+    console.error("[budget] parent deadline unreadable:", e.message);
+    return null;
+  }
+}
+
 async function approverPreread(ref) {
   const snap = await ref.get();
   if (!snap.exists) throw new BudgetError("NOT_FOUND", "Task not found.");
@@ -331,6 +359,36 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
      so acceptance has to admit them too — otherwise the turn handed to them by
      a counter is one they would be refused on. */
   const pre = await approverPreread(ref);
+  /* The clock's start, resolved out here for the same reason as the calendar:
+     it reads the assignee's duty document, and a transaction must finish its
+     reads before its first write. Keyed to the assignee it was resolved for so
+     a reassignment between this read and the write is noticed, not inherited. */
+  const preSnap = await ref.get();
+  const preAnchor = preSnap.exists
+    ? {
+        forAssignee: partiesOf(preSnap.data()).assignee,
+        /* The task's own id, so the queue-ahead rule can exclude it from its
+           own queue — without it the task waits for itself. */
+        ...(await resolveAcceptanceAnchor(preSnap.data(), Date.now(), String(taskId))),
+      }
+    : null;
+  /**
+   * **The project's deadline, which this subtask may not outlive.**
+   * OWNER DECISION, 16 Aug 2026.
+   *
+   * Read out here for the same reason as the calendar and the anchor: a
+   * transaction must finish its reads before its first write, and the parent is
+   * not part of this transaction's contended state.
+   *
+   * This is the check that actually guarantees the rule. The create form warns
+   * on a PROJECTION — inside a reporting line the deadline does not exist until
+   * this moment, and it is anchored to when the assignee first came online, so
+   * a budget that looked safe when it was set can land past the parent by the
+   * time it is accepted. Null for an ordinary task, which caps nothing.
+   */
+  const parentDueAtMs = preSnap.exists
+    ? await readParentDeadlineMs(preSnap.data())
+    : null;
 
   return firestore().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -374,18 +432,51 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
      * they were given by exactly how long the two sides took to agree. Only the
      * DURATION changes when the budget does.
      *
-     * No recorded anchor means this task never went through the
-     * cross-department grant, and acceptance itself is when the work becomes
-     * real — which is what the other approve paths already use.
+     * No recorded grant means this is a NORMAL task, and there the owner's
+     * rule is: the clock starts when the assignee first came online at or
+     * after the task was given — never at acceptance, which rewarded sitting
+     * on a task with a later deadline (see `acceptanceAnchorMs`). The
+     * pre-read is trusted only if the task still belongs to the assignee it
+     * was resolved for; otherwise the acceptance moment is the honest floor.
      */
+    const grantMs =
+      readMs(task.tlHoursSetAtMs) ?? readMs(task.tlHoursSetAt);
+    const normalAnchor =
+      preAnchor &&
+      String(partiesOf(task).assignee || "") ===
+        String(preAnchor.forAssignee || "")
+        ? preAnchor
+        : { anchorMs: Date.now(), source: "acceptance" };
+    /* The LATER of the two, not the grant alone. `preAnchor` may already have
+       been pushed past the grant by the work queued ahead of this task — see
+       `resolveAcceptanceAnchor` — and taking `grantMs` unconditionally would
+       throw that away, leaving one accept surface chaining and the other not.
+       Both intents survive a max: never before the hours were granted, and
+       never before the higher-priority work above it finishes. */
     const anchorMs =
-      readMs(task.tlHoursSetAtMs) ?? readMs(task.tlHoursSetAt) ?? Date.now();
-    const dueDate = addWorkingSecsIST(
+      grantMs != null
+        ? Math.max(grantMs, normalAnchor.anchorMs ?? grantMs)
+        : normalAnchor.anchorMs;
+    const anchorSource =
+      grantMs != null && anchorMs === grantMs
+        ? "hours_granted"
+        : normalAnchor.source;
+    const earned = addWorkingSecsIST(
       anchorMs,
       secs,
       calendar.schedule,
       calendar.breaks,
     );
+    /* Clamped rather than refused. The assignee did not choose this budget and
+       refusing their acceptance would strand them with a task they cannot take;
+       the project's date is the honest ceiling, and `deadlineCappedToParent`
+       records that it bit so the page can say why the date is earlier than the
+       budget implies. */
+    const cappedMs =
+      parentDueAtMs !== null && Date.parse(earned) > parentDueAtMs
+        ? parentDueAtMs
+        : null;
+    const dueDate = cappedMs === null ? earned : new Date(cappedMs).toISOString();
 
     tx.update(ref, {
       budgetNegotiation: {
@@ -410,6 +501,15 @@ async function acceptBudgetProposal({ taskId, employeeId, employeeName }) {
          hour to two went on being scored at half its true size. */
       etcHours: secs / 3600,
       dueDate,
+      /* The clock's start, stamped ONCE and kept. Presence history does not
+         exist, so an anchor recomputed later would silently move with the
+         assignee's next session — a deadline must be re-derivable from the
+         record that set it. `source` names which branch of the rule fired. */
+      clockStartsAtMs: anchorMs,
+      clockStartsAtSource: anchorSource,
+      /* True when the project's deadline cut this short — see above. Stored so
+         the task can explain a date that is earlier than its own budget. */
+      deadlineCappedToParent: cappedMs !== null,
       /* A leftover `fixedDeadline` from the sender's create outranks `dueDate`
          in the read precedence, so leaving it would discard everything above. */
       fixedDeadline: null,

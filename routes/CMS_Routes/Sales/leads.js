@@ -993,6 +993,63 @@ async function checkStrongDuplicates(lead) {
 // forward action the command centre shows. It UPDATES the existing open
 // follow-up in place (never piling up); it creates one only if none is open.
 // Qualification is never touched here.
+// POST /api/cms/crm/leads/:id/account
+// Create (or return the already-linked) customer Account for this Lead, so the
+// full "Customer setup" — contacts, locations, relationships, garment profile —
+// can be done on the Active Lead against a REAL Account, before any Journey
+// exists (the Sales Journey no longer has an "Account" stage). Idempotent: a
+// Lead that already has an accountId gets that same account back, never a twin.
+// At conversion the Journey links this same account rather than making a new one.
+router.post("/:id/account", salesAuth, async (req, res) => {
+  try {
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
+    if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
+      return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
+    }
+    if (lead.captureStatus === "draft") {
+      return res.status(400).json({ success: false, message: "Set up the customer once the Prospect is an Active Lead." });
+    }
+
+    // Already linked — hand back the same account, never a second one.
+    if (lead.accountId) {
+      const existing = await Account.findById(lead.accountId).lean();
+      if (existing) return res.json({ success: true, accountId: String(existing._id), account: existing, created: false });
+      // Dangling link (account was deleted) — fall through and re-create.
+    }
+
+    const companyName =
+      String(lead.company || "").trim() ||
+      [lead.firstName, lead.lastName].filter(Boolean).join(" ").trim() ||
+      "New customer";
+    const account = await Account.create({
+      companyName,
+      displayName: companyName,
+      assignedTo: lead.assignedTo || req.user?.id,
+      assignedToName: lead.assignedToName || req.user?.name,
+      createdBy: actor(req),
+      updatedBy: actor(req),
+    });
+
+    lead.accountId = account._id;
+    await lead.save();
+
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-account",
+      entityId: account._id,
+      entityLabel: account.companyName,
+      action: "create",
+      summary: `Created account ${account.accountId} — ${account.companyName} (customer setup on Lead ${lead.leadId || lead._id})`,
+      after: account.toObject(),
+    });
+
+    res.status(201).json({ success: true, accountId: String(account._id), account: account.toObject(), created: true });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
 router.patch("/:id/next-action", salesAuth, async (req, res) => {
   try {
     const lead = await Lead.findById(req.params.id);

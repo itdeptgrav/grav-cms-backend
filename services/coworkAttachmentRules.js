@@ -39,20 +39,36 @@ const MAX_BYTES = null;
  * used for nothing here except the display name. A `.pdf` that is actually an
  * HTML document would otherwise be stored and later served as a PDF.
  */
-const ALLOWED = new Set([
+/**
+ * **No type is refused any more** — withdrawn on the owner's instruction.
+ *
+ * `ALLOWED` was the upload gate: anything not in it was rejected. It is now the
+ * list of types that may be shown INLINE in the browser, which is a different
+ * job and the only one that still needs a list.
+ *
+ * Why the list did not simply get deleted: the download route serves an
+ * attachment with its own `Content-Type` and `Content-Disposition: inline`, so
+ * that images and PDFs can be previewed. With the upload gate gone, an
+ * uploaded HTML file would be served as `text/html`, inline, from this origin —
+ * the uploader's JavaScript running inside whoever opened it, with their
+ * session. Allowing every type to be STORED is the owner's decision; serving
+ * every type inline was never part of it, and is not required by it.
+ *
+ * So anything outside this list downloads instead of rendering. A `.zip`, an
+ * `.mp4`, a `.psd` all upload and all come back intact — they just arrive as a
+ * file rather than as a page.
+ */
+const INLINE_SAFE = new Set([
   "application/pdf",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.ms-excel",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.ms-powerpoint",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   "image/png",
   "image/jpeg",
   "image/webp",
-  "text/plain",
-  "text/csv",
 ]);
+
+/** Whether this type may be rendered in the browser rather than downloaded. */
+function mayRenderInline(mimeType) {
+  return INLINE_SAFE.has(String(mimeType || "").toLowerCase());
+}
 
 const startsWith = (buf, bytes) =>
   buf.length >= bytes.length && bytes.every((b, i) => buf[i] === b);
@@ -142,7 +158,9 @@ function safeName(name) {
 module.exports = {
   sniffMimeType,
   safeName,
-  ALLOWED,
+  /* Was `ALLOWED`, the upload gate. Now the inline-render list — see above. */
+  INLINE_SAFE,
+  mayRenderInline,
   MAX_BYTES,
   COLLECTION,
   COWORK_FOLDER_NAME,
