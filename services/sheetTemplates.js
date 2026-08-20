@@ -172,7 +172,16 @@ function buildRawItemsSheet(context = null) {
     styles[ref(0, 1)] = TITLE_STYLE;
   }
 
-  const headers = ["Sl no", "Category", "Raw item", "Variant / Vendor", "Unit cost", "Consumption (with allowance)", "Total cost"];
+  // Column layout: 0 Sl no, 1 Category, 2 Raw item, 3 Variant/Vendor,
+  // 4 Unit cost, 5 Unit, 6 Consumption (with allowance), 7 Total cost.
+  // "Unit" sits next to Consumption on purpose — consumption is meaningless
+  // without the unit it's counted in, and CostingSheetView.js special-cases
+  // this exact column (by sheet name + column index) to render it as a
+  // dropdown instead of free text (20 Aug 2026, explicit request — the raw
+  // item name here is typed text, not a RawItem._id, so the dropdown offers
+  // every registered unit rather than trying to resolve item-specific
+  // conversions from a fuzzy name match).
+  const headers = ["Sl no", "Category", "Raw item", "Variant / Vendor", "Unit cost", "Unit", "Consumption (with allowance)", "Total cost"];
   headers.forEach((h, i) => {
     cells[ref(i, headerRow)] = h;
     styles[ref(i, headerRow)] = HEAD_STYLE;
@@ -191,17 +200,17 @@ function buildRawItemsSheet(context = null) {
 
     const dataRow = row;
     cells[ref(0, dataRow)] = String(totalCostCells.length + 1);
-    cells[ref(6, dataRow)] = `=${ref(4, dataRow)}*${ref(5, dataRow)}`;
-    totalCostCells.push(ref(6, dataRow));
+    cells[ref(7, dataRow)] = `=${ref(4, dataRow)}*${ref(6, dataRow)}`;
+    totalCostCells.push(ref(7, dataRow));
     row += 1;
   }
 
   row += 1;
   cells[ref(1, row)] = "Total Raw Material Cost";
   styles[ref(1, row)] = HEAD_STYLE;
-  cells[ref(6, row)] = `=SUM(${totalCostCells[0]}:${totalCostCells[totalCostCells.length - 1]})`;
-  styles[ref(6, row)] = HEAD_STYLE;
-  const rawMaterialTotalRef = ref(6, row);
+  cells[ref(7, row)] = `=SUM(${totalCostCells[0]}:${totalCostCells[totalCostCells.length - 1]})`;
+  styles[ref(7, row)] = HEAD_STYLE;
+  const rawMaterialTotalRef = ref(7, row);
 
   return {
     id: "sheet-1",

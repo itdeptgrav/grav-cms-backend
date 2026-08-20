@@ -23,20 +23,26 @@ router.use(EmployeeAuthMiddleware);
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: unit conversion
 // ─────────────────────────────────────────────────────────────────────────────
-async function convertQuantity(quantity, fromUnit, toUnit) {
+// `unitMap` (optional) is a pre-fetched Map<unitName, unitDoc> — pass it to skip
+// the per-call Unit.findOne round trips when the caller has already batched them
+// (see PUT /:id/allocate-raw-materials). Omitted by other callers — behavior for
+// them is unchanged.
+async function convertQuantity(quantity, fromUnit, toUnit, unitMap = null) {
   if (!fromUnit || !toUnit || fromUnit === toUnit) return quantity;
   if (!quantity || isNaN(quantity)) return quantity;
   try {
-    const fromDoc = await Unit.findOne({ name: fromUnit })
-      .populate("conversions.toUnit", "name").lean();
+    const fromDoc = unitMap
+      ? (unitMap.get(fromUnit) || null)
+      : await Unit.findOne({ name: fromUnit }).populate("conversions.toUnit", "name").lean();
     if (fromDoc) {
       const direct = (fromDoc.conversions || []).find(
         c => (c.toUnit?.name || c.toUnit) === toUnit
       );
       if (direct?.quantity) return quantity * direct.quantity;
     }
-    const toDoc = await Unit.findOne({ name: toUnit })
-      .populate("conversions.toUnit", "name").lean();
+    const toDoc = unitMap
+      ? (unitMap.get(toUnit) || null)
+      : await Unit.findOne({ name: toUnit }).populate("conversions.toUnit", "name").lean();
     if (toDoc) {
       const reverse = (toDoc.conversions || []).find(
         c => (c.toUnit?.name || c.toUnit) === fromUnit
@@ -744,17 +750,48 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
     const remainingQuantity = workOrder.quantity - quantity;
     let newWorkOrder = null;
 
+    // ── Batch-fetch RawItems + Units up front so the two loops below don't do
+    // per-line DB round trips (previously: 2x RawItem.findById + up to 2x
+    // Unit.findOne per raw-material line). Read-only lookups here — the code
+    // never mutates or saves the RawItem docs in this route — so .lean() is
+    // safe and fast.
+    const rawItemIds = [...new Set(
+      workOrder.rawMaterials
+        .map(rm => rm.rawItemId)
+        .filter(Boolean)
+        .map(rid => rid.toString())
+    )];
+    const rawItemDocs = rawItemIds.length
+      ? await RawItem.find({ _id: { $in: rawItemIds } }).lean()
+      : [];
+    const rawItemMap = new Map(rawItemDocs.map(doc => [doc._id.toString(), doc]));
+
+    const unitNames = new Set();
+    for (const rm of workOrder.rawMaterials) {
+      if (rm.unit) unitNames.add(rm.unit);
+      if (rm.rawItemId) {
+        const ri = rawItemMap.get(rm.rawItemId.toString());
+        const registeredUnit = ri && (ri.customUnit || ri.unit);
+        if (registeredUnit) unitNames.add(registeredUnit);
+      }
+    }
+    const unitDocs = unitNames.size
+      ? await Unit.find({ name: { $in: [...unitNames] } })
+          .populate("conversions.toUnit", "name").lean()
+      : [];
+    const unitMap = new Map(unitDocs.map(doc => [doc.name, doc]));
+
     // Verify stock can support requested quantity
     let canProduceQuantity = workOrder.quantity;
     for (const rm of workOrder.rawMaterials) {
       if (!rm.rawItemId) continue;
-      const rawItem = await RawItem.findById(rm.rawItemId);
+      const rawItem = rawItemMap.get(rm.rawItemId.toString());
       if (!rawItem) continue;
       const rawItemRegisteredUnit = rawItem.customUnit || rawItem.unit;
       const requiredPerUnitBom    = workOrder.quantity > 0 ? rm.quantityRequired / workOrder.quantity : 0;
       const requiredPerUnit       =
         rm.unit && rawItemRegisteredUnit && rm.unit !== rawItemRegisteredUnit
-          ? await convertQuantity(requiredPerUnitBom, rm.unit, rawItemRegisteredUnit)
+          ? await convertQuantity(requiredPerUnitBom, rm.unit, rawItemRegisteredUnit, unitMap)
           : requiredPerUnitBom;
 
       let stock = 0;
@@ -817,7 +854,7 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
     workOrder.quantity = quantity;
 
     for (const rm of workOrder.rawMaterials) {
-      const rawItem = await RawItem.findById(rm.rawItemId);
+      const rawItem = rm.rawItemId ? (rawItemMap.get(rm.rawItemId.toString()) || null) : null;
       const requiredPerUnitBom = workOrder.originalQuantity > 0 ? rm.quantityRequired / workOrder.originalQuantity : 0;
       rm.quantityRequired = isNaN(requiredPerUnitBom * quantity) ? 0 : requiredPerUnitBom * quantity;
 
@@ -841,7 +878,7 @@ router.put("/:id/allocate-raw-materials", async (req, res) => {
 
       const availableInBomUnit =
         rm.unit && rawItemRegisteredUnit && rm.unit !== rawItemRegisteredUnit
-          ? await convertQuantity(availableStock, rawItemRegisteredUnit, rm.unit)
+          ? await convertQuantity(availableStock, rawItemRegisteredUnit, rm.unit, unitMap)
           : availableStock;
 
       const maxAllocatable = Math.min(rm.quantityRequired, availableInBomUnit);

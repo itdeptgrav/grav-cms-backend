@@ -61,6 +61,7 @@ const {
   LeadReviewError,
   applySubmit,
   applyApprove,
+  applyDirectConvert,
   applyReturn,
   applyReject,
 } = require("../../../services/leadReview");
@@ -1212,6 +1213,95 @@ router.patch("/:id/archive-draft", salesAuth, async (req, res) => {
 // reviewStatus, so this can't be bypassed. This is NOT "conversion" (Lead →
 // Account/Contact/Sales Journey, a later chunk) — it's an internal review
 // gate; the language throughout is "Approve as Active Lead", never "convert".
+
+// POST /api/cms/crm/leads/:id/convert-to-active — the direct path (20 Aug
+// 2026, explicit request): the salesperson converts a ready Prospect
+// straight to an Active Lead, no HOD review in between. Same readiness gate
+// /submit enforced, same create-Activity-then-flip-then-rollback reliability
+// pattern /approve uses — just one call instead of submit-then-approve, and
+// reviewStatus never passes through "submitted" (so the Prospect is never
+// locked read-only waiting on anyone). /submit, /approve, /return-for-info
+// and /reject below are left in place — nothing forces their use anymore,
+// but removing working, reachable routes wasn't asked for.
+router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
+  try {
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
+    if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
+      return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
+    }
+
+    const before = lead.toObject();
+    try {
+      applyDirectConvert(lead, { actor: actor(req) }); // validates researching/returned state; stamps review side
+    } catch (err) {
+      return sendReviewError(res, err);
+    }
+    const { checks, ready } = computeSubmissionReadiness(lead);
+    if (!ready) {
+      return res.status(400).json({
+        success: false,
+        message: "This Prospect isn't ready to convert yet.",
+        checks,
+      });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "assignedTo") && req.body.assignedTo) {
+      lead.assignedTo = req.body.assignedTo;
+      lead.assignedToName = await resolveEmployeeName(req.body.assignedTo, req);
+    }
+
+    // Create the first shared CRM follow-up Activity FIRST, while the Lead is
+    // still a draft — same reliability pattern /approve uses: a Prospect can
+    // never become an Active Lead with no first Activity, and a failed flip
+    // never leaves an orphaned Activity.
+    const activity = await Activity.create({
+      leadId: lead._id,
+      activityType: "follow_up",
+      subject: String(lead.pendingFirstAction.subject).trim(),
+      description: lead.pendingFirstAction.notes ? String(lead.pendingFirstAction.notes).trim() : undefined,
+      dueDate: lead.pendingFirstAction.dueDate,
+      status: "planned",
+      ownerId: lead.assignedTo || req.user?.id,
+      ownerName: lead.assignedToName || req.user?.name,
+      createdBy: actor(req),
+      updatedBy: actor(req),
+    });
+
+    try {
+      lead.captureStatus = "active";
+      lead.nextFollowUpAt = lead.pendingFirstAction.dueDate;
+      lead.updatedBy = actor(req);
+      await lead.save();
+    } catch (err) {
+      await Activity.deleteOne({ _id: activity._id });
+      throw err;
+    }
+
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "lead",
+      entityId: lead._id,
+      entityLabel: displayName(lead),
+      action: "update",
+      summary: `Prospect converted to Active Lead: ${lead.leadId}`,
+      before,
+      after: lead.toObject(),
+    });
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-activity",
+      entityId: activity._id,
+      entityLabel: activity.subject,
+      action: "create",
+      summary: `follow_up: ${activity.subject} (Lead ${displayName(lead)}, created on conversion)`,
+      after: activity.toObject(),
+    });
+    res.json({ success: true, lead, activity });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
 
 // POST /api/cms/crm/leads/:id/submit — the salesperson submits a researched
 // Prospect for HOD review. Enforces submission readiness server-side (the UI
