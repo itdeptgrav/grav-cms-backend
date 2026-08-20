@@ -1218,18 +1218,32 @@ router.post("/task/:taskId/approve-sender-timer", verifyCoworkToken, verifyEmplo
         // Office-hours-aware dueDate — consumes only WORKING time (skips off
         // days and breaks) instead of raw wall-clock addition, so a 4h task
         // approved at 5:15pm doesn't land due 9:15pm the same night.
+        //
+        // Anchored by the owner's rule, not at the press: the clock starts
+        // when the assignee first came online at/after the task was given
+        // (cross-department: when the hours were granted). Anchoring at
+        // acceptance rewarded sitting on a task with a later deadline. See
+        // resolveAcceptanceAnchor in services/officeDeadline.service.js —
+        // same rule as the budget-negotiation accept, so the two accept
+        // surfaces cannot hand out different deadlines for one task.
+        const { resolveAcceptanceAnchor } = require("../../services/officeDeadline.service");
+        const anchor = await resolveAcceptanceAnchor(task, Date.now(), taskId);
         let dueDate;
         try {
             const officeSnap = await db.collection("cowork_settings").doc("office").get();
             const _sched = officeSnap.exists ? officeSnap.data().schedule : null;
             const _brks = officeSnap.exists ? (officeSnap.data().breaks || []) : [];
-            dueDate = _addWorkingSecsIST(Date.now(), approvedSecs, _sched, _brks);
+            dueDate = _addWorkingSecsIST(anchor.anchorMs, approvedSecs, _sched, _brks);
         } catch (e) {
-            dueDate = new Date(Date.now() + approvedSecs * 1000).toISOString();
+            dueDate = new Date(anchor.anchorMs + approvedSecs * 1000).toISOString();
         }
 
         await taskRef.update({
             status: "deadline_approved",
+            clockStartsAtMs: anchor.anchorMs,
+            clockStartsAtSource: anchor.source,
+            queuedAfterTaskId: anchor.queuedAfterTaskId ?? null,
+            queuedAfterTitle: anchor.queuedAfterTitle ?? null,
             deadlineWindowSecs: approvedSecs,
             originalWindowSecs: approvedSecs,
             dueDate,
@@ -1411,6 +1425,25 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
         const { proposedDate, reason } = req.body;
         if (!proposedDate) return res.status(400).json({ error: "proposedDate required" });
 
+        // ── How much time is being ASKED FOR, in seconds ──────────────────────
+        // Ported from the copy in taskForward.js, which had it and this one did
+        // not. Both files register `/cowork` and taskForward wins on mount
+        // order, so this route is dormant — until somebody reorders the mounts,
+        // at which point every extension silently loses its amounts again.
+        //
+        // The record used to carry only a date. That is enough to move a
+        // deadline and useless for answering "how much longer did they ask
+        // for?" — the amount can only be recovered by differencing against the
+        // window in force, and approving the request overwrites exactly that.
+        //
+        // Stored at REQUEST time and never recomputed: previous + added = total,
+        // all three, so a granted extension still says what it added years
+        // later. Optional, so an older client that sends only a date works.
+        const _num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
+        const previousWindowSecs = _num(req.body.previousWindowSecs);
+        const addedSecs = _num(req.body.addedSecs);
+        const proposedWindowSecs = _num(req.body.proposedWindowSecs) || (previousWindowSecs + addedSecs);
+
         const { db, admin } = require("../../config/firebaseAdmin");
         const taskRef = db.collection("cowork_tasks").doc(taskId);
         const snap = await taskRef.get();
@@ -1449,6 +1482,11 @@ router.post("/task/:taskId/request-deadline-extension", verifyCoworkToken, verif
         await taskRef.update({
             deadlineExtRequest: {
                 proposedDate,
+                // The three figures, so the amount survives approval overwriting
+                // the window it was measured against.
+                previousWindowSecs,
+                addedSecs,
+                proposedWindowSecs,
                 reason: reason || "",
                 requestedBy: req.coworkUser.employeeId,
                 requestedByName: req.coworkUser.name,

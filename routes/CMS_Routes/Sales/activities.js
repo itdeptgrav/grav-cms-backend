@@ -29,7 +29,7 @@ const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
 // reassigned via a generic update, and `leadId` is never in either list, so
 // this Account-scoped router can never create or edit a Lead-owned Activity.
 const ACCOUNT_ACTIVITY_CREATE_FIELDS = [
-  "accountId", "contactId", "activityType", "subject", "description",
+  "accountId", "journeyRef", "stage", "contactId", "activityType", "subject", "description",
   "activityDate", "dueDate", "status", "priority", "outcome",
   "nextActionDate", "visibility", "links", "ownerId", "ownerName",
 ];
@@ -50,9 +50,10 @@ function pickFields(body = {}, allowed) {
 // GET /api/cms/crm/activities?accountId=&type=&status=&contactId=
 router.get("/", salesAuth, async (req, res) => {
   try {
-    const { accountId, type, status, contactId, from, to, page = 1, limit = 50 } = req.query;
+    const { accountId, journeyRef, type, status, contactId, from, to, page = 1, limit = 50 } = req.query;
     const filter = { isActive: true };
     if (accountId) filter.accountId = accountId;
+    if (journeyRef) filter.journeyRef = journeyRef;
     if (type && type !== "all") filter.activityType = type;
     if (status && status !== "all") filter.status = status;
     if (contactId) filter.contactId = contactId;

@@ -54,7 +54,10 @@ const stageStatesSchema = new mongoose.Schema(
       {
         type: String,
         enum: SALES_JOURNEY_STAGE_STATE_CODES,
-        default: code === "account" ? "inProgress" : "notStarted",
+        // Enquiry is the first stage now (the "account" stage was removed — the
+        // customer is set up on the Active Lead before conversion). "account"
+        // stays in the enum for legacy journeys but seeds notStarted.
+        default: code === "enquiry" ? "inProgress" : "notStarted",
       },
     ]),
   ),
@@ -72,6 +75,22 @@ const salesJourneySchema = new mongoose.Schema(
 
     name: { type: String, required: true, trim: true },
     accountId: { ...accountRef(), required: true, index: true },
+
+    // ── Which Lead became this order ────────────────────────────────────────
+    //
+    // The chain Prospect → HOD review → Active Lead → Account records every hop
+    // with a reason and an actor. Then the Journey was created against the
+    // ACCOUNT alone and the trail stopped dead: nothing on an order pointed at
+    // the lead that won it, so "who sourced this, and what did they promise"
+    // became unanswerable the moment the journey existed. Two disconnected
+    // steps — create the account from the lead, then separately create a
+    // journey and pick that account off a list — and nothing stitched them back.
+    //
+    // Optional, because journeys legitimately exist for walk-in and repeat
+    // business that never had a lead. `leadRef` is denormalised so the order can
+    // name its origin without a second query.
+    leadId: { type: mongoose.Schema.Types.ObjectId, ref: "Lead", index: true, sparse: true },
+    leadRef: { type: String, trim: true },
     businessType: { type: String, enum: SALES_JOURNEY_BUSINESS_TYPE_CODES, required: true },
 
     // Optional external orientation only — an RFQ number the customer used.
@@ -106,7 +125,7 @@ const salesJourneySchema = new mongoose.Schema(
     currentStage: {
       type: String,
       enum: SALES_JOURNEY_STAGE_CODES,
-      default: "account",
+      default: "enquiry",
       index: true,
     },
     stageStates: { type: stageStatesSchema, default: () => ({}) },
@@ -144,6 +163,63 @@ const salesJourneySchema = new mongoose.Schema(
     updatedBy: actorRef(),
     archivedAt: { type: Date },
     archivedBy: actorRef(),
+    // ── The customer's purchase order ───────────────────────────────────────
+    //
+    // Nothing recorded a PO anywhere — not here, not on the Enquiry — so the
+    // PO/Contract stage could be marked complete with no evidence that a PO
+    // exists, and "don't start production without a PO" was unenforceable
+    // because there was nothing to check. A file uploaded at that stage was
+    // never persisted against the journey either.
+    //
+    // `number` is the customer's own reference and the thing people quote in
+    // conversation, so it is required for the record to count as present.
+    po: {
+      number: { type: String, trim: true },
+      date: { type: Date },
+      amount: { type: Number, min: 0 },
+      currency: { type: String, trim: true, uppercase: true, default: "INR" },
+      file: {
+        name: { type: String, trim: true },
+        url: { type: String, trim: true },
+      },
+      recordedAt: { type: Date },
+      recordedBy: {
+        employeeId: { type: String, trim: true },
+        name: { type: String, trim: true },
+      },
+    },
+
+    // ── Every time a stage moved without its prerequisites ──────────────────
+    //
+    // The deliberate alternative to hard-gating every transition. Most stage
+    // moves stay permissive, because the person moving them can see reality
+    // better than the record can — but proceeding without a quotation or a PO
+    // is written down, with who did it and why. A permissive system with a
+    // complete record of where the rules were bent is more useful than a strict
+    // one people defeat by typing a fake PO number.
+    advancedWithoutPrerequisites: [
+      new mongoose.Schema(
+        {
+          stage: { type: String, trim: true },
+          missing: [{ type: String, trim: true }],
+          reason: { type: String, trim: true },
+          at: { type: Date, default: Date.now },
+          by: {
+            employeeId: { type: String, trim: true },
+            name: { type: String, trim: true },
+          },
+        },
+        { _id: false },
+      ),
+    ],
+
+    // When the order was formally closed. "Closed" has meant only
+    // `stageStates.retention === "complete"` until now, which records that the
+    // final stage finished but not WHEN the order was signed off — and closing
+    // is the moment money and delivery are declared settled, so it deserves its
+    // own timestamp. Set by the `close` action in services/salesJourneyProgress.
+    closedAt: { type: Date, default: null },
+
     isActive: { type: Boolean, default: true, index: true },
   },
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } },

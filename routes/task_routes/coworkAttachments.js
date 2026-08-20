@@ -198,13 +198,32 @@ router.get(
       }
 
       const { stream, meta } = await svc.streamAttachment(record.storageFileId);
-      res.setHeader("Content-Type", record.mimeType || meta.mimeType || "application/octet-stream");
-      /* `inline` so images and PDFs can be previewed; the filename is the
-         sanitised one, never the client's original string. */
+      const mimeType =
+        record.mimeType || meta.mimeType || "application/octet-stream";
+      res.setHeader("Content-Type", mimeType);
+      /**
+       * **`inline` only for types that are safe to RENDER.**
+       *
+       * Every file type may now be uploaded — the allow-list was withdrawn on
+       * the owner's instruction. That decision is about what may be STORED. It
+       * is not a decision to render arbitrary types in the browser, and this
+       * header is where the difference lives: an uploaded HTML file served
+       * `inline` as `text/html` from this origin runs its author's JavaScript
+       * inside whoever opens it, with that person's session. So images and PDFs
+       * still preview, and everything else downloads. The file is intact either
+       * way; only how the browser greets it changes.
+       *
+       * The type comes from the SNIFF taken at upload, not from the client's
+       * label — otherwise an HTML file announced as `image/png` would preview.
+       */
+      const disposition = svc.mayRenderInline(mimeType) ? "inline" : "attachment";
       res.setHeader(
         "Content-Disposition",
-        `inline; filename="${svc.safeName(record.originalName)}"`,
+        `${disposition}; filename="${svc.safeName(record.originalName)}"`,
       );
+      /* Belt and braces: stops a browser second-guessing the type above and
+         rendering something we said was a download. */
+      res.setHeader("X-Content-Type-Options", "nosniff");
       /* PRIVATE, and never cached by a shared proxy — this response is
          specific to one authenticated person. */
       res.setHeader("Cache-Control", "private, no-store");
