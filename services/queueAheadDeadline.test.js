@@ -105,11 +105,26 @@ test("a fixed calendar date does not occupy the queue", () => {
    * past next Friday. Two of ten live tasks carried such a date.
    */
   assert.match(src, /if \(other\.fixedDeadline \|\| other\.hasTimer === false\) return;/);
-  /* And the end read is now the budgeted date alone — reading `fixedDeadline`
-     here would reinstate exactly what the skip above removes. */
-  assert.match(src, /const end = readMs\(other\.dueDate\);/);
+
+  /**
+   * And the end read is the budgeted date alone — reading `fixedDeadline`
+   * here would reinstate exactly what the skip above removes.
+   *
+   * That read moved into `effectiveEndMs` on 18 Aug 2026, when submitted work
+   * started releasing the queue at its handover rather than at its deadline.
+   * The guarantee is unchanged and is now asserted where the read lives, so
+   * this still fails if a fixed calendar date creeps back into queue time.
+   */
+  assert.match(src, /const end = effectiveEndMs\(other\);/);
+
+  const body = src.slice(
+    src.indexOf("function effectiveEndMs"),
+    src.indexOf("/** This person's rank"),
+  );
+  assert.ok(body.length > 0, "effectiveEndMs has moved or been renamed");
+  assert.match(body, /readMs\(task\.dueDate\)/);
   assert.equal(
-    /const end = readMs\(other\.fixedDeadline\)/.test(src),
+    /fixedDeadline/.test(body),
     false,
     "a fixed calendar date is being read as queue time again",
   );

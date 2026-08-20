@@ -68,6 +68,12 @@ const gstr2bRecordSchema = new mongoose.Schema(
     cess: { type: Number, default: 0 }, // csamt
     invoiceValue: { type: Number, default: 0 }, // total including tax (for B2B); computed if absent
 
+    // GST rates present on the document. GSTR-2A itemises tax per line under
+    // `itms[].itm_det.rt`, so a single invoice can carry several rates; 2B
+    // reports one consolidated block and usually yields a single entry (or
+    // none, when the file omits `rt`).
+    taxRates: { type: [Number], default: [] },
+
     // ITC eligibility flags from GSTN
     itcAvailable: { type: Boolean, default: true }, // "Y"/"N" → boolean
     itcUnavailReason: { type: String, trim: true }, // rsn — populated when itcAvailable=false

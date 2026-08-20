@@ -1838,7 +1838,7 @@ router.post("/task/:taskId/submit-completion", verifyCoworkToken, verifyEmployee
 // ── POST /task/:taskId/rework — TL sends task back for rework ────────────────
 router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { reworkReason, waiveDeduction, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
+    const { reworkReason, waiveDeduction, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds, reworkPriority } = req.body;
     const { employeeId: reviewerId, name: reviewerName, role } = req.coworkUser;
     // The person who ASSIGNED this task may send it back. Was `role ===
     // "employee"` → refuse, which asked about a role string rather than about
@@ -1853,7 +1853,7 @@ router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, asyn
       reviewerId, reviewerName,
       reworkReason: reworkReason || "",
       waiveDeduction: waiveDeduction === true || waiveDeduction === "true",
-      reworkRequirements: reworkRequirements || [], reworkNote: reworkNote || "", reworkAttachments: reworkAttachments || [], reworkAttachmentIds: reworkAttachmentIds || [],
+      reworkRequirements: reworkRequirements || [], reworkNote: reworkNote || "", reworkAttachments: reworkAttachments || [], reworkAttachmentIds: reworkAttachmentIds || [], reworkPriority: reworkPriority ?? null,
     });
     res.json(result);
   } catch (e) {
@@ -1926,11 +1926,52 @@ router.post("/task/:taskId/extension-deduction", verifyCoworkToken, verifyEmploy
   }
 });
 
+/**
+ * What sending this back would do to the rest of that person's work.
+ *
+ * Read-only, and asked again on every change of the priority picker, so it
+ * runs the real queue walk in simulation rather than a second copy of the
+ * arithmetic — a preview that predicts something the commit does not do is
+ * worse than no preview.
+ */
+router.get("/task/:taskId/rework-preview", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { db } = require("../../config/firebaseAdmin");
+    const office = require("../../services/officeDeadline.service");
+
+    const snap = await db.collection("cowork_tasks").doc(req.params.taskId).get();
+    if (!snap.exists) return res.status(404).json({ error: "Task not found" });
+    const task = snap.data();
+
+    const assigneeId = String(req.query.assigneeId || (task.assigneeIds || [])[0] || "");
+    if (!assigneeId) return res.json({ leftoverSecs: null, currentRank: null, rows: [] });
+
+    /* The same number the rejection will actually give the rework. */
+    const leftoverSecs = office.reworkLeftoverSecs(task);
+    const currentRank = office.rankOf(task, assigneeId);
+    const rank = Number(req.query.priority) > 0 ? Number(req.query.priority) : currentRank;
+
+    const rows = await office.rechainQueueFor(assigneeId, {
+      dryRun: true,
+      reportAll: true,
+      simulate: {
+        taskId: req.params.taskId,
+        rank,
+        secs: leftoverSecs ?? 0,
+        startMs: Date.now(),
+      },
+    });
+
+    res.json({ leftoverSecs, currentRank, rank, rows });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+
 router.post("/task/:taskId/review-completion", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds } = req.body;
+    const { approved, rejectionReason, reworkRequirements, reworkNote, reworkAttachments, reworkAttachmentIds, reworkPriority } = req.body;
     if (typeof approved !== "boolean") return res.status(400).json({ error: "approved (boolean) required" });
-    const result = await svc.reviewCompletion({ taskId: req.params.taskId, reviewerId: req.coworkUser.employeeId, reviewerName: req.coworkUser.name, approved, rejectionReason: rejectionReason || "", reworkRequirements: reworkRequirements || [], reworkNote: reworkNote || "", reworkAttachments: reworkAttachments || [], reworkAttachmentIds: reworkAttachmentIds || [] });
+    const result = await svc.reviewCompletion({ taskId: req.params.taskId, reviewerId: req.coworkUser.employeeId, reviewerName: req.coworkUser.name, approved, rejectionReason: rejectionReason || "", reworkRequirements: reworkRequirements || [], reworkNote: reworkNote || "", reworkAttachments: reworkAttachments || [], reworkAttachmentIds: reworkAttachmentIds || [], reworkPriority: reworkPriority ?? null });
     res.json(result);
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
