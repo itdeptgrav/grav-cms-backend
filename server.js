@@ -954,6 +954,8 @@ app.use("/api/ai", gravAssistantRoutes);
 
 // PersonalCallRecorder Android app → call recording sync (metadata → Mongo, audio → Drive)
 app.use("/api/recordings", require("./routes/callRecordings"));
+// PersonalCallRecorder Android app → every call's outcome (received/missed) → Mongo callevents
+app.use("/api/call-events", require("./routes/callEvents"));
 
 app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
 
