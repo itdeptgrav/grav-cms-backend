@@ -20,6 +20,7 @@ const CallRecording = require("../../../models/CallRecording");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const Customer = require("../../../models/Customer_Models/Customer");
+const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { getDriveFileStream } = require("../../../services/mediaUpload.service");
 const { buildRecordingFilter, annotateMatches } = require("../../../services/callRecordingMatch.service");
@@ -36,10 +37,35 @@ const MAX_ROWS = 200;
  *                    every contact person at it, because the call almost always
  *                    goes to a person, not to a company switchboard.
  *   • Customer     — the portal/e-commerce account.
+ *   • Lead         — a Prospect/Active Lead, before it is anything else. Its
+ *                    own phone/whatsapp plus every stakeholder in `contacts[]`
+ *                    (Chunk B) — a lead often has more than one number on file
+ *                    before it converts to an Account with real Contacts.
  *
  * Returns null when the id resolves to nothing.
  */
-async function identityFor({ accountId, customerId }) {
+async function identityFor({ accountId, customerId, leadId }) {
+  if (leadId) {
+    const lead = await Lead.findById(leadId)
+      .select("company firstName lastName phone whatsapp contacts")
+      .lean();
+    if (!lead) return null;
+
+    const personName = [lead.firstName, lead.lastName].filter(Boolean).join(" ");
+    return {
+      label: lead.company || personName || "This lead",
+      phones: [
+        lead.phone,
+        lead.whatsapp,
+        ...(lead.contacts || []).map((c) => c.phone),
+      ],
+      names: [lead.company],
+      // Same "whole phrase only" rule the Account branch uses below — a
+      // stakeholder's first name alone is not a safe match key.
+      personNames: [personName, ...(lead.contacts || []).map((c) => c.name)],
+    };
+  }
+
   if (accountId) {
     const account = await Account.findById(accountId)
       .select("companyName displayName legalName brandName primaryPhone alternatePhone")
@@ -83,7 +109,7 @@ async function identityFor({ accountId, customerId }) {
 }
 
 /**
- * GET /api/cms/crm/call-recordings?accountId=… | ?customerId=…
+ * GET /api/cms/crm/call-recordings?accountId=… | ?customerId=… | ?leadId=…
  *
  * → { success, recordings[], identity: { label, phones, names }, counts }
  *
@@ -95,13 +121,13 @@ async function identityFor({ accountId, customerId }) {
  */
 router.get("/", salesAuth, async (req, res) => {
   try {
-    const { accountId, customerId } = req.query;
-    if (!accountId && !customerId) {
-      return res.status(400).json({ success: false, message: "accountId or customerId is required" });
+    const { accountId, customerId, leadId } = req.query;
+    if (!accountId && !customerId && !leadId) {
+      return res.status(400).json({ success: false, message: "accountId, customerId or leadId is required" });
     }
 
-    const identity = await identityFor({ accountId, customerId });
-    if (!identity) return res.status(404).json({ success: false, message: "Customer not found" });
+    const identity = await identityFor({ accountId, customerId, leadId });
+    if (!identity) return res.status(404).json({ success: false, message: leadId ? "Lead not found" : "Customer not found" });
 
     const filter = buildRecordingFilter(identity);
     /* No phone and no usable name means nothing to match on. Returning empty is

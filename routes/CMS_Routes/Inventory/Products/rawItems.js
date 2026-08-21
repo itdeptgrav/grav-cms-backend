@@ -85,6 +85,41 @@ const normaliseVariantNicknames = (incoming) => {
     }));
 };
 
+// Map of unit name → { baseUnit, conversions: [{toUnit, factor}] }, resolved
+// from the Unit master — the SAME source R&D's raw-item unit picker reads
+// (routes/CMS_Routes/Inventory/Products/stockItems.js's own copy of this;
+// duplicated rather than shared, same as sampleStyles.js's copy, since there
+// is no shared lib between route files here). Used to hand a costing row's
+// picked item its registered unit + conversions without the picker knowing
+// anything about Units itself.
+async function buildUnitConversionsMap() {
+  try {
+    const units = await Unit.find({ status: "Active" }).populate("conversions.toUnit", "name");
+    const map = {};
+    units.forEach(u => {
+      if (!map[u.name]) map[u.name] = { baseUnit: u.name, conversions: [] };
+      (u.conversions || []).forEach(c => {
+        const toUnitName = c.toUnit?.name || c.toUnit;
+        if (!toUnitName) return;
+        map[u.name].conversions.push({ toUnit: toUnitName, factor: c.quantity });
+      });
+    });
+    units.forEach(u => {
+      (u.conversions || []).forEach(c => {
+        const toUnitName = c.toUnit?.name || c.toUnit;
+        if (!toUnitName || !c.quantity) return;
+        if (!map[toUnitName]) map[toUnitName] = { baseUnit: toUnitName, conversions: [] };
+        const alreadyHas = map[toUnitName].conversions.some(x => x.toUnit === u.name);
+        if (!alreadyHas) map[toUnitName].conversions.push({ toUnit: u.name, factor: 1 / c.quantity });
+      });
+    });
+    return map;
+  } catch (err) {
+    console.error("buildUnitConversionsMap:", err);
+    return {};
+  }
+}
+
 // Normalise unitConversion input → returns object or null
 const normaliseUnitConversion = (uc) => {
   if (!uc || !uc.toUnit || uc.quantity === undefined || uc.quantity === null || uc.quantity === "") {
@@ -152,6 +187,15 @@ router.get("/", async (req, res) => {
 
     const totalItems = rawItems.length;
     const paged = rawItems.slice(skip, skip + limitNum);
+
+    // Attach each item's registered-unit conversions so a picker (e.g. the
+    // Sales costing sheet) can offer "which unit" without a second round
+    // trip per row — same map R&D's own raw-item picker resolves against.
+    const unitConversionsMap = await buildUnitConversionsMap();
+    paged.forEach((it) => {
+      const unitName = it.customUnit || it.unit || "";
+      it.unitConversions = unitConversionsMap[unitName]?.conversions || [];
+    });
 
     const allForStats = await RawItem.find({})
       .select("quantity minStock variants")
