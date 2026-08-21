@@ -356,11 +356,17 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
       });
     }
 
+    const prevItems = style.materials.items || [];
     style.materials.status = items.length ? "selected" : "pending";
     style.materials.items = items;
     style.materials.selectedBy = actor(req);
     style.materials.selectedAt = new Date();
     style.updatedBy = actor(req);
+    // Direct-apply path had no history entry at all until now — only the
+    // staged (Merchandiser/IE) path below logged anything, so a Sales/admin
+    // user setting materials directly left no trace (21 Aug 2026, explicit
+    // request for "what information he changed", not just "materials set").
+    logHistory(style, { kind: "materials_set", note: items.join(", ") || "cleared", from: prevItems.join(", "), to: items.join(", ") }, req);
     await style.save();
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
@@ -391,11 +397,14 @@ router.post("/:id/materials/change/:changeId/decide", salesAuth, async (req, res
     if (entry.status !== "pending") return res.status(400).json({ success: false, message: `This change was already ${entry.status}.` });
 
     if (decision === "approve") {
+      const prevItems = style.materials.items || [];
       style.materials.status = entry.items.length ? "selected" : "pending";
       style.materials.items = entry.items;
       style.materials.selectedBy = actor(req);
       style.materials.selectedAt = new Date();
-      logHistory(style, { kind: "materials_set", note: "" }, req);
+      logHistory(style, { kind: "materials_set", note: entry.items.join(", ") || "cleared", from: prevItems.join(", "), to: entry.items.join(", ") }, req);
+    } else {
+      logHistory(style, { kind: "materials_change_rejected", note: entry.items.join(", ") }, req);
     }
 
     entry.status = decision === "approve" ? "approved" : "rejected";

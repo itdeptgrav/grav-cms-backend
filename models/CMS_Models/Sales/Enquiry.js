@@ -193,6 +193,13 @@ const enquirySchema = new mongoose.Schema(
               {
                 category: { type: String, trim: true },
                 item: { type: String, trim: true },
+                // Set only when `item` was picked from the Store raw-item
+                // master (searchRawItems) rather than typed free-text — lets
+                // the row's own "info" button pull that item's full record
+                // (21 Aug 2026, "keep the info button for each and every raw
+                // item" extended to this sheet). A typed line with no master
+                // match simply has no id here, which is expected, not a bug.
+                rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
                 vendor: { type: String, trim: true },
                 unitCost: { type: String, trim: true },
                 // The unit consumption is counted in — a name from the Unit
@@ -271,6 +278,7 @@ const enquirySchema = new mongoose.Schema(
               {
                 category: { type: String, trim: true },
                 item: { type: String, trim: true },
+                rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
                 vendor: { type: String, trim: true },
                 unitCost: { type: String, trim: true },
                 unit: { type: String, trim: true },

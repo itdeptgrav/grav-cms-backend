@@ -27,6 +27,7 @@ const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { createWithRef } = require("../../../services/enquiryRef");
 const NotificationService = require("../../../services/NotificationService");
 const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
+const { recordChange, historyFor, diff } = require("../../../services/changeLog");
 const { isSalesManager, bypassesApproval } = require("../../../services/salesAccess");
 const { costingTotals } = require("../../../services/costingTotals");
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
@@ -125,6 +126,119 @@ const PRODUCT_TEXT_FIELDS = [
   "sizeRange", "brandingPlacement", "trims", "specialConstruction", "existingUniform",
 ];
 const GARMENT_GENDER_CODES = ["male", "female", "unisex"];
+
+// Human labels for the header PATCH's EDITABLE fields, used to turn a raw
+// diff into a readable log line — see summarizeEnquiryChange() below.
+const FIELD_LABEL = {
+  title: "title", enquiryDate: "enquiry date", source: "enquiry source",
+  expectedClosingDate: "expected closing date", requirementDeadline: "requirement deadline",
+  summary: "summary", status: "status", lostReason: "lost reason", lostReasonNote: "lost reason note",
+  pricingCurrency: "pricing currency", targetPrice: "target price",
+  estimatedPriceMin: "estimated price (min)", estimatedPriceMax: "estimated price (max)",
+  pricingNote: "pricing note", opportunitySize: "opportunity size", winProbability: "win probability",
+  priority: "priority", seriousness: "seriousness", expectedOrderDate: "expected order date",
+};
+
+function fmtFieldValue(v) {
+  if (v === null || v === undefined || v === "") return "empty";
+  if (Array.isArray(v)) return `${v.length} item${v.length === 1 ? "" : "s"}`;
+  if (typeof v === "object") return "…";
+  return String(v);
+}
+
+/**
+ * Per-product diff: match old/new rows by NAME (the one thing that survives a
+ * routine "Save requirement" — see sanitizeProducts' own comment on why _id
+ * can't be the join key), then list which fields changed on each.
+ */
+function summarizeProductChanges(before, after) {
+  const beforeByName = new Map((before || []).map((p) => [p.product, p]));
+  const afterByName = new Map((after || []).map((p) => [p.product, p]));
+  const bits = [];
+  for (const name of afterByName.keys()) {
+    if (!beforeByName.has(name)) { bits.push(`added "${name}"`); continue; }
+    const b = beforeByName.get(name), a = afterByName.get(name);
+    const changedFields = [];
+    for (const key of new Set([...Object.keys(b || {}), ...Object.keys(a || {})])) {
+      if (key === "_id") continue;
+      if (JSON.stringify(b?.[key]) === JSON.stringify(a?.[key])) continue;
+      changedFields.push(key === "images" ? "photo" : key);
+    }
+    if (changedFields.length) bits.push(`"${name}" (${changedFields.slice(0, 4).join(", ")}${changedFields.length > 4 ? ", …" : ""})`);
+  }
+  for (const name of beforeByName.keys()) {
+    if (!afterByName.has(name)) bits.push(`removed "${name}"`);
+  }
+  return bits;
+}
+
+/**
+ * A field-level "what actually changed" sentence for the change log — a bare
+ * "updated ENQ-2026-00005" answers nothing when read a second time (21 Aug
+ * 2026, explicit request: "what he change means what information he
+ * changed... if u keep that log in form of any description... then the log
+ * can be worth it").
+ */
+function summarizeEnquiryChange(before, after) {
+  const d = diff(before, after);
+  const bits = [];
+  for (const key of d.changed) {
+    if (key === "updatedBy" || key === "updatedAt" || key === "__v") continue;
+    if (key === "products") {
+      const productBits = summarizeProductChanges(before.products, after.products);
+      if (productBits.length) bits.push(`products — ${productBits.slice(0, 3).join("; ")}${productBits.length > 3 ? "; …" : ""}`);
+      continue;
+    }
+    if (key === "references") { bits.push("references"); continue; }
+    const label = FIELD_LABEL[key] || key;
+    bits.push(`${label}: ${fmtFieldValue(before[key])} → ${fmtFieldValue(after[key])}`);
+  }
+  return bits;
+}
+
+/**
+ * Generic row-array diff for costing sheet tables. Rows have no stable id
+ * across a save (the sanitizers below rebuild the array fresh, so Mongoose
+ * assigns brand-new subdocument _ids every time) — matched by `keyFn` instead,
+ * same reasoning as summarizeProductChanges' name-join above.
+ */
+function summarizeRowChanges(before, after, keyFn, label) {
+  const beforeByKey = new Map((before || []).map((r) => [keyFn(r), r]));
+  const afterByKey = new Map((after || []).map((r) => [keyFn(r), r]));
+  const added = [], removed = [], changed = [];
+  for (const [key, a] of afterByKey) {
+    const b = beforeByKey.get(key);
+    if (!b) { added.push(key); continue; }
+    const isDiff = ["category", "item", "vendor", "unitCost", "unit", "consumption", "detail", "sam", "rate", "name", "price"]
+      .some((f) => JSON.stringify(b[f]) !== JSON.stringify(a[f]));
+    if (isDiff) changed.push(key);
+  }
+  for (const key of beforeByKey.keys()) {
+    if (!afterByKey.has(key)) removed.push(key);
+  }
+  const bits = [];
+  if (added.length) bits.push(`added ${added.slice(0, 3).map((k) => `"${k}"`).join(", ")}${added.length > 3 ? ` +${added.length - 3} more` : ""}`);
+  if (changed.length) bits.push(`changed ${changed.slice(0, 3).map((k) => `"${k}"`).join(", ")}${changed.length > 3 ? ` +${changed.length - 3} more` : ""}`);
+  if (removed.length) bits.push(`removed ${removed.slice(0, 3).map((k) => `"${k}"`).join(", ")}${removed.length > 3 ? ` +${removed.length - 3} more` : ""}`);
+  return bits.length ? `${label}: ${bits.join("; ")}` : "";
+}
+
+function summarizeCostingSheetChange(before, after) {
+  const parts = [];
+  if (after.materials !== undefined) {
+    const bit = summarizeRowChanges(before.materials, after.materials, (r) => `${r.category || ""} / ${r.item || "untitled"}`, "raw materials");
+    if (bit) parts.push(bit);
+  }
+  if (after.operations !== undefined) {
+    const bit = summarizeRowChanges(before.operations, after.operations, (r) => r.detail || "untitled", "operations");
+    if (bit) parts.push(bit);
+  }
+  if (after.miscellaneous !== undefined) {
+    const bit = summarizeRowChanges(before.miscellaneous, after.miscellaneous, (r) => r.name || "untitled", "miscellaneous");
+    if (bit) parts.push(bit);
+  }
+  return parts.join(" · ");
+}
 
 // A client-supplied products array, cleaned to what the schema accepts: drop
 // blank rows, coerce quantity to a non-negative number, validate the gender
@@ -291,6 +405,79 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
   }
 });
 
+// GET /api/cms/crm/enquiries/by-journey/:journeyRef/change-log
+// The journey-level entry point into the SAME change log — the Activity
+// drawer only ever has the journey reference on hand, not the enquiry's own
+// Mongo _id, so it resolves through the journey exactly like the GET above
+// does rather than making every caller look the enquiry up twice.
+// Style & Sample's own timeline (SampleStyle.history — materials/tech-sheet/
+// sample/stage-routing events, already recorded by routes/.../sampleStyles.js
+// via logHistory()) predates this change log and lives on each style
+// document, not in the shared ChangeLog collection. Normalized into the same
+// {departmentSlug, action, summary, actorName, entityLabel, createdAt} shape
+// here so ONE feed covers every department touching the journey — Sales'
+// own edits AND R&D/Merchandising's style work — instead of Style & Sample
+// activity being invisible from the journey-level log (21 Aug 2026, explicit
+// request: "as this sales journey is happening via multiple department
+// multiple persons... proper log need to keep... what happened when
+// happened who did").
+const STYLE_HISTORY_LABEL = {
+  materials_set: "set the selected materials",
+  materials_change_rejected: "rejected a proposed materials change",
+  send_back: "sent the style back a stage",
+  route: "moved the style forward",
+  tech_submitted: "submitted the tech sheet",
+  tech_approved: "approved the tech sheet",
+  tech_changes: "requested changes to the tech sheet",
+  sample_round: "logged a sample round",
+  sample_submitted: "submitted the physical sample",
+  sample_approved: "approved the sample",
+  sample_rejected: "rejected the sample",
+};
+function styleHistoryEntries(style) {
+  return (style.history || []).map((ev) => {
+    const verb = STYLE_HISTORY_LABEL[ev.kind] || (ev.kind || "").replace(/_/g, " ");
+    const stageNote = ev.kind === "route" || ev.kind === "send_back"
+      ? ` (${ev.from || "?"} → ${ev.to || "?"}${ev.note ? ` — ${ev.note}` : ""})`
+      : ev.kind === "materials_set"
+        ? ` (${ev.from || "none"} → ${ev.to || "none"})`
+        : ev.note ? ` — ${ev.note}` : "";
+    return {
+      departmentSlug: "research-development",
+      entity: "crm-sample-style",
+      entityId: String(style._id),
+      entityLabel: style.productName || style.styleCode || style.sampleStyleId || "",
+      action: ev.kind || "update",
+      summary: `${ev.by?.name || "Someone"} ${verb} for "${style.productName || "a style"}"${stageNote}`,
+      actorName: ev.by?.name || "",
+      createdAt: ev.at,
+    };
+  });
+}
+
+router.get("/by-journey/:journeyRef/change-log", salesAuth, async (req, res) => {
+  try {
+    const journey = await loadJourney(req.params.journeyRef);
+    if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+
+    const enquiry = await Enquiry.findOne({ journeyId: journey._id, isActive: true }).select("_id").lean();
+    const styles = await SampleStyle.find({ journeyId: journey._id, isActive: true }).select("history productName styleCode sampleStyleId").lean();
+
+    const enquiryEntries = enquiry ? await historyFor("crm-enquiry", enquiry._id, limit) : [];
+    const styleEntries = styles.flatMap(styleHistoryEntries);
+
+    const entries = [...enquiryEntries, ...styleEntries]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, limit);
+
+    return res.json({ success: true, entries });
+  } catch (err) {
+    console.error("[enquiries] GET /by-journey/:journeyRef/change-log", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // Fields a client may set on the header (Chunk 1). Everything else is derived
 // or server-owned (enquiryId, accountId, ownerId, references).
 const EDITABLE = [
@@ -309,6 +496,11 @@ router.patch("/:id", salesAuth, async (req, res) => {
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const body = req.body || {};
+    // Snapshot before any field is touched — multiple departments (Sales,
+    // Merchandising, Project Manager) edit this same record, and this is
+    // the one route with no log at all until now: it just overwrote fields
+    // with only `updatedBy` set. See recordChange() below.
+    const before = enquiry.toObject();
 
     // Enforce the status machine: a status change must be a legal transition.
     // A no-op (same status, e.g. saving other fields) always passes.
@@ -388,10 +580,43 @@ router.patch("/:id", salesAuth, async (req, res) => {
       }
     }
 
+    const after = enquiry.toObject();
+    const changeBits = summarizeEnquiryChange(before, after);
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "update",
+      summary: changeBits.length
+        ? `${actor(req).name || "Someone"} updated ${enquiry.enquiryId} — ${changeBits.join("; ")}`
+        : `${actor(req).name || "Someone"} updated ${enquiry.enquiryId}`,
+      before,
+      after,
+    }).catch(() => {});
+
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id", err);
     return res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/change-log
+// Who changed what on this enquiry, newest first — Sales-auth-gated (unlike
+// /api/admin/change-log, which is platform-admin-only and unreachable from a
+// CRM screen). Reads the SAME ChangeLog collection recordChange() above and
+// the lifecycle-mutation routes below already write to; nothing new to
+// maintain, just a CRM-scoped door into it.
+router.get("/:id/change-log", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const entries = await historyFor("crm-enquiry", req.params.id, limit);
+    return res.json({ success: true, entries });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/change-log", err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -563,6 +788,11 @@ function sanitizeMaterialRows(input) {
   return (Array.isArray(input) ? input : []).map((m) => ({
     category: String(m?.category || "").trim(),
     item: String(m?.item || "").trim(),
+    // Only present when `item` was picked from the Store raw-item master
+    // rather than typed free-text — lets the row's "info" button resolve the
+    // full record. Validated rather than trusted blindly since it rides in
+    // on client input.
+    rawItemId: isObjectId(m?.rawItemId) ? m.rawItemId : null,
     vendor: String(m?.vendor || "").trim(),
     unitCost: m?.unitCost === "" || m?.unitCost == null ? "" : String(m.unitCost),
     unit: String(m?.unit || "").trim(),
@@ -1084,6 +1314,20 @@ router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res)
       ];
       await enquiry.save();
 
+      const proposedChangeBits = summarizeCostingSheetChange(
+        { materials: sheet.materials, operations: sheet.operations, miscellaneous: sheet.miscellaneous },
+        { materials, operations, miscellaneous },
+      );
+      recordChange(req, {
+        departmentSlug: req.user?.role === "project_manager" ? "project-manager" : "merchandiser",
+        entity: "crm-enquiry",
+        entityId: enquiry._id,
+        entityLabel: enquiry.enquiryId,
+        action: "costing-proposed",
+        summary: `${actor(req).name || "Someone"} proposed ${PART_LABEL[part] || part} costing changes for "${productName}"${proposedChangeBits ? ` — ${proposedChangeBits}` : ""} — awaiting Sales review`,
+        after: { productName, part, materials, operations, miscellaneous },
+      }).catch(() => {});
+
       return res.status(202).json({
         success: true,
         pending: true,
@@ -1102,12 +1346,26 @@ router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res)
       });
     }
 
+    const before = { materials: sheet.materials, operations: sheet.operations, miscellaneous: sheet.miscellaneous };
     if (Array.isArray(req.body?.materials)) sheet.materials = sanitizeMaterialRows(req.body.materials);
     if (Array.isArray(req.body?.operations)) sheet.operations = sanitizeOperationRows(req.body.operations);
     if (Array.isArray(req.body?.miscellaneous)) sheet.miscellaneous = sanitizeMiscRows(req.body.miscellaneous);
     sheet.updatedAt = new Date();
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    const costingAfter = { materials: sheet.materials, operations: sheet.operations, miscellaneous: sheet.miscellaneous };
+    const costingChangeBits = summarizeCostingSheetChange(before, costingAfter);
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "costing-updated",
+      summary: `${actor(req).name || "Sales"} updated the ${PART_LABEL[part] || part} costing for "${productName}"${costingChangeBits ? ` — ${costingChangeBits}` : ""}`,
+      before,
+      after: costingAfter,
+    }).catch(() => {});
 
     return res.json({ success: true, updatedAt: sheet.updatedAt });
   } catch (err) {
@@ -1163,6 +1421,15 @@ router.post("/:id/costing-sheet/:productName/change/:changeId/decide", salesAuth
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: decision === "approve" ? "costing-approved" : "costing-rejected",
+      summary: `${actor(req).name || "Sales"} ${decision === "approve" ? "approved" : "rejected"} ${entry.submittedBy?.name || "a"}'s proposed ${PART_LABEL[entry.part || "combined"] || entry.part} costing changes for "${productName}"`,
+    }).catch(() => {});
+
     return res.json({ success: true, status: entry.status, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] POST /:id/costing-sheet/:productName/change/:changeId/decide", err);
@@ -1202,6 +1469,15 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
     entry.sentToCustomerBy = actor(req);
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "sent-to-customer",
+      summary: `${actor(req).name || "Sales"} sent pricing for "${productName}" to the customer`,
+    }).catch(() => {});
 
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
@@ -1268,6 +1544,15 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
     enquiry.updatedBy = who;
     await enquiry.save();
 
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: req.body.approved ? "customer-approved" : "customer-rejected",
+      summary: `${who.name || "Sales"} recorded that the customer ${req.body.approved ? "approved" : "rejected"} "${productName}"${note ? ` — ${note}` : ""}`,
+    }).catch(() => {});
+
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
       const customerName = await customerNameFor(enquiry);
@@ -1319,6 +1604,15 @@ router.post("/:id/products/:productName/request-stock-item", salesAuth, async (r
     entry.stockItemRequestDecisionNote = undefined;
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "stock-item-requested",
+      summary: `${actor(req).name || "Sales"} requested "${productName}" be added to inventory`,
+    }).catch(() => {});
 
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
@@ -1433,6 +1727,15 @@ router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, a
     entry.stockItemRequestDecisionNote = note;
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "merchandiser",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: decision === "approve" ? "stock-item-approved" : "stock-item-rejected",
+      summary: `${actor(req).name || "Merchandising"} ${decision === "approve" ? "approved" : "rejected"} the stock-item request for "${productName}"${note ? ` — ${note}` : ""}`,
+    }).catch(() => {});
 
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
