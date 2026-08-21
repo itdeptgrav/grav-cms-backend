@@ -104,11 +104,18 @@ router.get("/", salesAuth, async (req, res) => {
 // ─── POST /api/cms/sales/customers ───────────────────────────────────────────
 router.post("/", salesAuth, async (req, res) => {
   try {
-    const { name, password: rawPassword, profile = {} } = req.body;
+    const { name, password: rawPassword, profile = {}, businessInfo } = req.body;
 
     // ── Sanitise inputs first — trim whitespace so queries are clean ─────────
     const email = (req.body.email || "").trim().toLowerCase();
     const phone = (req.body.phone || "").trim();
+    const alternatePhone = (req.body.alternatePhone || "").trim();
+    // Kept in step with profile.gstNumber ("kept for backward compat" per the
+    // model's own comment) — the Lead-conversion verification form (20 Aug
+    // 2026) is the first caller that actually sends this at creation time,
+    // so both copies get written together rather than one silently trailing
+    // the other from day one.
+    const gstNumber = (req.body.gstNumber || profile.gstNumber || "").trim().toUpperCase();
 
     if (!name?.trim() || !email || !phone) {
       return res.status(400).json({
@@ -145,11 +152,15 @@ router.post("/", salesAuth, async (req, res) => {
       name: name.trim(),
       email,
       phone,
+      alternatePhone: alternatePhone || undefined,
+      gstNumber: gstNumber || undefined,
       password: tempPassword, // hashed by pre-save hook
       profile: {
         ...profile,
+        gstNumber: gstNumber || profile.gstNumber || undefined,
         avatar: profile.avatar || null,
       },
+      businessInfo: businessInfo || undefined,
       isActive: true,
       isEmailVerified: true,
       createdBySales: true,
