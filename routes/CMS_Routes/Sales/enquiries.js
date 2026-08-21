@@ -26,6 +26,7 @@ const Employee = require("../../../models/Employee");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { createWithRef } = require("../../../services/enquiryRef");
 const NotificationService = require("../../../services/NotificationService");
+const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
 const { isSalesManager, bypassesApproval } = require("../../../services/salesAccess");
 const { costingTotals } = require("../../../services/costingTotals");
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
@@ -34,6 +35,24 @@ const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem")
 // Same three roles CoWork's own documents used — kept as the vocabulary for
 // "who can see/edit this sheet" now that the sheet itself is native.
 const SHARE_ROLES = new Set(["owner", "editor", "viewer"]);
+
+// For the department-notification emails below — user-entered names/refs land
+// straight in an HTML email, so they're escaped the same way every other
+// HTML-building email sender in this backend does.
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+
+// So every notification email below can say WHICH customer this is, not just
+// which enquiry — a bare enquiry reference means nothing to someone on
+// another department's dashboard who has never opened this record.
+async function customerNameFor(enquiry) {
+  if (!enquiry?.accountId) return "—";
+  const acc = await Account.findById(enquiry.accountId).select("displayName companyName").lean();
+  return acc?.displayName || acc?.companyName || "—";
+}
 
 // The margin policy. Hardcoded for now and deliberately server-side: the floor
 // price is computed here and only the RESULT is sent, so cost never has to be
@@ -237,6 +256,32 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
         createdBy: actor(req),
         updatedBy: actor(req),
       });
+
+      // Merchandising and the Project Manager both work this enquiry from
+      // here on (see the "staged instead" comment on the products route
+      // below) — best-effort, never awaited: an email failing must not
+      // affect the enquiry that was just created.
+      (async () => {
+        const customerName = await customerNameFor(enquiry);
+        const products = enquiry.products || [];
+        const productSummary = products.length
+          ? products.map((p) => (p.quantity ? `${p.product} (${p.quantity} pcs)` : p.product)).join(", ")
+          : "Not specified yet";
+        await notifyEvent("enquiry_created", {
+          heading: `New enquiry: ${enquiry.title || enquiry.enquiryId}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> opened a new Enquiry/RFQ.</p>`,
+          details: [
+            ["Customer", customerName],
+            ["Enquiry ref", enquiry.enquiryId],
+            ["Product(s)", productSummary],
+            ["Source", enquiry.source],
+          ],
+          image: products[0]?.images?.[0],
+          bodyText: `${actor(req).name || "Sales"} opened a new Enquiry/RFQ for ${customerName} — ${enquiry.enquiryId || ""}.`,
+          ctaLabel: "Open Enquiry",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${journey.journeyId}/enquiry`,
+        });
+      })().catch(() => {});
     }
 
     return res.json({ success: true, enquiry: await decorate(enquiry) });
@@ -1157,6 +1202,26 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
     entry.sentToCustomerBy = actor(req);
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("costing_sent_to_customer", {
+        heading: `Quote sent to customer: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> sent pricing for this product to the customer.</p>`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${actor(req).name || "Sales"} sent pricing for "${productName}" to ${customerName} — ${enquiry.enquiryId || ""}.`,
+        ctaLabel: "Open Cost & Quote",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+      });
+    })().catch(() => {});
+
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/send-to-customer", err);
@@ -1202,6 +1267,26 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
     entry.customerDecisionNote = note;
     enquiry.updatedBy = who;
     await enquiry.save();
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("customer_decision_recorded", {
+        heading: `Customer ${req.body.approved ? "approved" : "rejected"}: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(who.name || "Sales")}</strong> recorded that the customer <strong>${req.body.approved ? "approved" : "rejected"}</strong> this quote.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${who.name || "Sales"} recorded that ${customerName} ${req.body.approved ? "approved" : "rejected"} "${productName}" — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
+        ctaLabel: "Open Cost & Quote",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+      });
+    })().catch(() => {});
+
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/customer-approval", err);
@@ -1234,6 +1319,26 @@ router.post("/:id/products/:productName/request-stock-item", salesAuth, async (r
     entry.stockItemRequestDecisionNote = undefined;
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("stock_item_requested", {
+        heading: `Stock item requested: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> asked for this product to be added to inventory.</p>`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${actor(req).name || "Sales"} asked for "${productName}" (${customerName}) to be added to inventory — ${enquiry.enquiryId || ""}.`,
+        ctaLabel: "Review request",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/merchandiser/products`,
+      });
+    })().catch(() => {});
+
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/request-stock-item", err);
@@ -1328,6 +1433,26 @@ router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, a
     entry.stockItemRequestDecisionNote = note;
     enquiry.updatedBy = actor(req);
     await enquiry.save();
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("stock_item_request_decided", {
+        heading: `Stock item request ${decision === "approve" ? "approved" : "rejected"}: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Merchandising")}</strong> <strong>${decision === "approve" ? "approved" : "rejected"}</strong> the request to add this product to inventory.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${actor(req).name || "Merchandising"} ${decision === "approve" ? "approved" : "rejected"} the stock-item request for "${productName}" (${customerName}) — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
+        ctaLabel: "Open Cost & Quote",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+      });
+    })().catch(() => {});
+
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/stock-item-request/decide", err);

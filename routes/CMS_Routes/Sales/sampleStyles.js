@@ -32,6 +32,7 @@ const Unit = require("../../../models/CMS_Models/Inventory/Configurations/Unit")
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
 const { createWorkOrdersAndProgress } = require("./quotationRoutes");
 const { sendCustomerEmail } = require("../../../utils/salesEmailService");
+const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
 const salesAuthBase = require("../../../Middlewear/SalesAuthMiddlewear");
 
 // R&D owns the tech sheet and the sample rounds, so R&D must be able to call
@@ -52,6 +53,30 @@ const router = express.Router();
 
 const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
 const isObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
+
+// For the department-notification emails below.
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+
+// So every notification email can say WHICH customer this style belongs to.
+async function customerNameFor(style) {
+  if (!style?.accountId) return "—";
+  const acc = await Account.findById(style.accountId).select("displayName companyName").lean();
+  return acc?.displayName || acc?.companyName || "—";
+}
+
+// The style's own reference image — the SAME one the Enquiry/RFQ stage
+// captured for this product, since SampleStyle carries no images of its own
+// until R&D submits an actual sample photo (see the `/sample` submit action,
+// which DOES have its own photos — that one is used directly instead of this).
+async function referenceImageFor(style) {
+  if (!style?.enquiryId) return null;
+  const enq = await Enquiry.findById(style.enquiryId).select("products").lean();
+  return enq?.products?.find((p) => p.product === style.productName)?.images?.[0] || null;
+}
 
 // Append one event to the style's shared timeline.
 const logHistory = (style, ev, req) => {
@@ -305,6 +330,25 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
         { items, status: "pending", submittedBy: actor(req), submittedAt: new Date() },
       ];
       await style.save();
+
+      (async () => {
+        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        await notifyEvent("materials_change_requested", {
+          heading: `Materials change requested: ${style.productName || style.styleCode || ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Merchandising")}</strong> proposed a materials change for this style, needing your review.</p>`,
+          details: [
+            ["Customer", customerName],
+            ["Style", style.styleCode || style.sampleStyleId],
+            ["Product", style.productName],
+            ["Proposed materials", items.join(", ")],
+          ],
+          image,
+          bodyText: `${actor(req).name || "Merchandising"} proposed a materials change for "${style.productName || "a style"}" (${customerName}): ${items.join(", ")}.`,
+          ctaLabel: "Review change",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+        });
+      })().catch(() => {});
+
       return res.status(202).json({
         success: true,
         pending: true,
@@ -399,6 +443,33 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     logHistory(style, { kind: backward ? "send_back" : "route", from, to: stage, note: reason }, req);
     style.updatedBy = actor(req);
     await style.save();
+
+    // "Sending to R&D is what makes it appear in the R&D app" (see this
+    // route's own header comment) — R&D otherwise has no way to know a style
+    // is waiting for them short of opening the app and checking. Only on the
+    // actual transition INTO rnd, never a redundant re-save at the same
+    // stage. Best-effort, never awaited: an email failing must not affect
+    // the routing that just succeeded.
+    if (stage === "rnd" && from !== "rnd") {
+      (async () => {
+        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        await notifyEvent("sample_sent_to_rnd", {
+          heading: `Style sent to R&D: ${style.productName || style.styleCode || ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> sent this style to R&D for tech-pack / development.</p>`,
+          details: [
+            ["Customer", customerName],
+            ["Style", style.styleCode || style.sampleStyleId],
+            ["Product", style.productName],
+            ["Materials", (style.materials?.items || []).join(", ")],
+          ],
+          image,
+          bodyText: `${actor(req).name || "Sales"} sent "${style.productName || "a style"}" (${customerName}) to R&D for tech-pack / development.`,
+          ctaLabel: "Open in R&D",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/research-development/dashboard`,
+        });
+      })().catch(() => {});
+    }
+
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] PATCH /:id/stage", err);
@@ -448,6 +519,45 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
     if (tsKind) logHistory(style, { kind: tsKind, note: req.body.note || "" }, req);
     style.updatedBy = actor(req);
     await style.save();
+
+    if (action === "submit") {
+      (async () => {
+        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        await notifyEvent("tech_sheet_submitted", {
+          heading: `Tech sheet submitted: ${style.productName || style.styleCode || ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "R&D")}</strong> submitted the tech sheet for your review.</p>`,
+          details: [
+            ["Customer", customerName],
+            ["Style", style.styleCode || style.sampleStyleId],
+            ["Product", style.productName],
+            ["File", style.techSheet.file?.name],
+          ],
+          image,
+          bodyText: `${actor(req).name || "R&D"} submitted the tech sheet for "${style.productName || "a style"}" (${customerName}) for review.`,
+          ctaLabel: "Review tech sheet",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+        });
+      })().catch(() => {});
+    } else if (action === "approve" || action === "changes") {
+      (async () => {
+        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        const note = req.body.note || "";
+        await notifyEvent("tech_sheet_decision", {
+          heading: `Tech sheet ${action === "approve" ? "approved" : "changes requested"}: ${style.productName || style.styleCode || ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> ${action === "approve" ? "approved the tech sheet" : "requested changes to the tech sheet"}.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+          details: [
+            ["Customer", customerName],
+            ["Style", style.styleCode || style.sampleStyleId],
+            ["Product", style.productName],
+          ],
+          image,
+          bodyText: `${actor(req).name || "Sales"} ${action === "approve" ? "approved" : "requested changes to"} the tech sheet for "${style.productName || "a style"}" (${customerName}).${note ? ` Note: ${note}` : ""}`,
+          ctaLabel: "Open in R&D",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/research-development/dashboard`,
+        });
+      })().catch(() => {});
+    }
+
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/tech-sheet", err);
@@ -529,6 +639,47 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
     if (smKind) logHistory(style, { kind: smKind, note: action === "round" ? req.body.type : (req.body.note || "") }, req);
     style.updatedBy = actor(req);
     await style.save();
+
+    if (action === "submit") {
+      // The sample's OWN photo, not the enquiry reference image — this is
+      // what was actually made, so it's the more useful picture to include.
+      (async () => {
+        const customerName = await customerNameFor(style);
+        await notifyEvent("sample_submitted", {
+          heading: `Sample submitted for approval: ${style.productName || style.styleCode || ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "R&D")}</strong> submitted a physical sample for your approval.</p>`,
+          details: [
+            ["Customer", customerName],
+            ["Style", style.styleCode || style.sampleStyleId],
+            ["Product", style.productName],
+            ["Round", `#${style.sample.rounds?.length || ""}`],
+          ],
+          image: style.sample.photos?.[0],
+          bodyText: `${actor(req).name || "R&D"} submitted a sample of "${style.productName || "a style"}" (${customerName}) for approval.`,
+          ctaLabel: "Review sample",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${style.journeyId}/style-sample`,
+        });
+      })().catch(() => {});
+    } else if (action === "approve" || action === "reject") {
+      (async () => {
+        const customerName = await customerNameFor(style);
+        const note = req.body.note || "";
+        await notifyEvent("sample_decision", {
+          heading: `Sample ${action === "approve" ? "approved" : "rejected"}: ${style.productName || style.styleCode || ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> ${action === "approve" ? "approved" : "rejected"} the submitted sample.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+          details: [
+            ["Customer", customerName],
+            ["Style", style.styleCode || style.sampleStyleId],
+            ["Product", style.productName],
+          ],
+          image: style.sample.photos?.[0],
+          bodyText: `${actor(req).name || "Sales"} ${action === "approve" ? "approved" : "rejected"} the sample of "${style.productName || "a style"}" (${customerName}).${note ? ` Note: ${note}` : ""}`,
+          ctaLabel: "Open in R&D",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/research-development/dashboard`,
+        });
+      })().catch(() => {});
+    }
+
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample", err);
