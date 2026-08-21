@@ -41,6 +41,29 @@ router.post("/", checkApiKey, upload.single("audio"), async (req, res) => {
       }
     }
 
+    // Idempotency: if this exact recording was already stored (e.g. the app
+    // retried after a lost response), return the existing doc instead of
+    // re-uploading to Drive + duplicating in Mongo.
+    const dedupeKey = metadata.audioFileName
+      ? { audioFileName: metadata.audioFileName }
+      : (metadata.startTime != null
+          ? { startTime: metadata.startTime, phoneNumber: metadata.phoneNumber ?? null }
+          : null);
+    if (dedupeKey) {
+      const existing = await CallRecording.findOne(dedupeKey)
+        .select("_id driveFileId driveViewUrl")
+        .lean();
+      if (existing) {
+        return res.json({
+          success: true,
+          mongoId: String(existing._id),
+          driveFileId: existing.driveFileId,
+          driveViewUrl: existing.driveViewUrl,
+          duplicate: true,
+        });
+      }
+    }
+
     let drive = null;
     if (req.file) {
       drive = await uploadToGoogleDrive(req.file.buffer, {
