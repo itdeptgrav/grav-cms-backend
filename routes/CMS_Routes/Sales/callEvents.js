@@ -99,4 +99,102 @@ router.get("/", salesAuth, async (req, res) => {
   }
 });
 
+/** Every calendar day (IST) in the trailing `days`-day window, oldest first. */
+function trailingDayKeys(days) {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const keys = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const ist = new Date(Date.now() - i * 86400000 + IST_OFFSET_MS);
+    keys.push(ist.toISOString().slice(0, 10));
+  }
+  return keys;
+}
+
+/**
+ * GET /api/cms/crm/call-events/stats?days=14
+ *
+ * Department-wide call activity — every call the PersonalCallRecorder app has
+ * reported, not scoped to one customer, for the Messages page's "how many
+ * calls, how many received/rejected/not received, how much talk time" overview
+ * (21 Aug 2026, explicit request). CallEvent carries no salesperson/device
+ * owner field, so this is org-wide by design, same as the events themselves.
+ *
+ * "received" / "rejected" / "not received" are exactly the three outcomes
+ * `deriveReceived`/`deriveRejected` (routes/callEvents.js) can produce — not
+ * received is simply neither of the other two (a ring nobody answered, a
+ * block, a voicemail), never inferred from duration here.
+ */
+router.get("/stats", salesAuth, async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 14, 1), 90);
+    const since = new Date(Date.now() - days * 86400000);
+
+    const rows = await CallEvent.aggregate([
+      {
+        $addFields: {
+          effectiveAt: {
+            $cond: [{ $gt: ["$startTime", 0] }, { $toDate: "$startTime" }, "$createdAt"],
+          },
+        },
+      },
+      { $match: { effectiveAt: { $gte: since } } },
+      {
+        $addFields: {
+          dateKey: { $dateToString: { format: "%Y-%m-%d", date: "$effectiveAt", timezone: "Asia/Kolkata" } },
+        },
+      },
+      {
+        $group: {
+          _id: "$dateKey",
+          incoming: { $sum: { $cond: [{ $eq: ["$direction", "INCOMING"] }, 1, 0] } },
+          outgoing: { $sum: { $cond: [{ $eq: ["$direction", "OUTGOING"] }, 1, 0] } },
+          received: { $sum: { $cond: ["$received", 1, 0] } },
+          rejected: { $sum: { $cond: ["$rejected", 1, 0] } },
+          missed: {
+            $sum: {
+              $cond: [{ $and: [{ $eq: ["$received", false] }, { $eq: ["$rejected", false] }] }, 1, 0],
+            },
+          },
+          totalDurationSec: { $sum: "$durationSec" },
+          total: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const byDate = new Map(rows.map((r) => [r._id, r]));
+    const daily = trailingDayKeys(days).map((date) => {
+      const r = byDate.get(date);
+      return {
+        date,
+        incoming: r?.incoming || 0,
+        outgoing: r?.outgoing || 0,
+        received: r?.received || 0,
+        rejected: r?.rejected || 0,
+        missed: r?.missed || 0,
+        totalDurationSec: r?.totalDurationSec || 0,
+        total: r?.total || 0,
+      };
+    });
+
+    const totals = daily.reduce(
+      (acc, d) => ({
+        total: acc.total + d.total,
+        incoming: acc.incoming + d.incoming,
+        outgoing: acc.outgoing + d.outgoing,
+        received: acc.received + d.received,
+        rejected: acc.rejected + d.rejected,
+        missed: acc.missed + d.missed,
+        totalDurationSec: acc.totalDurationSec + d.totalDurationSec,
+      }),
+      { total: 0, incoming: 0, outgoing: 0, received: 0, rejected: 0, missed: 0, totalDurationSec: 0 },
+    );
+    totals.avgDurationSec = totals.received > 0 ? Math.round(totals.totalDurationSec / totals.received) : 0;
+
+    return res.json({ success: true, days, daily, totals });
+  } catch (error) {
+    console.error("[crm/call-events] stats failed:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;
