@@ -12,6 +12,32 @@ function checkApiKey(req, res, next) {
 }
 
 /**
+ * Whether a call actually connected — derived server-side from `callType`
+ * (read straight off the device's own system call log by the app, the one
+ * value here that isn't a client guess) rather than trusting the app's own
+ * `received` boolean blindly. Mirrors CallLogEntry.received in the Android
+ * app's CallLogResolver.kt exactly, so the two never disagree — but this is
+ * now the SOURCE OF TRUTH: a client bug that ever miscomputes `received`
+ * can't silently mislabel a missed call as answered once it reaches Mongo
+ * (21 Aug 2026, explicit request — "if anything missing as per the data
+ * sent by the app... let's handle those in the backend").
+ */
+function deriveReceived(callType, durationSec) {
+  const d = Number(durationSec) || 0;
+  switch (callType) {
+    case "MISSED":
+    case "REJECTED":
+    case "BLOCKED":
+      return false;
+    case "INCOMING":
+    case "ANSWERED_EXTERNALLY":
+      return true;
+    default:
+      return d > 0;
+  }
+}
+
+/**
  * POST /api/call-events   (application/json)
  * Logs one call's outcome (received/missed/etc). No audio.
  * Idempotent on (startTime + phoneNumber) so a re-send doesn't duplicate.
@@ -28,15 +54,18 @@ router.post("/", checkApiKey, async (req, res) => {
       if (dup) return res.json({ success: true, mongoId: String(dup._id), duplicate: true });
     }
 
+    const callType = b.callType ?? "UNKNOWN";
+    const durationSec = b.durationSec ?? 0;
     const doc = await CallEvent.create({
       phoneNumber: b.phoneNumber ?? null,
       contactName: b.contactName ?? null,
       direction: b.direction ?? "UNKNOWN",
-      callType: b.callType ?? "UNKNOWN",
-      received: !!b.received,
-      durationSec: b.durationSec ?? 0,
+      callType,
+      received: deriveReceived(callType, durationSec),
+      durationSec,
       startTime: b.startTime,
       endTime: b.endTime ?? null,
+      source: b.source || "personalcallrecorder",
     });
 
     res.json({ success: true, mongoId: doc._id.toString() });
