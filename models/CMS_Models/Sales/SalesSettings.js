@@ -140,6 +140,18 @@ const salesSettingsSchema = new mongoose.Schema(
       }) },
     },
 
+    // ── Department notifications — NOT customer-facing (20 Aug 2026) ─────────
+    // Cross-department "something happened, you should know" emails — e.g.
+    // Merchandising + the Project Manager when Sales opens a new Enquiry/RFQ,
+    // R&D when a style is sent to them. WHO receives each one is decided by
+    // Access Control (department membership), never stored here. This is only
+    // the ON/OFF switch per situation — see services/departmentNotify.service.js
+    // for the fixed event → department map and the event registry (labels,
+    // descriptions) the settings page reads.
+    departmentNotifications: {
+      disabledEvents: { type: [String], default: [] },
+    },
+
     // ── Audit ─────────────────────────────────────────────────────────────────
     updatedBy:     { type: mongoose.Schema.Types.ObjectId, ref: "SalesDepartment" },
     updatedByName: { type: String, trim: true },
