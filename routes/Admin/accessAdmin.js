@@ -1052,10 +1052,34 @@ router.post("/employees/:id/cowork-account", async (req, res) => {
 
     await Employee.updateOne({ _id: employee._id }, { $set: { coworkEmployeeId: result.employeeId } });
     audit(req, "employee.cowork-provision", `${employee.email} → ${result.employeeId}`);
+
+    // Send the new starter their id and temporary password.
+    //
+    // Awaited rather than fired and forgotten, because the panel tells the admin
+    // "we emailed them" and they need to know when that is not true — they are
+    // holding the only other copy of the password. The account is already
+    // written by this point, so a mail that fails costs a mail and nothing more;
+    // never let it turn a created account into a 500.
+    let welcomeEmail = { sent: false, reason: "Not attempted." };
+    try {
+      const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
+      welcomeEmail = await sendWelcomeEmail(
+        { name, email: employee.email, employeeId: result.employeeId, role: result.role, department: employee.department || "" },
+        result.tempPassword,
+      );
+    } catch (mailErr) {
+      welcomeEmail = { sent: false, reason: mailErr?.message || "Unknown mail error" };
+      console.error("[access-admin] cowork welcome email:", mailErr?.message || mailErr);
+    }
+
     res.status(201).json({
       success: true,
-      message: "CoWork account created.",
+      message: welcomeEmail?.sent
+        ? "CoWork account created and the sign-in details have been emailed."
+        : "CoWork account created. The welcome email could not be sent — share the details below.",
       account: { employeeId: result.employeeId, role: result.role, tempPassword: result.tempPassword },
+      emailSent: !!welcomeEmail?.sent,
+      emailError: welcomeEmail?.sent ? null : welcomeEmail?.reason || null,
     });
   } catch (error) {
     console.error("[access-admin] provision cowork account:", error);
