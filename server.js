@@ -1199,6 +1199,9 @@ app.use("/api/cms/crm/lookups", require("./routes/CMS_Routes/Sales/crmLookups"))
 // only get in the way of. The Android app's upload endpoint stays separate at
 // /api/recordings.
 app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callRecordings"));
+// Every call (answered/missed/rejected, recorded or not) for the Active Lead
+// workspace's outreach-attempt suggestion — see that route file's own header.
+app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
 
 // Sales Journey — the connected commercial lifecycle record (Account →
 // Retention). Same Sales role + approval guard as the rest of CRM: an editor's

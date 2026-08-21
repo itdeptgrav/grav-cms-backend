@@ -455,6 +455,92 @@ function styleHistoryEntries(style) {
   });
 }
 
+// GET /api/cms/crm/enquiries/by-journey/:journeyRef/pending-approvals
+//
+// Every decision this journey is currently waiting on FROM SALES, in one
+// list — costing changes Merchandising/PM proposed, tech sheets R&D
+// submitted, samples R&D submitted, materials changes proposed — scanned
+// across the Enquiry AND every SampleStyle under this journey, so it's one
+// consolidated answer regardless of which stage the pending thing actually
+// lives in. Powers a global "you have approvals waiting" banner shown on
+// every stage tab, not just the one where the item sits (21 Aug 2026,
+// explicit request — "so many approval and things are there... showcase
+// the approvals... so the sales person can easily get to know").
+//
+// Deliberately narrow: this is SALES' OWN inbox, not a general activity feed
+// — customer-approval and stock-item-request items are a different audience
+// (the customer, and Merchandising, respectively) and stay out of this list.
+router.get("/by-journey/:journeyRef/pending-approvals", salesAuth, async (req, res) => {
+  try {
+    const journey = await loadJourney(req.params.journeyRef);
+    if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
+
+    const enquiry = await Enquiry.findOne({ journeyId: journey._id, isActive: true })
+      .select("costingChangeLog").lean();
+    const styles = await SampleStyle.find({ journeyId: journey._id, isActive: true })
+      .select("productName styleCode sampleStyleId materialsChangeLog techSheet sample").lean();
+
+    const approvals = [];
+
+    for (const entry of (enquiry?.costingChangeLog || [])) {
+      if (entry.status !== "pending") continue;
+      approvals.push({
+        key: `costing-${entry._id}`,
+        type: "costing",
+        stage: "costQuote",
+        productName: entry.productName,
+        label: `${PART_LABEL[entry.part || "combined"] || entry.part} costing for "${entry.productName}"`,
+        submittedByName: entry.submittedBy?.name || "Someone",
+        submittedAt: entry.submittedAt,
+      });
+    }
+
+    for (const style of styles) {
+      const label = style.productName || style.styleCode || style.sampleStyleId || "a style";
+      for (const entry of (style.materialsChangeLog || [])) {
+        if (entry.status !== "pending") continue;
+        approvals.push({
+          key: `materials-${entry._id}`,
+          type: "materials",
+          stage: "styleSample",
+          productName: style.productName,
+          label: `Materials for "${label}"`,
+          submittedByName: entry.submittedBy?.name || "Someone",
+          submittedAt: entry.submittedAt,
+        });
+      }
+      if (style.techSheet?.status === "submitted") {
+        approvals.push({
+          key: `tech-${style._id}`,
+          type: "techSheet",
+          stage: "styleSample",
+          productName: style.productName,
+          label: `Tech sheet for "${label}"`,
+          submittedByName: "R&D",
+          submittedAt: style.techSheet.submittedAt,
+        });
+      }
+      if (style.sample?.status === "submitted") {
+        approvals.push({
+          key: `sample-${style._id}`,
+          type: "sample",
+          stage: "styleSample",
+          productName: style.productName,
+          label: `Sample for "${label}"`,
+          submittedByName: "R&D",
+          submittedAt: style.sample.submittedAt,
+        });
+      }
+    }
+
+    approvals.sort((a, b) => new Date(a.submittedAt || 0) - new Date(b.submittedAt || 0));
+    return res.json({ success: true, approvals });
+  } catch (err) {
+    console.error("[enquiries] GET /by-journey/:journeyRef/pending-approvals", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/by-journey/:journeyRef/change-log", salesAuth, async (req, res) => {
   try {
     const journey = await loadJourney(req.params.journeyRef);
