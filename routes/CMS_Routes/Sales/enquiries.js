@@ -26,9 +26,34 @@ const Employee = require("../../../models/Employee");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { createWithRef } = require("../../../services/enquiryRef");
 const NotificationService = require("../../../services/NotificationService");
-const { SHARE_ROLES } = require("../../../services/coworkSheets.service");
-const { isSalesManager } = require("../../../services/salesAccess");
+const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
+const { recordChange, historyFor, diff } = require("../../../services/changeLog");
+const { isSalesManager, bypassesApproval } = require("../../../services/salesAccess");
 const { costingTotals } = require("../../../services/costingTotals");
+const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
+const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
+
+// Same three roles CoWork's own documents used — kept as the vocabulary for
+// "who can see/edit this sheet" now that the sheet itself is native.
+const SHARE_ROLES = new Set(["owner", "editor", "viewer"]);
+
+// For the department-notification emails below — user-entered names/refs land
+// straight in an HTML email, so they're escaped the same way every other
+// HTML-building email sender in this backend does.
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+
+// So every notification email below can say WHICH customer this is, not just
+// which enquiry — a bare enquiry reference means nothing to someone on
+// another department's dashboard who has never opened this record.
+async function customerNameFor(enquiry) {
+  if (!enquiry?.accountId) return "—";
+  const acc = await Account.findById(enquiry.accountId).select("displayName companyName").lean();
+  return acc?.displayName || acc?.companyName || "—";
+}
 
 // The margin policy. Hardcoded for now and deliberately server-side: the floor
 // price is computed here and only the RESULT is sent, so cost never has to be
@@ -102,6 +127,119 @@ const PRODUCT_TEXT_FIELDS = [
 ];
 const GARMENT_GENDER_CODES = ["male", "female", "unisex"];
 
+// Human labels for the header PATCH's EDITABLE fields, used to turn a raw
+// diff into a readable log line — see summarizeEnquiryChange() below.
+const FIELD_LABEL = {
+  title: "title", enquiryDate: "enquiry date", source: "enquiry source",
+  expectedClosingDate: "expected closing date", requirementDeadline: "requirement deadline",
+  summary: "summary", status: "status", lostReason: "lost reason", lostReasonNote: "lost reason note",
+  pricingCurrency: "pricing currency", targetPrice: "target price",
+  estimatedPriceMin: "estimated price (min)", estimatedPriceMax: "estimated price (max)",
+  pricingNote: "pricing note", opportunitySize: "opportunity size", winProbability: "win probability",
+  priority: "priority", seriousness: "seriousness", expectedOrderDate: "expected order date",
+};
+
+function fmtFieldValue(v) {
+  if (v === null || v === undefined || v === "") return "empty";
+  if (Array.isArray(v)) return `${v.length} item${v.length === 1 ? "" : "s"}`;
+  if (typeof v === "object") return "…";
+  return String(v);
+}
+
+/**
+ * Per-product diff: match old/new rows by NAME (the one thing that survives a
+ * routine "Save requirement" — see sanitizeProducts' own comment on why _id
+ * can't be the join key), then list which fields changed on each.
+ */
+function summarizeProductChanges(before, after) {
+  const beforeByName = new Map((before || []).map((p) => [p.product, p]));
+  const afterByName = new Map((after || []).map((p) => [p.product, p]));
+  const bits = [];
+  for (const name of afterByName.keys()) {
+    if (!beforeByName.has(name)) { bits.push(`added "${name}"`); continue; }
+    const b = beforeByName.get(name), a = afterByName.get(name);
+    const changedFields = [];
+    for (const key of new Set([...Object.keys(b || {}), ...Object.keys(a || {})])) {
+      if (key === "_id") continue;
+      if (JSON.stringify(b?.[key]) === JSON.stringify(a?.[key])) continue;
+      changedFields.push(key === "images" ? "photo" : key);
+    }
+    if (changedFields.length) bits.push(`"${name}" (${changedFields.slice(0, 4).join(", ")}${changedFields.length > 4 ? ", …" : ""})`);
+  }
+  for (const name of beforeByName.keys()) {
+    if (!afterByName.has(name)) bits.push(`removed "${name}"`);
+  }
+  return bits;
+}
+
+/**
+ * A field-level "what actually changed" sentence for the change log — a bare
+ * "updated ENQ-2026-00005" answers nothing when read a second time (21 Aug
+ * 2026, explicit request: "what he change means what information he
+ * changed... if u keep that log in form of any description... then the log
+ * can be worth it").
+ */
+function summarizeEnquiryChange(before, after) {
+  const d = diff(before, after);
+  const bits = [];
+  for (const key of d.changed) {
+    if (key === "updatedBy" || key === "updatedAt" || key === "__v") continue;
+    if (key === "products") {
+      const productBits = summarizeProductChanges(before.products, after.products);
+      if (productBits.length) bits.push(`products — ${productBits.slice(0, 3).join("; ")}${productBits.length > 3 ? "; …" : ""}`);
+      continue;
+    }
+    if (key === "references") { bits.push("references"); continue; }
+    const label = FIELD_LABEL[key] || key;
+    bits.push(`${label}: ${fmtFieldValue(before[key])} → ${fmtFieldValue(after[key])}`);
+  }
+  return bits;
+}
+
+/**
+ * Generic row-array diff for costing sheet tables. Rows have no stable id
+ * across a save (the sanitizers below rebuild the array fresh, so Mongoose
+ * assigns brand-new subdocument _ids every time) — matched by `keyFn` instead,
+ * same reasoning as summarizeProductChanges' name-join above.
+ */
+function summarizeRowChanges(before, after, keyFn, label) {
+  const beforeByKey = new Map((before || []).map((r) => [keyFn(r), r]));
+  const afterByKey = new Map((after || []).map((r) => [keyFn(r), r]));
+  const added = [], removed = [], changed = [];
+  for (const [key, a] of afterByKey) {
+    const b = beforeByKey.get(key);
+    if (!b) { added.push(key); continue; }
+    const isDiff = ["category", "item", "vendor", "unitCost", "unit", "consumption", "detail", "sam", "rate", "name", "price"]
+      .some((f) => JSON.stringify(b[f]) !== JSON.stringify(a[f]));
+    if (isDiff) changed.push(key);
+  }
+  for (const key of beforeByKey.keys()) {
+    if (!afterByKey.has(key)) removed.push(key);
+  }
+  const bits = [];
+  if (added.length) bits.push(`added ${added.slice(0, 3).map((k) => `"${k}"`).join(", ")}${added.length > 3 ? ` +${added.length - 3} more` : ""}`);
+  if (changed.length) bits.push(`changed ${changed.slice(0, 3).map((k) => `"${k}"`).join(", ")}${changed.length > 3 ? ` +${changed.length - 3} more` : ""}`);
+  if (removed.length) bits.push(`removed ${removed.slice(0, 3).map((k) => `"${k}"`).join(", ")}${removed.length > 3 ? ` +${removed.length - 3} more` : ""}`);
+  return bits.length ? `${label}: ${bits.join("; ")}` : "";
+}
+
+function summarizeCostingSheetChange(before, after) {
+  const parts = [];
+  if (after.materials !== undefined) {
+    const bit = summarizeRowChanges(before.materials, after.materials, (r) => `${r.category || ""} / ${r.item || "untitled"}`, "raw materials");
+    if (bit) parts.push(bit);
+  }
+  if (after.operations !== undefined) {
+    const bit = summarizeRowChanges(before.operations, after.operations, (r) => r.detail || "untitled", "operations");
+    if (bit) parts.push(bit);
+  }
+  if (after.miscellaneous !== undefined) {
+    const bit = summarizeRowChanges(before.miscellaneous, after.miscellaneous, (r) => r.name || "untitled", "miscellaneous");
+    if (bit) parts.push(bit);
+  }
+  return parts.join(" · ");
+}
+
 // A client-supplied products array, cleaned to what the schema accepts: drop
 // blank rows, coerce quantity to a non-negative number, validate the gender
 // enum, and carry the garment-spec fields through trimmed.
@@ -123,13 +261,14 @@ function sanitizeProducts(input) {
         const v = p[f];
         if (v != null && String(v).trim()) out[f] = String(v).trim();
       }
-      // Reference images (Drive) — keep up to 8, dropping entries with neither a
-      // fileId nor a URL. Trusted shape: { fileId, name, url }.
+      // Reference images (Cloudinary or, on older rows, Drive) — keep up to 8,
+      // dropping entries with neither a publicId, a fileId, nor a URL.
       if (Array.isArray(p.images)) {
         const imgs = p.images
-          .filter((im) => im && (String(im.fileId || "").trim() || String(im.url || "").trim()))
+          .filter((im) => im && (String(im.publicId || "").trim() || String(im.fileId || "").trim() || String(im.url || "").trim()))
           .slice(0, 8)
           .map((im) => ({
+            publicId: String(im.publicId || "").trim() || undefined,
             fileId: String(im.fileId || "").trim() || undefined,
             name: String(im.name || "").trim() || undefined,
             url: String(im.url || "").trim() || undefined,
@@ -231,11 +370,110 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
         createdBy: actor(req),
         updatedBy: actor(req),
       });
+
+      // Merchandising and the Project Manager both work this enquiry from
+      // here on (see the "staged instead" comment on the products route
+      // below) — best-effort, never awaited: an email failing must not
+      // affect the enquiry that was just created.
+      (async () => {
+        const customerName = await customerNameFor(enquiry);
+        const products = enquiry.products || [];
+        const productSummary = products.length
+          ? products.map((p) => (p.quantity ? `${p.product} (${p.quantity} pcs)` : p.product)).join(", ")
+          : "Not specified yet";
+        await notifyEvent("enquiry_created", {
+          heading: `New enquiry: ${enquiry.title || enquiry.enquiryId}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> opened a new Enquiry/RFQ.</p>`,
+          details: [
+            ["Customer", customerName],
+            ["Enquiry ref", enquiry.enquiryId],
+            ["Product(s)", productSummary],
+            ["Source", enquiry.source],
+          ],
+          image: products[0]?.images?.[0],
+          bodyText: `${actor(req).name || "Sales"} opened a new Enquiry/RFQ for ${customerName} — ${enquiry.enquiryId || ""}.`,
+          ctaLabel: "Open Enquiry",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${journey.journeyId}/enquiry`,
+        });
+      })().catch(() => {});
     }
 
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] GET /by-journey", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/by-journey/:journeyRef/change-log
+// The journey-level entry point into the SAME change log — the Activity
+// drawer only ever has the journey reference on hand, not the enquiry's own
+// Mongo _id, so it resolves through the journey exactly like the GET above
+// does rather than making every caller look the enquiry up twice.
+// Style & Sample's own timeline (SampleStyle.history — materials/tech-sheet/
+// sample/stage-routing events, already recorded by routes/.../sampleStyles.js
+// via logHistory()) predates this change log and lives on each style
+// document, not in the shared ChangeLog collection. Normalized into the same
+// {departmentSlug, action, summary, actorName, entityLabel, createdAt} shape
+// here so ONE feed covers every department touching the journey — Sales'
+// own edits AND R&D/Merchandising's style work — instead of Style & Sample
+// activity being invisible from the journey-level log (21 Aug 2026, explicit
+// request: "as this sales journey is happening via multiple department
+// multiple persons... proper log need to keep... what happened when
+// happened who did").
+const STYLE_HISTORY_LABEL = {
+  materials_set: "set the selected materials",
+  materials_change_rejected: "rejected a proposed materials change",
+  send_back: "sent the style back a stage",
+  route: "moved the style forward",
+  tech_submitted: "submitted the tech sheet",
+  tech_approved: "approved the tech sheet",
+  tech_changes: "requested changes to the tech sheet",
+  sample_round: "logged a sample round",
+  sample_submitted: "submitted the physical sample",
+  sample_approved: "approved the sample",
+  sample_rejected: "rejected the sample",
+};
+function styleHistoryEntries(style) {
+  return (style.history || []).map((ev) => {
+    const verb = STYLE_HISTORY_LABEL[ev.kind] || (ev.kind || "").replace(/_/g, " ");
+    const stageNote = ev.kind === "route" || ev.kind === "send_back"
+      ? ` (${ev.from || "?"} → ${ev.to || "?"}${ev.note ? ` — ${ev.note}` : ""})`
+      : ev.kind === "materials_set"
+        ? ` (${ev.from || "none"} → ${ev.to || "none"})`
+        : ev.note ? ` — ${ev.note}` : "";
+    return {
+      departmentSlug: "research-development",
+      entity: "crm-sample-style",
+      entityId: String(style._id),
+      entityLabel: style.productName || style.styleCode || style.sampleStyleId || "",
+      action: ev.kind || "update",
+      summary: `${ev.by?.name || "Someone"} ${verb} for "${style.productName || "a style"}"${stageNote}`,
+      actorName: ev.by?.name || "",
+      createdAt: ev.at,
+    };
+  });
+}
+
+router.get("/by-journey/:journeyRef/change-log", salesAuth, async (req, res) => {
+  try {
+    const journey = await loadJourney(req.params.journeyRef);
+    if (!journey) return res.status(404).json({ success: false, message: "Journey not found." });
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+
+    const enquiry = await Enquiry.findOne({ journeyId: journey._id, isActive: true }).select("_id").lean();
+    const styles = await SampleStyle.find({ journeyId: journey._id, isActive: true }).select("history productName styleCode sampleStyleId").lean();
+
+    const enquiryEntries = enquiry ? await historyFor("crm-enquiry", enquiry._id, limit) : [];
+    const styleEntries = styles.flatMap(styleHistoryEntries);
+
+    const entries = [...enquiryEntries, ...styleEntries]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, limit);
+
+    return res.json({ success: true, entries });
+  } catch (err) {
+    console.error("[enquiries] GET /by-journey/:journeyRef/change-log", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -258,6 +496,11 @@ router.patch("/:id", salesAuth, async (req, res) => {
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const body = req.body || {};
+    // Snapshot before any field is touched — multiple departments (Sales,
+    // Merchandising, Project Manager) edit this same record, and this is
+    // the one route with no log at all until now: it just overwrote fields
+    // with only `updatedBy` set. See recordChange() below.
+    const before = enquiry.toObject();
 
     // Enforce the status machine: a status change must be a legal transition.
     // A no-op (same status, e.g. saving other fields) always passes.
@@ -337,10 +580,43 @@ router.patch("/:id", salesAuth, async (req, res) => {
       }
     }
 
+    const after = enquiry.toObject();
+    const changeBits = summarizeEnquiryChange(before, after);
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "update",
+      summary: changeBits.length
+        ? `${actor(req).name || "Someone"} updated ${enquiry.enquiryId} — ${changeBits.join("; ")}`
+        : `${actor(req).name || "Someone"} updated ${enquiry.enquiryId}`,
+      before,
+      after,
+    }).catch(() => {});
+
     return res.json({ success: true, enquiry: await decorate(enquiry) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id", err);
     return res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/change-log
+// Who changed what on this enquiry, newest first — Sales-auth-gated (unlike
+// /api/admin/change-log, which is platform-admin-only and unreachable from a
+// CRM screen). Reads the SAME ChangeLog collection recordChange() above and
+// the lifecycle-mutation routes below already write to; nothing new to
+// maintain, just a CRM-scoped door into it.
+router.get("/:id/change-log", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const entries = await historyFor("crm-enquiry", req.params.id, limit);
+    return res.json({ success: true, entries });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/change-log", err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -370,39 +646,64 @@ router.get("/cowork-employees", salesAuth, async (req, res) => {
   }
 });
 
+// GET /api/cms/crm/enquiries/my-pending-count
+// "N need your input" — a live, computed count for the Merchandiser/PM nav
+// badge (19 Aug 2026), not a stored/mark-as-read notification: how many of
+// the caller's own assigned costing sheets (raw-materials or operations) are
+// still empty. Always fresh off the same data the costing panel itself
+// reads — nothing to keep in sync, nothing to mark seen.
+router.get("/my-pending-count", salesAuth, async (req, res) => {
+  try {
+    const me = await coworkIdentity(req);
+    if (!me) return res.json({ success: true, count: 0 });
+
+    const enquiries = await Enquiry.find({
+      isActive: true,
+      "costingSheets.members.employeeId": me.coworkEmployeeId,
+    }).select("costingSheets").lean();
+
+    let count = 0;
+    for (const enquiry of enquiries) {
+      for (const sheet of enquiry.costingSheets || []) {
+        const mine = (sheet.members || []).find((m) => m.employeeId === me.coworkEmployeeId);
+        if (!canWrite(mine?.role)) continue;
+        const part = sheet.part || "combined";
+        if (part === "raw" && !(sheet.materials || []).length) count += 1;
+        else if (part === "operations" && !(sheet.operations || []).length) count += 1;
+        else if (part === "combined" && !(sheet.materials || []).length && !(sheet.operations || []).length) count += 1;
+      }
+    }
+
+    return res.json({ success: true, count });
+  } catch (err) {
+    console.error("[enquiries] GET /my-pending-count", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ─── Costing sheets ──────────────────────────────────────────────────────────
 //
-// ONE SHEET PER CONTRIBUTOR (17 Aug 2026). A costing used to be one CoWork
+// ONE SHEET PER CONTRIBUTOR (17 Aug 2026). A costing used to be one shared
 // document with two tabs, shared with the merchandiser and the industrial
-// engineer together. CoWork's roles are whole-document — owner|editor|viewer,
-// there is no per-tab or per-range permission — so that arrangement could not
-// express who owns what, and either contributor could overwrite the other's
-// work with nothing to stop them.
+// engineer together — one whole-document set of roles, no per-tab permission —
+// so that arrangement could not express who owns what, and either contributor
+// could overwrite the other's work with nothing to stop them.
 //
-// A costing is now two documents:
+// A costing is two row-sets:
 //
 //   part "raw"         raw materials      merchandiser        = editor
 //   part "operations"  operations / CMP   industrial engineer = editor
 //
 // The other contributor is a viewer on each (an IE reading the fabric costs is
 // normal; an IE editing them is not), and the salesperson who raised it owns
-// both. Total FOB is not on either sheet — a formula cannot reach into another
-// document — so the CMS composes the two and totals them.
+// both. Total FOB is not on either sheet on its own — the CMS composes the two
+// and totals them (services/costingTotals.js).
 //
-// Rows written before the split have no `part` and default to "combined"; those
-// documents are still live in CoWork, so every route here handles them.
-const {
-  createSheet,
-  setMembers,
-  getSheet,
-  getSheetBody,
-  updateSheetBody,
-} = require("../../../services/coworkSheets.service");
-const {
-  buildRawMaterialsWorkbook,
-  buildOperationsWorkbook,
-} = require("../../../services/sheetTemplates");
-
+// NATIVE, NOT COWORK (19 Aug 2026, explicit request). This used to be a
+// pointer into a CoWork Firestore workbook — raw items and production cost are
+// now defined directly on the Enquiry document itself; see the model's own
+// comment on `costingSheets` for why. Rows written before the split have no
+// `part` and default to "combined"; every route here still handles them.
 const PART_LABEL = { raw: "Raw materials", operations: "Operations", combined: "Costing" };
 const PART_ROLE = { raw: "merchandiser", operations: "industrialEngineer" };
 
@@ -475,22 +776,118 @@ const NO_COWORK_ACCOUNT = {
   message: "Your account isn't linked to a CoWork identity yet. Ask an administrator to link it on the Access Control page.",
 };
 
-/** What this person may do with this document, read from CoWork itself. */
-async function roleOn(documentId, coworkEmployeeId) {
-  const doc = await getSheet(documentId);
-  if (!doc) return { doc: null, role: null };
-  const mine = (doc.members || []).find((m) => m.employeeId === coworkEmployeeId);
-  return { doc, role: mine?.role || null };
-}
-
 const canWrite = (role) => role === "owner" || role === "editor";
 
+// Whose saves apply immediately versus get staged for review (19 Aug 2026).
+// Sales raised the enquiry and IS the approver; admin/CEO have standing
+// authority above any department. Everyone else who can reach this route —
+// concretely, "merchandiser" and "project_manager" — gets staged instead.
+
+/** Clean a client-supplied materials array to the shape the schema accepts. */
+function sanitizeMaterialRows(input) {
+  return (Array.isArray(input) ? input : []).map((m) => ({
+    category: String(m?.category || "").trim(),
+    item: String(m?.item || "").trim(),
+    // Only present when `item` was picked from the Store raw-item master
+    // rather than typed free-text — lets the row's "info" button resolve the
+    // full record. Validated rather than trusted blindly since it rides in
+    // on client input.
+    rawItemId: isObjectId(m?.rawItemId) ? m.rawItemId : null,
+    vendor: String(m?.vendor || "").trim(),
+    unitCost: m?.unitCost === "" || m?.unitCost == null ? "" : String(m.unitCost),
+    unit: String(m?.unit || "").trim(),
+    consumption: m?.consumption === "" || m?.consumption == null ? "" : String(m.consumption),
+    // Only ever set by the R&D-sample seed below — carried through so a
+    // Sales/Merchandiser edit of an already-seeded row doesn't silently drop
+    // the provenance figure (empty string means "not from a sample").
+    allowancePercent: m?.allowancePercent === "" || m?.allowancePercent == null ? "" : String(m.allowancePercent),
+  }));
+}
+
+// Same shelf-mapping costingMasters.js uses client-side to open a picker on
+// the right category — duplicated here (no shared lib between the two repos'
+// route/lib files) so a seeded row lands in a real costing category instead
+// of an empty one the grouped table can't place.
+const RAW_MATERIAL_CATEGORY_MAP = {
+  Fabric: ["Fabric"],
+  Thread: ["Thread"],
+  Button: ["Buttons", "Fasteners"],
+  Fusing: ["Interlining"],
+  "Trims & Accessory": [
+    "Trims", "Accessories", "Elastic", "Zippers", "Laces",
+    "Ribbons", "Cords", "Tapes", "Piping", "Webbing", "Labels",
+  ],
+  "Packing Materials": ["Packaging"],
+};
+function costingCategoryFor(rawItemCategory) {
+  const want = String(rawItemCategory || "").trim();
+  if (!want) return "Trims & Accessory";
+  for (const [costingCategory, masterCategories] of Object.entries(RAW_MATERIAL_CATEGORY_MAP)) {
+    if (masterCategories.includes(want)) return costingCategory;
+  }
+  return "Trims & Accessory";
+}
+
+/**
+ * The raw-materials starting point for a brand-new costing sheet: whatever
+ * R&D actually consumed making the approved sample, not a blank table.
+ * Merchandising still has to pick a vendor (and so a price) per row — this
+ * only carries over WHAT was used and HOW MUCH, straight from the sample
+ * that Sales already signed off (20 Aug 2026, explicit request).
+ *
+ * Returns [] when there's no approved sample for this product, or it left
+ * nothing consumed — the sheet then starts exactly as blank as it always did.
+ */
+async function seedMaterialsFromApprovedSample(enquiryId, productName) {
+  const style = await SampleStyle.findOne({
+    enquiryId, productName, "sample.status": "approved",
+  }).select("sample.consumptionRawItems").lean();
+  const rows = style?.sample?.consumptionRawItems || [];
+  if (!rows.length) return [];
+
+  const ids = rows.map((r) => r.rawItemId).filter(Boolean);
+  const items = ids.length
+    ? await RawItem.find({ _id: { $in: ids } }).select("category customCategory").lean()
+    : [];
+  const categoryById = new Map(items.map((it) => [String(it._id), it.customCategory || it.category || ""]));
+
+  return rows
+    .filter((r) => r.rawItemName && Number(r.quantity) > 0)
+    .map((r) => {
+      const allowance = Number(r.allowancePercent) || 0;
+      const consumption = Number(r.quantity) * (1 + allowance / 100);
+      return {
+        category: costingCategoryFor(categoryById.get(String(r.rawItemId)) || ""),
+        item: r.rawItemName,
+        vendor: (r.variantCombination || []).filter(Boolean).join(" / "),
+        unitCost: "",
+        unit: r.unit || "",
+        consumption: String(Math.round(consumption * 10000) / 10000),
+        allowancePercent: String(allowance),
+      };
+    });
+}
+/** Clean a client-supplied operations array to the shape the schema accepts. */
+function sanitizeOperationRows(input) {
+  return (Array.isArray(input) ? input : []).map((o) => ({
+    detail: String(o?.detail || "").trim(),
+    sam: o?.sam === "" || o?.sam == null ? "" : String(o.sam),
+    rate: o?.rate === "" || o?.rate == null ? "" : String(o.rate),
+  }));
+}
+/** Clean a client-supplied miscellaneous array to the shape the schema accepts. */
+function sanitizeMiscRows(input) {
+  return (Array.isArray(input) ? input : []).map((x) => ({
+    name: String(x?.name || "").trim(),
+    price: x?.price === "" || x?.price == null ? "" : String(x.price),
+  }));
+}
+
 // POST /api/cms/crm/enquiries/:id/costing-sheet
-// Raise the costing for one product: creates BOTH sheets and hands each to the
-// person responsible for it. Creating again for the same product REPLACES the
-// costingSheets entries (fresh CoWork documents) rather than editing the old
-// ones in place — the old sheets are not deleted from CoWork, just unlinked
-// here, since somebody may still have them open.
+// Raise the costing for one product: creates BOTH row-sets (empty, ready to
+// fill in) and hands each to the person responsible for it. Creating again for
+// the same product REPLACES the costingSheets entries rather than editing the
+// old ones in place.
 router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
@@ -502,11 +899,10 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
     const product = (enquiry.products || []).find((p) => p.product === productName);
     if (!product) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
 
-    // The creator must be a real employee with a CoWork account already
-    // linked — the same link Access Control's "CoWork account" control
-    // establishes (Employee.coworkEmployeeId). Without it there is no
-    // CoWork identity to make the sheets' owner, and minting one here would
-    // bypass the admin-driven linking flow entirely.
+    // The creator must be a real employee with a stable identity to record as
+    // the sheet's owner — the same link Access Control's "CoWork account"
+    // control establishes (Employee.coworkEmployeeId), kept as the identity
+    // scheme for costing membership even though the sheet itself is native.
     const me = await coworkIdentity(req);
     if (!me) return res.status(409).json(NO_COWORK_ACCOUNT);
 
@@ -535,14 +931,9 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
       });
     }
 
-    const context = {
-      enquiry: { enquiryId: enquiry.enquiryId, customerName: (await decorate(enquiry)).customerName, enquiryDate: enquiry.enquiryDate },
-      product,
-    };
-
     const plan = [
-      { part: "raw", workbook: buildRawMaterialsWorkbook(context), assignee: team.merchandiser, other: team.industrialEngineer },
-      { part: "operations", workbook: buildOperationsWorkbook(context), assignee: team.industrialEngineer, other: team.merchandiser },
+      { part: "raw", assignee: team.merchandiser, other: team.industrialEngineer },
+      { part: "operations", assignee: team.industrialEngineer, other: team.merchandiser },
     ];
 
     const created = [];
@@ -551,35 +942,28 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
       // counterpart as a viewer is deliberate — costing decisions reference each
       // other constantly, and making people ask for access to LOOK is how a
       // costing ends up copy-pasted into a chat message.
-      const shareWith = [];
+      const members = [{ employeeId: me.coworkEmployeeId, name: me.name || "", role: "owner" }];
       if (step.assignee && step.assignee.employeeId !== me.coworkEmployeeId) {
-        shareWith.push({ employeeId: step.assignee.employeeId, name: step.assignee.name, role: "editor" });
+        members.push({ employeeId: step.assignee.employeeId, name: step.assignee.name, role: "editor" });
       }
       if (step.other && step.other.employeeId !== me.coworkEmployeeId
           && step.other.employeeId !== step.assignee?.employeeId) {
-        shareWith.push({ employeeId: step.other.employeeId, name: step.other.name, role: "viewer" });
+        members.push({ employeeId: step.other.employeeId, name: step.other.name, role: "viewer" });
       }
-
-      const title = `${PART_LABEL[step.part]} — ${productName}`;
-      const { documentId } = await createSheet({
-        title,
-        creatorEmployeeId: me.coworkEmployeeId,
-        shareWith,
-        workbook: step.workbook,
-      });
 
       created.push({
         productName,
         part: step.part,
-        documentId,
-        title,
         assignee: step.assignee || undefined,
         createdAt: new Date(),
+        updatedAt: new Date(),
         createdBy: actor(req),
-        members: [
-          { employeeId: me.coworkEmployeeId, name: me.name || "", role: "owner" },
-          ...shareWith,
-        ],
+        members,
+        // The merchandiser's sheet starts from what R&D actually consumed on
+        // the approved sample, not blank — see the function's own comment.
+        materials: step.part === "raw" ? await seedMaterialsFromApprovedSample(enquiry._id, productName) : [],
+        operations: [],
+        miscellaneous: [],
       });
     }
 
@@ -652,7 +1036,9 @@ router.patch("/:id/costing-sheet/assign", salesAuth, async (req, res) => {
       const person = role ? wanted[role] : null;
       if (!person) continue;
 
-      await setMembers(sheet.documentId, [{ employeeId: person.employeeId, role: "editor" }]);
+      const others = (sheet.members || []).filter((m) => m.employeeId !== person.employeeId);
+      sheet.members = [...others, { employeeId: person.employeeId, name: person.name, role: "editor" }];
+      sheet.assignee = person;
       changed.push({ part, assignee: person });
     }
     if (!changed.length) {
@@ -662,19 +1048,6 @@ router.patch("/:id/costing-sheet/assign", salesAuth, async (req, res) => {
       });
     }
 
-    const byPart = new Map(changed.map((c) => [c.part, c.assignee]));
-    enquiry.costingSheets = (enquiry.costingSheets || []).map((s) => {
-      const plain = s.toObject ? s.toObject() : s;
-      if (plain.productName !== productName) return plain;
-      const next = byPart.get(plain.part || "combined");
-      if (!next) return plain;
-      const others = (plain.members || []).filter((m) => m.employeeId !== next.employeeId);
-      return {
-        ...plain,
-        assignee: next,
-        members: [...others, { employeeId: next.employeeId, name: next.name, role: "editor" }],
-      };
-    });
     enquiry.costingTeam = {
       merchandiser: wanted.merchandiser || enquiry.costingTeam?.merchandiser,
       industrialEngineer: wanted.industrialEngineer || enquiry.costingTeam?.industrialEngineer,
@@ -700,10 +1073,8 @@ router.patch("/:id/costing-sheet/assign", salesAuth, async (req, res) => {
 // costing sheet, in one request — the multi-person case: a sales person
 // assigning a whole team to a sheet at once, not just at creation time.
 // Accepts either `{members:[{employeeId,name,role}, ...]}` or a single
-// `{employeeId,name,role}` for convenience. Writes the CoWork document's
-// real member list (services/coworkSheets.service.js's setMembers) and
-// mirrors the same change into this enquiry's denormalised snapshot in one
-// request, so the two never disagree.
+// `{employeeId,name,role}` for convenience. Writes the sheet's own `members`
+// array directly — there is no second copy of it to keep in step anymore.
 //
 // `part` picks one of the product's sheets; omitting it applies the change to
 // every sheet of that product, which is what "give my manager access to this
@@ -747,17 +1118,10 @@ router.patch("/:id/costing-sheet/members", salesAuth, async (req, res) => {
       });
     }
 
-    for (const sheet of targets) await setMembers(sheet.documentId, additions);
-
-    // Mirror into the denormalised snapshot: replace an existing entry for
-    // each added employee, or append.
     const addedIds = new Set(additions.map((m) => m.employeeId));
-    const touched = new Set(targets.map((s) => s.documentId));
-    enquiry.costingSheets = (enquiry.costingSheets || []).map((s) => {
-      const plain = s.toObject ? s.toObject() : s;
-      if (!touched.has(plain.documentId)) return plain;
-      return { ...plain, members: [...(plain.members || []).filter((m) => !addedIds.has(m.employeeId)), ...additions] };
-    });
+    for (const sheet of targets) {
+      sheet.members = [...(sheet.members || []).filter((m) => !addedIds.has(m.employeeId)), ...additions];
+    }
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
@@ -769,19 +1133,23 @@ router.patch("/:id/costing-sheet/members", salesAuth, async (req, res) => {
 });
 
 // GET /api/cms/crm/enquiries/:id/costing-sheet/:productName/data
-// The actual cell content of a product's costing — every part of it — so the
-// CMS can render it as a real table on the journey page instead of sending the
-// sales person over to CoWork. The DATA still only ever comes from CoWork
-// (whoever holds each sheet fills it in over there); this route just reads what
-// they wrote. Reading server-side via the Admin SDK doesn't require the
-// viewer's own CoWork identity, so anyone who can see this enquiry can READ its
-// costing — writing is a different question, answered by `canEdit` per part and
-// enforced on the PATCH below.
+// The actual rows of a product's costing — every part of it — natively, so the
+// CMS renders it as a real table on the journey page. Reading doesn't require
+// the viewer's own linked identity, so anyone who can see this enquiry can READ
+// its costing.
+//
+// WHO MAY EDIT (19 Aug 2026, explicit request). Merchandiser and Project
+// Manager/IE are open to fill ANY part of the costing — `canEdit` is simply
+// `true` for them, no per-document role check. What used to be that check is
+// now what decides whether their save applies immediately or is staged for
+// Sales to approve — see the PATCH below and `pendingChanges` here, which
+// carries whatever of THEIR OWN submissions on this sheet are still
+// awaiting a decision, so they aren't left wondering if it was lost.
 router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
     const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true })
-      .select("costingSheets ownerId").lean();
+      .select("costingSheets costingChangeLog ownerId").lean();
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -789,45 +1157,66 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
     if (!sheets.length) return res.status(404).json({ success: false, message: "No costing sheet exists yet for that product." });
 
     const me = await coworkIdentity(req);
+    const open = !bypassesApproval(req.user);
 
-    const parts = await Promise.all(sheets.map(async (sheet) => {
-      const [body, doc] = await Promise.all([
-        getSheetBody(sheet.documentId),
-        getSheet(sheet.documentId),
-      ]);
-      const mine = me ? (doc?.members || []).find((m) => m.employeeId === me.coworkEmployeeId) : null;
-      // "Who did what" the sheet's own record actually carries — CoWork has no
-      // cell-level change log to show, only who created it and who most
-      // recently touched it. Real, not invented: employeeIds only, resolved to
-      // names on the client against the members list it already has.
+    const parts = sheets.map((sheet) => {
+      const mine = me ? (sheet.members || []).find((m) => m.employeeId === me.coworkEmployeeId) : null;
       return {
         part: sheet.part || "combined",
-        documentId: sheet.documentId,
-        title: sheet.title || "",
+        title: PART_LABEL[sheet.part || "combined"] || "",
         assignee: sheet.assignee || null,
         members: sheet.members || [],
-        workbook: body?.workbook || null,
-        updatedAt: body?.updatedAt || null,
-        createdById: doc?.createdById || null,
-        lastEditedById: doc?.lastEditedById || null,
-        missing: !body,
+        materials: sheet.materials || [],
+        operations: sheet.operations || [],
+        miscellaneous: sheet.miscellaneous || [],
+        updatedAt: sheet.updatedAt || null,
+        missing: false,
         myRole: mine?.role || null,
-        canEdit: canWrite(mine?.role),
+        canEdit: open || canWrite(mine?.role),
       };
-    }));
+    });
+
+    // Pending review queue for this sheet — everyone sees it (Sales reviews
+    // it here; a Merchandiser/IE sees their own submission is still pending
+    // rather than silently gone). Approved/rejected entries aren't returned —
+    // once decided they're history, not a working queue.
+    const pendingChanges = (enquiry.costingChangeLog || [])
+      .filter((c) => c.productName === productName && c.status === "pending")
+      .map((c) => ({
+        id: String(c._id),
+        part: c.part || "combined",
+        materials: c.materials?.length ? c.materials : undefined,
+        operations: c.operations?.length ? c.operations : undefined,
+        miscellaneous: c.miscellaneous?.length ? c.miscellaneous : undefined,
+        submittedBy: c.submittedBy || null,
+        submittedAt: c.submittedAt || null,
+      }));
 
     // ── Reduce to what this caller is allowed (see costingTier) ────────────
+    // Merchandiser/IE are never wall-gated — "anyone can fill anything" means
+    // full sheet access for them regardless of whether they hold a role on
+    // any specific document. `costingTier`'s owner/manager gate is what
+    // still protects the SALES side from an unassigned colleague browsing in.
     const bestRole = parts.reduce(
       (best, p) => (p.myRole === "owner" ? "owner" : p.myRole === "editor" && best !== "owner" ? "editor" : best),
       null,
     );
-    const tier = await costingTier(req, enquiry, bestRole);
-    const totals = costingTotals(parts.map((p) => p.workbook), MARGIN_FLOOR_PERCENT);
+    const tier = open ? "sheet" : await costingTier(req, enquiry, bestRole);
+    const totals = costingTotals(parts, MARGIN_FLOOR_PERCENT);
 
     if (tier !== "sheet") {
-      // The workbook never leaves the server for these callers. What they get is
-      // the answer, not the working: a floor price, plus cost per piece if they
+      // Rows never leave the server for these callers. What they get is the
+      // answer, not the working: a floor price, plus cost per piece if they
       // are the deal owner or a manager.
+      //
+      // `pendingChanges` still goes out here (19 Aug 2026, bug fix). This
+      // branch is only ever reached by a caller `bypassesApproval` already
+      // let through (`open` was false to land here at all — see above), and
+      // the decide route below authorises exactly that same check with no
+      // tier or ownership condition. Leaving pendingChanges out of THIS
+      // response meant any Sales viewer who wasn't the deal owner or a
+      // manager could approve/reject via the API but never see there was
+      // anything to decide — the review UI had nothing to show.
       return res.json({
         success: true,
         tier,
@@ -844,21 +1233,17 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
           myRole: p.myRole,
           canEdit: false,
         })),
+        pendingChanges,
       });
     }
 
-    const legacy = parts.find((p) => p.part === "combined");
     return res.json({
       success: true,
       tier,
       summary: totals,
       parts,
       linked: Boolean(me),
-      // Pre-split shape, for a costing that is still one two-tab document.
-      workbook: legacy?.workbook ?? null,
-      updatedAt: legacy?.updatedAt ?? null,
-      createdById: legacy?.createdById ?? null,
-      lastEditedById: legacy?.lastEditedById ?? null,
+      pendingChanges,
     });
   } catch (err) {
     console.error("[enquiries] GET /:id/costing-sheet/:productName/data", err);
@@ -867,25 +1252,27 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
 });
 
 // PATCH /api/cms/crm/enquiries/:id/costing-sheet/:productName/data
-// Save an edit made on the CMS's own costing form back into the CoWork sheet
-// (11 Aug 2026, explicit request — this used to be read-only by design; see
-// services/coworkSheets.service.js's updateSheetBody for why that changed and,
-// importantly, what it still can't fully protect against: this is NOT a safe
-// concurrent editor. CoWork's live collaboration (Yjs) is not replicated here,
-// so a save from here can still collide with someone editing the same sheet in
-// CoWork at the same moment. `expectedUpdatedAt` (send back whatever GET
-// .../data last returned) catches the ordinary case — two edits minutes apart —
-// as a real 409, not a silent overwrite.
+// Save an edit made on the CMS's own costing form — natively, onto this
+// sheet's `materials`/`operations`/`miscellaneous` rows.
 //
-// THE SHEET'S OWN PERMISSIONS DECIDE (17 Aug 2026). Until now this route let
-// any salesperson overwrite any costing workbook, which made the per-sheet
-// roles decorative: the split would have separated the documents while leaving
-// the CMS a way around them. The caller's role on THAT document is read from
-// CoWork and must be owner or editor.
+// TWO PATHS (19 Aug 2026, explicit request — replaces the old per-document
+// owner/editor gate entirely):
+//
+//   Sales / admin / CEO   → applies immediately, straight onto `costingSheets`.
+//                           `expectedUpdatedAt` still guards two people saving
+//                           the same sheet minutes apart — a real 409, not a
+//                           silent overwrite.
+//   Merchandiser / IE     → NEVER writes `costingSheets` directly. The
+//                           submission is appended to `costingChangeLog` as a
+//                           `status: "pending"` entry instead — no permission
+//                           check beyond "is this a real, identifiable
+//                           person" (anyone in either role can propose a
+//                           change to any part of any product's costing).
+//                           Sales approves or rejects it below.
 router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
-    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("costingSheets").lean();
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
     const productName = decodeURIComponent(req.params.productName);
@@ -900,6 +1287,652 @@ router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res)
       });
     }
 
+    const me = await coworkIdentity(req);
+    if (!me) return res.status(409).json(NO_COWORK_ACCOUNT);
+
+    // ── Merchandiser / IE: stage it, never write live ──────────────────────
+    if (!bypassesApproval(req.user)) {
+      const materials = Array.isArray(req.body?.materials) ? sanitizeMaterialRows(req.body.materials) : undefined;
+      const operations = Array.isArray(req.body?.operations) ? sanitizeOperationRows(req.body.operations) : undefined;
+      const miscellaneous = Array.isArray(req.body?.miscellaneous) ? sanitizeMiscRows(req.body.miscellaneous) : undefined;
+      if (!materials && !operations && !miscellaneous) {
+        return res.status(400).json({ success: false, message: "Nothing to submit." });
+      }
+
+      enquiry.costingChangeLog = [
+        ...(enquiry.costingChangeLog || []),
+        {
+          productName,
+          part,
+          materials,
+          operations,
+          miscellaneous,
+          status: "pending",
+          submittedBy: actor(req),
+          submittedAt: new Date(),
+        },
+      ];
+      await enquiry.save();
+
+      const proposedChangeBits = summarizeCostingSheetChange(
+        { materials: sheet.materials, operations: sheet.operations, miscellaneous: sheet.miscellaneous },
+        { materials, operations, miscellaneous },
+      );
+      recordChange(req, {
+        departmentSlug: req.user?.role === "project_manager" ? "project-manager" : "merchandiser",
+        entity: "crm-enquiry",
+        entityId: enquiry._id,
+        entityLabel: enquiry.enquiryId,
+        action: "costing-proposed",
+        summary: `${actor(req).name || "Someone"} proposed ${PART_LABEL[part] || part} costing changes for "${productName}"${proposedChangeBits ? ` — ${proposedChangeBits}` : ""} — awaiting Sales review`,
+        after: { productName, part, materials, operations, miscellaneous },
+      }).catch(() => {});
+
+      return res.status(202).json({
+        success: true,
+        pending: true,
+        message: "Submitted for approval — your sales contact will review it.",
+      });
+    }
+
+    // ── Sales / admin / CEO: applies immediately ───────────────────────────
+    const expected = req.body?.expectedUpdatedAt ? new Date(req.body.expectedUpdatedAt).getTime() : null;
+    const current = sheet.updatedAt ? new Date(sheet.updatedAt).getTime() : null;
+    if (expected != null && current != null && expected !== current) {
+      return res.status(409).json({
+        success: false,
+        code: "CONFLICT",
+        message: "Someone changed this sheet since it was loaded. Reload to pick up their edits before saving yours.",
+      });
+    }
+
+    const before = { materials: sheet.materials, operations: sheet.operations, miscellaneous: sheet.miscellaneous };
+    if (Array.isArray(req.body?.materials)) sheet.materials = sanitizeMaterialRows(req.body.materials);
+    if (Array.isArray(req.body?.operations)) sheet.operations = sanitizeOperationRows(req.body.operations);
+    if (Array.isArray(req.body?.miscellaneous)) sheet.miscellaneous = sanitizeMiscRows(req.body.miscellaneous);
+    sheet.updatedAt = new Date();
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    const costingAfter = { materials: sheet.materials, operations: sheet.operations, miscellaneous: sheet.miscellaneous };
+    const costingChangeBits = summarizeCostingSheetChange(before, costingAfter);
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "costing-updated",
+      summary: `${actor(req).name || "Sales"} updated the ${PART_LABEL[part] || part} costing for "${productName}"${costingChangeBits ? ` — ${costingChangeBits}` : ""}`,
+      before,
+      after: costingAfter,
+    }).catch(() => {});
+
+    return res.json({ success: true, updatedAt: sheet.updatedAt });
+  } catch (err) {
+    console.error("[enquiries] PATCH /:id/costing-sheet/:productName/data", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/costing-sheet/:productName/change/:changeId/decide
+// Sales/admin/CEO approves or rejects one pending change-log entry. Approve
+// copies whichever field(s) the entry carries onto the real costingSheets
+// row-set; reject just marks it decided and changes nothing live.
+router.post("/:id/costing-sheet/:productName/change/:changeId/decide", salesAuth, async (req, res) => {
+  try {
+    if (!bypassesApproval(req.user)) {
+      return res.status(403).json({ success: false, message: "Only Sales, an admin or the CEO can decide a submitted change." });
+    }
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = decodeURIComponent(req.params.productName);
+    const decision = String(req.body?.decision || "").trim();
+    if (!["approve", "reject"].includes(decision)) {
+      return res.status(400).json({ success: false, message: 'decision must be "approve" or "reject".' });
+    }
+
+    const entry = (enquiry.costingChangeLog || []).id(req.params.changeId);
+    if (!entry || entry.productName !== productName) {
+      return res.status(404).json({ success: false, message: "That submitted change could not be found." });
+    }
+    if (entry.status !== "pending") {
+      return res.status(400).json({ success: false, message: `This change was already ${entry.status}.` });
+    }
+
+    if (decision === "approve") {
+      const part = entry.part || "combined";
+      const sheet = (enquiry.costingSheets || []).find(
+        (s) => s.productName === productName && (s.part || "combined") === part,
+      );
+      if (!sheet) {
+        return res.status(404).json({ success: false, message: "The sheet this change targets no longer exists." });
+      }
+      if (entry.materials?.length) sheet.materials = entry.materials;
+      if (entry.operations?.length) sheet.operations = entry.operations;
+      if (entry.miscellaneous?.length) sheet.miscellaneous = entry.miscellaneous;
+      sheet.updatedAt = new Date();
+    }
+
+    entry.status = decision === "approve" ? "approved" : "rejected";
+    entry.decidedBy = actor(req);
+    entry.decidedAt = new Date();
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: decision === "approve" ? "costing-approved" : "costing-rejected",
+      summary: `${actor(req).name || "Sales"} ${decision === "approve" ? "approved" : "rejected"} ${entry.submittedBy?.name || "a"}'s proposed ${PART_LABEL[entry.part || "combined"] || entry.part} costing changes for "${productName}"`,
+    }).catch(() => {});
+
+    return res.json({ success: true, status: entry.status, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/costing-sheet/:productName/change/:changeId/decide", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── Costing lifecycle — sent to customer, customer approval, stock-item
+// request (20 Aug 2026) — see the model's own comment on costingLifecycle
+// for why this is a separate array keyed by product name. Three small
+// actions, no state machine to enforce between them (any can be re-fired —
+// e.g. sending again after a spec change) beyond what the route itself needs.
+
+function findOrCreateLifecycle(enquiry, productName) {
+  enquiry.costingLifecycle = enquiry.costingLifecycle || [];
+  let entry = enquiry.costingLifecycle.find((c) => c.productName === productName);
+  if (!entry) {
+    entry = { productName };
+    enquiry.costingLifecycle.push(entry);
+    entry = enquiry.costingLifecycle[enquiry.costingLifecycle.length - 1];
+  }
+  return entry;
+}
+
+// POST /api/cms/crm/enquiries/:id/products/:productName/send-to-customer
+router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const productName = decodeURIComponent(req.params.productName);
+    if (!(enquiry.products || []).some((p) => p.product === productName)) {
+      return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+    }
+    const entry = findOrCreateLifecycle(enquiry, productName);
+    entry.sentToCustomerAt = new Date();
+    entry.sentToCustomerBy = actor(req);
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "sent-to-customer",
+      summary: `${actor(req).name || "Sales"} sent pricing for "${productName}" to the customer`,
+    }).catch(() => {});
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("costing_sent_to_customer", {
+        heading: `Quote sent to customer: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> sent pricing for this product to the customer.</p>`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${actor(req).name || "Sales"} sent pricing for "${productName}" to ${customerName} — ${enquiry.enquiryId || ""}.`,
+        ctaLabel: "Open Cost & Quote",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+      });
+    })().catch(() => {});
+
+    return res.json({ success: true, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/products/:productName/send-to-customer", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/products/:productName/customer-approval
+// Body: { approved: boolean, note?: string }. Sales records what the
+// customer decided — there is no customer login here to do it themselves.
+//
+// APPENDS to customerApprovalLog, never overwrites (20 Aug 2026, explicit
+// request — see the model's own comment on customerApprovalLog for why). A
+// REVERSAL — this entry disagreeing with the current cached decision —
+// requires a note; a first-time decision doesn't, there's nothing to explain
+// yet.
+router.post("/:id/products/:productName/customer-approval", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const productName = decodeURIComponent(req.params.productName);
+    if (!(enquiry.products || []).some((p) => p.product === productName)) {
+      return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+    }
+    if (typeof req.body?.approved !== "boolean") {
+      return res.status(400).json({ success: false, message: "approved (true/false) is required." });
+    }
+    const note = String(req.body?.note || "").trim();
+    const entry = findOrCreateLifecycle(enquiry, productName);
+    const isReversal = entry.customerApproved != null && entry.customerApproved !== req.body.approved;
+    if (isReversal && !note) {
+      return res.status(400).json({ success: false, message: "Changing a customer decision needs a reason." });
+    }
+    const now = new Date();
+    const who = actor(req);
+    entry.customerApprovalLog = entry.customerApprovalLog || [];
+    entry.customerApprovalLog.push({ approved: req.body.approved, decidedAt: now, decidedBy: who, note });
+    // Cache of the log's last entry — see the model's own comment.
+    entry.customerApproved = req.body.approved;
+    entry.customerApprovedAt = now;
+    entry.customerApprovedBy = who;
+    entry.customerDecisionNote = note;
+    enquiry.updatedBy = who;
+    await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: req.body.approved ? "customer-approved" : "customer-rejected",
+      summary: `${who.name || "Sales"} recorded that the customer ${req.body.approved ? "approved" : "rejected"} "${productName}"${note ? ` — ${note}` : ""}`,
+    }).catch(() => {});
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("customer_decision_recorded", {
+        heading: `Customer ${req.body.approved ? "approved" : "rejected"}: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(who.name || "Sales")}</strong> recorded that the customer <strong>${req.body.approved ? "approved" : "rejected"}</strong> this quote.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${who.name || "Sales"} recorded that ${customerName} ${req.body.approved ? "approved" : "rejected"} "${productName}" — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
+        ctaLabel: "Open Cost & Quote",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+      });
+    })().catch(() => {});
+
+    return res.json({ success: true, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/products/:productName/customer-approval", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/products/:productName/request-stock-item
+// A REQUEST, not a StockItem creation — Merchandising still makes the SKU/
+// category/BOM decisions themselves, from app/merchandiser/products'
+// "Requests" view (see stock-item-request routes below). This just puts it
+// in front of them and records that Sales asked, when, and by whom.
+router.post("/:id/products/:productName/request-stock-item", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const productName = decodeURIComponent(req.params.productName);
+    if (!(enquiry.products || []).some((p) => p.product === productName)) {
+      return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+    }
+    const entry = findOrCreateLifecycle(enquiry, productName);
+    entry.stockItemRequestedAt = new Date();
+    entry.stockItemRequestedBy = actor(req);
+    // Re-requesting after a rejection reopens it — Merchandising sees it
+    // again rather than it staying silently rejected forever.
+    entry.stockItemRequestStatus = "pending";
+    entry.stockItemRequestDecidedAt = undefined;
+    entry.stockItemRequestDecidedBy = undefined;
+    entry.stockItemRequestDecisionNote = undefined;
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: "stock-item-requested",
+      summary: `${actor(req).name || "Sales"} requested "${productName}" be added to inventory`,
+    }).catch(() => {});
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("stock_item_requested", {
+        heading: `Stock item requested: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> asked for this product to be added to inventory.</p>`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${actor(req).name || "Sales"} asked for "${productName}" (${customerName}) to be added to inventory — ${enquiry.enquiryId || ""}.`,
+        ctaLabel: "Review request",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/merchandiser/products`,
+      });
+    })().catch(() => {});
+
+    return res.json({ success: true, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/products/:productName/request-stock-item", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── Stock-item requests — Merchandising's side (app/merchandiser/products'
+// "Requests" view) ───────────────────────────────────────────────────────
+//
+// Reuses `salesAuth`, same as every other route in this file — the whole
+// costing/lifecycle surface here is deliberately open to Merchandiser/PM as
+// well as Sales (19–20 Aug 2026, "anyone can fill anything" for costing; the
+// same reasoning applies to acting on their own stock-item requests).
+
+// GET /api/cms/crm/enquiries/stock-item-requests?status=pending|approved|rejected|all
+// Scans every active Enquiry's costingLifecycle for a request in the given
+// status (default "pending" — the work queue) and returns it flattened, one
+// row per requested product, newest first.
+router.get("/stock-item-requests", salesAuth, async (req, res) => {
+  try {
+    const status = String(req.query?.status || "pending").trim();
+    const statusFilter = status === "all" ? { $ne: "none" } : status;
+    const enquiries = await Enquiry.find({
+      isActive: true,
+      costingLifecycle: { $elemMatch: { stockItemRequestStatus: statusFilter } },
+    })
+      .select("enquiryId accountId products costingLifecycle")
+      .populate("accountId", "companyName displayName")
+      .lean();
+
+    const rows = [];
+    for (const enq of enquiries) {
+      for (const entry of enq.costingLifecycle || []) {
+        const matches = status === "all" ? entry.stockItemRequestStatus !== "none" : entry.stockItemRequestStatus === status;
+        if (!matches) continue;
+        const product = (enq.products || []).find((p) => p.product === entry.productName) || null;
+        rows.push({
+          enquiryId: enq._id,
+          enquiryRef: enq.enquiryId,
+          customerName: enq.accountId?.displayName || enq.accountId?.companyName || "",
+          productName: entry.productName,
+          product,
+          sentToCustomerAt: entry.sentToCustomerAt || null,
+          customerApproved: entry.customerApproved,
+          customerApprovedAt: entry.customerApprovedAt || null,
+          stockItemRequestedAt: entry.stockItemRequestedAt || null,
+          stockItemRequestedBy: entry.stockItemRequestedBy || null,
+          stockItemRequestStatus: entry.stockItemRequestStatus || "none",
+          stockItemRequestDecidedAt: entry.stockItemRequestDecidedAt || null,
+          stockItemRequestDecidedBy: entry.stockItemRequestDecidedBy || null,
+          stockItemRequestDecisionNote: entry.stockItemRequestDecisionNote || "",
+        });
+      }
+    }
+    rows.sort((a, b) => new Date(b.stockItemRequestedAt || 0) - new Date(a.stockItemRequestedAt || 0));
+    return res.json({ success: true, requests: rows });
+  } catch (err) {
+    console.error("[enquiries] GET /stock-item-requests", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/products/:productName/stock-item-request/decide
+// Body: { decision: "approve"|"reject", note?: string }. Merchandising's own
+// call — "approve" says they'll create the Stock Item themselves; "reject"
+// needs a reason (why it isn't going into Inventory as asked).
+router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const productName = decodeURIComponent(req.params.productName);
+    const decision = String(req.body?.decision || "").trim();
+    if (!["approve", "reject"].includes(decision)) {
+      return res.status(400).json({ success: false, message: 'decision must be "approve" or "reject".' });
+    }
+    const note = String(req.body?.note || "").trim();
+    if (decision === "reject" && !note) {
+      return res.status(400).json({ success: false, message: "A reason is required to reject a stock-item request." });
+    }
+    const entry = (enquiry.costingLifecycle || []).find((c) => c.productName === productName);
+    if (!entry || entry.stockItemRequestStatus === "none") {
+      return res.status(404).json({ success: false, message: "No stock-item request for that product." });
+    }
+    if (entry.stockItemRequestStatus !== "pending") {
+      return res.status(400).json({ success: false, message: `This request was already ${entry.stockItemRequestStatus}.` });
+    }
+    entry.stockItemRequestStatus = decision === "approve" ? "approved" : "rejected";
+    entry.stockItemRequestDecidedAt = new Date();
+    entry.stockItemRequestDecidedBy = actor(req);
+    entry.stockItemRequestDecisionNote = note;
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    recordChange(req, {
+      departmentSlug: "merchandiser",
+      entity: "crm-enquiry",
+      entityId: enquiry._id,
+      entityLabel: enquiry.enquiryId,
+      action: decision === "approve" ? "stock-item-approved" : "stock-item-rejected",
+      summary: `${actor(req).name || "Merchandising"} ${decision === "approve" ? "approved" : "rejected"} the stock-item request for "${productName}"${note ? ` — ${note}` : ""}`,
+    }).catch(() => {});
+
+    (async () => {
+      const product = (enquiry.products || []).find((p) => p.product === productName);
+      const customerName = await customerNameFor(enquiry);
+      await notifyEvent("stock_item_request_decided", {
+        heading: `Stock item request ${decision === "approve" ? "approved" : "rejected"}: ${productName}`,
+        bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Merchandising")}</strong> <strong>${decision === "approve" ? "approved" : "rejected"}</strong> the request to add this product to inventory.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+        details: [
+          ["Customer", customerName],
+          ["Enquiry ref", enquiry.enquiryId],
+          ["Product", productName],
+          ["Quantity", product?.quantity],
+        ],
+        image: product?.images?.[0],
+        bodyText: `${actor(req).name || "Merchandising"} ${decision === "approve" ? "approved" : "rejected"} the stock-item request for "${productName}" (${customerName}) — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
+        ctaLabel: "Open Cost & Quote",
+        ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
+      });
+    })().catch(() => {});
+
+    return res.json({ success: true, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/products/:productName/stock-item-request/decide", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+// ─── Product sheets ────────────────────────────────────────────────────────────
+//
+// The free-form "communicate in a sheet" surface, per product — NOT costing.
+// This is the CoWork-sheet mechanism costing used to use (see the model's own
+// comment on `productSheets`), repointed here now that costing is native. The
+// salesperson creates a sheet, is its owner, and decides who else can view or
+// edit it; the sheet itself renders natively via CostingSheetView.js (it is
+// already a generic CoWork-sheet grid, nothing costing-specific in its body).
+const {
+  createSheet: createProductSheetDoc,
+  setMembers: setProductSheetMembers,
+  getSheet: getProductSheetDoc,
+  getSheetBody: getProductSheetBody,
+  updateSheetBody: updateProductSheetBody,
+} = require("../../../services/coworkSheets.service");
+
+const productSheetCanWrite = (role) => role === "owner" || role === "editor";
+
+// POST /api/cms/crm/enquiries/:id/product-sheet
+// Create a blank sheet for one product, owned by the caller. Optionally
+// shares it with people right away (`shareWith: [{employeeId, name, role}]`);
+// more people can be added later via the members route below.
+router.post("/:id/product-sheet", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = String(req.body?.productName || "").trim();
+    if (!productName) return res.status(400).json({ success: false, message: "productName is required." });
+    const product = (enquiry.products || []).find((p) => p.product === productName);
+    if (!product) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+
+    const me = await coworkIdentity(req);
+    if (!me) return res.status(409).json(NO_COWORK_ACCOUNT);
+
+    const shareWith = (Array.isArray(req.body?.shareWith) ? req.body.shareWith : [])
+      .map((m) => ({ employeeId: String(m?.employeeId || "").trim(), name: m?.name || "", role: m?.role }))
+      .filter((m) => m.employeeId && m.employeeId !== me.coworkEmployeeId && SHARE_ROLES.has(m.role));
+
+    const title = `Sheet — ${productName}`;
+    const { documentId, members } = await createProductSheetDoc({
+      title,
+      creatorEmployeeId: me.coworkEmployeeId,
+      shareWith,
+    });
+
+    const created = {
+      productName,
+      documentId,
+      title,
+      createdAt: new Date(),
+      createdBy: actor(req),
+      members: members.map((m) => ({ employeeId: m.employeeId, name: m.employeeId === me.coworkEmployeeId ? (me.name || "") : (shareWith.find((s) => s.employeeId === m.employeeId)?.name || ""), role: m.role })),
+    };
+
+    enquiry.productSheets = [
+      ...(enquiry.productSheets || []).filter((s) => s.productName !== productName),
+      created,
+    ];
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    return res.status(201).json({ success: true, productSheet: created, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/product-sheet", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PATCH /api/cms/crm/enquiries/:id/product-sheet/members
+// Add (or re-role) one or more people on a product's sheet — the "sales
+// person picks who can see or edit it" control.
+router.patch("/:id/product-sheet/members", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = String(req.body?.productName || "").trim();
+    if (!productName) return res.status(400).json({ success: false, message: "productName is required." });
+
+    const raw = Array.isArray(req.body?.members)
+      ? req.body.members
+      : req.body?.employeeId
+        ? [{ employeeId: req.body.employeeId, name: req.body.name, role: req.body.role }]
+        : [];
+    if (!raw.length) return res.status(400).json({ success: false, message: "At least one member is required." });
+
+    const additions = raw.map((m) => ({
+      employeeId: String(m?.employeeId || "").trim(),
+      name: m?.name || "",
+      role: m?.role,
+    }));
+    for (const m of additions) {
+      if (!m.employeeId) return res.status(400).json({ success: false, message: "Every member needs an employeeId." });
+      if (!SHARE_ROLES.has(m.role)) return res.status(400).json({ success: false, message: `Unknown share role: ${m.role}` });
+    }
+
+    const sheet = (enquiry.productSheets || []).find((s) => s.productName === productName);
+    if (!sheet) return res.status(404).json({ success: false, message: "No sheet exists yet for that product." });
+
+    await setProductSheetMembers(sheet.documentId, additions);
+
+    const addedIds = new Set(additions.map((m) => m.employeeId));
+    sheet.members = [...(sheet.members || []).filter((m) => !addedIds.has(m.employeeId)), ...additions];
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    return res.json({ success: true, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] PATCH /:id/product-sheet/members", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/product-sheet/:productName/data
+// The sheet's actual content, read straight from CoWork — same "render
+// natively instead of an iframe" approach costing used, no tier-gating (this
+// isn't commercial data): anyone who can see this enquiry can read it,
+// `canEdit` says whether the caller may save to it.
+router.get("/:id/product-sheet/:productName/data", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productSheets").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = decodeURIComponent(req.params.productName);
+    const sheet = (enquiry.productSheets || []).find((s) => s.productName === productName);
+    if (!sheet) return res.status(404).json({ success: false, message: "No sheet exists yet for that product." });
+
+    const me = await coworkIdentity(req);
+    const [body, doc] = await Promise.all([
+      getProductSheetBody(sheet.documentId),
+      getProductSheetDoc(sheet.documentId),
+    ]);
+    const mine = me ? (doc?.members || []).find((m) => m.employeeId === me.coworkEmployeeId) : null;
+
+    return res.json({
+      success: true,
+      linked: Boolean(me),
+      parts: [],
+      workbook: body?.workbook || null,
+      updatedAt: body?.updatedAt || null,
+      createdById: doc?.createdById || null,
+      lastEditedById: doc?.lastEditedById || null,
+      members: sheet.members || [],
+      canEdit: productSheetCanWrite(mine?.role),
+    });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/product-sheet/:productName/data", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PATCH /api/cms/crm/enquiries/:id/product-sheet/:productName/data
+// Save an edit made on the CMS's own view back to the CoWork sheet. The
+// sheet's own permissions decide — same rule costing used: the caller's role
+// is read from CoWork's member list and must be owner or editor.
+router.patch("/:id/product-sheet/:productName/data", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productSheets").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = decodeURIComponent(req.params.productName);
+    const sheet = (enquiry.productSheets || []).find((s) => s.productName === productName);
+    if (!sheet) return res.status(404).json({ success: false, message: "No sheet exists yet for that product." });
+
     const workbook = req.body?.workbook;
     if (!workbook || !Array.isArray(workbook.sheets)) {
       return res.status(400).json({ success: false, message: "A valid workbook (with a sheets array) is required." });
@@ -908,29 +1941,184 @@ router.patch("/:id/costing-sheet/:productName/data", salesAuth, async (req, res)
     const me = await coworkIdentity(req);
     if (!me) return res.status(409).json(NO_COWORK_ACCOUNT);
 
-    const { doc, role } = await roleOn(sheet.documentId, me.coworkEmployeeId);
-    if (!doc) return res.status(404).json({ success: false, message: "The costing sheet could not be found in CoWork." });
-    if (!canWrite(role)) {
-      const holder = sheet.assignee?.name;
-      const who = PART_ROLE[part] ? ROLE_LABEL[PART_ROLE[part]] : "person";
+    const doc = await getProductSheetDoc(sheet.documentId);
+    if (!doc) return res.status(404).json({ success: false, message: "The sheet could not be found in CoWork." });
+    const mine = (doc.members || []).find((m) => m.employeeId === me.coworkEmployeeId);
+    if (!productSheetCanWrite(mine?.role)) {
       return res.status(403).json({
         success: false,
         code: "NOT_AN_EDITOR",
-        message: holder
-          ? `This is ${holder}'s sheet — you can read it, but only its ${who} can change it.`
-          : `You can read this sheet, but you are not an editor on it, so you cannot change it.`,
+        message: "You can read this sheet, but you are not an editor on it, so you cannot change it.",
       });
     }
 
     try {
-      const { updatedAt } = await updateSheetBody(sheet.documentId, workbook, me.coworkEmployeeId, req.body?.expectedUpdatedAt);
+      const { updatedAt } = await updateProductSheetBody(sheet.documentId, workbook, me.coworkEmployeeId, req.body?.expectedUpdatedAt);
       return res.json({ success: true, updatedAt });
     } catch (err) {
       if (err.code === "CONFLICT") return res.status(409).json({ success: false, code: "CONFLICT", message: err.message });
       throw err;
     }
   } catch (err) {
-    console.error("[enquiries] PATCH /:id/costing-sheet/:productName/data", err);
+    console.error("[enquiries] PATCH /:id/product-sheet/:productName/data", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+
+// ─── Product chat ───────────────────────────────────────────────────────────
+//
+// A real conversation per product, shown natively on this page. Backed by an
+// ordinary CoWork group underneath — see the model's own comment on
+// `productThreads` — created and messaged here via services/cowork.service.js,
+// the same functions CoWork's own group-chat routes call, just invoked
+// server-side instead of requiring the caller to hold a Firebase ID token.
+const coworkService = require("../../../services/cowork.service");
+
+// POST /api/cms/crm/enquiries/:id/product-thread
+// Start the conversation for one product. The caller is always a member;
+// `memberIds` (optional) adds others right away — more can be added later.
+router.post("/:id/product-thread", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = String(req.body?.productName || "").trim();
+    if (!productName) return res.status(400).json({ success: false, message: "productName is required." });
+    const product = (enquiry.products || []).find((p) => p.product === productName);
+    if (!product) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+
+    const me = await coworkIdentity(req);
+    if (!me) return res.status(409).json(NO_COWORK_ACCOUNT);
+
+    const invited = (Array.isArray(req.body?.members) ? req.body.members : [])
+      .map((m) => ({ employeeId: String(m?.employeeId || "").trim(), name: m?.name || "" }))
+      .filter((m) => m.employeeId && m.employeeId !== me.coworkEmployeeId);
+
+    const memberIds = [me.coworkEmployeeId, ...invited.map((m) => m.employeeId)];
+    const group = await coworkService.createCoworkGroup({
+      name: `${enquiry.enquiryId} · ${productName}`,
+      description: `Chat for ${productName} on ${enquiry.enquiryId}`,
+      memberIds,
+      createdBy: me.coworkEmployeeId,
+      createdByAuthUid: null,
+    });
+
+    const created = {
+      productName,
+      groupId: group.groupId,
+      createdAt: new Date(),
+      createdBy: actor(req),
+      members: [{ employeeId: me.coworkEmployeeId, name: me.name || "" }, ...invited],
+    };
+
+    enquiry.productThreads = [
+      ...(enquiry.productThreads || []).filter((t) => t.productName !== productName),
+      created,
+    ];
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    return res.status(201).json({ success: true, productThread: created, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/product-thread", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PATCH /api/cms/crm/enquiries/:id/product-thread/members
+// Add people to a product's conversation — the sales person picks who's in.
+router.patch("/:id/product-thread/members", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = String(req.body?.productName || "").trim();
+    if (!productName) return res.status(400).json({ success: false, message: "productName is required." });
+
+    const raw = Array.isArray(req.body?.members)
+      ? req.body.members
+      : req.body?.employeeId
+        ? [{ employeeId: req.body.employeeId, name: req.body.name }]
+        : [];
+    const additions = raw
+      .map((m) => ({ employeeId: String(m?.employeeId || "").trim(), name: m?.name || "" }))
+      .filter((m) => m.employeeId);
+    if (!additions.length) return res.status(400).json({ success: false, message: "At least one member is required." });
+
+    const thread = (enquiry.productThreads || []).find((t) => t.productName === productName);
+    if (!thread) return res.status(404).json({ success: false, message: "No conversation exists yet for that product." });
+
+    const me = await coworkIdentity(req);
+    if (!me) return res.status(409).json(NO_COWORK_ACCOUNT);
+
+    const existingIds = new Set((thread.members || []).map((m) => m.employeeId));
+    for (const m of additions) {
+      if (existingIds.has(m.employeeId)) continue; // already a member — addGroupMember would refuse it
+      await coworkService.addGroupMember(thread.groupId, me.coworkEmployeeId, req.user.role, m.employeeId);
+    }
+
+    const addedIds = new Set(additions.map((m) => m.employeeId));
+    thread.members = [...(thread.members || []).filter((m) => !addedIds.has(m.employeeId)), ...additions];
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    return res.json({ success: true, enquiry: await decorate(enquiry) });
+  } catch (err) {
+    console.error("[enquiries] PATCH /:id/product-thread/members", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/product-thread/:productName/messages
+router.get("/:id/product-thread/:productName/messages", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productThreads").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = decodeURIComponent(req.params.productName);
+    const thread = (enquiry.productThreads || []).find((t) => t.productName === productName);
+    if (!thread) return res.status(404).json({ success: false, message: "No conversation exists yet for that product." });
+
+    const messages = await coworkService.getGroupMessages(thread.groupId, req.query.limit || 60);
+    return res.json({ success: true, groupId: thread.groupId, members: thread.members || [], messages });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/product-thread/:productName/messages", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/product-thread/:productName/messages
+router.post("/:id/product-thread/:productName/messages", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).select("productThreads").lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = decodeURIComponent(req.params.productName);
+    const thread = (enquiry.productThreads || []).find((t) => t.productName === productName);
+    if (!thread) return res.status(404).json({ success: false, message: "No conversation exists yet for that product." });
+
+    const text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ success: false, message: "A message needs text." });
+
+    const me = await coworkIdentity(req);
+    if (!me) return res.status(409).json(NO_COWORK_ACCOUNT);
+
+    const message = await coworkService.sendGroupMessage({
+      groupId: thread.groupId,
+      senderId: me.coworkEmployeeId,
+      senderName: me.name || req.user.name || "",
+      text,
+      clientMessageId: req.body?.clientMessageId || null,
+    });
+
+    return res.status(201).json({ success: true, message });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/product-thread/:productName/messages", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });

@@ -320,6 +320,22 @@ const workOrderSchema = new mongoose.Schema(
       notes: { type: String, trim: true },
     },
 
+    // ── QC quantity tracking (PM manual mark — QC has no per-unit aggregate
+    // elsewhere: real QC results live in the separate QCInspection collection,
+    // keyed by individual barcode, with nothing rolled up onto the WorkOrder).
+    // Mirrors productionCompletion's shape at the scale this needs (19 Aug 2026).
+    qcCompletion: {
+      completedQuantity: { type: Number, default: 0, min: 0 },
+      history: [
+        {
+          quantity: { type: Number, required: true, min: 1 },
+          notes: { type: String, trim: true, default: "" },
+          checkedBy: { type: String, default: "" },
+          checkedAt: { type: Date, default: Date.now },
+        },
+      ],
+    },
+
     cuttingStatus: {
       type: String,
       enum: ["pending", "in_progress", "completed"],

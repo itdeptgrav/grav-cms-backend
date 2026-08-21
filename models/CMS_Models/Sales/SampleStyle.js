@@ -55,7 +55,12 @@ const roundSchema = new mongoose.Schema(
 );
 
 const imageSchema = new mongoose.Schema(
-  { fileId: { type: String, trim: true }, name: { type: String, trim: true }, url: { type: String, trim: true } },
+  {
+    fileId: { type: String, trim: true }, // Drive file id (legacy)
+    publicId: { type: String, trim: true }, // Cloudinary public id — dropped before 19 Aug 2026, see briefFromProduct
+    name: { type: String, trim: true },
+    url: { type: String, trim: true },
+  },
   { _id: false },
 );
 
@@ -129,6 +134,11 @@ const sampleStyleSchema = new mongoose.Schema(
       brandingPlacement: { type: String, trim: true },
       trims: { type: String, trim: true },
       specialConstruction: { type: String, trim: true },
+      // Missing from this snapshot until 19 Aug 2026 even though the enquiry
+      // product row always carried it — R&D never saw what the customer
+      // currently wears, which is exactly the kind of context that shapes a
+      // tech pack.
+      existingUniform: { type: String, trim: true },
       images: [imageSchema],
     },
 
@@ -140,6 +150,25 @@ const sampleStyleSchema = new mongoose.Schema(
       selectedBy: actorRef(),
       selectedAt: { type: Date },
     },
+
+    // Staged Merchandiser/PM submissions awaiting a Sales decision — mirrors
+    // Enquiry.costingChangeLog exactly, same reason: "anyone can fill
+    // anything" (19 Aug 2026) means `materials` above is never written
+    // directly by them, only by Sales/CEO/admin (bypassesApproval) or by an
+    // approved entry here being copied over.
+    materialsChangeLog: [
+      new mongoose.Schema(
+        {
+          items: [{ type: String, trim: true }],
+          status: { type: String, trim: true, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
+          submittedBy: actorRef(),
+          submittedAt: { type: Date, default: Date.now },
+          decidedBy: actorRef(),
+          decidedAt: { type: Date, default: null },
+        },
+        { timestamps: false },
+      ),
+    ],
 
     // ── Tech sheet — R&D produces it; Sales approves (gate 1).
     techSheet: {
@@ -163,6 +192,81 @@ const sampleStyleSchema = new mongoose.Schema(
       approvedBy: actorRef(),
       rounds: [roundSchema],
       revisions: [revisionSchema],
+      // What the submission to Sales actually carries — raised alongside
+      // "submit" (20 Aug 2026, explicit request): the raw materials actually
+      // consumed making the physical sample (suggested from the registered
+      // product's BOM, editable), and at least one photo of the sample
+      // itself, so Sales can approve/reject with real evidence, not just a
+      // status flip.
+      consumptionRawItems: [
+        {
+          rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem" },
+          rawItemName: { type: String, trim: true },
+          variantId: { type: mongoose.Schema.Types.ObjectId },
+          variantCombination: [{ type: String, trim: true }],
+          quantity: { type: Number, min: 0 },
+          unit: { type: String, trim: true },
+          // Wastage/buffer % on top of `quantity`, same field the production
+          // BOM already carries (StockItem's rawItems.allowancePercent) — so
+          // Sales sees the same allowance R&D is planning around, not just a
+          // bare consumed number (20 Aug 2026, explicit request).
+          allowancePercent: { type: Number, default: 0, min: 0 },
+          notes: { type: String, trim: true, default: "" },
+        },
+      ],
+      photos: [imageSchema],
+      // R&D ↔ Sales conversation about THIS sample specifically — not the
+      // enquiry-level product chat (that's about the whole product, not
+      // necessarily sampling), and not CoWork-backed: a plain embedded log
+      // both sides already read/write the same SampleStyle record for, same
+      // as everything else here. Doubles as the "attach more info" R&D
+      // asked for — a message can carry a file with no text, text with no
+      // file, or both (20 Aug 2026, explicit request).
+      discussion: [
+        {
+          text: { type: String, trim: true, default: "" },
+          attachment: {
+            name: { type: String, trim: true },
+            url: { type: String, trim: true },
+            fileId: { type: String, trim: true },
+            publicId: { type: String, trim: true },
+          },
+          by: actorRef(),
+          at: { type: Date, default: Date.now },
+        },
+      ],
+    },
+
+    // ── Production (bulk / size-wise order) — DELIBERATELY SEPARATE from
+    // `sample` above (19 Aug 2026, explicit request). `sample` is R&D's own
+    // proto/fit/PP round-making, gated by the tech sheet, ending in a Sales
+    // approval that just closes the SampleStyle. This is the real commercial
+    // pipeline — Customer → Stock Item (finished good + BOM) → Customer
+    // Request → (internal, auto-approved) quotation → Work Orders — driven
+    // from R&D because R&D is the one who now knows the real product/BOM.
+    // Reuses the SAME collections and the SAME WO-creation logic
+    // (createWorkOrdersAndProgress, exported from quotationRoutes.js) Sales'
+    // own "New Order on Behalf" flow already uses — this is a second front
+    // door onto that pipeline, not a parallel one.
+    production: {
+      status: {
+        type: String,
+        enum: ["not_started", "customer_linked", "stock_item_linked", "submitted"],
+        default: "not_started",
+      },
+      customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer" },
+      stockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem" },
+      customerRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest" },
+      workOrderIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder" }],
+      // The audit trail R&D reads back — "customer created", "product
+      // registered", "order request raised", "approved, N work orders
+      // created" — exactly what the pipeline actually did, in order.
+      log: [
+        new mongoose.Schema(
+          { kind: { type: String, trim: true }, note: { type: String, trim: true }, at: { type: Date, default: Date.now }, by: actorRef() },
+          { _id: false },
+        ),
+      ],
     },
 
     // Shared timeline of every routing hop and gate decision (newest last).
@@ -178,8 +282,26 @@ const sampleStyleSchema = new mongoose.Schema(
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } },
 );
 
-// One style per product per journey.
-sampleStyleSchema.index({ journeyId: 1, productName: 1 }, { unique: true });
+// One ACTIVE style per product per journey. Partial (scoped to isActive:true)
+// rather than a flat unique index: a soft-deactivated duplicate must never
+// block provisioning a fresh style under the same name.
+//
+// BUG FIX (19 Aug 2026): this index was declared here all along but had never
+// actually been built on the live database — only the single-field indexes
+// Mongoose derives from `index: true` on individual fields existed. Two
+// concurrent provision calls (React StrictMode's double effect-invoke on
+// mount, or Sales and R&D opening the same journey within milliseconds of
+// each other) both passed provisionJourneyStyles' "does this already exist"
+// read before either had committed its write, and with no unique index to
+// stop the second insert, both landed — one SampleStyle per product turned
+// into two, which is exactly the duplicate rows the R&D board showed. Cleaned
+// up the existing duplicates in the database directly; this index plus the
+// catch-and-requery guard in services/sampleStyleProvision.js close the race
+// itself so it can't recur.
+sampleStyleSchema.index(
+  { journeyId: 1, productName: 1 },
+  { unique: true, partialFilterExpression: { isActive: true } },
+);
 
 // Heal legacy routing values (an earlier build used brief/merchandiser) so old
 // rows validate against the current enum instead of throwing on save.

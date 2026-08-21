@@ -3863,3 +3863,8 @@ router.get("/requests/:requestId/po-breakdown", async (req, res) => {
 });
 
 module.exports = router;
+// Exposed so other routers can reuse the exact same WO-creation logic instead
+// of re-deriving its variant-resolution/BOM-snapshot rules (19 Aug 2026 — R&D's
+// "Send to Production" wizard in sampleStyleProduction.js is the first caller).
+// Purely additive: router is a function, and a function can carry properties.
+module.exports.createWorkOrdersAndProgress = createWorkOrdersAndProgress;

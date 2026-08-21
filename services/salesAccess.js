@@ -41,4 +41,18 @@ async function isSalesManager(user) {
   return Boolean(role) && roleAtLeast(role, "approver");
 }
 
-module.exports = { isSalesManager };
+/**
+ * Sales/CEO/admin bypass the "anyone can fill anything, staged for approval"
+ * gate (costing, Style & Sample materials) — their own writes apply
+ * immediately, and only they can decide on someone else's staged submission.
+ * Synchronous, unlike isSalesManager: no department-role lookup, just the
+ * JWT's own role/isAdmin. Shared so the costing and materials approval paths
+ * (and the aggregated approvals queue) agree on exactly who that is
+ * (19 Aug 2026).
+ * @param {{role?:string, isAdmin?:boolean}} user
+ */
+function bypassesApproval(user) {
+  return ["sales", "ceo"].includes(user?.role) || Boolean(user?.isAdmin);
+}
+
+module.exports = { isSalesManager, bypassesApproval };
