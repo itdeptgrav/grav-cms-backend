@@ -172,7 +172,7 @@ test("the queue chains from the handover, in both places that ask", () => {
   /* `queueAheadEndMs` answers for one arriving task, `rechainQueueFor` walks
      the whole queue. Two readings of "when is the work above me done" would
      eventually disagree. */
-  assert.match(office, /const end = effectiveEndMs\(other\);/);
+  assert.match(office, /endMs: effectiveEndMs\(other\)/);
   assert.match(office, /handedOverMs: simulated \? null : effectiveEndMs\(t\)/);
 });
 
