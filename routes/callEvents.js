@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const CallEvent = require("../models/CallEvent");
+const { findMatchingCallEvent } = require("../services/callEventMatch.service");
 
 /** Optional shared-secret (same scheme as callRecordings). */
 function checkApiKey(req, res, next) {
@@ -37,31 +38,51 @@ function deriveReceived(callType, durationSec) {
   }
 }
 
+/** "whether call reject or not" — explicit declines only, never a plain unanswered ring. */
+function deriveRejected(callType) {
+  return callType === "REJECTED";
+}
+
 /**
  * POST /api/call-events   (application/json)
- * Logs one call's outcome (received/missed/etc). No audio.
- * Idempotent on (startTime + phoneNumber) so a re-send doesn't duplicate.
+ * Logs one call's outcome (received/missed/rejected/etc) — no audio here,
+ * see /api/recordings for that half. Writes into the SAME CallEvent document
+ * a recording upload for this call would use (matched by phone + time
+ * window, see callEventMatch.service), so a call reported here first and
+ * recorded a moment later ends up as ONE document, not two.
  */
 router.post("/", checkApiKey, async (req, res) => {
   try {
     const b = req.body || {};
-
-    if (b.startTime) {
-      const dup = await CallEvent.findOne({
-        startTime: b.startTime,
-        phoneNumber: b.phoneNumber ?? null,
-      }).select("_id").lean();
-      if (dup) return res.json({ success: true, mongoId: String(dup._id), duplicate: true });
-    }
-
+    const phoneNumber = b.phoneNumber ?? null;
     const callType = b.callType ?? "UNKNOWN";
     const durationSec = b.durationSec ?? 0;
+    const received = deriveReceived(callType, durationSec);
+    const rejected = deriveRejected(callType);
+
+    const existing = b.startTime ? await findMatchingCallEvent(phoneNumber, b.startTime) : null;
+    if (existing) {
+      // Already has a document (most likely the recording upload for this
+      // same call arrived first) — refresh the outcome fields onto it
+      // rather than creating a second one.
+      existing.contactName = b.contactName ?? existing.contactName;
+      existing.direction = b.direction ?? existing.direction;
+      existing.callType = callType;
+      existing.received = received;
+      existing.rejected = rejected;
+      existing.durationSec = durationSec;
+      existing.endTime = b.endTime ?? existing.endTime;
+      await existing.save();
+      return res.json({ success: true, mongoId: String(existing._id), duplicate: true });
+    }
+
     const doc = await CallEvent.create({
-      phoneNumber: b.phoneNumber ?? null,
+      phoneNumber,
       contactName: b.contactName ?? null,
       direction: b.direction ?? "UNKNOWN",
       callType,
-      received: deriveReceived(callType, durationSec),
+      received,
+      rejected,
       durationSec,
       startTime: b.startTime,
       endTime: b.endTime ?? null,
@@ -75,7 +96,7 @@ router.post("/", checkApiKey, async (req, res) => {
   }
 });
 
-/** GET /api/call-events — recent call events (verification). */
+/** GET /api/call-events — recent call events (verification). Every call, recorded or not. */
 router.get("/", checkApiKey, async (_req, res) => {
   try {
     const items = await CallEvent.find().sort({ createdAt: -1 }).limit(100).lean();

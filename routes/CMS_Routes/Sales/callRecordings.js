@@ -11,12 +11,18 @@
 // That is why it is mounted WITHOUT the salesWrites() approval guard: holding a
 // "summarise" click as a change request for an approver would be nonsense, and
 // the guard exists to protect business records, which these are not.
+//
+// Reads CallEvent, not the old CallRecording model (21 Aug 2026 — the two
+// call-tracking collections were consolidated into one; see CallEvent.js's
+// own header comment). Filtered to `driveFileId` set, since this view is
+// specifically "what got recorded" — every OTHER call CallEvent now also
+// holds (missed/rejected/unrecorded) is out of scope for this screen.
 "use strict";
 
 const express = require("express");
 const router = express.Router();
 
-const CallRecording = require("../../../models/CallRecording");
+const CallRecording = require("../../../models/CallEvent");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const Customer = require("../../../models/Customer_Models/Customer");
@@ -142,7 +148,7 @@ router.get("/", salesAuth, async (req, res) => {
       });
     }
 
-    const rows = await CallRecording.find(filter)
+    const rows = await CallRecording.find({ ...filter, driveFileId: { $ne: null } })
       .sort({ startTime: -1, createdAt: -1 })
       .limit(MAX_ROWS)
       .lean();
@@ -153,7 +159,7 @@ router.get("/", salesAuth, async (req, res) => {
       contactName: r.contactName,
       direction: r.direction,
       startTime: r.startTime,
-      durationMillis: r.durationMillis,
+      durationMillis: Math.round((r.durationSec || 0) * 1000),
       transcription: r.transcription,
       deviceSummary: r.summary,
       aiSummary: r.aiSummary,
