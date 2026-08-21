@@ -194,6 +194,72 @@ router.post("/conversations/:id/send", async (req, res) => {
   }
 });
 
+/** Every calendar day (IST) in the trailing `days`-day window, oldest first. */
+function trailingDayKeys(days) {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const keys = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const ist = new Date(Date.now() - i * 86400000 + IST_OFFSET_MS);
+    keys.push(ist.toISOString().slice(0, 10));
+  }
+  return keys;
+}
+
+// GET /stats?days=14 — department-wide WhatsApp activity for the Messages
+// page's overview (21 Aug 2026, explicit request — "showcase the [chat] logs
+// properly... in graph structure"): messages per day by direction, plus
+// live totals (active conversations, unread) that a day-bucketed count can't
+// carry since they're a snapshot, not an event.
+router.get("/stats", async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 14, 1), 90);
+    const since = new Date(Date.now() - days * 86400000);
+
+    const rows = await WhatsAppMessage.aggregate([
+      { $match: { timestamp: { $gte: since } } },
+      {
+        $addFields: {
+          dateKey: { $dateToString: { format: "%Y-%m-%d", date: { $ifNull: ["$timestamp", "$createdAt"] }, timezone: "Asia/Kolkata" } },
+        },
+      },
+      {
+        $group: {
+          _id: "$dateKey",
+          incoming: { $sum: { $cond: [{ $eq: ["$direction", "incoming"] }, 1, 0] } },
+          outgoing: { $sum: { $cond: [{ $eq: ["$direction", "outgoing"] }, 1, 0] } },
+          total: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const byDate = new Map(rows.map((r) => [r._id, r]));
+    const daily = trailingDayKeys(days).map((date) => {
+      const r = byDate.get(date);
+      return { date, incoming: r?.incoming || 0, outgoing: r?.outgoing || 0, total: r?.total || 0 };
+    });
+
+    const totals = daily.reduce(
+      (acc, d) => ({ total: acc.total + d.total, incoming: acc.incoming + d.incoming, outgoing: acc.outgoing + d.outgoing }),
+      { total: 0, incoming: 0, outgoing: 0 },
+    );
+
+    const [activeConversations, unreadAgg] = await Promise.all([
+      WhatsAppConversation.countDocuments({ isActive: true }),
+      WhatsAppConversation.aggregate([
+        { $match: { isActive: true } },
+        { $group: { _id: null, sum: { $sum: "$unreadCount" } } },
+      ]),
+    ]);
+    totals.activeConversations = activeConversations;
+    totals.unreadCount = unreadAgg[0]?.sum || 0;
+
+    res.json({ success: true, days, daily, totals });
+  } catch (err) {
+    console.error("[crm/whatsapp] stats failed:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // POST /start  { phone, name?, accountId?, leadId?, contactId? }
 // Find or create the conversation for a customer's number — the "Message"
 // button. Returns the conversation to open; sends nothing.
