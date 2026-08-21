@@ -12,6 +12,7 @@ const Operation                  = require("../../../../models/CMS_Models/Invent
 const QCInspection               = require("../../../../models/CMS_Models/Manufacturing/QC/DefectRecord");
 const EmployeeMpc                = require("../../../../models/Customer_Models/Employee_Mpc");
 const Measurement                = require("../../../../models/Customer_Models/Measurement");
+const StockItem                  = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const istDateString = (d = new Date()) => {
@@ -58,6 +59,35 @@ const getMasterOperations = async () => {
     .select("name operationCode totalSam machineType").lean();
   opsCacheAt = now;
   return opsCache;
+};
+
+/**
+ * The operations THIS product is actually built from.
+ *
+ * QC was listing the entire master operation sheet — 259 rows for a shirt whose
+ * product page defines a few dozen. Every piece of every product showed the same
+ * list, so the inspector was scrolling past operations that were never performed
+ * on the garment in their hand, and a category count like "S 95" described the
+ * factory's whole vocabulary rather than this style.
+ *
+ * The product page's Operations tab is the real scope: StockItem.operations,
+ * where `type` is the operation's name as the merchandiser entered it and
+ * `totalSeconds` is its time. The master sheet is still consulted, but only to
+ * fill in a canonical name, SAM or machine type where the product row left one
+ * blank.
+ *
+ * Returns null when the product cannot supply a scope — no stock item on the
+ * work order, no such product, or a product with an empty Operations tab. The
+ * caller then falls back to the master sheet rather than showing an inspector an
+ * empty list: a data-entry gap must not stop the line, but it is reported so
+ * nobody mistakes the master sheet for this product's own.
+ */
+const getProductOperations = async (stockItemId) => {
+  if (!stockItemId) return null;
+  const item = await StockItem.findById(stockItemId).select("operations").lean().catch(() => null);
+  const rows = item?.operations;
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  return rows;
 };
 
 router.post("/refresh-operations-cache", (_req, res) => {
@@ -137,13 +167,14 @@ router.post("/lookup-piece", async (req, res) => {
     if (unitNumber > workOrder.quantity)
       return res.status(400).json({ success: false, message: `Unit ${unitNumber} out of range (1–${workOrder.quantity})` });
 
-    const [customerRequest, empProgress] = await Promise.all([
+    const [customerRequest, empProgress, productOps] = await Promise.all([
       workOrder.customerRequestId
         ? CustomerRequest.findById(workOrder.customerRequestId).lean()
         : Promise.resolve(null),
       EmployeeProductionProgress.findOne({
         workOrderId: workOrder._id, unitStart: { $lte: unitNumber }, unitEnd: { $gte: unitNumber },
       }).lean(),
+      getProductOperations(workOrder.stockItemId),
     ]);
 
     const isMeasurementConversion =
@@ -220,7 +251,61 @@ router.post("/lookup-piece", async (req, res) => {
       }
     }
 
-    const operations = masterOps.map(op => {
+    // Resolve which operations this piece is inspected against.
+    const masterByCode = new Map(
+      masterOps.map((o) => [(o.operationCode || "").trim().toLowerCase(), o]),
+    );
+
+    let opSource = null;
+    let operationScope = null;
+
+    if (productOps) {
+      const seen = new Set();
+      const scoped = [];
+      let withoutCode = 0;
+      for (const row of productOps) {
+        const code = (row.operationCode || "").trim();
+        // A defect is recorded BY operation code, so a product row without one
+        // cannot be flagged. Skipping it is honest; counting it lets the screen
+        // say the product sheet is incomplete.
+        if (!code) { withoutCode += 1; continue; }
+        const key = code.toLowerCase();
+        if (seen.has(key)) continue;            // the same operation listed twice
+        seen.add(key);
+        const m = masterByCode.get(key);
+        scoped.push({
+          operationCode: code,
+          name: row.type || m?.name || code,
+          totalSam: row.totalSeconds != null
+            ? Math.round((row.totalSeconds / 60) * 100) / 100
+            : m?.totalSam,
+          machineType: row.machineType || row.machine || m?.machineType || "",
+        });
+      }
+      if (scoped.length) {
+        opSource = scoped;
+        operationScope = {
+          source: "product",
+          defined: productOps.length,
+          used: scoped.length,
+          withoutCode,
+        };
+      }
+    }
+
+    if (!opSource) {
+      opSource = masterOps;
+      operationScope = {
+        source: "master",
+        reason: !workOrder.stockItemId
+          ? "This work order is not linked to a product."
+          : !productOps
+            ? "This product has no operations on its Operations tab."
+            : "This product's operations have no operation codes.",
+      };
+    }
+
+    const operations = opSource.map(op => {
       const lower       = (op.operationCode || "").trim().toLowerCase();
       const opOperators = opOperatorsMap.get(lower);
       const operators   = opOperators
@@ -252,7 +337,7 @@ router.post("/lookup-piece", async (req, res) => {
         customerName: customerRequest.customerInfo?.name, customerPhone: customerRequest.customerInfo?.phone,
         status: customerRequest.status,
       } : null,
-      isMeasurementConversion, pieceOwner, operations, categories,
+      isMeasurementConversion, pieceOwner, operations, categories, operationScope,
       totalScans, totalOperations: operations.length,
       existingInspections, previousDefectCodes,
     });
@@ -361,13 +446,32 @@ router.get("/piece-operators", async (req, res) => {
 // Must be defined BEFORE /inspections to avoid any path conflicts
 router.get("/trend", async (req, res) => {
   try {
-    const { days = 7 } = req.query;
+    const { days = 7, end } = req.query;
     const n = Math.min(Math.max(parseInt(days) || 7, 1), 90);
 
-    // Build IST date strings oldest → newest
+    // The window ENDS on `end` (an IST YYYY-MM-DD), defaulting to today.
+    //
+    // It used to always end on today, whatever date the overview was showing.
+    // Open a day three weeks back and the page put that day's figures beside a
+    // trend for the last seven days — a chart that looked broken or empty when
+    // it was simply describing a different week. The anchor now follows the
+    // date being viewed. Future dates are clamped to today: there is nothing
+    // to plot ahead of now, and a bad query should not silently return a
+    // window of empty buckets.
+    const todayIST = () => {
+      const t = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+      return `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, "0")}-${String(t.getUTCDate()).padStart(2, "0")}`;
+    };
+    const today = todayIST();
+    const anchor = (typeof end === "string" && /^\d{4}-\d{2}-\d{2}$/.test(end) && end <= today)
+      ? end
+      : today;
+
+    // Build IST date strings oldest → newest, ending at the anchor.
+    const [ay, am, ad] = anchor.split("-").map(Number);
     const dates = [];
     for (let i = n - 1; i >= 0; i--) {
-      const d = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+      const d = new Date(Date.UTC(ay, am - 1, ad));
       d.setUTCDate(d.getUTCDate() - i);
       dates.push(
         `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`
