@@ -1515,6 +1515,16 @@ app.use("/api/employee/regularizations", empRegularize);
 const empDocuments = require("./routes/Employee_Routes/documents");
 app.use("/api/employee/documents", empDocuments);
 
+// Who is away, by day — the workforce-wide planning calendar for the app.
+// Past days come from DailyAttendance, future days from approved leave, so it
+// answers "who is out next Tuesday" and not only "who was out".
+//
+// It reports a person as absent or on leave and NEVER which leave type: "SL"
+// would publish a colleague's sick days to the whole company. Same scoping
+// rule as the standings board above.
+const empAbsenceCalendar = require("./routes/Employee_Routes/absenceCalendar");
+app.use("/api/employee/absence-calendar", empAbsenceCalendar);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ACCOUNTANT DEPARTMENT ROUTES — ALL 20 ENDPOINTS (17 legacy + 3 sub-account)
 // ═══════════════════════════════════════════════════════════════════════════
