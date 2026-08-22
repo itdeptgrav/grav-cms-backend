@@ -124,26 +124,115 @@ function normInvNum(s) {
     .replace(/^0+/, "");
 }
 
-// Parse GSTN's "dt" date format. GSTR-2B uses "DD-MM-YYYY" (e.g. "25-04-2026").
+const MONTH_ABBR = {
+  JAN: 1,
+  FEB: 2,
+  MAR: 3,
+  APR: 4,
+  MAY: 5,
+  JUN: 6,
+  JUL: 7,
+  AUG: 8,
+  SEP: 9,
+  OCT: 10,
+  NOV: 11,
+  DEC: 12,
+};
+
+// Parse GSTN's date formats.
+//   GSTR-2B  "dt"      → "DD-MM-YYYY"  e.g. "25-04-2026"
+//   GSTR-2A  "idt"     → "DD-MM-YYYY"  (same)
+//   GSTR-2A  "fldtr1"  → "DD-MMM-YY"   e.g. "08-Aug-26"  ← supplier filing date
+// Anything unrecognised returns null rather than an Invalid Date, because a
+// downstream `new Date(undefined)` is what produced the old "date is not
+// defined"-style import failures.
 function parseGstnDate(s) {
   if (!s) return null;
-  if (s instanceof Date) return s;
-  const m = String(s).match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (s instanceof Date) return isNaN(s.getTime()) ? null : s;
+  const str = String(s).trim();
+  if (!str) return null;
+
+  // DD-MM-YYYY  or  DD/MM/YYYY
+  let m = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+
+  // DD-MMM-YY  or  DD-MMM-YYYY  (2A filing dates)
+  m = str.match(/^(\d{1,2})[-\/ ]([A-Za-z]{3})[A-Za-z]*[-\/ ](\d{2}|\d{4})$/);
   if (m) {
-    return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+    const mon = MONTH_ABBR[m[2].toUpperCase()];
+    if (mon) {
+      let yr = Number(m[3]);
+      if (yr < 100) yr += 2000;
+      return new Date(yr, mon - 1, Number(m[1]));
+    }
   }
+
   // Fallback — let JS try
-  const d = new Date(s);
+  const d = new Date(str);
   return isNaN(d.getTime()) ? null : d;
 }
 
-// Parse GSTN's "rtnprd" — MMYYYY string. e.g. "042026" → { month: 4, year: 2026 }.
+// Parse GSTN's return period. GSTR-2B calls it `rtnprd`, GSTR-2A calls it `fp`;
+// both are MMYYYY strings. e.g. "042026" → { month: 4, year: 2026 }.
 function parseReturnPeriod(s) {
-  if (!s || typeof s !== "string" || s.length !== 6) return null;
-  const month = Number(s.slice(0, 2));
-  const year = Number(s.slice(2));
+  if (s == null) return null;
+  const str = String(s).trim();
+  if (str.length !== 6) return null;
+  const month = Number(str.slice(0, 2));
+  const year = Number(str.slice(2));
   if (!month || !year || month < 1 || month > 12) return null;
   return { month, year };
+}
+
+// GSTR-2A nests tax amounts one level deeper than GSTR-2B: instead of the
+// invoice carrying `txval`/`camt`/`samt`/`iamt`/`csamt` directly, it carries
+// `itms: [{ num, itm_det: { txval, camt, samt, iamt, csamt, rt } }]`.
+// Returns null when there is no `itms` array so the caller can fall back to
+// the flat 2B fields.
+function sumItemTax(entry) {
+  const itms = entry && Array.isArray(entry.itms) ? entry.itms : null;
+  if (!itms || !itms.length) return null;
+  const t = { txval: 0, cgst: 0, sgst: 0, igst: 0, cess: 0, rates: new Set() };
+  for (const it of itms) {
+    const d = (it && (it.itm_det || it.itmDet)) || it || {};
+    t.txval += Number(d.txval ?? 0) || 0;
+    t.cgst += Number(d.camt ?? d.cgst ?? 0) || 0;
+    t.sgst += Number(d.samt ?? d.sgst ?? 0) || 0;
+    t.igst += Number(d.iamt ?? d.igst ?? 0) || 0;
+    t.cess += Number(d.csamt ?? d.cess ?? 0) || 0;
+    if (d.rt != null && d.rt !== "") t.rates.add(Number(d.rt));
+  }
+  return t;
+}
+
+// Read one document's tax block, transparently handling both the flat 2B shape
+// and the itemised 2A shape.
+function readTaxBlock(entry) {
+  const items = sumItemTax(entry);
+  if (items) {
+    return {
+      taxableValue: items.txval,
+      cgst: items.cgst,
+      sgst: items.sgst,
+      igst: items.igst,
+      cess: items.cess,
+      taxRates: Array.from(items.rates).sort((a, b) => a - b),
+    };
+  }
+  return {
+    taxableValue: Number(entry.txval ?? entry.val ?? 0) || 0,
+    cgst: Number(entry.cgst ?? entry.camt ?? 0) || 0,
+    sgst: Number(entry.sgst ?? entry.samt ?? 0) || 0,
+    igst: Number(entry.igst ?? entry.iamt ?? 0) || 0,
+    cess: Number(entry.cess ?? entry.csamt ?? 0) || 0,
+    taxRates: entry.rt != null && entry.rt !== "" ? [Number(entry.rt)] : [],
+  };
+}
+
+// "Y"/"N" flags, tolerant of missing values.
+function isYes(v, dflt = false) {
+  if (v == null || v === "") return dflt;
+  return String(v).trim().toUpperCase() === "Y";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -163,19 +252,24 @@ function parseGstr2bJson(raw) {
   }
 
   const taxpayerGSTIN = (root.gstin || raw.gstin || "").toUpperCase().trim();
-  const returnPeriod = (root.rtnprd || raw.rtnprd || "").trim();
+  // 2B calls the return period `rtnprd`; 2A calls it `fp`. Accept either.
+  const returnPeriod = String(
+    root.rtnprd ?? raw.rtnprd ?? root.fp ?? raw.fp ?? "",
+  ).trim();
   if (
     !taxpayerGSTIN ||
     !/^[0-9]{2}[A-Z0-9]{10}[A-Z0-9]{3}$/.test(taxpayerGSTIN)
   ) {
     throw new Error(
-      "Invalid GSTR-2B JSON: missing or malformed taxpayer GSTIN",
+      "Invalid GSTR-2A/2B JSON: missing or malformed taxpayer GSTIN",
     );
   }
   const periodParts = parseReturnPeriod(returnPeriod);
   if (!periodParts) {
     throw new Error(
-      `Invalid GSTR-2B JSON: return period "${returnPeriod}" is not in MMYYYY format`,
+      returnPeriod
+        ? `Invalid GSTR-2A/2B JSON: return period "${returnPeriod}" is not in MMYYYY format`
+        : "Invalid GSTR-2A/2B JSON: no return period found (expected `rtnprd` for 2B or `fp` for 2A at the top level)",
     );
   }
 
@@ -223,7 +317,14 @@ function parseGstr2bJson(raw) {
     }
   }
 
-  const docdata = root.docdata || raw.docdata || {};
+  // 2B nests every section under `docdata`; 2A puts b2b / b2ba / cdnr / cdnra /
+  // impg / isd straight on the root. Merge both so one code path serves either.
+  const docdata = Object.assign(
+    {},
+    root,
+    raw.docdata || {},
+    root.docdata || {},
+  );
   const records = [];
 
   // ── B2B + B2BA: invoices grouped by supplier ──
@@ -232,36 +333,42 @@ function parseGstr2bJson(raw) {
     for (const supplier of arr) {
       const supplierGSTIN = (supplier.ctin || "").toUpperCase().trim();
       const supplierName = supplier.trdnm || supplier.name || "";
-      const supplierFilingStatus = supplier.supfildt
+      // 2B: `supfildt` (filing date) + `supprd`.
+      // 2A: `fldtr1` (filing date, DD-MMM-YY) + `flprdr1` (filed period) and a
+      //     `cfs` "counter-party filing status" Y/N flag.
+      const supplierFilingDate = parseGstnDate(
+        supplier.supfildt || supplier.fldtr1,
+      );
+      const supplierFilingStatus = supplierFilingDate
         ? "Filed"
-        : supplier.flprdr1 || "";
-      const supplierFilingDate = parseGstnDate(supplier.supfildt);
-      const supplierReturnPeriod = supplier.supprd || "";
+        : isYes(supplier.cfs)
+          ? "Filed"
+          : supplier.flprdr1 || "";
+      const supplierReturnPeriod = supplier.supprd || supplier.flprdr1 || "";
       const invs = supplier.inv || [];
       for (const inv of invs) {
         // Read tax amounts. Modern GSTN GSTR-2B uses the long names
         // (`cgst`, `sgst`, `igst`, `cess`); legacy GSTR-1-style downloads used
-        // the abbreviated forms (`camt`, `samt`, `iamt`, `csamt`). Try long
-        // names first since that's what the current portal returns.
-        const taxableValue = Number(inv.txval ?? inv.val ?? 0);
-        const cgst = Number(inv.cgst ?? inv.camt ?? 0);
-        const sgst = Number(inv.sgst ?? inv.samt ?? 0);
-        const igst = Number(inv.igst ?? inv.iamt ?? 0);
-        const cess = Number(inv.cess ?? inv.csamt ?? 0);
+        // the abbreviated forms (`camt`, `samt`, `iamt`, `csamt`); GSTR-2A
+        // nests them per line item under `itms[].itm_det`. readTaxBlock covers
+        // all three.
+        const { taxableValue, cgst, sgst, igst, cess, taxRates } =
+          readTaxBlock(inv);
 
         records.push({
           section,
           supplierGSTIN,
           supplierName,
           docNumber: String(inv.inum || "").trim(),
-          docDate: parseGstnDate(inv.dt),
+          docDate: parseGstnDate(inv.dt || inv.idt),
+          taxRates,
           // GSTN ships single-letter type codes:
           //   R  = Regular
           //   SEWP = SEZ supplies with payment of tax
           //   SEWOP = SEZ supplies without payment of tax
           //   DE = Deemed Export
           //   CBW = Customs Bonded Warehouse
-          docType: inv.typ || "R",
+          docType: inv.typ || inv.inv_typ || "R",
           taxableValue,
           cgst,
           sgst,
@@ -270,13 +377,14 @@ function parseGstr2bJson(raw) {
           invoiceValue: Number(
             inv.val ?? taxableValue + cgst + sgst + igst + cess,
           ),
-          itcAvailable: (inv.itcavl || "Y").toUpperCase() === "Y",
+          itcAvailable: isYes(inv.itcavl, true),
           itcUnavailReason: inv.rsn || "",
           supplierFilingStatus,
           supplierFilingDate,
           supplierReturnPeriod,
           placeOfSupply: inv.pos || "",
-          reverseCharge: (inv.rev || "N").toUpperCase() === "Y",
+          // 2B: `rev`. 2A: `rchrg`.
+          reverseCharge: isYes(inv.rev ?? inv.rchrg),
           // IMS status — current portal uses `imsStatus`; older may use `imsaction`
           imsAction: inv.imsStatus || inv.imsaction || inv.imsAction || "",
           originalDocNumber:
@@ -294,40 +402,50 @@ function parseGstr2bJson(raw) {
     for (const supplier of arr) {
       const supplierGSTIN = (supplier.ctin || "").toUpperCase().trim();
       const supplierName = supplier.trdnm || supplier.name || "";
-      const supplierFilingDate = parseGstnDate(supplier.supfildt);
-      const supplierReturnPeriod = supplier.supprd || "";
+      const supplierFilingDate = parseGstnDate(
+        supplier.supfildt || supplier.fldtr1,
+      );
+      const supplierReturnPeriod = supplier.supprd || supplier.flprdr1 || "";
       const notes = supplier.nt || supplier.cdnr || [];
       for (const nt of notes) {
         // Note type: typ="C" credit / "D" debit. Some files also expose
         // it on the supplier-level via `nttyp` (seen in cpsumm sections).
+        // 2A uses `ntty`.
         const noteType = (nt.typ || nt.ntty || nt.nttyp || "C").toUpperCase();
-        const taxableValue = Number(nt.txval ?? nt.val ?? 0);
+        const tax = readTaxBlock(nt);
         // Credit notes reduce ITC, so amounts are stored signed-negative.
         const sign = noteType === "C" ? -1 : 1;
         records.push({
           section,
           supplierGSTIN,
           supplierName,
-          docNumber: String(nt.ntnum || nt.inum || "").trim(),
-          docDate: parseGstnDate(nt.dt),
-          docType: nt.suptyp || "R",
+          // 2A calls the note number `nt_num` and its date `nt_dt`.
+          docNumber: String(nt.ntnum || nt.nt_num || nt.inum || "").trim(),
+          docDate: parseGstnDate(nt.dt || nt.nt_dt),
+          docType: nt.suptyp || nt.inv_typ || "R",
           noteType: noteType === "C" ? "Credit" : "Debit",
-          taxableValue: sign * taxableValue,
-          cgst: sign * Number(nt.cgst ?? nt.camt ?? 0),
-          sgst: sign * Number(nt.sgst ?? nt.samt ?? 0),
-          igst: sign * Number(nt.igst ?? nt.iamt ?? 0),
-          cess: sign * Number(nt.cess ?? nt.csamt ?? 0),
-          invoiceValue: sign * Number(nt.val ?? 0),
-          itcAvailable: (nt.itcavl || "Y").toUpperCase() === "Y",
+          taxRates: tax.taxRates,
+          taxableValue: sign * tax.taxableValue,
+          cgst: sign * tax.cgst,
+          sgst: sign * tax.sgst,
+          igst: sign * tax.igst,
+          cess: sign * tax.cess,
+          invoiceValue: sign * (Number(nt.val ?? 0) || 0),
+          itcAvailable: isYes(nt.itcavl, true),
           itcUnavailReason: nt.rsn || "",
           supplierFilingDate,
           supplierReturnPeriod,
           placeOfSupply: nt.pos || "",
-          reverseCharge: (nt.rev || "N").toUpperCase() === "Y",
+          reverseCharge: isYes(nt.rev ?? nt.rchrg),
           imsAction: nt.imsStatus || nt.imsaction || nt.imsAction || "",
           originalDocNumber:
-            section === "cdnra" ? String(nt.ontnum || "").trim() : "",
-          originalDocDate: section === "cdnra" ? parseGstnDate(nt.ontdt) : null,
+            section === "cdnra"
+              ? String(nt.ontnum || nt.ont_num || "").trim()
+              : "",
+          originalDocDate:
+            section === "cdnra"
+              ? parseGstnDate(nt.ontdt || nt.ont_dt)
+              : null,
           raw: nt,
         });
       }
@@ -342,15 +460,15 @@ function parseGstr2bJson(raw) {
         section,
         supplierGSTIN: "", // imports don't have supplier GSTIN
         supplierName: imp.txprd || imp.portcd || "Import",
-        docNumber: String(imp.boenum || "").trim(),
-        docDate: parseGstnDate(imp.boedt),
+        docNumber: String(imp.boenum || imp.benum || "").trim(),
+        docDate: parseGstnDate(imp.boedt || imp.bedt),
         docType: "Bill of Entry",
-        taxableValue: Number(imp.txval ?? 0),
+        taxableValue: Number(imp.txval ?? 0) || 0,
         cgst: 0,
         sgst: 0,
-        igst: Number(imp.igst ?? imp.iamt ?? 0),
-        cess: Number(imp.cess ?? imp.csamt ?? 0),
-        invoiceValue: Number(imp.val ?? 0),
+        igst: Number(imp.igst ?? imp.iamt ?? 0) || 0,
+        cess: Number(imp.cess ?? imp.csamt ?? 0) || 0,
+        invoiceValue: Number(imp.val ?? 0) || 0,
         itcAvailable: true,
         placeOfSupply: imp.portcd || "",
         imsAction: imp.imsStatus || imp.imsaction || imp.imsAction || "",
@@ -373,16 +491,16 @@ function parseGstr2bJson(raw) {
           section,
           supplierGSTIN,
           supplierName,
-          docNumber: String(d.docnum || "").trim(),
-          docDate: parseGstnDate(d.docdt),
-          docType: d.doctyp || "ISD",
+          docNumber: String(d.docnum || d.doc_num || "").trim(),
+          docDate: parseGstnDate(d.docdt || d.doc_dt),
+          docType: d.doctyp || d.isd_docty || "ISD",
           taxableValue: 0,
-          cgst: Number(d.cgst ?? d.camt ?? 0),
-          sgst: Number(d.sgst ?? d.samt ?? 0),
-          igst: Number(d.igst ?? d.iamt ?? 0),
-          cess: Number(d.cess ?? d.csamt ?? 0),
+          cgst: Number(d.cgst ?? d.camt ?? 0) || 0,
+          sgst: Number(d.sgst ?? d.samt ?? 0) || 0,
+          igst: Number(d.igst ?? d.iamt ?? 0) || 0,
+          cess: Number(d.cess ?? d.csamt ?? 0) || 0,
           invoiceValue: 0,
-          itcAvailable: (d.itcavl || "Y").toUpperCase() === "Y",
+          itcAvailable: isYes(d.itcavl ?? d.itc_elg, true),
           imsAction: d.imsStatus || d.imsaction || d.imsAction || "",
           raw: d,
         });
@@ -393,6 +511,25 @@ function parseGstr2bJson(raw) {
   if (records.length === 0) {
     warnings.push(
       "No records found in B2B/CDNR/IMPG/ISD sections. The file parsed but appears empty — verify the return period has supplier filings.",
+    );
+  }
+
+  // GSTR-2A ships no `itcsumm` block (it's a running view, not a locked
+  // statement), so the summary would otherwise read as all zeros and the
+  // "did the file parse fully?" check on the UI would look broken. Derive the
+  // totals from the records we just flattened.
+  if (!summBlocks && records.length) {
+    for (const r of records) {
+      const bucket = r.itcAvailable
+        ? summaryTotals.itcAvailable
+        : summaryTotals.itcUnavailable;
+      bucket.cgst += r.cgst || 0;
+      bucket.sgst += r.sgst || 0;
+      bucket.igst += r.igst || 0;
+      bucket.cess += r.cess || 0;
+    }
+    warnings.push(
+      "File has no ITC summary block (normal for GSTR-2A) — summary totals were derived from the invoice records.",
     );
   }
 
@@ -481,6 +618,49 @@ router.post(
           success: false,
           message: `GSTIN mismatch. Uploaded file is for ${parsed.taxpayerGSTIN}, but the selected company's GSTIN is ${company.gstin}. Did you upload the wrong file?`,
         });
+      }
+
+      // GSTR-2A carries no supplier trade name (`trdnm`), unlike 2B — the
+      // portal only gives us the counterparty GSTIN. Backfill the name from
+      // our own ledger master so the recon report isn't a wall of blanks.
+      const namelessGstins = [
+        ...new Set(
+          parsed.records
+            .filter((r) => !r.supplierName && r.supplierGSTIN)
+            .map((r) => r.supplierGSTIN),
+        ),
+      ];
+      if (namelessGstins.length) {
+        try {
+          const ledgers = await Acc_Ledger.find({
+            companyId,
+            $or: [
+              { gstin: { $in: namelessGstins } },
+              { "additionalGstins.gstin": { $in: namelessGstins } },
+            ],
+          })
+            .select("name gstin additionalGstins")
+            .lean();
+          const byGstin = new Map();
+          for (const lg of ledgers) {
+            for (const g of [
+              lg.gstin,
+              ...(lg.additionalGstins || []).map((a) => a.gstin),
+            ]) {
+              const key = String(g || "")
+                .toUpperCase()
+                .trim();
+              if (key && !byGstin.has(key)) byGstin.set(key, lg.name);
+            }
+          }
+          for (const r of parsed.records) {
+            if (!r.supplierName && byGstin.has(r.supplierGSTIN))
+              r.supplierName = byGstin.get(r.supplierGSTIN);
+          }
+        } catch (e) {
+          // Non-fatal — the import is still valid without resolved names.
+          console.error("[gstr2b/upload] supplier name backfill:", e.message);
+        }
       }
 
       // Upsert — re-uploading the same (period, type) replaces the prior import.
@@ -980,14 +1160,21 @@ router.get("/:period/recon", accountantAuth, async (req, res) => {
       status: "posted",
     })
       .select(
-        "voucherNumber voucherDate voucherType partyLedgerName partyLedgerId ledgerEntries inventoryEntries",
+        "voucherNumber voucherDate voucherType partyLedgerName partyLedgerId partyGstin ledgerEntries inventoryEntries",
       )
       .lean();
 
     // Flatten vouchers into bookRecords matching the 2B record shape
     const bookRecords = [];
     for (const v of vouchers) {
-      let supplierGSTIN = gstinByLedger[v.partyLedgerName] || "";
+      // `partyGstin` is the registration the accountant actually picked on the
+      // voucher. It's the only correct answer for a party with several GSTINs,
+      // since `gstinByLedger` only knows the ledger's PRIMARY one — falling
+      // straight to that would reconcile a branch bill against head office.
+      let supplierGSTIN =
+        (v.partyGstin || "").toUpperCase().trim() ||
+        gstinByLedger[v.partyLedgerName] ||
+        "";
 
       // For journal vouchers, partyLedgerName may be empty (freight entries).
       // Scan Cr ledger entries to find a vendor/creditor with a GSTIN.

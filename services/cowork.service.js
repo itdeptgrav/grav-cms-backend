@@ -102,6 +102,51 @@ async function createCoworkEmployee({ name, email, mobile, city, department, rol
 }
 
 
+// ── VERIFY A PASSWORD THE CALLER CLAIMS IS THEIRS ───────────────────────────
+//
+// The Admin SDK can SET a password but cannot CHECK one — password hashes never
+// leave Google. The only way to test a password is to try signing in with it,
+// which is what the Identity Toolkit endpoint below does. It is the same call
+// the browser SDK makes for a normal sign-in.
+//
+// The key is the Firebase **Web API key** — the public one already embedded in
+// the frontend bundle, not a secret. Set FIREBASE_WEB_API_KEY (or reuse
+// FIREBASE_API_KEY) to switch this on.
+//
+// Returns one of:
+//   { ok: true }                       — the password is correct
+//   { ok: false, reason: "wrong" }     — it is not
+//   { ok: false, reason: "throttled" } — Google is rate-limiting this account
+//   { ok: false, reason: "unavailable" } — no key configured, or Google is down
+//
+// "unavailable" is deliberately distinct from "wrong". A caller must not treat
+// "we could not check" as "the password was correct", and equally must not tell
+// somebody their own password is wrong because a key is missing from a server.
+async function verifyEmployeePassword({ email, password }) {
+  const key = process.env.FIREBASE_WEB_API_KEY || process.env.FIREBASE_API_KEY;
+  if (!key) return { ok: false, reason: "unavailable", detail: "No FIREBASE_WEB_API_KEY configured." };
+  if (!email || !password) return { ok: false, reason: "wrong" };
+
+  const axios = require("axios");
+  try {
+    await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(key)}`,
+      { email, password, returnSecureToken: false },
+      { timeout: 10000 },
+    );
+    return { ok: true };
+  } catch (e) {
+    const code = e.response?.data?.error?.message || "";
+    if (code.startsWith("TOO_MANY_ATTEMPTS")) return { ok: false, reason: "throttled" };
+    // INVALID_PASSWORD, EMAIL_NOT_FOUND, INVALID_LOGIN_CREDENTIALS — newer
+    // Firebase collapses the first two into the third on purpose, so that a
+    // failed check cannot be used to discover which addresses have accounts.
+    if (e.response?.status === 400) return { ok: false, reason: "wrong" };
+    console.error("[verifyEmployeePassword]", code || e.message);
+    return { ok: false, reason: "unavailable", detail: code || e.message };
+  }
+}
+
 // ── CHANGE EMPLOYEE PASSWORD ────────────────────────────
 async function changeEmployeePassword({ employeeId, authUid, newPassword }) {
   if (newPassword.length < 6) throw new Error("Password must be at least 6 characters.");
@@ -1319,6 +1364,7 @@ async function getDirectMessagesWithFallback(conversationId, limit = 60) {
 module.exports = {
   createCoworkEmployee,
   changeEmployeePassword,
+  verifyEmployeePassword,
   listCoworkEmployees,
   invalidateEmpListCache,
   getCoworkEmployee,

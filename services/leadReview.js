@@ -19,7 +19,11 @@
 //     same one the old activate path used). This function only records that
 //     the review was approved.
 //
-// The four transitions, and who the route restricts each to:
+// The transitions, and who the route restricts each to:
+//   convert (researching|returned → approved)    — the Prospect's owner/creator
+//     (20 Aug 2026 — the direct path; see applyDirectConvert. The HOD-review
+//     hop is no longer in the UI, but submit/approve/return/reject below are
+//     left in place rather than removed — nothing forces their use anymore.)
 //   submit  (researching|returned → submitted)  — the Prospect's owner/creator
 //   approve (submitted → approved)               — HOD/admin only
 //   return  (submitted → returned)               — HOD/admin only, reason req.
@@ -88,6 +92,39 @@ function applyApprove(lead, { actor } = {}) {
 }
 
 /**
+ * Convert a Prospect straight to Active Lead — researching|returned →
+ * approved, skipping "submitted" entirely. The HOD-review hop was removed
+ * (20 Aug 2026, explicit request: "these are not needed... directly just
+ * keep the button for Convert to Active Lead"). Same destination state as
+ * submit-then-approve (reviewStatus "approved"), just reached in one
+ * transition instead of two, so nothing downstream that reads reviewStatus
+ * has to know the difference. Readiness (services/leadReadiness.js
+ * computeSubmissionReadiness) is enforced by the route, same as submit was.
+ */
+function applyDirectConvert(lead, { actor } = {}) {
+  if (lead.captureStatus !== "draft") {
+    throw new LeadReviewError("Only a Prospect can be converted to an Active Lead.");
+  }
+  // Deliberately wider than SUBMITTABLE_FROM: also allows a Prospect a HOD
+  // never got to review before this hop was removed ("submitted", left mid-
+  // flow) to still convert, rather than getting stuck with no UI that can
+  // move it. Only "approved"/"rejected" (already resolved) are refused.
+  if (!["researching", "submitted", "returned"].includes(currentReview(lead))) {
+    throw new LeadReviewError(
+      `This Prospect has already been reviewed (currently "${currentReview(lead)}").`,
+    );
+  }
+  const now = new Date();
+  lead.submittedAt = now;
+  lead.submittedBy = actor;
+  lead.reviewStatus = "approved";
+  lead.reviewedAt = now;
+  lead.reviewedBy = actor;
+  lead.reviewReason = undefined;
+  if (actor) lead.updatedBy = actor;
+}
+
+/**
  * Return a submitted Prospect for more information. submitted → returned.
  * A reason is required (it's shown to the salesperson so they know what to
  * add). Stays a Prospect (captureStatus unchanged) and becomes editable /
@@ -132,6 +169,7 @@ module.exports = {
   LeadReviewError,
   applySubmit,
   applyApprove,
+  applyDirectConvert,
   applyReturn,
   applyReject,
 };

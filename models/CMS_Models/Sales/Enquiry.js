@@ -111,14 +111,17 @@ const enquirySchema = new mongoose.Schema(
           existingUniform: { type: String, trim: true }, // existing garment details / what they wear now
 
           // Reference images — what the garment should look like, so Merchandising
-          // + Industrial Engineering can cost it. Uploaded to Google Drive via
-          // /api/upload-to-drive (file made public), previewed inline.
+          // + Industrial Engineering can cost it. Previewed inline. Uploaded via
+          // Cloudinary (`publicId` set) since 19 Aug 2026 — see
+          // grav-clothing/lib/driveImage.js. Older rows uploaded to Google Drive
+          // via /api/upload-to-drive (`fileId` set) still resolve and render.
           images: [
             new mongoose.Schema(
               {
-                fileId: { type: String, trim: true },
+                fileId: { type: String, trim: true }, // Drive file id (legacy)
+                publicId: { type: String, trim: true }, // Cloudinary public id
                 name: { type: String, trim: true },
-                url: { type: String, trim: true }, // Drive view/thumbnail URL
+                url: { type: String, trim: true }, // direct image URL
               },
               { _id: false },
             ),
@@ -128,7 +131,7 @@ const enquirySchema = new mongoose.Schema(
       ),
     ],
 
-    // ── Costing sheets (CoWork bridge) — top-level, keyed by PRODUCT NAME ───
+    // ── Costing sheets — NATIVE, keyed by PRODUCT NAME (19 Aug 2026) ────────
     // Not embedded on the product row above, and not keyed by that row's
     // _id: routes/CMS_Routes/Sales/enquiries.js's sanitizeProducts() rebuilds
     // the entire `products` array from client input on every "Save
@@ -138,33 +141,29 @@ const enquirySchema = new mongoose.Schema(
     // edited a quantity. Product NAME survives that rewrite — it's the field
     // a requirement edit actually preserves — so it is what this joins on.
     // If a product is later renamed, its costing sheet is not auto-migrated;
-    // the sheet itself still exists in CoWork and isn't lost, just no longer
-    // linked from this row until someone re-links it.
+    // it still exists, just no longer linked from this row until re-linked.
     //
-    // The sheet's cell content and live collaboration state live entirely in
-    // CoWork (Firestore cowork_documents/cowork_document_bodies, kind:
-    // "sheet") — this is only the pointer plus a denormalised membership
-    // snapshot so the CMS can render without a round trip to CoWork on every
-    // list view. Source of truth for membership stays the CoWork document
-    // itself — see services/coworkSheets.service.js.
-    // A product now has ONE SHEET PER CONTRIBUTOR, not one sheet (17 Aug 2026).
-    // CoWork's roles are whole-document, so the only way to say "the
-    // merchandiser owns the materials and the industrial engineer owns the
-    // operations" is to give each of them their own document. `part` says which
-    // half a row is, and (productName, part) is the key.
+    // FORMERLY a pointer into a CoWork Firestore workbook (cowork_documents/
+    // cowork_document_bodies). Moved fully native (19 Aug 2026, explicit
+    // request): raw items and production cost are now defined directly here —
+    // `materials`/`operations` ARE the costing, not a mirror of one. No
+    // Firestore round trip, no CoWork document, no "Open in CoWork" escape
+    // hatch. `members`/`assignee` keep the exact same access-control shape
+    // CoWork's own documents used (owner|editor|viewer), just enforced here
+    // instead of by a Firestore document's member list.
     //
-    //   raw        → the merchandiser's raw-materials sheet
-    //   operations → the industrial engineer's operations sheet
-    //   combined   → a pre-split two-tab sheet. Rows written before the split
-    //                have no `part` at all and default to this, so the costings
-    //                already out there keep resolving without a migration.
+    // A product still has ONE SHEET PER CONTRIBUTOR: `part` says which half a
+    // row set is, and (productName, part) is the key.
+    //
+    //   raw        → the merchandiser's raw-materials rows
+    //   operations → the industrial engineer's operation rows
+    //   combined   → a pre-split sheet holding both. Rows written before the
+    //                split have no `part` at all and default to this.
     costingSheets: [
       new mongoose.Schema(
         {
           productName: { type: String, trim: true, required: true },
           part: { type: String, trim: true, enum: ["raw", "operations", "combined"], default: "combined" },
-          documentId: { type: String, trim: true, required: true }, // cowork_documents doc id
-          title: { type: String, trim: true },
           // Whose sheet this is — the one person expected to fill it in, held
           // separately from `members` because "has access" and "is responsible
           // for it" are different questions and the second one is the one Sales
@@ -175,11 +174,269 @@ const enquirySchema = new mongoose.Schema(
           },
           createdAt: { type: Date, default: Date.now },
           createdBy: actorRef(),
+          // Bumped on every save of this sheet's rows — the optimistic-
+          // concurrency anchor a client's `expectedUpdatedAt` is checked
+          // against, same purpose the CoWork document's own `updatedAt` served.
+          updatedAt: { type: Date, default: Date.now },
           members: [
             {
               employeeId: { type: String, trim: true },
               name: { type: String, trim: true },
               role: { type: String, trim: true, enum: ["owner", "editor", "viewer"] },
+            },
+          ],
+          // Raw-materials rows (part: "raw", or both halves of "combined").
+          // Each gets its own _id, used client-side as the row's stable key —
+          // no more spreadsheet row-number bookkeeping.
+          materials: [
+            new mongoose.Schema(
+              {
+                category: { type: String, trim: true },
+                item: { type: String, trim: true },
+                // Set only when `item` was picked from the Store raw-item
+                // master (searchRawItems) rather than typed free-text — lets
+                // the row's own "info" button pull that item's full record
+                // (21 Aug 2026, "keep the info button for each and every raw
+                // item" extended to this sheet). A typed line with no master
+                // match simply has no id here, which is expected, not a bug.
+                rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
+                vendor: { type: String, trim: true },
+                unitCost: { type: String, trim: true },
+                // The unit consumption is counted in — a name from the Unit
+                // master (Store's raw-item register), not a free-cost figure.
+                // Added 20 Aug 2026 so a costing line can say "0.4" and mean
+                // something, instead of leaving the reader to guess metres vs
+                // pieces vs kilograms.
+                unit: { type: String, trim: true },
+                consumption: { type: String, trim: true },
+                // Only set when this row was seeded from an R&D-approved
+                // sample's consumption (see enquiries.js's
+                // seedMaterialsFromApprovedSample) — the wastage/buffer % R&D
+                // planned around, shown to Sales read-only alongside
+                // Consumption (which already has it baked in) so the number
+                // isn't opaque (20 Aug 2026, explicit request).
+                allowancePercent: { type: String, trim: true },
+              },
+              { _id: true },
+            ),
+          ],
+          // Operation rows (part: "operations", or both halves of "combined").
+          operations: [
+            new mongoose.Schema(
+              {
+                detail: { type: String, trim: true },
+                sam: { type: String, trim: true },
+                rate: { type: String, trim: true },
+              },
+              { _id: true },
+            ),
+          ],
+          // Miscellaneous cost rows (19 Aug 2026) — a straight name + price
+          // line, for whatever doesn't fit the raw-materials or operations
+          // shape: testing, handling, a courier fee, wastage allowance. Lives
+          // on the "raw"/merchandiser sheet (and "combined" pre-split sheets),
+          // same edit rights as `materials` — a plain cost line needs no
+          // vendor lookup or SAM measurement, just what it's called and what
+          // it costs.
+          miscellaneous: [
+            new mongoose.Schema(
+              {
+                name: { type: String, trim: true },
+                price: { type: String, trim: true },
+              },
+              { _id: true },
+            ),
+          ],
+        },
+        { _id: false },
+      ),
+    ],
+
+    // ── Costing change log — Merchandiser/PM propose, Sales decides (19 Aug
+    // 2026, explicit request) ────────────────────────────────────────────────
+    //
+    // Merchandiser and Project Manager/IE are NOT restricted to their own
+    // part anymore — either can fill raw materials, operations or
+    // miscellaneous. What replaces field-level restriction is this: a save
+    // from either of those two roles does not touch `costingSheets` directly
+    // — it lands here instead, as a PROPOSED full snapshot of whichever
+    // field(s) they changed, `status: "pending"`. Sales (or an admin/CEO)
+    // reviews it, and Approve copies the snapshot onto the real
+    // `costingSheets` entry; Reject just marks it rejected and changes
+    // nothing. A Sales save is never staged — it applies immediately, same
+    // as always, since Sales IS the approver.
+    costingChangeLog: [
+      new mongoose.Schema(
+        {
+          productName: { type: String, trim: true, required: true },
+          part: { type: String, trim: true, enum: ["raw", "operations", "combined"], default: "combined" },
+          // Only the field(s) actually submitted are set — applying a
+          // decision only ever touches what's present here, never blanks a
+          // field the submitter didn't propose changing.
+          materials: [
+            new mongoose.Schema(
+              {
+                category: { type: String, trim: true },
+                item: { type: String, trim: true },
+                rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", default: null },
+                vendor: { type: String, trim: true },
+                unitCost: { type: String, trim: true },
+                unit: { type: String, trim: true },
+                consumption: { type: String, trim: true },
+                allowancePercent: { type: String, trim: true },
+              },
+              { _id: false },
+            ),
+          ],
+          operations: [
+            new mongoose.Schema(
+              {
+                detail: { type: String, trim: true },
+                sam: { type: String, trim: true },
+                rate: { type: String, trim: true },
+              },
+              { _id: false },
+            ),
+          ],
+          miscellaneous: [
+            new mongoose.Schema(
+              {
+                name: { type: String, trim: true },
+                price: { type: String, trim: true },
+              },
+              { _id: false },
+            ),
+          ],
+          status: { type: String, trim: true, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
+          submittedBy: actorRef(),
+          submittedAt: { type: Date, default: Date.now },
+          decidedBy: actorRef(),
+          decidedAt: { type: Date, default: null },
+        },
+        { timestamps: false },
+      ),
+    ],
+
+    // ── Costing lifecycle — the three steps after a product is costed (20 Aug
+    // 2026, explicit request, replacing the removed PI/quotation workflow on
+    // the Cost & Quote screen): sent to the customer, the customer's
+    // approve/reject, and asking Store to add the finished product as an
+    // Inventory Stock Item. Deliberately its own array keyed by PRODUCT NAME —
+    // same reasoning as costingSheets above: a "Save requirement" rewrite of
+    // `products[]` reassigns every row a fresh _id, so anything that has to
+    // survive that can only join on the name.
+    //
+    // "Stock item requested" is a FLAG, not a StockItem creation — Store still
+    // does that themselves, with the SKU/category/BOM decisions a request
+    // can't make for them. This just records that Sales asked and when.
+    costingLifecycle: [
+      new mongoose.Schema(
+        {
+          productName: { type: String, trim: true, required: true },
+          sentToCustomerAt: { type: Date },
+          sentToCustomerBy: actorRef(),
+
+          // ── Customer approval — a LOG, not a switch (20 Aug 2026, explicit
+          // request: "it seems like u are making it just normally so that the
+          // user can change anytime he want ok, so don't do that ok, keep an
+          // proper log and all like the reason and all"). Every decision
+          // (first one and any later reversal) is APPENDED here, never
+          // overwritten — the full history of who decided what, when, and
+          // why is what "proper" meant. `customerApproved` etc. below are a
+          // cache of the LAST entry, kept only so a reader doesn't have to
+          // walk the log for the common case; the log is the source of truth.
+          customerApprovalLog: [
+            new mongoose.Schema(
+              {
+                approved: { type: Boolean, required: true },
+                decidedAt: { type: Date, default: Date.now },
+                decidedBy: actorRef(),
+                // Required when this entry REVERSES the previous one (the
+                // route enforces this — a first decision can be quick, a
+                // change of mind has to say why).
+                note: { type: String, trim: true },
+              },
+              { _id: false },
+            ),
+          ],
+          // null = no decision yet; a real boolean once the customer answers.
+          // Cache of customerApprovalLog[last] — see that field's comment.
+          customerApproved: { type: Boolean, default: null },
+          customerApprovedAt: { type: Date },
+          customerApprovedBy: actorRef(),
+          customerDecisionNote: { type: String, trim: true },
+
+          stockItemRequestedAt: { type: Date },
+          stockItemRequestedBy: actorRef(),
+          // Merchandising's own decision on the request (app/merchandiser
+          // /products' "Requests" view) — separate from the customer's
+          // approval above, and from an actual StockItem existing: approving
+          // here just means Merchandising accepts the ask and will create
+          // the Stock Item themselves (SKU/BOM decisions stay theirs).
+          stockItemRequestStatus: { type: String, trim: true, enum: ["none", "pending", "approved", "rejected"], default: "none" },
+          stockItemRequestDecidedAt: { type: Date },
+          stockItemRequestDecidedBy: actorRef(),
+          stockItemRequestDecisionNote: { type: String, trim: true },
+        },
+        { _id: false },
+      ),
+    ],
+
+    // ── Product sheets — free-form, CoWork-backed, per product (19 Aug 2026) ─
+    //
+    // Not costing. This is the general-purpose "communicate in a sheet"
+    // surface the salesperson raises per product and shares with whoever
+    // needs it — a place to work something out together beyond the
+    // structured costing/requirement fields, without leaving this page. It is
+    // the exact mechanism costing used to use (a CoWork
+    // cowork_documents/cowork_document_bodies "sheet" document, native
+    // grid + "Open in CoWork"), freed up once costing went native and
+    // repointed at this instead — see services/coworkSheets.service.js.
+    //
+    // Keyed by (productName), one sheet per product. `members` is the whole
+    // access-control story: the creator is always `owner`; the salesperson
+    // decides who else gets `editor` (can change it) or `viewer` (can only
+    // read it) — see PATCH /:id/product-sheet/members.
+    productSheets: [
+      new mongoose.Schema(
+        {
+          productName: { type: String, trim: true, required: true },
+          documentId: { type: String, trim: true, required: true }, // cowork_documents doc id
+          title: { type: String, trim: true },
+          createdAt: { type: Date, default: Date.now },
+          createdBy: actorRef(),
+          members: [
+            {
+              employeeId: { type: String, trim: true },
+              name: { type: String, trim: true },
+              role: { type: String, trim: true, enum: ["owner", "editor", "viewer"] },
+            },
+          ],
+        },
+        { _id: false },
+      ),
+    ],
+
+    // ── Product chat — per product, CoWork group underneath (19 Aug 2026) ───
+    //
+    // A real conversation, product by product, shown on this page instead of
+    // sending anyone to CoWork to find it. Backed by an ordinary CoWork group
+    // (cowork_groups + its messages subcollection) created via
+    // services/cowork.service.js — the same mechanism CoWork's own group chat
+    // uses, just minted from here. Membership is who the salesperson has
+    // added; there is no separate "role" here the way the sheet has one —
+    // being in the conversation IS the access.
+    productThreads: [
+      new mongoose.Schema(
+        {
+          productName: { type: String, trim: true, required: true },
+          groupId: { type: String, trim: true, required: true }, // cowork_groups doc id
+          createdAt: { type: Date, default: Date.now },
+          createdBy: actorRef(),
+          members: [
+            {
+              employeeId: { type: String, trim: true },
+              name: { type: String, trim: true },
             },
           ],
         },

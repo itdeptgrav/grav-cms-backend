@@ -101,41 +101,10 @@ router.get("/scheduling/blocked-dates", verifyCoworkToken, async (req, res) => {
 });
 
 // ── Change Password ──────────────────────────────
-//
-// Self-service: somebody changing their OWN password. The current one has to be
-// proved, not just claimed — a session token alone is not enough authority to
-// lock its owner out of their account. A borrowed laptop with an open tab is the
-// ordinary case, not an exotic one.
-//
-// The client already sent `currentPassword` before this checked it. That was the
-// gap: the field was accepted and dropped on the floor.
 router.post("/change-password", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { currentPassword, newPassword } = req.body;
-
-    if (!newPassword || newPassword.length < 6)
-      return res.status(400).json({ error: "Password must be at least 6 characters." });
-    if (currentPassword && newPassword === currentPassword)
-      return res.status(400).json({ error: "Your new password must be different from your current one." });
-
-    const email = req.coworkUser.employeeData?.email || "";
-
-    // Verified where the server can. When no web API key is configured the
-    // check cannot run at all — that is a server misconfiguration, and it fails
-    // CLOSED rather than waving the request through, because a password change
-    // that skips its own check is the whole vulnerability.
-    const check = await svc.verifyEmployeePassword({ email, password: currentPassword });
-    if (!check.ok) {
-      if (check.reason === "wrong")
-        return res.status(403).json({ error: "That is not your current password." });
-      if (check.reason === "throttled")
-        return res.status(429).json({ error: "Too many attempts. Wait a few minutes and try again." });
-      console.error("[change-password] cannot verify current password:", check.detail);
-      return res.status(503).json({
-        error: "Passwords cannot be changed right now — this server cannot verify your current one. Please tell your administrator.",
-      });
-    }
-
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
     await svc.changeEmployeePassword({ employeeId: req.coworkUser.employeeId, authUid: req.coworkUser.authUid, newPassword });
     res.json({ success: true, message: "Password changed successfully." });
   } catch (e) { res.status(400).json({ error: e.message }); }
@@ -370,22 +339,11 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, re
     const resolvedRole = empRole === "tl" ? "tl" : "employee";
     const result = await svc.createCoworkEmployee({ name, email, mobile, city, department, role: resolvedRole, employeeId: chosenId || null });
 
-    // Send the new starter their id and temporary password.
-    //
-    // Awaited rather than fired and forgotten: the admin who created the account
-    // is holding the only other copy of that password, so they have to be told
-    // when the email did not go. It never throws past here — the account is
-    // already written, and a failed mail must not turn it into a 500.
-    let welcomeEmail = { sent: false, reason: "Not attempted." };
-    try {
-      welcomeEmail = await sendWelcomeEmail(
-        { name, email, employeeId: result.employeeId, role: resolvedRole, department },
-        result.tempPassword
-      );
-    } catch (err) {
-      welcomeEmail = { sent: false, reason: err?.message || "Unknown mail error" };
-      console.error("[cowork/create-employee] Email error:", err?.message || err);
-    }
+    // Send welcome email (non-blocking)
+    sendWelcomeEmail(
+      { name, email, employeeId: result.employeeId, role: resolvedRole, department },
+      result.tempPassword
+    ).catch(err => console.error("[cowork/create-employee] Email error:", err.message));
 
     invalidateEmpListCache();
     res.status(201).json({
@@ -393,8 +351,6 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, re
       employeeId: result.employeeId,
       tempPassword: result.tempPassword,
       role: resolvedRole,
-      emailSent: !!welcomeEmail?.sent,
-      emailError: welcomeEmail?.sent ? null : welcomeEmail?.reason || null,
     });
   } catch (e) {
     // Firebase also throws this if race condition hits after our check
@@ -631,64 +587,6 @@ router.post("/employee/:id/reset-password", verifyCoworkToken, verifyCeoOrTL, as
     });
   } catch (e) {
     console.error("[reset-password]", e);
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-
-// ── Resend somebody's sign-in details, on demand ─────────────────────────────
-//
-// The welcome email goes out automatically when the account is made. This is for
-// afterwards: it bounced, it went to spam, they deleted it, the mail server was
-// switched off that day. The admin presses Send mail and it goes again.
-//
-// It can only ever resend the TEMPORARY password, because that is the only one
-// anybody still holds — once somebody chooses their own, `changeEmployeePassword`
-// nulls `tempPassword` and nobody on earth can read it back, administrators
-// included. So this refuses rather than sending a mail with no password in it,
-// and names the button that CAN help: Reset password.
-router.post("/employee/:id/send-credentials", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
-  try {
-    const { id: employeeId } = req.params;
-    const empDoc = await db.collection("cowork_employees").doc(employeeId).get();
-    if (!empDoc.exists) return res.status(404).json({ error: "Employee not found." });
-
-    const emp = empDoc.data();
-    if (!emp.email)
-      return res.status(400).json({ error: "This employee has no email address on file." });
-
-    if (emp.passwordChanged !== false || !emp.tempPassword) {
-      return res.status(409).json({
-        // Short enough to be read where it is shown — the full reasoning is in
-        // the help article. The instruction is the part that must survive.
-        error: "They have chosen their own password, which cannot be read back. Use Reset password instead.",
-      });
-    }
-
-    const { sendWelcomeEmail } = require("../../services/emailNotifications.service");
-    const result = await sendWelcomeEmail(
-      { name: emp.name, email: emp.email, employeeId, role: emp.role, department: emp.department || "" },
-      emp.tempPassword,
-    );
-
-    if (!result?.sent) {
-      return res.status(502).json({
-        error: result?.reason || "The email could not be sent.",
-        // The provider's own wording, unabridged. `error` is the short version
-        // fit for a table cell; this is for whoever has to diagnose it.
-        detail: result?.detail || null,
-        emailSent: false,
-      });
-    }
-
-    console.log(`[SendCredentials] ${employeeId} -> ${emp.email} by ${req.coworkUser.employeeId}`);
-    return res.json({
-      success: true,
-      emailSent: true,
-      message: `Sign-in details sent to ${emp.email}.`,
-    });
-  } catch (e) {
-    console.error("[send-credentials]", e);
     return res.status(500).json({ error: e.message });
   }
 });

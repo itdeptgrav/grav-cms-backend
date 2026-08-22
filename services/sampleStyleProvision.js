@@ -75,20 +75,36 @@ async function provisionJourneyStyles({
     let style = (pid && byProductId.get(pid)) || byName.get(p.product);
 
     if (!style) {
-      style = await createWithRef(SampleStyle, {
-        journeyId: journey._id,
-        enquiryId: enquiry?._id,
-        enquiryProductId: p._id || undefined,
-        accountId: journey.accountId,
-        productName: p.product,
-        styleCode: `SC-${journey.journeyId}-${String(i + 1).padStart(2, "0")}`,
-        ownerId: journey.ownerId,
-        ownerName: journey.ownerName,
-        brief: briefFromProduct(p),
-        createdBy: actor,
-        updatedBy: actor,
-      });
-      created += 1;
+      try {
+        style = await createWithRef(SampleStyle, {
+          journeyId: journey._id,
+          enquiryId: enquiry?._id,
+          enquiryProductId: p._id || undefined,
+          accountId: journey.accountId,
+          productName: p.product,
+          styleCode: `SC-${journey.journeyId}-${String(i + 1).padStart(2, "0")}`,
+          ownerId: journey.ownerId,
+          ownerName: journey.ownerName,
+          brief: briefFromProduct(p),
+          createdBy: actor,
+          updatedBy: actor,
+        });
+        created += 1;
+      } catch (err) {
+        // Two callers racing to provision the same journey (React StrictMode's
+        // double effect-invoke, or Sales and R&D opening it within
+        // milliseconds of each other) both pass the "doesn't exist yet" read
+        // above before either commits. The {journeyId, productName} unique
+        // index (see the model) means only one of the two concurrent inserts
+        // can land — the loser re-reads the winner's doc instead of failing
+        // the whole request (19 Aug 2026, bug fix; this IS the race that
+        // produced duplicate SampleStyle rows before this index existed).
+        const isDuplicateProduct =
+          err?.code === 11000 && JSON.stringify(err?.keyPattern || {}).includes("productName");
+        if (!isDuplicateProduct) throw err;
+        style = await SampleStyle.findOne({ journeyId: journey._id, productName: p.product, isActive: true });
+        if (!style) throw err; // genuinely unexpected — surface the original error
+      }
       if (pid) byProductId.set(pid, style);
       byName.set(style.productName, style);
     } else {

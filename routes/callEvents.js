@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const CallEvent = require("../models/CallEvent");
+const { findMatchingCallEvent } = require("../services/callEventMatch.service");
 
 /** Optional shared-secret (same scheme as callRecordings). */
 function checkApiKey(req, res, next) {
@@ -12,31 +13,80 @@ function checkApiKey(req, res, next) {
 }
 
 /**
+ * Whether a call actually connected — derived server-side from `callType`
+ * (read straight off the device's own system call log by the app, the one
+ * value here that isn't a client guess) rather than trusting the app's own
+ * `received` boolean blindly. Mirrors CallLogEntry.received in the Android
+ * app's CallLogResolver.kt exactly, so the two never disagree — but this is
+ * now the SOURCE OF TRUTH: a client bug that ever miscomputes `received`
+ * can't silently mislabel a missed call as answered once it reaches Mongo
+ * (21 Aug 2026, explicit request — "if anything missing as per the data
+ * sent by the app... let's handle those in the backend").
+ */
+function deriveReceived(callType, durationSec) {
+  const d = Number(durationSec) || 0;
+  switch (callType) {
+    case "MISSED":
+    case "REJECTED":
+    case "BLOCKED":
+      return false;
+    case "INCOMING":
+    case "ANSWERED_EXTERNALLY":
+      return true;
+    default:
+      return d > 0;
+  }
+}
+
+/** "whether call reject or not" — explicit declines only, never a plain unanswered ring. */
+function deriveRejected(callType) {
+  return callType === "REJECTED";
+}
+
+/**
  * POST /api/call-events   (application/json)
- * Logs one call's outcome (received/missed/etc). No audio.
- * Idempotent on (startTime + phoneNumber) so a re-send doesn't duplicate.
+ * Logs one call's outcome (received/missed/rejected/etc) — no audio here,
+ * see /api/recordings for that half. Writes into the SAME CallEvent document
+ * a recording upload for this call would use (matched by phone + time
+ * window, see callEventMatch.service), so a call reported here first and
+ * recorded a moment later ends up as ONE document, not two.
  */
 router.post("/", checkApiKey, async (req, res) => {
   try {
     const b = req.body || {};
+    const phoneNumber = b.phoneNumber ?? null;
+    const callType = b.callType ?? "UNKNOWN";
+    const durationSec = b.durationSec ?? 0;
+    const received = deriveReceived(callType, durationSec);
+    const rejected = deriveRejected(callType);
 
-    if (b.startTime) {
-      const dup = await CallEvent.findOne({
-        startTime: b.startTime,
-        phoneNumber: b.phoneNumber ?? null,
-      }).select("_id").lean();
-      if (dup) return res.json({ success: true, mongoId: String(dup._id), duplicate: true });
+    const existing = b.startTime ? await findMatchingCallEvent(phoneNumber, b.startTime) : null;
+    if (existing) {
+      // Already has a document (most likely the recording upload for this
+      // same call arrived first) — refresh the outcome fields onto it
+      // rather than creating a second one.
+      existing.contactName = b.contactName ?? existing.contactName;
+      existing.direction = b.direction ?? existing.direction;
+      existing.callType = callType;
+      existing.received = received;
+      existing.rejected = rejected;
+      existing.durationSec = durationSec;
+      existing.endTime = b.endTime ?? existing.endTime;
+      await existing.save();
+      return res.json({ success: true, mongoId: String(existing._id), duplicate: true });
     }
 
     const doc = await CallEvent.create({
-      phoneNumber: b.phoneNumber ?? null,
+      phoneNumber,
       contactName: b.contactName ?? null,
       direction: b.direction ?? "UNKNOWN",
-      callType: b.callType ?? "UNKNOWN",
-      received: !!b.received,
-      durationSec: b.durationSec ?? 0,
+      callType,
+      received,
+      rejected,
+      durationSec,
       startTime: b.startTime,
       endTime: b.endTime ?? null,
+      source: b.source || "personalcallrecorder",
     });
 
     res.json({ success: true, mongoId: doc._id.toString() });
@@ -46,7 +96,7 @@ router.post("/", checkApiKey, async (req, res) => {
   }
 });
 
-/** GET /api/call-events — recent call events (verification). */
+/** GET /api/call-events — recent call events (verification). Every call, recorded or not. */
 router.get("/", checkApiKey, async (_req, res) => {
   try {
     const items = await CallEvent.find().sort({ createdAt: -1 }).limit(100).lean();

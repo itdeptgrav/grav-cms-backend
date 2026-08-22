@@ -1,6 +1,7 @@
 // /service/emailService.js
 
 const axios = require('axios');
+const { brevoAgent } = require('../config/brevoAgent');
 
 const CEO_NOTIFICATION_EMAIL = "ray@grav.in";
 const CEO_NOTIFICATION_NAME = "Grav CEO";
@@ -41,6 +42,9 @@ class EmailService {
         };
         const response = await axios.post(`${this.baseUrl}/smtp/email`, merged, {
             headers: { 'api-key': this.apiKey, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            // Same outbound address as every other Brevo call, so one allowlist
+            // entry covers HR mail too — see config/brevoAgent.js.
+            ...(brevoAgent ? { httpsAgent: brevoAgent } : {}),
         });
         return { success: true, messageId: response.data.messageId };
     }

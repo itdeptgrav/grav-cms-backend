@@ -9,6 +9,7 @@
  */
 
 const axios = require("axios");
+const { brevoAgent } = require("../config/brevoAgent");
 
 const BREVO_URL = "https://api.brevo.com/v3/smtp/email";
 const FROM_EMAIL = process.env.CUSTOMER_SENDER_EMAIL || "noreply@grav.in";
@@ -16,10 +17,13 @@ const FROM_NAME = "Grav CoWork";
 const LOGIN_URL = process.env.COWORK_APP_URL || "https://cowork.grav.in";
 
 // ── Internal Brevo send ────────────────────────────────────────────────────
+// Returns { sent, reason } so a caller that promises the user "we emailed them"
+// can tell whether that is true. Every existing caller ignores the return value,
+// which is why this could be added without touching any of them.
 async function _send({ to, subject, html, text }) {
-    if (process.env.ENABLE_EMAILS !== "true") { console.warn(`[Email] SKIPPED "${subject}" — ENABLE_EMAILS is not "true"`); return; }
+    if (process.env.ENABLE_EMAILS !== "true") { console.warn(`[Email] SKIPPED "${subject}" — ENABLE_EMAILS is not "true"`); return { sent: false, reason: "Email sending is switched off on the server (ENABLE_EMAILS)." }; }
     const key = process.env.BREVO_API_KEY;
-    if (!key) { console.warn("[Email] BREVO_API_KEY not set"); return; }
+    if (!key) { console.warn("[Email] BREVO_API_KEY not set"); return { sent: false, reason: "No mail API key is configured on the server." }; }
     try {
         await axios.post(BREVO_URL, {
             sender: { name: FROM_NAME, email: FROM_EMAIL },
@@ -38,17 +42,60 @@ async function _send({ to, subject, html, text }) {
         }, {
             headers: { "api-key": key, "Content-Type": "application/json", Accept: "application/json" },
             timeout: 10000,
+            // Pinned to one outbound address so Brevo's IP allowlist can hold —
+            // see config/brevoAgent.js.
+            ...(brevoAgent ? { httpsAgent: brevoAgent } : {}),
         });
         const toStr = (Array.isArray(to) ? to : [to]).map(t => t.email).join(", ");
         console.log(`[Email] "${subject}" -> ${toStr}`);
+        return { sent: true };
     } catch (e) {
-        console.error(`[Email] Failed "${subject}":`, e.response?.data?.message || e.message);
+        const raw = e.response?.data?.message || e.message || "Unknown mail error";
+        console.error(`[Email] Failed "${subject}":`, raw);
+        return { sent: false, reason: _mailErrorSummary(raw, e.response?.status), detail: raw };
     }
+}
+
+/**
+ * A provider error in one short line somebody can act on.
+ *
+ * Brevo answers in prose — the IP-allowlist refusal is three sentences and an
+ * IPv6 address — and that was being passed through to a table cell verbatim,
+ * where it wrapped to six lines and pushed the row apart. Length is not the
+ * only problem: "We have detected you are using an unrecognised IP address"
+ * describes Brevo's situation, not what the person reading it should do.
+ *
+ * The full text is still returned as `detail` and is always logged. Nothing is
+ * hidden — it is moved to where length does not break a layout.
+ */
+function _mailErrorSummary(raw, status) {
+    const text = String(raw);
+
+    // The account has an IP allowlist and this server is not on it. Common after
+    // a server move, a dynamic-IP change, or the first deploy to a new machine.
+    if (/unrecognised IP address|unrecognized IP address|authorised_ips|authorized_ips/i.test(text)) {
+        const ip = text.match(/(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7})/i)?.[1];
+        // Kept short on purpose: this lands in a table cell. The IP is the one
+        // piece that cannot be shortened and is the whole point of the message.
+        return `Brevo is blocking this server's IP${ip ? ` (${ip})` : ""}. Add it in Brevo's authorised IPs.`;
+    }
+    if (status === 401) return "Brevo rejected this server's mail credentials.";
+    if (/quota|credit/i.test(text)) return "Brevo has no sending credit left on this account.";
+    if (status === 429) return "Brevo is rate-limiting this account. Try again shortly.";
+    if (/ECONNABORTED|timeout/i.test(text)) return "The mail server did not respond in time. Try again.";
+
+    // Unknown: pass it through, but bounded — an unbounded provider string is
+    // how this became a layout bug in the first place.
+    return text.length > 140 ? `${text.slice(0, 137)}…` : text;
 }
 
 // ── HTML helpers ───────────────────────────────────────────────────────────
 function _wrap(title, body) {
-    return `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1a1a1a">
+    // The white background is load-bearing, not decoration. Without it a
+    // dark-mode client paints its own dark ground behind #1a1a1a text and the
+    // body of the mail comes out near-invisible — the boxed sections survive
+    // only because they set their own background.
+    return `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1a1a1a;background:#ffffff">
   <div style="background:#2563EB;padding:16px 24px"><span style="color:#fff;font-size:18px;font-weight:700">Grav CoWork</span></div>
   <div style="padding:24px">
     <h2 style="font-size:16px;margin:0 0 16px">${title}</h2>
@@ -265,11 +312,66 @@ async function sendNotificationEmail({ senderId, senderName, receiverId, receive
 }
 
 // ── WELCOME EMAIL (no cooldown) ────────────────────────────────────────────
+// This is the one an employee reads before they have ever seen the product, so
+// it carries more than the bare credentials: what CoWork is, what their id is
+// for, and a plain instruction to change the password. Returns { sent, reason }
+// so the admin who created the account is told whether it actually went out —
+// they hold the only other copy of the temporary password.
 async function sendWelcomeEmail(employee, tempPassword) {
     const { name, email, employeeId, role, department } = employee;
+    if (!email) return { sent: false, reason: "That employee has no email address on file." };
     const roleLabel = role === "tl" ? "Team Lead" : "Employee";
-    const html = _wrap("Welcome to CoWork", `<p>Dear ${name},</p><p>Your CoWork account has been created.</p>${_table(_row("Employee ID", employeeId), _row("Role", roleLabel), _row("Department", department || "—"), _row("Email", email), _row("Password", `<strong>${tempPassword}</strong>`))}${_btn("Log In Now", LOGIN_URL)}<p>Please change your password immediately after first login.</p>`);
-    await _send({ to: [{ name, email }], subject: `Your CoWork account is ready — ${name}`, html, text: `ID: ${employeeId} | Password: ${tempPassword} | Login: ${LOGIN_URL}` });
+
+    const cred = (label, value, mono) =>
+        `<tr><td style="padding:9px 14px;border-bottom:1px solid #e5e7eb;font-size:13px;color:#555;width:44%">${label}</td>` +
+        `<td style="padding:9px 14px;border-bottom:1px solid #e5e7eb;font-size:14px;color:#111;font-weight:600${mono ? ";font-family:'Courier New',Courier,monospace;letter-spacing:.5px" : ""}">${value}</td></tr>`;
+
+    const body = `
+<p>Dear ${name},</p>
+<p>An account has been created for you on <strong>Grav CoWork</strong> — the workspace where your tasks, projects, meetings, messages and performance record are kept. You can sign in using the details below.</p>
+<table style="width:100%;border-collapse:collapse;background:#f8f9fb;border:1px solid #e5e7eb;border-radius:6px;margin:18px 0">
+${cred("Employee ID", employeeId)}
+${cred("Email address", email)}
+${cred("Temporary password", tempPassword, true)}
+${cred("Role", roleLabel)}
+${department ? cred("Department", department) : ""}
+</table>
+${_btn("Sign in to CoWork", LOGIN_URL)}
+<div style="background:#fffbeb;border:1px solid #fde68a;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;padding:12px 14px;margin:18px 0;font-size:13px;color:#78350f">
+<strong>Please change this password when you first sign in.</strong> It is temporary, it was generated for you, and it should not be shared with anyone — including anyone claiming to be from IT.
+</div>
+<p style="font-size:13px;color:#666;margin-bottom:0">If you were not expecting this email, or believe you have received it in error, please contact your manager or the IT department before signing in.</p>`;
+
+    const text = `YOUR COWORK ACCOUNT IS READY
+
+Dear ${name},
+
+An account has been created for you on Grav CoWork - the workspace where
+your tasks, projects, meetings, messages and performance record are kept.
+
+  Employee ID .......... ${employeeId}
+  Email address ........ ${email}
+  Temporary password ... ${tempPassword}
+  Role ................. ${roleLabel}${department ? `\n  Department ........... ${department}` : ""}
+
+Sign in: ${LOGIN_URL}
+
+IMPORTANT: Please change this password when you first sign in. It is
+temporary, it was generated for you, and it should not be shared with
+anyone - including anyone claiming to be from IT.
+
+If you were not expecting this email, contact your manager or the IT
+department before signing in.
+
+--
+This is an automated message from Grav CoWork. Please do not reply to it.`;
+
+    return _send({
+        to: [{ name, email }],
+        subject: "Your CoWork account is ready — sign-in details inside",
+        html: _wrap("Welcome to CoWork", body),
+        text,
+    });
 }
 
 // ── TASK ASSIGNED EMAIL (no cooldown) ─────────────────────────────────────
