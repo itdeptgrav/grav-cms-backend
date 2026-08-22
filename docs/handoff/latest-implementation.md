@@ -2,6 +2,63 @@
 
 ---
 
+## Raw-item labels printed at goods receipt
+
+> **A storekeeper can now label a delivery as it is unpacked, and a scan of any
+> label answers what the lot is, who supplied it, when it arrived and what it
+> cost.** Nothing committed.
+>
+> Note this sits outside `docs/tasks/current-task.md`, which describes the
+> Prospect/Active-Lead chunk plan — it was requested directly.
+
+### What was reused rather than built
+
+A `Barcode` model, a `POST /api/cms/inventory/barcodes` endpoint and a
+50 mm × 25 mm sticker printer already existed behind the store's **Product
+Marking** page, and cutting-master already scans those stickers. This extends
+that: no second label model, no second print routine, no new dependency.
+
+### Backend (`grav-cms-backend`)
+
+| File | Change |
+|---|---|
+| `models/CMS_Models/Inventory/Operations/Barcode.js` | Added `vendor` + `vendorName`, `unitPrice`, `purchaseOrderItemId`. The price is stored rather than looked up later because a vendor's rate moves — a scan months on must report what *this* lot cost. The PO line is recorded because one PO can carry the same item twice at different prices, so the order id alone cannot pin a price. |
+| `routes/CMS_Routes/Inventory/Operations/barcodes.js` | `POST /` now also accepts `unitName` (goods receipt only knows the unit as the string on the PO line) and `purchaseOrderItemId`. **Vendor and price are read off the PO line server-side, never taken from the request** — a price is a financial fact and the client has no business asserting it. `GET /:id` populates vendor and PO, resolves the variant out of the raw item's subdocument array, and strips the full `variants` array from the response (it was the largest thing in it and is never read). |
+
+### Frontend (`grav-cms`)
+
+| File | Change |
+|---|---|
+| `lib/barcodeSticker.js` | **New.** The single sticker implementation, lifted out of the Product Marking page: QR generation, the hidden-iframe 50 × 25 mm print job, and the code helpers `itemQrPayload` / `parseItemQr` / `isItemQr`. User-entered item names are HTML-escaped before going into the print document. |
+| `components/inventory/GenerateBarcodeModal.js` | **New.** Number of labels × quantity per label, with the arithmetic stated back ("20 labels × 500 Pcs = 10,000 Pcs") because those two fields are easy to enter the wrong way round. Warns — without blocking — when the total does not match what the line is receiving. |
+| `app/store/dashboard/operations/purchase-order/[id]/receive/page.js` | A per-row **Generate Barcode** button, and the dialog mounted outside the `<form>` so its buttons can never submit the delivery. |
+| `app/store/dashboard/item-info/{page.js,ItemInfoClient.js}` | **New.** Where a scan lands. Split into a Suspense boundary + client component, matching how every other query-string page here is built. Accepts a wedge scanner, a typed id, or a `?itemid=` deep link from a phone camera. |
+| `app/store/dashboard/operations/barcode-generator/page.js` | Now imports the shared module (62 lines of duplicated helpers removed) and emits the new payload. |
+| `StockAdjustmentDrawer.js`, both `raw-item-tracker/page.js` | Read through `isItemQr`/`parseItemQr` instead of a local `RawItem=` constant; on-screen format hints updated. |
+| `components/Store_DashboardLayout.js` | **Item Info** added under Product Tracking, so a torn label can still be looked up by typing its id. |
+
+### The payload format, and why both are accepted
+
+New labels encode **`itemid=<barcodeId>`** as requested. The established format
+was `RawItem=<barcodeId>`, and three scanner screens rejected anything else
+outright — so every reader now accepts both. Labels already stuck to stock in
+the warehouse keep scanning; had this been a straight swap they would have
+stopped dead.
+
+### Verification
+
+- Created a barcode against real PO `PO26089303` and read it back the way a scan
+  does: item, variant, vendor (ANANDI ENTERPRISES), PO, order date, receipt
+  timestamp and unit price (₹2,775.42) all resolved. Test document deleted.
+- 17 parser cases pass: new prefix, legacy prefix, mixed case, trailing newline
+  from a wedge scanner, bare id, camera URL, and rejection of work-order and
+  employee codes.
+- All five affected routes compile and render 200 with no build errors.
+- **Not verified:** a physical print. The browser cannot report whether a
+  thermal printer produced anything, so the first real run should be watched.
+
+---
+
 ## Call recordings on the Sales customer record
 
 > **Synced phone-call recordings surface on the customer they belong to, matched

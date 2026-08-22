@@ -3,6 +3,13 @@
 // Each document represents ONE printed barcode/QR sticker against a raw-item
 // variant. The MongoDB _id of this document is what gets encoded in the QR code.
 //
+// Stickers are produced in two places, and both write the same shape:
+//   · Product Marking (store/operations/barcode-generator) — ad-hoc labelling
+//   · Goods receipt   (purchase-order/:id/receive)         — labelling a delivery
+// The receive path additionally records where the lot came from and what it
+// cost (vendor, purchaseOrderItemId, unitPrice), which is what makes a scan
+// able to answer "when did this arrive, from whom, at what price".
+//
 // `cuttingSessions` tracks each cutting session against this fabric roll.
 // A session is open while closedAt is null; once closed, endQty is set and
 // the parent `quantity` is updated to that endQty (so the next session's
@@ -55,6 +62,29 @@ const barcodeSchema = new mongoose.Schema(
       index: true,
     },
     purchaseOrderNumber: { type: String, trim: true, default: "" },
+
+    // Which PO line the stock came in against. A PO can carry the same raw item
+    // on more than one line at different prices, so the line is what pins the
+    // price below to a specific purchase — the PO id alone would not.
+    purchaseOrderItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    // ── Where it came from and what it cost ──────────────────────────────────
+    // Captured when the sticker is printed at goods-receipt, and deliberately
+    // stored rather than looked up later: the vendor's price on a raw item
+    // changes over time, so a scan months from now must report what THIS lot
+    // actually cost, not today's rate.
+    vendor: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Vendor",
+      default: null,
+      index: true,
+    },
+    // Denormalised for the same reason rawItemName and purchaseOrderNumber are:
+    // a scan renders the label's own facts without joining three collections.
+    vendorName: { type: String, trim: true, default: "" },
+
+    // Per-unit purchase price from the PO line, in rupees.
+    unitPrice: { type: Number, default: null, min: 0 },
 
     // ── Audit ────────────────────────────────────────────────────────────────
     generatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },

@@ -88,12 +88,25 @@ router.get("/suggested-units/:rawItemId", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /
-// Body: { rawItemId, variantId?, quantity, unitId, purchaseOrderId? }
+// Body: { rawItemId, variantId?, quantity, unitId | unitName,
+//         purchaseOrderId?, purchaseOrderItemId? }
 // Creates one Barcode document. The returned _id is what gets QR-encoded.
+//
+// Two callers, two ways of naming the unit. Product Marking picks a Unit from a
+// dropdown and sends `unitId`; goods-receipt only ever knows the unit as the
+// string already on the PO line, so `unitName` is accepted as well. Exactly one
+// is required.
+//
+// When `purchaseOrderItemId` is supplied the vendor and the purchase price are
+// read off the PO line here rather than taken from the request. A price is a
+// financial fact about a delivery and the client has no business asserting it.
 // ─────────────────────────────────────────────────────────────────────────────
 router.post("/", async (req, res) => {
   try {
-    const { rawItemId, variantId, quantity, unitId, purchaseOrderId } = req.body;
+    const {
+      rawItemId, variantId, quantity, unitId, unitName,
+      purchaseOrderId, purchaseOrderItemId
+    } = req.body;
 
     if (!rawItemId || !mongoose.Types.ObjectId.isValid(rawItemId)) {
       return res.status(400).json({ success: false, message: "Valid rawItemId is required" });
@@ -101,17 +114,28 @@ router.post("/", async (req, res) => {
     if (!quantity || parseFloat(quantity) <= 0) {
       return res.status(400).json({ success: false, message: "Quantity must be > 0" });
     }
-    if (!unitId || !mongoose.Types.ObjectId.isValid(unitId)) {
+    if (!unitId && !unitName) {
+      return res.status(400).json({ success: false, message: "A unit is required" });
+    }
+    if (unitId && !mongoose.Types.ObjectId.isValid(unitId)) {
       return res.status(400).json({ success: false, message: "Valid unit is required" });
     }
 
     const [rawItem, unit] = await Promise.all([
-      RawItem.findById(rawItemId).select("name sku variants").lean(),
-      Unit.findById(unitId).select("name").lean()
+      RawItem.findById(rawItemId).select("name sku variants unit customUnit").lean(),
+      unitId ? Unit.findById(unitId).select("name").lean() : Promise.resolve(null)
     ]);
 
     if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
-    if (!unit) return res.status(404).json({ success: false, message: "Unit not found" });
+    if (unitId && !unit) return res.status(404).json({ success: false, message: "Unit not found" });
+
+    // A name is taken as given — the PO line it came from is the authority on
+    // what unit the goods were bought in, and it may legitimately be a unit
+    // that was never registered in the Unit collection.
+    const resolvedUnitName = unit ? unit.name : String(unitName).trim();
+    if (!resolvedUnitName) {
+      return res.status(400).json({ success: false, message: "A unit is required" });
+    }
 
     // Resolve variant info if specified
     let variantCombination = [];
@@ -130,14 +154,47 @@ router.post("/", async (req, res) => {
       variantSku = variant.sku || "";
     }
 
-    // Optional PO
+    // Optional PO, and with it the provenance of this lot.
     let resolvedPoId = null;
     let poNumber = "";
+    let resolvedPoItemId = null;
+    let vendorId = null;
+    let vendorName = "";
+    let unitPrice = null;
+
     if (purchaseOrderId && mongoose.Types.ObjectId.isValid(purchaseOrderId)) {
-      const po = await PurchaseOrder.findById(purchaseOrderId).select("poNumber").lean();
+      const po = await PurchaseOrder.findById(purchaseOrderId)
+        .select("poNumber vendor vendorName items")
+        .populate("vendor", "companyName")
+        .lean();
       if (po) {
         resolvedPoId = po._id;
         poNumber = po.poNumber || "";
+        vendorId = po.vendor?._id || po.vendor || null;
+        vendorName = po.vendor?.companyName || po.vendorName || "";
+
+        // The price belongs to a line, not to the order. Match the requested
+        // line when one was given; otherwise fall back to the line for this
+        // raw item and variant, which is unambiguous in the ordinary case
+        // where a PO lists each item once.
+        const items = po.items || [];
+        const line =
+          (purchaseOrderItemId &&
+            mongoose.Types.ObjectId.isValid(purchaseOrderItemId) &&
+            items.find((i) => String(i._id) === String(purchaseOrderItemId))) ||
+          items.find(
+            (i) =>
+              String(i.rawItem) === String(rawItem._id) &&
+              String(i.variantId || "") === String(resolvedVariantId || "")
+          ) ||
+          null;
+
+        if (line) {
+          resolvedPoItemId = line._id;
+          unitPrice = Number.isFinite(Number(line.unitPrice))
+            ? Number(line.unitPrice)
+            : null;
+        }
       }
     }
 
@@ -149,9 +206,13 @@ router.post("/", async (req, res) => {
       variantCombination,
       variantSku,
       quantity: parseFloat(quantity),
-      unit: unit.name,
+      unit: resolvedUnitName,
       purchaseOrder: resolvedPoId,
       purchaseOrderNumber: poNumber,
+      purchaseOrderItemId: resolvedPoItemId,
+      vendor: vendorId,
+      vendorName,
+      unitPrice,
       generatedBy: req.user?.id || req.user?._id || null
     });
 
@@ -163,7 +224,13 @@ router.post("/", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /:id   — lookup a single barcode (used when scanning QR later)
+// GET /:id   — lookup a single barcode (this is what a scan resolves to)
+//
+// Returns everything the Item Info screen shows, so a scan is one request:
+// the label's own facts, the raw item and variant behind it, and the purchase
+// it arrived on. Dates come from two different places on purpose — `orderDate`
+// is when it was bought, the barcode's own `createdAt` is when it was received
+// and labelled, and a delivery can be weeks after an order.
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {
   try {
@@ -171,12 +238,29 @@ router.get("/:id", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid barcode id" });
     }
     const barcode = await Barcode.findById(req.params.id)
-      .populate("rawItem", "name sku unit customUnit")
-      .populate("purchaseOrder", "poNumber")
+      .populate("rawItem", "name sku unit customUnit category quantity minStock status variants")
+      .populate("purchaseOrder", "poNumber orderDate expectedDeliveryDate status")
+      .populate("vendor", "companyName contactPerson phone email gstNumber")
       .populate("generatedBy", "name email")
       .lean();
 
     if (!barcode) return res.status(404).json({ success: false, message: "Barcode not found" });
+
+    // Attach the variant's own record. It lives inside the raw item's variants
+    // array, so it cannot be populated — resolve it here rather than making
+    // every caller re-implement the lookup.
+    if (barcode.variantId && barcode.rawItem?.variants) {
+      barcode.variant =
+        barcode.rawItem.variants.find(
+          (v) => String(v._id) === String(barcode.variantId)
+        ) || null;
+    } else {
+      barcode.variant = null;
+    }
+    // The full variants array is only needed to find that one entry; sending
+    // it back would be the largest thing in the response and is never read.
+    if (barcode.rawItem) delete barcode.rawItem.variants;
+
     return res.json({ success: true, barcode });
   } catch (error) {
     console.error("Error fetching barcode:", error);
