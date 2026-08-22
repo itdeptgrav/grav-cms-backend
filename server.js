@@ -41,6 +41,21 @@ const allowedOrigins = [
   "https://wnpt3pw1-3002.inc1.devtunnels.ms" , 
   "https://grav-cowork-space-main-hazel.vercel.app",
   /**
+   * The employee app's web build.
+   *
+   * `App/` is one Expo codebase shipping to Android, iOS AND the browser. The
+   * two native builds never appear here — a native app sends no Origin header
+   * and is waved through by the `!origin` branch below — but the web build is
+   * an ordinary cross-origin page and is not. Without its origin in this list
+   * every /api/employee call fails with an opaque "Not allowed by CORS" and
+   * the app looks broken with nothing in the logs pointing here.
+   *
+   * localhost:8081 above already covers `npx expo start --web`. Deploy previews
+   * and LAN addresses belong in EXTRA_ALLOWED_ORIGINS, not in this literal —
+   * see the note below it.
+   */
+  "https://app.grav.in",
+  /**
    * Extra origins from the environment, comma-separated.
    *
    * Where a LAN address belongs — NOT in this literal. A dev machine's IP
