@@ -14,6 +14,15 @@ yarn-error.log*
 .env.development
 .env.production
 .env.test
+# Catch-all for the variants people actually create by hand. `.env.bak` was
+# committed on 22 Aug 2026 with live credentials in it — MongoDB URI, Firebase
+# private key, JWT secret, Google OAuth secret, LiveKit, Brevo, Gemini, VAPID,
+# the salary encryption key — because the list above named specific files and
+# a hand-made backup was not one of them. A prefix rule cannot be outrun the
+# same way.
+.env.*
+!.env.example
+!.env.sample
 
 # ===============================
 # Build output
