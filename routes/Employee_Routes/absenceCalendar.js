@@ -27,10 +27,12 @@
  * `leave` (approved time off), and nothing finer. That distinction is what a
  * shift plan actually needs: whether the gap was known in advance.
  *
- * What IS returned per person is exactly what the requesting screen needs to
- * identify and reach someone: name, phone, biometric ID, photo, department and
- * designation. All of it is already visible on the standings board or a shift
- * roster.
+ * It also does not return a PHONE NUMBER. Identifying who is missing needs a
+ * name, a face and the biometric ID people use on the floor; it does not need
+ * a company-wide directory of everyone's mobile number, indexed by the days
+ * they were out. That is a different and much larger disclosure than an
+ * absence list, so the field is not selected from Mongo at all — a UI change
+ * cannot reintroduce it, and it never reaches a log or a response body.
  *
  * ── PAST AND FUTURE COME FROM DIFFERENT PLACES ────────────────────────────
  *
@@ -269,7 +271,9 @@ router.get("/day", AllEmployeeAppMiddleware, async (req, res) => {
       biometricId: { $in: [...away.keys()] },
       $or: [{ isActive: true }, { isActive: { $exists: false } }],
     })
-      .select("firstName middleName lastName biometricId phone department designation profileImage")
+      // No `phone`. See the header — not selected rather than dropped later,
+      // so it cannot leak through a response body or a debug log.
+      .select("firstName middleName lastName biometricId department designation profileImage")
       .lean();
 
     const people = employees
@@ -285,7 +289,6 @@ router.get("/day", AllEmployeeAppMiddleware, async (req, res) => {
               .filter(Boolean)
               .join(" ")
               .trim() || "Unnamed",
-          phone: emp.phone || null,
           avatar: emp.profileImage || null,
           department: emp.department || null,
           designation: emp.designation || null,
