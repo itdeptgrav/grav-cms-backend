@@ -2910,9 +2910,48 @@ async function restoreUnblockedDeadlines({ employeeId, effectiveP1TaskId = null 
   return { rechained: rechained.length, announcedP1: announced };
 }
 
+/**
+ * Everyone whose queue this approval just changed.
+ *
+ * **An approval reorders somebody ELSE's day.** That is the whole point of a
+ * dependency: Umung approves an output and Rakesh's blocked task becomes
+ * workable, so it climbs back and his dates move with it. Until now this
+ * function told him and stopped there — his order and deadlines stayed frozen
+ * in the blocked arrangement until he happened to open a task list and the
+ * throttled sync fired.
+ *
+ * Reported exactly that way: Dev stored P1 and workable again, still sitting at
+ * effective P2 with the early slot given to Cowork, hours after its input
+ * landed.
+ *
+ * The re-chain is the engine's own `rechainQueueFor` — no deadline is computed
+ * here. That distinction is what makes this safe where the earlier
+ * push-and-give-back pair was not: this asks the one chain to re-walk, rather
+ * than being a second opinion about dates.
+ */
+async function _rechainAffected(employeeIds) {
+  const unique = [...new Set(employeeIds.filter(Boolean))];
+  if (!unique.length) return;
+  const { rechainQueueFor } = require("./officeDeadline.service");
+  for (const id of unique) {
+    try {
+      const moved = await rechainQueueFor(id);
+      if (moved.length)
+        console.log(`[outputs] approval re-chained ${moved.length} deadline(s) for ${id}`);
+    } catch (e) {
+      /* A queue that could not be re-walked is a wrong date to fix on the next
+         load, never a reason to fail the approval that has already been saved. */
+      console.warn(`[outputs] re-chain failed for ${id}:`, e.message);
+    }
+  }
+}
+
 async function _releaseOutputDependents(outputId, label, actorId, actorName) {
   const snap = await db.collection("cowork_tasks").where("hasOutputs", "==", true).get();
   const approved = await _approvedOutputIds();
+  /* Collected across the loop and re-walked once each — a person holding two
+     freed tasks must not have their queue walked twice. */
+  const affected = [];
   for (const d of snap.docs) {
     const t = d.data();
     if (t.status === "done" || t.completionStatus === "tl_final_approved") continue;
@@ -2920,6 +2959,10 @@ async function _releaseOutputDependents(outputId, label, actorId, actorName) {
       (o) => (o.needsOutputIds || []).includes(outputId) && _outputWorkable(o, approved)
     );
     if (!freed.length) continue;
+    /* Their ORDER changed whether or not there is anybody to notify — a
+       self-assigned task frees nobody but still climbs the queue. */
+    affected.push(...(t.assigneeIds || []));
+
     const recipients = [...new Set((t.assigneeIds || []).filter((id) => id && id !== actorId))];
     if (!recipients.length) continue;
     await _notifyMany({
@@ -2930,6 +2973,9 @@ async function _releaseOutputDependents(outputId, label, actorId, actorName) {
       senderId: actorId, senderName: actorName,
     }).catch(() => {});
   }
+
+  /* After the loop, so one person holding several freed tasks is walked once. */
+  await _rechainAffected(affected);
 }
 
 // ═════════════════════════════════════════════════════════

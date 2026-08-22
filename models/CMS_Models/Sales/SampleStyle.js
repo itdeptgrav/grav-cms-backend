@@ -27,6 +27,7 @@ const {
   SAMPLE_TECHSHEET_STATUS_CODES,
   SAMPLE_SAMPLING_STATUS_CODES,
   SAMPLE_ROUND_TYPE_CODES,
+  SAMPLE_ROUND_OUTCOME_CODES,
   SAMPLE_STYLE_STATUS_CODES,
   SAMPLE_STYLE_STAGE_CODES,
   GARMENT_GENDER_CODES,
@@ -37,26 +38,51 @@ const actorRef = () => ({
   name: { type: String, trim: true },
 });
 
+const imageSchema = new mongoose.Schema(
+  { fileId: { type: String, trim: true }, name: { type: String, trim: true }, url: { type: String, trim: true } },
+  { _id: false },
+);
+
 // A revision bounced back from a Sales gate — the note + who/when.
+//
+// `roundId` says WHICH round was rejected. Without it the revisions and the
+// rounds were two parallel lists that could only be lined up by comparing
+// timestamps, so "what was wrong with the second fit sample" had no answer.
+// Absent on tech-sheet revisions, which are not about a round.
 const revisionSchema = new mongoose.Schema(
-  { note: { type: String, trim: true }, at: { type: Date, default: Date.now }, by: actorRef() },
+  {
+    note: { type: String, trim: true },
+    roundId: { type: mongoose.Schema.Types.ObjectId },
+    at: { type: Date, default: Date.now },
+    by: actorRef(),
+  },
   { _id: false },
 );
 
 // One physical sample round on the ladder (Proto → Fit → … → PP).
+//
+// A round used to be four fields — number, type, note, date — which recorded
+// THAT a sample happened and nothing about it. It is now the record of the
+// sample itself: what was made (`images`), how it was judged (`outcome`) and
+// what was said (`feedback`, in the customer's or Sales' words).
+//
+// `outcome` moves on its own, not with sample.status: a style can be back in
+// progress on round 4 while rounds 1–3 stay individually rejected or
+// superseded. "superseded" is for a round nobody ruled on before the next one
+// was made — common, and not the same as rejected.
 const roundSchema = new mongoose.Schema(
   {
     roundNo: { type: Number, min: 1 },
     type: { type: String, enum: SAMPLE_ROUND_TYPE_CODES },
     note: { type: String, trim: true },
+    images: [imageSchema],
+    outcome: { type: String, enum: SAMPLE_ROUND_OUTCOME_CODES, default: "pending" },
+    feedback: { type: String, trim: true },
+    judgedAt: { type: Date },
+    judgedBy: actorRef(),
     madeAt: { type: Date, default: Date.now },
   },
   { _id: true },
-);
-
-const imageSchema = new mongoose.Schema(
-  { fileId: { type: String, trim: true }, name: { type: String, trim: true }, url: { type: String, trim: true } },
-  { _id: false },
 );
 
 // One event on the style's shared timeline — every hop and bounce, so Sales,
@@ -103,6 +129,36 @@ const sampleStyleSchema = new mongoose.Schema(
     // Sparse: styles created before this field existed have none, and they are
     // matched by name and backfilled on the next provision.
     enquiryProductId: { type: mongoose.Schema.Types.ObjectId, index: true, sparse: true },
+
+    // ── Variants ────────────────────────────────────────────────────────────
+    //
+    // One enquiry product can be developed as SEVERAL styles at once — the same
+    // polo in navy poly-cotton and in white PC, offered together so the
+    // customer picks. Each is its own record with its own tech sheet, its own
+    // sample ladder and its own gates, because that is what they are: separate
+    // things being made. What makes them siblings is sharing a product.
+    //
+    // `variantKey` is the empty string for the BASE variant — the style
+    // provisioning raises straight from the enquiry product. Every existing row
+    // is therefore a base variant with no migration, and a journey that never
+    // asks for a variant behaves exactly as it did.
+    //
+    // The uniqueness that used to be { journeyId, productName } is now
+    // { journeyId, productName, variantKey }, so two variants of one product
+    // can coexist while two BASE styles for one product still cannot.
+    variantKey: { type: String, trim: true, default: "", index: true },
+    /** What to call it on screen: "White PC", "Heavier GSM", "Contrast collar". */
+    variantLabel: { type: String, trim: true },
+    /** Why this variant exists — the ask it answers. */
+    variantNote: { type: String, trim: true },
+    /** The style it was branched from, for ordering and for "same as X, but…". */
+    variantOf: { type: mongoose.Schema.Types.ObjectId, ref: "SampleStyle", index: true, sparse: true },
+    /**
+     * Set once the customer picks between siblings. Only one per product should
+     * ever be true; the route that sets it clears the others in the same save.
+     * Not a status — a style can be approved and still not be the one chosen.
+     */
+    variantChosen: { type: Boolean, default: false },
 
     // Routing position (kanban): brief → materials → rnd. Created at "brief"
     // (carried from the enquiry, sent nowhere yet); the R&D app only lists
@@ -179,7 +235,13 @@ const sampleStyleSchema = new mongoose.Schema(
 );
 
 // One style per product per journey.
-sampleStyleSchema.index({ journeyId: 1, productName: 1 }, { unique: true });
+// One BASE style per product per journey, and one style per named variant of
+// it. See the `variantKey` field for why the key grew a third part.
+//
+// NOTE for deploys: this replaces a unique { journeyId, productName }. Mongo
+// does not drop a renamed index on its own — run scripts/dropLegacyStyleIndex.js
+// once, or the old one keeps refusing the second variant.
+sampleStyleSchema.index({ journeyId: 1, productName: 1, variantKey: 1 }, { unique: true });
 
 // Heal legacy routing values (an earlier build used brief/merchandiser) so old
 // rows validate against the current enum instead of throwing on save.

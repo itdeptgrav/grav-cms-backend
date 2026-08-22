@@ -114,11 +114,24 @@ const FREIGHT_ARRANGEMENTS = [
 // Contacted → Requirement Gathering → Qualified → Development Started is the
 // forward funnel; on_hold / lost / cancelled are the off-ramps. `lost` requires
 // a reason (see ENQUIRY_LOST_REASONS).
+// LABELS DESCRIBE THE ENQUIRY, NOT THE BUYER.
+//
+// These read "New → Contacted → Requirement Gathering → Qualified", which is
+// the Lead's own qualification ladder said a second time: whether the buyer is
+// real is settled before a journey exists (Lead.qualificationState), and the
+// unified Opportunities stage bar now shows both, so the same three words
+// appeared twice on one screen. An enquiry is a DOCUMENT — it is drafted, its
+// requirement gets gathered, and it becomes complete.
+//
+// CODES ARE UNCHANGED ON PURPOSE. Six enquiries hold these values; renaming
+// the codes would orphan every one of them for a wording problem. Only the
+// labels move, and `contacted` keeps a sensible label for the one record still
+// on it even though nothing advances into it any more.
 const ENQUIRY_STATUSES = [
-  pair("new", "New"),
-  pair("contacted", "Contacted"),
-  pair("requirement_gathering", "Requirement Gathering"),
-  pair("qualified", "Qualified"),
+  pair("new", "Draft"),
+  pair("contacted", "Details taken"),
+  pair("requirement_gathering", "Gathering requirement"),
+  pair("qualified", "Requirement complete"),
   pair("development_started", "Development Started"),
   pair("on_hold", "On Hold"),
   pair("lost", "Lost"),
@@ -866,6 +879,17 @@ const SAMPLE_SAMPLING_TRANSITIONS = {
   rejected: ["in_progress"],
   approved: [],
 };
+// How one round was judged. Deliberately separate from SAMPLE_SAMPLING_STATUSES:
+// that is where the STYLE is, this is what happened to a single sample. Round 2
+// stays "rejected" forever even after round 3 is approved — that is the record.
+// "superseded" is the honest label for a round nobody ruled on before the next
+// one was made, which is most of them.
+const SAMPLE_ROUND_OUTCOMES = [
+  pair("pending", "Awaiting verdict"),
+  pair("accepted", "Accepted"),
+  pair("rejected", "Rejected"),
+  pair("superseded", "Superseded"),
+];
 const SAMPLE_ROUND_TYPES = [
   pair("proto", "Proto"),
   pair("fit", "Fit"),
@@ -942,6 +966,8 @@ module.exports = {
   SAMPLE_SAMPLING_TRANSITIONS,
   SAMPLE_ROUND_TYPES,
   SAMPLE_ROUND_TYPE_CODES: codes(SAMPLE_ROUND_TYPES),
+  SAMPLE_ROUND_OUTCOMES,
+  SAMPLE_ROUND_OUTCOME_CODES: codes(SAMPLE_ROUND_OUTCOMES),
   SAMPLE_STYLE_STATUSES,
   SAMPLE_STYLE_STATUS_CODES: codes(SAMPLE_STYLE_STATUSES),
   SAMPLE_STYLE_STAGES,

@@ -33,6 +33,12 @@ const salesAuthBase = require("../../../Middlewear/SalesAuthMiddlewear");
 const salesAuth = salesAuthBase.withRoles(salesAuthBase.RND_ROLES);
 const { isSalesManager } = require("../../../services/salesAccess");
 const { provisionJourneyStyles } = require("../../../services/sampleStyleProvision");
+const { createWithRef } = require("../../../services/sampleStyleRef");
+const {
+  variantKeyFrom,
+  variantStyleCode,
+  buildVariantDoc,
+} = require("../../../services/sampleStyleVariant");
 const {
   SAMPLE_TECHSHEET_TRANSITIONS,
   SAMPLE_SAMPLING_TRANSITIONS,
@@ -79,6 +85,22 @@ async function resolveStyle(idOrRef) {
     : { sampleStyleId: idOrRef };
   return SampleStyle.findOne({ ...query, isActive: true });
 }
+
+/**
+ * Only the three fields the image subdocument has, and only from a real array.
+ *
+ * Round photos arrive from the client, so this is a whitelist rather than a
+ * pass-through: without it any object posted as an image would be stored.
+ */
+const sanitizeImages = (v) =>
+  (Array.isArray(v) ? v : [])
+    .filter((i) => i && (i.url || i.fileId))
+    .slice(0, 12)
+    .map((i) => ({
+      fileId: i.fileId ? String(i.fileId).trim() : undefined,
+      name: i.name ? String(i.name).trim().slice(0, 200) : undefined,
+      url: i.url ? String(i.url).trim() : undefined,
+    }));
 
 // Snapshot an enquiry product row into the style's read-only brief.
 const briefFromProduct = (p) => ({
@@ -339,8 +361,39 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       if (style.sample.status !== "in_progress") return res.status(400).json({ success: false, message: "Start sampling before adding a round." });
       const type = req.body.type;
       if (!SAMPLE_ROUND_TYPE_CODES.includes(type)) return res.status(400).json({ success: false, message: "Invalid round type." });
+
+      // Anything still awaiting a verdict when the next sample is made was, in
+      // fact, overtaken. Recording that is the difference between "nobody ruled
+      // on round 2" and "round 2 is still open", and only one of those is true.
+      (style.sample.rounds || []).forEach((r) => { if (r.outcome === "pending") r.outcome = "superseded"; });
+
       const roundNo = (style.sample.rounds?.length || 0) + 1;
-      style.sample.rounds.push({ roundNo, type, note: req.body.note || "", madeAt: new Date() });
+      style.sample.rounds.push({
+        roundNo,
+        type,
+        note: req.body.note || "",
+        // What was actually made. The one thing a round could never say before.
+        images: sanitizeImages(req.body.images),
+        outcome: "pending",
+        madeAt: new Date(),
+      });
+    } else if (action === "judge") {
+      // A verdict on ONE round, separate from the style's own status.
+      //
+      // Sampling status answers "where is this style"; a round's outcome
+      // answers "what happened to that sample", and they are not the same
+      // question — round 2 stays rejected forever after round 3 is approved.
+      // Kept apart so the ladder reads as a history instead of being rewritten
+      // by the latest state.
+      if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can judge a round." });
+      const round = (style.sample.rounds || []).id(req.body.roundId);
+      if (!round) return res.status(404).json({ success: false, message: "That round is not on this style." });
+      const outcome = req.body.outcome;
+      if (!["accepted", "rejected"].includes(outcome)) return res.status(400).json({ success: false, message: "A round is judged accepted or rejected." });
+      round.outcome = outcome;
+      round.feedback = (req.body.feedback || "").trim();
+      round.judgedAt = new Date();
+      round.judgedBy = actor(req);
     } else if (action === "submit") {
       if (!can("submitted")) return invalid("submitted");
       style.sample.status = "submitted";
@@ -352,22 +405,127 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       style.sample.approvedAt = new Date();
       style.sample.approvedBy = actor(req);
       style.status = "completed";
+      // Approving the style accepts the sample they approved it on.
+      const passed = (style.sample.rounds || [])[style.sample.rounds.length - 1];
+      if (passed) {
+        passed.outcome = "accepted";
+        passed.feedback = (req.body.note || "").trim() || passed.feedback;
+        passed.judgedAt = new Date();
+        passed.judgedBy = actor(req);
+      }
     } else if (action === "reject") {
       if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can reject the sample." });
       if (!can("rejected")) return invalid("rejected");
       style.sample.status = "rejected";
-      style.sample.revisions.push({ note: (req.body.note || "").trim(), at: new Date(), by: actor(req) });
+      // Rejecting the style rejects the sample in front of them — the latest
+      // round. Naming it turns two parallel lists into one readable ladder:
+      // the revision now has a subject instead of only a timestamp.
+      const latest = (style.sample.rounds || [])[style.sample.rounds.length - 1];
+      const note = (req.body.note || "").trim();
+      if (latest) {
+        latest.outcome = "rejected";
+        latest.feedback = note;
+        latest.judgedAt = new Date();
+        latest.judgedBy = actor(req);
+      }
+      style.sample.revisions.push({ note, roundId: latest?._id, at: new Date(), by: actor(req) });
     } else {
       return res.status(400).json({ success: false, message: "Unknown sample action." });
     }
 
-    const smKind = { round: "sample_round", submit: "sample_submitted", approve: "sample_approved", reject: "sample_rejected" }[action];
+    const smKind = { round: "sample_round", judge: `round_${req.body?.outcome}`, submit: "sample_submitted", approve: "sample_approved", reject: "sample_rejected" }[action];
     if (smKind) logHistory(style, { kind: smKind, note: action === "round" ? req.body.type : (req.body.note || "") }, req);
     style.updatedBy = actor(req);
     await style.save();
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VARIANTS — one enquiry product, several styles developed side by side
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/cms/crm/sample-styles/:id/variants
+// Branch this style into a sibling: same product, different execution.
+//
+// A variant is a full style — its own tech sheet, its own sample ladder, its
+// own two gates — because that is what it is in the building. What it inherits
+// is the brief, so raising "the same polo in white PC" is one field and not a
+// retyped requirement. What it never inherits is a phase: see buildVariantDoc.
+router.post("/:id/variants", salesAuth, async (req, res) => {
+  try {
+    const parent = await resolveStyle(req.params.id);
+    if (!parent) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const label = String(req.body?.label || "").trim();
+    if (!label) return res.status(400).json({ success: false, message: "Give the variant a name — what makes it different?" });
+
+    const variantKey = variantKeyFrom(label);
+    // "" is the base variant's key, so a label that slugs to nothing would
+    // collide with the style this was branched from rather than sit beside it.
+    if (!variantKey) return res.status(400).json({ success: false, message: "That name has no letters or numbers in it — try something like “White PC”." });
+
+    const family = await SampleStyle.find({
+      journeyId: parent.journeyId,
+      productName: parent.productName,
+      isActive: true,
+    }).select("variantKey variantLabel styleCode").lean();
+
+    if (family.some((f) => (f.variantKey || "") === variantKey)) {
+      return res.status(409).json({ success: false, message: `“${label}” already exists for this product.` });
+    }
+
+    const base = family.find((f) => !f.variantKey) || parent;
+    const doc = buildVariantDoc(parent, {
+      label,
+      note: req.body?.note,
+      brief: req.body?.brief,
+      styleCode: variantStyleCode(base.styleCode, family.filter((f) => f.variantKey).length),
+      actor: actor(req),
+    });
+
+    const style = await createWithRef(SampleStyle, doc);
+    logHistory(style, { kind: "variant_raised", note: `${label}${req.body?.note ? ` — ${req.body.note}` : ""}` }, req);
+    await style.save();
+
+    return res.status(201).json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    // The compound unique is the real guard; the check above is only the good
+    // error message. A race lands here.
+    if (err?.code === 11000) return res.status(409).json({ success: false, message: "That variant already exists for this product." });
+    console.error("[sampleStyles] POST /:id/variants", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/sample-styles/:id/choose
+// The customer picked this one. Clears the flag on its siblings in the same
+// pass, so "chosen" can never be true twice for a product.
+//
+// Deliberately NOT a status: a style can be approved and still not be the one
+// chosen, and the ones not chosen stay exactly as they are — they are the
+// record of what was offered.
+router.post("/:id/choose", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can choose the variant." });
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    await SampleStyle.updateMany(
+      { journeyId: style.journeyId, productName: style.productName, _id: { $ne: style._id } },
+      { $set: { variantChosen: false } },
+    );
+    style.variantChosen = true;
+    logHistory(style, { kind: "variant_chosen", note: (req.body?.note || "").trim() }, req);
+    style.updatedBy = actor(req);
+    await style.save();
+
+    return res.json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/choose", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });

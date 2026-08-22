@@ -325,18 +325,23 @@ function occupiesQueue(task, approvedOutputIds) {
  * queue read asks once per task, and the answer cannot meaningfully change
  * between them.
  */
-let _approvedCache = { at: 0, ids: null };
-async function approvedOutputIdsNow() {
-  if (_approvedCache.ids && Date.now() - _approvedCache.at < 5000)
-    return _approvedCache.ids;
+let _approvedCache = { at: 0, ids: null, times: null };
+async function _approvedIndex() {
+  if (_approvedCache.ids && Date.now() - _approvedCache.at < 5000) return _approvedCache;
   const ids = new Set();
+  /** outputId -> the instant its approval was recorded. */
+  const times = new Map();
   try {
     const { db } = require("../config/firebaseAdmin");
     const snap = await db.collection("cowork_tasks").where("hasOutputs", "==", true).get();
     snap.forEach((d) => {
       const subs = d.data().outputSubmissions || {};
       for (const [oid, sub] of Object.entries(subs))
-        if (sub && sub.review && sub.review.approved === true) ids.add(oid);
+        if (sub && sub.review && sub.review.approved === true) {
+          ids.add(oid);
+          const at = readMs(sub.review.reviewedAt);
+          if (Number.isFinite(at)) times.set(oid, at);
+        }
     });
   } catch (e) {
     /* An unreadable index means "nothing is approved", which keeps blocked work
@@ -344,8 +349,73 @@ async function approvedOutputIdsNow() {
        deadline earlier, never push one past a date somebody was promised. */
     console.warn("[officeDeadline] output index read failed:", e.message);
   }
-  _approvedCache = { at: Date.now(), ids };
-  return ids;
+  _approvedCache = { at: Date.now(), ids, times };
+  return _approvedCache;
+}
+
+/** Every output approved anywhere. */
+async function approvedOutputIdsNow() {
+  return (await _approvedIndex()).ids;
+}
+
+/**
+ * **When this task could FIRST have been started.**
+ *
+ * A task blocked on somebody else's output cannot begin before that output is
+ * approved, so its clock must not start earlier — otherwise it is charged hours
+ * it was forbidden to work. The chain handles this whenever something sits
+ * ABOVE it (that task finishes later anyway); the hole is a blocked task that
+ * reaches the FRONT, where the queue start would otherwise apply.
+ *
+ * **The EARLIEST unblocking, not the last.** OWNER DECISION, 21 Aug 2026. An
+ * output whose own inputs are all approved is startable, and a task is workable
+ * when ANY one of them is — the same rule `occupiesQueue` uses. So a task
+ * waiting on Gopalpur (approved 14:00) and Puri (approved 17:00) could have
+ * begun at 14:00, and 14:00 is its start.
+ *
+ * Returns null where the rule has nothing to say: no outputs, an output that
+ * needs no input (startable from the beginning, so never constrained), or
+ * nothing approved yet.
+ */
+function unblockedAtMs(task, approvedAt, nowMs) {
+  const outputs = Array.isArray(task.outputs) ? task.outputs : [];
+  if (outputs.length === 0) return null;
+  let earliest = null;
+  for (const o of outputs) {
+    const needs = Array.isArray(o.needsOutputIds) ? o.needsOutputIds : [];
+    /* Nothing to wait for — this task was never held up. */
+    if (needs.length === 0) return null;
+    let lastOfThisOutput = 0;
+    let allApproved = true;
+    for (const n of needs) {
+      const at = approvedAt.get(n);
+      if (!Number.isFinite(at)) { allApproved = false; break; }
+      if (at > lastOfThisOutput) lastOfThisOutput = at;
+    }
+    /* Still waiting on something: this output cannot be the one that freed it. */
+    if (!allApproved) continue;
+    if (earliest === null || lastOfThisOutput < earliest) earliest = lastOfThisOutput;
+  }
+
+  /**
+   * **Nothing freed yet, so it still cannot start — and the floor is NOW.**
+   *
+   * Without this a task waiting with no approval at all had no floor: it fell
+   * back to the queue's start and its deadline burned down while it sat unable
+   * to touch the work. With nothing above it in the queue that is the whole of
+   * its clock, running against a wait somebody else owns.
+   *
+   * So while it waits the floor moves with the clock and the deadline keeps
+   * pushing out. The moment an input is approved the branch above answers
+   * instead — a FIXED instant — and the date stops moving. Waiting costs the
+   * assignee nothing; being free and idle costs them normally.
+   *
+   * This is a deliberate exception to "a due date is decided once and then
+   * holds still". It is the one case where holding still would be a promise the
+   * person was forbidden to keep.
+   */
+  if (earliest === null && Number.isFinite(nowMs)) return nowMs;
+  return earliest;
 }
 
 /**
@@ -474,10 +544,27 @@ async function resolveAcceptanceAnchor(task, nowMs = Date.now(), taskId = null) 
       if (snap.exists) {
         const d = snap.data();
         dutyMode = d.mode ?? null;
-        /* `updatedAt` is written only on a mode change, so while the mode is
-           online it IS the session start — the same reading the Cowork
-           frontend's `queueAnchorMs` uses. */
-        dutySessionStartMs = readMs(d.updatedAt);
+        /**
+         * **`since` is the session start. `updatedAt` is the last write.**
+         *
+         * This read `updatedAt`, on the stated assumption that it "is written
+         * only on a mode change, so while the mode is online it IS the session
+         * start". The assumption does not hold: heartbeats and the break-credit
+         * ledger write the duty document continuously, so `updatedAt` tracks
+         * NOW.
+         *
+         * The anchor is `max(createdAt, sessionStart)`, so a session start that
+         * creeps forward drags every anchor with it and the deadline walks all
+         * day — the exact fault `anchorMsFor` documents and refuses for its own
+         * origin. Observed on GR0045: `since` 12:01:41, `updatedAt` 17:00:11 at
+         * 17:04, and a task raised at 16:19 anchored to 16:57.
+         *
+         * `since` is a Timestamp set when the mode last changed, which is what
+         * "the first provable moment they were online" means. `updatedAt` stays
+         * as a fallback for a document written before `since` existed — worse,
+         * but better than no anchor at all.
+         */
+        dutySessionStartMs = readMs(d.since) ?? readMs(d.updatedAt);
       }
     } catch (e) {
       /* An unreadable duty doc costs the first_online refinement, never the
@@ -597,7 +684,18 @@ async function rechainQueueFor(employeeId, opts = {}) {
     throw new Error("simulate requires dryRun — a preview must not write.");
   }
 
-  const approvedOutputIds = await approvedOutputIdsNow();
+  const { ids: approvedOutputIds, times: approvedAtById } = await _approvedIndex();
+
+  /**
+   * Stamped ONCE for the whole walk, so every task in one pass is anchored
+   * against the same instant.
+   *
+   * Declared here, above everything that reads it — the entry build, the
+   * re-anchor, the unblocking floor. Putting it lower has now caused the same
+   * fault three times in this file: a value used before its `const`, which
+   * throws at runtime while every source-assertion test passes.
+   */
+  const nowMs = Date.now();
 
   const live = [];
   /* Every document this person holds, collected in the pass that is already
@@ -641,6 +739,9 @@ async function rechainQueueFor(employeeId, opts = {}) {
          simply chained after the work that overtook it, which is the ordinary
          rule that one person does one task at a time. */
       workable: simulated ? true : occupiesQueue(t, approvedOutputIds),
+      /* When this task could first have been started, where it was held up by
+         somebody else's output. Null where it never was. */
+      unblockedAtMs: simulated ? null : unblockedAtMs(t, approvedAtById, nowMs),
       raw: t,
     });
   });
@@ -689,7 +790,11 @@ async function rechainQueueFor(employeeId, opts = {}) {
       const { db } = require("../config/firebaseAdmin");
       const duty = await db.collection("cowork_duty_status").doc(String(employeeId)).get();
       if (duty.exists && duty.data().mode === "online") {
-        sessionStartMs = readMs(duty.data().updatedAt);
+        /* `since`, not `updatedAt` — the same correction as
+           `resolveAcceptanceAnchor`, and for the same reason: `updatedAt`
+           tracks the last write, so using it here made the queue's start creep
+           forward all day and took every deadline with it. */
+        sessionStartMs = readMs(duty.data().since) ?? readMs(duty.data().updatedAt);
       }
     } catch (e) {
       /* No duty document is not a reason to move anybody's deadline. Without
@@ -703,10 +808,6 @@ async function rechainQueueFor(employeeId, opts = {}) {
         : earliestCreated;
     }
   }
-  /* Stamped once for the whole walk, so every task in one pass is anchored
-     against the same instant — and in scope for the re-anchor below, which is
-     several blocks down from here. */
-  const nowMs = Date.now();
   const moved = [];
   let previousEndMs = null;
 
@@ -812,22 +913,57 @@ async function rechainQueueFor(employeeId, opts = {}) {
     /* The head carries the QUEUE's start, so the number does not change with
        whichever task happens to lead. Never later than the task's own anchor —
        this rule may tighten a deadline, never loosen one. */
+    /**
+     * **The head takes the queue's start, whichever direction that moves it.**
+     *
+     * This used to adopt the queue start only when it was EARLIER, a guard
+     * against the anchor creeping forward. That creep had a different cause —
+     * the session start was read from `updatedAt`, which tracks the last write
+     * — and it is fixed at the source now that `since` is read instead.
+     *
+     * What the guard did instead was freeze ghosts. The queue start is
+     * `max(session, earliest task in the queue)`, so DELETING the earliest task
+     * moves it later; a stored anchor derived from the deleted task then could
+     * never be corrected. Reported exactly that way: Cowork anchored 16:19:02,
+     * the creation time of a Dev task that no longer existed, while the queue's
+     * earliest surviving task was Cowork itself at 16:33:46. The engine held
+     * 18:19 and the confirm dialog — which recomputes from scratch — showed
+     * 09:33 the next morning. Both were internally consistent and they
+     * disagreed, which is the failure this whole area keeps producing.
+     *
+     * The queue start is now stable in its own right: `since` does not move
+     * while the mode holds, and creation times do not move at all. So adopting
+     * it unconditionally cannot drift — it can only follow the queue it
+     * describes.
+     */
     const headAnchorMs =
       /* A simulation carries its own `startMs` — the rejection preview asks
          "what if I sent this back, starting now", and answering from the
          queue's start instead would answer a different question. */
-      !task.isRework &&
-      Number.isFinite(queueAnchorMs) &&
-      queueAnchorMs < (personalAnchorMs ?? task.anchorMs)
+      !task.isRework && Number.isFinite(queueAnchorMs)
         ? queueAnchorMs
         : (personalAnchorMs ?? task.anchorMs);
 
-    const anchorMs =
+    /* `let`, because the unblocking floor below may raise it. */
+    let anchorMs =
       previousEndMs === null
         ? headAnchorMs
         : anchorIsQueueDerived
           ? previousEndMs
           : Math.max(task.anchorMs, previousEndMs);
+    /**
+     * **Nothing starts before it was allowed to.** OWNER RULE, 21 Aug 2026.
+     *
+     * Applied AFTER the chain has had its say, and as a `max`, so it can only
+     * ever push a start later — never pull one earlier, and never reorder
+     * anything. Where the task above already finishes after the approval this
+     * changes nothing, which is the ordinary case; it bites where a blocked
+     * task reaches the FRONT and would otherwise take the queue's start.
+     */
+    if (Number.isFinite(task.unblockedAtMs) && task.unblockedAtMs > anchorMs) {
+      anchorMs = task.unblockedAtMs;
+    }
+
     let dueIso = addWorkingSecsIST(
       anchorMs,
       task.secs,
@@ -1045,6 +1181,7 @@ module.exports = {
   addWorkingSecsIST,
   occupiesQueue,
   approvedOutputIdsNow,
+  unblockedAtMs,
   rechainQueueFor,
   readOfficeCalendar,
   computeWorkingDeadline,

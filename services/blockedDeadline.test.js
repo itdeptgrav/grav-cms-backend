@@ -317,3 +317,161 @@ test("a rank already correct is not rewritten", () => {
   /* The overwhelmingly common case: nothing moved, so nothing is written. */
   assert.match(fn("_closeRankGaps"), /if \(Number\(t\.current\) === position\) return null;/);
 });
+
+/* ── An approval reorders somebody else's day ─────────────────────────────── */
+
+/**
+ * **The trigger that was missing.**
+ *
+ * A dependency means one person's approval changes ANOTHER person's queue:
+ * Umung approves an output, Rakesh's blocked task becomes workable, it climbs
+ * back and his dates move with it. `_releaseOutputDependents` told him and
+ * stopped — his order and deadlines stayed frozen in the blocked arrangement
+ * until he happened to open a task list and the throttled sync fired.
+ *
+ * Reported from live data: Dev stored P1 and workable again, still sitting at
+ * effective P2 with the early slot held by Cowork, hours after its input landed.
+ *
+ * This is safe where the earlier push-and-give-back pair was not, and the
+ * difference is exact: that computed a deadline of its own and argued with the
+ * chain. This computes nothing — it asks the one chain to re-walk.
+ */
+
+test("approving an output re-chains everybody it unblocked", () => {
+  const body = fn("_releaseOutputDependents");
+  assert.match(body, /await _rechainAffected\(affected\);/);
+  /* Collected inside the loop, walked once after it — a person holding two
+     freed tasks must not have their queue walked twice. */
+  assert.ok(
+    body.indexOf("affected.push") < body.indexOf("_rechainAffected(affected)"),
+    "the re-chain must run after the whole sweep, not per task",
+  );
+});
+
+test("order changes even where there is nobody to notify", () => {
+  /* A self-assigned task frees no recipient but still climbs the queue, so the
+     collection must not sit behind the notification guard. */
+  const body = fn("_releaseOutputDependents");
+  assert.ok(
+    body.indexOf("affected.push") < body.indexOf("if (!recipients.length) continue;"),
+    "a task with no one to notify would be left un-rechained",
+  );
+});
+
+test("it re-walks the engine's chain and computes no date itself", () => {
+  /* The distinction that keeps this from becoming a second opinion about
+     deadlines — the fault that sank `blocked_on_input`. */
+  const body = fn("_rechainAffected");
+  assert.notEqual(body, "", "_rechainAffected not found — renamed?");
+  assert.match(body, /rechainQueueFor\(id\)/);
+  assert.doesNotMatch(body, /addWorkingSecsIST|dueDate|clockStartsAtMs/);
+});
+
+test("each person is walked once, and a failure cannot fail the approval", () => {
+  const body = fn("_rechainAffected");
+  assert.match(body, /\[\.\.\.new Set\(employeeIds\.filter\(Boolean\)\)\]/);
+  assert.match(body, /catch \(e\) \{/);
+});
+
+/* ── Nothing starts before it was allowed to ──────────────────────────────── */
+
+/**
+ * **A task blocked on somebody else's output cannot begin before that output
+ * was approved.** OWNER RULE, 21 Aug 2026.
+ *
+ * The chain handled this whenever something sat ABOVE the task — that task
+ * finishes after the approval anyway. The hole was a blocked task reaching the
+ * FRONT, where it took the queue's start instead and was charged hours it was
+ * forbidden to work.
+ *
+ * **The EARLIEST unblocking, not the last.** A task is workable when ANY one of
+ * its outputs is startable — the rule `occupiesQueue` already uses — so a task
+ * waiting on Gopalpur (approved 14:00) and Puri (approved 17:00) could have
+ * begun at 14:00.
+ *
+ * Verified by execution: Dependent alone at the front of a queue starting 10:00
+ * was anchored 14:00, not 10:00 and not 17:00.
+ */
+
+test("the floor is the earliest approval that frees any output", () => {
+  const body = officeFn("unblockedAtMs");
+  assert.notEqual(body, "", "unblockedAtMs not found — renamed?");
+  /* Earliest across outputs... */
+  assert.match(body, /if \(earliest === null \|\| lastOfThisOutput < earliest\) earliest = lastOfThisOutput;/);
+  /* ...but an output is not free until ALL of ITS inputs are. */
+  assert.match(body, /if \(at > lastOfThisOutput\) lastOfThisOutput = at;/);
+  assert.match(body, /if \(!allApproved\) continue;/);
+});
+
+test("a task that was never held up is not constrained", () => {
+  /* An output needing no input is startable from the beginning, so the rule has
+     nothing to say about that task at all. */
+  const body = officeFn("unblockedAtMs");
+  assert.match(body, /if \(needs\.length === 0\) return null;/);
+  assert.match(body, /if \(outputs\.length === 0\) return null;/);
+});
+
+test("it can only push a start later, never pull one earlier", () => {
+  /* Applied after the chain has decided, as a max — so it cannot reorder
+     anything or make a deadline harder than the queue already made it. */
+  const i = office.indexOf("async function rechainQueueFor(");
+  const body = office.slice(i);
+  assert.match(
+    body,
+    /if \(Number\.isFinite\(task\.unblockedAtMs\) && task\.unblockedAtMs > anchorMs\) \{\s*\n\s*anchorMs = task\.unblockedAtMs;/,
+  );
+  /* And the anchor must be assignable for that to work — this threw
+     "Assignment to constant variable" on the first attempt, which every
+     source-assertion test in this file happily passed. */
+  assert.match(body, /let anchorMs =/);
+});
+
+test("a preview keeps the start the caller asked about", () => {
+  const i = office.indexOf("async function rechainQueueFor(");
+  const body = office.slice(i);
+  assert.match(body, /unblockedAtMs: simulated \? null : unblockedAtMs\(t, approvedAtById, nowMs\)/);
+});
+
+test("the approval instant is recorded when the review is written", () => {
+  /* Without `reviewedAt` there is nothing to anchor to. */
+  assert.match(fn("reviewOutput"), /reviewedAt: new Date\(\)\.toISOString\(\)/);
+});
+
+test("nowMs is declared before everything that reads it", () => {
+  /**
+   * Pinned because this exact slip has now happened three times in this file —
+   * `_blockedRefire`, `anchorMs` as a const, and `nowMs` — and every one of
+   * them threw at runtime while the whole source-assertion suite passed. These
+   * tests cannot see an execution fault, so the shape has to be asserted.
+   */
+  const i = office.indexOf("async function rechainQueueFor(");
+  const body = office.slice(i);
+  const decl = body.indexOf("const nowMs = Date.now();");
+  assert.ok(decl !== -1, "nowMs is not declared inside rechainQueueFor");
+  for (const m of body.matchAll(/\bnowMs\b/g)) {
+    assert.ok(
+      m.index >= decl,
+      `nowMs is read at ${m.index}, before its declaration at ${decl}`,
+    );
+  }
+});
+
+test("a still-blocked task floors at now, so its deadline does not burn", () => {
+  /**
+   * OWNER RULE, 21 Aug 2026. A task waiting with NOTHING approved had no floor
+   * at all — it fell back to the queue start and its deadline ran down while it
+   * sat unable to touch the work. With nothing above it in the queue that is
+   * the whole of its clock, running against a wait somebody else owns.
+   *
+   * While it waits the floor moves with the clock. The moment an input is
+   * approved the earliest-approval branch answers instead, a FIXED instant, and
+   * the date stops moving.
+   */
+  const body = officeFn("unblockedAtMs");
+  assert.match(body, /if \(earliest === null && Number\.isFinite\(nowMs\)\) return nowMs;/);
+  /* And it must come AFTER the approval search, so a freed task gets the fixed
+     instant rather than the moving one. */
+  assert.ok(
+    body.indexOf("if (!allApproved) continue;") < body.indexOf("earliest === null && Number.isFinite(nowMs)"),
+  );
+});

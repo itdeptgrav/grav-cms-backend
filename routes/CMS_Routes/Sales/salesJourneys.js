@@ -52,6 +52,7 @@ const { closingVerdictForJourney } = require("../../../services/closingVerdict")
 const { assertLeadConvertible, deriveLegacyStage } = require("../../../services/leadQualification");
 const { planStageTransition, JourneyTransitionError } = require("../../../services/salesJourneyProgress");
 const { isSalesManager } = require("../../../services/salesAccess");
+const { ensureOrderLink } = require("../../../services/orderBookLink");
 const {
   canViewCredit,
   stripJourneyCommercial,
@@ -533,6 +534,27 @@ router.post("/", salesAuth, async (req, res) => {
         : {}),
     };
 
+    /*
+     * A REPEAT ORDER DOES NOT NEED SAMPLING.
+     *
+     * `notApplicable` is the journey's own word for a stage that was never in
+     * play, both steppers already draw it, and until now nothing ever set it —
+     * not one journey in this database has a single stage marked. The result is
+     * SJ-2026-0005, a `repeat` order, sitting AT Style & Sample: a tech sheet
+     * and a physical sample being asked for on a style that was already
+     * approved and produced.
+     *
+     * Repeat and replenishment are, by definition, orders off an approved
+     * style. Marking the stage skipped at creation is honest and reversible —
+     * the stage stays reachable, its history survives, and Sales can reopen it
+     * by setting a state on it if this particular repeat does need a new
+     * sample. Only NEW journeys are affected; nothing existing is migrated.
+     */
+    const SKIPS_SAMPLING = new Set(["repeat", "replenishment"]);
+    if (SKIPS_SAMPLING.has(payload.businessType)) {
+      payload.stageStates = { ...(payload.stageStates || {}), styleSample: "notApplicable" };
+    }
+
     const journey = await createWithRef(SalesJourney, payload);
 
     await recordChange(req, {
@@ -723,19 +745,33 @@ router.patch("/:journeyId/po", salesAuth, async (req, res) => {
     journey.updatedBy = actor(req);
     await journey.save();
 
+    // Recording the PO is the moment an opportunity becomes an order, so it is
+    // the moment to pin its order record by id instead of leaving the post-PO
+    // screens to find it by matching the customer's name. Advisory: never
+    // throws, and a PO is recorded whether or not the link resolves. See
+    // services/orderBookLink.js for why it links but does not create.
+    const orderLink = await ensureOrderLink(journey);
+
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "crm-sales-journey",
       entityId: journey._id,
       entityLabel: journey.journeyId,
       action: "update",
-      summary: `Sales Journey ${journey.journeyId} PO recorded (${number})`,
+      summary: `Sales Journey ${journey.journeyId} PO recorded (${number})`
+        + (orderLink.linked && orderLink.requestId ? ` — order ${orderLink.requestId} linked` : ""),
       before,
       after: journey.toObject(),
     });
 
     const saved = await SalesJourney.findById(journey._id).populate(POPULATE_DETAIL).lean({ virtuals: false });
-    return res.json({ success: true, journey: stripJourneyCommercial(detailDto(saved), req.user) });
+    return res.json({
+      success: true,
+      journey: stripJourneyCommercial(detailDto(saved), req.user),
+      // Advisory only — the UI does not depend on it yet. Surfaced so the link
+      // (or the reason it could not be made) is visible rather than silent.
+      orderLink,
+    });
   } catch (err) {
     const status = err instanceof ValidationError || err.name === "ValidationError" ? 400 : 500;
     return res.status(status).json({ success: false, message: err.message });

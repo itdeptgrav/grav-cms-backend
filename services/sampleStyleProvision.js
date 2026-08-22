@@ -42,7 +42,21 @@ async function provisionJourneyStyles({
 }) {
   const products = (enquiry?.products || []).filter((p) => p && p.product);
 
-  const existing = await SampleStyle.find({ journeyId: journey._id, isActive: true });
+  // BASE VARIANTS ONLY.
+  //
+  // A product can now be developed as several styles at once (see the
+  // `variantKey` field on SampleStyle). Provisioning owns exactly one of them:
+  // the base, raised straight from the enquiry product. If it saw the variants
+  // too it would match one of them by name, overwrite its brief with the
+  // enquiry's on every sync, and undo the very thing that makes it a variant.
+  //
+  // It also must not CREATE anything for a product that already has a base, so
+  // the maps are built from base rows and the "not found" path stays correct.
+  const existing = await SampleStyle.find({
+    journeyId: journey._id,
+    isActive: true,
+    $or: [{ variantKey: "" }, { variantKey: { $exists: false } }],
+  });
   const byProductId = new Map(
     existing.filter((s) => s.enquiryProductId).map((s) => [String(s.enquiryProductId), s]),
   );
@@ -86,6 +100,14 @@ async function provisionJourneyStyles({
       // The rename case this whole change exists for: the product's text moved,
       // so carry the style with it instead of stranding it.
       if (style.productName !== p.product) {
+        // Carry the SIBLINGS too. productName is what groups a family, so
+        // renaming only the base would split it: the variants would keep the
+        // old name, stop appearing under the product, and be free to collide
+        // with a future style of that name.
+        await SampleStyle.updateMany(
+          { journeyId: journey._id, productName: style.productName, variantKey: { $nin: ["", null] } },
+          { $set: { productName: p.product } },
+        );
         style.productName = p.product;
         renamed += 1;
       }

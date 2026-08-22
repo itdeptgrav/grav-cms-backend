@@ -1266,6 +1266,122 @@ router.post("/:id/submit", salesAuth, async (req, res) => {
   }
 });
 
+// POST /api/cms/crm/leads/:id/convert-to-active — the DIRECT path.
+//
+// Prospect Setup's own button (DraftWorkspace.js) has called this since the
+// review hop was dropped on 20 Aug 2026 — "Send to HOD and then HOD approval…
+// these are not needed" — but the route was never written, so the button has
+// been posting into a 404 and no Prospect could reach Active Leads through the
+// UI at all. Written 22 Aug 2026.
+//
+// It is /approve minus the review state machine, and nothing else:
+//
+//   • No applyApprove — that asserts the Prospect is AWAITING REVIEW, which is
+//     exactly the hop this path removes. `reviewStatus` is still stamped
+//     "approved" so the record reads consistently to everything that displays
+//     it (leadReview.js, the Prospects filters, the workspace chip).
+//   • The readiness CHECKLIST still gates it. The review hop was removed; the
+//     bar was not. The UI disables the button on the same computation, so this
+//     is the server refusing what the client already refuses — not a new rule.
+//   • Same create-Activity-then-flip-then-rollback order as /approve, for the
+//     same reason: an Active Lead must never exist without its first follow-up,
+//     and a failed flip must not strand an Activity.
+//
+// /approve stays exactly as it is. Nothing is torn out — a workflow that does
+// route Prospects through a reviewer still works.
+router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
+  try {
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
+    if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
+      return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
+    }
+    if (lead.captureStatus !== "draft") {
+      return res.status(400).json({
+        success: false,
+        message: lead.captureStatus === "active"
+          ? "This is already an Active Lead."
+          : "Only a Prospect can be converted to an Active Lead.",
+      });
+    }
+
+    const { checks, ready } = computeSubmissionReadiness(lead);
+    if (!ready) {
+      return res.status(400).json({
+        success: false,
+        message: "This Prospect isn't ready to become an Active Lead yet.",
+        checks,
+      });
+    }
+
+    // Belt and braces: readiness covers the first action, but this route
+    // dereferences it below and a 500 would be a poor way to say so.
+    const first = lead.pendingFirstAction || {};
+    if (!String(first.subject || "").trim() || !first.dueDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Set the first follow-up — an Active Lead starts with something scheduled.",
+      });
+    }
+
+    const before = lead.toObject();
+
+    // Activity FIRST, flip second, roll the Activity back if the flip fails.
+    const activity = await Activity.create({
+      leadId: lead._id,
+      activityType: "follow_up",
+      subject: String(first.subject).trim(),
+      description: first.notes ? String(first.notes).trim() : undefined,
+      dueDate: first.dueDate,
+      status: "planned",
+      ownerId: lead.assignedTo || req.user?.id,
+      ownerName: lead.assignedToName || req.user?.name,
+      createdBy: actor(req),
+      updatedBy: actor(req),
+    });
+
+    try {
+      lead.captureStatus = "active";
+      // qualificationState is untouched — it stays "new". Converting says this
+      // is worth working, not that it has been qualified.
+      lead.reviewStatus = "approved";
+      lead.reviewedAt = new Date();
+      lead.reviewedBy = actor(req);
+      lead.reviewReason = undefined;
+      lead.nextFollowUpAt = first.dueDate;
+      lead.updatedBy = actor(req);
+      await lead.save();
+    } catch (err) {
+      await Activity.deleteOne({ _id: activity._id });
+      throw err;
+    }
+
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "lead",
+      entityId: lead._id,
+      entityLabel: displayName(lead),
+      action: "update",
+      summary: `Prospect converted to Active Lead: ${lead.leadId}`,
+      before,
+      after: lead.toObject(),
+    });
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-activity",
+      entityId: activity._id,
+      entityLabel: activity.subject,
+      action: "create",
+      summary: `follow_up: ${activity.subject} (Lead ${displayName(lead)}, created on conversion)`,
+      after: activity.toObject(),
+    });
+
+    res.json({ success: true, lead, activity });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
 // POST /api/cms/crm/leads/:id/approve — approves a submitted Prospect AS an
 // Active Lead. The ONLY path from Prospect to Active Lead.
 // Optional `assignedTo` lets the approver assign a different owner IN the
