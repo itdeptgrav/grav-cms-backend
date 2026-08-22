@@ -6,11 +6,80 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequest");
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const EmployeeMpc = require("../../../../models/Customer_Models/Employee_Mpc");
 const DispatchChallan = require("../../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Manufacturing/Production/ProductionCompletionScanRecord");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
+
+// ── Barcode scan helpers — mirrors routes/CMS_Routes/Manufacturing/Production/
+// productionCompletionRoutes.js exactly (barcode format "WO-<shortId>-<unit>",
+// short id = last 8 chars of the WorkOrder _id, IST calendar-day bucketing).
+// Duplicated locally rather than shared, matching how that file already
+// duplicates its own copy rather than exporting one.
+const parseBarcode = (barcodeId) => {
+  if (!barcodeId || typeof barcodeId !== "string") return { success: false };
+  const parts = barcodeId.trim().split("-");
+  if (parts.length >= 3 && parts[0] === "WO") {
+    const unit = parseInt(parts[2], 10);
+    if (!isNaN(unit) && unit > 0) return { success: true, woShortId: parts[1], unitNumber: unit };
+  }
+  return { success: false };
+};
+const getISTMidnight = (dateStr) => {
+  const d = dateStr ? new Date(dateStr) : new Date();
+  const istMs = d.getTime() + 5.5 * 60 * 60 * 1000;
+  const istDate = new Date(istMs);
+  istDate.setUTCHours(0, 0, 0, 0);
+  return new Date(istDate.getTime() - 5.5 * 60 * 60 * 1000);
+};
+const woShortIdOf = (wo) => wo._id.toString().slice(-8);
+
+// Every unit number already scanned (any day, ever) for one WO — the same
+// "production completed" truth the Production Supervisor's barcode scanner
+// writes to, so this reads back exactly what they've actually done rather
+// than a separately-tracked number (19 Aug 2026, explicit request).
+async function getScannedUnitNumbers(woShortId) {
+  const docs = await ProductionCompletionScanRecord.find({
+    scans: { $elemMatch: { barcodeId: new RegExp(`^WO-${woShortId}-`) } },
+  }).select("scans").lean();
+  const units = new Set();
+  for (const doc of docs) {
+    for (const s of doc.scans || []) {
+      const p = parseBarcode(s.barcodeId);
+      if (p.success && p.woShortId === woShortId) units.add(p.unitNumber);
+    }
+  }
+  return units;
+}
+
+// Records up to `count` new scans for a WO — i.e. "Mark Production" writes
+// into the SAME ProductionCompletionScanRecord ledger a real barcode scan
+// would, tagged so it's clearly a manual entry, not a device scan. Picks the
+// lowest-numbered units not already scanned. Returns how many were actually
+// added (fewer than `count` if there aren't that many unscanned units left).
+async function addProductionScans(woShortId, alreadyScanned, totalQty, count, actorName) {
+  const newUnits = [];
+  for (let u = 1; u <= totalQty && newUnits.length < count; u++) {
+    if (!alreadyScanned.has(u)) newUnits.push(u);
+  }
+  if (!newUnits.length) return 0;
+  const now = new Date();
+  const dateBucket = getISTMidnight(now);
+  const scanEntries = newUnits.map((u) => ({
+    barcodeId: `WO-${woShortId}-${String(u).padStart(3, "0")}`,
+    scannedAt: now,
+    scannedBy: `${actorName} (manual mark)`,
+  }));
+  await ProductionCompletionScanRecord.findOneAndUpdate(
+    { date: dateBucket },
+    { $push: { scans: { $each: scanEntries } }, $setOnInsert: { date: dateBucket } },
+    { upsert: true },
+  );
+  return newUnits.length;
+}
 
 router.get("/", async (req, res) => {
   try {
@@ -1199,10 +1268,32 @@ router.get("/:id/bulk-tracking", async (req, res) => {
     const pg = Math.max(1, parseInt(page)), lm = Math.max(1, parseInt(limit));
 
     const wos = await WorkOrder.find({ customerRequestId: new mongoose.Types.ObjectId(id) })
-      .select("workOrderNumber status quantity variantAttributes stockItemId stockItemName stockItemReference productionCompletion bulkDispatchHistory")
+      .select("workOrderNumber status quantity variantAttributes stockItemId stockItemName stockItemReference qcCompletion packagedQuantity bulkDispatchHistory")
       .populate("stockItemId", "name reference genderCategory images variants")
       .sort({ createdAt: 1 })
       .lean();
+
+    // Production completion comes from the SAME barcode-scan ledger the
+    // Production Supervisor's scanner writes to (ProductionCompletionScanRecord)
+    // — not WorkOrder.productionCompletion.overallCompletedQuantity, a stored
+    // snapshot that depends on a sync job to stay current. One query, batched
+    // across every WO on this MO (19 Aug 2026, explicit request).
+    const shortIds = wos.map(woShortIdOf);
+    const scannedByShortId = new Map();
+    if (shortIds.length) {
+      const alternation = shortIds.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+      const scanDocs = await ProductionCompletionScanRecord.find({
+        scans: { $elemMatch: { barcodeId: new RegExp(`^WO-(${alternation})-`) } },
+      }).select("scans").lean();
+      for (const doc of scanDocs) {
+        for (const s of doc.scans || []) {
+          const p = parseBarcode(s.barcodeId);
+          if (!p.success) continue;
+          if (!scannedByShortId.has(p.woShortId)) scannedByShortId.set(p.woShortId, new Set());
+          scannedByShortId.get(p.woShortId).add(p.unitNumber);
+        }
+      }
+    }
 
     const extractUrl = (e) => { if (!e) return null; if (typeof e === "string") return e; return e?.url || e?.src || e?.imageUrl || null; };
     const pickImage = (wo) => {
@@ -1216,8 +1307,10 @@ router.get("/:id/bulk-tracking", async (req, res) => {
     let enriched = wos.map((wo) => {
       const history = wo.bulkDispatchHistory || [];
       const totalDisp = history.reduce((s, r) => s + (r.quantity || 0), 0);
-      const completedQty = wo.productionCompletion?.overallCompletedQuantity || 0;
-      const completionPct = wo.productionCompletion?.overallCompletionPercentage || 0;
+      const completedQty = scannedByShortId.get(woShortIdOf(wo))?.size || 0;
+      const completionPct = wo.quantity ? Math.min(100, Math.round((completedQty / wo.quantity) * 100)) : 0;
+      const qcQty = wo.qcCompletion?.completedQuantity || 0;
+      const packagedQty = wo.packagedQuantity || 0;
       const available = Math.max(0, completedQty - totalDisp);
       return {
         workOrderId: wo._id,
@@ -1231,6 +1324,10 @@ router.get("/:id/bulk-tracking", async (req, res) => {
         totalQuantity: wo.quantity || 0,
         completedQuantity: completedQty,
         completionPct,
+        // QC/packaging progress — the manual "Mark Production/QC/Packaging/
+        // Dispatch" actions read and write these same fields (19 Aug 2026).
+        qcQuantity: qcQty,
+        packagedQuantity: packagedQty,
         dispatchedQuantity: totalDisp,
         availableForDispatch: available,
         pendingProduction: Math.max(0, (wo.quantity || 0) - completedQty),
@@ -1257,7 +1354,7 @@ router.get("/:id/bulk-tracking", async (req, res) => {
     const totals = wos.reduce((acc, wo) => {
       const hist = wo.bulkDispatchHistory || [];
       acc.totalQty += (wo.quantity || 0);
-      acc.completedQty += (wo.productionCompletion?.overallCompletedQuantity || 0);
+      acc.completedQty += (scannedByShortId.get(woShortIdOf(wo))?.size || 0);
       acc.dispatchedQty += hist.reduce((s, r) => s + (r.quantity || 0), 0);
       return acc;
     }, { totalWOs: wos.length, totalQty: 0, completedQty: 0, dispatchedQty: 0 });
@@ -1325,6 +1422,193 @@ router.post("/:id/dispatch-bulk", async (req, res) => {
     });
   } catch (err) {
     console.error("dispatch-bulk error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Sequentially distribute a stage's quantity delta across a WO's
+// EmployeeProductionProgress docs (measurement/person-wise orders), sorted by
+// unitStart — so a manual mark from the PM reflects as real per-employee
+// completion, not just a WO-level number (19 Aug 2026, explicit request).
+// QC has no per-employee field anywhere in this schema, so QC deltas are not
+// reflected here — only production/packaging/dispatch are.
+async function reflectStageOnEmployeeProgress(docs, deltas, actor, now) {
+  if (deltas.production > 0) {
+    let remaining = deltas.production;
+    for (const doc of docs) {
+      if (remaining <= 0) break;
+      const room = (doc.totalUnits || 0) - (doc.completedUnits || 0);
+      if (room <= 0) continue;
+      const take = Math.min(room, remaining);
+      doc.completedUnits = (doc.completedUnits || 0) + take;
+      doc.completionPercentage = doc.totalUnits ? Math.min(100, Math.round((doc.completedUnits / doc.totalUnits) * 100)) : 0;
+      remaining -= take;
+      await doc.save();
+    }
+  }
+  if (deltas.packaging > 0) {
+    let remaining = deltas.packaging;
+    for (const doc of docs) {
+      if (remaining <= 0) break;
+      const room = (doc.completedUnits || 0) - (doc.packagedUnits || 0); // can't package more than produced
+      if (room <= 0) continue;
+      const take = Math.min(room, remaining);
+      doc.packagedUnits = (doc.packagedUnits || 0) + take;
+      doc.isFullyPackaged = doc.totalUnits ? doc.packagedUnits >= doc.totalUnits : false;
+      doc.lastPackagedAt = now;
+      doc.packagingHistory = doc.packagingHistory || [];
+      doc.packagingHistory.push({ packagedQuantity: take, packagedAt: now, packagedBy: actor, notes: "Marked by Project Manager" });
+      remaining -= take;
+      await doc.save();
+    }
+  }
+  if (deltas.dispatch > 0) {
+    // isDispatched is a per-employee boolean, not a quantity — only mark an
+    // employee dispatched when the delta can cover their WHOLE allocation, so
+    // this never records a partial dispatch as complete.
+    let remaining = deltas.dispatch;
+    for (const doc of docs) {
+      if (remaining <= 0) break;
+      if (doc.isDispatched) continue;
+      const unitsHere = doc.totalUnits || 0;
+      if (unitsHere <= 0 || remaining < unitsHere) continue;
+      doc.isDispatched = true;
+      doc.dispatchHistory = doc.dispatchHistory || [];
+      doc.dispatchHistory.push({ dispatchedAt: now, dispatchedBy: actor, notes: "Marked by Project Manager" });
+      remaining -= unitsHere;
+      await doc.save();
+    }
+  }
+}
+
+// POST /:id/work-orders/:woId/mark-stage — the manual backup for production →
+// QC → packaging → dispatch progress, alongside whatever auto-completes them
+// (the packaging scan/cron flow, dispatch-bulk). Cascades FORWARD: marking a
+// later stage also ensures every earlier stage is caught up to at least the
+// same quantity first, since a unit can't be packaged without having been
+// produced (19 Aug 2026, explicit request — "Mark Production" / "Mark QC"
+// (also marks production) / "Mark Packaging" (also marks production+QC) /
+// "Dispatch Work" (also marks all three)).
+router.post("/:id/work-orders/:woId/mark-stage", async (req, res) => {
+  try {
+    const { id, woId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(woId))
+      return res.status(400).json({ success: false, message: "Invalid work order ID" });
+
+    const STAGES = ["production", "qc", "packaging", "dispatch"];
+    const { stage, quantity, notes } = req.body;
+    if (!STAGES.includes(stage))
+      return res.status(400).json({ success: false, message: "Invalid stage." });
+    const qty = parseInt(quantity, 10);
+    if (!qty || qty < 1)
+      return res.status(400).json({ success: false, message: "Quantity must be at least 1." });
+
+    const wo = await WorkOrder.findById(woId);
+    if (!wo) return res.status(404).json({ success: false, message: "Work order not found." });
+    if (id && String(wo.customerRequestId) !== String(id))
+      return res.status(400).json({ success: false, message: "Work order does not belong to this manufacturing order." });
+
+    const totalQty = wo.quantity || 0;
+    const cap = (v) => Math.max(0, totalQty ? Math.min(totalQty, v) : v);
+    const actor = req.user?.name || "Project Manager";
+    const now = new Date();
+    const targetIndex = STAGES.indexOf(stage);
+    const deltas = { production: 0, qc: 0, packaging: 0, dispatch: 0 };
+
+    // 1. Production — every stage implies it. "Mark Production" is the manual
+    // backup for the Production Supervisor's barcode scan, so it writes into
+    // the exact same ledger (ProductionCompletionScanRecord) a real scan
+    // would, rather than a separate counter — that's what actually drives
+    // the "completed" progress bar now too (19 Aug 2026, explicit request).
+    const woShortId = woShortIdOf(wo);
+    const alreadyScanned = await getScannedUnitNumbers(woShortId);
+    const prodBefore = alreadyScanned.size;
+    const prodTarget = cap(Math.max(prodBefore, qty));
+    if (prodTarget > prodBefore) {
+      deltas.production = await addProductionScans(woShortId, alreadyScanned, totalQty, prodTarget - prodBefore, actor);
+    }
+    const prodAfter = prodBefore + deltas.production;
+
+    // Keep the WorkOrder's own snapshot in step too — monotonically, never
+    // downgraded — so anything still reading productionCompletion directly
+    // (e.g. the MO stats strip) isn't stuck behind the scan ledger.
+    wo.productionCompletion = wo.productionCompletion || {};
+    if (prodAfter > (wo.productionCompletion.overallCompletedQuantity || 0)) {
+      wo.productionCompletion.overallCompletedQuantity = prodAfter;
+      wo.productionCompletion.overallCompletionPercentage = totalQty ? Math.min(100, Math.round((prodAfter / totalQty) * 100)) : 0;
+    }
+
+    // 2. QC — capped at what's been produced.
+    if (targetIndex >= 1) {
+      wo.qcCompletion = wo.qcCompletion || { completedQuantity: 0, history: [] };
+      const qcBefore = wo.qcCompletion.completedQuantity || 0;
+      const qcAfter = Math.min(prodAfter, Math.max(qcBefore, qty));
+      if (qcAfter > qcBefore) {
+        wo.qcCompletion.completedQuantity = qcAfter;
+        wo.qcCompletion.history.push({ quantity: qcAfter - qcBefore, notes: notes || "", checkedBy: actor, checkedAt: now });
+        deltas.qc = qcAfter - qcBefore;
+      }
+    }
+
+    // 3. Packaging — capped at what's passed QC.
+    if (targetIndex >= 2) {
+      const packBefore = wo.packagedQuantity || 0;
+      const packCap = wo.qcCompletion?.completedQuantity || 0;
+      const packAfter = Math.min(packCap, Math.max(packBefore, qty));
+      if (packAfter > packBefore) {
+        wo.packagedQuantity = packAfter;
+        wo.packagingRecords = wo.packagingRecords || [];
+        wo.packagingRecords.push({ packagedQuantity: packAfter - packBefore, packagedAt: now, packagedBy: actor, packagingType: "bulk", notes: notes || "Marked by Project Manager" });
+        deltas.packaging = packAfter - packBefore;
+      }
+    }
+
+    // 4. Dispatch — capped at what's been packaged, minus what's already dispatched.
+    if (targetIndex === 3) {
+      const currentDispatched = (wo.bulkDispatchHistory || []).reduce((s, r) => s + (r.quantity || 0), 0);
+      const availableForDispatch = Math.max(0, (wo.packagedQuantity || 0) - currentDispatched);
+      const dispatchQty = Math.min(qty, availableForDispatch);
+      if (dispatchQty > 0) {
+        wo.bulkDispatchHistory = wo.bulkDispatchHistory || [];
+        wo.bulkDispatchHistory.push({ quantity: dispatchQty, notes: notes || "Marked by Project Manager", dispatchedBy: actor, dispatchedAt: now });
+        deltas.dispatch = dispatchQty;
+      }
+    }
+
+    // Status — never downgrades, same convention as the packaging auto-flow.
+    if (wo.status !== "completed") {
+      if (prodAfter >= totalQty && totalQty > 0) {
+        wo.status = "completed";
+        if (wo.timeline && !wo.timeline.actualEndDate) wo.timeline.actualEndDate = now;
+      } else if (prodAfter > 0 && wo.status === "pending") {
+        wo.status = "in_progress";
+      }
+    }
+
+    await wo.save();
+
+    const progressDocs = await EmployeeProductionProgress.find({ workOrderId: wo._id }).sort({ unitStart: 1 });
+    if (progressDocs.length) {
+      await reflectStageOnEmployeeProgress(progressDocs, deltas, actor, now);
+    }
+
+    const totalDispatched = (wo.bulkDispatchHistory || []).reduce((s, r) => s + (r.quantity || 0), 0);
+    return res.json({
+      success: true,
+      deltas,
+      workOrder: {
+        id: String(wo._id),
+        status: wo.status,
+        totalQuantity: totalQty,
+        productionCompletedQuantity: wo.productionCompletion.overallCompletedQuantity || 0,
+        qcCompletedQuantity: wo.qcCompletion?.completedQuantity || 0,
+        packagedQuantity: wo.packagedQuantity || 0,
+        dispatchedQuantity: totalDispatched,
+      },
+      employeeProgressUpdated: progressDocs.length,
+    });
+  } catch (err) {
+    console.error("mark-stage error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });

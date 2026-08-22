@@ -4,7 +4,7 @@ const axios = require('axios');
 class VendorEmailService {
     constructor() {
         this.apiKey = process.env.BREVO_API_KEY;
-        this.senderEmail = "biswalpramod3.1415@gmail.com";
+        this.senderEmail = process.env.CUSTOMER_SENDER_EMAIL || "biswalpramod3.1415@gmail.com";
         this.senderName = "Grav Clothing - Purchasing Department";
         this.baseUrl = "https://api.brevo.com/v3";
         this.companyName = "Grav Clothing";

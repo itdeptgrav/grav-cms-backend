@@ -969,6 +969,8 @@ app.use("/api/ai", gravAssistantRoutes);
 
 // PersonalCallRecorder Android app → call recording sync (metadata → Mongo, audio → Drive)
 app.use("/api/recordings", require("./routes/callRecordings"));
+// PersonalCallRecorder Android app → every call's outcome (received/missed) → Mongo callevents
+app.use("/api/call-events", require("./routes/callEvents"));
 
 app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
 
@@ -986,6 +988,12 @@ app.use("/api/hr", hrProfileRoutes);
  * --------------------------------------------------------------------- */
 const deptAuthRoutes = require("./routes/auth/deptAuth");
 app.use("/api/auth", deptAuthRoutes);
+
+// Self-service "forgot password" for the same login this replaces — request a
+// 4-digit email OTP, verify it, then set a new password. Reuses deptAuth's own
+// identity resolution, so it covers every account /login can authenticate.
+const passwordResetRoutes = require("./routes/auth/passwordReset");
+app.use("/api/auth", passwordResetRoutes);
 
 const requirePlatformAdmin = require("./Middlewear/requirePlatformAdmin");
 const accessAdminRoutes = require("./routes/Admin/accessAdmin");
@@ -1206,6 +1214,9 @@ app.use("/api/cms/crm/lookups", require("./routes/CMS_Routes/Sales/crmLookups"))
 // only get in the way of. The Android app's upload endpoint stays separate at
 // /api/recordings.
 app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callRecordings"));
+// Every call (answered/missed/rejected, recorded or not) for the Active Lead
+// workspace's outreach-attempt suggestion — see that route file's own header.
+app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
 
 // Sales Journey — the connected commercial lifecycle record (Account →
 // Retention). Same Sales role + approval guard as the rest of CRM: an editor's
@@ -1233,6 +1244,14 @@ app.use(
 app.use(
   "/api/cms/crm/sample-styles",
   require("./routes/CMS_Routes/Sales/sampleStyles"),
+);
+
+// The Sales-wide inbox of pending costing/materials submissions across every
+// journey — read-only aggregation over what enquiries.js and sampleStyles.js
+// already stage per-product (19 Aug 2026).
+app.use(
+  "/api/cms/crm/pending-changes",
+  require("./routes/CMS_Routes/Sales/pendingChanges"),
 );
 
 // Inventory Routes

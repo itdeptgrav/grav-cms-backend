@@ -1557,3 +1557,9 @@ module.exports.buildTokenPayload = buildTokenPayload;
 // Exported so a shared permission resolver can decide HR-tool access from the
 // SAME department grants used at login — not a second, drifting copy.
 module.exports.resolveEmployeeDepartments = resolveEmployeeDepartments;
+// Exported so routes/auth/passwordReset.js can resolve the SAME "which of the
+// twelve legacy department collections does this email belong to" answer
+// /login itself uses, instead of keeping a second copy of that model list that
+// could drift out of step as models are migrated off it.
+module.exports.findLegacyUser = findLegacyUser;
+module.exports.legacyModel = legacyModel;

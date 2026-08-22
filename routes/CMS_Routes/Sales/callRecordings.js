@@ -11,79 +11,29 @@
 // That is why it is mounted WITHOUT the salesWrites() approval guard: holding a
 // "summarise" click as a change request for an approver would be nonsense, and
 // the guard exists to protect business records, which these are not.
+//
+// Reads CallEvent, not the old CallRecording model (21 Aug 2026 — the two
+// call-tracking collections were consolidated into one; see CallEvent.js's
+// own header comment). Filtered to `driveFileId` set, since this view is
+// specifically "what got recorded" — every OTHER call CallEvent now also
+// holds (missed/rejected/unrecorded) is out of scope for this screen.
 "use strict";
 
 const express = require("express");
 const router = express.Router();
 
-const CallRecording = require("../../../models/CallRecording");
-const Account = require("../../../models/CMS_Models/Sales/Account");
-const Contact = require("../../../models/CMS_Models/Sales/Contact");
-const Customer = require("../../../models/Customer_Models/Customer");
+const CallRecording = require("../../../models/CallEvent");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { getDriveFileStream } = require("../../../services/mediaUpload.service");
 const { buildRecordingFilter, annotateMatches } = require("../../../services/callRecordingMatch.service");
+const { identityFor } = require("../../../services/customerIdentityLookup.service");
 const { summariseCall } = require("../../../services/callSummary.service");
 
 /** Hard ceiling on one customer's call history in a single response. */
 const MAX_ROWS = 200;
 
 /**
- * Collect every phone number and name that identifies a customer, from either
- * of the two "customer" models Sales runs on:
- *
- *   • CRMAccount   — the organisation (Customer Hub). Its own numbers, plus
- *                    every contact person at it, because the call almost always
- *                    goes to a person, not to a company switchboard.
- *   • Customer     — the portal/e-commerce account.
- *
- * Returns null when the id resolves to nothing.
- */
-async function identityFor({ accountId, customerId }) {
-  if (accountId) {
-    const account = await Account.findById(accountId)
-      .select("companyName displayName legalName brandName primaryPhone alternatePhone")
-      .lean();
-    if (!account) return null;
-
-    const contacts = await Contact.find({ accountId })
-      .select("firstName lastName phone mobile whatsapp alternatePhone")
-      .lean();
-
-    return {
-      label: account.displayName || account.companyName,
-      phones: [
-        account.primaryPhone,
-        account.alternatePhone,
-        ...contacts.flatMap((c) => [c.phone, c.mobile, c.whatsapp, c.alternatePhone]),
-      ],
-      names: [account.companyName, account.displayName, account.legalName, account.brandName],
-      // Kept apart from the org names: a person's name is matched only as a
-      // whole phrase, never by its leading word. "Rahul" is not an identity.
-      personNames: contacts.map((c) => [c.firstName, c.lastName].filter(Boolean).join(" ")),
-    };
-  }
-
-  const customer = await Customer.findById(customerId)
-    .select("name phone alternatePhone profile.companyName")
-    .lean();
-  if (!customer) return null;
-
-  /* A portal Customer's `name` is the buying organisation as often as it is a
-     person, and nothing in the schema distinguishes the two — so it is treated
-     as an org name. That is the looser reading, which is the right default
-     here: a missed call is invisible, a name-matched one is labelled as a guess
-     on screen and can be judged. */
-  return {
-    label: customer.name,
-    phones: [customer.phone, customer.alternatePhone],
-    names: [customer.name, customer.profile?.companyName],
-    personNames: [],
-  };
-}
-
-/**
- * GET /api/cms/crm/call-recordings?accountId=… | ?customerId=…
+ * GET /api/cms/crm/call-recordings?accountId=… | ?customerId=… | ?leadId=…
  *
  * → { success, recordings[], identity: { label, phones, names }, counts }
  *
@@ -95,13 +45,13 @@ async function identityFor({ accountId, customerId }) {
  */
 router.get("/", salesAuth, async (req, res) => {
   try {
-    const { accountId, customerId } = req.query;
-    if (!accountId && !customerId) {
-      return res.status(400).json({ success: false, message: "accountId or customerId is required" });
+    const { accountId, customerId, leadId } = req.query;
+    if (!accountId && !customerId && !leadId) {
+      return res.status(400).json({ success: false, message: "accountId, customerId or leadId is required" });
     }
 
-    const identity = await identityFor({ accountId, customerId });
-    if (!identity) return res.status(404).json({ success: false, message: "Customer not found" });
+    const identity = await identityFor({ accountId, customerId, leadId });
+    if (!identity) return res.status(404).json({ success: false, message: leadId ? "Lead not found" : "Customer not found" });
 
     const filter = buildRecordingFilter(identity);
     /* No phone and no usable name means nothing to match on. Returning empty is
@@ -116,7 +66,7 @@ router.get("/", salesAuth, async (req, res) => {
       });
     }
 
-    const rows = await CallRecording.find(filter)
+    const rows = await CallRecording.find({ ...filter, driveFileId: { $ne: null } })
       .sort({ startTime: -1, createdAt: -1 })
       .limit(MAX_ROWS)
       .lean();
@@ -127,7 +77,7 @@ router.get("/", salesAuth, async (req, res) => {
       contactName: r.contactName,
       direction: r.direction,
       startTime: r.startTime,
-      durationMillis: r.durationMillis,
+      durationMillis: Math.round((r.durationSec || 0) * 1000),
       transcription: r.transcription,
       deviceSummary: r.summary,
       aiSummary: r.aiSummary,
