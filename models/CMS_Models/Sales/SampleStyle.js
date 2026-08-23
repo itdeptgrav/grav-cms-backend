@@ -130,6 +130,20 @@ const sampleStyleSchema = new mongoose.Schema(
     // matched by name and backfilled on the next provision.
     enquiryProductId: { type: mongoose.Schema.Types.ObjectId, index: true, sparse: true },
 
+    // ── Raised from a registered product ────────────────────────────────────
+    //
+    // The item-master entry the enquiry row named, when it named one. Distinct
+    // from `production.stockItemId` further down, which is the OPPOSITE
+    // direction: that is the product this style became after being developed.
+    // This is the product it came from, already developed.
+    //
+    // It is what lets the Style & Sample stage prove the claim it makes. Saying
+    // "no development needed" without being able to show WHY would be worse
+    // than asking for the work: the reader has to take it on trust, and six
+    // months later nobody can tell a waived style from a forgotten one.
+    sourceStockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem", index: true, sparse: true },
+    sourceStockItemReference: { type: String, trim: true },
+
     // ── Variants ────────────────────────────────────────────────────────────
     //
     // One enquiry product can be developed as SEVERAL styles at once — the same

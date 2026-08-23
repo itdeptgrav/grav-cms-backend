@@ -1000,6 +1000,12 @@ app.use("/api/employees", employeeRoutes);
 const pushTokenRoutes = require("./routes/Employee_Routes/pushToken");
 app.use("/api/employee", pushTokenRoutes);
 
+// The personal Planner — one employee's own Vision → Mission → Project → Task
+// ladder. Not a department and not gated on a role: every signed-in employee
+// has one, and it follows them when they switch departments. Every query inside
+// is scoped to the verified user, so there is deliberately no manager view.
+app.use("/api/planner", require("./routes/Planner/planner"));
+
 const barcodeRoutes = require("./routes/CMS_Routes/Inventory/Operations/barcodes");
 app.use("/api/cms/inventory/barcodes", barcodeRoutes);
 

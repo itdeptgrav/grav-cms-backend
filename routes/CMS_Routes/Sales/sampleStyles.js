@@ -226,13 +226,33 @@ router.post("/by-journey/:journeyRef/provision", salesAuth, async (req, res) => 
       journey.accountId ? Account.findById(journey.accountId).select("accountId companyName displayName").lean() : null,
     ]);
 
-    const { styles, created, renamed, backfilled } = await provisionJourneyStyles({
+    const { styles, created, renamed, backfilled, waived } = await provisionJourneyStyles({
       SampleStyle, journey, enquiry, briefFromProduct, actor: actor(req),
+      // Has this garment actually been made before? Only a prior approved
+      // sample or a measured SAM says yes — see services/developmentRecord.js.
+      // Cached per stock item because a journey routinely repeats a product
+      // across rows, and each check is two reads.
+      assessDevelopment: (() => {
+        const seen = new Map();
+        return async (product) => {
+          const key = String(product.stockItemId || "");
+          if (!key) return { proven: false };
+          if (seen.has(key)) return seen.get(key);
+          const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+          const [stockItem, priorStyles] = await Promise.all([
+            StockItem.findById(key).select("name reference category operations variants.rawItems measurements images").lean(),
+            SampleStyle.find({ sourceStockItemId: key, isActive: true }).select("sample.status sample.approvedAt").lean(),
+          ]);
+          const record = buildDevelopmentRecord({ stockItem, priorStyles });
+          seen.set(key, record);
+          return record;
+        };
+      })(),
     });
 
     return res.json({
       success: true,
-      created, renamed, backfilled,
+      created, renamed, backfilled, waived,
       sampleStyles: styles.map((s) => decorate(s, journey, account)),
     });
   } catch (err) {
@@ -764,6 +784,55 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/sample-styles/:id/development-record
+//
+// The evidence behind "this style needs no development".
+//
+// A style raised from a registered product skips the tech sheet and the sample.
+// This is what the stage shows in their place — and it is deliberately capable
+// of saying the evidence is THIN, because a registered product is not
+// automatically a developed one. A stock item created five minutes ago with a
+// name and nothing else would otherwise wave a style straight past R&D.
+const { buildDevelopmentRecord } = require("../../../services/developmentRecord");
+
+router.get("/:id/development-record", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    if (!style.sourceStockItemId) {
+      return res.json({ success: true, record: buildDevelopmentRecord({}) });
+    }
+
+    const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
+    const [stockItem, priorRaw] = await Promise.all([
+      StockItem.findById(style.sourceStockItemId)
+        .select("name reference category operations variants.rawItems measurements images").lean(),
+      // Earlier styles for the SAME product, on any other journey. The strongest
+      // evidence there is: a sample this factory actually made and Sales signed.
+      SampleStyle.find({
+        sourceStockItemId: style.sourceStockItemId,
+        _id: { $ne: style._id },
+        isActive: true,
+      }).select("journeyId sample.status sample.approvedAt sample.rounds").limit(20).lean(),
+    ]);
+
+    // Decorate each prior style with its journey reference, so the record can
+    // name where it was approved rather than showing a raw id.
+    const journeyIds = [...new Set(priorRaw.map((p) => String(p.journeyId)).filter(Boolean))];
+    const journeys = journeyIds.length
+      ? await SalesJourney.find({ _id: { $in: journeyIds } }).select("journeyId").lean()
+      : [];
+    const refById = Object.fromEntries(journeys.map((j) => [String(j._id), j.journeyId]));
+    const priorStyles = priorRaw.map((p) => ({ ...p, journeyRef: refById[String(p.journeyId)] || null }));
+
+    return res.json({ success: true, record: buildDevelopmentRecord({ stockItem, priorStyles }) });
+  } catch (err) {
+    console.error("[sampleStyles] GET /:id/development-record", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });

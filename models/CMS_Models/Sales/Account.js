@@ -228,6 +228,22 @@ const accountSchema = new mongoose.Schema(
     // Commercial profile
     paymentTermsCode: { type: String, trim: true },
     creditDays: { type: Number, min: 0 }, // standard days-to-pay this customer runs on
+
+    // ── The one payment term the system can ENFORCE ──────────────────────
+    //
+    // % of an order's value that must be RECEIVED before that order goes into
+    // production. It lives on the Account because it is a standing agreement
+    // with this customer, not something renegotiated per order — a journey
+    // inherits it and may override it for one deal (recorded as a deviation).
+    //
+    // Structured while `paymentTermsCode` ("NET30") and `negotiatedTerms`
+    // stay free text, because those describe what happens AFTER the goods
+    // exist, and nothing in the pipeline can act on them. This one decides
+    // whether production may start at all, so it has to be a number.
+    //
+    // Unset (not 0) means "no advance agreed" and gates nothing. 0 is a real,
+    // deliberately-recorded answer meaning the same thing; both pass.
+    advancePercent: { type: Number, min: 0, max: 100 },
     gstTreatment: { type: String, enum: GST_TREATMENT_CODES },
     freightArrangement: { type: String, enum: FREIGHT_ARRANGEMENT_CODES },
     negotiatedTerms: { type: String, trim: true }, // free-text: special rates / standing agreements

@@ -7,9 +7,16 @@
 const express = require("express");
 const router = express.Router();
 const Relationship = require("../../../models/CMS_Models/Sales/AccountRelationship");
+const Account = require("../../../models/CMS_Models/Sales/Account");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
 const { relationshipLabelFrom } = require("../../../constants/crm");
+const {
+  isHierarchyType,
+  assertGroupEdgeApplicable,
+  applyGroupLink,
+  clearGroupLink,
+} = require("../../../services/crmGroupLink");
 
 const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
 const dupMessage = (err) => (err?.code === 11000 ? "That relationship already exists between these accounts." : err.message);
@@ -54,7 +61,13 @@ router.post("/", salesAuth, async (req, res) => {
     if (!fromAccountId || !toAccountId || !relationshipType) {
       return res.status(400).json({ success: false, message: "fromAccountId, toAccountId and relationshipType are required." });
     }
+    // A group edge (parent_of / subsidiary_of) also writes Account.parentAccountId
+    // — see services/crmGroupLink.js. Validated BEFORE the row is created: there
+    // is no transaction here, so a refused link must not leave a relationship
+    // behind claiming a parent the spine does not have.
+    await assertGroupEdgeApplicable(Account, { fromAccountId, toAccountId, relationshipType });
     const rel = await Relationship.create({ ...req.body, createdBy: actor(req), updatedBy: actor(req) });
+    await applyGroupLink(Account, rel, actor(req));
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "crm-account-relationship",
@@ -75,11 +88,18 @@ router.patch("/:id", salesAuth, async (req, res) => {
   try {
     const before = await Relationship.findById(req.params.id).lean();
     if (!before) return res.status(404).json({ success: false, message: "Relationship not found" });
+    // Retyping can move a row into or out of the group hierarchy, so the spine
+    // is recomputed rather than patched: validate the new edge first, drop the
+    // old one, then write the new one.
+    const next = { ...before, ...req.body };
+    await assertGroupEdgeApplicable(Account, next);
     const rel = await Relationship.findByIdAndUpdate(
       req.params.id,
       { ...req.body, updatedBy: actor(req) },
       { new: true, runValidators: true },
     );
+    if (isHierarchyType(before.relationshipType)) await clearGroupLink(Account, before, actor(req));
+    await applyGroupLink(Account, rel, actor(req));
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "crm-account-relationship",
@@ -104,6 +124,9 @@ router.delete("/:id", salesAuth, async (req, res) => {
       { new: true },
     );
     if (!rel) return res.status(404).json({ success: false, message: "Relationship not found" });
+    // Ending a group edge takes the account out of the group. Conditional —
+    // it only clears a parent that still points at THIS row's parent.
+    await clearGroupLink(Account, rel, actor(req));
     await recordChange(req, {
       departmentSlug: "sales",
       entity: "crm-account-relationship",

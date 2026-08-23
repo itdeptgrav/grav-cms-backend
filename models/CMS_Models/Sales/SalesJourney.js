@@ -30,6 +30,7 @@ const {
   SALES_JOURNEY_STAGE_CODES,
   SALES_JOURNEY_STAGE_STATE_CODES,
   SALES_JOURNEY_RISK_CODES,
+  SALES_JOURNEY_OUTCOME_CODES,
   SALES_JOURNEY_BUSINESS_TYPE_CODES,
 } = require("../../../constants/crm");
 
@@ -91,7 +92,21 @@ const salesJourneySchema = new mongoose.Schema(
     // name its origin without a second query.
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: "Lead", index: true, sparse: true },
     leadRef: { type: String, trim: true },
-    businessType: { type: String, enum: SALES_JOURNEY_BUSINESS_TYPE_CODES, required: true },
+    /**
+     * OPTIONAL since 22 Aug 2026, and no longer asked for at creation.
+     *
+     * It was required, and it drove exactly one behaviour: `repeat` and
+     * `replenishment` journeys skipped sampling. That turned out to be keyed on
+     * the wrong thing — whether a SAMPLE is needed depends on whether the
+     * PRODUCT is registered, not on whether the customer is a returning one —
+     * so the behaviour moved to sampleStyleProvision.js and this field went
+     * back to being a plain classification.
+     *
+     * A required classification nobody uses gets filled with whatever is first
+     * in the dropdown, which is worse than an empty one: it reads as data. It
+     * stays on the model, stays filterable, and existing values are untouched.
+     */
+    businessType: { type: String, enum: SALES_JOURNEY_BUSINESS_TYPE_CODES },
 
     // Optional external orientation only — an RFQ number the customer used.
     // This does NOT create or imply an Enquiry record; that module does not
@@ -132,6 +147,76 @@ const salesJourneySchema = new mongoose.Schema(
 
     risk: { type: String, enum: SALES_JOURNEY_RISK_CODES, default: "onTrack", index: true },
     riskReason: { type: String, trim: true },
+
+    // ── Outcome: a second axis, alongside currentStage ──────────────────────
+    //
+    // A customer going quiet, or going elsewhere, is not a stage — it can
+    // happen at any of them. Until this existed the only tools past Enquiry
+    // were `blocked` (which reads as OUR problem, and which the planner then
+    // refuses to advance or close past) and `waitingCustomer` (which promises a
+    // reply is coming). Neither could say "dormant" or "we lost it", so every
+    // dead journey stayed on the board as "in flight" forever.
+    //
+    // `outcomeStage` is the whole point of the pair: recording WHERE a deal was
+    // when it died is what turns a list of failures into "we lose most of them
+    // at Cost & Quote".
+    //
+    // LOST IS PRE-PO ONLY. Once `po.number` exists the customer has committed,
+    // capacity is booked and material is bought — walking away is a
+    // cancellation with money and work orders to unwind, which is a different
+    // job with a different authority. The planner refuses `lose` past the PO
+    // rather than pretending this covers it.
+    outcome: { type: String, enum: SALES_JOURNEY_OUTCOME_CODES, default: "active", index: true },
+    /** Where it was when it stopped. Never overwritten by a later revive. */
+    outcomeStage: { type: String, enum: SALES_JOURNEY_STAGE_CODES },
+    /** A code from SALES_JOURNEY_PARK_REASONS or SALES_JOURNEY_LOST_REASONS. */
+    outcomeReason: { type: String, trim: true },
+    /** The salesperson's own words. Where the actual story lives. */
+    outcomeNote: { type: String, trim: true },
+    outcomeAt: { type: Date },
+    outcomeBy: actorRef(),
+    // ── Hold: why the current stage is not moving ───────────────────────────
+    //
+    // Two states stop a stage — `blocked` and `waitingOutside` — and until now
+    // neither could say WHY on the record. The planner set the state and the
+    // reason went into the change log alone, so the board showed "Blocked" and
+    // whoever opened it next had to dig through an audit trail to learn that
+    // fabric was at a mill.
+    //
+    // One block for both, because they are the same shape: this stage is held,
+    // here is who or what by, here is when we expect it back.
+    //
+    // JOURNEY-LEVEL, not per stage. Only the CURRENT stage can be blocked or
+    // waiting — the planner enforces that — so a single record is enough, and
+    // widening the stageStates sub-schema into objects would be a migration for
+    // no gain. `stage` records which stage it was raised at.
+    //
+    // Cleared whenever the stage moves to any other state. A stale "waiting on
+    // Vardhman" under an in-progress stage is worse than no note at all.
+    hold: {
+      /** "blocked" or "waitingOutside" — mirrors the stage state that set it. */
+      kind: { type: String, trim: true },
+      /**
+       * Free text, deliberately. Who or what we are waiting on: "Vardhman —
+       * fabric dyeing", "SGS lab — colourfastness", "customer's architect".
+       * An enum here would be a list of every vendor GRAV has ever used,
+       * maintained by hand, and out of date the first time somebody tries a
+       * new mill.
+       */
+      on: { type: String, trim: true },
+      /** When we expect it back. Optional — sometimes nobody has committed. */
+      expectedBack: { type: Date },
+      since: { type: Date },
+      by: actorRef(),
+      stage: { type: String, enum: SALES_JOURNEY_STAGE_CODES },
+    },
+
+    /**
+     * When to look at a PARKED journey again. Required to park, because a park
+     * with no date is how a pipeline silently becomes a graveyard — the same
+     * rule the Lead's nurture state already enforces with its next action.
+     */
+    revisitOn: { type: Date, index: true, sparse: true },
     businessStatus: { type: String, trim: true },
 
     // ── Timing ──────────────────────────────────────────────────────────────
@@ -186,6 +271,33 @@ const salesJourneySchema = new mongoose.Schema(
       recordedBy: {
         employeeId: { type: String, trim: true },
         name: { type: String, trim: true },
+      },
+
+      // ── Payment terms, and the one they gate on ─────────────────────────
+      //
+      // Recorded HERE because the PO is where commercial terms are actually
+      // agreed. Until now they lived in somebody's head or in the quotation's
+      // notes, so nothing could act on them: a journey with a PO on file could
+      // walk into production having received nothing.
+      //
+      // `advancePercent` is the only structured number, and only because it is
+      // the only one the system can enforce before production. The rest is free
+      // text — garment payment terms are a negotiation ("60% against BL, 40% on
+      // delivery, retention 5% for 90 days"), and an enum would either refuse
+      // real terms or grow forever.
+      paymentTerms: {
+        /** % of the order value that must be RECEIVED before production starts. */
+        advancePercent: { type: Number, min: 0, max: 100 },
+        /** Everything after the advance, in the words it was agreed in. */
+        balanceTerms: { type: String, trim: true },
+        note: { type: String, trim: true },
+        /**
+         * A production start with the advance short is possible, but never
+         * silent: it takes a Sales manager and a written reason, and lands in
+         * `advancedWithoutPrerequisites` below like every other bent rule.
+         */
+        agreedAt: { type: Date },
+        agreedBy: actorRef(),
       },
     },
 

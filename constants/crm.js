@@ -138,20 +138,41 @@ const ENQUIRY_STATUSES = [
   pair("cancelled", "Cancelled"),
 ];
 
-// The allowed status moves. New → Contacted → Requirement Gathering →
-// Qualified → Development Started is the forward funnel; on_hold / lost /
-// cancelled are reachable off-ramps, and a parked/closed enquiry can be
-// reopened back into the funnel. `development_started` is only reachable from
-// `qualified` — you don't start development on an unqualified opportunity.
+// The allowed status moves.
+//
+// THE FORWARD FUNNEL IS ONE STEP NOW (22 Aug 2026, explicit request): from any
+// working status the only way on is `development_started`. Contacted →
+// Requirement Gathering → Qualified are no longer offered.
+//
+// They were removed because they duplicated the Lead. A Lead is already walked
+// through contacted → qualified against a checklist, and it cannot become a
+// journey until it clears that; the enquiry then re-asked the same three
+// questions on a second record one stage later. Two ladders for one funnel, and
+// the enquiry's was the one nobody could see the criteria for.
+//
+// THE CODES ARE KEPT, NOT DELETED. Two live enquiries sit on `new` and one on
+// `qualified`, and older records hold `contacted` / `requirement_gathering`.
+// Deleting a code would strand them at a status the enum no longer admits, so
+// every one of those states stays legal to BE in — there is simply one exit
+// from each. Nothing enters `contacted` or `requirement_gathering` any more.
+//
+// on_hold / lost / cancelled remain reachable off-ramps, and a parked or closed
+// enquiry can be reopened back into the funnel.
 const ENQUIRY_STATUS_TRANSITIONS = {
-  new: ["contacted", "requirement_gathering", "qualified", "on_hold", "lost", "cancelled"],
-  contacted: ["requirement_gathering", "qualified", "on_hold", "lost", "cancelled"],
-  requirement_gathering: ["qualified", "contacted", "on_hold", "lost", "cancelled"],
+  // Every working status exits the same way. The intermediate hops stay legal
+  // so a record already mid-funnel is not trapped, and so a mistaken jump can
+  // be walked back.
+  new: ["development_started", "contacted", "requirement_gathering", "qualified", "on_hold", "lost", "cancelled"],
+  contacted: ["development_started", "requirement_gathering", "qualified", "on_hold", "lost", "cancelled"],
+  requirement_gathering: ["development_started", "qualified", "contacted", "on_hold", "lost", "cancelled"],
   qualified: ["development_started", "requirement_gathering", "on_hold", "lost", "cancelled"],
   development_started: ["on_hold", "cancelled"],
-  on_hold: ["contacted", "requirement_gathering", "qualified", "lost", "cancelled"],
-  lost: ["contacted", "requirement_gathering", "qualified"],
-  cancelled: ["contacted", "requirement_gathering", "qualified"],
+  // Reopening lands on `new` — an enquiry coming back off a ramp is simply
+  // open again, and with the funnel collapsed there is no rung to return it to.
+  // The old targets stay legal so an existing record can still be corrected.
+  on_hold: ["new", "development_started", "contacted", "requirement_gathering", "qualified", "lost", "cancelled"],
+  lost: ["new", "contacted", "requirement_gathering", "qualified"],
+  cancelled: ["new", "contacted", "requirement_gathering", "qualified"],
 };
 
 // How the enquiry came in — distinct from a Lead's source (how a prospect was
@@ -577,7 +598,7 @@ const COSTING_REQUEST_STATUS_TRANSITIONS = {
 };
 const COSTING_REQUEST_PURPOSES = [
   pair("enquiry_indicative", "Indicative (Enquiry)"),
-  pair("cost_quote_formal", "Formal quote (Cost & Quote)"),
+  pair("cost_quote_formal", "Formal quote (Cost & Invoicing)"),
 ];
 
 const codes = (list) => list.map((x) => x.code);
@@ -635,7 +656,7 @@ const SALES_JOURNEY_STAGES = [
   pair("account", "Account"),
   pair("enquiry", "Enquiry/RFQ"),
   pair("styleSample", "Style & Sample"),
-  pair("costQuote", "Cost & Quote"),
+  pair("costQuote", "Cost & Invoicing"),
   pair("poContract", "PO/Contract"),
   pair("production", "Production"),
   pair("shipment", "Shipment"),
@@ -652,6 +673,14 @@ const SALES_JOURNEY_STAGE_STATES = [
   pair("complete", "Complete"),
   pair("reopened", "Reopened"),
   pair("blocked", "Blocked"),
+  // Waiting on someone who is neither us nor the customer — a mill dyeing
+  // fabric, a testing lab, an embroidery unit. Its own state because the other
+  // three could not say it: not the customer, not our team, and not "blocked",
+  // which reads as something having gone wrong when the work is simply
+  // happening in another building. WHO is free text on the journey's `hold`
+  // block, not an enum — the list of outside parties is the supply chain, and
+  // it changes faster than a dropdown can.
+  pair("waitingOutside", "Waiting on an outside party"),
   pair("notApplicable", "Not Applicable"),
 ];
 
@@ -660,6 +689,57 @@ const SALES_JOURNEY_RISKS = [
   pair("atRisk", "At Risk"),
   pair("delayed", "Delayed"),
   pair("blocked", "Blocked"),
+];
+
+/**
+ * How a journey ended, or paused, independently of where it got to.
+ *
+ * A customer going quiet is not a stage — it can happen at any of them — so it
+ * is a second axis alongside `currentStage`, recorded WITH the stage it
+ * happened at. That pairing is the point: "we lose most deals at Cost & Quote"
+ * is a question nobody could ask before.
+ *
+ * `closed` is the successful end and is set by the close verb, not by a person
+ * choosing it from a list.
+ */
+const SALES_JOURNEY_OUTCOMES = [
+  pair("active", "Active"),
+  pair("parked", "Parked"),
+  pair("lost", "Lost"),
+  pair("closed", "Closed"),
+];
+
+/**
+ * Why a journey was parked. Always a real waiting-on, never "other" alone —
+ * a parked deal with no stated reason is a forgotten deal.
+ */
+const SALES_JOURNEY_PARK_REASONS = [
+  pair("budgetCycle", "Waiting for their budget cycle"),
+  pair("customerQuiet", "Customer has gone quiet"),
+  pair("customerPaused", "Customer asked us to pause"),
+  pair("awaitingApproval", "Waiting on their internal approval"),
+  pair("seasonal", "Seasonal — revisit nearer the time"),
+  pair("other", "Something else"),
+];
+
+/**
+ * Why a journey was lost. Grouped by WHERE the loss usually happens, because
+ * losing at Enquiry ("no budget") and losing at Cost & Quote ("price") are
+ * different failures and lumping them together hides the one thing this data
+ * is for. Every reason stays selectable from every stage — the grouping is for
+ * the picker's benefit, not a rule.
+ */
+const SALES_JOURNEY_LOST_REASONS = [
+  pair("price", "Price — too expensive"),
+  pair("competitor", "Went to a competitor"),
+  pair("leadTime", "Lead time we could not meet"),
+  pair("sampleRejected", "Sample was not accepted"),
+  pair("capability", "We could not make what they wanted"),
+  pair("moq", "Quantity below our minimum"),
+  pair("budgetGone", "Their budget was withdrawn"),
+  pair("projectCancelled", "Their project was cancelled"),
+  pair("noResponse", "Never heard back"),
+  pair("other", "Something else"),
 ];
 
 const SALES_JOURNEY_BUSINESS_TYPES = [
@@ -853,13 +933,20 @@ const SAMPLE_MATERIALS_STATUSES = [
 ];
 const SAMPLE_TECHSHEET_STATUSES = [
   pair("pending", "Not started"),
+  // Raised from a REGISTERED product. The garment already has a tech sheet in
+  // the item master — measured operations, a costed bill of materials — so
+  // there is nothing for R&D to draw. Same reasoning as the sampling waiver.
+  pair("notApplicable", "Not needed — registered product"),
   pair("in_progress", "In progress"),
   pair("submitted", "With Sales"),
   pair("approved", "Approved"),
   pair("changes", "Changes requested"),
 ];
 const SAMPLE_TECHSHEET_TRANSITIONS = {
-  pending: ["in_progress"],
+  pending: ["in_progress", "notApplicable"],
+  // Waived, never locked: a known garment in a new fabric may genuinely need a
+  // fresh sheet, and that is R&D's call to make.
+  notApplicable: ["in_progress"],
   in_progress: ["submitted"],
   submitted: ["approved", "changes"],
   changes: ["in_progress"],
@@ -867,13 +954,23 @@ const SAMPLE_TECHSHEET_TRANSITIONS = {
 };
 const SAMPLE_SAMPLING_STATUSES = [
   pair("not_started", "Not started"),
+  // A style raised from a REGISTERED stock item. The garment has been made
+  // before — it carries a costed bill of materials and a measured SAM — so
+  // there is nothing a physical sample would establish. Set at provisioning,
+  // never by a person, and reversible: "notApplicable" transitions back into
+  // in_progress, because a known garment in an unknown fabric is a fair reason
+  // to sample it anyway.
+  pair("notApplicable", "Not needed — registered product"),
   pair("in_progress", "In progress"),
   pair("submitted", "With Sales"),
   pair("approved", "Approved"),
   pair("rejected", "Rejected"),
 ];
 const SAMPLE_SAMPLING_TRANSITIONS = {
-  not_started: ["in_progress"],
+  not_started: ["in_progress", "notApplicable"],
+  // Waived, but never locked. Sampling a registered garment is a decision Sales
+  // is allowed to make.
+  notApplicable: ["in_progress"],
   in_progress: ["submitted"],
   submitted: ["approved", "rejected"],
   rejected: ["in_progress"],
@@ -948,6 +1045,12 @@ module.exports = {
   SALES_JOURNEY_STAGES,
   SALES_JOURNEY_STAGE_STATES,
   SALES_JOURNEY_RISKS,
+  SALES_JOURNEY_OUTCOMES,
+  SALES_JOURNEY_OUTCOME_CODES: codes(SALES_JOURNEY_OUTCOMES),
+  SALES_JOURNEY_PARK_REASONS,
+  SALES_JOURNEY_PARK_REASON_CODES: codes(SALES_JOURNEY_PARK_REASONS),
+  SALES_JOURNEY_LOST_REASONS,
+  SALES_JOURNEY_LOST_REASON_CODES: codes(SALES_JOURNEY_LOST_REASONS),
   SALES_JOURNEY_BUSINESS_TYPES,
   SALES_JOURNEY_LINK_MODULE,
   SALES_JOURNEY_STAGE_CODES: codes(SALES_JOURNEY_STAGES),

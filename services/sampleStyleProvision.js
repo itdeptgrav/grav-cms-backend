@@ -31,7 +31,7 @@ const { createWithRef } = require("./sampleStyleRef");
  * @param {object}   deps.enquiry      Enquiry document/lean object with `products`
  * @param {Function} deps.briefFromProduct  (product) => brief subdocument
  * @param {object}   deps.actor        { employeeId, name } audit stamp
- * @returns {Promise<{styles: Array, created: number, renamed: number, backfilled: number}>}
+ * @returns {Promise<{styles: Array, created: number, renamed: number, backfilled: number, waived: number}>}
  */
 async function provisionJourneyStyles({
   SampleStyle,
@@ -39,6 +39,15 @@ async function provisionJourneyStyles({
   enquiry,
   briefFromProduct,
   actor,
+  /**
+   * `(product) => Promise<{proven: boolean}>` — has this garment actually been
+   * made before? Injected so this service stays DB-free and unit-testable.
+   *
+   * OMITTED MEANS NOTHING IS WAIVED, deliberately. Failing closed costs a
+   * sample nobody needed; failing open sends an unmade garment to a customer
+   * with no sample and no tech sheet, which costs an order.
+   */
+  assessDevelopment = null,
 }) {
   const products = (enquiry?.products || []).filter((p) => p && p.product);
 
@@ -66,6 +75,7 @@ async function provisionJourneyStyles({
   let created = 0;
   let renamed = 0;
   let backfilled = 0;
+  let waived = 0;
 
   for (let i = 0; i < products.length; i++) {
     const p = products[i];
@@ -73,6 +83,37 @@ async function provisionJourneyStyles({
 
     // Identity first, name only as a fallback for pre-existing rows.
     let style = (pid && byProductId.get(pid)) || byName.get(p.product);
+
+    // SAMPLING IS WAIVED BY THE PRODUCT, NOT BY THE CUSTOMER (22 Aug 2026).
+    //
+    // A row linked to a registered stock item names a garment that has been
+    // made before — it carries a costed bill of materials and a measured SAM,
+    // so a physical sample would establish nothing that is not already known.
+    // A row typed by hand names something new, and that is what sampling is
+    // for. The journey's business type says nothing about this either way: a
+    // repeat customer can perfectly well ask for a garment nobody has made,
+    // which is why the old businessType check in salesJourneys.js was removed.
+    //
+    // Applied only where the style is CREATED. Re-provisioning must never reach
+    // into a style already being sampled and cancel it.
+    //
+    // BEING REGISTERED IS NOT ENOUGH (22 Aug 2026, corrected same day).
+    //
+    // The first cut of this waived the step on `Boolean(p.stockItemId)` alone.
+    // That is too loose: a stock item is created the moment someone types a
+    // name, so a garment nobody has ever cut would skip both the tech sheet and
+    // the sample on the strength of existing in a dropdown.
+    //
+    // The test is now whether it has actually BEEN MADE — a prior approved
+    // sample, or operations with measured times. See services/developmentRecord
+    // .js for why a bill of materials does not count.
+    //
+    // A registered-but-unproven product still gets its register link recorded,
+    // so the stage can show what IS known while asking for the sample anyway.
+    const registered = Boolean(p.stockItemId);
+    const proven = registered && assessDevelopment
+      ? Boolean((await assessDevelopment(p))?.proven)
+      : false;
 
     if (!style) {
       try {
@@ -86,10 +127,25 @@ async function provisionJourneyStyles({
           ownerId: journey.ownerId,
           ownerName: journey.ownerName,
           brief: briefFromProduct(p),
+          sourceStockItemId: p.stockItemId || undefined,
+          sourceStockItemReference: p.stockItemReference || undefined,
+          techSheet: proven ? { status: "notApplicable", revisions: [] } : undefined,
+          sample: proven ? { status: "notApplicable", rounds: [], revisions: [] } : undefined,
+          // Recorded in the shared timeline, because "why was this never
+          // sampled" is exactly the question somebody asks six months later.
+          history: proven
+            ? [{
+              kind: "development_waived",
+              note: `Already made before${p.stockItemReference ? ` (${p.stockItemReference})` : ""} — no tech sheet or sample needed.`,
+              by: actor,
+              at: new Date(),
+            }]
+            : undefined,
           createdBy: actor,
           updatedBy: actor,
         });
         created += 1;
+        if (proven) waived += 1;
       } catch (err) {
         // Two callers racing to provision the same journey (React StrictMode's
         // double effect-invoke, or Sales and R&D opening it within
@@ -134,7 +190,7 @@ async function provisionJourneyStyles({
     out.push(style);
   }
 
-  return { styles: out, created, renamed, backfilled };
+  return { styles: out, created, renamed, backfilled, waived };
 }
 
 module.exports = { provisionJourneyStyles };

@@ -41,6 +41,7 @@ const router = express.Router();
 
 const mongoose = require("mongoose");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
+const { resolvePaymentTerms, advanceGate } = require("../../../services/paymentTerms");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Contact = require("../../../models/CMS_Models/Sales/Contact");
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
@@ -52,6 +53,7 @@ const { closingVerdictForJourney } = require("../../../services/closingVerdict")
 const { assertLeadConvertible, deriveLegacyStage } = require("../../../services/leadQualification");
 const { planStageTransition, JourneyTransitionError } = require("../../../services/salesJourneyProgress");
 const { isSalesManager } = require("../../../services/salesAccess");
+const { journeyAttention } = require("../../../services/journeyAttention");
 const { ensureOrderLink } = require("../../../services/orderBookLink");
 const {
   canViewCredit,
@@ -193,6 +195,54 @@ function summaryDto(j) {
     stageStates,
     risk: j.risk,
     riskReason: j.riskReason || null,
+    // The second axis. Legacy rows have no `outcome`, so it reads "active" —
+    // which is what they are.
+    outcome: j.outcome || "active",
+    outcomeStage: j.outcomeStage || null,
+    outcomeReason: j.outcomeReason || null,
+    outcomeNote: j.outcomeNote || null,
+    outcomeAt: j.outcomeAt || null,
+    outcomeBy: j.outcomeBy?.name || null,
+    revisitOn: j.revisitOn || null,
+    // "This needs a decision", and which of the three reasons put it there.
+    // Computed on read rather than stored: every input is a date compared to
+    // now, so a stored flag would be wrong by tomorrow.
+    attention: journeyAttention({
+      outcome: j.outcome,
+      revisitOn: j.revisitOn,
+      hold: j.hold,
+      nextAction: j.nextAction,
+      targetDate: j.targetDate,
+      updatedAt: j.updatedAt,
+    }),
+    // Why the current stage is not moving, when it is not. Cleared to null the
+    // moment the stage moves to any other state.
+    po: j.po
+      ? {
+        number: j.po.number || null,
+        date: j.po.date || null,
+        amount: j.po.amount ?? null,
+        currency: j.po.currency || "INR",
+        file: j.po.file?.url ? { name: j.po.file.name || null, url: j.po.file.url } : null,
+        paymentTerms: j.po.paymentTerms?.advancePercent != null || j.po.paymentTerms?.balanceTerms
+          ? {
+            advancePercent: j.po.paymentTerms.advancePercent ?? null,
+            balanceTerms: j.po.paymentTerms.balanceTerms || null,
+            note: j.po.paymentTerms.note || null,
+          }
+          : null,
+      }
+      : null,
+    hold: j.hold?.kind
+      ? {
+        kind: j.hold.kind,
+        on: j.hold.on || null,
+        expectedBack: j.hold.expectedBack || null,
+        since: j.hold.since || null,
+        by: j.hold.by?.name || null,
+        stage: j.hold.stage || null,
+      }
+      : null,
     businessStatus: j.businessStatus || null,
     waitingOn:
       currentStageState === "waitingCustomer" ? "customer"
@@ -298,11 +348,43 @@ router.get("/", salesAuth, async (req, res) => {
   try {
     const {
       scope = "team", search, accountId, owner, stage, stageState,
-      risk, businessType, waitingOn, valueMin, valueMax,
+      risk, businessType, waitingOn, valueMin, valueMax, outcome,
       page = 1, limit = 50,
     } = req.query;
 
     const filter = { isActive: true };
+
+    // ── The board shows what is IN FLIGHT ───────────────────────────────────
+    //
+    // Parked and lost journeys are excluded unless asked for. Without this the
+    // hub counts a deal we lost in March forever, and "6 journeys in flight"
+    // stops meaning anything — which is the state it was in before the outcome
+    // axis existed.
+    //
+    // `outcome=all` returns everything; a specific value filters to it. The
+    // `$ne` form rather than `outcome: "active"` is deliberate: every journey
+    // that predates this field has no `outcome` at all, and an equality filter
+    // would hide all of them.
+    if (outcome && outcome !== "all") {
+      filter.outcome = outcome;
+    } else if (!outcome) {
+      // A PARKED JOURNEY WHOSE DATE HAS COME ROUND IS BACK ON THE BOARD.
+      //
+      // Hiding every parked journey would break the one thing parking is FOR:
+      // you said November, and in November it has to reappear. Without this the
+      // revisit date is a note in a drawer and nobody would ever park anything.
+      //
+      // Lost and closed stay hidden unconditionally — those decisions are made.
+      filter.$and = [
+        ...(filter.$and || []),
+        {
+          $or: [
+            { outcome: { $nin: ["parked", "lost", "closed"] } },
+            { outcome: "parked", revisitOn: { $lte: new Date() } },
+          ],
+        },
+      ];
+    }
 
     // MY WORK IS RESOLVED FROM THE SESSION, NOT THE QUERY STRING. A client that
     // sends `?scope=mine&owner=<someone-else>` still gets its own work.
@@ -402,7 +484,31 @@ router.get("/:journeyId", salesAuth, async (req, res) => {
     if (!journey) {
       return res.status(404).json({ success: false, message: `No Sales Journey matches ${req.params.journeyId}.` });
     }
-    res.json({ success: true, journey: stripJourneyCommercial(detailDto(journey), req.user) });
+    // The payment gate travels with the journey so Order Confirmation can list
+    // it as outstanding work from the start. Previously it existed only inside
+    // the stage POST, which meant the first anyone heard of an unpaid advance
+    // was an error on "Release to Production" — after the work of the stage was
+    // already done.
+    const gate = await advanceStatus(journey);
+    const dto = stripJourneyCommercial(detailDto(journey), req.user);
+
+    // The VERDICT is operational — anyone working this journey needs to know
+    // whether it can be released. The rupee figures are commercial, and follow
+    // the same credit-visibility rule as expectedValue above.
+    dto.paymentGate = gate
+      ? canViewCredit(req.user)
+        ? gate
+        : {
+            required: gate.required,
+            cleared: gate.cleared,
+            percent: gate.percent,
+            reason: gate.reason,
+            terms: { source: gate.terms.source, overridden: gate.terms.overridden },
+            restricted: true,
+          }
+      : null;
+
+    res.json({ success: true, journey: dto });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -434,8 +540,9 @@ router.post("/", salesAuth, async (req, res) => {
     // ── Name and business type ────────────────────────────────────────────
     const name = String(b.name || "").trim();
     if (!name) throw new ValidationError("Journey name is required.");
-    if (!b.businessType) throw new ValidationError("Business type is required.");
-    assertEnum(b.businessType, SALES_JOURNEY_BUSINESS_TYPE_CODES, "Business type");
+    // Optional now — see the model. Still validated when one IS sent, so an
+    // existing caller or a later filter UI cannot write a value off the enum.
+    if (b.businessType) assertEnum(b.businessType, SALES_JOURNEY_BUSINESS_TYPE_CODES, "Business type");
 
     // ── Contact: if given, it must belong to the selected Account ─────────
     let primaryContactId;
@@ -535,26 +642,20 @@ router.post("/", salesAuth, async (req, res) => {
     };
 
     /*
-     * A REPEAT ORDER DOES NOT NEED SAMPLING.
+     * SAMPLING IS NOT DECIDED HERE ANY MORE (22 Aug 2026).
      *
-     * `notApplicable` is the journey's own word for a stage that was never in
-     * play, both steppers already draw it, and until now nothing ever set it —
-     * not one journey in this database has a single stage marked. The result is
-     * SJ-2026-0005, a `repeat` order, sitting AT Style & Sample: a tech sheet
-     * and a physical sample being asked for on a style that was already
-     * approved and produced.
+     * This used to mark styleSample "notApplicable" whenever the journey's
+     * businessType was `repeat` or `replenishment` — whenever the CUSTOMER was
+     * a returning one. That is the wrong axis. A repeat customer ordering a
+     * garment nobody has made before still needs a sample; a first-time
+     * customer ordering a shirt that has sat in the register for two years,
+     * with a measured SAM and a costed bill of materials, does not.
      *
-     * Repeat and replenishment are, by definition, orders off an approved
-     * style. Marking the stage skipped at creation is honest and reversible —
-     * the stage stays reachable, its history survives, and Sales can reopen it
-     * by setting a state on it if this particular repeat does need a new
-     * sample. Only NEW journeys are affected; nothing existing is migrated.
+     * What decides it is the PRODUCT, and the product is not known here — at
+     * journey creation there is no enquiry and no product rows yet. The call is
+     * made where it can be: services/sampleStyleProvision.js, one style at a
+     * time, against whether that row is linked to a registered stock item.
      */
-    const SKIPS_SAMPLING = new Set(["repeat", "replenishment"]);
-    if (SKIPS_SAMPLING.has(payload.businessType)) {
-      payload.stageStates = { ...(payload.stageStates || {}), styleSample: "notApplicable" };
-    }
-
     const journey = await createWithRef(SalesJourney, payload);
 
     await recordChange(req, {
@@ -730,11 +831,36 @@ router.patch("/:journeyId/po", salesAuth, async (req, res) => {
       if (!Number.isFinite(amount) || amount < 0) throw new ValidationError("PO amount must be a positive number.");
     }
 
+    // ── Payment terms ───────────────────────────────────────────────────
+    // Only `advancePercent` is validated as a number, because it is the only
+    // one anything enforces. The rest is the deal in the words it was agreed
+    // in. Terms already on file survive a PO edit that does not mention them —
+    // re-recording a PO number should not quietly drop the payment agreement.
+    const prevTerms = journey.po?.paymentTerms;
+    let advancePercent;
+    if (b.advancePercent !== undefined && b.advancePercent !== null && b.advancePercent !== "") {
+      advancePercent = Number(b.advancePercent);
+      if (!Number.isFinite(advancePercent) || advancePercent < 0 || advancePercent > 100) {
+        throw new ValidationError("The advance must be a percentage between 0 and 100.");
+      }
+    }
+    const termsTouched = ["advancePercent", "balanceTerms", "paymentNote"].some((k) => b[k] !== undefined);
+    const paymentTerms = termsTouched
+      ? {
+        ...(advancePercent !== undefined ? { advancePercent } : {}),
+        ...(b.balanceTerms !== undefined ? { balanceTerms: String(b.balanceTerms || "").trim() } : {}),
+        ...(b.paymentNote !== undefined ? { note: String(b.paymentNote || "").trim() } : {}),
+        agreedAt: new Date(),
+        agreedBy: actor(req),
+      }
+      : prevTerms;
+
     const before = journey.toObject();
     journey.po = {
       number,
       ...(poDate ? { date: poDate } : {}),
       ...(amount !== undefined ? { amount } : {}),
+      ...(paymentTerms ? { paymentTerms } : {}),
       currency: String(b.currency || journey.po?.currency || "INR").trim().toUpperCase(),
       ...(b.file?.name || b.file?.url
         ? { file: { name: String(b.file.name || "").trim(), url: String(b.file.url || "").trim() } }
@@ -778,6 +904,63 @@ router.patch("/:journeyId/po", salesAuth, async (req, res) => {
   }
 });
 
+/**
+ * How much of the agreed advance has actually arrived.
+ *
+ * Two halves that live in different places: the TERMS are on the journey's PO
+ * (where they were negotiated) and the RECEIPTS are on the linked
+ * CustomerRequest (where the accountant records them). Neither is any use
+ * without the other, which is why nothing could enforce payment terms before.
+ *
+ * Returns null when there is nothing to enforce — no terms agreed, or no order
+ * to read receipts from. The planner treats null as "no gate", deliberately: a
+ * rule nobody agreed to should not stop a journey.
+ */
+// The advance gate for one journey: which terms apply, and whether the money
+// against them has arrived.
+//
+// TERMS COME FROM THE ACCOUNT (services/paymentTerms.js). They used to come
+// only from whatever somebody typed on this PO, so two journeys for the same
+// buyer could gate on different figures and neither was wrong. The journey may
+// still override for one deal — that is recorded as a deviation, not hidden.
+async function advanceStatus(journey) {
+  const AccountModel = require("../../../models/CMS_Models/Sales/Account");
+  // Populated on the detail GET, a bare ObjectId on the stage POST — take the
+  // id either way rather than depending on which caller we are serving.
+  const accountId = journey.accountId?._id || journey.accountId;
+  const account = accountId
+    ? await AccountModel.findById(accountId)
+        .select("advancePercent paymentTermsCode creditDays negotiatedTerms")
+        .lean()
+    : null;
+
+  const terms = resolvePaymentTerms(account, journey.po);
+  if (terms.advancePercent === null) return null;
+
+  const EnquiryModel = require("../../../models/CMS_Models/Sales/Enquiry");
+  const CustomerRequestModel = require("../../../models/Customer_Models/CustomerRequest");
+  const enquiry = await EnquiryModel.findOne({ journeyId: journey._id, isActive: true })
+    .select("customerRequestId").lean();
+  const order = enquiry?.customerRequestId
+    ? await CustomerRequestModel.findById(enquiry.customerRequestId)
+        .select("grandTotal totalPaidAmount quotations.grandTotal").lean()
+    : null;
+
+  // The PO's own amount is the agreed value and wins. The order's total is the
+  // fallback for a PO recorded without one.
+  const orderValue = Number(journey.po?.amount) > 0
+    ? Number(journey.po.amount)
+    : Number(order?.grandTotal) || Number(order?.quotations?.slice(-1)[0]?.grandTotal) || 0;
+
+  const gate = advanceGate(terms, {
+    orderValue,
+    received: Number(order?.totalPaidAmount) || 0,
+    currency: journey.po?.currency || account?.defaultCurrency || "INR",
+  });
+
+  return { ...gate, terms };
+}
+
 router.post("/:journeyId/stage", salesAuth, async (req, res) => {
   try {
     const journey = await SalesJourney.findOne({ journeyId: req.params.journeyId, isActive: true });
@@ -809,12 +992,18 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
     if (b.action === "close") {
       const closing = await closingVerdictForJourney(journey._id);
       if (closing) context = { closing };
+    } else if (b.action === "lose") {
+      // Derived, never trusted from the client: whether a PO exists is the one
+      // thing standing between "we lost it" and "we have to cancel a committed
+      // order".
+      context = { poOnFile: Boolean(journey.po?.number) };
     } else if (b.action === "advance") {
       // Only the Production gate needs anything, and it needs one boolean plus
       // who is asking. `poOnFile` is derived here rather than trusted from the
       // client for the obvious reason.
       context = {
         poOnFile: Boolean(journey.po?.number),
+        advance: await advanceStatus(journey),
         isManager: isOwner ? await isSalesManager(req.user) : true,
         overrideReason: b.overrideReason || b.reason || "",
         actor: { employeeId: req.user?.employeeId || "", name: req.user?.name || "" },
@@ -827,6 +1016,13 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
       toState: b.toState || b.state,
       stage: b.stage,
       reason: b.reason,
+      note: b.note,
+      revisitOn: b.revisitOn,
+      // Who the stage is waiting on, and when it is due back. Free text by
+      // design — see the `hold` block on the model.
+      on: b.on,
+      expectedBack: b.expectedBack,
+      actor: actor(req),
       context,
     });
 
@@ -839,6 +1035,43 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
     }
     journey.updatedBy = actor(req);
     await journey.save();
+
+    // ── Tell R&D ────────────────────────────────────────────────────────────
+    //
+    // A journey with open styles has real work on R&D's board: a tech sheet
+    // being drawn, a sample being stitched. Marking the deal lost in Sales and
+    // saying nothing means the factory keeps making samples for a customer who
+    // is gone — the sharpest cost of this whole gap.
+    //
+    // LOST cancels those styles. PARKED does not: it is expected back, and
+    // cancelling a style would throw away a tech sheet that will be wanted
+    // again. It leaves a line on the style's shared timeline instead, which is
+    // what R&D actually reads.
+    //
+    // Best-effort and never fatal — the outcome is already saved, and failing
+    // to notify must not undo it.
+    if (plan.set.outcome === "lost" || plan.set.outcome === "parked") {
+      try {
+        const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
+        const open = await SampleStyle.find({
+          journeyId: journey._id, isActive: true, status: "active",
+        }).select("_id history status");
+        for (const st of open) {
+          st.history = [...(st.history || []), {
+            kind: plan.set.outcome === "lost" ? "journey_lost" : "journey_parked",
+            note: plan.set.outcome === "lost"
+              ? `Sales marked this journey lost — stop work on this style.`
+              : `Sales parked this journey — hold work until it is picked up again.`,
+            by: actor(req),
+            at: new Date(),
+          }];
+          if (plan.set.outcome === "lost") st.status = "cancelled";
+          await st.save();
+        }
+      } catch (e) {
+        console.error("[salesJourneys] notifying R&D of outcome failed", e.message);
+      }
+    }
 
     await recordChange(req, {
       departmentSlug: "sales",

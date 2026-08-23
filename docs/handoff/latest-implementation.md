@@ -2,6 +2,55 @@
 
 ---
 
+## Personal Planner — chunk 1: foundation, Today, Ladder, Review
+
+> **One employee's own Vision → Mission → Project → Task ladder, private to
+> them, reachable from inside any department.** Backend models + API + two pure
+> services, frontend route with three views. Nothing committed.
+
+### Backend (`grav-cms-backend`)
+
+| File | Purpose |
+|---|---|
+| `constants/planner.js` | **New.** The vocabulary — three levels with the ladder encoded as `childLevel` data rather than an if-chain, four goal statuses, three task statuses. Kept separate from `constants/crm.js` on purpose: nothing here is a business record, and sharing a constants file is how a privacy boundary quietly stops being true. |
+| `models/Planner/PlannerGoal.js` | **New.** One collection for all three goal levels. A pre-validate hook enforces the ladder (vision rootless, mission under vision, project under mission), which makes the tree exactly three deep **by construction** — so unlike `services/crmHierarchy.js` there is no cycle to guard. No `percentComplete` field anywhere: progress is derived, never stored. |
+| `models/Planner/PlannerTask.js` | **New.** `goalId` is **nullable** — a task with no goal is the Inbox. This is the load-bearing decision: requiring every task to ladder up to a vision is what kills a personal planner, because capture has to be free. `doneAt` is maintained in a pre-save hook so it can never disagree with `status`. |
+| `services/plannerRollup.js` | **New**, pure. Builds the tree and derives progress: project = done/total tasks, mission = mean of its projects, vision = mean of its missions. Achieved is 100% whatever the tasks say; **dropped leaves the denominator** rather than scoring zero, so honestly abandoning something never damages the number above it. `hasBasis` distinguishes "no tasks in it" from a real 0%. |
+| `services/plannerAttention.js` | **New**, pure. The Review engine, modelled on `services/journeyAttention.js` — six triggers (`overdue`, `stale`, `empty`, `barren`, `pausedLong`, `nearlyDone`), one reason per goal, ranked by reason then age. `nearlyDone` is the only positive item; a review that only nags is one people stop opening. |
+| `routes/Planner/planner.js` | **New**, `EmployeeAuthMiddleware` on the whole router. `GET /tree`, `GET /review`, `GET /tasks`, `GET /lookups`, plus goal and task CRUD. **`ownerId` comes from the verified JWT and never from the body**, every read filters on it, and every id the client names is re-checked against it. Delete is narrow: a goal holding anything refuses with a count and points at `dropped`; deleting a project **unfiles** its tasks rather than destroying them. |
+| `server.js` | One mount at `/api/planner`. Not gated on a department role — your own goals should not disappear because you moved from Sales to HR for an hour. |
+
+### Frontend (`grav-cms`)
+
+> **Rebuilt on the Sales design system after review.** The first pass used the
+> `--g-*` portal tokens from `/onboarding` and a ~700-line stylesheet of its own.
+> That was the wrong system: Sales runs FrostShell over `.grav-ui`
+> ("Chrome Under Frost", `app/grav-ui.css`) with the shared kit in
+> `components/ceo/ui/Primitives.tsx`. The bespoke stylesheet is deleted and the
+> Planner now composes the same primitives Sales does.
+
+| File | Purpose |
+|---|---|
+| `components/Planner_DashboardLayout.js` | **New.** FrostShell nav config, same arrangement as `Sales_DashboardLayout.js` — `variant="top"`, three items. **No `guardSlug`**: DepartmentGuard's first branch is `if (!slug \|\| …) → ok`, so the Planner still requires a valid session but asks no question about which department it is in. The left rail stays (Sales opts out of it) because this is the one surface people reach from inside another department. |
+| `lib/planner/vocabulary.js` · `lib/planner/api.js` · `lib/planner/usePlanner.js` | **New.** The client mirror of the constants (server validates, client labels — the `stageConfig.js` pattern), one function per endpoint (the `coworkApi.js` pattern), and one shared read so Today, Ladder and Review cannot disagree about a percentage. |
+| `app/planner/{,ladder/,review/}page.js` · `layout.js` | **New.** Three thin routes that name a view; `components/planner/PlannerScreen.js` holds the shell, `PageHead`, the shared read and the drawer once. Content sits in the same `mx-auto max-w-[1400px] px-4 pt-6 pb-10 deck:px-6` container every Sales page uses. |
+| `components/planner/{TodayView,LadderView,ReviewView,EditDrawer}.js` | **New.** Built from `Panel`, `PanelHead`, `Rows`, `Button`, `Chip`, `Field`, `Input`, `Select`, `Textarea`, `EmptyState`, `ErrorState`, `InlineError`, `SkeletonRows`. The drawer is `CrmDrawer` — the same dialog every Sales screen opens — rather than a second one. |
+| `components/planner/plannerBits.js` | **New.** Only what the kit genuinely lacks: a task tick, the ladder line under a title, and a progress figure that can say "nothing in it yet" instead of "0%". |
+| `components/shell/DepartmentRail.js` | One fixed Planner control beside "Apps". Not added to the department list, which is data (PRODUCT.md: "Departments are data"). Needed `usePathname` — the rail's existing `current` prop is a department slug and cannot answer "are we on /planner". |
+
+### Verification
+
+- **47 backend tests, all passing**: `services/plannerRollup.test.js` (15, `node --test`), `services/plannerAttention.test.js` (20, `node --test`), `test/planner/planner.route.test.js` (27, jest + in-memory Mongo — counted 27 with the 4 review cases).
+- The privacy boundary is covered per handler, not sampled: another owner's goal cannot be read, patched, deleted, reparented onto, filed against, or have a task touched, and `ownerId` in a request body is ignored.
+- Full backend suite: **6 suites fail, and all 6 are pre-existing** — they die on `FIREBASE_SERVICE_ACCOUNT` missing from this environment's `.env` (CRM enquiry, lead-review, sales-journey ×2, sample-style, hr-ai). None touch the Planner, which needs no Firebase.
+- **Not verified in a browser**: no logged-in session was available in this environment, so the three views, the drawer and the tick animation have not been exercised against real data.
+
+### Preserved / no commit
+
+Purely additive apart from two one-line-scale edits (`server.js` mount, the rail control). The uncommitted Sales-journey work in both repos was not touched, and `docs/tasks/current-task.md` was deliberately left alone — it still scopes the Lead chunks.
+
+---
+
 ## Call recordings on the Sales customer record
 
 > **Synced phone-call recordings surface on the customer they belong to, matched

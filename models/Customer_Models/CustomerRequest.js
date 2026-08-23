@@ -36,6 +36,31 @@ const requestItemVariantSchema = new mongoose.Schema(
       type: Number,
       min: 0,
     },
+
+    // ── WHO this quantity is for ──────────────────────────────────────────
+    //
+    // On a uniform order built from a measurement drive, `quantity: 12` is
+    // twelve named people. The line stays aggregated because that is the right
+    // commercial shape — nobody wants a 300-line invoice — but without this the
+    // identities were simply gone: "did we make, or bill, Ramesh's uniform?"
+    // could only be answered by reopening the drive and guessing by size, which
+    // fails as soon as two people share one.
+    //
+    // Empty on an ordinary stock order, where there is nobody to name.
+    // `services/personRoster.js` builds it and checks it sums to `quantity`.
+    persons: [
+      {
+        employeeId: { type: mongoose.Schema.Types.ObjectId, ref: "EmployeeMpc" },
+        // The customer's OWN identifier for the person, and the one they will
+        // quote back at us when they ask. Kept as a string alongside the ref so
+        // the answer survives the employee record being archived.
+        employeeUIN: { type: String, trim: true },
+        employeeName: { type: String, trim: true },
+        department: { type: String, trim: true },
+        designation: { type: String, trim: true },
+        quantity: { type: Number, min: 0, default: 1 },
+      },
+    ],
   },
   { _id: false },
 );
@@ -473,6 +498,28 @@ const quotationSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "SalesDepartment",
     },
+
+    // ── NEGOTIATION ────────────────────────────────────────────────────────
+    // A price that goes to a customer is rarely the price they accept. Each
+    // round is a REVISION: `quotations[0]` is always the current one — thirty
+    // readers across Sales, the accountant module and the dashboard assume
+    // that and none of them had to change — and the round it replaced is
+    // archived whole into `quotationRevisions` on the request.
+    revision: {
+      type: Number,
+      default: 1,
+      min: 1,
+    },
+    /** Why this round exists, in the salesperson's own words. */
+    revisionReason: {
+      type: String,
+      trim: true,
+    },
+    /** The archived revision this one answers. Null on the first. */
+    supersedesQuotationId: {
+      type: mongoose.Schema.Types.ObjectId,
+    },
+
     status: {
       type: String,
       enum: [
@@ -812,6 +859,17 @@ const customerRequestSchema = new mongoose.Schema(
 
     // Quotation Management - ONLY ONE QUOTATION ALLOWED
     quotations: [quotationSchema],
+
+    /**
+     * Superseded rounds, oldest first. Append-only.
+     *
+     * A revision is history the moment it is replaced: what we offered, what it
+     * came to, when it went out and what the customer said. Overwriting it —
+     * which is what this route did before, `Object.assign` onto quotations[0] —
+     * lost the entire negotiation and left nobody able to answer "what did we
+     * quote them in August". Nothing writes to these once archived.
+     */
+    quotationRevisions: [quotationSchema],
     // REMOVED: currentQuotation field (not needed with single quotation)
     finalOrderPrice: {
       type: Number,

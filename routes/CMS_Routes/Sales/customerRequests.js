@@ -19,6 +19,52 @@ router.use(EmployeeAuthMiddleware);
 // DASHBOARD ROUTES
 // ════════════════════════════════════════════════════════════════════════════
 
+// GET /api/cms/crm/customer-requests/:id/persons
+// GET /api/cms/crm/customer-requests/:id/persons?uin=EMP-0042
+//
+// WHO is on this order — the answer to "did we make, or bill, Ramesh's
+// uniform?", which until now required opening the measurement drive and
+// guessing by garment size.
+//
+// Reads the roster carried on each line (services/personRoster.js). Orders
+// converted before that existed have no roster and honestly report none,
+// rather than inferring one from sizes and being confidently wrong.
+router.get("/:id/persons", async (req, res) => {
+  try {
+    const request = await CustomerRequest.findById(req.params.id)
+      .select("requestId requestType measurementId measurementName items status")
+      .lean();
+    if (!request) return res.status(404).json({ success: false, message: "Order not found" });
+
+    let persons = personsOnOrder(request.items);
+    const uin = String(req.query.uin || "").trim();
+    if (uin) {
+      const needle = uin.toLowerCase();
+      persons = persons.filter(
+        (p) =>
+          String(p.employeeUIN).toLowerCase() === needle ||
+          String(p.employeeName).toLowerCase().includes(needle),
+      );
+    }
+
+    return res.json({
+      success: true,
+      requestId: request.requestId,
+      // Says WHY the list is empty. An ordinary stock order has nobody to name;
+      // a pre-roster measurement order has people the record simply never kept.
+      traceable: (request.items || []).some((i) =>
+        (i.variants || []).some((v) => (v.persons || []).length > 0),
+      ),
+      isMeasurementOrder: request.requestType === "measurement_conversion",
+      fromDrive: request.measurementName || null,
+      count: persons.length,
+      persons,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/dashboard", async (req, res) => {
     try {
         const now = new Date();
@@ -293,6 +339,38 @@ router.get("/requests", async (req, res) => {
     }
 });
 
+/**
+ * Where this order came from, when it came from anywhere.
+ *
+ * An order raised in the customer portal has no history — most of them. One
+ * that came down the Pipeline does, and the Order Book had no way to say so:
+ * the page showed the order as if it had appeared from nowhere, while the
+ * enquiry, the journey and everything decided on them sat one join away.
+ *
+ * Two indexed lookups, both optional, neither ever fatal.
+ */
+async function upstreamOf(requestId) {
+    try {
+        const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
+        const EnquiryModel = require("../../../models/CMS_Models/Sales/Enquiry");
+        const enquiry = await EnquiryModel.findOne({ customerRequestId: requestId, isActive: true })
+            .select("enquiryId title journeyId").lean();
+        if (!enquiry) return null;
+        const journey = enquiry.journeyId
+            ? await SalesJourney.findById(enquiry.journeyId).select("journeyId name currentStage").lean()
+            : null;
+        return {
+            enquiryRef: enquiry.enquiryId || null,
+            enquiryId: String(enquiry._id),
+            journeyRef: journey?.journeyId || null,
+            journeyName: journey?.name || null,
+            journeyStage: journey?.currentStage || null,
+        };
+    } catch {
+        return null;
+    }
+}
+
 router.get("/requests/:requestId", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId)
@@ -350,14 +428,18 @@ router.get("/requests/:requestId", async (req, res) => {
                         };
                     });
 
-                    return res.json({ success: true, request: enrichedRequest });
+                    return res.json({
+                        success: true,
+                        request: enrichedRequest,
+                        upstream: await upstreamOf(request._id),
+                    });
                 }
             } catch (enrichError) {
                 console.error('[salesRoutes] MPC name enrichment failed:', enrichError.message);
             }
         }
 
-        res.json({ success: true, request });
+        res.json({ success: true, request, upstream: await upstreamOf(request._id) });
     } catch (error) {
         console.error("Error fetching customer request:", error);
         res.status(500).json({

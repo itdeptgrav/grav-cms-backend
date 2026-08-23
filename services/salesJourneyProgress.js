@@ -41,6 +41,8 @@
 const {
   SALES_JOURNEY_STAGES,
   SALES_JOURNEY_STAGE_STATES,
+  SALES_JOURNEY_PARK_REASON_CODES,
+  SALES_JOURNEY_LOST_REASON_CODES,
 } = require("../constants/crm");
 
 // Ordered stage codes — index IS the lifecycle position. Mirrors the frontend
@@ -52,7 +54,37 @@ const STATE_LABEL = Object.fromEntries(SALES_JOURNEY_STAGE_STATES.map((s) => [s.
 // The states setState may assign to the current stage. Deliberately excludes
 // notStarted (you cannot un-start the stage you are on), blocked (use `block`),
 // reopened (use `reopen`) and notApplicable (the active stage can't be N/A).
-const SETTABLE_STATES = new Set(["inProgress", "waitingCustomer", "waitingInternal", "complete"]);
+const SETTABLE_STATES = new Set(["inProgress", "waitingCustomer", "waitingInternal", "waitingOutside", "complete"]);
+
+/**
+ * The two states that HOLD a stage, and so carry a `hold` record saying why.
+ *
+ * `blocked` means something is wrong and the stage cannot move. `waitingOutside`
+ * means the work is happening somewhere else — a mill, a lab, a job-work unit —
+ * which is not a problem and does NOT stop the journey advancing. Different
+ * meanings, same need: say who, and say when it is expected back.
+ */
+const HOLD_STATES = new Set(["blocked", "waitingOutside"]);
+
+/** The hold record for a state that holds, or the cleared shape for one that
+ *  does not. Stale holds are worse than none — "waiting on Vardhman" sitting
+ *  under an in-progress stage is a lie the reader has no way to catch. */
+function holdFor({ kind, on, expectedBack, stage, actor }) {
+  if (!HOLD_STATES.has(kind)) {
+    return { hold: { kind: null, on: null, expectedBack: null, since: null, by: null, stage: null } };
+  }
+  const due = expectedBack ? new Date(expectedBack) : null;
+  return {
+    hold: {
+      kind,
+      on: String(on || "").trim(),
+      expectedBack: due && !Number.isNaN(due.valueOf()) ? due : null,
+      since: new Date(),
+      by: actor || null,
+      stage,
+    },
+  };
+}
 
 /** A move the caller can fix (wrong action, illegal from here) — a 4xx, not a 500. */
 class JourneyTransitionError extends Error {
@@ -111,11 +143,29 @@ function planStageTransition(journey = {}, input = {}) {
   const currentState = states[current];
   const currentIdx = STAGE_ORDER.indexOf(current);
 
+  // ── The outcome axis gates every other verb ─────────────────────────────
+  //
+  // A parked or lost journey is not a journey you can advance, set a state on,
+  // block or close. Checked once here rather than in five cases, so a verb
+  // added later cannot forget it. `revive` is the only way back, and `park` on
+  // an already-parked journey is allowed so a revisit date can be pushed.
+  const outcome = journey.outcome || "active";
+  if (outcome !== "active" && !["revive", "park", "lose"].includes(action)) {
+    throw new JourneyTransitionError(
+      outcome === "closed"
+        ? "This order is closed."
+        : `This Journey is ${outcome}. Revive it before working it again.`,
+    );
+  }
+
   switch (action) {
     case "advance": {
       if (currentState === "blocked") {
         throw new JourneyTransitionError(`${labelOf(current)} is blocked — resolve the block before moving forward.`);
       }
+      // `waitingOutside` deliberately does NOT stop an advance. Fabric being at
+      // a mill is not a fault; if the work it was waiting on has come back and
+      // the stage is done, the journey moves and the hold clears with it.
       // (The old Account → Enquiry readiness gate was removed on 13 Aug 2026:
       // "account" is no longer a journey stage. The customer is set up on the
       // Active Lead before conversion, so there is no hollow-account state to
@@ -141,6 +191,31 @@ function planStageTransition(journey = {}, input = {}) {
       const missing = [];
       if (next === "production" && context.poOnFile === false) missing.push("customer PO");
 
+      // ── And the money the PO promised ────────────────────────────────────
+      //
+      // A PO on file says the customer committed; it does not say they paid.
+      // Buying fabric and booking a line against terms nobody has honoured is
+      // the same exposure the PO gate exists to prevent, one step later — so
+      // the agreed advance is a prerequisite too.
+      //
+      // Only when terms were actually recorded. A journey whose PO carries no
+      // `advancePercent` is not held up by a rule nobody agreed to; the gate
+      // enforces the deal that was struck, it does not invent one.
+      //
+      // `context.advance` is assembled by the route (services/paymentTerms.js)
+      // from the ACCOUNT'S standing terms, any per-deal override on the PO, and
+      // the linked order's receipts — never trusted from the client, for the
+      // obvious reason. Its `required` is a BOOLEAN ("is there an advance to
+      // satisfy"); the money is `amountRequired` / `amountReceived`.
+      const adv = context.advance;
+      if (next === "production" && adv && adv.required === true && adv.cleared === false) {
+        const inr = (n) => Math.round(n).toLocaleString("en-IN");
+        missing.push(
+          `agreed advance (${adv.percent}% — ${adv.currency} ${inr(adv.amountRequired)}`
+          + `, ${inr(adv.amountReceived)} received)`,
+        );
+      }
+
       if (missing.length) {
         const reason = String(context.overrideReason || "").trim();
         if (!reason) {
@@ -159,6 +234,9 @@ function planStageTransition(journey = {}, input = {}) {
       const set = {
         currentStage: next,
         [`stageStates.${current}`]: "complete",
+        // The hold belonged to the stage being left. Cleared here, or the next
+        // stage silently inherits "waiting on Vardhman" from the last one.
+        ...holdFor({ kind: null }),
       };
       // Returned SEPARATELY from `set`, not as a $push inside it: the route
       // applies set with journey.set(path, value), so a mongo operator key would
@@ -244,9 +322,25 @@ function planStageTransition(journey = {}, input = {}) {
       if (states[current] === toState) {
         throw new JourneyTransitionError(`${labelOf(current)} is already ${stateLabelOf(toState)}.`);
       }
+      // Waiting on an outside party has to say WHO. Free text, because the list
+      // of mills, labs and job-work units is the supply chain and no dropdown
+      // keeps up with it — but not optional, because "waiting" with no subject
+      // is the state this was added to replace.
+      if (toState === "waitingOutside" && !String(input.on || input.reason || "").trim()) {
+        throw new JourneyTransitionError("Say who this is waiting on — the mill, the lab, whoever has it.");
+      }
+      const who = String(input.on || input.reason || "").trim();
       return {
-        set: { [`stageStates.${current}`]: toState },
-        summary: `set ${labelOf(current)} to ${stateLabelOf(toState)}`,
+        set: {
+          [`stageStates.${current}`]: toState,
+          // Writes the hold for waitingOutside, and CLEARS it for every other
+          // state — moving a stage back to In progress must not leave a stale
+          // "waiting on Vardhman" hanging under it.
+          ...holdFor({ kind: toState, on: who, expectedBack: input.expectedBack, stage: current, actor: input.actor }),
+        },
+        summary: toState === "waitingOutside"
+          ? `set ${labelOf(current)} to waiting on ${who}`
+          : `set ${labelOf(current)} to ${stateLabelOf(toState)}`,
       };
     }
 
@@ -255,7 +349,13 @@ function planStageTransition(journey = {}, input = {}) {
       if (!reason) throw new JourneyTransitionError("A reason is required to block a stage.");
       if (currentState === "blocked") throw new JourneyTransitionError(`${labelOf(current)} is already blocked.`);
       return {
-        set: { [`stageStates.${current}`]: "blocked" },
+        set: {
+          [`stageStates.${current}`]: "blocked",
+          // The reason is STORED now, not left in the change log alone. Reading
+          // "Blocked" on the board and having to open an audit trail to learn
+          // why was the defect this fixes.
+          ...holdFor({ kind: "blocked", on: reason, expectedBack: input.expectedBack, stage: current, actor: input.actor }),
+        },
         summary: `blocked ${labelOf(current)} — ${reason}`,
       };
     }
@@ -281,9 +381,93 @@ function planStageTransition(journey = {}, input = {}) {
       };
     }
 
+    /*
+     * PARK — dormant, expected back. Requires a reason AND a revisit date.
+     *
+     * The date is not politeness. A park with no date is indistinguishable
+     * from an abandoned deal a week later, and the pipeline quietly becomes a
+     * graveyard — which is exactly why the Lead's nurture state already
+     * demands a next action before it will let you park a lead.
+     *
+     * The stage pointer does NOT move. Parking is not progress and not a
+     * setback; the journey resumes exactly where it stopped.
+     */
+    case "park": {
+      const reason = String(input.reason || "").trim();
+      if (!SALES_JOURNEY_PARK_REASON_CODES.includes(reason)) {
+        throw new JourneyTransitionError("Choose why this Journey is being parked.");
+      }
+      const revisit = input.revisitOn ? new Date(input.revisitOn) : null;
+      if (!revisit || Number.isNaN(revisit.valueOf())) {
+        throw new JourneyTransitionError("Parking needs a date to look at this again.");
+      }
+      return {
+        set: {
+          outcome: "parked",
+          outcomeStage: current,
+          outcomeReason: reason,
+          outcomeNote: String(input.note || "").trim(),
+          outcomeAt: new Date(),
+          revisitOn: revisit,
+        },
+        summary: `parked at ${labelOf(current)} — ${reason}, revisit ${revisit.toISOString().slice(0, 10)}`,
+      };
+    }
+
+    /*
+     * LOSE — they are not coming back.
+     *
+     * PRE-PO ONLY. Once a PO is on file the customer has committed: capacity is
+     * booked, material is bought, work orders may be running and money may have
+     * been received. Walking away from that is a cancellation to be unwound,
+     * not a deal that was lost, and it needs an authority and a settlement this
+     * verb does not have. Refused rather than quietly mishandled.
+     */
+    case "lose": {
+      if (context.poOnFile) {
+        throw new JourneyTransitionError(
+          "There is a PO on this Journey, so it cannot be marked lost — a committed order has to be cancelled, which is a separate decision.",
+        );
+      }
+      const reason = String(input.reason || "").trim();
+      if (!SALES_JOURNEY_LOST_REASON_CODES.includes(reason)) {
+        throw new JourneyTransitionError("Choose why this Journey was lost.");
+      }
+      return {
+        set: {
+          outcome: "lost",
+          outcomeStage: current,
+          outcomeReason: reason,
+          outcomeNote: String(input.note || "").trim(),
+          outcomeAt: new Date(),
+          revisitOn: null,
+        },
+        summary: `lost at ${labelOf(current)} — ${reason}`,
+      };
+    }
+
+    /*
+     * REVIVE — back to active, at the stage it stopped on.
+     *
+     * `outcomeStage` and the reason are deliberately NOT cleared. They are the
+     * record of what happened, and a deal that was lost in March and revived in
+     * June should still be able to say it was lost in March at Cost & Quote.
+     * Only the live fields — outcome and the revisit date — are reset.
+     */
+    case "revive": {
+      if (outcome === "active") throw new JourneyTransitionError("This Journey is already active.");
+      if (outcome === "closed") throw new JourneyTransitionError("A closed order cannot be revived.");
+      const reason = String(input.reason || "").trim();
+      if (!reason) throw new JourneyTransitionError("Say why this Journey is being picked up again.");
+      return {
+        set: { outcome: "active", revisitOn: null },
+        summary: `revived at ${labelOf(current)} — ${reason}`,
+      };
+    }
+
     default:
       throw new JourneyTransitionError(
-        `"${action || "(none)"}" is not a stage action. Use one of: advance, close, setState, block, reopen.`,
+        `"${action || "(none)"}" is not a stage action. Use one of: advance, close, setState, block, reopen, park, lose, revive.`,
       );
   }
 }

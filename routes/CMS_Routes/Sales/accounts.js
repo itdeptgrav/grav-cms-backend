@@ -205,7 +205,9 @@ router.post("/", salesAuth, async (req, res) => {
   }
 });
 
-// GET /api/cms/crm/accounts/:id/hierarchy — parent chain + children + sites.
+// GET /api/cms/crm/accounts/:id/hierarchy — parent chain + children + siblings
+// + sites. This is what the account workspace's Group card reads: for one hotel
+// in a chain it answers "who owns this, and which other properties are theirs".
 router.get("/:id/hierarchy", salesAuth, async (req, res) => {
   try {
     const self = await Account.findById(req.params.id).select("accountId companyName parentAccountId").lean();
@@ -223,12 +225,36 @@ router.get("/:id/hierarchy", salesAuth, async (req, res) => {
       cursor = p.parentAccountId;
     }
 
-    const [children, sites] = await Promise.all([
-      Account.find({ parentAccountId: self._id, isActive: true }).select("accountId companyName status").lean(),
+    // Siblings share this account's parent. Excluded when it has none: every
+    // root account would otherwise "sibling" every other root account, which is
+    // not a group, it is the whole customer list.
+    const [children, siblings, sites] = await Promise.all([
+      Account.find({ parentAccountId: self._id, isActive: true })
+        .select("accountId companyName status lifecycleStage city").sort({ companyName: 1 }).lean(),
+      self.parentAccountId
+        ? Account.find({ parentAccountId: self.parentAccountId, isActive: true, _id: { $ne: self._id } })
+            .select("accountId companyName status lifecycleStage city").sort({ companyName: 1 }).lean()
+        : Promise.resolve([]),
       Site.find({ accountId: self._id, isActive: true }).select("siteId name siteType isPrimary").lean(),
     ]);
 
-    res.json({ success: true, account: self, ancestors: ancestors.reverse(), children, sites });
+    // The group's root is the top ancestor, or this account when it has none —
+    // so a parent opening its own page still sees "this group" rather than a
+    // blank where its own name should be.
+    const ordered = ancestors.reverse();
+    const root = ordered[0] || { _id: self._id, accountId: self.accountId, companyName: self.companyName };
+
+    res.json({
+      success: true,
+      account: self,
+      root,
+      isRoot: !self.parentAccountId,
+      ancestors: ordered,
+      parent: ordered.length ? ordered[ordered.length - 1] : null,
+      children,
+      siblings,
+      sites,
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -255,6 +281,10 @@ router.get("/:id", salesAuth, async (req, res) => {
       .populate("primaryContact", "firstName lastName email phone designation")
       .populate("assignedTo", "name email")
       .populate("parentAccountId", "accountId companyName")
+      // Populated so the workspace can NAME the portal customer rather than
+      // print its id — the MPC section reads this to decide whether it has
+      // anything to act on behalf of.
+      .populate("linkedCustomer", "name email customerId profile.companyName")
       .populate("garmentSalesProfile.defaultPoIssuerAccountId", "accountId companyName")
       .populate("garmentSalesProfile.defaultBillToAccountId", "accountId companyName")
       .populate("garmentSalesProfile.defaultImporterAccountId", "accountId companyName")

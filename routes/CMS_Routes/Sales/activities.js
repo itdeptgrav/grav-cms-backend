@@ -19,6 +19,13 @@
 const express = require("express");
 const router = express.Router();
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
+// Required for their side effect: `tasks/mine` populates accountId -> CRMAccount
+// and leadId -> Lead, and mongoose resolves a ref by NAME at query time. Left
+// implicit, this route works only because some other router happened to be
+// mounted first and registered them — reorder the mounts in server.js and it
+// throws MissingSchemaError at runtime, on a route no test covers.
+require("../../../models/CMS_Models/Sales/Lead");
+require("../../../models/CMS_Models/Sales/Account");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
 const { ACTIVITY_TASK_TYPES } = require("../../../constants/crm");
@@ -111,6 +118,61 @@ router.get("/tasks/overdue", salesAuth, async (req, res) => {
     res.json({ success: true, tasks });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/activities/tasks/mine
+//
+// Everything I still have to do, across leads, accounts and journeys.
+//
+// The two routes above take `ownerId` from the QUERY STRING, which makes them
+// reporting endpoints — anyone can read anyone's list, and the client decides
+// whose. This one resolves the owner from the SESSION and cannot be pointed
+// elsewhere, the same rule the Leads hub applies to "My work".
+//
+// One call, not two. `tasks/overdue` and `tasks/upcoming` returned separate
+// lists that a client had to merge, and between them they missed two things a
+// worklist needs: tasks due beyond the window, and tasks with no date at all.
+// A task somebody wrote down with no date is still a real intention; dropping
+// it teaches people the list is unreliable.
+const { bucketTasks, taskSubject } = require("../../../services/taskBuckets");
+
+router.get("/tasks/mine", salesAuth, async (req, res) => {
+  try {
+    const ownerId = req.user?.id;
+    if (!ownerId) return res.json({ success: true, buckets: {}, counts: {}, total: 0, order: [] });
+
+    const tasks = await Activity.find({ isActive: true, status: "planned", ownerId })
+      // Populated so each row can NAME what it is on and link to it. Without
+      // this the list reads as a column of orphan subjects.
+      .populate("accountId", "accountId companyName displayName")
+      .populate("leadId", "leadId company firstName lastName")
+      .sort({ dueDate: 1 })
+      .limit(500)
+      .lean();
+
+    const grouped = bucketTasks(tasks, new Date());
+    const shape = (t) => ({
+      id: String(t._id),
+      activityId: t.activityId || null,
+      subject: t.subject,
+      description: t.description || null,
+      type: t.activityType,
+      priority: t.priority || "normal",
+      dueDate: t.dueDate || null,
+      on: taskSubject(t),
+    });
+
+    return res.json({
+      success: true,
+      order: grouped.order,
+      counts: grouped.counts,
+      total: grouped.total,
+      buckets: Object.fromEntries(grouped.order.map((b) => [b, grouped.buckets[b].map(shape)])),
+    });
+  } catch (err) {
+    console.error("[activities] GET /tasks/mine", err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
