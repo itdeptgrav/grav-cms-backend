@@ -5,6 +5,7 @@ const router = express.Router();
 const Employee = require("../../models/Employee");
 const { PayrollItem } = require("../../models/HR_Models/Payroll");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
+const { sendPayslipPdf } = require("../../services/payslipPdf.service");
 
 const MONTH_NAMES = [
     "", "January", "February", "March", "April", "May", "June",
@@ -123,6 +124,38 @@ router.get("/employees", EmployeeAuthMiddlewear, async (req, res) => {
         }));
         res.json({ success: true, data: formatted, count: formatted.length });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+});
+
+// ── GET /:employeeId/pdf — the payslip as a downloaded file ───────────────
+//
+// Before /:employeeId, or Express matches "pdf" as an employee id.
+//
+// Same renderer the employee app uses, so a payslip HR downloads and one the
+// employee downloads are the same bytes rather than two documents that merely
+// look alike. It also replaces the dashboard's "Download PDF" button, which
+// called window.print() and downloaded nothing.
+router.get("/:employeeId/pdf", EmployeeAuthMiddlewear, async (req, res) => {
+    try {
+        const { user } = req;
+        const { employeeId } = req.params;
+        const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+        const year = parseInt(req.query.year) || new Date().getFullYear();
+        if (user.role !== "hr_manager" && user.id !== employeeId)
+            return res.status(403).json({ success: false, message: "Access denied" });
+        const employee = await Employee.findById(employeeId).select("-password -temporaryPassword -__v").lean();
+        if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
+        const item = await PayrollItem.findOne({ employeeId, month, year }).lean();
+        if (!item) return res.status(404).json({
+            success: false, code: "PAYROLL_NOT_RUN",
+            message: `Payroll not yet processed for ${MONTH_NAMES[month]} ${year}. Please run payroll first.`,
+        });
+        await sendPayslipPdf(res, buildPayslipPayload(item, employee));
+    } catch (err) {
+        console.error("[HR-PAYSLIP-PDF]", err);
+        if (err.name === "CastError") return res.status(400).json({ success: false, message: "Invalid employee ID" });
+        if (res.headersSent) return res.end();
+        res.status(500).json({ success: false, message: "Could not build the payslip PDF" });
+    }
 });
 
 router.get("/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {

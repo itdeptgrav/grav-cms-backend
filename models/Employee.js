@@ -154,7 +154,25 @@ const employeeSchema = new mongoose.Schema({
     default: "",
   },
   workLocation: { type: String, default: "GRAV Clothing" },
+  // Legacy free-text shift label. Kept as-is: it is written by the employee
+  // importer, exported again, and shown on the profile screen. Repurposing it
+  // would fail to cast every existing string.
   shift: { type: String, trim: true },
+
+  // The shift attendance is actually JUDGED against.
+  //
+  // "core" and "general" name the two presets in attendance settings — and
+  // mind the inversion documented in services/shiftPolicy.js, where UI "Core"
+  // is stored as shifts.executive. "custom" carries this person's own hours,
+  // with the grace periods coming from the shared custom profile in settings.
+  //
+  // Left unset, attendance falls back to the department/designation mapping
+  // that decided it before, so nobody's status changes until HR sets one.
+  workShift: {
+    mode: { type: String, enum: ["core", "general", "custom"], default: undefined },
+    start: { type: String, trim: true }, // "HH:MM", custom only
+    end: { type: String, trim: true },   // "HH:MM", custom only
+  },
 
   status: { type: String, default: "active" },
   isActive: { type: Boolean, default: true },
