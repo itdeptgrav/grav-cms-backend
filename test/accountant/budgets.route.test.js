@@ -2987,3 +2987,451 @@ describe("adjustments — supplementary and revision", () => {
     expect(await allocationOf(budget._id, revenueItem._id)).toBe(5000000);
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * CHUNK 8 — TRANSFERS
+ *
+ * Moving approved amount between lines. Not extra money: the company's total
+ * commitment is unchanged and only who may spend it moves.
+ *
+ * The invariant everything here defends: YOU CANNOT MOVE MONEY THAT HAS
+ * ALREADY BEEN SPENT. `allocated` is not availability. A line with ₹1L
+ * allocated and ₹90k consumed has ₹10k to give, and transferring against the
+ * allocation would leave the source instantly over budget having done nothing.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("transfers", () => {
+  let seq = 0;
+
+  async function setup({ status = "active", admin = 100000, production = 50000 } = {}) {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    /* A SECOND expense head, so the two sides of a transfer are genuinely
+       different lines on different ledgers — a transfer between two lines
+       sharing a head would hide any ledger mix-up. */
+    const expGroup = await Acc_Group.findOne({ companyId: company._id, nature: "expense" });
+    const repairsLedger = await Acc_Ledger.create({
+      companyId: company._id, name: "Repairs & Maintenance",
+      groupId: expGroup._id, groupName: expGroup.name, nature: "expense",
+    });
+
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status,
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [
+        {
+          ledgerId: repairsLedger._id, ledgerName: repairsLedger.name,
+          groupName: repairsLedger.groupName, nature: "expense",
+          department: "Admin", allocatedAmount: admin,
+        },
+        {
+          ledgerId: expenseLedger._id, ledgerName: expenseLedger.name,
+          groupName: expenseLedger.groupName, nature: "expense",
+          department: "Production", allocatedAmount: production,
+        },
+        {
+          ledgerId: revenueLedger._id, ledgerName: revenueLedger.name,
+          groupName: revenueLedger.groupName, nature: "revenue",
+          department: "Sales", allocatedAmount: 4000000,
+        },
+      ],
+    });
+    return {
+      company, budget, repairsLedger, expenseLedger, revenueLedger,
+      q: `?companyId=${company._id}`,
+      source: budget.items[0],       // Admin · Repairs
+      destination: budget.items[1],  // Production · Freight
+      revenueItem: budget.items[2],
+    };
+  }
+
+  async function spend({ company, ledger, amount, date = "2026-06-15" }) {
+    return Acc_Voucher.create({
+      companyId: company._id, voucherType: "purchase",
+      voucherNumber: `TR/${seq++}/${Date.now()}`,
+      voucherDate: new Date(date), status: "posted", grandTotal: amount,
+      ledgerEntries: [{ ledgerId: ledger._id, ledgerName: ledger.name, type: "Dr", amount }],
+    });
+  }
+
+  const submit = (budget, q, body) =>
+    call(`/${budget._id}/transfers${q}`, { method: "POST", body });
+
+  const move = (source, destination, amount, extra = {}) => ({
+    fromItemId: String(source._id),
+    toItemId: String(destination._id),
+    amount,
+    reason: "Admin repairs underspent; Production maintenance is short.",
+    ...extra,
+  });
+
+  const allocations = async (budgetId) => {
+    const b = await Acc_Budget.findById(budgetId).lean();
+    return Object.fromEntries(b.items.map((i) => [i.department, i.allocatedAmount]));
+  };
+
+  /* ── submitting ───────────────────────────────────────────────────────── */
+
+  test("a transfer records both sides as they stood, including what was already spent", async () => {
+    const { company, budget, q, source, destination, repairsLedger } = await setup({ admin: 100000, production: 50000 });
+    await spend({ company, ledger: repairsLedger, amount: 25000 });
+
+    const { status, body } = await submit(budget, q, move(source, destination, 60000));
+    expect(status).toBe(201);
+
+    const t = body.transfer;
+    expect(t.state).toBe("submitted");
+    expect(t.amount).toBe(60000);
+    expect(t.fromSnapshot.department).toBe("Admin");
+    expect(t.fromSnapshot.ledgerName).toBe("Repairs & Maintenance");
+    expect(t.fromSnapshot.allocatedAmount).toBe(100000);
+    // The evidence for the case being made: ₹25k already gone, ₹75k to give.
+    expect(t.fromSnapshot.actual).toBe(25000);
+    expect(t.fromSnapshot.remaining).toBe(75000);
+    expect(t.toSnapshot.department).toBe("Production");
+    expect(t.toSnapshot.allocatedAmount).toBe(50000);
+  });
+
+  test("SUBMITTING MOVES NOTHING", async () => {
+    const { budget, q, source, destination } = await setup();
+    const before = await allocations(budget._id);
+
+    await submit(budget, q, move(source, destination, 60000));
+    await submit(budget, q, move(source, destination, 10000));
+
+    expect(await allocations(budget._id)).toEqual(before);
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.transfers).toHaveLength(2);
+  });
+
+  /* ── validation ───────────────────────────────────────────────────────── */
+
+  test("the amount must be positive", async () => {
+    const { budget, q, source, destination } = await setup();
+    for (const bad of [0, -60000, "abc"]) {
+      const { status, body } = await submit(budget, q, move(source, destination, bad));
+      expect(status).toBe(400);
+      expect(body.message).toMatch(/greater than 0/);
+    }
+  });
+
+  test("both lines must exist, and they must be different lines", async () => {
+    const { budget, q, source, destination } = await setup();
+
+    const same = await submit(budget, q, move(source, source, 1000));
+    expect(same.status).toBe(400);
+    expect(same.body.message).toMatch(/two different lines/);
+
+    const missing = await submit(budget, q, {
+      ...move(source, destination, 1000),
+      toItemId: new mongoose.Types.ObjectId().toString(),
+    });
+    expect(missing.status).toBe(404);
+
+    const junk = await submit(budget, q, { ...move(source, destination, 1000), fromItemId: "nope" });
+    expect(junk.status).toBe(404);
+  });
+
+  test("a reason is required — a transfer with none is unreviewable", async () => {
+    const { budget, q, source, destination } = await setup();
+    const { status, body } = await submit(budget, q, {
+      fromItemId: String(source._id), toItemId: String(destination._id), amount: 1000,
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/reason is required/);
+  });
+
+  test("expense and revenue lines cannot be transferred between", async () => {
+    const { budget, q, source, revenueItem } = await setup();
+    const { status, body } = await submit(budget, q, move(source, revenueItem, 1000));
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/different kinds of number/);
+  });
+
+  test("a closed budget can no longer have money moved; a live or blown one can", async () => {
+    for (const status of ["draft", "collecting", "closed"]) {
+      const { budget, q, source, destination } = await setup({ status });
+      const res = await submit(budget, q, move(source, destination, 1000));
+      expect(res.status).toBe(409);
+      expect(res.body.message).toMatch(/no longer be moved/);
+    }
+    for (const status of ["review", "active", "exceeded"]) {
+      const { budget, q, source, destination } = await setup({ status });
+      expect((await submit(budget, q, move(source, destination, 1000))).status).toBe(201);
+    }
+  });
+
+  /* ── the invariant ────────────────────────────────────────────────────── */
+
+  test("SPENT MONEY CANNOT BE MOVED — availability is allocated minus actual", async () => {
+    const { company, budget, q, source, destination, repairsLedger } = await setup({ admin: 100000 });
+    // ₹90k of the ₹1L is already gone. Only ₹10k can move.
+    await spend({ company, ledger: repairsLedger, amount: 90000 });
+
+    const tooMuch = await submit(budget, q, move(source, destination, 60000));
+    expect(tooMuch.status).toBe(400);
+    expect(tooMuch.body.message).toMatch(/only ₹10,000 left to give/);
+    expect(tooMuch.body.message).toMatch(/₹90,000 of its ₹1,00,000 is already spent/);
+    expect(tooMuch.body.available.remaining).toBe(10000);
+
+    // Exactly the available amount is fine.
+    expect((await submit(budget, q, move(source, destination, 10000))).status).toBe(201);
+  });
+
+  test("a line already over budget has nothing to give, not a negative amount", async () => {
+    const { company, budget, q, source, destination, repairsLedger } = await setup({ admin: 100000 });
+    await spend({ company, ledger: repairsLedger, amount: 150000 });
+
+    const { status, body } = await submit(budget, q, move(source, destination, 1));
+    expect(status).toBe(400);
+    expect(body.available.remaining).toBe(0);
+  });
+
+  test("availability is re-checked at approval, because spend arrives in between", async () => {
+    const { company, budget, q, source, destination, repairsLedger } = await setup({ admin: 100000 });
+
+    // ₹60k is available when the case is made.
+    const created = await submit(budget, q, move(source, destination, 60000));
+    expect(created.status).toBe(201);
+    expect(created.body.transfer.fromSnapshot.remaining).toBe(100000);
+
+    // Admin then spends ₹80k while finance is thinking about it.
+    await spend({ company, ledger: repairsLedger, amount: 80000 });
+
+    const { status, body } = await call(
+      `/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`, { method: "POST" },
+    );
+    expect(status).toBe(409);
+    expect(body.message).toMatch(/no longer has/);
+    // Nothing moved.
+    expect(await allocations(budget._id)).toEqual({ Admin: 100000, Production: 50000, Sales: 4000000 });
+  });
+
+  /* ── approving ────────────────────────────────────────────────────────── */
+
+  test("approving subtracts from the source and adds to the destination", async () => {
+    const { budget, q, source, destination } = await setup({ admin: 100000, production: 50000 });
+    const created = await submit(budget, q, move(source, destination, 60000));
+
+    const { status, body } = await call(
+      `/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`,
+      { method: "POST", body: { financeNote: "Agreed — Admin has no repairs planned." } },
+    );
+
+    expect(status).toBe(200);
+    expect(body.transfer.state).toBe("approved");
+    expect(body.transfer.appliedAt).toBeTruthy();
+    expect(body.transfer.reviewedBy).toBe(OWNER.name);
+    expect(body.transfer.financeNote).toMatch(/no repairs planned/);
+    expect(await allocations(budget._id)).toEqual({ Admin: 40000, Production: 110000, Sales: 4000000 });
+  });
+
+  test("the company's total commitment is unchanged — this is not extra money", async () => {
+    const { budget, q, source, destination } = await setup({ admin: 100000, production: 50000 });
+    const created = await submit(budget, q, move(source, destination, 60000));
+
+    const { body } = await call(
+      `/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`, { method: "POST" },
+    );
+
+    // 100000 + 50000 = 150000, before and after.
+    expect(body.totals.totalExpenseAllocated).toBe(150000);
+    expect(body.totals.totalRevenueAllocated).toBe(4000000);
+    expect(body.totals.totalAllocated).toBe(4150000);
+
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.totalExpenseAllocated).toBe(150000);
+  });
+
+  test("APPROVING TWICE APPLIES ONCE", async () => {
+    const { budget, q, source, destination } = await setup({ admin: 100000, production: 50000 });
+    const created = await submit(budget, q, move(source, destination, 60000));
+    const url = `/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`;
+
+    expect((await call(url, { method: "POST" })).status).toBe(200);
+    expect(await allocations(budget._id)).toEqual({ Admin: 40000, Production: 110000, Sales: 4000000 });
+
+    const second = await call(url, { method: "POST" });
+    expect(second.status).toBe(409);
+    expect(second.body.message).toMatch(/already been applied/);
+    expect(await allocations(budget._id)).toEqual({ Admin: 40000, Production: 110000, Sales: 4000000 });
+
+    await Promise.all([call(url, { method: "POST" }), call(url, { method: "POST" })]);
+    expect(await allocations(budget._id)).toEqual({ Admin: 40000, Production: 110000, Sales: 4000000 });
+  });
+
+  test("a source line may be emptied to zero but never taken below it", async () => {
+    const { budget, q, source, destination } = await setup({ admin: 100000, production: 50000 });
+    const created = await submit(budget, q, move(source, destination, 100000));
+
+    const { status } = await call(
+      `/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`, { method: "POST" },
+    );
+    expect(status).toBe(200);
+    expect(await allocations(budget._id)).toEqual({ Admin: 0, Production: 150000, Sales: 4000000 });
+  });
+
+  test("evaluated variance reflects both sides immediately after approval", async () => {
+    const { company, budget, q, source, destination, expenseLedger } = await setup({ admin: 100000, production: 50000 });
+    // Production has overspent its ₹50k.
+    await spend({ company, ledger: expenseLedger, amount: 90000 });
+
+    const before = await call(`/${budget._id}${q}&asOf=2027-03-31`);
+    const prodBefore = before.body.budget.items.find((i) => i.department === "Production");
+    expect(prodBefore.variance).toBe(-40000);
+    expect(prodBefore.pace).toBe("over_budget");
+
+    const created = await submit(budget, q, move(source, destination, 60000));
+    await call(`/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`, { method: "POST" });
+
+    const after = await call(`/${budget._id}${q}&asOf=2027-03-31`);
+    const prodAfter = after.body.budget.items.find((i) => i.department === "Production");
+    const adminAfter = after.body.budget.items.find((i) => i.department === "Admin");
+    expect(prodAfter.allocated).toBe(110000);
+    expect(prodAfter.variance).toBe(20000);
+    expect(prodAfter.pace).not.toBe("over_budget");
+    expect(adminAfter.allocated).toBe(40000);
+  });
+
+  /* ── refusing ─────────────────────────────────────────────────────────── */
+
+  test("rejecting answers without moving a rupee", async () => {
+    const { budget, q, source, destination } = await setup();
+    const created = await submit(budget, q, move(source, destination, 60000));
+
+    const { status, body } = await call(
+      `/${budget._id}/transfers/${created.body.transfer._id}/reject${q}`,
+      { method: "POST", body: { financeNote: "Admin will need this in Q4." } },
+    );
+    expect(status).toBe(200);
+    expect(body.transfer.state).toBe("rejected");
+    expect(body.transfer.appliedAt).toBeUndefined();
+    expect(await allocations(budget._id)).toEqual({ Admin: 100000, Production: 50000, Sales: 4000000 });
+  });
+
+  test("a rejected transfer cannot then be approved, and an applied one cannot be undone here", async () => {
+    const { budget, q, source, destination } = await setup();
+
+    const a = await submit(budget, q, move(source, destination, 10000));
+    await call(`/${budget._id}/transfers/${a.body.transfer._id}/reject${q}`, { method: "POST" });
+    const revived = await call(`/${budget._id}/transfers/${a.body.transfer._id}/approve${q}`, { method: "POST" });
+    expect(revived.status).toBe(409);
+
+    const b = await submit(budget, q, move(source, destination, 10000));
+    await call(`/${budget._id}/transfers/${b.body.transfer._id}/approve${q}`, { method: "POST" });
+    expect((await call(`/${budget._id}/transfers/${b.body.transfer._id}/reject${q}`, { method: "POST" })).status).toBe(409);
+    expect((await call(`/${budget._id}/transfers/${b.body.transfer._id}/cancel${q}`, { method: "POST" })).status).toBe(409);
+  });
+
+  test("the requester can withdraw a submitted transfer", async () => {
+    const { budget, q, source, destination } = await setup();
+    const created = await submit(budget, q, move(source, destination, 10000));
+    const id = created.body.transfer._id;
+
+    const { status, body } = await call(`/${budget._id}/transfers/${id}/cancel${q}`, { method: "POST" });
+    expect(status).toBe(200);
+    expect(body.transfer.state).toBe("cancelled");
+    expect((await call(`/${budget._id}/transfers/${id}/cancel${q}`, { method: "POST" })).status).toBe(409);
+  });
+
+  /* ── smuggling and scoping ────────────────────────────────────────────── */
+
+  test("a requester cannot smuggle approved or applied fields through the body", async () => {
+    const { budget, q, source, destination } = await setup({ admin: 100000, production: 50000 });
+    const { status, body } = await submit(budget, q, {
+      ...move(source, destination, 60000),
+      state: "approved",
+      appliedAt: new Date().toISOString(),
+      reviewedBy: "someone.else@example.com",
+      requestedBy: "not.me@example.com",
+      financeNote: "Approved by me, obviously.",
+      fromSnapshot: { allocatedAmount: 99999999, remaining: 99999999 },
+      toSnapshot: { allocatedAmount: 1 },
+    });
+
+    expect(status).toBe(201);
+    const t = body.transfer;
+    expect(t.state).toBe("submitted");
+    expect(t.appliedAt).toBeUndefined();
+    expect(t.reviewedBy).toBeUndefined();
+    expect(t.financeNote).toBeUndefined();
+    // Snapshots are computed from the real lines, never accepted.
+    expect(t.fromSnapshot.allocatedAmount).toBe(100000);
+    expect(t.toSnapshot.allocatedAmount).toBe(50000);
+    expect(await allocations(budget._id)).toEqual({ Admin: 100000, Production: 50000, Sales: 4000000 });
+  });
+
+  test("another company can neither see nor move this budget's money", async () => {
+    const { budget, q, source, destination } = await setup();
+    const other = await seedCompany();
+    const oq = `?companyId=${other.company._id}`;
+
+    expect((await call(`/${budget._id}/transfers${oq}`)).status).toBe(404);
+    expect((await call(`/${budget._id}/transfers/available${oq}`)).status).toBe(404);
+    expect((await submit(budget, oq, move(source, destination, 1000))).status).toBe(404);
+
+    const mine = await submit(budget, q, move(source, destination, 1000));
+    const id = mine.body.transfer._id;
+    expect((await call(`/${budget._id}/transfers/${id}/approve${oq}`, { method: "POST" })).status).toBe(404);
+    expect((await call(`/${budget._id}/transfers/${id}/reject${oq}`, { method: "POST" })).status).toBe(404);
+  });
+
+  test("another company's spend does not change what a line has to give", async () => {
+    const a = await setup({ admin: 100000 });
+    const b = await seedCompany();
+    // B posts against A's head id — must not reduce A's availability.
+    await Acc_Voucher.create({
+      companyId: b.company._id, voucherType: "purchase",
+      voucherNumber: `TRX/${seq++}/${Date.now()}`,
+      voucherDate: new Date("2026-06-15"), status: "posted", grandTotal: 95000,
+      ledgerEntries: [{ ledgerId: a.repairsLedger._id, ledgerName: a.repairsLedger.name, type: "Dr", amount: 95000 }],
+    });
+
+    const { body } = await call(`/${a.budget._id}/transfers/available${a.q}`);
+    const admin = body.lines.find((l) => l.department === "Admin");
+    expect(admin.actual).toBe(0);
+    expect(admin.remaining).toBe(100000);
+  });
+
+  /* ── reading ──────────────────────────────────────────────────────────── */
+
+  test("the availability read shows what every line could give, spend included", async () => {
+    const { company, budget, q, repairsLedger } = await setup({ admin: 100000, production: 50000 });
+    await spend({ company, ledger: repairsLedger, amount: 30000 });
+
+    const { status, body } = await call(`/${budget._id}/transfers/available${q}`);
+    expect(status).toBe(200);
+
+    const admin = body.lines.find((l) => l.department === "Admin");
+    expect(admin.allocated).toBe(100000);
+    expect(admin.actual).toBe(30000);
+    expect(admin.remaining).toBe(70000);
+
+    const production = body.lines.find((l) => l.department === "Production");
+    expect(production.remaining).toBe(50000);
+  });
+
+  test("the list stays readable after the budget closes, but no longer accepts one", async () => {
+    const { budget, q, source, destination } = await setup();
+    await submit(budget, q, move(source, destination, 10000));
+
+    const open = await call(`/${budget._id}/transfers${q}`);
+    expect(open.body.transfers).toHaveLength(1);
+    expect(open.body.transferable).toBe(true);
+
+    await Acc_Budget.updateOne({ _id: budget._id }, { $set: { status: "closed" } });
+    const closed = await call(`/${budget._id}/transfers${q}`);
+    expect(closed.status).toBe(200);
+    expect(closed.body.transfers).toHaveLength(1);
+    expect(closed.body.transferable).toBe(false);
+  });
+
+  test("an unknown or malformed budget or transfer id is a clean 404", async () => {
+    const { budget, q } = await setup();
+    expect((await call(`/${new mongoose.Types.ObjectId()}/transfers${q}`)).status).toBe(404);
+    expect((await call(`/not-an-id/transfers${q}`)).status).toBe(404);
+    expect(
+      (await call(`/${budget._id}/transfers/${new mongoose.Types.ObjectId()}/approve${q}`, { method: "POST" })).status,
+    ).toBe(404);
+    expect((await call(`/${budget._id}/transfers/nope/approve${q}`, { method: "POST" })).status).toBe(404);
+  });
+});

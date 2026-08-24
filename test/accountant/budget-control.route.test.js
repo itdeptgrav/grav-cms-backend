@@ -1223,3 +1223,122 @@ describe("gates 7–9 — the approvals executor", () => {
     expect(saved.budgetOverride?.required).toBeUndefined();
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * CHUNK 8 — control must read the allocation a transfer left behind
+ *
+ * A transfer changes what two lines are worth. If budget control kept reading
+ * the pre-transfer number, the destination would still be refused for spend it
+ * now has budget for, and the source would still clear spend it no longer can
+ * afford — which is the whole point of moving the money in the first place.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("budget control after a transfer", () => {
+  test("the destination can spend what it was given, and the source can no longer spend what it gave", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const expGroup = await Acc_Group.findOne({ companyId: company._id, nature: "expense" });
+    const repairsLedger = await Acc_Ledger.create({
+      companyId: company._id, name: "Repairs & Maintenance",
+      groupId: expGroup._id, groupName: expGroup.name, nature: "expense",
+    });
+
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [
+        { ledgerId: repairsLedger._id, ledgerName: repairsLedger.name, nature: "expense", department: "Admin", allocatedAmount: 100000 },
+        { ledgerId: expenseLedger._id, ledgerName: expenseLedger.name, nature: "expense", department: "Production", allocatedAmount: 50000 },
+      ],
+    });
+    const q = `?companyId=${company._id}`;
+
+    const spendCheck = (ledger, amount) =>
+      call("/budgets/check-availability", {
+        method: "POST",
+        body: {
+          companyId: String(company._id), voucherDate: "2026-08-10",
+          ledgerEntries: [{ ledgerId: String(ledger._id), type: "Dr", amount }],
+        },
+      });
+
+    // Before: Production cannot afford ₹90k; Admin can.
+    expect((await spendCheck(expenseLedger, 90000)).body.overallStatus).toBe("over_budget");
+    expect((await spendCheck(repairsLedger, 90000)).body.overallStatus).not.toBe("over_budget");
+
+    const created = await call(`/budgets/${budget._id}/transfers${q}`, {
+      method: "POST",
+      body: {
+        fromItemId: String(budget.items[0]._id),
+        toItemId: String(budget.items[1]._id),
+        amount: 60000,
+        reason: "Admin repairs underspent; Production maintenance is short.",
+      },
+    });
+    expect(created.status).toBe(201);
+    const approved = await call(
+      `/budgets/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`, { method: "POST" },
+    );
+    expect(approved.status).toBe(200);
+
+    // After: exactly reversed. That is what the transfer was for.
+    const prod = await spendCheck(expenseLedger, 90000);
+    expect(prod.body.overallStatus).not.toBe("over_budget");
+    expect(prod.body.results[0].allocated).toBe(110000);
+
+    const admin = await spendCheck(repairsLedger, 90000);
+    expect(admin.body.overallStatus).toBe("over_budget");
+    expect(admin.body.results[0].allocated).toBe(40000);
+    expect(admin.body.results[0].overBy).toBe(50000);
+  });
+
+  test("a voucher refused before a transfer posts cleanly after it", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    const expGroup = await Acc_Group.findOne({ companyId: company._id, nature: "expense" });
+    const repairsLedger = await Acc_Ledger.create({
+      companyId: company._id, name: "Repairs & Maintenance",
+      groupId: expGroup._id, groupName: expGroup.name, nature: "expense",
+    });
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [
+        { ledgerId: repairsLedger._id, ledgerName: repairsLedger.name, nature: "expense", department: "Admin", allocatedAmount: 100000 },
+        { ledgerId: expenseLedger._id, ledgerName: expenseLedger.name, nature: "expense", department: "Production", allocatedAmount: 50000 },
+      ],
+    });
+    const q = `?companyId=${company._id}`;
+
+    const post = () =>
+      call("/vouchers", {
+        method: "POST",
+        body: {
+          companyId: String(company._id), voucherType: "purchase",
+          voucherNumber: `TRC/${Date.now()}/${Math.round(Math.random() * 1e6)}`,
+          voucherDate: "2026-08-10", grandTotal: 90000, autoPost: true,
+          ledgerEntries: [
+            { ledgerId: String(expenseLedger._id), ledgerName: expenseLedger.name, type: "Dr", amount: 90000 },
+            { ledgerId: String(bankLedger._id), ledgerName: bankLedger.name, type: "Cr", amount: 90000 },
+          ],
+        },
+      });
+
+    const refused = await post();
+    expect(refused.status).toBe(409);
+
+    const created = await call(`/budgets/${budget._id}/transfers${q}`, {
+      method: "POST",
+      body: {
+        fromItemId: String(budget.items[0]._id), toItemId: String(budget.items[1]._id),
+        amount: 60000, reason: "Fund the maintenance run.",
+      },
+    });
+    await call(`/budgets/${budget._id}/transfers/${created.body.transfer._id}/approve${q}`, { method: "POST" });
+
+    // The legitimate path worked: no override reason was ever needed.
+    const allowed = await post();
+    expect(allowed.status).toBe(201);
+    expect(allowed.body.status).toBe("posted");
+    expect(allowed.body.budgetOverride?.required).toBeUndefined();
+  });
+});

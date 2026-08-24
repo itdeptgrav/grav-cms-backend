@@ -1835,6 +1835,393 @@ router.post("/:id/adjustments/:adjustmentId/cancel", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * TRANSFERS — moving approved amount between lines (Chunk 8)
+ *
+ * Not extra money. A supplementary raises what the company has committed; a
+ * transfer leaves the total exactly where it was and changes only who may
+ * spend it. Separate from adjustments because finance signs the two off on
+ * different grounds — "can we afford more?" versus "is Admin really not going
+ * to use this?" — and one list mixing them would hide that.
+ *
+ * THE INVARIANT: you cannot move money that has already been spent. `allocated`
+ * alone is not availability. A line with ₹1L allocated and ₹90k consumed has
+ * ₹10k to give; transferring against the allocation would leave the source
+ * instantly over budget through no act of its own, and the first thing anyone
+ * would notice is the dashboard turning red on a department that did nothing.
+ *
+ * Availability is therefore computed from EVALUATED actuals — the same posted
+ * vouchers every other figure in this module reads — and re-checked at approve
+ * time, because spend keeps arriving between the ask and the decision.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Same live-enough-to-change rule as adjustments. */
+const TRANSFERABLE_STATES = ADJUSTABLE_STATES;
+
+/**
+ * What one line can actually give away, right now.
+ *
+ * Returns the line's evaluated actual and `remaining` = allocated − actual,
+ * floored at zero: a line already over budget has nothing to give, and a
+ * negative "available" would let an overspent line fund another one.
+ *
+ * Revenue lines are included for completeness but a transfer between natures
+ * is refused below — moving a sales target into a freight budget is not a
+ * thing that means anything.
+ */
+async function availabilityFor(budget, req, items) {
+  const hydrated = await actuals.hydrateLines({
+    companyId: actualsCompanyFor(budget, req),
+    lines: items.map((i) => ({
+      _id: i._id,
+      ledgerId: i.ledgerId,
+      nature: i.nature,
+      allocatedAmount: i.allocatedAmount,
+    })),
+    from: budget.startDate,
+    to: budget.endDate,
+  });
+
+  return new Map(
+    hydrated.map((h) => {
+      const allocated = variance.money(h.allocatedAmount) ?? 0;
+      const actual = variance.money(h.actual) ?? 0;
+      return [
+        String(h._id),
+        { allocated, actual, remaining: Math.max(0, allocated - actual) },
+      ];
+    }),
+  );
+}
+
+/** Both sides of a transfer, resolved and validated. */
+async function resolveTransferSides(budget, req, { fromItemId, toItemId }) {
+  if (!isUsableId(fromItemId) || !isUsableId(toItemId)) {
+    return { error: { status: 404, message: "Budget line not found" } };
+  }
+  if (String(fromItemId) === String(toItemId)) {
+    return {
+      error: { status: 400, message: "A transfer needs two different lines." },
+    };
+  }
+
+  const from = budget.items.id(fromItemId);
+  const to = budget.items.id(toItemId);
+  if (!from || !to) {
+    return { error: { status: 404, message: "Budget line not found" } };
+  }
+
+  /* Expense and revenue are not the same currency of decision. Moving a sales
+   * target into a freight budget would make both numbers meaningless and the
+   * net figure silently wrong. */
+  const fromNature = from.nature === "revenue" ? "revenue" : "expense";
+  const toNature = to.nature === "revenue" ? "revenue" : "expense";
+  if (fromNature !== toNature) {
+    return {
+      error: {
+        status: 400,
+        message: `Cannot transfer between a ${fromNature} line and a ${toNature} one — they are different kinds of number.`,
+      },
+    };
+  }
+
+  const avail = await availabilityFor(budget, req, [from, to]);
+  return { from, to, avail };
+}
+
+const snapshotOf = (item, a) => ({
+  department: item.department || null,
+  ledgerId: item.ledgerId || undefined,
+  ledgerName: item.ledgerName || null,
+  groupName: item.groupName || null,
+  nature: item.nature || "expense",
+  allocatedAmount: a.allocated,
+  actual: a.actual,
+  remaining: a.remaining,
+});
+
+/** Budget + transfer for a review action. */
+async function budgetAndTransfer(req, { mutating = true } = {}) {
+  if (!isUsableId(req.params.id)) {
+    return { error: { status: 404, message: "Budget not found" } };
+  }
+  const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id));
+  if (!budget) return { error: { status: 404, message: "Budget not found" } };
+
+  if (mutating && !TRANSFERABLE_STATES.includes(budget.status)) {
+    return {
+      error: {
+        status: 409,
+        message: `This budget is ${budget.status}; its allocations can no longer be moved.`,
+      },
+    };
+  }
+
+  if (req.params.transferId !== undefined) {
+    if (!isUsableId(req.params.transferId)) {
+      return { error: { status: 404, message: "Transfer not found" } };
+    }
+    const transfer = budget.transfers.id(req.params.transferId);
+    if (!transfer) return { error: { status: 404, message: "Transfer not found" } };
+    return { budget, transfer };
+  }
+
+  return { budget };
+}
+
+/* ── LIST ──────────────────────────────────────────────────────────────── */
+router.get("/:id/transfers", async (req, res) => {
+  try {
+    const { budget, error } = await budgetAndTransfer(req, { mutating: false });
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    res.json({
+      success: true,
+      transfers: budget.transfers || [],
+      budgetStatus: budget.status,
+      transferable: TRANSFERABLE_STATES.includes(budget.status),
+    });
+  } catch (error) {
+    console.error("[budgets] list transfers error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── AVAILABILITY ──────────────────────────────────────────────────────────
+ * What each line could give away, so the form can show it before anyone
+ * types a number they cannot have. Read-only. */
+router.get("/:id/transfers/available", async (req, res) => {
+  try {
+    const { budget, error } = await budgetAndTransfer(req, { mutating: false });
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const avail = await availabilityFor(budget, req, budget.items || []);
+    res.json({
+      success: true,
+      lines: (budget.items || []).map((i) => {
+        const a = avail.get(String(i._id)) || { allocated: 0, actual: 0, remaining: 0 };
+        return {
+          _id: i._id,
+          ledgerId: i.ledgerId || null,
+          ledgerName: i.ledgerName || null,
+          groupName: i.groupName || null,
+          department: i.department || null,
+          nature: i.nature || "expense",
+          ...a,
+        };
+      }),
+    });
+  } catch (error) {
+    console.error("[budgets] transfer availability error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── SUBMIT ────────────────────────────────────────────────────────────────
+ * Asking moves nothing, exactly as with adjustments. Availability is checked
+ * here too, but only to refuse an obviously impossible ask early and to
+ * record what was true when the case was made — approve re-checks, because
+ * spend keeps arriving in between and that check is the authoritative one. */
+router.post("/:id/transfers", async (req, res) => {
+  try {
+    const { budget, error } = await budgetAndTransfer(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const body = req.body || {};
+    const sides = await resolveTransferSides(budget, req, body);
+    if (sides.error) {
+      return res.status(sides.error.status).json({ success: false, message: sides.error.message });
+    }
+    const { from, to, avail } = sides;
+
+    const amount = variance.money(body.amount);
+    if (amount === null || amount <= 0) {
+      return res.status(400).json({ success: false, message: "amount must be greater than 0" });
+    }
+
+    const fromAvail = avail.get(String(from._id));
+    if (amount > fromAvail.remaining) {
+      return res.status(400).json({
+        success: false,
+        message: `${from.ledgerName || "That line"} has only ₹${Math.round(fromAvail.remaining).toLocaleString("en-IN")} left to give — ₹${Math.round(fromAvail.actual).toLocaleString("en-IN")} of its ₹${Math.round(fromAvail.allocated).toLocaleString("en-IN")} is already spent.`,
+        available: fromAvail,
+      });
+    }
+
+    if (!String(body.reason || "").trim()) {
+      return res.status(400).json({ success: false, message: "reason is required" });
+    }
+
+    /* Built field by field. A body that could set state, appliedAt or
+     * reviewedBy would be a transfer that approves itself. */
+    budget.transfers.push({
+      fromItemId: from._id,
+      toItemId: to._id,
+      amount,
+      reason: body.reason,
+      state: "submitted",
+      fromSnapshot: snapshotOf(from, fromAvail),
+      toSnapshot: snapshotOf(to, avail.get(String(to._id))),
+      requestedAt: new Date(),
+      requestedBy: actorOf(req),
+    });
+
+    await budget.save();
+    res.status(201).json({
+      success: true,
+      transfer: budget.transfers[budget.transfers.length - 1],
+    });
+  } catch (error) {
+    console.error("[budgets] create transfer error:", error);
+    res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+/* ── APPROVE ───────────────────────────────────────────────────────────────
+ * The money moves here and nowhere else. Both sides change in one save, so a
+ * transfer can never half-happen and leave the budget's total wrong. */
+router.post("/:id/transfers/:transferId/approve", async (req, res) => {
+  try {
+    const { budget, transfer, error } = await budgetAndTransfer(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (transfer.appliedAt) {
+      return res.status(409).json({
+        success: false,
+        message: "This transfer has already been applied.",
+        transfer,
+      });
+    }
+    if (transfer.state === "rejected" || transfer.state === "cancelled") {
+      return res.status(409).json({
+        success: false,
+        message: `This transfer is ${transfer.state} and cannot be approved.`,
+      });
+    }
+
+    const from = budget.items.id(transfer.fromItemId);
+    const to = budget.items.id(transfer.toItemId);
+    if (!from || !to) {
+      return res.status(409).json({
+        success: false,
+        message: "A budget line this transfer refers to no longer exists.",
+      });
+    }
+
+    /* Re-checked against what is TRUE NOW, not against the snapshot. Spend
+     * arrives between the ask and the decision, and approving a week-old
+     * "₹1L unused" that has since been consumed is exactly how a source line
+     * ends up over budget without spending anything new. */
+    const avail = await availabilityFor(budget, req, [from, to]);
+    const fromAvail = avail.get(String(from._id));
+    const amount = variance.money(transfer.amount) ?? 0;
+
+    if (amount > fromAvail.remaining) {
+      return res.status(409).json({
+        success: false,
+        message: `${from.ledgerName || "The source line"} no longer has ₹${Math.round(amount).toLocaleString("en-IN")} to give — ₹${Math.round(fromAvail.remaining).toLocaleString("en-IN")} is left after ₹${Math.round(fromAvail.actual).toLocaleString("en-IN")} of spend.`,
+        available: fromAvail,
+      });
+    }
+
+    from.allocatedAmount = (variance.money(from.allocatedAmount) ?? 0) - amount;
+    to.allocatedAmount = (variance.money(to.allocatedAmount) ?? 0) + amount;
+
+    /* Belt and braces on rule 10. The availability check above already makes
+     * this impossible, but an allocation that went negative would poison
+     * every roll-up that touches it, so it is asserted rather than assumed. */
+    if (from.allocatedAmount < 0) {
+      return res.status(409).json({
+        success: false,
+        message: "That transfer would take the source line below zero.",
+      });
+    }
+
+    transfer.state = "approved";
+    transfer.appliedAt = new Date();
+    transfer.reviewedAt = new Date();
+    transfer.reviewedBy = actorOf(req);
+    if (req.body?.financeNote !== undefined) transfer.financeNote = req.body.financeNote;
+
+    recacheBudgetTotals(budget);
+    await budget.save();
+
+    res.json({
+      success: true,
+      transfer,
+      from,
+      to,
+      totals: {
+        totalAllocated: budget.totalAllocated,
+        totalRevenueAllocated: budget.totalRevenueAllocated,
+        totalExpenseAllocated: budget.totalExpenseAllocated,
+      },
+    });
+  } catch (error) {
+    console.error("[budgets] approve transfer error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── REJECT ────────────────────────────────────────────────────────────── */
+router.post("/:id/transfers/:transferId/reject", async (req, res) => {
+  try {
+    const { budget, transfer, error } = await budgetAndTransfer(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (transfer.appliedAt) {
+      return res.status(409).json({
+        success: false,
+        message: "This transfer has already been applied and cannot be rejected.",
+      });
+    }
+
+    transfer.state = "rejected";
+    transfer.reviewedAt = new Date();
+    transfer.reviewedBy = actorOf(req);
+    if (req.body?.financeNote !== undefined) transfer.financeNote = req.body.financeNote;
+
+    await budget.save();
+    res.json({ success: true, transfer });
+  } catch (error) {
+    console.error("[budgets] reject transfer error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── CANCEL ────────────────────────────────────────────────────────────────
+ * The requester withdrawing. Distinct from rejected, which is finance's
+ * answer — collapsing them would lose who decided. */
+router.post("/:id/transfers/:transferId/cancel", async (req, res) => {
+  try {
+    const { budget, transfer, error } = await budgetAndTransfer(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (transfer.appliedAt) {
+      return res.status(409).json({
+        success: false,
+        message: "This transfer has already been applied and cannot be cancelled.",
+      });
+    }
+    if (transfer.state !== "submitted") {
+      return res.status(409).json({
+        success: false,
+        message: `Only a submitted transfer can be withdrawn (this one is ${transfer.state}).`,
+      });
+    }
+
+    transfer.state = "cancelled";
+    transfer.reviewedAt = new Date();
+    transfer.reviewedBy = actorOf(req);
+
+    await budget.save();
+    res.json({ success: true, transfer });
+  } catch (error) {
+    console.error("[budgets] cancel transfer error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 /* ── DELETE ──────────────────────────────────────────────────────────────── */
 router.delete("/:id", async (req, res) => {
   try {

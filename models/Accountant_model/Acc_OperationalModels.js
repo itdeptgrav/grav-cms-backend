@@ -652,6 +652,84 @@ const budgetSchema = new mongoose.Schema(
       },
     ],
 
+    /* ── TRANSFERS (Chunk 8) ─────────────────────────────────────────────────
+     * Moving approved amount from one line to another inside the same budget.
+     *
+     * NOT extra money, which is what makes it different from an adjustment and
+     * why it is a separate array. A supplementary raises the company's total
+     * commitment; a transfer leaves it exactly where it was and changes only
+     * who may spend it. Finance signs those off on different grounds — one is
+     * "can we afford more?", the other "is Admin really not going to use
+     * this?" — and a single list mixing them would hide that difference.
+     *
+     * The invariant a transfer must never break: you cannot move money that
+     * has already been SPENT. `allocated` alone is not availability — a line
+     * with ₹1L allocated and ₹90k consumed has ₹10k to give, not ₹1L, and
+     * transferring against the allocation would leave the source instantly
+     * over budget through no act of its own. */
+    transfers: [
+      {
+        fromItemId: {
+          type: mongoose.Schema.Types.ObjectId,
+          required: true,
+          index: true,
+        },
+        toItemId: {
+          type: mongoose.Schema.Types.ObjectId,
+          required: true,
+          index: true,
+        },
+        amount: { type: Number, required: true },
+
+        reason: { type: String, trim: true },
+        state: {
+          type: String,
+          enum: ["submitted", "approved", "rejected", "cancelled"],
+          default: "submitted",
+          index: true,
+        },
+
+        /* Both sides as they stood when the transfer was raised, INCLUDING
+         * the evaluated actual and what that left available. Finance
+         * approving next week has to be able to see the case that was made —
+         * "Admin Repairs has ₹1L unused" is the entire argument, and a bare
+         * pair of ids would make it unreviewable. Snapshots, deliberately:
+         * they are evidence of what was claimed, not a live read. */
+        fromSnapshot: {
+          department: { type: String, trim: true },
+          ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+          ledgerName: { type: String, trim: true },
+          groupName: { type: String, trim: true },
+          nature: { type: String },
+          allocatedAmount: { type: Number },
+          actual: { type: Number },
+          remaining: { type: Number },
+        },
+        toSnapshot: {
+          department: { type: String, trim: true },
+          ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+          ledgerName: { type: String, trim: true },
+          groupName: { type: String, trim: true },
+          nature: { type: String },
+          allocatedAmount: { type: Number },
+          actual: { type: Number },
+          remaining: { type: Number },
+        },
+
+        /* Same idempotency key as adjustments, for the same reason: approving
+         * is the only operation here that moves money, and a retried request
+         * that moved ₹60k twice would leave both lines wrong with no ledger
+         * anywhere to reveal it. */
+        appliedAt: { type: Date },
+
+        requestedBy: { type: String, trim: true },
+        requestedAt: { type: Date },
+        reviewedBy: { type: String, trim: true },
+        reviewedAt: { type: Date },
+        financeNote: { type: String, trim: true },
+      },
+    ],
+
     alerts: [
       {
         message: String,
