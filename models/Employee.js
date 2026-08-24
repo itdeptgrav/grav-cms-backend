@@ -37,6 +37,10 @@ const employeeSchema = new mongoose.Schema({
 
   phone: { type: String },
   alternatePhone: { type: String },
+  // The number the company gives them, as opposed to `phone`, which is the
+  // personal one they log into the app with. Deliberately NOT surfaced in any
+  // company-wide list — the same rule that keeps numbers off Who's away.
+  workPhone: { type: String, trim: true },
   extension: { type: String }, // office extension number
 
   dateOfBirth: { type: Date },
@@ -153,6 +157,33 @@ const employeeSchema = new mongoose.Schema({
     enum: ["full_time", "part_time", "contract", "intern", ""],
     default: "",
   },
+
+  // ─── INTERNSHIP ────────────────────────────────────────────────────────────
+  //  An intern is an Employee with employmentType "intern", not a record in
+  //  some other collection. Attendance, leave, documents and the biometric ID
+  //  all key off this collection; a parallel one would mean a second copy of
+  //  every one of them.
+  //
+  //  What actually differs is money and access, and both are handled where
+  //  they belong: services/payroll pays a prorated stipend with no statutory
+  //  components (see Payroll_section.js), and the app login refuses them
+  //  outright (Employee_Routes/login.js).
+  //
+  //  stipendType is the arrangement, and there are three:
+  //    paid       the company pays them a monthly stipend
+  //    unpaid     no money changes hands
+  //    self_paid  the internship is funded by the intern or their institution
+  //  Only "paid" has an amount, and it lives in salary.stipend with every
+  //  other pay figure — encrypted, because it is compensation.
+  internship: {
+    stipendType: {
+      type: String,
+      enum: ["paid", "unpaid", "self_paid"],
+      default: undefined,
+    },
+    startDate: { type: Date },
+    endDate: { type: Date },
+  },
   workLocation: { type: String, default: "GRAV Clothing" },
   // Legacy free-text shift label. Kept as-is: it is written by the employee
   // importer, exported again, and shown on the profile screen. Repurposing it
@@ -188,6 +219,13 @@ const employeeSchema = new mongoose.Schema({
   salary: {
     // ── HR Input ──────────────────────────────────────────────────────────────
     gross: { type: mongoose.Schema.Types.Mixed, default: 0 },
+
+    // An intern's monthly stipend. Kept here, alongside gross, so it rides the
+    // encryption and the decryptEmployeeDoc() path that every existing reader
+    // already goes through rather than needing a second one. Mutually
+    // exclusive with gross in practice: the pre-save hook below computes the
+    // statutory breakdown for one and refuses to for the other.
+    stipend: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
     // ── Earnings (auto) ───────────────────────────────────────────────────────
     basic: { type: mongoose.Schema.Types.Mixed, default: 0 },
@@ -420,6 +458,43 @@ employeeSchema.pre("save", async function (next) {
       encryptSalaryFields,
     } = require("../utils/salaryEncryption");
 
+    // ── Interns take the short road ──────────────────────────────────────────
+    // A stipend has no components. Splitting it into basic and HRA, deducting
+    // provident fund from it and enrolling it in ESI would all be inventions —
+    // there is no such arrangement to describe. So an intern's salary object
+    // holds the stipend and nothing else, and every derived figure is written
+    // as zero rather than left at whatever a previous employment type put
+    // there. Somebody converted from employee to intern must not keep a
+    // basic and an EPF from their old contract.
+    if (this.employmentType === "intern") {
+      const prev = decryptSalaryFields(this.salary);
+      const stipend = Number(prev.stipend) || 0;
+      const encrypted = encryptSalaryFields({
+        stipend,
+        gross: 0,
+        basic: 0,
+        hra: 0,
+        specialAllowance: 0,
+        epf: 0,
+        edli: 0,
+        adminCharges: 0,
+        eeesic: 0,
+        erEsic: 0,
+        foodAllowance: 0,
+        employerCost: stipend,
+        totalDeduction: 0,
+        netSalary: stipend,
+        allowances: 0,
+        deductions: 0,
+      });
+      encrypted.epfOverride = false;
+      encrypted.edliOverride = false;
+      encrypted.adminOverride = false;
+      this.salary = encrypted;
+      this.updatedAt = Date.now();
+      return next();
+    }
+
     const cfg = await SalaryConfig.getSingleton();
 
     // ── 1. Decrypt first so all arithmetic works on plain numbers ────────────
@@ -480,6 +555,10 @@ employeeSchema.pre("save", async function (next) {
       netSalary,
       allowances: hra,
       deductions: totalDeduction,
+      // Zeroed, not omitted: encryptSalaryFields replaces this.salary
+      // wholesale, so an intern promoted to staff would otherwise keep a
+      // stipend sitting beside their new gross.
+      stipend: 0,
     };
 
     // ── 3. Encrypt all monetary fields before persisting ─────────────────────

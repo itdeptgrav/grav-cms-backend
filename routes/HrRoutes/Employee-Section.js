@@ -7,6 +7,9 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 const emailService = require("../../services/emailService");
 const { recordChange } = require("../../services/changeLog");
 const {
+  invalidateAppAccess,
+} = require("../../Middlewear/AllEmployeeAppMiddleware");
+const {
   encryptSalaryFields,
   decryptSalaryFields,
   decryptEmployeeDoc,
@@ -18,9 +21,31 @@ require("dotenv").config();
 // ─── SALARY CALCULATION HELPER ───────────────────────────────────────────────
 // Always operates on plain numbers. Caller must decrypt before passing in,
 // and encrypt the result before saving to MongoDB.
-function recalculateSalary(salary = {}, cfg = {}) {
+function recalculateSalary(salary = {}, cfg = {}, employmentType = "") {
   // Decrypt in case caller passed an encrypted object (belt-and-suspenders)
   const s = decryptSalaryFields(salary);
+
+  // ── Interns ──────────────────────────────────────────────────────────────
+  // A stipend has no basic, no HRA and no statutory deductions, so none are
+  // computed. This has to live here as well as in the model's pre-save hook
+  // because the update below goes through findByIdAndUpdate, which does not
+  // fire that hook — the two paths would otherwise disagree about what an
+  // intern's salary object contains, and HR editing an intern would quietly
+  // give them an EPF deduction.
+  if (employmentType === "intern") {
+    const stipend = Number(s.stipend) || 0;
+    return {
+      stipend,
+      gross: 0, basic: 0, hra: 0, specialAllowance: 0,
+      epf: 0, edli: 0, adminCharges: 0,
+      epfOverride: false, edliOverride: false, adminOverride: false,
+      eeesic: 0, erEsic: 0, foodAllowance: 0,
+      employerCost: stipend,
+      totalDeduction: 0,
+      netSalary: stipend,
+      allowances: 0, deductions: 0,
+    };
+  }
 
   const basicPct = (cfg.basicPct ?? 50) / 100;
   const hraPct = (cfg.hraPct ?? 50) / 100;
@@ -83,6 +108,10 @@ function recalculateSalary(salary = {}, cfg = {}) {
     netSalary,
     allowances: hra,
     deductions: totalDeduction,
+    // Zeroed rather than omitted — the caller replaces the whole salary
+    // object, so an intern promoted to staff would otherwise keep a stipend
+    // sitting beside their new gross.
+    stipend: 0,
   };
 }
 
@@ -376,7 +405,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // never logged.
     const beforeDoc = await Employee.findById(id)
       .select(
-        "firstName lastName department designation jobTitle status email phone salary primaryManager secondaryManager",
+        "firstName lastName department designation jobTitle status email phone salary employmentType primaryManager secondaryManager",
       )
       .lean();
     const beforeGross = beforeDoc?.salary
@@ -445,7 +474,16 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // then encrypt the result before it goes into MongoDB
     if (updateData.salary) {
       const cfg = await SalaryConfig.getSingleton();
-      const calculated = recalculateSalary(updateData.salary, cfg.toObject());
+      // The type being saved, or the one already on file when this edit does
+      // not touch it — a partial update must not turn an intern back into a
+      // salaried employee by omission.
+      const effectiveType =
+        updateData.employmentType ?? beforeDoc?.employmentType ?? "";
+      const calculated = recalculateSalary(
+        updateData.salary,
+        cfg.toObject(),
+        effectiveType,
+      );
       updateData.salary = encryptSalaryFields(calculated);
       // Boolean override flags are not encrypted
       updateData.salary.epfOverride = calculated.epfOverride;
@@ -462,6 +500,16 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+
+    // App access is cached for five minutes per employee. Moving somebody to
+    // or from intern changes whether they may use the app at all, so the
+    // stale answer is dropped here instead of being served for another five.
+    if (
+      updateData.employmentType !== undefined &&
+      updateData.employmentType !== beforeDoc?.employmentType
+    ) {
+      invalidateAppAccess(id);
+    }
 
     // Decrypt salary before sending to client
     const decryptedDoc = decryptEmployeeDoc(updated);
@@ -840,11 +888,16 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
           secondaryManager: doc.secondaryManager?.managerName || "",
         };
 
+        const beforeType = doc.employmentType;
         for (const [path, value] of Object.entries(paths)) doc.set(path, value);
         doc.set("updatedBy", user.id);
         doc.set("updatedByName", user.name || "");
         // pre-save hook recalculates + re-encrypts salary and stamps updatedAt
         await doc.save();
+        // Same reason as the single-employee update: a change of employment
+        // type changes whether the app will let them in, and the answer is
+        // cached for five minutes.
+        if (doc.employmentType !== beforeType) invalidateAppAccess(doc._id);
 
         const name = `${doc.firstName || ""} ${doc.lastName || ""}`.trim();
         recordChange(req, {

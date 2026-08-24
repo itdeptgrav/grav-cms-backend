@@ -39,7 +39,7 @@ const PREFIX = "enc:";
 
 // Salary fields that should be encrypted (Employee model only)
 const SALARY_NUM_FIELDS = [
-    "gross", "basic", "hra", "specialAllowance",
+    "gross", "stipend", "basic", "hra", "specialAllowance",
     "epf", "edli", "adminCharges",
     "eeesic", "erEsic", "foodAllowance",
     "employerCost", "totalDeduction", "netSalary",
