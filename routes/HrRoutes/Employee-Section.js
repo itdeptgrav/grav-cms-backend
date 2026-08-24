@@ -684,7 +684,15 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
 // ─── GET ALL employees (paginated, filterable) ─────────────────────────────────
 router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    const { page = 1, limit = 10, department, status, search, sort } = req.query;
+    const {
+      page = 1,
+      limit = 10,
+      department,
+      status,
+      search,
+      sort,
+      employmentType,
+    } = req.query;
 
     // Optional sort — the list defaults to newest-first; "dob"/"dob_desc"
     // order by date of birth (missing DOBs sink to the end via the fallback).
@@ -710,6 +718,16 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
       };
 
     if (status && status !== "all") filter.status = status;
+
+    // "interns" and "staff" rather than a bare employmentType match, because
+    // the useful question on this page is which side of that line somebody
+    // falls — and "staff" has to include the employees who predate the field
+    // and have it empty, which $ne does and an enum match would not.
+    if (employmentType === "interns") filter.employmentType = "intern";
+    else if (employmentType === "staff")
+      filter.employmentType = { $ne: "intern" };
+    else if (employmentType && employmentType !== "all")
+      filter.employmentType = employmentType;
     if (search) {
       filter.$or = [
         { firstName: { $regex: search, $options: "i" } },
