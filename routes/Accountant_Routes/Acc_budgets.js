@@ -107,10 +107,56 @@ function isUsableId(id) {
   return !!actuals.oid(id);
 }
 
-/** Recompute a budget's derived figures. Shared by the detail and list reads. */
-async function evaluate(budget, { asOf } = {}) {
+/**
+ * Which company's postings a budget's actuals must be summed from.
+ *
+ * ── THE LEAK THIS CLOSES ────────────────────────────────────────────────────
+ * `evaluate()` used to pass `budget.companyId` straight through. For a LEGACY
+ * row — one written before the field existed — that is `undefined`, and
+ * `movementByLedger` applies a company filter only `if (cid)`. So the
+ * aggregation ran unscoped and summed posted vouchers from EVERY company.
+ * Verified before the fix: company A opening a legacy budget read ₹7,77,777
+ * of company B's postings as its own actuals.
+ *
+ * Note this was a leak in the NUMBERS, not in record access — Chunk 1A's
+ * guard already governs who may open the row. A budget can be legitimately
+ * visible (the legacy compatibility rule) and still have no business showing
+ * another company's spend inside it.
+ *
+ * ── THE ORDER, AND WHY IT IS THIS WAY ROUND ─────────────────────────────────
+ * The budget's OWN company wins when it has one: those are the books the
+ * budget belongs to, and that is true regardless of who is looking. The
+ * request's selected company is the fallback, used only for a legacy row that
+ * names no company of its own.
+ *
+ * After Chunk 1A the two can never actually disagree on a by-id route —
+ * `scopeFilter` only matches a budget whose companyId equals the selected one
+ * or is absent — so this order is about stating the intent correctly rather
+ * than resolving a live conflict. The one case where `budget.companyId` is
+ * neither is when NO company is selected at all, and there its own company is
+ * plainly the right answer.
+ *
+ * Returns undefined only when neither has one, which preserves the existing
+ * unscoped behaviour rather than silently inventing a scope. See the summary's
+ * remaining risks: that path is reachable only when no company is selected,
+ * which is already how the LIST behaves, and narrowing it belongs with that
+ * decision rather than here.
+ */
+function actualsCompanyFor(budget, req) {
+  return budget?.companyId ?? companyOf(req) ?? undefined;
+}
+
+/**
+ * Recompute a budget's derived figures. Shared by the detail and list reads.
+ *
+ * `req` is required so the actuals can be scoped for a legacy row — see
+ * actualsCompanyFor above. It is deliberately a positional argument rather
+ * than an option: an evaluate() that can be called without it is an
+ * evaluate() that can silently go back to aggregating every company.
+ */
+async function evaluate(budget, req, { asOf } = {}) {
   const lines = await actuals.hydrateLines({
-    companyId: budget.companyId,
+    companyId: actualsCompanyFor(budget, req),
     lines: budget.items || [],
     from: budget.startDate,
     to: budget.endDate,
@@ -179,7 +225,7 @@ router.get("/", async (req, res) => {
       return res.json({ success: true, budgets });
     }
 
-    const hydrated = await Promise.all(budgets.map((b) => evaluate(b)));
+    const hydrated = await Promise.all(budgets.map((b) => evaluate(b, req)));
     res.json({ success: true, budgets: hydrated });
   } catch (error) {
     console.error("[budgets] list error:", error);
@@ -237,7 +283,7 @@ router.get("/:id", async (req, res) => {
     const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id)).lean();
     if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
     const asOf = req.query.asOf ? new Date(req.query.asOf) : undefined;
-    res.json({ success: true, budget: await evaluate(budget, { asOf }) });
+    res.json({ success: true, budget: await evaluate(budget, req, { asOf }) });
   } catch (error) {
     console.error("[budgets] detail error:", error);
     res.status(500).json({ success: false, message: error.message });

@@ -366,7 +366,17 @@ const budgetSchema = new mongoose.Schema(
     budgetId: {
       type: String,
       unique: true,
-      default: () => `BUD-${Date.now().toString(36).toUpperCase()}`,
+      /* Millisecond timestamp ALONE is not unique enough for a uniquely-indexed
+       * field: two budgets created in the same millisecond collided and the
+       * second one's insert threw. Now matches the random-suffix pattern
+       * `expenseId` and `transactionId` in this same file already use.
+       * (`.slice` rather than their deprecated `.substr` — identical output.)
+       *
+       * Existing rows keep whatever budgetId they were given; this is a
+       * default for new documents only, and nothing in the codebase parses or
+       * queries this value by format. */
+      default: () =>
+        `BUD-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
     },
     name: { type: String, required: true, trim: true },
     financialYear: { type: String, required: true },

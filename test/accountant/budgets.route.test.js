@@ -32,6 +32,7 @@ jest.mock("../../Middlewear/AccountantAuthMiddleware", () => ({
 
 const { Acc_Company, Acc_Group, Acc_Ledger } = require("../../models/Accountant_model/Acc_MasterModels");
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
+const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
 
 const OWNER = { id: new mongoose.Types.ObjectId().toString(), name: "Priya Owner", permissions: { canEdit: true } };
 
@@ -323,11 +324,11 @@ describe("company ownership on by-id routes", () => {
     // Written straight to the collection so it genuinely carries NO
     // companyId — the shape that predates the field.
     //
-    // `budgetId` is supplied explicitly because the schema's own default is
-    // `BUD-${Date.now().toString(36)}` with NO random component, so two rows
-    // created in the same millisecond collide on its unique index. That is a
-    // real latent bug in the model (see the summary's remaining risks), not
-    // something these tests should be exposed to.
+    // `budgetId` is still supplied explicitly so each legacy seed is
+    // identifiable in a failure message. The collision that originally forced
+    // this — the schema's old `BUD-${Date.now().toString(36)}` default had no
+    // random component, so same-millisecond inserts threw on the unique index
+    // — is fixed in Acc_OperationalModels.js as of Chunk 1B.
     const legacy = await Acc_Budget.create({
       budgetId: `BUD-LEGACY-${legacySeq++}`,
       name: "Legacy budget",
@@ -548,5 +549,203 @@ describe("company ownership on by-id routes", () => {
       })).status,
     ).toBe(404);
     expect((await call(`/not-an-id/close-collection${q}`, { method: "POST" })).status).toBe(404);
+  });
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Chunk 1B — ACTUALS ARE SCOPED TO A COMPANY
+ *
+ * Every test above this point creates budgets but no POSTED VOUCHERS, so all
+ * actuals were zero and a cross-company leak in the aggregation was invisible
+ * to the whole suite. These tests post real vouchers in two companies, which
+ * is the only way the bug shows up.
+ *
+ * The bug: evaluate() passed `budget.companyId` straight into hydrateLines.
+ * For a legacy row that is undefined, and movementByLedger only filters
+ * `if (cid)` — so the aggregation ran unscoped across every company's books.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("actuals are scoped to a company", () => {
+  let seq = 0;
+
+  /** A posted voucher hitting `ledger` for `amount`, owned by `companyId`. */
+  async function postVoucher({ companyId, ledger, amount, type = "Dr" }) {
+    return Acc_Voucher.create({
+      companyId,
+      voucherType: "purchase",
+      voucherNumber: `PU/${seq++}/${Date.now()}`,
+      voucherDate: new Date("2026-06-15"),
+      status: "posted",
+      grandTotal: amount,
+      ledgerEntries: [
+        { ledgerId: ledger._id, ledgerName: ledger.name, type, amount },
+      ],
+    });
+  }
+
+  /**
+   * Two companies that share a ledger HEAD id.
+   *
+   * Sharing the head is what makes the test meaningful: the aggregation
+   * matches on ledgerId, so if it fails to filter by company it will happily
+   * sum B's voucher into A's budget. With separate heads the leak would be
+   * hidden by the ledger filter rather than by the fix.
+   */
+  async function seedTwoCompaniesWithPostings() {
+    const a = await seedCompany();
+    const b = await seedCompany();
+
+    // A spends 100000 on its own expense head.
+    await postVoucher({ companyId: a.company._id, ledger: a.expenseLedger, amount: 100000 });
+    // B spends 777777 on the SAME head id. Must never reach A's budget.
+    await postVoucher({ companyId: b.company._id, ledger: a.expenseLedger, amount: 777777 });
+
+    return { a, b };
+  }
+
+  /** A budget for `companyId` (or none at all, for the legacy case). */
+  async function makeBudget({ companyId, expenseLedger, name }) {
+    return Acc_Budget.create({
+      budgetId: `BUD-1B-${seq++}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      financialYear: "2026-27",
+      period: "yearly",
+      status: "draft",
+      startDate: new Date("2026-04-01"),
+      endDate: new Date("2027-03-31"),
+      createdBy: OWNER.id,
+      ...(companyId ? { companyId } : {}),
+      items: [
+        {
+          ledgerId: expenseLedger._id,
+          ledgerName: expenseLedger.name,
+          nature: "expense",
+          department: "Logistics",
+          allocatedAmount: 1000000,
+        },
+      ],
+    });
+  }
+
+  test("sanity: both companies really did post against the same ledger head", async () => {
+    const { a, b } = await seedTwoCompaniesWithPostings();
+    const all = await Acc_Voucher.find({ "ledgerEntries.ledgerId": a.expenseLedger._id }).lean();
+    expect(all).toHaveLength(2);
+    expect(all.map((v) => String(v.companyId)).sort()).toEqual(
+      [String(a.company._id), String(b.company._id)].sort(),
+    );
+  });
+
+  /* ── A normal, company-owned budget ────────────────────────────────────── */
+
+  test("a company-owned budget counts ONLY its own company's postings", async () => {
+    const { a } = await seedTwoCompaniesWithPostings();
+    const budget = await makeBudget({
+      companyId: a.company._id,
+      expenseLedger: a.expenseLedger,
+      name: "A's budget",
+    });
+
+    const { status, body } = await call(`/${budget._id}?companyId=${a.company._id}`);
+    expect(status).toBe(200);
+    // 100000 (A's own), NOT 877777 (both) and NOT 777777 (B's).
+    expect(body.budget.items[0].actual).toBe(100000);
+    expect(body.budget.totals.expense.actual).toBe(100000);
+  });
+
+  /* ── The legacy row: the actual bug ────────────────────────────────────── */
+
+  test("a LEGACY budget is scoped to the REQUEST company, not to every company", async () => {
+    const { a } = await seedTwoCompaniesWithPostings();
+    const legacy = await makeBudget({
+      companyId: null,
+      expenseLedger: a.expenseLedger,
+      name: "Legacy budget",
+    });
+
+    const { status, body } = await call(`/${legacy._id}?companyId=${a.company._id}`);
+    expect(status).toBe(200);
+    // Before the fix this read 877777 — A's 100000 plus B's 777777.
+    expect(body.budget.items[0].actual).toBe(100000);
+    expect(body.budget.totals.expense.actual).toBe(100000);
+  });
+
+  test("the SAME legacy row read as company B shows B's postings, not A's", async () => {
+    const { a, b } = await seedTwoCompaniesWithPostings();
+    const legacy = await makeBudget({
+      companyId: null,
+      expenseLedger: a.expenseLedger,
+      name: "Legacy budget",
+    });
+
+    const { status, body } = await call(`/${legacy._id}?companyId=${b.company._id}`);
+    expect(status).toBe(200);
+    // The row is shared by the compatibility rule, but the FIGURES follow
+    // whoever is asking — which is the whole product decision here.
+    expect(body.budget.items[0].actual).toBe(777777);
+  });
+
+  test("reading a legacy budget does not write a companyId onto it", async () => {
+    const { a } = await seedTwoCompaniesWithPostings();
+    const legacy = await makeBudget({
+      companyId: null,
+      expenseLedger: a.expenseLedger,
+      name: "Legacy budget",
+    });
+
+    await call(`/${legacy._id}?companyId=${a.company._id}`);
+
+    const stored = await Acc_Budget.findById(legacy._id).lean();
+    expect(stored.companyId == null).toBe(true);
+  });
+
+  /* ── The list, which hydrates too ──────────────────────────────────────── */
+
+  test("list totals are company-scoped for both normal and legacy rows", async () => {
+    const { a } = await seedTwoCompaniesWithPostings();
+    await makeBudget({ companyId: a.company._id, expenseLedger: a.expenseLedger, name: "A's budget" });
+    await makeBudget({ companyId: null, expenseLedger: a.expenseLedger, name: "Legacy budget" });
+
+    const { status, body } = await call(`/?companyId=${a.company._id}&withTotals=true`);
+    expect(status).toBe(200);
+    expect(body.budgets).toHaveLength(2);
+    // Neither row may carry B's 777777 — the list hydrates through the same
+    // evaluate(), so it had the identical leak.
+    for (const b of body.budgets) {
+      expect(b.totals.expense.actual).toBe(100000);
+    }
+  });
+
+  /* ── Arithmetic is untouched ───────────────────────────────────────────── */
+
+  test("nature-aware variance still holds once actuals are real, not zero", async () => {
+    const a = await seedCompany();
+    // Revenue EARNED is a credit; expense SPENT is a debit.
+    await postVoucher({ companyId: a.company._id, ledger: a.revenueLedger, amount: 250000, type: "Cr" });
+    await postVoucher({ companyId: a.company._id, ledger: a.expenseLedger, amount: 300000, type: "Dr" });
+
+    const budget = await Acc_Budget.create({
+      budgetId: `BUD-1B-VAR-${seq++}`,
+      name: "Mixed", financialYear: "2026-27", period: "yearly", status: "draft",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: a.company._id, createdBy: OWNER.id,
+      items: [
+        { ledgerId: a.revenueLedger._id, ledgerName: a.revenueLedger.name, nature: "revenue", allocatedAmount: 1000000 },
+        { ledgerId: a.expenseLedger._id, ledgerName: a.expenseLedger.name, nature: "expense", allocatedAmount: 1000000 },
+      ],
+    });
+
+    const { body } = await call(`/${budget._id}?companyId=${a.company._id}&asOf=2027-03-31`);
+    const revenue = body.budget.items.find((i) => i.nature === "revenue");
+    const expense = body.budget.items.find((i) => i.nature === "expense");
+
+    expect(revenue.actual).toBe(250000);
+    expect(expense.actual).toBe(300000);
+    // Revenue 750k SHORT of target is adverse; expense 700k UNDER is
+    // favourable. Same numbers, opposite verdicts — unchanged by this chunk.
+    expect(revenue.variance).toBe(-750000);
+    expect(revenue.favourable).toBe(false);
+    expect(expense.variance).toBe(700000);
+    expect(expense.favourable).toBe(true);
   });
 });
