@@ -41,6 +41,21 @@ const allowedOrigins = [
   "https://wnpt3pw1-3002.inc1.devtunnels.ms" , 
   "https://grav-cowork-space-main-hazel.vercel.app",
   /**
+   * The employee app's web build.
+   *
+   * `App/` is one Expo codebase shipping to Android, iOS AND the browser. The
+   * two native builds never appear here — a native app sends no Origin header
+   * and is waved through by the `!origin` branch below — but the web build is
+   * an ordinary cross-origin page and is not. Without its origin in this list
+   * every /api/employee call fails with an opaque "Not allowed by CORS" and
+   * the app looks broken with nothing in the logs pointing here.
+   *
+   * localhost:8081 above already covers `npx expo start --web`. Deploy previews
+   * and LAN addresses belong in EXTRA_ALLOWED_ORIGINS, not in this literal —
+   * see the note below it.
+   */
+  "https://app.grav.in",
+  /**
    * Extra origins from the environment, comma-separated.
    *
    * Where a LAN address belongs — NOT in this literal. A dev machine's IP
@@ -1518,6 +1533,16 @@ app.use("/api/employee/regularizations", empRegularize);
 // not by guessing an _id. The HR half mounts at /api/hr/documents.
 const empDocuments = require("./routes/Employee_Routes/documents");
 app.use("/api/employee/documents", empDocuments);
+
+// Who is away, by day — the workforce-wide planning calendar for the app.
+// Past days come from DailyAttendance, future days from approved leave, so it
+// answers "who is out next Tuesday" and not only "who was out".
+//
+// It reports a person as absent or on leave and NEVER which leave type: "SL"
+// would publish a colleague's sick days to the whole company. Same scoping
+// rule as the standings board above.
+const empAbsenceCalendar = require("./routes/Employee_Routes/absenceCalendar");
+app.use("/api/employee/absence-calendar", empAbsenceCalendar);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACCOUNTANT DEPARTMENT ROUTES — ALL 20 ENDPOINTS (17 legacy + 3 sub-account)
