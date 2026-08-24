@@ -2772,6 +2772,37 @@ router.put("/:id", auth, async (req, res) => {
       }
     }
 
+    /* ── BUDGET CONTROL ON THE EDIT (Chunk 6A) ──────────────────────────────
+     * Chunk 6 gated every point at which a voucher BECOMES posted, which left
+     * one way round it: post ₹10,000 within budget, then edit the posted
+     * voucher up to ₹10,00,000. The ledger moves either way, so the same
+     * question has to be asked here.
+     *
+     * Checked BEFORE the old balances are reversed, so a refusal leaves the
+     * ledger exactly as it was — reversing first and refusing after would
+     * unpost a voucher nobody asked to unpost.
+     *
+     * `proposedVoucher` checks what the edit will BECOME while excluding this
+     * voucher's own current movement from the actuals; without that exclusion
+     * an edit reads as its old amount plus its new one.
+     *
+     * Only when it is already posted, and only when the edit can actually
+     * move a budget — a narration change on a posted voucher does not deserve
+     * two aggregations to confirm nothing happened. */
+    if (wasPosted && budgetControl.affectsBudget(body)) {
+      const clearance = await budgetControl.clearanceFor({
+        voucher: budgetControl.proposedVoucher(existing, body),
+        overrideReason: body.budgetOverrideReason,
+        department: body.department,
+        user: req.user,
+      });
+      if (clearance.blocked) return res.status(409).json(clearance.payload);
+      if (clearance.override) body.budgetOverride = clearance.override;
+    }
+    /* Not a schema field — mongoose would drop it silently, but leaving it on
+       the body invites someone to think it persists. */
+    delete body.budgetOverrideReason;
+
     // For a posted voucher, reverse the OLD balances before mutating entries.
     if (wasPosted) {
       await applyLedgerBalances(existing, -1);

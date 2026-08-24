@@ -22,6 +22,17 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
+/* ── BUDGET CONTROL (Chunk 6A) ────────────────────────────────────────────
+ * Three of the executors below turn an approval into POSTED spend — create,
+ * post, and update. They bypass the voucher routes entirely, so the gates
+ * added in Chunk 6 never see them: an editor submits, an admin approves here,
+ * and the money moves without a budget ever being consulted. Same gate, three
+ * more places.
+ *
+ * These run inside transactions with no `res` to write to, so they use
+ * `assertClearance`, which throws a typed error the approve endpoint maps
+ * back to a 409 carrying the full check. */
+const budgetControl = require("../../services/budgetControl.service");
 const router = express.Router();
 
 const {
@@ -42,6 +53,9 @@ const {
   requireRole,
   requirePermission,
 } = require("../../Middlewear/AccountantOrgAuthMiddleware");
+const {
+  defaultDueDateOnVoucherBody,
+} = require("../../services/voucherDueDateDefault.service");
 
 router.use(orgAuth);
 
@@ -128,7 +142,7 @@ async function applyLedgerBalances(voucher, direction, session) {
 // ─────────────────────────────────────────────────────────────────────────
 // The executor — turns an approved Acc_ApprovalRequest into a real change
 // ─────────────────────────────────────────────────────────────────────────
-async function applyApprovedAction(reqDoc, approver) {
+async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason } = {}) {
   const { kind, action, payload, target } = reqDoc;
 
   // VOUCHER  ── post an existing draft
@@ -148,6 +162,16 @@ async function applyApprovedAction(reqDoc, approver) {
       }
       if (!voucher.isBalanced)
         throw new Error("Voucher Dr/Cr totals do not balance");
+
+      /* Approving IS posting. The approver answers for the overspend, being
+       * the one with the authority the submitter lacked. */
+      const override = await budgetControl.assertClearance({
+        voucher,
+        overrideReason: budgetOverrideReason,
+        user: approver,
+      });
+      if (override) voucher.budgetOverride = override;
+
       voucher.status = "posted";
       voucher.updatedBy = approver.id;
       await voucher.save({ session });
@@ -179,7 +203,24 @@ async function applyApprovedAction(reqDoc, approver) {
           body.numberingPrefix,
         );
       }
+      // C0-C — this branch builds a brand-new Acc_Voucher straight from the
+      // stored request payload, bypassing the normal create route (and its
+      // own defaulting) entirely. Without this call, any voucher approved
+      // through this path would never get a due date, no matter how the
+      // party's credit terms are set. Session-scoped so the read joins the
+      // same transaction as the rest of this materialization.
+      await defaultDueDateOnVoucherBody(body, { session });
       const voucher = new Acc_Voucher(body);
+
+      /* This branch materialises a POSTED voucher straight from the stored
+       * payload, bypassing the create route and its gate. */
+      const override = await budgetControl.assertClearance({
+        voucher,
+        overrideReason: budgetOverrideReason,
+        user: approver,
+      });
+      if (override) voucher.budgetOverride = override;
+
       await voucher.save({ session });
       await applyLedgerBalances(voucher, +1, session);
       await session.commitTransaction();
@@ -254,6 +295,19 @@ async function applyApprovedAction(reqDoc, approver) {
       }
       const wasPosted = voucher.status === "posted";
 
+      /* Checked BEFORE the reversal, so a refusal leaves the ledger exactly as
+       * it was rather than unposting a voucher nobody asked to unpost. The
+       * proposed shape excludes this voucher's own current movement, or the
+       * edit would read as its old amount plus its new one. */
+      let editOverride = null;
+      if (wasPosted && budgetControl.affectsBudget(payload)) {
+        editOverride = await budgetControl.assertClearance({
+          voucher: budgetControl.proposedVoucher(voucher, payload),
+          overrideReason: budgetOverrideReason,
+          user: approver,
+        });
+      }
+
       // Reverse the old balances first (mirror of the direct edit path).
       if (wasPosted) {
         await applyLedgerBalances(voucher, -1, session);
@@ -262,6 +316,7 @@ async function applyApprovedAction(reqDoc, approver) {
       // Apply the proposed changes. These were canonicalised when the edit was
       // submitted; re-strip the protected fields defensively.
       const body = { ...payload };
+      delete body.budgetOverrideReason;
       delete body._id;
       delete body.companyId;
       delete body.voucherType;
@@ -272,6 +327,7 @@ async function applyApprovedAction(reqDoc, approver) {
       body.updatedBy = approver.id;
 
       Object.assign(voucher, body);
+      if (editOverride) voucher.budgetOverride = editOverride;
       await voucher.save({ session });
 
       // Re-apply balances if it remains posted.
@@ -718,8 +774,16 @@ router.post(
       // Execute
       let result;
       try {
-        result = await applyApprovedAction(item, req.user);
+        result = await applyApprovedAction(item, req.user, {
+          budgetOverrideReason: req.body?.budgetOverrideReason,
+        });
       } catch (e) {
+        /* A budget refusal is a question for the approver, not a failure.
+           Flattening it into "Execution failed: <string>" would tell them
+           they are over budget with no idea by how much or on which head. */
+        if (e && e.code === "BUDGET_OVERRIDE_REQUIRED") {
+          return res.status(409).json({ success: false, ...e.payload });
+        }
         console.error("[approvals] execution failed:", e);
         return res
           .status(400)

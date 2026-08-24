@@ -15,6 +15,23 @@
 const express = require("express");
 const mongoose = require("mongoose");
 
+/* The approvals router authenticates through a DIFFERENT middleware — it is
+ * org-scoped rather than company-scoped. Mocked the same way so the executor
+ * gates can be exercised over real HTTP rather than by calling the executor
+ * directly, which would prove the function works and not that the route
+ * reaches it. */
+jest.mock("../../Middlewear/AccountantOrgAuthMiddleware", () => ({
+  orgAuth: (req, res, next) => {
+    const raw = req.headers["x-test-user"];
+    if (!raw) return res.status(401).json({ error: "Authentication required." });
+    req.user = JSON.parse(raw);
+    next();
+  },
+  requireRole: () => (req, res, next) => next(),
+  requirePermission: (perm) => (req, res, next) =>
+    req.user?.permissions?.[perm] ? next() : res.status(403).json({ error: `Missing ${perm}` }),
+}));
+
 jest.mock("../../Middlewear/AccountantAuthMiddleware", () => ({
   accountantAuth: (req, res, next) => {
     const raw = req.headers["x-test-user"];
@@ -67,6 +84,7 @@ beforeAll(async () => {
   app.use("/api/accountant/budgets", require("../../routes/Accountant_Routes/Acc_budgets"));
   app.use("/api/accountant/vouchers", require("../../routes/Accountant_Routes/Acc_vouchers"));
   app.use("/api/accountant/expenses", require("../../routes/Accountant_Routes/Acc_expenses"));
+  app.use("/api/accountant/approvals", require("../../routes/Accountant_Routes/Acc_approvals"));
   await new Promise((resolve) => {
     server = app.listen(0, resolve);
   });
@@ -828,5 +846,380 @@ describe("the control and the budget screens agree", () => {
     expect(drill.body.totals.actual).toBe(150000);
     expect(drill.body.vouchers).toHaveLength(1);
     expect(String(drill.body.vouchers[0].voucherId)).toBe(String(created.body._id));
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * CHUNK 6A — EDITS
+ *
+ * Chunk 6 gated every point at which a voucher BECOMES posted, which left one
+ * way round the whole control: post ₹10,000 within budget, then edit the
+ * posted voucher up to ₹10,00,000. The ledger moves either way.
+ *
+ * The trap unique to editing is self-counting: the voucher being edited is
+ * ALREADY in the actuals, so a naive re-check reads it as its old amount plus
+ * its new one and refuses edits that are perfectly fine. Several of these
+ * tests exist only to pin that.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("gate 6 — editing a POSTED voucher", () => {
+  /** A posted voucher for `amount`, created through the real gate. */
+  async function posted({ company, expenseLedger, bankLedger, amount, reason }) {
+    const { status, body } = await call("/vouchers", {
+      method: "POST",
+      body: voucherBody({
+        companyId: company._id, expenseLedger, bankLedger, amount,
+        extra: { autoPost: true, ...(reason ? { budgetOverrideReason: reason } : {}) },
+      }),
+    });
+    expect(status).toBe(201);
+    expect(body.status).toBe("posted");
+    return body;
+  }
+
+  const editTo = (v, { expenseLedger, bankLedger, amount, extra = {} }) => ({
+    method: "PUT",
+    body: {
+      voucherDate: v.voucherDate,
+      grandTotal: amount,
+      ledgerEntries: [
+        { ledgerId: String(expenseLedger._id), ledgerName: expenseLedger.name, type: "Dr", amount },
+        { ledgerId: String(bankLedger._id), ledgerName: bankLedger.name, type: "Cr", amount },
+      ],
+      ...extra,
+    },
+  });
+
+  test("THE HOLE: editing a posted voucher upward past the allocation is now refused", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    // Posted well within budget — no override, nothing to answer for.
+    const v = await posted({ company, expenseLedger, bankLedger, amount: 10000 });
+    expect(v.budgetOverride?.required).toBeUndefined();
+
+    // Now edit it to ten times the allocation. Before this chunk this saved.
+    const { status, body } = await call(
+      `/vouchers/${v._id}`,
+      editTo(v, { expenseLedger, bankLedger, amount: 1000000 }),
+    );
+
+    expect(status).toBe(409);
+    expect(body.code).toBe("BUDGET_OVERRIDE_REQUIRED");
+    expect(body.budgetCheck.overallStatus).toBe("over_budget");
+
+    // Refused BEFORE the reversal — the ledger is untouched and the voucher
+    // still holds its original amount.
+    const still = await Acc_Voucher.findById(v._id).lean();
+    expect(still.status).toBe("posted");
+    expect(still.grandTotal).toBe(10000);
+    expect(still.ledgerEntries.find((e) => e.type === "Dr").amount).toBe(10000);
+  });
+
+  test("the voucher's OWN posted amount is excluded, so an in-budget edit is not self-blocked", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    // 60k posted. Editing to 90k is fine — but only if the check does NOT
+    // count the existing 60k as history and add the new 90k on top, which
+    // would read 150k and refuse.
+    const v = await posted({ company, expenseLedger, bankLedger, amount: 60000 });
+    const { status } = await call(
+      `/vouchers/${v._id}`,
+      editTo(v, { expenseLedger, bankLedger, amount: 90000 }),
+    );
+    expect(status).toBe(200);
+
+    const saved = await Acc_Voucher.findById(v._id).lean();
+    expect(saved.grandTotal).toBe(90000);
+    expect(saved.budgetOverride?.required).toBeUndefined();
+
+    // And the drilldown agrees: 90k total, not 150k.
+    const check = await call("/budgets/check-availability", {
+      method: "POST", body: checkBody({ company, ledger: expenseLedger, amount: 0 }),
+    });
+    expect(check.body.results[0].actual).toBe(90000);
+  });
+
+  test("editing DOWNWARD out of an overspend is allowed without a reason", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    const v = await posted({ company, expenseLedger, bankLedger, amount: 150000, reason: "Signed off." });
+
+    // Fixing a mistake must not need a second signature.
+    const { status } = await call(
+      `/vouchers/${v._id}`,
+      editTo(v, { expenseLedger, bankLedger, amount: 40000 }),
+    );
+    expect(status).toBe(200);
+  });
+
+  test("an over-budget edit WITH a reason saves and re-stamps the override with the new figures", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    const v = await posted({ company, expenseLedger, bankLedger, amount: 10000 });
+
+    const { status } = await call(
+      `/vouchers/${v._id}`,
+      editTo(v, {
+        expenseLedger, bankLedger, amount: 250000,
+        extra: { budgetOverrideReason: "Scope grew — revised PO attached." },
+      }),
+    );
+    expect(status).toBe(200);
+
+    const saved = await Acc_Voucher.findById(v._id).lean();
+    expect(saved.grandTotal).toBe(250000);
+    expect(saved.budgetOverride.required).toBe(true);
+    expect(saved.budgetOverride.reason).toMatch(/Scope grew/);
+    // The snapshot is of THIS edit, not the original posting.
+    expect(saved.budgetOverride.results[0].thisVoucher).toBe(250000);
+    expect(saved.budgetOverride.results[0].actual).toBe(0);
+    expect(saved.budgetOverride.results[0].remainingAfter).toBe(-150000);
+  });
+
+  test("moving a posted voucher's DATE out of the budget period is re-checked", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    // The budget only covers FY26-27.
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 500000 });
+    const v = await posted({ company, expenseLedger, bankLedger, amount: 50000 });
+
+    // Same amount, different year — now no live budget covers it at all.
+    const { status, body } = await call(`/vouchers/${v._id}`, {
+      method: "PUT",
+      body: { voucherDate: "2029-08-10" },
+    });
+    expect(status).toBe(409);
+    expect(body.budgetCheck.overallStatus).toBe("missing_budget");
+  });
+
+  test("editing a DRAFT is never blocked", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    const created = await call("/vouchers", {
+      method: "POST",
+      body: voucherBody({ companyId: company._id, expenseLedger, bankLedger, amount: 10000 }),
+    });
+    expect(created.body.status).toBe("draft");
+
+    const { status } = await call(
+      `/vouchers/${created.body._id}`,
+      editTo(created.body, { expenseLedger, bankLedger, amount: 9000000 }),
+    );
+    expect(status).toBe(200);
+    // Still a draft, so still not money — the /post gate catches it later.
+    const saved = await Acc_Voucher.findById(created.body._id).lean();
+    expect(saved.status).toBe("draft");
+
+    const refused = await call(`/vouchers/${created.body._id}/post`, { method: "POST" });
+    expect(refused.status).toBe(409);
+  });
+
+  test("an edit that cannot move a budget skips the check entirely", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    // Deliberately ALREADY over budget: if this edit ran a check it would be
+    // refused. It must not run one — a narration is not spend.
+    const v = await posted({ company, expenseLedger, bankLedger, amount: 150000, reason: "Signed off." });
+
+    const { status } = await call(`/vouchers/${v._id}`, {
+      method: "PUT",
+      body: { narration: "Corrected the description only." },
+    });
+    expect(status).toBe(200);
+
+    const saved = await Acc_Voucher.findById(v._id).lean();
+    expect(saved.narration).toBe("Corrected the description only.");
+    expect(saved.grandTotal).toBe(150000);
+    // The ORIGINAL override survives — the edit did not re-open the question.
+    expect(saved.budgetOverride.reason).toBe("Signed off.");
+  });
+
+  test("a revenue voucher can be edited upward freely — a target is not a cap", async () => {
+    const { company, revenueLedger, bankLedger } = await seedCompany();
+    await liveBudget({
+      companyId: company._id, ledger: revenueLedger, allocated: 1000000,
+      nature: "revenue", department: "Sales",
+    });
+
+    const created = await call("/vouchers", {
+      method: "POST",
+      body: {
+        companyId: String(company._id), voucherType: "sales",
+        voucherNumber: `SL/E${seq++}/${Date.now()}`,
+        voucherDate: "2026-08-10", grandTotal: 100000, autoPost: true,
+        ledgerEntries: [
+          { ledgerId: String(bankLedger._id), ledgerName: bankLedger.name, type: "Dr", amount: 100000 },
+          { ledgerId: String(revenueLedger._id), ledgerName: revenueLedger.name, type: "Cr", amount: 100000 },
+        ],
+      },
+    });
+    expect(created.status).toBe(201);
+
+    const { status } = await call(`/vouchers/${created.body._id}`, {
+      method: "PUT",
+      body: {
+        grandTotal: 9000000,
+        ledgerEntries: [
+          { ledgerId: String(bankLedger._id), ledgerName: bankLedger.name, type: "Dr", amount: 9000000 },
+          { ledgerId: String(revenueLedger._id), ledgerName: revenueLedger.name, type: "Cr", amount: 9000000 },
+        ],
+      },
+    });
+    expect(status).toBe(200);
+  });
+
+  test("another company's budget cannot be spent by editing into its head", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    // B has a huge allocation on the SAME head id; A has a small one.
+    await liveBudget({ companyId: a.company._id, ledger: a.expenseLedger, allocated: 50000 });
+    await liveBudget({ companyId: b.company._id, ledger: a.expenseLedger, allocated: 9999999 });
+
+    const v = await posted({
+      company: a.company, expenseLedger: a.expenseLedger, bankLedger: a.bankLedger, amount: 10000,
+    });
+    const { status, body } = await call(
+      `/vouchers/${v._id}`,
+      editTo(v, { expenseLedger: a.expenseLedger, bankLedger: a.bankLedger, amount: 500000 }),
+    );
+    expect(status).toBe(409);
+    expect(body.budgetCheck.results[0].allocated).toBe(50000);
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * The approvals engine posts money too — three more executors that Chunk 6
+ * never saw, because they bypass the voucher routes entirely.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("gates 7–9 — the approvals executor", () => {
+  const { Acc_ApprovalRequest } = require("../../models/Accountant_model/Acc_OrgModels");
+  const ORG = new mongoose.Types.ObjectId().toString();
+
+  const orgUser = (u) => ({ ...u, organizationId: ORG });
+  const APPROVER = orgUser({ ...OWNER, role: "approver" });
+
+  function request({ company, action, target, payload }) {
+    return Acc_ApprovalRequest.create({
+      organizationId: ORG,
+      companyId: company._id,
+      kind: "voucher",
+      action,
+      title: `${action} test`,
+      ...(target ? { target: { collection: "Acc_Voucher", id: target } } : {}),
+      ...(payload ? { payload } : {}),
+      requestedBy: new mongoose.Types.ObjectId().toString(),
+      requestedByName: "Sam Editor",
+      status: "pending",
+    });
+  }
+
+  const approve = (id, body) =>
+    call(`/approvals/${id}/approve`, { method: "POST", body, user: APPROVER });
+
+  test("gate 7 — approving a POST of an over-budget draft is refused, then allowed with a reason", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 50000 });
+
+    const draft = await call("/vouchers", {
+      method: "POST",
+      body: voucherBody({ companyId: company._id, expenseLedger, bankLedger, amount: 200000 }),
+    });
+    const ar = await request({ company, action: "post", target: draft.body._id });
+
+    const refused = await approve(ar._id);
+    expect(refused.status).toBe(409);
+    expect(refused.body.code).toBe("BUDGET_OVERRIDE_REQUIRED");
+    await expect(
+      Acc_Voucher.findById(draft.body._id).then((d) => d.status),
+    ).resolves.toBe("draft");
+
+    const ok = await approve(ar._id, { budgetOverrideReason: "Approved at board level." });
+    expect(ok.status).toBe(200);
+    const saved = await Acc_Voucher.findById(draft.body._id).lean();
+    expect(saved.status).toBe("posted");
+    expect(saved.budgetOverride.reason).toMatch(/board level/);
+  });
+
+  test("gate 8 — approving a CREATE that materialises a posted voucher is gated", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 50000 });
+
+    const ar = await request({
+      company,
+      action: "create",
+      payload: voucherBody({ companyId: company._id, expenseLedger, bankLedger, amount: 300000 }),
+    });
+
+    const refused = await approve(ar._id);
+    expect(refused.status).toBe(409);
+    await expect(Acc_Voucher.countDocuments({ companyId: company._id })).resolves.toBe(0);
+
+    const ok = await approve(ar._id, { budgetOverrideReason: "Emergency repair, quoted twice." });
+    expect(ok.status).toBe(200);
+    const saved = await Acc_Voucher.findOne({ companyId: company._id }).lean();
+    expect(saved.status).toBe("posted");
+    expect(saved.budgetOverride.reason).toMatch(/Emergency repair/);
+  });
+
+  test("gate 9 — approving an UPDATE that pushes a posted voucher over budget is gated", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+
+    const v = await call("/vouchers", {
+      method: "POST",
+      body: voucherBody({ companyId: company._id, expenseLedger, bankLedger, amount: 20000, extra: { autoPost: true } }),
+    });
+    expect(v.body.status).toBe("posted");
+
+    const ar = await request({
+      company, action: "update", target: v.body._id,
+      payload: {
+        grandTotal: 900000,
+        ledgerEntries: [
+          { ledgerId: String(expenseLedger._id), ledgerName: expenseLedger.name, type: "Dr", amount: 900000 },
+          { ledgerId: String(bankLedger._id), ledgerName: bankLedger.name, type: "Cr", amount: 900000 },
+        ],
+      },
+    });
+
+    const refused = await approve(ar._id);
+    expect(refused.status).toBe(409);
+    // Untouched: not unposted, not re-valued.
+    const still = await Acc_Voucher.findById(v.body._id).lean();
+    expect(still.status).toBe("posted");
+    expect(still.grandTotal).toBe(20000);
+
+    const ok = await approve(ar._id, { budgetOverrideReason: "Variation order signed." });
+    expect(ok.status).toBe(200);
+    const saved = await Acc_Voucher.findById(v.body._id).lean();
+    expect(saved.grandTotal).toBe(900000);
+    expect(saved.budgetOverride.reason).toMatch(/Variation order/);
+  });
+
+  test("an approved update that stays within budget needs no reason", async () => {
+    const { company, expenseLedger, bankLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 500000 });
+
+    const v = await call("/vouchers", {
+      method: "POST",
+      body: voucherBody({ companyId: company._id, expenseLedger, bankLedger, amount: 20000, extra: { autoPost: true } }),
+    });
+    const ar = await request({
+      company, action: "update", target: v.body._id,
+      payload: {
+        grandTotal: 60000,
+        ledgerEntries: [
+          { ledgerId: String(expenseLedger._id), ledgerName: expenseLedger.name, type: "Dr", amount: 60000 },
+          { ledgerId: String(bankLedger._id), ledgerName: bankLedger.name, type: "Cr", amount: 60000 },
+        ],
+      },
+    });
+
+    const ok = await approve(ar._id);
+    expect(ok.status).toBe(200);
+    const saved = await Acc_Voucher.findById(v.body._id).lean();
+    expect(saved.grandTotal).toBe(60000);
+    expect(saved.budgetOverride?.required).toBeUndefined();
   });
 });

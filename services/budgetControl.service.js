@@ -440,6 +440,76 @@ async function clearanceFor({ voucher, overrideReason, department = null, user =
   }
 }
 
+/**
+ * Thrown by `assertClearance` when spend needs an override and none was given.
+ *
+ * Carries the SAME payload the HTTP gates return, because the callers that
+ * need this are executors with no `res` to write to — the approvals engine
+ * applies an approved edit deep inside a transaction. Without a typed error
+ * its caller would flatten the whole budget check into
+ * "Execution failed: <string>" and the approver would be told they are over
+ * budget with no idea by how much or on which head.
+ */
+class BudgetOverrideRequiredError extends Error {
+  constructor(payload) {
+    super(payload.error);
+    this.name = "BudgetOverrideRequiredError";
+    this.code = "BUDGET_OVERRIDE_REQUIRED";
+    this.payload = payload;
+  }
+}
+
+/**
+ * The shape to run a check against for a voucher that is being EDITED.
+ *
+ * An edit is checked on what it will BECOME, not what it is: the incoming
+ * body's entries and date where it supplies them, the stored ones where it
+ * does not. `status` is forced to the stored status so `clearanceFor` decides
+ * the self-exclusion correctly — a posted voucher's own movement is already
+ * in the actuals, and counting it again would report an edit as roughly
+ * double its real impact.
+ */
+function proposedVoucher(existing, body = {}) {
+  return {
+    _id: existing._id,
+    companyId: existing.companyId,
+    status: existing.status,
+    voucherDate: body.voucherDate || existing.voucherDate,
+    ledgerEntries: Array.isArray(body.ledgerEntries)
+      ? body.ledgerEntries
+      : existing.ledgerEntries,
+    department: body.department || existing.department || null,
+  };
+}
+
+/**
+ * Can this edit change what the budget sees?
+ *
+ * Only two things move a budget: WHICH heads are charged and for how much, and
+ * WHEN — the date decides which budget period applies. An edit that touches
+ * neither cannot change the answer, so re-checking a narration change would
+ * be two aggregations to confirm nothing happened.
+ *
+ * Deliberately conservative: an absent `ledgerEntries` means "not editing the
+ * entries", and anything else present is assumed to matter only if it is one
+ * of these two.
+ */
+function affectsBudget(body = {}) {
+  return Array.isArray(body.ledgerEntries) || body.voucherDate !== undefined;
+}
+
+/**
+ * `clearanceFor`, for callers that cannot return an HTTP response.
+ *
+ * Throws BudgetOverrideRequiredError instead of returning `{ blocked: true }`.
+ * Returns the override metadata to stamp, or null.
+ */
+async function assertClearance(args) {
+  const clearance = await clearanceFor(args);
+  if (clearance.blocked) throw new BudgetOverrideRequiredError(clearance.payload);
+  return clearance.override;
+}
+
 module.exports = {
   CONTROLLING_STATUSES,
   WARN_AT_PCT,
@@ -448,4 +518,8 @@ module.exports = {
   proposedByLedger,
   checkBudgetAvailability,
   clearanceFor,
+  assertClearance,
+  proposedVoucher,
+  affectsBudget,
+  BudgetOverrideRequiredError,
 };
