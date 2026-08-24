@@ -613,6 +613,128 @@ router.get("/:id", async (req, res) => {
   }
 });
 
+/** Just enough of the line for the drilldown to caption itself. */
+function lineSummary(item, meta) {
+  return {
+    _id: item._id,
+    ledgerId: item.ledgerId || null,
+    ledgerName: (meta && meta.ledgerName) || item.ledgerName || null,
+    groupName: (meta && meta.groupName) || item.groupName || null,
+    /* An unbound legacy line has no ledgerName; `category` is the only thing
+     * naming it, and the variance tables already fall back to it. Without it
+     * here the drilldown captions itself "Unnamed line" for a row the table
+     * behind it calls "Marketing & Advertising". */
+    category: item.category || null,
+    nature: (meta && meta.nature) || item.nature || "expense",
+    department: item.department || null,
+    allocatedAmount: item.allocatedAmount || 0,
+  };
+}
+
+/* ── LINE DRILLDOWN ──────────────────────────────────────────────────────────
+ * Which posted vouchers make up one line's actual.
+ *
+ * A budget that reports ₹8,20,000 spent and cannot say where it went is a
+ * number people either trust blindly or ignore; neither is what a budget is
+ * for. This is the "show your working" read.
+ *
+ * Every scoping decision here is deliberately the SAME one evaluate() makes —
+ * actualsCompanyFor for the company (so a legacy row falls back to the
+ * caller's books rather than aggregating everyone's), the budget's own
+ * start/end as the default window, natureByLedger for the sign. Anything that
+ * drifted would produce a list that does not add up to the figure above it.
+ * There is a test asserting the two agree.
+ */
+router.get("/:id/items/:itemId/vouchers", async (req, res) => {
+  try {
+    if (!isUsableId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Budget not found" });
+    }
+    const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id)).lean();
+    if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
+
+    const item = (budget.items || []).find((i) => String(i._id) === String(req.params.itemId));
+    if (!item) {
+      return res.status(404).json({ success: false, message: "Budget line not found" });
+    }
+
+    /* The window defaults to the budget's own period — the same bounds the
+     * line's actual was computed over. `from`/`to` narrow it; they cannot
+     * widen it past the budget, because spend outside the period was never
+     * part of this number. */
+    const budgetFrom = budget.startDate;
+    const budgetTo = budget.endDate;
+    const parseBound = (raw, fallback) => {
+      if (!raw) return fallback;
+      const d = new Date(raw);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+    const from = parseBound(req.query.from, budgetFrom);
+    const to = parseBound(req.query.to, budgetTo);
+    if (from === null || to === null) {
+      return res.status(400).json({ success: false, message: "from and to must be valid dates" });
+    }
+    const clampedFrom = budgetFrom && from < budgetFrom ? budgetFrom : from;
+    const clampedTo = budgetTo && to > budgetTo ? budgetTo : to;
+
+    /* An unbound legacy line has no head to match on. It reads zero in the
+     * variance tables for exactly this reason, and saying so plainly beats
+     * an empty list that looks like "nothing was spent". */
+    if (!item.ledgerId) {
+      return res.json({
+        success: true,
+        unbound: true,
+        line: lineSummary(item, null),
+        vouchers: [],
+        totals: { debit: 0, credit: 0, signed: 0, actual: 0, voucherCount: 0 },
+        window: { from: clampedFrom, to: clampedTo },
+        page: 1,
+        limit: 0,
+        pageCount: 0,
+      });
+    }
+
+    /* The ledger tree is the authority on nature, not the snapshot on the row
+     * — see natureByLedger. A head re-parented from expenses to revenue must
+     * flip the sign here exactly as it does in the actuals. */
+    const natures = await actuals.natureByLedger([item.ledgerId]);
+    const meta = natures.get(String(item.ledgerId)) || {};
+    const nature = meta.nature || item.nature || "expense";
+
+    const { rows, totals, page, limit, pageCount } = await actuals.voucherMovementsForLedger({
+      companyId: actualsCompanyFor(budget, req),
+      ledgerId: item.ledgerId,
+      from: clampedFrom,
+      to: clampedTo,
+      page: req.query.page,
+      limit: req.query.limit,
+    });
+
+    /* actualFrom is the one place the nature rule lives. Applying it per row
+     * and again to the window totals means a row's contribution and the total
+     * cannot use different sign conventions. */
+    const vouchers = rows.map((r) => ({
+      ...r,
+      actualContribution: actuals.actualFrom(r, nature),
+    }));
+
+    res.json({
+      success: true,
+      unbound: false,
+      line: lineSummary(item, { ...meta, nature }),
+      vouchers,
+      totals: { ...totals, actual: actuals.actualFrom(totals, nature) },
+      window: { from: clampedFrom, to: clampedTo },
+      page,
+      limit,
+      pageCount,
+    });
+  } catch (error) {
+    console.error("[budgets] line vouchers error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 /* ── CREATE ──────────────────────────────────────────────────────────────── */
 router.post("/", async (req, res) => {
   try {

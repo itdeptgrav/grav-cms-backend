@@ -2180,3 +2180,335 @@ describe("dashboard", () => {
     expect(status).toBe(401);
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * CHUNK 5 — VOUCHER DRILLDOWN
+ *
+ * The property that matters is not "the endpoint returns vouchers" — it is
+ * that the vouchers it returns ADD UP to the number the budget already showed.
+ * A drilldown that disagrees with the figure above it is worse than none: it
+ * teaches people the budget is wrong. Most of what follows is that one
+ * assertion, approached from the angles where the two reads could drift apart.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("budget line voucher drilldown", () => {
+  let seq = 0;
+
+  async function postVoucher({
+    companyId, ledger, amount, type = "Dr",
+    date = "2026-06-15", status = "posted", isOptional = false,
+    party = "Northline Facilities Management", narration = "Export freight",
+  }) {
+    return Acc_Voucher.create({
+      companyId,
+      voucherType: type === "Cr" ? "sales" : "purchase",
+      voucherNumber: `DD/${seq++}/${Date.now()}`,
+      voucherDate: new Date(date),
+      status,
+      isOptional,
+      partyLedgerName: party,
+      narration,
+      grandTotal: amount,
+      ledgerEntries: [{ ledgerId: ledger._id, ledgerName: ledger.name, type, amount }],
+    });
+  }
+
+  async function makeBudget({ companyId, ledger, allocated = 500000, nature = "expense" }) {
+    return Acc_Budget.create({
+      name: "FY26-27",
+      financialYear: "2026-27",
+      period: "yearly",
+      status: "active",
+      startDate: new Date("2026-04-01"),
+      endDate: new Date("2027-03-31"),
+      ...(companyId ? { companyId } : {}),
+      items: [
+        ...(ledger
+          ? [{ ledgerId: ledger._id, nature, department: "Logistics", allocatedAmount: allocated }]
+          : [{ nature, category: "marketing", department: "Marketing", allocatedAmount: allocated }]),
+      ],
+    });
+  }
+
+  const drill = (budget, itemId, companyId, extra = "") =>
+    call(`/${budget._id}/items/${itemId}/vouchers?companyId=${companyId}${extra}`);
+
+  /* ── the one property ─────────────────────────────────────────────────── */
+
+  test("the drilldown total matches the budget line's evaluated actual", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 120000 });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 90000, date: "2026-08-02" });
+
+    const detail = await call(`/${budget._id}?companyId=${company._id}&asOf=2027-03-31`);
+    const line = detail.body.budget.items[0];
+
+    const { status, body } = await drill(budget, line._id, company._id);
+    expect(status).toBe(200);
+    expect(body.totals.actual).toBe(line.actual);
+    expect(body.totals.actual).toBe(210000);
+    expect(body.totals.voucherCount).toBe(2);
+    expect(body.vouchers).toHaveLength(2);
+    // And the rows themselves add up to the total they sit under.
+    expect(body.vouchers.reduce((s, v) => s + v.actualContribution, 0)).toBe(body.totals.actual);
+  });
+
+  test("a voucher touching the same head twice is ONE row and ONE count", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+    // A split allocation across the same head — movementByLedger counts the
+    // voucher once via $addToSet, so the drilldown must too.
+    await Acc_Voucher.create({
+      companyId: company._id,
+      voucherType: "purchase",
+      voucherNumber: `DD/SPLIT/${Date.now()}`,
+      voucherDate: new Date("2026-06-15"),
+      status: "posted",
+      grandTotal: 50000,
+      ledgerEntries: [
+        { ledgerId: expenseLedger._id, ledgerName: expenseLedger.name, type: "Dr", amount: 30000 },
+        { ledgerId: expenseLedger._id, ledgerName: expenseLedger.name, type: "Dr", amount: 20000 },
+      ],
+    });
+
+    const detail = await call(`/${budget._id}?companyId=${company._id}&asOf=2027-03-31`);
+    const line = detail.body.budget.items[0];
+    const { body } = await drill(budget, line._id, company._id);
+
+    expect(body.vouchers).toHaveLength(1);
+    expect(body.vouchers[0].debit).toBe(50000);
+    expect(body.totals.voucherCount).toBe(line.voucherCount);
+    expect(body.totals.actual).toBe(line.actual);
+  });
+
+  /* ── what must not be counted ─────────────────────────────────────────── */
+
+  test("another company's voucher on the same head id is excluded", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    const budget = await makeBudget({ companyId: a.company._id, ledger: a.expenseLedger });
+
+    await postVoucher({ companyId: a.company._id, ledger: a.expenseLedger, amount: 100000 });
+    // B posts to the SAME head id. Sharing the head is what makes this
+    // meaningful — with separate heads the ledger filter would hide the leak.
+    await postVoucher({ companyId: b.company._id, ledger: a.expenseLedger, amount: 777777 });
+
+    const { body } = await drill(budget, budget.items[0]._id, a.company._id);
+    expect(body.totals.actual).toBe(100000);
+    expect(body.vouchers).toHaveLength(1);
+  });
+
+  test("a legacy budget with no companyId scopes to the requesting company", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    const budget = await makeBudget({ companyId: null, ledger: a.expenseLedger });
+
+    await postVoucher({ companyId: a.company._id, ledger: a.expenseLedger, amount: 100000 });
+    await postVoucher({ companyId: b.company._id, ledger: a.expenseLedger, amount: 777777 });
+
+    const { body } = await drill(budget, budget.items[0]._id, a.company._id);
+    expect(body.totals.actual).toBe(100000);
+    expect(body.totals.actual).not.toBe(877777);
+
+    // And it agrees with what the detail read reports for the same budget.
+    const detail = await call(`/${budget._id}?companyId=${a.company._id}&asOf=2027-03-31`);
+    expect(body.totals.actual).toBe(detail.body.budget.items[0].actual);
+  });
+
+  test("optional, draft and pending vouchers are all excluded", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 100000 });
+    // Tally's planning entry — not posted to the ledger. Counting it would let
+    // the budget report its own forecast as achievement.
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 500000, isOptional: true });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 400000, status: "draft" });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 300000, status: "pending_approval" });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 200000, status: "cancelled" });
+
+    const { body } = await drill(budget, budget.items[0]._id, company._id);
+    expect(body.totals.actual).toBe(100000);
+    expect(body.vouchers).toHaveLength(1);
+    expect(body.vouchers[0].status).toBe("posted");
+  });
+
+  test("spend outside the budget's own period is excluded", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 100000, date: "2026-06-15" });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 999999, date: "2025-06-15" });
+
+    const { body } = await drill(budget, budget.items[0]._id, company._id);
+    expect(body.totals.actual).toBe(100000);
+  });
+
+  /* ── sign ─────────────────────────────────────────────────────────────── */
+
+  test("revenue contribution is credit-positive, not debit-positive", async () => {
+    const { company, revenueLedger } = await seedCompany();
+    const budget = await makeBudget({
+      companyId: company._id, ledger: revenueLedger, nature: "revenue", allocated: 4000000,
+    });
+    await postVoucher({ companyId: company._id, ledger: revenueLedger, amount: 250000, type: "Cr" });
+
+    const { body } = await drill(budget, budget.items[0]._id, company._id);
+    const v = body.vouchers[0];
+    expect(v.credit).toBe(250000);
+    expect(v.debit).toBe(0);
+    expect(v.signed).toBe(-250000);       // raw Dr-Cr
+    expect(v.actualContribution).toBe(250000); // nature-corrected
+    expect(body.totals.actual).toBe(250000);
+    expect(body.line.nature).toBe("revenue");
+  });
+
+  test("a credit against an expense head reduces the actual", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 100000 });
+    // A purchase return against the same head.
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 30000, type: "Cr", date: "2026-07-01" });
+
+    const detail = await call(`/${budget._id}?companyId=${company._id}&asOf=2027-03-31`);
+    const { body } = await drill(budget, budget.items[0]._id, company._id);
+
+    expect(body.totals.actual).toBe(70000);
+    expect(body.totals.actual).toBe(detail.body.budget.items[0].actual);
+    expect(body.vouchers.find((v) => v.credit > 0).actualContribution).toBe(-30000);
+  });
+
+  /* ── unbound ──────────────────────────────────────────────────────────── */
+
+  test("an unbound legacy line says so rather than returning a bare empty list", async () => {
+    const { company } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: null });
+
+    const { status, body } = await drill(budget, budget.items[0]._id, company._id);
+    expect(status).toBe(200);
+    expect(body.unbound).toBe(true);
+    expect(body.vouchers).toEqual([]);
+    expect(body.totals.actual).toBe(0);
+    expect(body.line.ledgerId).toBeNull();
+    expect(body.line.allocatedAmount).toBe(500000);
+  });
+
+  /* ── shape ────────────────────────────────────────────────────────────── */
+
+  test("rows carry the fields a drilldown table needs, from the real model", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+    await postVoucher({
+      companyId: company._id, ledger: expenseLedger, amount: 25804.8,
+      party: "Mayfair Hotels & Resorts Private Limited (Bhubaneswar)",
+      narration: "Supply of uniforms — housekeeping and F&B, as per PO 44192",
+    });
+
+    const { body } = await drill(budget, budget.items[0]._id, company._id);
+    const v = body.vouchers[0];
+    for (const f of [
+      "voucherId", "voucherNumber", "voucherType", "voucherDate",
+      "partyLedgerName", "narration", "debit", "credit", "signed",
+      "actualContribution", "status",
+    ]) {
+      expect(v).toHaveProperty(f);
+    }
+    expect(v.voucherType).toBe("purchase");
+    expect(v.partyLedgerName).toMatch(/Mayfair/);
+    expect(v.debit).toBe(25804.8);
+    expect(body.line.ledgerName).toBe("Freight & Forwarding");
+    expect(body.line.groupName).toBe("Indirect Expenses");
+  });
+
+  /* ── pagination ───────────────────────────────────────────────────────── */
+
+  test("pagination pages the rows but never the totals", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+    for (let i = 0; i < 7; i++) {
+      await postVoucher({
+        companyId: company._id, ledger: expenseLedger, amount: 10000,
+        date: `2026-06-${String(i + 1).padStart(2, "0")}`,
+      });
+    }
+
+    const p1 = await drill(budget, budget.items[0]._id, company._id, "&page=1&limit=3");
+    expect(p1.body.vouchers).toHaveLength(3);
+    expect(p1.body.pageCount).toBe(3);
+    // The total is the WHOLE window — a page-local total answers no question.
+    expect(p1.body.totals.actual).toBe(70000);
+    expect(p1.body.totals.voucherCount).toBe(7);
+
+    const p3 = await drill(budget, budget.items[0]._id, company._id, "&page=3&limit=3");
+    expect(p3.body.vouchers).toHaveLength(1);
+    expect(p3.body.totals.actual).toBe(70000);
+
+    const beyond = await drill(budget, budget.items[0]._id, company._id, "&page=9&limit=3");
+    expect(beyond.body.vouchers).toEqual([]);
+    expect(beyond.body.totals.actual).toBe(70000);
+
+    // Pages do not overlap and cover everything.
+    const p2 = await drill(budget, budget.items[0]._id, company._id, "&page=2&limit=3");
+    const ids = [...p1.body.vouchers, ...p2.body.vouchers, ...p3.body.vouchers].map((v) => String(v.voucherId));
+    expect(new Set(ids).size).toBe(7);
+  });
+
+  /* ── guards ───────────────────────────────────────────────────────────── */
+
+  test("another company cannot drill into this budget", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    const budget = await makeBudget({ companyId: a.company._id, ledger: a.expenseLedger });
+
+    const { status } = await drill(budget, budget.items[0]._id, b.company._id);
+    expect(status).toBe(404);
+  });
+
+  test("an unknown or malformed budget or item id is a clean 404", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+
+    const badItem = await drill(budget, new mongoose.Types.ObjectId().toString(), company._id);
+    expect(badItem.status).toBe(404);
+    expect(badItem.body.message).toMatch(/line not found/i);
+
+    const junkItem = await drill(budget, "not-an-id", company._id);
+    expect(junkItem.status).toBe(404);
+
+    const badBudget = await call(
+      `/${new mongoose.Types.ObjectId()}/items/${budget.items[0]._id}/vouchers?companyId=${company._id}`,
+    );
+    expect(badBudget.status).toBe(404);
+
+    const junkBudget = await call(`/not-an-id/items/x/vouchers?companyId=${company._id}`);
+    expect(junkBudget.status).toBe(404);
+  });
+
+  test("a narrowing from/to is honoured; a widening one cannot escape the budget period", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 100000, date: "2026-06-15" });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 50000, date: "2026-11-20" });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 999999, date: "2025-01-01" });
+
+    const narrow = await drill(budget, budget.items[0]._id, company._id, "&from=2026-10-01&to=2027-03-31");
+    expect(narrow.body.totals.actual).toBe(50000);
+
+    // Asking for 2020 onwards must not pull in spend the budget never covered.
+    const wide = await drill(budget, budget.items[0]._id, company._id, "&from=2020-01-01&to=2030-01-01");
+    expect(wide.body.totals.actual).toBe(150000);
+
+    const bad = await drill(budget, budget.items[0]._id, company._id, "&from=not-a-date");
+    expect(bad.status).toBe(400);
+  });
+
+  test("the drilldown requires authentication", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, ledger: expenseLedger });
+    const { status } = await call(
+      `/${budget._id}/items/${budget.items[0]._id}/vouchers?companyId=${company._id}`,
+      { user: null },
+    );
+    expect(status).toBe(401);
+  });
+});

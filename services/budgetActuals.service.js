@@ -139,6 +139,142 @@ async function movementByLedger({ companyId, ledgerIds = [], from, to }) {
   );
 }
 
+/**
+ * The SAME movement, voucher by voucher, so an actual can be explained.
+ *
+ * ── WHY THIS SITS BESIDE movementByLedger RATHER THAN INSIDE THE ROUTE ──────
+ * Every filter here has to be byte-for-byte the one above — same `posted`,
+ * same `isOptional` exclusion, same company clause, same date bounds, same
+ * Dr/Cr arithmetic. If the two ever diverge, the drilldown shows a list of
+ * vouchers that does not add up to the number it is explaining, and a user
+ * who has been told the actual is ₹8,20,000 counts ₹7,90,000 on screen and
+ * stops trusting the budget. Keeping them adjacent is the cheapest way to
+ * keep them honest; the route test asserts the two agree.
+ *
+ * One row per VOUCHER, not per ledger entry: a voucher may touch the same
+ * head twice (a split allocation), and movementByLedger counts it once via
+ * $addToSet. Rows are grouped the same way so voucherCount matches too.
+ *
+ * `page` is 1-based. The totals returned are for the WHOLE window, not the
+ * page — a page-local total under a paginated list is a number that answers
+ * no question anyone asked.
+ */
+async function voucherMovementsForLedger({
+  companyId,
+  ledgerId,
+  from,
+  to,
+  page = 1,
+  limit = 50,
+}) {
+  const id = oid(ledgerId);
+  if (!id) return { rows: [], totals: { debit: 0, credit: 0, signed: 0, voucherCount: 0 }, page: 1, limit, pageCount: 0 };
+
+  const match = {
+    status: "posted",
+    isOptional: { $ne: true },
+    "ledgerEntries.ledgerId": id,
+  };
+  const cid = oid(companyId);
+  if (cid) match.companyId = cid;
+
+  const fromT = from ? new Date(from) : null;
+  const toT = to ? new Date(to) : null;
+  if (fromT && !Number.isNaN(fromT.getTime())) match.voucherDate = { $gte: fromT };
+  if (toT && !Number.isNaN(toT.getTime())) {
+    match.voucherDate = { ...(match.voucherDate || {}), $lte: toT };
+  }
+
+  /* Everything up to and including the per-voucher $group is shared, so the
+   * page of rows and the window totals cannot be computed from different
+   * sets of vouchers. */
+  const base = [
+    { $match: match },
+    { $unwind: "$ledgerEntries" },
+    { $match: { "ledgerEntries.ledgerId": id } },
+    {
+      $group: {
+        _id: "$_id",
+        voucherNumber: { $first: "$voucherNumber" },
+        referenceNumber: { $first: "$referenceNumber" },
+        voucherType: { $first: "$voucherType" },
+        voucherTypeName: { $first: "$voucherTypeName" },
+        voucherDate: { $first: "$voucherDate" },
+        partyLedgerId: { $first: "$partyLedgerId" },
+        partyLedgerName: { $first: "$partyLedgerName" },
+        narration: { $first: "$narration" },
+        status: { $first: "$status" },
+        debit: {
+          $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", 0] },
+        },
+        credit: {
+          $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Cr"] }, "$ledgerEntries.amount", 0] },
+        },
+        /* The entry's own narration is usually the more specific one — the
+         * voucher-level note describes the whole document. Prefer it when it
+         * is there, fall back to the header. */
+        entryNarration: { $first: "$ledgerEntries.narration" },
+      },
+    },
+  ];
+
+  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const safePage = Math.max(Number(page) || 1, 1);
+
+  const [out] = await Acc_Voucher.aggregate([
+    ...base,
+    {
+      $facet: {
+        rows: [
+          { $sort: { voucherDate: 1, voucherNumber: 1 } },
+          { $skip: (safePage - 1) * safeLimit },
+          { $limit: safeLimit },
+        ],
+        totals: [
+          {
+            $group: {
+              _id: null,
+              debit: { $sum: "$debit" },
+              credit: { $sum: "$credit" },
+              voucherCount: { $sum: 1 },
+            },
+          },
+        ],
+      },
+    },
+  ]);
+
+  const t = (out && out.totals && out.totals[0]) || { debit: 0, credit: 0, voucherCount: 0 };
+  const rows = (out && out.rows) || [];
+
+  return {
+    rows: rows.map((r) => ({
+      voucherId: r._id,
+      voucherNumber: r.voucherNumber || null,
+      referenceNumber: r.referenceNumber || null,
+      voucherType: r.voucherType || null,
+      voucherTypeName: r.voucherTypeName || null,
+      voucherDate: r.voucherDate || null,
+      partyLedgerId: r.partyLedgerId || null,
+      partyLedgerName: r.partyLedgerName || null,
+      narration: r.entryNarration || r.narration || null,
+      status: r.status,
+      debit: r.debit || 0,
+      credit: r.credit || 0,
+      signed: (r.debit || 0) - (r.credit || 0),
+    })),
+    totals: {
+      debit: t.debit || 0,
+      credit: t.credit || 0,
+      signed: (t.debit || 0) - (t.credit || 0),
+      voucherCount: t.voucherCount || 0,
+    },
+    page: safePage,
+    limit: safeLimit,
+    pageCount: Math.ceil((t.voucherCount || 0) / safeLimit),
+  };
+}
+
 /** Turn raw movement into a budget "actual", given the line's nature. */
 function actualFrom(movement, nature) {
   if (!movement) return 0;
@@ -188,6 +324,7 @@ module.exports = {
   oid,
   natureByLedger,
   movementByLedger,
+  voucherMovementsForLedger,
   actualFrom,
   hydrateLines,
 };
