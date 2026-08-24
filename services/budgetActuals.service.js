@@ -89,7 +89,7 @@ async function natureByLedger(ledgerIds = []) {
  * Both are returned so a caller can also show the gross two-sided movement,
  * which is what an accountant checking a surprising figure asks for first.
  */
-async function movementByLedger({ companyId, ledgerIds = [], from, to }) {
+async function movementByLedger({ companyId, ledgerIds = [], from, to, excludeVoucherId = null }) {
   const ids = ledgerIds.map(oid).filter(Boolean);
   if (ids.length === 0) return new Map();
 
@@ -98,6 +98,12 @@ async function movementByLedger({ companyId, ledgerIds = [], from, to }) {
     isOptional: { $ne: true },
     "ledgerEntries.ledgerId": { $in: ids },
   };
+  /* Used when re-checking a voucher that is ALREADY posted: without this its
+   * own movement is in the actual, and a caller adding the proposal on top
+   * reports double what the voucher really does. Off by default — every
+   * ordinary read wants every posted voucher. */
+  const excl = oid(excludeVoucherId);
+  if (excl) match._id = { $ne: excl };
   const cid = oid(companyId);
   if (cid) match.companyId = cid;
 

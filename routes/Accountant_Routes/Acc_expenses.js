@@ -41,6 +41,10 @@ const {
   Acc_Group,
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+/* Budget control (Chunk 6). The expense module posts straight to the ledger,
+ * so these two paths are as much "spending money" as the voucher routes are —
+ * and they use the SAME gate, in budgetControl.service.js. */
+const budgetControl = require("../../services/budgetControl.service");
 
 router.use(accountantAuth);
 
@@ -471,6 +475,21 @@ router.post("/", async (req, res) => {
       .filter((e) => e.type === "Cr")
       .reduce((s, e) => s + e.amount, 0);
 
+    /* Checked BEFORE the document exists when this request posts immediately,
+     * so a refused expense leaves nothing behind to clean up. A draft
+     * (autoPost false) is saved unchecked — drafting is not spending. */
+    let budgetOverride;
+    if (autoPost) {
+      const clearance = await budgetControl.clearanceFor({
+        voucher: { companyId, voucherDate: voucherDate || new Date(), ledgerEntries, status: "draft" },
+        overrideReason: body.budgetOverrideReason,
+        department: body.department || body.costCentre || null,
+        user: req.user,
+      });
+      if (clearance.blocked) return res.status(409).json(clearance.payload);
+      budgetOverride = clearance.override || undefined;
+    }
+
     const voucher = await Acc_Voucher.create({
       companyId,
       voucherType,
@@ -494,6 +513,7 @@ router.post("/", async (req, res) => {
       enteredBy: req.user?.id,
       postedBy: autoPost ? req.user?.id : undefined,
       postedAt: autoPost ? new Date() : undefined,
+      budgetOverride,
     });
 
     // Apply balance updates only when posted
@@ -532,6 +552,19 @@ router.post("/:id/approve", async (req, res) => {
     if (v.status === "posted") {
       return res.status(400).json({ error: "Already approved" });
     }
+
+    /* Approving an expense posts it. Same gate — and the approver is the
+     * right person to answer for an overspend, being the one with the
+     * authority the submitter lacked. */
+    const clearance = await budgetControl.clearanceFor({
+      voucher: v,
+      overrideReason: req.body?.budgetOverrideReason,
+      department: req.body?.department || null,
+      user: req.user,
+    });
+    if (clearance.blocked) return res.status(409).json(clearance.payload);
+    if (clearance.override) v.budgetOverride = clearance.override;
+
     v.status = "posted";
     v.postedBy = req.user?.id;
     v.postedAt = new Date();

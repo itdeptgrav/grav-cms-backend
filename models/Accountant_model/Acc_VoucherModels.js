@@ -388,6 +388,46 @@ const tallyVoucherSchema = new mongoose.Schema(
     // (planning-only, not posted to the ledger).
     isOptional: { type: Boolean, default: false },
 
+    /* ── BUDGET OVERRIDE (Chunk 6) ──────────────────────────────────────────
+     * Written when spend was posted against a head that had no approved
+     * allocation, or not enough of one. It is the answer to "who let this
+     * through, and what did they say?" — an over-budget voucher with no
+     * recorded reason is the thing this control exists to prevent.
+     *
+     * A real schema field rather than the strict:false bypass used for
+     * debitNoteType above: that bypass is a workaround for fields nobody
+     * planned, and this is audit evidence. It has to be queryable, and it has
+     * to survive a document being re-saved by code that does not know about
+     * it — neither of which a strict-bypass path guarantees.
+     *
+     * Optional and unindexed: absent on every voucher that was within budget,
+     * which is almost all of them. */
+    budgetOverride: {
+      required: { type: Boolean },
+      reason: { type: String, trim: true },
+      status: { type: String }, // the overall status at the moment of posting
+      checkedAt: { type: Date },
+      overriddenBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
+      overriddenByName: { type: String, trim: true },
+      /* A SNAPSHOT of what was true when this was waved through, not a live
+       * reference. The budget can be revised afterwards; the reason someone
+       * gave has to keep pointing at the numbers they actually saw. */
+      results: [
+        {
+          _id: false,
+          ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+          ledgerName: { type: String },
+          department: { type: String },
+          status: { type: String },
+          allocated: { type: Number },
+          actual: { type: Number },
+          thisVoucher: { type: Number },
+          projectedActual: { type: Number },
+          remainingAfter: { type: Number },
+        },
+      ],
+    },
+
     // Uniqueness gate for the voucher-number index. TRUE for "live" vouchers
     // (draft / pending_approval / posted), FALSE once cancelled or voided.
     // The unique index on (companyId, voucherType, voucherNumber) is PARTIAL
@@ -531,6 +571,21 @@ const tallyVoucherSchema = new mongoose.Schema(
 // ─────────────────────────────────────────────────────────────────────────────
 // PRE-SAVE: compute signedAmount + totals + balance flag + financial year
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Dr/Cr totals for a set of entries, and whether they balance.
+ *
+ * A static rather than only a pre-save side effect, because callers need the
+ * answer BEFORE the first save: `isBalanced` is written by the hook below, so
+ * on a brand-new document it still reads `false`, and anything gating on it
+ * pre-save silently never fires. Budget control in Acc_vouchers.js hit exactly
+ * that. One rule, two callers.
+ */
+tallyVoucherSchema.statics.balanceOf = function (ledgerEntries = []) {
+  const totalDebit = ledgerEntries.reduce((s, l) => s + (l.type === "Dr" ? l.amount || 0 : 0), 0);
+  const totalCredit = ledgerEntries.reduce((s, l) => s + (l.type === "Cr" ? l.amount || 0 : 0), 0);
+  return { totalDebit, totalCredit, isBalanced: Math.abs(totalDebit - totalCredit) < 0.01 };
+};
+
 tallyVoucherSchema.pre("save", function (next) {
   // Signed amount per line
   this.ledgerEntries.forEach((l) => {
@@ -538,15 +593,10 @@ tallyVoucherSchema.pre("save", function (next) {
   });
 
   // Dr / Cr totals
-  this.totalDebit = this.ledgerEntries.reduce(
-    (s, l) => s + (l.type === "Dr" ? l.amount : 0),
-    0,
-  );
-  this.totalCredit = this.ledgerEntries.reduce(
-    (s, l) => s + (l.type === "Cr" ? l.amount : 0),
-    0,
-  );
-  this.isBalanced = Math.abs(this.totalDebit - this.totalCredit) < 0.01;
+  const totals = tallyVoucherSchema.statics.balanceOf(this.ledgerEntries);
+  this.totalDebit = totals.totalDebit;
+  this.totalCredit = totals.totalCredit;
+  this.isBalanced = totals.isBalanced;
 
   // Live flag drives the partial unique index on voucherNumber. A
   // cancelled/void voucher is NOT live, so its number is freed for reuse.

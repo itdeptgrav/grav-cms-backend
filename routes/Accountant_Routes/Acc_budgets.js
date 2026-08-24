@@ -21,6 +21,7 @@ const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalMod
 const { Acc_Ledger, Acc_Group } = require("../../models/Accountant_model/Acc_MasterModels");
 const variance = require("../../services/budgetVariance.service");
 const actuals = require("../../services/budgetActuals.service");
+const control = require("../../services/budgetControl.service");
 
 router.use(AccountantAuthMiddleware.accountantAuth);
 
@@ -593,6 +594,37 @@ router.get("/dashboard", async (req, res) => {
     });
   } catch (error) {
     console.error("[budgets] dashboard error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── AVAILABILITY CHECK ──────────────────────────────────────────────────────
+ * "Is there budget for this, and what happens to the budget if I post it?"
+ *
+ * Read-only and side-effect free, so a voucher form can call it on every
+ * change without committing to anything. The routes that actually post money
+ * call the same service directly — see requireBudgetClearance in
+ * Acc_vouchers.js — so the warning a user sees before submitting and the
+ * refusal they get on submit cannot come from different arithmetic.
+ *
+ * Declared before /:id, like /dashboard. */
+router.post("/check-availability", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const result = await control.checkBudgetAvailability({
+      companyId: body.companyId || companyOf(req),
+      voucherDate: body.voucherDate,
+      ledgerEntries: body.ledgerEntries || [],
+      department: body.department || body.costCentre || null,
+      excludeVoucherId: body.excludeVoucherId || null,
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    /* A bad date is the caller's mistake, not a server fault. */
+    if (/voucherDate/.test(error.message || "")) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
+    console.error("[budgets] check-availability error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
