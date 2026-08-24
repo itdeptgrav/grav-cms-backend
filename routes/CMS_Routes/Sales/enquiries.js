@@ -29,6 +29,8 @@ const NotificationService = require("../../../services/NotificationService");
 const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
 const { recordChange, historyFor, diff } = require("../../../services/changeLog");
 const { isSalesManager, bypassesApproval } = require("../../../services/salesAccess");
+const CRMSettings = require("../../../models/CMS_Models/Sales/CRMSettings");
+const { canSeeCost, costingTier, visibleParts, reduceCostLedger } = require("../../../services/crmCostVisibility");
 const { costingTotals } = require("../../../services/costingTotals");
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
@@ -59,29 +61,32 @@ async function customerNameFor(enquiry) {
 // price is computed here and only the RESULT is sent, so cost never has to be
 // on the wire for a salesperson to know what they may not go below. When the
 // rate card lands this becomes a per-style-family setting.
-const MARGIN_FLOOR_PERCENT = 22;
-
 /**
- * WHO MAY SEE WHAT OF A COSTING. Three tiers, enforced here rather than in the
- * UI, because hiding columns in React while this endpoint serves the workbook
- * leaves the vendor prices one network-tab click away.
+ * The markup policy, from Sales settings, cached briefly.
  *
- *   sheet    the workbook itself — vendor names with their prices, SAM, cost per
- *            minute. Only for someone who OWNS or EDITS that CoWork document:
- *            the merchandiser, the industrial engineer, the salesperson who
- *            raised it. No Sales capability grants this on its own.
- *   cost     cost per piece and its materials/operations split. Sales managers
- *            and the deal owner, who need it to negotiate.
- *   floor    the lowest sellable price. Everyone else. One number, no structure
- *            behind it — you cannot work back to a vendor from it.
+ * It was `const MARGIN_FLOOR_PERCENT = 22` here — the THIRD hardcoded copy of
+ * the same number (the other two were in the frontend and in costingTotals'
+ * default). One of them is now the truth: CRMSettings.commercial.markupPct.
+ * Cached for a minute because every costing read asks for it and it changes
+ * about never.
  */
-async function costingTier(req, enquiry, myRoleOnAnySheet) {
-  if (myRoleOnAnySheet === "owner" || myRoleOnAnySheet === "editor") return "sheet";
-  const owns = enquiry.ownerId && String(enquiry.ownerId) === String(req.user?.id);
-  if (owns) return "cost";
-  if (await isSalesManager(req.user)) return "cost";
-  return "floor";
+let _markupCache = { at: 0, pct: 22 };
+async function markupPercent() {
+  if (Date.now() - _markupCache.at < 60_000) return _markupCache.pct;
+  try {
+    const settings = await CRMSettings.getSingleton();
+    const pct = Number(settings?.commercial?.markupPct);
+    _markupCache = { at: Date.now(), pct: Number.isFinite(pct) ? pct : 22 };
+  } catch {
+    // Keep the last known figure rather than silently repricing everything at
+    // a default because one settings read failed.
+    _markupCache = { ..._markupCache, at: Date.now() };
+  }
+  return _markupCache.pct;
 }
+
+/* Costing visibility — see services/crmCostVisibility.js for the rules and
+   why they live outside this file (it cannot be required without Firebase). */
 
 const { ENQUIRY_STATUS_CODES, ENQUIRY_STATUS_TRANSITIONS, ENQUIRY_SOURCE_CODES, ENQUIRY_LOST_REASON_CODES, ENQUIRY_PRIORITY_CODES, CUSTOMER_SERIOUSNESS_CODES, ENQUIRY_REFERENCE_TYPE_CODES } = require("../../../constants/crm");
 
@@ -102,6 +107,35 @@ function enquirySourceFromLead(lead) {
   if (s === "website") return "website";
   if (s === "existing_customer") return "repeat_customer";
   return "existing_lead";
+}
+
+/**
+ * The Lead's commercial picture, frozen at conversion.
+ *
+ * Every figure keeps its confidence and its stated source, because "4,800 pcs,
+ * contact-confirmed, from the GM's expansion plan" and "4,800 pcs, assumed"
+ * are different facts and only one of them should survive a challenge.
+ *
+ * Returns undefined when the lead had nothing, so an enquiry raised without a
+ * lead carries an absent block rather than an empty one full of nulls.
+ */
+function leadEstimateSnapshot(lead) {
+  if (!lead) return undefined;
+  const snap = {
+    annualQuantity: lead.estimatedAnnualQuantity ?? undefined,
+    annualQuantityConfidence: lead.estimatedAnnualQuantityConfidence || undefined,
+    annualQuantitySource: lead.estimatedAnnualQuantitySource || undefined,
+    annualRevenue: lead.estimatedAnnualRevenue ?? undefined,
+    annualRevenueConfidence: lead.estimatedAnnualRevenueConfidence || undefined,
+    annualRevenueSource: lead.estimatedAnnualRevenueSource || undefined,
+    unitPrice: lead.estimatedUnitPrice ?? undefined,
+    unitPriceConfidence: lead.estimatedUnitPriceConfidence || undefined,
+    unitPriceSource: lead.estimatedUnitPriceSource || undefined,
+  };
+  if (Object.values(snap).every((v) => v === undefined)) return undefined;
+  snap.capturedAt = new Date();
+  snap.capturedFromLeadRef = lead.leadId || undefined;
+  return snap;
 }
 
 // Seed enquiry products from the lead's structured requirement. `requirementItems`
@@ -249,8 +283,13 @@ function sanitizeProducts(input) {
     .filter((p) => p && String(p.product || "").trim())
     .map((p) => {
       const qty = p.quantity === "" || p.quantity == null ? undefined : Number(p.quantity);
+      // A picked row carries its master id; a typed one does not, and both are
+      // valid. Validated rather than trusted — this arrives from the client.
+      const sid = String(p.stockItemId || "").trim();
       const out = {
         product: String(p.product).trim(),
+        stockItemId: mongoose.Types.ObjectId.isValid(sid) ? sid : undefined,
+        stockItemReference: String(p.stockItemReference || "").trim() || undefined,
         quantity: Number.isFinite(qty) && qty >= 0 ? qty : undefined,
         gender: GARMENT_GENDER_CODES.includes(p.gender) ? p.gender : undefined,
         logo: Boolean(p.logo),
@@ -306,14 +345,14 @@ async function loadJourney(journeyRef) {
 }
 
 /** Populate the display names a client needs, without duplicating them in the DB. */
-async function decorate(enquiry) {
+async function decorate(enquiry, req = null) {
   const obj = enquiry.toObject ? enquiry.toObject() : enquiry;
   const [account, contact, journey] = await Promise.all([
     obj.accountId ? Account.findById(obj.accountId).select("accountId companyName displayName").lean() : null,
     obj.primaryContactId ? Contact.findById(obj.primaryContactId).select("firstName lastName jobTitle email mobile whatsapp").lean() : null,
     obj.journeyId ? SalesJourney.findById(obj.journeyId).select("journeyId name").lean() : null,
   ]);
-  return {
+  const out = {
     ...obj,
     customerName: account ? account.displayName || account.companyName : null,
     customerCode: account?.accountId || null,
@@ -323,6 +362,14 @@ async function decorate(enquiry) {
     journeyRef: journey?.journeyId || null,
     journeyName: journey?.name || null,
   };
+  // `req` is optional so an internal caller (notifications, the PI resolver)
+  // can decorate without a request — those never reach a browser. Every ROUTE
+  // passes it, and a route that forgets falls through to the safe side.
+  if (!Array.isArray(out.costLedger)) return out;
+  // `req` is optional so an internal caller (notifications, the PI resolver)
+  // can decorate without a request — those never reach a browser. Every ROUTE
+  // passes it, and a route that forgets falls through to the safe side.
+  return { ...out, costLedger: reduceCostLedger(out.costLedger, req ? canSeeCost(req.user) : false, await markupPercent()) };
 }
 
 // GET /api/cms/crm/enquiries/by-journey/:journeyRef
@@ -339,7 +386,10 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
       // journey), if any — it carries the source, the summary and the
       // product-wise requirement captured at lead stage.
       const lead = await Lead.findOne({ "conversion.journeyId": journey._id })
-        .select("source company firstName lastName requirements requirementItems productInterest estimatedUnitPrice")
+        .select("leadId source company firstName lastName requirements requirementItems productInterest "
+              + "estimatedUnitPrice estimatedUnitPriceConfidence estimatedUnitPriceSource "
+              + "estimatedAnnualQuantity estimatedAnnualQuantityConfidence estimatedAnnualQuantitySource "
+              + "estimatedAnnualRevenue estimatedAnnualRevenueConfidence estimatedAnnualRevenueSource")
         .lean();
       const primaryContact = journey.primaryContactId
         ? journey.primaryContactId
@@ -362,6 +412,12 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
         // left blank for them to capture.
         estimatedPriceMin: lead?.estimatedUnitPrice || undefined,
         estimatedPriceMax: lead?.estimatedUnitPrice || undefined,
+        // …and keep what makes that number mean something. The Lead spent a
+        // whole checklist establishing these and how sure it was of each; the
+        // conversion used to keep one figure and throw the rest away, so the
+        // enquiry opened showing a price nobody could account for. See the
+        // `leadEstimate` block on the Enquiry model for why it is a snapshot.
+        leadEstimate: leadEstimateSnapshot(lead),
         // Smart start: an enquiry converted FROM a lead has already been
         // contacted and had its requirement gathered (that's what let the lead
         // convert), so it opens at "qualified" rather than re-walking the funnel.
@@ -398,7 +454,7 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
       })().catch(() => {});
     }
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] GET /by-journey", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -622,12 +678,18 @@ router.patch("/:id", salesAuth, async (req, res) => {
       // the sheet follow the rename instead. Only applied when `to` is
       // actually a product on the new list — never rename onto nothing.
       const renames = Array.isArray(body.renames) ? body.renames : [];
-      if (renames.length && enquiry.costingSheets?.length) {
+      if (renames.length) {
         const newNames = new Set(enquiry.products.map((p) => p.product));
         for (const { from, to } of renames) {
           if (!from || !to || from === to || !newNames.has(to)) continue;
-          const sheet = enquiry.costingSheets.find((s) => s.productName === from);
+          const sheet = enquiry.costingSheets?.find((s) => s.productName === from);
           if (sheet) sheet.productName = to;
+          // The cost ledger is keyed by name for the same reason and breaks the
+          // same way — renaming a product would strand its cost and price, and
+          // the stage would quietly show an uncosted line for a product that
+          // had been costed all along.
+          const ledger = enquiry.costLedger?.find((l) => l.productName === from);
+          if (ledger) ledger.productName = to;
         }
       }
     }
@@ -681,7 +743,7 @@ router.patch("/:id", salesAuth, async (req, res) => {
       after,
     }).catch(() => {});
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id", err);
     return res.status(400).json({ success: false, message: err.message });
@@ -1072,7 +1134,7 @@ router.post("/:id/costing-sheet", salesAuth, async (req, res) => {
       await notifyAssignee(step.assignee, { enquiry, productName: product?.product || "", part: step.part });
     }
 
-    return res.status(201).json({ success: true, costingSheets: created, enquiry: await decorate(enquiry) });
+    return res.status(201).json({ success: true, costingSheets: created, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/costing-sheet", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1147,7 +1209,7 @@ router.patch("/:id/costing-sheet/assign", salesAuth, async (req, res) => {
       await notifyAssignee(c.assignee, { enquiry, productName, part: c.part });
     }
 
-    return res.json({ success: true, changed, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, changed, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id/costing-sheet/assign", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1211,7 +1273,7 @@ router.patch("/:id/costing-sheet/members", salesAuth, async (req, res) => {
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id/costing-sheet/members", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1287,13 +1349,25 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
       (best, p) => (p.myRole === "owner" ? "owner" : p.myRole === "editor" && best !== "owner" ? "editor" : best),
       null,
     );
-    const tier = open ? "sheet" : await costingTier(req, enquiry, bestRole);
-    const totals = costingTotals(parts, MARGIN_FLOOR_PERCENT);
+    // `open` (merchandiser / IE — anyone who does not bypass approval) no
+    // longer means "see the whole workbook". They get the sheet tier, but only
+    // for the parts they hold; someone with no part on this product gets the
+    // floor like everyone else. That is the change from "anyone can fill
+    // anything" to "each discipline sees its own part".
+    const rawTier = open ? "sheet" : costingTier(req.user, bestRole);
+    const mine = visibleParts(parts, me, rawTier === "cost");
+    const tier = rawTier === "sheet" && mine.length === 0 ? "floor" : rawTier;
+
+    // TOTALS ARE ALWAYS COMPUTED FROM EVERY PART, never from the visible ones:
+    // the floor price is a fact about the whole garment, and an industrial
+    // engineer who could see it derived from operations alone would be reading
+    // a number that is wrong AND that leaks the shape of their own half.
+    const totals = costingTotals(parts, await markupPercent());
 
     if (tier !== "sheet") {
       // Rows never leave the server for these callers. What they get is the
-      // answer, not the working: a floor price, plus cost per piece if they
-      // are the deal owner or a manager.
+      // answer, not the working: a floor price, plus cost per piece only for
+      // admin/CEO. Nobody in Sales reaches the cost tier any more.
       //
       // `pendingChanges` still goes out here (19 Aug 2026, bug fix). This
       // branch is only ever reached by a caller `bypassesApproval` already
@@ -1309,7 +1383,7 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
         linked: Boolean(me),
         summary: tier === "cost"
           ? totals
-          : { costed: totals.costed, floorPrice: totals.floorPrice, floorPercent: totals.floorPercent },
+          : { costed: totals.costed, floorPrice: totals.floorPrice, markupPercent: totals.markupPercent },
         parts: parts.map((p) => ({
           part: p.part,
           title: p.title,
@@ -1323,11 +1397,14 @@ router.get("/:id/costing-sheet/:productName/data", salesAuth, async (req, res) =
       });
     }
 
+    // `mine`, not `parts`: the sheet tier now means "the parts you hold", so
+    // the rows for a part this caller has no role on never leave the server.
+    // `summary` stays whole-garment (see the note above the totals call).
     return res.json({
       success: true,
       tier,
       summary: totals,
-      parts,
+      parts: mine,
       linked: Boolean(me),
       pendingChanges,
     });
@@ -1516,7 +1593,7 @@ router.post("/:id/costing-sheet/:productName/change/:changeId/decide", salesAuth
       summary: `${actor(req).name || "Sales"} ${decision === "approve" ? "approved" : "rejected"} ${entry.submittedBy?.name || "a"}'s proposed ${PART_LABEL[entry.part || "combined"] || entry.part} costing changes for "${productName}"`,
     }).catch(() => {});
 
-    return res.json({ success: true, status: entry.status, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, status: entry.status, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/costing-sheet/:productName/change/:changeId/decide", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1541,6 +1618,78 @@ function findOrCreateLifecycle(enquiry, productName) {
 }
 
 // POST /api/cms/crm/enquiries/:id/products/:productName/send-to-customer
+// PATCH /api/cms/crm/enquiries/:id/products/:productName/cost-ledger
+//
+// The one figure Sales reads off the costing workbook's Master tab, and the
+// price they decided to quote. Replaces the localStorage the Cost & Invoicing
+// stage used to keep this in — see the model's `costLedger` comment.
+//
+// Upsert by product name. Sending only one of the two leaves the other alone:
+// keying a cost and deciding a price are separate acts, minutes or days apart,
+// and a partial save must not blank the half that is already right.
+router.patch("/:id/products/:productName/cost-ledger", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    const productName = String(req.params.productName || "").trim();
+    if (!productName) return res.status(400).json({ success: false, message: "A product name is required." });
+    // Only against a product this enquiry actually has: a ledger row for a
+    // product nobody is quoting is a number that can never be reconciled.
+    if (!(enquiry.products || []).some((p) => p.product === productName)) {
+      return res.status(404).json({ success: false, message: `"${productName}" is not a product on this enquiry.` });
+    }
+
+    // `null` clears a figure; absent leaves it untouched. They are different
+    // intentions and the client can express both.
+    const parse = (v) => {
+      if (v === null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : undefined;
+    };
+    const cost = "cost" in req.body ? parse(req.body.cost) : undefined;
+    const price = "price" in req.body ? parse(req.body.price) : undefined;
+    if (cost === undefined && price === undefined) {
+      return res.status(400).json({ success: false, message: "Send a cost, a price, or both." });
+    }
+    // Sales sets the PRICE. They do not see cost and they do not write it — a
+    // writable field they cannot read is a field they can only corrupt, and it
+    // would let the floor price be moved by the person the floor constrains.
+    if (cost !== undefined && !canSeeCost(req.user)) {
+      return res.status(403).json({
+        success: false,
+        message: "Cost is set from the costing sheet, not here. You can set the quoted price.",
+      });
+    }
+
+    enquiry.costLedger = enquiry.costLedger || [];
+    let row = enquiry.costLedger.find((l) => l.productName === productName);
+    if (!row) {
+      row = { productName };
+      enquiry.costLedger.push(row);
+      row = enquiry.costLedger[enquiry.costLedger.length - 1];
+    }
+    if (cost !== undefined) row.cost = cost === null ? undefined : cost;
+    if (price !== undefined) row.price = price === null ? undefined : price;
+    row.updatedBy = actor(req);
+    row.updatedAt = new Date();
+
+    enquiry.updatedBy = actor(req);
+    await enquiry.save();
+
+    // Reduced like every other read — this endpoint must not be the one hole
+    // that hands the cost back to the caller who just set a price.
+    res.json({
+      success: true,
+      costLedger: reduceCostLedger(enquiry.costLedger, canSeeCost(req.user), await markupPercent()),
+    });
+  } catch (err) {
+    console.error("[enquiries] PATCH cost-ledger", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req, res) => {
   try {
     if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
@@ -1579,12 +1728,12 @@ router.post("/:id/products/:productName/send-to-customer", salesAuth, async (req
         ],
         image: product?.images?.[0],
         bodyText: `${actor(req).name || "Sales"} sent pricing for "${productName}" to ${customerName} — ${enquiry.enquiryId || ""}.`,
-        ctaLabel: "Open Cost & Quote",
+        ctaLabel: "Open Cost & Invoicing",
         ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
       });
     })().catch(() => {});
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/send-to-customer", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1653,12 +1802,12 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
         ],
         image: product?.images?.[0],
         bodyText: `${who.name || "Sales"} recorded that ${customerName} ${req.body.approved ? "approved" : "rejected"} "${productName}" — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
-        ctaLabel: "Open Cost & Quote",
+        ctaLabel: "Open Cost & Invoicing",
         ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
       });
     })().catch(() => {});
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/customer-approval", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1719,7 +1868,7 @@ router.post("/:id/products/:productName/request-stock-item", salesAuth, async (r
       });
     })().catch(() => {});
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/request-stock-item", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1837,12 +1986,12 @@ router.post("/:id/products/:productName/stock-item-request/decide", salesAuth, a
         ],
         image: product?.images?.[0],
         bodyText: `${actor(req).name || "Merchandising"} ${decision === "approve" ? "approved" : "rejected"} the stock-item request for "${productName}" (${customerName}) — ${enquiry.enquiryId || ""}.${note ? ` Note: ${note}` : ""}`,
-        ctaLabel: "Open Cost & Quote",
+        ctaLabel: "Open Cost & Invoicing",
         ctaUrl: `${DEPT_NOTIFY_APP_URL}/sales/dashboard/journeys/${enquiry.journeyId}/cost-quote`,
       });
     })().catch(() => {});
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/stock-item-request/decide", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1913,7 +2062,7 @@ router.post("/:id/product-sheet", salesAuth, async (req, res) => {
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
-    return res.status(201).json({ success: true, productSheet: created, enquiry: await decorate(enquiry) });
+    return res.status(201).json({ success: true, productSheet: created, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/product-sheet", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1959,7 +2108,7 @@ router.patch("/:id/product-sheet/members", salesAuth, async (req, res) => {
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id/product-sheet/members", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -2106,7 +2255,7 @@ router.post("/:id/product-thread", salesAuth, async (req, res) => {
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
-    return res.status(201).json({ success: true, productThread: created, enquiry: await decorate(enquiry) });
+    return res.status(201).json({ success: true, productThread: created, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/product-thread", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -2151,7 +2300,7 @@ router.patch("/:id/product-thread/members", salesAuth, async (req, res) => {
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id/product-thread/members", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -2265,7 +2414,7 @@ router.patch("/:id/link-request", salesAuth, async (req, res) => {
       { new: true },
     );
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
-    return res.json({ success: true, enquiry: await decorate(enquiry) });
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] PATCH /:id/link-request", err);
     return res.status(500).json({ success: false, message: err.message });
@@ -2282,7 +2431,7 @@ router.get("/:id/production", salesAuth, async (req, res) => {
     const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
-    const decorated = await decorate(enquiry);
+    const decorated = await decorate(enquiry, req);
     const { id: requestId, resolved } = await resolveRequestId(enquiry, decorated.customerName);
     if (!requestId) {
       return res.json({
@@ -2337,7 +2486,7 @@ router.get("/:id/shipment", salesAuth, async (req, res) => {
     const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
-    const decorated = await decorate(enquiry);
+    const decorated = await decorate(enquiry, req);
     const { id: requestId, resolved } = await resolveRequestId(enquiry, decorated.customerName);
     if (!requestId) {
       return res.json({
@@ -2401,7 +2550,7 @@ router.post("/:id/early-dispatch", salesAuth, async (req, res) => {
     }
 
     // Cannot ask for more than is actually packed and still here.
-    const decorated = await decorate(enquiry);
+    const decorated = await decorate(enquiry, req);
     const { id: requestId } = await resolveRequestId(enquiry, decorated.customerName);
     if (requestId) {
       const workOrders = await WorkOrder.find({ customerRequestId: requestId })
@@ -2431,13 +2580,52 @@ router.post("/:id/early-dispatch", salesAuth, async (req, res) => {
     enquiry.updatedBy = actor(req);
     await enquiry.save();
 
-    return res.status(201).json({ success: true, enquiry: await decorate(enquiry) });
+    return res.status(201).json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/early-dispatch", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
 
+
+// ─── The commercial ladder ───────────────────────────────────────────────────
+//
+// GET /api/cms/crm/enquiries/:id/commercial-ladder
+//
+// The same deal value as it was claimed at each stage — researched at the Lead,
+// indicative here, costed at the quote, actual on the order — so the drift
+// between them is readable. See services/commercialLadder.js for why a rung is
+// never rewritten by a later one.
+const { buildCommercialLadder } = require("../../../services/commercialLadder");
+
+router.get("/:id/commercial-ladder", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true }).lean();
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+
+    // The quoted total, when a quotation exists on the linked order. Read from
+    // the order rather than recomputed from the costing sheet: the quotation is
+    // the number that was actually put in front of the customer.
+    const decorated = await decorate(enquiry, req);
+    const { id: requestId } = await resolveRequestId(enquiry, decorated.customerName);
+    const order = requestId
+      ? await CustomerRequestModel.findById(requestId)
+          .select("requestId grandTotal totalPaidAmount updatedAt quotations.grandTotal").lean()
+      : null;
+    const quotedTotal = order?.quotations?.length
+      ? order.quotations[order.quotations.length - 1]?.grandTotal ?? null
+      : null;
+
+    return res.json({
+      success: true,
+      ...buildCommercialLadder({ enquiry, quotedTotal, order }),
+    });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/commercial-ladder", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // ─── Order Closing Report ─────────────────────────────────────────────────────
 //
@@ -2456,7 +2644,7 @@ router.get("/:id/closing-report", salesAuth, async (req, res) => {
     const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
     if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
 
-    const decorated = await decorate(enquiry);
+    const decorated = await decorate(enquiry, req);
     const { id: requestId } = await resolveRequestId(enquiry, decorated.customerName);
     if (!requestId) {
       return res.json({

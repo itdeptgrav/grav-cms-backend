@@ -80,7 +80,7 @@ const EVENT_REGISTRY = [
   },
   {
     key: "costing_sent_to_customer",
-    label: "Cost & Quote sent to customer",
+    label: "Cost & Invoicing sent to customer",
     description: "Merchandising and the Project Manager are notified when Sales sends pricing to the customer.",
     departments: ["merchandiser", "project-manager"],
   },

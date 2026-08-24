@@ -19,6 +19,52 @@ router.use(EmployeeAuthMiddleware);
 // DASHBOARD ROUTES
 // ════════════════════════════════════════════════════════════════════════════
 
+// GET /api/cms/crm/customer-requests/:id/persons
+// GET /api/cms/crm/customer-requests/:id/persons?uin=EMP-0042
+//
+// WHO is on this order — the answer to "did we make, or bill, Ramesh's
+// uniform?", which until now required opening the measurement drive and
+// guessing by garment size.
+//
+// Reads the roster carried on each line (services/personRoster.js). Orders
+// converted before that existed have no roster and honestly report none,
+// rather than inferring one from sizes and being confidently wrong.
+router.get("/:id/persons", async (req, res) => {
+  try {
+    const request = await CustomerRequest.findById(req.params.id)
+      .select("requestId requestType measurementId measurementName items status")
+      .lean();
+    if (!request) return res.status(404).json({ success: false, message: "Order not found" });
+
+    let persons = personsOnOrder(request.items);
+    const uin = String(req.query.uin || "").trim();
+    if (uin) {
+      const needle = uin.toLowerCase();
+      persons = persons.filter(
+        (p) =>
+          String(p.employeeUIN).toLowerCase() === needle ||
+          String(p.employeeName).toLowerCase().includes(needle),
+      );
+    }
+
+    return res.json({
+      success: true,
+      requestId: request.requestId,
+      // Says WHY the list is empty. An ordinary stock order has nobody to name;
+      // a pre-roster measurement order has people the record simply never kept.
+      traceable: (request.items || []).some((i) =>
+        (i.variants || []).some((v) => (v.persons || []).length > 0),
+      ),
+      isMeasurementOrder: request.requestType === "measurement_conversion",
+      fromDrive: request.measurementName || null,
+      count: persons.length,
+      persons,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/dashboard", async (req, res) => {
     try {
         const now = new Date();
@@ -293,6 +339,38 @@ router.get("/requests", async (req, res) => {
     }
 });
 
+/**
+ * Where this order came from, when it came from anywhere.
+ *
+ * An order raised in the customer portal has no history — most of them. One
+ * that came down the Pipeline does, and the Order Book had no way to say so:
+ * the page showed the order as if it had appeared from nowhere, while the
+ * enquiry, the journey and everything decided on them sat one join away.
+ *
+ * Two indexed lookups, both optional, neither ever fatal.
+ */
+async function upstreamOf(requestId) {
+    try {
+        const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
+        const EnquiryModel = require("../../../models/CMS_Models/Sales/Enquiry");
+        const enquiry = await EnquiryModel.findOne({ customerRequestId: requestId, isActive: true })
+            .select("enquiryId title journeyId").lean();
+        if (!enquiry) return null;
+        const journey = enquiry.journeyId
+            ? await SalesJourney.findById(enquiry.journeyId).select("journeyId name currentStage").lean()
+            : null;
+        return {
+            enquiryRef: enquiry.enquiryId || null,
+            enquiryId: String(enquiry._id),
+            journeyRef: journey?.journeyId || null,
+            journeyName: journey?.name || null,
+            journeyStage: journey?.currentStage || null,
+        };
+    } catch {
+        return null;
+    }
+}
+
 router.get("/requests/:requestId", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId)
@@ -350,14 +428,18 @@ router.get("/requests/:requestId", async (req, res) => {
                         };
                     });
 
-                    return res.json({ success: true, request: enrichedRequest });
+                    return res.json({
+                        success: true,
+                        request: enrichedRequest,
+                        upstream: await upstreamOf(request._id),
+                    });
                 }
             } catch (enrichError) {
                 console.error('[salesRoutes] MPC name enrichment failed:', enrichError.message);
             }
         }
 
-        res.json({ success: true, request });
+        res.json({ success: true, request, upstream: await upstreamOf(request._id) });
     } catch (error) {
         console.error("Error fetching customer request:", error);
         res.status(500).json({
@@ -600,6 +682,186 @@ router.post("/:requestId/reject-edit", async (req, res) => {
     } catch (error) {
         console.error("Error rejecting edit request:", error);
         res.status(500).json({ success: false, message: "Server error while rejecting edit request" });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// EXECUTION — Production, Shipment, Order Closing
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The three screens the Sales Journey shows after the PO, served here keyed by
+// the ORDER instead of the enquiry (22 Aug 2026).
+//
+// The journey's own versions live on /crm/enquiries/:id/{production,shipment,
+// closing-report}. Every one of them spends its first half turning an enquiry
+// into a `customerRequestId` — by stored link if one exists, otherwise by
+// matching the customer's NAME — and its second half reading work orders off
+// that id. This page already holds the id, so these routes are that second half
+// and nothing else. The view builders are the same modules, so the numbers are
+// the same numbers.
+//
+// Why this way round, rather than resolving an enquiry from here: of the 16
+// orders that have work orders, exactly ONE is reachable through an enquiry.
+// Orders raised in the customer portal never had a journey, and the Order Book
+// is the surface that has to show them all.
+//
+// The enquiry is still looked up when one exists, because two things genuinely
+// live on it: the early-dispatch asks Sales has recorded, and the costing-sheet
+// estimate half of the closing report. Both degrade to absent, never to an
+// error — an order with no enquiry still gets its production, its dispatch and
+// its closing figures.
+const DispatchChallan = require("../../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
+const { buildProductionView } = require("../../../services/productionView");
+const { buildShipmentView } = require("../../../services/shipmentView");
+const { buildClosingReport } = require("../../../services/closingReport");
+const { isSalesManager } = require("../../../services/salesAccess");
+const mongooseLib = require("mongoose");
+
+const isOid = (v) => mongooseLib.Types.ObjectId.isValid(v);
+
+/** The enquiry behind this order, when the two were ever linked. Never fatal. */
+async function enquiryForRequest(requestId) {
+    try {
+        return await Enquiry.findOne({ customerRequestId: requestId, isActive: true }).lean();
+    } catch {
+        return null;
+    }
+}
+
+// GET /api/cms/sales/requests/:requestId/production
+router.get("/requests/:requestId/production", async (req, res) => {
+    try {
+        const { requestId } = req.params;
+        if (!isOid(requestId)) return res.status(400).json({ success: false, message: "Invalid order reference." });
+
+        const workOrders = await WorkOrder.find({ customerRequestId: requestId })
+            .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity status "
+                  + "assignedDeadline productionCompletion customerName")
+            .lean();
+
+        if (!workOrders.length) {
+            return res.json({
+                success: true, linked: true, requestId, workOrders: 0,
+                reason: "No work order has been raised against this order yet, so nothing is in production.",
+            });
+        }
+
+        return res.json({ success: true, linked: true, requestId, view: buildProductionView(workOrders) });
+    } catch (error) {
+        console.error("[customerRequests] GET /requests/:requestId/production", error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// GET /api/cms/sales/requests/:requestId/shipment
+router.get("/requests/:requestId/shipment", async (req, res) => {
+    try {
+        const { requestId } = req.params;
+        if (!isOid(requestId)) return res.status(400).json({ success: false, message: "Invalid order reference." });
+
+        const [workOrders, challans, enquiry] = await Promise.all([
+            WorkOrder.find({ customerRequestId: requestId })
+                .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity status "
+                      + "assignedDeadline dispatchedQuantity productionCompletion.operationCompletion")
+                .lean(),
+            DispatchChallan.find({ manufacturingOrderId: requestId })
+                .select("challanNumber dispatchType totalUnits totalPersons persons.employeeName persons.employeeUIN "
+                      + "persons.department persons.designation persons.totalUnits dispatchedBy notes createdAt")
+                .lean(),
+            enquiryForRequest(requestId),
+        ]);
+
+        if (!workOrders.length) {
+            return res.json({
+                success: true, linked: true, requestId, workOrders: 0,
+                enquiryId: enquiry ? String(enquiry._id) : null,
+                reason: "No work order has been raised against this order yet, so nothing has been packed.",
+            });
+        }
+
+        return res.json({
+            success: true,
+            linked: true,
+            requestId,
+            // The early-send ask is WRITTEN onto the enquiry, so the panel that
+            // raises one needs this id and hides itself without it. Reading is
+            // unaffected: no enquiry simply means no asks recorded yet.
+            enquiryId: enquiry ? String(enquiry._id) : null,
+            view: buildShipmentView(workOrders, challans, enquiry?.earlyDispatchRequests || []),
+        });
+    } catch (error) {
+        console.error("[customerRequests] GET /requests/:requestId/shipment", error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// GET /api/cms/sales/requests/:requestId/closing-report
+router.get("/requests/:requestId/closing-report", async (req, res) => {
+    try {
+        const { requestId } = req.params;
+        if (!isOid(requestId)) return res.status(400).json({ success: false, message: "Invalid order reference." });
+
+        const [workOrders, challans, request, enquiry] = await Promise.all([
+            WorkOrder.find({ customerRequestId: requestId })
+                .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity assignedDeadline "
+                      + "dispatchedQuantity estimatedCost actualCost rawMaterials.quantityIssued rawMaterials.unitCost "
+                      + "productionCompletion.operationCompletion productionCompletion.timeMetrics "
+                      + "productionCompletion.invalidScansCount")
+                .lean(),
+            DispatchChallan.find({ manufacturingOrderId: requestId })
+                .select("challanNumber dispatchType totalUnits totalPersons createdAt "
+                      + "persons.employeeName persons.department persons.totalUnits")
+                .lean(),
+            CustomerRequest.findById(requestId)
+                .select("requestId customerInfo.name grandTotal paymentSchedule quotations.grandTotal").lean(),
+            enquiryForRequest(requestId),
+        ]);
+
+        if (!request) return res.status(404).json({ success: false, message: "Order not found." });
+
+        if (!workOrders.length) {
+            return res.json({
+                success: true, linked: true, requestId, workOrders: 0,
+                reason: "No work order was ever raised against this order, so there is nothing to report on.",
+            });
+        }
+
+        const report = buildClosingReport({ workOrders, challans, request, enquiry });
+
+        // Same rule as the journey's own closing report, and for the same
+        // reason: profit = revenue − cost, and the invoice total is visible to
+        // everyone, so a margin percentage hands over the cost by subtraction.
+        // Cost and margin move together or not at all.
+        //
+        // The enquiry's owner usually cannot be consulted here — most orders
+        // have no enquiry — so where the journey grants "cost" to the deal
+        // owner, this route mostly falls back to manager-or-not. Stricter,
+        // never looser.
+        const owns = enquiry?.ownerId && String(enquiry.ownerId) === String(req.user?.id);
+        const tier = owns || (await isSalesManager(req.user)) ? "cost" : "floor";
+
+        if (tier === "floor") {
+            const { costing, ...rest } = report;
+            return res.json({
+                success: true, linked: true, tier, requestId,
+                customerName: request.customerInfo?.name || null,
+                report: {
+                    ...rest,
+                    costing: null,
+                    lines: rest.lines.map(({ cost, ...line }) => line),
+                },
+            });
+        }
+
+        return res.json({
+            success: true, linked: true, tier, requestId,
+            customerName: request.customerInfo?.name || null,
+            report,
+        });
+    } catch (error) {
+        console.error("[customerRequests] GET /requests/:requestId/closing-report", error);
+        return res.status(500).json({ success: false, message: error.message });
     }
 });
 

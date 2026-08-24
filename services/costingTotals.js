@@ -3,7 +3,7 @@
 // Cost per piece, and the floor price, computed ON THE SERVER.
 //
 // WHY THIS EXISTS. The floor price used to be worked out in the browser —
-// `cost / (1 - floor%)` inside CostingPanel — which meant the cost had to be on
+// inside CostingPanel — which meant the cost had to be on
 // the wire for the floor to be displayable. Gating the columns in React while
 // the endpoint still served the underlying rows was theatre: anyone could read
 // the vendor prices out of the network tab.
@@ -30,9 +30,9 @@ const num = (v) => {
  *
  * @param {object[]} parts one per contributor sheet (raw / operations / combined),
  *   each `{ materials?: {unitCost, consumption}[], operations?: {sam, rate}[] }`
- * @param {number} floorPercent the margin policy, e.g. 22
+ * @param {number} markupPercent the markup policy, e.g. 22 → cost × 1.22
  */
-function costingTotals(parts = [], floorPercent = 22) {
+function costingTotals(parts = [], markupPercent = 22) {
   let materials = 0;
   let operations = 0;
   let miscellaneous = 0;
@@ -45,10 +45,20 @@ function costingTotals(parts = [], floorPercent = 22) {
   const costPerPiece = +(materials + operations + miscellaneous).toFixed(2);
 
   // The one number a non-commercial viewer may have: the lowest price this
-  // product can be sold at and still clear the margin policy. It reveals no
-  // structure — you cannot work backwards to a vendor from it.
-  const pct = Math.min(99, Math.max(0, num(floorPercent)));
-  const floorPrice = costPerPiece > 0 ? +(costPerPiece / (1 - pct / 100)).toFixed(2) : null;
+  // product may be sold at. It reveals no structure — you cannot work backwards
+  // to a vendor from it.
+  //
+  // MARKUP ON COST, NOT MARGIN ON PRICE (22 Aug 2026, explicit decision).
+  // This was `cost / (1 - pct/100)` — the price that DELIVERS pct% margin. It
+  // is now `cost × (1 + pct/100)` — cost plus pct%. They are different numbers
+  // and the difference is not small: at 22% on a ₹412 cost, the old formula
+  // gave ₹528.21 and this gives ₹502.64, which realises 18.0% margin, not 22%.
+  //
+  // So the word changed with the formula. Everything user-facing says MARKUP,
+  // and the setting is `commercial.markupPct`. Calling a markup a margin is how
+  // a business quietly ships four points under the number it thought it set.
+  const pct = Math.min(500, Math.max(0, num(markupPercent)));
+  const floorPrice = costPerPiece > 0 ? +(costPerPiece * (1 + pct / 100)).toFixed(2) : null;
 
   return {
     costed: costPerPiece > 0,
@@ -57,7 +67,7 @@ function costingTotals(parts = [], floorPercent = 22) {
     operations: +operations.toFixed(2),
     miscellaneous: +miscellaneous.toFixed(2),
     floorPrice,
-    floorPercent: pct,
+    markupPercent: pct,
   };
 }
 

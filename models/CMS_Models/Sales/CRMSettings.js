@@ -168,6 +168,40 @@ const crmSettingsSchema = new mongoose.Schema(
       ],
     },
 
+    // ── Commercial governance ──────────────────────────────────────────────
+    //
+    // THE PRICING STANDARD, IN ONE PLACE (22 Aug 2026).
+    //
+    // It used to be two numbers that disagreed: `MARGIN_FLOOR = 22` hardcoded
+    // in the frontend (grav-cms/lib/salesJourney/costLedger.js), which drove
+    // every under-margin flag on Cost & Invoicing, and "margin below 15%
+    // requires commercial approval" written into the approval copy on that same
+    // stage. Two rules, one question, and neither was changeable without a
+    // deploy — so "is this deal within the management standard" had no single
+    // answer the business could actually set.
+    //
+    // Now it is one number, owned by whoever administers Sales, and it drives
+    // BOTH: the flag and the approval gate are the same test.
+    commercial: {
+      /**
+       * MARKUP ON COST, as a percentage. The floor price is
+       * `cost × (1 + markupPct/100)` — cost plus this much.
+       *
+       * Deliberately a markup and deliberately not called a margin: 22% markup
+       * on a ₹412 cost is ₹502.64, which realises 18.0% margin. The two are
+       * different numbers and both get called "margin" in conversation, so the
+       * field, the label and the copy all say markup (22 Aug 2026, explicit
+       * decision).
+       *
+       * It is the ONLY pricing figure anyone maintains: the floor price Sales
+       * is shown, and the test a quoted line is judged against, both come from
+       * it. Above 100 is allowed — a 150% markup is a real policy, whereas a
+       * 150% margin is impossible, which is another reason the two must not
+       * share a field.
+       */
+      markupPct: { type: Number, default: 22, min: 0, max: 500 },
+    },
+
     // ── Product / service interest options ─────────────────────────────────
     productInterestOptions: {
       type: [String],

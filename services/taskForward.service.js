@@ -1460,6 +1460,72 @@ async function editTaskDeadline({ taskId, newDueDate, reason, editedBy, editedBy
 // ═════════════════════════════════════════════════════════
 //  11. DELETE TASK (CEO only — recursively deletes children)
 // ═════════════════════════════════════════════════════════
+/**
+ * Close the gap a departed task leaves in somebody's ranks.
+ *
+ * **A rank is a POSITION, and positions do not have holes.** Ranks are handed
+ * out as "your open task count + 1" (`taskForward.js`, the create path), so
+ * they are contiguous the moment they are written — and then a task is deleted
+ * and the numbers around it are left alone. Reported: a queue of two reading
+ * P1 and P3, because the task that had been 2 was gone. Nothing on screen could
+ * explain the missing number, because nothing was missing — 2 had simply left.
+ *
+ * The ACTIVE queue hides this: `assignPriorityRanks` renumbers what it shows,
+ * 1..N with no gaps. Work awaiting acceptance shows the STORED rank instead
+ * (owner decision, 17 Aug), so for that work the hole is visible and permanent.
+ * Rather than teach the display to paper over it, the hole is not left.
+ *
+ * **Order is preserved; only the numbering compacts.** Tasks keep their
+ * sequence — sorted by the rank they had, then by which was raised first — so
+ * this never reorders anybody's work. It is the same operation
+ * `/priority-order` performs, applied to what a deletion left behind.
+ */
+async function _closeRankGaps(employeeId) {
+  if (!employeeId) return 0;
+  const [mine, held] = await Promise.all([
+    db.collection("cowork_tasks").where("assigneeIds", "array-contains", String(employeeId)).get(),
+    db.collection("cowork_tasks").where("pendingAssigneeId", "==", String(employeeId)).get().catch(() => null),
+  ]);
+
+  const TERMINAL = ["done", "cancelled", "tl_final_approved", "ceo_approved", "approved", "completed"];
+  const seen = new Map();
+  for (const d of [...mine.docs, ...((held && held.docs) || [])]) {
+    if (seen.has(d.id)) continue;
+    const t = d.data();
+    if (t.isDeleted || TERMINAL.includes(t.status)) continue;
+    /* A broken-down task is a project, not a queue slot — the same exclusion
+       the queue itself makes. */
+    if ((t.subtaskIds || []).length > 0) continue;
+    seen.set(d.id, {
+      ref: d.ref,
+      rank: Number((t.assigneePriorities || {})[employeeId] ?? t.priority) || 99,
+      createdMs: t.createdAt?.toMillis?.() || Date.parse(t.createdAtISO || "") || 0,
+      current: (t.assigneePriorities || {})[employeeId],
+    });
+  }
+
+  const ordered = [...seen.values()].sort(
+    (a, b) => a.rank - b.rank || a.createdMs - b.createdMs,
+  );
+
+  let changed = 0;
+  await Promise.all(
+    ordered.map((t, i) => {
+      const position = i + 1;
+      if (Number(t.current) === position) return null;
+      changed++;
+      return t.ref
+        .update({
+          [`assigneePriorities.${employeeId}`]: position,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        })
+        .catch((e) => console.warn("[rank-gap] write failed:", e.message));
+    }).filter(Boolean),
+  );
+  if (changed) console.log(`[rank-gap] closed ${changed} gap(s) for ${employeeId}`);
+  return changed;
+}
+
 async function deleteTask({ taskId, deletedBy }) {
   const doc = await db.collection("cowork_tasks").doc(taskId).get();
   if (!doc.exists) throw new Error("Task not found.");
@@ -1491,6 +1557,13 @@ async function deleteTask({ taskId, deletedBy }) {
   }
 
   await deleteRecursive(taskId);
+
+  /* The numbers left behind are now a position short. See `_closeRankGaps`. */
+  for (const holder of [...new Set([...(task.assigneeIds || []), task.pendingAssigneeId].filter(Boolean))]) {
+    await _closeRankGaps(holder).catch((e) =>
+      console.warn(`[rank-gap] could not renumber ${holder}:`, e.message),
+    );
+  }
 
   // Remove from parent's subtaskIds
   if (task.parentTaskId) {
@@ -2420,6 +2493,492 @@ async function ceoReviewCompletion({ taskId, reviewerId, reviewerName, approved,
 }
 
 // ═════════════════════════════════════════════════════════
+//  OUTPUTS — what a task hands over, delivered one at a time
+// ═════════════════════════════════════════════════════════
+/**
+ * An OUTPUT is a thing this task hands to somebody else — "Google Doc —
+ * Gopalpur". A REQUIREMENT is what must be true for this task to be finished.
+ * They are different questions and a task may carry both; overloading
+ * `requirements` for handovers would have made every task's definition of done
+ * get rewritten to suit its consumers.
+ *
+ * Why this exists: a content task covering ten properties is handed over one
+ * property at a time. The designer starts Gopalpur as soon as Gopalpur is
+ * approved, while the writer is still on Puri. A task-level dependency can only
+ * mean "wait for all of it", which is not how the work runs.
+ *
+ * ## Shape, and why it is on the task document
+ *
+ *   outputs: [ { id, label, order, needsOutputIds: [] } ]
+ *   outputSubmissions: { [outputId]: { …completionSubmission, review } }
+ *
+ * `outputs` sits beside `requirements`, which is already an array on the doc.
+ * `outputSubmissions` is `completionSubmission` keyed by output — the SAME
+ * object shape, so every existing reader can be taught it in one place. Ten
+ * outputs is roughly 20KB against Firestore's 1MB limit, so a subcollection
+ * would buy nothing but extra reads and a new security rule.
+ *
+ * ## One review step, because that is this engine's rule
+ *
+ * `_reviewFlow` resolves to the assigner of record, whose approval is FINAL
+ * (owner decision, 16 Aug 2026). There is no chain here and therefore no
+ * mid-stage state: an approval IS the release.
+ */
+
+/** Every output id approved anywhere — what an input is checked against. */
+async function _approvedOutputIds() {
+  const snap = await db.collection("cowork_tasks").where("hasOutputs", "==", true).get();
+  const ids = new Set();
+  snap.forEach((d) => {
+    const t = d.data();
+    const subs = t.outputSubmissions || {};
+    for (const o of t.outputs || []) {
+      if (subs[o.id]?.review?.approved === true) ids.add(o.id);
+    }
+  });
+  return ids;
+}
+
+/**
+ * Every output in the workspace, with its label and whether it is approved.
+ *
+ * **An input is another task's output**, so no single task document can answer
+ * whether its inputs have landed or what they are called. Without this the
+ * screen can only say "an output you cannot see" about a link somebody
+ * deliberately made, and would treat it as never satisfied.
+ *
+ * One query, filtered on `hasOutputs`, rather than a read per link: a task
+ * waiting on three inputs would otherwise cost three round trips to render one
+ * panel.
+ */
+async function listOutputIndex() {
+  const snap = await db.collection("cowork_tasks").where("hasOutputs", "==", true).get();
+  const items = [];
+  snap.forEach((d) => {
+    const t = d.data();
+    const subs = t.outputSubmissions || {};
+    for (const o of t.outputs || []) {
+      items.push({
+        outputId: o.id,
+        label: o.label,
+        taskId: d.id,
+        taskTitle: t.title || "",
+        approved: subs[o.id]?.review?.approved === true,
+      });
+    }
+  });
+  return { items };
+}
+
+/** Can this output be started — is everything it needs approved? */
+function _outputWorkable(output, approvedIds) {
+  return (output.needsOutputIds || []).every((id) => approvedIds.has(id));
+}
+
+/**
+ * Declare what a task hands over.
+ *
+ * The same two people who may edit the task: whoever raised it and whoever
+ * carries it. An output that has already been submitted may be RENAMED but not
+ * removed — its submission and review name it, and deleting it would orphan a
+ * record the score is computed from.
+ */
+async function setTaskOutputs({ taskId, employeeId, outputs = [] }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+
+  const mayEdit =
+    task.assignedBy === employeeId ||
+    task.createdBy === employeeId ||
+    (task.assigneeIds || []).includes(employeeId);
+  if (!mayEdit) throw new Error("Only the person who raised this task or the person carrying it can set its outputs.");
+
+  const subs = task.outputSubmissions || {};
+  const keeping = new Set(outputs.map((o) => o.id).filter(Boolean));
+  const removedWithHistory = (task.outputs || []).filter(
+    (o) => !keeping.has(o.id) && subs[o.id]
+  );
+  if (removedWithHistory.length) {
+    throw new Error(`"${removedWithHistory[0].label}" has already been submitted and cannot be removed.`);
+  }
+
+  const next = outputs.map((o, i) => {
+    const label = String(o.label || "").trim();
+    if (!label) throw new Error("Give the output a name.");
+    const id = o.id || `out_${taskId}_${i}_${Date.now().toString(36)}`;
+    return {
+      id,
+      label,
+      order: i,
+      /* Never itself: an output waiting on its own approval could never be
+         worked on, and nothing would ever clear it. */
+      needsOutputIds: [...new Set(o.needsOutputIds || [])].filter((x) => x !== id),
+    };
+  });
+
+  await ref.update({
+    outputs: next,
+    /* A flag rather than a length check, so `_approvedOutputIds` can query for
+       the tasks that matter instead of reading the whole collection. */
+    hasOutputs: next.length > 0,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return { success: true, taskId, outputs: next };
+}
+
+/**
+ * Hand over ONE output for review.
+ *
+ * The task does not move. Its assignee is still writing the rest, still holds
+ * their queue position, and their clock should keep running — flipping
+ * `completionStatus` to "submitted" on one output would stop all of it.
+ */
+async function submitOutput({ taskId, outputId, employeeId, employeeName, message, imageUrls = [], pdfAttachments = [] }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+  if (!(task.assigneeIds || []).includes(employeeId)) throw new Error("Not assigned to this task.");
+
+  const output = (task.outputs || []).find((o) => o.id === outputId);
+  if (!output) throw new Error("That output does not belong to this task.");
+
+  const approved = await _approvedOutputIds();
+  if (!_outputWorkable(output, approved)) {
+    throw new Error(`"${output.label}" cannot be submitted yet — it is waiting on work that has not been approved.`);
+  }
+
+  const prior = (task.outputSubmissions || {})[outputId];
+  if (prior?.review?.approved === true) throw new Error("That output is already approved.");
+
+  const submission = {
+    submittedBy: employeeId,
+    submittedByName: employeeName,
+    message: message || "",
+    imageUrls,
+    pdfAttachments,
+    submittedAt: new Date().toISOString(),
+    /* Per (task, output). A second try at Gopalpur is attempt 2 OF GOPALPUR —
+       it does not share a counter with Puri, which is what made a single
+       per-task `completionSubmission` unable to express this at all. */
+    attempt: (prior?.attempt || 0) + 1,
+    review: null,
+  };
+
+  await ref.update({
+    [`outputSubmissions.${outputId}`]: submission,
+    /* `reviewFlow` is resolved once and stored, exactly as the task-level path
+       does, so a later change to the routing rule cannot silently re-point work
+       already in flight. */
+    reviewFlow: task.reviewFlow || (await _reviewFlow(task)),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await sendTaskChat({
+    taskId, senderId: employeeId, senderName: employeeName,
+    text: `📤 ${employeeName} submitted "${output.label}" for review.`,
+    messageType: "system",
+  });
+
+  /**
+   * Tell the reviewer, because nothing else will.
+   *
+   * A task-level submission sets `completionStatus: "submitted"`, which is what
+   * every "waiting on you" list keys off. An output submission deliberately
+   * does NOT — the task is still in progress while one piece of it is read — so
+   * without this the work reached the reviewer's queue by no route at all and
+   * simply sat there.
+   *
+   * The recipient is the assigner of record: this engine resolves one reviewer
+   * whose approval is final (owner decision, 16 Aug 2026).
+   */
+  const reviewerId = task.assignedBy || task.createdBy || null;
+  if (reviewerId && reviewerId !== employeeId) {
+    await _notifyMany({
+      recipientIds: [reviewerId],
+      type: "review_requested",
+      title: `📤 Review: ${output.label}`,
+      body: `${employeeName} submitted "${output.label}" from "${task.title}".`,
+      data: { taskId, taskTitle: task.title, outputId, outputLabel: output.label },
+      senderId: employeeId,
+      senderName: employeeName,
+    }).catch(() => {});
+    socket.emitToMany([reviewerId], "task_updated", { taskId });
+  }
+
+  return { success: true, taskId, outputId, attempt: submission.attempt };
+}
+
+/**
+ * Approve or return ONE output.
+ *
+ * Approving releases everything waiting on it, and — when it was the last one —
+ * finishes the task through the SAME write `reviewCompletion` performs. There
+ * is deliberately no second, task-level review afterwards: it would ask this
+ * reviewer to approve work they have already approved a piece at a time, and a
+ * review that can only ever approve measures nothing.
+ */
+async function reviewOutput({ taskId, outputId, reviewerId, reviewerName, approved, note = "" }) {
+  const ref = db.collection("cowork_tasks").doc(taskId);
+  const doc = await ref.get();
+  if (!doc.exists) throw new Error("Task not found.");
+  const task = doc.data();
+
+  const output = (task.outputs || []).find((o) => o.id === outputId);
+  if (!output) throw new Error("That output does not belong to this task.");
+  const submission = (task.outputSubmissions || {})[outputId];
+  if (!submission) throw new Error("That output has not been submitted.");
+  if (submission.review) throw new Error("That output has already been decided.");
+  if (submission.submittedBy === reviewerId) throw new Error("You cannot review your own submission.");
+
+  const review = {
+    reviewedBy: reviewerId,
+    reviewedByName: reviewerName,
+    approved: !!approved,
+    note: note || "",
+    reviewedAt: new Date().toISOString(),
+  };
+
+  const updates = {
+    [`outputSubmissions.${outputId}.review`]: review,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  /**
+   * Rework counts FRACTIONALLY.
+   *
+   * C1 is `1.0 − 0.2 × reworksReceived` against a base of one per task, so
+   * counting each returned output as a whole rework would let five returns on a
+   * ten-output task zero a score that a one-output task could only reach by
+   * being wrong five times over. The task keeps the value it already has and
+   * its outputs divide it: one of ten returned costs a tenth.
+   *
+   * `etcHours` still carries the weight between tasks, untouched — so nobody
+   * can inflate their share by splitting an assignment more finely.
+   */
+  if (!approved) {
+    const total = (task.outputs || []).length || 1;
+    updates.outputReworkUnits = admin.firestore.FieldValue.increment(1 / total);
+  }
+
+  const allApproved =
+    approved &&
+    (task.outputs || []).every((o) =>
+      o.id === outputId ? true : (task.outputSubmissions || {})[o.id]?.review?.approved === true
+    );
+
+  if (allApproved) {
+    /* The same write the task-level approval performs — see `reviewCompletion`
+       under `tl_final`. Reusing it keeps one definition of "this task is done"
+       rather than a second that could drift from it. */
+    updates.completionStatus = "tl_final_approved";
+    updates.status = "done";
+    updates.progressPercent = 100;
+    updates.tlReview = { reviewedBy: reviewerId, reviewedByName: reviewerName, approved: true, reviewedAt: review.reviewedAt };
+  }
+
+  await ref.update(updates);
+
+  await sendTaskChat({
+    taskId, senderId: reviewerId, senderName: reviewerName,
+    text: approved
+      ? `✅ ${reviewerName} approved "${output.label}".`
+      : `↩️ ${reviewerName} returned "${output.label}"${note ? `: ${note}` : "."}`,
+    messageType: "system",
+  });
+
+  if (approved) await _releaseOutputDependents(outputId, output.label, reviewerId, reviewerName);
+
+  if (allApproved) {
+    const allIds = [...new Set([...(task.assigneeIds || []), task.assignedBy].filter((id) => id && id !== reviewerId))];
+    await _notifyMany({
+      recipientIds: allIds, type: "completion_ceo_approved",
+      title: `✅ Complete: ${task.title}`,
+      body: `All ${(task.outputs || []).length} outputs approved. Task is done!`,
+      data: { taskId, taskTitle: task.title }, senderId: reviewerId, senderName: reviewerName,
+    });
+    socket.emitToMany(allIds, "task_completed", { taskId });
+    if (task.parentTaskId) await _syncParentProgress(task.parentTaskId);
+  }
+
+  return { success: true, taskId, outputId, approved: !!approved, taskCompleted: !!allApproved };
+}
+
+/**
+ * Tell whoever was waiting on an output that they can start.
+ *
+ * Nothing is written to the waiting task: being blocked is DERIVED from whether
+ * its inputs are approved, so approving the input IS the release. This only
+ * makes the consequence visible to the people it affects.
+ */
+/**
+ * Tell somebody their P1 changed.
+ *
+ * **Deduped on the task id, not on a clock.** The queue is derived on every
+ * page load, so the honest trigger — "what is first has changed" — would
+ * otherwise fire continuously for a queue that has not changed at all. The last
+ * id we announced is remembered against the employee, so this sends when the
+ * TOP genuinely moves and stays silent otherwise, however often it is asked.
+ *
+ * That is also what makes it safe to call from three different places: a block
+ * demoting a task, an approval handing the slot back, and a manual reorder all
+ * ask the same question, and only one of them can be the first to answer it.
+ *
+ * `senderId: "system"` because nobody did this TO them — a blocked P1 is a
+ * consequence of somebody else's work not being ready, not an instruction.
+ */
+async function _notifyP1Changed({ employeeId, p1TaskId, cause }) {
+  if (!employeeId || !p1TaskId) return false;
+  const empRef = db.collection("cowork_employees").doc(String(employeeId));
+  const empSnap = await empRef.get();
+  if (!empSnap.exists) return false;
+  /* Already announced. The overwhelmingly common case on a queue that is being
+     re-derived rather than re-ordered. */
+  if (empSnap.data().p1NotifiedTaskId === p1TaskId) return false;
+
+  const taskSnap = await db.collection("cowork_tasks").doc(String(p1TaskId)).get();
+  if (!taskSnap.exists) return false;
+  const title = taskSnap.data().title || p1TaskId;
+
+  await empRef.update({
+    p1NotifiedTaskId: p1TaskId,
+    p1NotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await _notifyMany({
+    recipientIds: [String(employeeId)],
+    type: "p1_changed",
+    title: "🔺 Your P1 changed",
+    body: cause
+      ? `"${title}" is now first — ${cause}`
+      : `"${title}" is now first. Check the top of your list before you carry on.`,
+    data: { taskId: String(p1TaskId), taskTitle: title, employeeId: String(employeeId) },
+    senderId: "system",
+    senderName: "CoWork",
+  }).catch(() => {});
+  console.log(`[P1-SVC] announced new P1 for ${employeeId}: ${p1TaskId} (${title})`);
+  return true;
+}
+
+/**
+ * Keep this person's deadlines in step with the order actually shown.
+ *
+ * **The dependency feature does one thing: it swaps priority.** Everything
+ * about deadlines is the engine's own — anchors from `resolveAcceptanceAnchor`,
+ * dates from `addWorkingSecsIST`, chaining from `rechainQueueFor`. There is no
+ * separate deadline rule for blocked work and there must not be one: a blocked
+ * task drops to P2, and the ordinary chain then anchors it after the task that
+ * overtook it. That IS the clock stopping while the input is unavailable, paid
+ * for by the swap rather than by a second mechanism arguing with the first.
+ *
+ * (An earlier version pushed a blocked task's deadline out directly and gave it
+ * back on approval. It computed the same answer twice, from two anchors, and
+ * the two disagreed the moment either side moved.)
+ *
+ * `rechainQueueFor` writes only where a date actually changes, so a queue
+ * already correct costs one read and no writes.
+ */
+async function restoreUnblockedDeadlines({ employeeId, effectiveP1TaskId = null }) {
+  if (!employeeId) return { rechained: 0 };
+
+  /* The caller derived the queue, so it knows what is actually first — this
+     side never re-derives it, which is what keeps one answer to that question.
+     Deduped, so a queue merely being re-read announces nothing. */
+  let announced = false;
+  if (effectiveP1TaskId) {
+    announced = await _notifyP1Changed({
+      employeeId,
+      p1TaskId: effectiveP1TaskId,
+      cause: null,
+    }).catch(() => false);
+  }
+
+  let rechained = [];
+  try {
+    const { rechainQueueFor } = require("./officeDeadline.service");
+    rechained = await rechainQueueFor(employeeId);
+    if (rechained.length)
+      console.log(`[P1-SVC] re-chained ${rechained.length} deadline(s) for ${employeeId}`);
+  } catch (e) {
+    /* A queue that could not be re-chained is a wrong date to fix next load,
+       never a reason to fail the read that asked. */
+    console.warn(`[P1-SVC] re-chain failed for ${employeeId}:`, e.message);
+  }
+
+  return { rechained: rechained.length, announcedP1: announced };
+}
+
+/**
+ * Everyone whose queue this approval just changed.
+ *
+ * **An approval reorders somebody ELSE's day.** That is the whole point of a
+ * dependency: Umung approves an output and Rakesh's blocked task becomes
+ * workable, so it climbs back and his dates move with it. Until now this
+ * function told him and stopped there — his order and deadlines stayed frozen
+ * in the blocked arrangement until he happened to open a task list and the
+ * throttled sync fired.
+ *
+ * Reported exactly that way: Dev stored P1 and workable again, still sitting at
+ * effective P2 with the early slot given to Cowork, hours after its input
+ * landed.
+ *
+ * The re-chain is the engine's own `rechainQueueFor` — no deadline is computed
+ * here. That distinction is what makes this safe where the earlier
+ * push-and-give-back pair was not: this asks the one chain to re-walk, rather
+ * than being a second opinion about dates.
+ */
+async function _rechainAffected(employeeIds) {
+  const unique = [...new Set(employeeIds.filter(Boolean))];
+  if (!unique.length) return;
+  const { rechainQueueFor } = require("./officeDeadline.service");
+  for (const id of unique) {
+    try {
+      const moved = await rechainQueueFor(id);
+      if (moved.length)
+        console.log(`[outputs] approval re-chained ${moved.length} deadline(s) for ${id}`);
+    } catch (e) {
+      /* A queue that could not be re-walked is a wrong date to fix on the next
+         load, never a reason to fail the approval that has already been saved. */
+      console.warn(`[outputs] re-chain failed for ${id}:`, e.message);
+    }
+  }
+}
+
+async function _releaseOutputDependents(outputId, label, actorId, actorName) {
+  const snap = await db.collection("cowork_tasks").where("hasOutputs", "==", true).get();
+  const approved = await _approvedOutputIds();
+  /* Collected across the loop and re-walked once each — a person holding two
+     freed tasks must not have their queue walked twice. */
+  const affected = [];
+  for (const d of snap.docs) {
+    const t = d.data();
+    if (t.status === "done" || t.completionStatus === "tl_final_approved") continue;
+    const freed = (t.outputs || []).filter(
+      (o) => (o.needsOutputIds || []).includes(outputId) && _outputWorkable(o, approved)
+    );
+    if (!freed.length) continue;
+    /* Their ORDER changed whether or not there is anybody to notify — a
+       self-assigned task frees nobody but still climbs the queue. */
+    affected.push(...(t.assigneeIds || []));
+
+    const recipients = [...new Set((t.assigneeIds || []).filter((id) => id && id !== actorId))];
+    if (!recipients.length) continue;
+    await _notifyMany({
+      recipientIds: recipients, type: "task_unblocked",
+      title: `▶️ Ready to start: ${freed[0].label}`,
+      body: `"${label}" was approved, so you can begin.`,
+      data: { taskId: d.id, taskTitle: t.title, outputId: freed[0].id },
+      senderId: actorId, senderName: actorName,
+    }).catch(() => {});
+  }
+
+  /* After the loop, so one person holding several freed tasks is walked once. */
+  await _rechainAffected(affected);
+}
+
+// ═════════════════════════════════════════════════════════
 //  15. UPDATE PARENT TASK PROGRESS (TL pushes to CEO)
 // ═════════════════════════════════════════════════════════
 async function updateParentTaskProgress({ parentTaskId, updatedBy, updatedByName, note }) {
@@ -3086,6 +3645,12 @@ async function getDraftChat(taskId, limit = 100) {
 }
 
 // ── P1 CONFLICT CHECK — called from frontend timer start ──────────────────────
+//
+// `trigger` names WHY the cascade is running, and there are two answers.
+//
+//  · "p1_conflict_check" — the original. Somebody started or dragged a P1, so
+//    everything below it waits for that P1 and its deadlines move out once.
+//    A drag fires this repeatedly, which is what the 2-minute dedup is for.
 async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assignedByName, newP1Priority, reason, oldPriorities, newPriorities }) {
   try {
     const p1Snap = await db.collection("cowork_tasks").doc(newP1TaskId).get();
@@ -3323,6 +3888,11 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
 
     if (!extendedResults.length) { console.log("[P1-conflict] no tasks needed extension"); return null; }
 
+    /* The dependency feature's ONLY effect here: whatever now leads this
+       person's queue is announced to them. No deadline rule of its own — the
+       swap does that through the ordinary chain. */
+    await _notifyP1Changed({ employeeId, p1TaskId: newP1TaskId, cause: null }).catch(() => {});
+
     const empSnap = await db.collection("cowork_employees").doc(employeeId).get();
     const empName = empSnap.exists ? (empSnap.data().name || employeeId) : employeeId;
 
@@ -3346,6 +3916,13 @@ async function checkAndExtendForP1({ newP1TaskId, employeeId, assignedBy, assign
 }
 
 module.exports = {
+  _closeRankGaps,
+  _notifyP1Changed,
+  restoreUnblockedDeadlines,
+  listOutputIndex,
+  setTaskOutputs,
+  submitOutput,
+  reviewOutput,
   declineAssignment,
   setActiveTaskBudget,
   validateReworkRequirements,

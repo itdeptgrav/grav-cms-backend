@@ -35,7 +35,8 @@ const getGSTPercentage = (unitPrice) => {
 };
 
 // ─── QUOTATION ↔ REQUEST STATUS MACHINE ───────────────────────────────────────
-// There is exactly ONE quotation per request (request.quotations[0]). Its status
+// request.quotations[0] is the CURRENT quotation. Superseded rounds live in
+// request.quotationRevisions (see POST .../quotation/revise). Its status
 // is the single source of truth; request.status is a projection of it. Every
 // place that touches either one must go through the helpers below, otherwise a
 // plain re-save of the quotation silently drops the request back to
@@ -1168,6 +1169,102 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
 });
 
 // UPDATE quotation
+// ─── REVISE ───────────────────────────────────────────────────────────────────
+// Open the next round of a negotiation.
+//
+// A quotation that has gone to a customer is a statement of what we offered on
+// a date. Editing it in place — which is what POST .../quotation does, and all
+// it could do while a request held exactly one — erases that: the price they
+// rejected, the date it went out and their reason all vanish behind the new
+// number, and nobody can answer "what did we quote them in August".
+//
+// So the current round is ARCHIVED WHOLE into `quotationRevisions` and
+// `quotations[0]` becomes a fresh draft carrying the same lines forward. Index
+// 0 stays the current quotation, which is what every other reader in this
+// codebase already assumes — the accountant module, the dashboard, send,
+// approve and reject all keep working untouched.
+//
+// A DRAFT IS NOT REVISED, it is edited. Revising one would archive a round the
+// customer never saw and burn a revision number on nothing.
+router.post("/requests/:requestId/quotation/revise", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { reason } = req.body || {};
+
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!request.quotations.length) {
+      return res.status(400).json({ success: false, message: "There is no quotation to revise" });
+    }
+
+    const current = request.quotations[0];
+    if (current.status === "draft") {
+      return res.status(400).json({
+        success: false,
+        message: "This quotation is still a draft — edit it rather than revising it.",
+      });
+    }
+
+    // Snapshot first. `toObject` so the archived copy is detached from the
+    // subdocument we are about to overwrite.
+    const archived = current.toObject();
+    const archivedId = archived._id;
+    request.quotationRevisions.push(archived);
+
+    const nextRevision = (current.revision || 1) + 1;
+    // Strip any existing -R<n> so numbers read QT-REQ-001-R2, never -R2-R3.
+    const base = String(current.quotationNumber || "").replace(/-R\d+$/, "");
+
+    // The new round starts from the last offer: same lines, same terms. That is
+    // what a negotiation is — one figure moves, not the whole document.
+    current.revision = nextRevision;
+    current.revisionReason = (reason || "").trim() || undefined;
+    current.supersedesQuotationId = archivedId;
+    current.quotationNumber = `${base}-R${nextRevision}`;
+    current.status = "draft";
+    current.date = new Date();
+
+    // Everything the previous round earned belongs to the previous round.
+    current.sentToCustomerAt = undefined;
+    current.sentBy = undefined;
+    current.customerApproval = undefined;
+    current.salesApproval = undefined;
+    current.accountantApproval = undefined;
+    current.paymentSubmissions = [];
+
+    await request.save();
+
+    res.json({
+      success: true,
+      message: `Revision ${nextRevision} opened`,
+      quotation: request.quotations[0],
+      revisions: request.quotationRevisions,
+    });
+  } catch (error) {
+    console.error("Error revising quotation:", error);
+    res.status(500).json({ success: false, message: "Server error while revising quotation" });
+  }
+});
+
+// ─── REVISION HISTORY ─────────────────────────────────────────────────────────
+// Read-only. The current round plus every round it replaced, oldest first.
+router.get("/requests/:requestId/quotation/revisions", async (req, res) => {
+  try {
+    const request = await CustomerRequest.findById(req.params.requestId)
+      .select("quotations quotationRevisions requestId")
+      .lean();
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    res.json({
+      success: true,
+      current: request.quotations?.[0] || null,
+      revisions: request.quotationRevisions || [],
+    });
+  } catch (error) {
+    console.error("Error loading quotation revisions:", error);
+    res.status(500).json({ success: false, message: "Server error while loading revisions" });
+  }
+});
+
 router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
   try {
     const { requestId, quotationId } = req.params;

@@ -3,12 +3,14 @@
 const express = require("express");
 const router = express.Router();
 const Measurement = require("../../../models/Customer_Models/Measurement");
+const { rosterFor, rosterAgrees } = require("../../../services/personRoster");
 const Customer = require("../../../models/Customer_Models/Customer");
 const EmployeeMpc = require("../../../models/Customer_Models/Employee_Mpc");
 const StockItem = require("../../../models/CMS_Models/Inventory/Products/StockItem");
 const MeasurementCategory = require("../../../models/CMS_Models/Configurations/MeasurementCategory");
 const EmployeeAuthMiddleware = require("../../../Middlewear/EmployeeAuthMiddlewear");
 const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
+const { nextRequestId } = require("../../../services/requestId");
 const mongoose = require("mongoose");
 
 router.use(EmployeeAuthMiddleware);
@@ -1976,6 +1978,10 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
             employeeCount: 0,
             totalQuantity: 0,
             employeeNames: [],
+            // The people behind this line, kept so the order can say WHO its
+            // quantity is. `employeeNames` above was already collected and then
+            // silently dropped by the schema, which is how identity was lost.
+            contributors: [],
           });
         }
 
@@ -1983,6 +1989,7 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
         pd.employeeCount++;
         pd.totalQuantity += quantity;
         pd.employeeNames.push(emp.employeeName);
+        pd.contributors.push({ employee: emp, quantity });
       }
     }
 
@@ -1993,8 +2000,23 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
         .json({ success: false, message: "No valid products found for PO" });
 
     // ── Create CustomerRequest ─────────────────────────────────────────────
-    const requestCount = await CustomerRequest.countDocuments();
-    const requestId = `REQ-${new Date().getFullYear()}-${String(requestCount + 1).padStart(4, "0")}`;
+    // A roster that does not add up to the line beside it is a silent billing
+    // discrepancy — the invoice says 12 and the people say 11 — and is worse
+    // than no roster, because it looks authoritative. Refuse rather than write.
+    for (const p of products) {
+      const roster = rosterFor(p.contributors);
+      if (!rosterAgrees(roster, p.totalQuantity)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            `Could not account for every garment on "${p.stockItemName}": the line is `
+            + `${p.totalQuantity} but the people on it add up to `
+            + `${roster.reduce((n, r) => n + r.quantity, 0)}. Nothing has been converted.`,
+        });
+      }
+    }
+
+    const requestId = await nextRequestId(CustomerRequest);
 
     const validatedItems = products.map((p) => ({
       stockItemId: p.stockItemId,
@@ -2013,6 +2035,11 @@ router.post("/:measurementId/convert-to-po", async (req, res) => {
           quantity: p.totalQuantity,
           specialInstructions: [],
           estimatedPrice: p.totalQuantity * p.unitPrice,
+          // AGGREGATE FOR PRICE, ITEMISE FOR TRACEABILITY. The line keeps one
+          // quantity and one price; the roster says which people that quantity
+          // is made of, so "did we bill Ramesh?" is a query rather than an
+          // excavation through the drive.
+          persons: rosterFor(p.contributors),
         },
       ],
       totalQuantity: p.totalQuantity,
