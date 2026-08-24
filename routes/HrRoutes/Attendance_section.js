@@ -6,6 +6,7 @@ const router = express.Router();
 const ExcelJS = require("exceljs");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
+const { resolveShift } = require("../../services/shiftPolicy");
 const Employee = require("../../models/Employee");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 
@@ -311,6 +312,23 @@ function resolveEmployeeType(emp, settings) {
     const t = String(emp.employeeType).toLowerCase();
     if (t === "operator" || t === "executive") return t;
   }
+  // The employee's shift category settles the punch pattern too. Core is the
+  // office 2-punch day and General the production 6-punch one; Custom is the
+  // only one that has to be told, and it is told once in attendance settings
+  // rather than read off anybody's department.
+  const mode = emp?.workShift?.mode;
+  if (mode === "core") return "executive";
+  if (mode === "general") return "operator";
+  if (mode === "custom") {
+    return settings.shifts?.custom?.punchPattern === "production"
+      ? "operator"
+      : "executive";
+  }
+  // Below here is the pre-categories fallback, and it should never fire:
+  // scripts/backfillWorkShift.js gives every existing employee a mode and the
+  // employee form requires one. It stays for anyone the backfill has not
+  // reached yet, so their day is classified the way it was yesterday instead
+  // of silently becoming an office day.
   const designation = extractDesignation(emp);
   const department = extractDepartment(emp).toUpperCase().trim();
   const opDesigs = settings.operatorDesignations || [],
@@ -330,6 +348,50 @@ function resolveEmployeeType(emp, settings) {
   if (coreDepts.has(department)) return "operator";
   if (genDepts.has(department)) return "executive";
   return "executive";
+}
+
+/**
+ * The shift an employee is judged against.
+ *
+ * Every call site in this file used to do `settings.shifts[empType]`, where
+ * empType came from their department — so a housekeeper on 06:00-14:00 was
+ * still measured against 09:30-18:30 and marked early-out every day. Worse,
+ * setting their shift on the employee form changed nothing, because none of
+ * these paths ever looked at it. That is the "resync did not apply it" report:
+ * the sync writes the right shift now, but the HR routes that recompute and
+ * display the day were still deriving their own.
+ *
+ * One helper, so there is one answer. Returns the same {start, end,
+ * lateGraceMins, halfDayThresholdMins, otGraceMins} shape those call sites
+ * already expect, so nothing downstream changes.
+ */
+function shiftFor(emp, settings) {
+  return resolveShift(emp || {}, settings);
+}
+
+/**
+ * Rebuild a full shift from the hours stored on an attendance entry.
+ *
+ * The merge path has the entry but not the employee, and the entry records
+ * only shiftStart and shiftEnd. Those hours can have come from exactly three
+ * places, so matching them back identifies which — and that matters, because
+ * the merge reads lateGraceMins as well as the times. Taking the grace from
+ * whichever profile happened to be handy is how a General employee gets an
+ * office grace period.
+ */
+function shiftFromStoredTimes(entry, settings) {
+  const start = entry?.shiftStart;
+  const end = entry?.shiftEnd;
+  const shifts = settings.shifts || {};
+  if (!start || !end) return resolveShift({}, settings);
+
+  for (const key of ["executive", "operator"]) {
+    const p = shifts[key];
+    if (p && p.start === start && p.end === end) return { ...p };
+  }
+  // Neither preset matches, so these hours are somebody's custom ones and the
+  // custom profile holds their rules.
+  return { ...(shifts.custom || {}), start, end };
 }
 
 function shiftMidpointMins(shift) {
@@ -857,8 +919,9 @@ async function smartSaveDay(
     );
     const hasHROverride = !!(old.hrFinalStatus || old.hrRemarks);
     if (!hasManualPunches && !hasHROverride) return fresh;
-    const empType = fresh.employeeType || "operator";
-    const shift = settings.shifts[empType] || settings.shifts.executive;
+    // fresh was built moments ago with this employee's own shift and carries
+    // the hours. Re-deriving from their department here would undo that.
+    const shift = shiftFromStoredTimes(fresh, settings);
     return mergeEmployeeEntry(fresh, old, shift, isToday);
   });
   const freshBids = new Set(freshEmployees.map((e) => e.biometricId));
@@ -1004,7 +1067,7 @@ async function syncDay(dateStr, empCode = "ALL") {
       identityId = extractIdentity(g.employee);
       numericId = numericOf(g.biometricId);
     }
-    const shift = settings.shifts[employeeType] || settings.shifts.executive;
+    const shift = shiftFor(g.isGhost ? null : g.employee, settings);
     const extraGrace = graceAppliesTo(employeeType, settings)
       ? yesterdayOt.get(g.biometricId) || 0
       : 0;
@@ -1046,7 +1109,7 @@ async function syncDay(dateStr, empCode = "ALL") {
       const key = String(bid).toUpperCase();
       if (seenBiometricIds.has(key)) continue;
       const empType = resolveEmployeeType(emp, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(emp, settings);
       employees.push({
         employeeDbId: emp._id,
         biometricId: key,
@@ -1320,7 +1383,7 @@ async function syncDayForce(dateStr, empCode = "ALL") {
       identityId = extractIdentity(g.employee);
       numericId = numericOf(g.biometricId);
     }
-    const shift = settings.shifts[employeeType] || settings.shifts.executive;
+    const shift = shiftFor(g.isGhost ? null : g.employee, settings);
     const extraGrace = graceAppliesTo(employeeType, settings)
       ? yesterdayOt.get(g.biometricId) || 0
       : 0;
@@ -1362,7 +1425,7 @@ async function syncDayForce(dateStr, empCode = "ALL") {
       const key = String(bid).toUpperCase();
       if (seenBids.has(key)) continue;
       const empType = resolveEmployeeType(emp, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(emp, settings);
       employees.push({
         employeeDbId: emp._id,
         biometricId: key,
@@ -2039,7 +2102,7 @@ async function applyRegularizationToAttendance(r, actor = {}) {
   // nothing new to derive from, and recomputing would churn the day for nothing.
   if (punchChanges.length > 0) {
     const settings = await AttendanceSettings.getConfig();
-    const shift = settings.shifts[emp.employeeType] || settings.shifts.executive;
+    const shift = shiftFor(emp, settings);
     const shiftStart = hhmmMins(shift.start),
       shiftEnd = hhmmMins(shift.end),
       inMins = minsOf(emp.inTime),
@@ -2409,7 +2472,7 @@ async function getDailyAttendance(date, department) {
         )
           continue;
         const empType = resolveEmployeeType(emp, settings);
-        const shift = settings.shifts[empType] || settings.shifts.executive;
+        const shift = shiftFor(emp, settings);
         absentEntries.push({
           employeeDbId: emp._id,
           biometricId: bid,
@@ -2647,6 +2710,7 @@ function buildSettingsChanges(oldCfg, body) {
     );
     diff("Custom half-day measured on", oc.halfDayBasis, cs.halfDayBasis);
     diff("Custom OT grace (mins)", oc.otGraceMins, cs.otGraceMins);
+    diff("Custom punch pattern", oc.punchPattern, cs.punchPattern);
   }
   const nwd = body.nonWorkingDay;
   if (nwd) {
@@ -3452,7 +3516,7 @@ router.get("/employee-detail", EmployeeAuthMiddlewear, async (req, res) => {
 
     if (!empMeta && empDoc) {
       const empType = resolveEmployeeType(empDoc, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(empDoc, settings);
       empMeta = {
         employeeName: extractName(empDoc),
         department: extractDepartment(empDoc),
@@ -6825,7 +6889,7 @@ router.get("/timecard", EmployeeAuthMiddlewear, async (req, res) => {
     }
     if (!empMeta && empDoc) {
       const empType = resolveEmployeeType(empDoc, settings);
-      const shift = settings.shifts[empType] || settings.shifts.executive;
+      const shift = shiftFor(empDoc, settings);
       empMeta = {
         employeeName: extractName(empDoc),
         department: extractDepartment(empDoc),
@@ -8175,8 +8239,9 @@ module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
 module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
 module.exports.syncTodayOnly = syncTodayOnly;
 // Exported so Access Control can filter employees by operator/executive using
-// the SAME policy HR configures here (designation lists, department
-// categories) rather than a second, drifting copy of the rules.
+// the SAME policy attendance does — the employee's own shift category, and for
+// Custom the punch pattern in attendance settings — rather than a second,
+// drifting copy of the rules.
 module.exports.resolveEmployeeType = resolveEmployeeType;
 // Exported so the read-only Daily Attendance AI assistant builds its context
 // from the SAME computation the HR daily page uses, rather than a second copy.
