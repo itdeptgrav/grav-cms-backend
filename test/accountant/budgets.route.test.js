@@ -1200,14 +1200,21 @@ describe("department budget requests", () => {
     expect(stored.budgetRequests).toHaveLength(0);
   });
 
-  test.each(["countered", "agreed"])(
+  test.each([
+    ["countered", "counter", { counterAmount: 100000 }],
+    ["agreed", "agree", {}],
+  ])(
     "a %s request cannot be withdrawn — that would erase finance's side",
-    async (state) => {
+    async (_state, action, body) => {
       const { company, budget, request } = await seedOneRequest();
-      await call(`/${budget._id}/requests/${request._id}?companyId=${company._id}`, {
-        method: "PUT",
-        body: { state },
-      });
+      // Reached through the real finance action. This test used to set `state`
+      // via PUT, which Chunk 3 refuses outright — the setup was exploiting the
+      // very hole that chunk closed.
+      const review = await call(
+        `/${budget._id}/requests/${request._id}/${action}?companyId=${company._id}`,
+        { method: "POST", body },
+      );
+      expect(review.status).toBe(200);
 
       const { status } = await call(
         `/${budget._id}/requests/${request._id}?companyId=${company._id}`,
@@ -1219,4 +1226,452 @@ describe("department budget requests", () => {
       expect(stored.budgetRequests).toHaveLength(1);
     },
   );
+});
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Chunk 3 — FINANCE REVIEW & APPROVED ALLOCATIONS
+ *
+ * Agreeing is the moment an ask becomes money: it writes a real line into
+ * items[], which totals, actuals and variance all read. These tests pin both
+ * that it happens and that nothing SHORT of it does.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("finance review", () => {
+  let seq = 0;
+
+  async function setup({ budgetStatus = "collecting" } = {}) {
+    const seeded = await seedCompany();
+    const budget = await Acc_Budget.create({
+      budgetId: `BUD-C3-${seq++}-${Math.random().toString(36).slice(2, 8)}`,
+      name: "Reviewable",
+      financialYear: "2026-27",
+      period: "yearly",
+      status: budgetStatus,
+      startDate: new Date("2026-04-01"),
+      endDate: new Date("2027-03-31"),
+      companyId: seeded.company._id,
+      createdBy: OWNER.id,
+      items: [],
+    });
+    const q = `?companyId=${seeded.company._id}`;
+    const made = await call(`/${budget._id}/requests${q}`, {
+      method: "POST",
+      body: {
+        department: "Logistics",
+        ledgerId: seeded.expenseLedger._id.toString(),
+        requestedAmount: 300000,
+        priority: "high",
+        purpose: "Export freight for the Diwali peak",
+      },
+    });
+    return { ...seeded, budget, q, request: made.body.request };
+  }
+
+  /* ── The Chunk 2 hole, closed ──────────────────────────────────────────── */
+
+  test.each(["state", "agreedAmount", "counterAmount", "financeNote"])(
+    "ordinary PUT cannot set %s",
+    async (field) => {
+      const { budget, q, request } = await setup();
+      const value = field === "state" ? "agreed" : field === "financeNote" ? "ok by me" : 999999;
+
+      const { status, body } = await call(`/${budget._id}/requests/${request._id}${q}`, {
+        method: "PUT",
+        body: { [field]: value },
+      });
+      expect(status).toBe(403);
+      expect(body.message).toMatch(/finance review/i);
+
+      const stored = await Acc_Budget.findById(budget._id).lean();
+      const row = stored.budgetRequests[0];
+      expect(row.state).toBe("submitted");
+      expect(row[field] == null || row[field] === "submitted").toBe(true);
+      // And critically: no allocation was conjured.
+      expect(stored.items).toHaveLength(0);
+      expect(stored.totalAllocated).toBe(0);
+    },
+  );
+
+  test("a requester still cannot self-agree even alongside legitimate edits", async () => {
+    const { budget, q, request } = await setup();
+    const { status } = await call(`/${budget._id}/requests/${request._id}${q}`, {
+      method: "PUT",
+      body: { purpose: "Updated purpose", state: "agreed", agreedAmount: 500000 },
+    });
+    expect(status).toBe(403);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    // The legitimate half must not sneak through either — the whole write is
+    // refused, not partially applied.
+    expect(stored.budgetRequests[0].purpose).toMatch(/Diwali/);
+    expect(stored.items).toHaveLength(0);
+  });
+
+  test("ordinary edits still work — the lockdown is targeted, not a freeze", async () => {
+    const { budget, q, request } = await setup();
+    const { status, body } = await call(`/${budget._id}/requests/${request._id}${q}`, {
+      method: "PUT",
+      body: { requestedAmount: 350000, priority: "critical" },
+    });
+    expect(status).toBe(200);
+    expect(body.request.requestedAmount).toBe(350000);
+    expect(body.request.priority).toBe("critical");
+  });
+
+  /* ── Agree ─────────────────────────────────────────────────────────────── */
+
+  test("agreeing creates an approved allocation carrying the request's head", async () => {
+    const { budget, q, request, expenseLedger } = await setup();
+    const { status, body } = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST",
+      body: { agreedAmount: 275000, financeNote: "Trimmed to last year's actual." },
+    });
+    expect(status).toBe(200);
+    expect(body.created).toBe(true);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests[0].state).toBe("agreed");
+    expect(stored.budgetRequests[0].agreedAmount).toBe(275000);
+    expect(stored.budgetRequests[0].financeNote).toMatch(/Trimmed/);
+
+    expect(stored.items).toHaveLength(1);
+    const item = stored.items[0];
+    expect(item.allocatedAmount).toBe(275000);
+    expect(String(item.ledgerId)).toBe(String(expenseLedger._id));
+    expect(item.ledgerName).toBe("Freight & Forwarding");
+    expect(item.groupName).toBe("Indirect Expenses");
+    expect(item.nature).toBe("expense");
+    expect(item.department).toBe("Logistics");
+    expect(String(item.sourceRequestId)).toBe(String(request._id));
+    // The reason travels with the line — it explains the number later.
+    expect(item.notes).toMatch(/Diwali/);
+  });
+
+  test("agreeing without an amount agrees what was requested", async () => {
+    const { budget, q, request } = await setup();
+    const { status } = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST",
+      body: {},
+    });
+    expect(status).toBe(200);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests[0].agreedAmount).toBe(300000);
+    expect(stored.items[0].allocatedAmount).toBe(300000);
+  });
+
+  test("totals update when an allocation is approved", async () => {
+    const { budget, q, request } = await setup();
+    const before = await Acc_Budget.findById(budget._id).lean();
+    expect(before.totalAllocated).toBe(0);
+
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST",
+      body: { agreedAmount: 275000 },
+    });
+
+    const after = await Acc_Budget.findById(budget._id).lean();
+    expect(after.totalAllocated).toBe(275000);
+    expect(after.totalExpenseAllocated).toBe(275000);
+    expect(after.totalRevenueAllocated).toBe(0);
+  });
+
+  test("a revenue request allocates to the revenue side of the totals", async () => {
+    const seeded = await seedCompany();
+    const budget = await Acc_Budget.create({
+      budgetId: `BUD-C3-REV-${seq++}`,
+      name: "Rev", financialYear: "2026-27", period: "yearly", status: "collecting",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: seeded.company._id, createdBy: OWNER.id, items: [],
+    });
+    const q = `?companyId=${seeded.company._id}`;
+    const made = await call(`/${budget._id}/requests${q}`, {
+      method: "POST",
+      body: {
+        department: "Sales",
+        ledgerId: seeded.revenueLedger._id.toString(),
+        requestedAmount: 4000000,
+        purpose: "Export target",
+      },
+    });
+    await call(`/${budget._id}/requests/${made.body.request._id}/agree${q}`, {
+      method: "POST", body: {},
+    });
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.totalRevenueAllocated).toBe(4000000);
+    expect(stored.totalExpenseAllocated).toBe(0);
+    expect(stored.items[0].nature).toBe("revenue");
+  });
+
+  test("agreeing the SAME request twice updates one line, never duplicates", async () => {
+    const { budget, q, request } = await setup();
+
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST", body: { agreedAmount: 300000 },
+    });
+    const second = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST", body: { agreedAmount: 400000 },
+    });
+    expect(second.body.created).toBe(false);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.items).toHaveLength(1); // not 2 — and not 700000 allocated
+    expect(stored.items[0].allocatedAmount).toBe(400000);
+    expect(stored.totalAllocated).toBe(400000);
+  });
+
+  test("two SEPARATE requests on the same head stay separate lines", async () => {
+    const { budget, q, expenseLedger } = await setup();
+    const second = await call(`/${budget._id}/requests${q}`, {
+      method: "POST",
+      body: {
+        department: "Logistics",
+        ledgerId: expenseLedger._id.toString(),
+        requestedAmount: 50000,
+        purpose: "Courier, a different ask entirely",
+      },
+    });
+
+    const stored0 = await Acc_Budget.findById(budget._id).lean();
+    for (const r of stored0.budgetRequests) {
+      await call(`/${budget._id}/requests/${r._id}/agree${q}`, { method: "POST", body: {} });
+    }
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    // Same department, same head, two purposes — merging them would erase the
+    // distinction the two requests exist to make.
+    expect(stored.items).toHaveLength(2);
+    expect(stored.totalAllocated).toBe(350000);
+    expect(second.status).toBe(201);
+  });
+
+  test("an agreed request cannot be ordinary-edited", async () => {
+    const { budget, q, request } = await setup();
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, { method: "POST", body: {} });
+
+    const { status, body } = await call(`/${budget._id}/requests/${request._id}${q}`, {
+      method: "PUT",
+      body: { requestedAmount: 999999 },
+    });
+    expect(status).toBe(409);
+    expect(body.message).toMatch(/reopen/i);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests[0].requestedAmount).toBe(300000);
+    expect(stored.items[0].allocatedAmount).toBe(300000);
+  });
+
+  test("a negative agreed amount is refused and allocates nothing", async () => {
+    const { budget, q, request } = await setup();
+    const { status } = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST", body: { agreedAmount: -1 },
+    });
+    expect(status).toBe(400);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.items).toHaveLength(0);
+    expect(stored.budgetRequests[0].state).toBe("submitted");
+  });
+
+  /* ── Counter ───────────────────────────────────────────────────────────── */
+
+  test("countering records the offer and allocates NOTHING", async () => {
+    const { budget, q, request } = await setup();
+    const { status, body } = await call(`/${budget._id}/requests/${request._id}/counter${q}`, {
+      method: "POST",
+      body: { counterAmount: 180000, financeNote: "Can fund 1.8L this cycle." },
+    });
+    expect(status).toBe(200);
+    expect(body.request.state).toBe("countered");
+    expect(body.request.counterAmount).toBe(180000);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    // A counter is an open question. Money must not move on one side of a
+    // conversation.
+    expect(stored.items).toHaveLength(0);
+    expect(stored.totalAllocated).toBe(0);
+    expect(stored.budgetRequests[0].financeNote).toMatch(/1.8L/);
+  });
+
+  test("a counter without an amount is refused", async () => {
+    const { budget, q, request } = await setup();
+    const { status } = await call(`/${budget._id}/requests/${request._id}/counter${q}`, {
+      method: "POST", body: { financeNote: "too much" },
+    });
+    expect(status).toBe(400);
+  });
+
+  test("a countered request can then be agreed, and only then allocates", async () => {
+    const { budget, q, request } = await setup();
+    await call(`/${budget._id}/requests/${request._id}/counter${q}`, {
+      method: "POST", body: { counterAmount: 180000 },
+    });
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST", body: { agreedAmount: 180000 },
+    });
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests[0].state).toBe("agreed");
+    expect(stored.items).toHaveLength(1);
+    expect(stored.totalAllocated).toBe(180000);
+  });
+
+  /* ── Reopen ────────────────────────────────────────────────────────────── */
+
+  test("reopening WITHDRAWS the allocation — money never approved must not linger", async () => {
+    const { budget, q, request } = await setup();
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST", body: { agreedAmount: 275000 },
+    });
+
+    const { status, body } = await call(`/${budget._id}/requests/${request._id}/reopen${q}`, {
+      method: "POST", body: {},
+    });
+    expect(status).toBe(200);
+    expect(body.withdrewAllocations).toBe(1);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests[0].state).toBe("submitted");
+    expect(stored.budgetRequests[0].agreedAmount == null).toBe(true);
+    expect(stored.items).toHaveLength(0);
+    expect(stored.totalAllocated).toBe(0);
+  });
+
+  test("reopening frees the request for ordinary editing again", async () => {
+    const { budget, q, request } = await setup();
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, { method: "POST", body: {} });
+    await call(`/${budget._id}/requests/${request._id}/reopen${q}`, { method: "POST", body: {} });
+
+    const { status } = await call(`/${budget._id}/requests/${request._id}${q}`, {
+      method: "PUT", body: { requestedAmount: 120000 },
+    });
+    expect(status).toBe(200);
+  });
+
+  test("reopening leaves hand-written lines alone — only the linked one goes", async () => {
+    const { budget, q, request, expenseLedger } = await setup();
+    // A line nobody requested, added by finance directly.
+    await Acc_Budget.findByIdAndUpdate(budget._id, {
+      $push: {
+        items: {
+          ledgerId: expenseLedger._id,
+          ledgerName: expenseLedger.name,
+          nature: "expense",
+          department: "Admin",
+          allocatedAmount: 90000,
+        },
+      },
+    });
+
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, { method: "POST", body: {} });
+    await call(`/${budget._id}/requests/${request._id}/reopen${q}`, { method: "POST", body: {} });
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.items).toHaveLength(1);
+    expect(stored.items[0].department).toBe("Admin");
+    expect(stored.totalAllocated).toBe(90000);
+  });
+
+  /* ── Budget state gates ────────────────────────────────────────────────── */
+
+  test("finance CAN review while the budget is in `review` — unlike departments", async () => {
+    const { budget, q, request } = await setup({ budgetStatus: "collecting" });
+    await Acc_Budget.findByIdAndUpdate(budget._id, { status: "review" });
+
+    // A department may no longer add requests…
+    const deptAttempt = await call(`/${budget._id}/requests${q}`, {
+      method: "POST",
+      body: { department: "X", ledgerId: request.ledgerId, requestedAmount: 1, purpose: "p" },
+    });
+    expect(deptAttempt.status).toBe(409);
+
+    // …but finance must still be able to act on the ones already in.
+    const { status } = await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST", body: {},
+    });
+    expect(status).toBe(200);
+  });
+
+  test.each(["active", "closed", "exceeded"])(
+    "finance review is refused once the budget is %s",
+    async (budgetStatus) => {
+      const { budget, q, request } = await setup();
+      await Acc_Budget.findByIdAndUpdate(budget._id, { status: budgetStatus });
+
+      for (const action of ["agree", "counter", "reopen"]) {
+        const { status } = await call(
+          `/${budget._id}/requests/${request._id}/${action}${q}`,
+          { method: "POST", body: { counterAmount: 1 } },
+        );
+        expect(status).toBe(409);
+      }
+
+      const stored = await Acc_Budget.findById(budget._id).lean();
+      expect(stored.items).toHaveLength(0);
+    },
+  );
+
+  /* ── Company scope ─────────────────────────────────────────────────────── */
+
+  test.each(["agree", "counter", "reopen"])(
+    "another company cannot %s a request",
+    async (action) => {
+      const { budget, request } = await setup();
+      const other = await seedCompany();
+
+      const { status } = await call(
+        `/${budget._id}/requests/${request._id}/${action}?companyId=${other.company._id}`,
+        { method: "POST", body: { counterAmount: 1 } },
+      );
+      expect(status).toBe(404);
+
+      const stored = await Acc_Budget.findById(budget._id).lean();
+      expect(stored.items).toHaveLength(0);
+      expect(stored.budgetRequests[0].state).toBe("submitted");
+    },
+  );
+
+  test("an unknown or malformed requestId is a clean 404 on every review action", async () => {
+    const { budget, q } = await setup();
+    const ghost = new mongoose.Types.ObjectId().toString();
+    for (const action of ["agree", "counter", "reopen"]) {
+      expect(
+        (await call(`/${budget._id}/requests/${ghost}/${action}${q}`, { method: "POST", body: { counterAmount: 1 } })).status,
+      ).toBe(404);
+      expect(
+        (await call(`/${budget._id}/requests/not-an-id/${action}${q}`, { method: "POST", body: { counterAmount: 1 } })).status,
+      ).toBe(404);
+    }
+  });
+
+  /* ── Arithmetic is still arithmetic ────────────────────────────────────── */
+
+  test("an approved allocation behaves like any other line for actuals and variance", async () => {
+    const { company, budget, q, request, expenseLedger } = await setup();
+    await call(`/${budget._id}/requests/${request._id}/agree${q}`, {
+      method: "POST", body: { agreedAmount: 300000 },
+    });
+
+    // Real spend against that head, in this company.
+    await Acc_Voucher.create({
+      companyId: company._id,
+      voucherType: "purchase",
+      voucherNumber: `PU/C3/${seq++}`,
+      voucherDate: new Date("2026-06-15"),
+      status: "posted",
+      grandTotal: 120000,
+      ledgerEntries: [
+        { ledgerId: expenseLedger._id, ledgerName: expenseLedger.name, type: "Dr", amount: 120000 },
+      ],
+    });
+
+    const { body } = await call(`/${budget._id}${q}&asOf=2027-03-31`);
+    const line = body.budget.items[0];
+    expect(line.allocated).toBe(300000);
+    expect(line.actual).toBe(120000); // recomputed from the voucher, not stored
+    // Expense under budget is favourable — unchanged by where the line came from.
+    expect(line.variance).toBe(180000);
+    expect(line.favourable).toBe(true);
+  });
 });

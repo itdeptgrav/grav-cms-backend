@@ -563,9 +563,11 @@ function validateRequestBody(body = {}, { partial = false } = {}) {
     if (!stillHasOne) errors.push("either purpose or justification is required");
   }
 
+  // `state` is deliberately absent: it is not settable through this path at
+  // all (see the finance-fields refusal in PUT), so validating it here would
+  // imply it were.
   for (const [field, allowed] of [
     ["priority", ["low", "normal", "high", "critical"]],
-    ["state", ["awaiting", "submitted", "countered", "agreed", "defaulted"]],
   ]) {
     if (body[field] !== undefined && !allowed.includes(body[field])) {
       errors.push(`${field} must be one of: ${allowed.join(", ")}`);
@@ -693,6 +695,40 @@ router.put("/:id/requests/:requestId", async (req, res) => {
     const row = budget.budgetRequests.id(req.params.requestId);
     if (!row) return res.status(404).json({ success: false, message: "Request not found" });
 
+    /* ── FINANCE FIELDS ARE NOT EDITABLE HERE (closes the Chunk 2 risk) ──
+     * Chunk 2 left `state`, `agreedAmount`, `counterAmount` and `financeNote`
+     * in this endpoint's assignable list, so a requester could mark their own
+     * request `agreed`. It granted no money then, because nothing read those
+     * fields — but this chunk makes `agreed` create a real allocation, and the
+     * same request would now allocate budget to whoever asked for it.
+     *
+     * REFUSED rather than silently dropped: a caller who sends `state` and
+     * gets 200 back has every reason to believe it took effect. Nothing in
+     * this repo round-trips a whole request object through PUT, so there is no
+     * well-behaved client to break — unlike budget PUT's companyId, which is
+     * dropped quietly for exactly that reason. */
+    const financeOnly = ["state", "agreedAmount", "counterAmount", "financeNote"];
+    const attempted = financeOnly.filter((f) => req.body[f] !== undefined);
+    if (attempted.length) {
+      return res.status(403).json({
+        success: false,
+        message:
+          `${attempted.join(", ")} ${attempted.length === 1 ? "is" : "are"} set by finance review, ` +
+          `not by editing the request. Use the agree or counter action.`,
+      });
+    }
+
+    /* An agreed request is a settled decision with an allocation behind it.
+     * Editing its amount here would leave the request and the budget line it
+     * created disagreeing — so it must be reopened first, which withdraws the
+     * allocation deliberately rather than as a side effect. */
+    if (row.state === "agreed") {
+      return res.status(409).json({
+        success: false,
+        message: "This request is agreed. Reopen it before editing.",
+      });
+    }
+
     const errors = validateRequestBody(req.body, { partial: true });
     if (errors.length) {
       return res.status(400).json({ success: false, message: errors.join("; "), errors });
@@ -712,12 +748,11 @@ router.put("/:id/requests/:requestId", async (req, res) => {
       Object.assign(row, resolved.ledger);
     }
 
+    // The requester's own content, and nothing else. Finance's fields are
+    // refused above and written only by the review actions.
     const assignable = [
       "department", "requestedAmount", "priority", "purpose", "justification",
       "expectedMonth", "expectedFrom", "expectedTo", "note",
-      // Finance's side. Stored here so the negotiation has a memory; the UI
-      // that drives it is a later chunk, but the field must exist first.
-      "financeNote", "counterAmount", "agreedAmount", "state",
     ];
     for (const key of assignable) {
       if (req.body[key] !== undefined) row[key] = req.body[key];
@@ -762,6 +797,233 @@ router.delete("/:id/requests/:requestId", async (req, res) => {
     res.json({ success: true, requests: budget.budgetRequests });
   } catch (error) {
     console.error("[budgets] delete request error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * FINANCE REVIEW (Chunk 3)
+ *
+ * Finance's side of the conversation, and the ONLY way `state`,
+ * `agreedAmount`, `counterAmount` and `financeNote` are ever written. The
+ * ordinary request PUT refuses them outright.
+ *
+ * Agreeing is the moment an ask becomes money: it writes an approved
+ * allocation into `items[]`, which is what the actuals, variance and totals
+ * all read. Everything else here stops short of that on purpose.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Finance may review while the budget is still being built AND while it is
+ * under review — that last state is the whole point of the review step, and
+ * excluding it would make the status unusable. Past it (active/closed/
+ * exceeded) the allocations are settled and a change is a supplementary
+ * budget, not a late review. */
+const REVIEWABLE_STATES = ["draft", "collecting", "review"];
+
+/**
+ * Load a budget + one request for a FINANCE action.
+ *
+ * Kept separate from budgetForRequests because the allowed states genuinely
+ * differ — a department may not add a request during `review`, but finance
+ * must be able to act on one. Sharing a helper and passing a flag would hide
+ * that difference rather than state it.
+ */
+async function budgetAndRequestForReview(req) {
+  if (!isUsableId(req.params.id)) {
+    return { error: { status: 404, message: "Budget not found" } };
+  }
+  const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id));
+  if (!budget) return { error: { status: 404, message: "Budget not found" } };
+
+  if (!REVIEWABLE_STATES.includes(budget.status)) {
+    return {
+      error: {
+        status: 409,
+        message: `This budget is ${budget.status}; its requests are no longer under review.`,
+      },
+    };
+  }
+
+  if (!isUsableId(req.params.requestId)) {
+    return { error: { status: 404, message: "Request not found" } };
+  }
+  const request = budget.budgetRequests.id(req.params.requestId);
+  if (!request) return { error: { status: 404, message: "Request not found" } };
+
+  return { budget, request };
+}
+
+/**
+ * Make `items[]` reflect an agreed request — create the line, or update the
+ * one this request already produced.
+ *
+ * The link is `sourceRequestId`, not department+head. Two requests from the
+ * same department against the same head are legitimately separate asks, and
+ * merging them on those fields would silently collapse two decisions into one.
+ * Agreeing the SAME request twice must update, though, or a revision from 3L
+ * to 4L would leave 7L allocated.
+ */
+function syncAllocationFromRequest(budget, request) {
+  const existing = (budget.items || []).find(
+    (i) => i.sourceRequestId && String(i.sourceRequestId) === String(request._id),
+  );
+
+  /* Carried across because they explain the line after the request scrolls
+   * out of view. `submittedBy` becomes the owner only when it actually looks
+   * like an address — the field is `ownerEmail`, and putting a display name
+   * or a user id in it would make it lie. */
+  const owner =
+    typeof request.submittedBy === "string" && request.submittedBy.includes("@")
+      ? request.submittedBy
+      : undefined;
+  const why = request.purpose || request.justification || undefined;
+
+  const shape = {
+    sourceRequestId: request._id,
+    ledgerId: request.ledgerId,
+    ledgerName: request.ledgerName,
+    groupName: request.groupName,
+    nature: request.nature,
+    department: request.department,
+    allocatedAmount: variance.money(request.agreedAmount) ?? 0,
+  };
+
+  if (existing) {
+    Object.assign(existing, shape);
+    // Do not clobber a note or owner finance has since edited on the line
+    // itself; fill them only where the line has nothing.
+    if (!existing.notes && why) existing.notes = why;
+    if (!existing.ownerEmail && owner) existing.ownerEmail = owner;
+    return { item: existing, created: false };
+  }
+
+  budget.items.push({ ...shape, notes: why, ownerEmail: owner });
+  return { item: budget.items[budget.items.length - 1], created: true };
+}
+
+/** Re-run the document's cached roll-ups after items change. */
+function recacheBudgetTotals(budget) {
+  const cached = cacheTotals({ items: budget.items || [] });
+  budget.totalRevenueAllocated = cached.totalRevenueAllocated;
+  budget.totalExpenseAllocated = cached.totalExpenseAllocated;
+  budget.totalAllocated = cached.totalAllocated;
+}
+
+/* ── AGREE ───────────────────────────────────────────────────────────────────
+ * The ask becomes an approved allocation. Omitting `agreedAmount` agrees the
+ * amount that was requested, which is the common case and saves finance
+ * retyping a number it already accepted. */
+router.post("/:id/requests/:requestId/agree", async (req, res) => {
+  try {
+    const { budget, request, error } = await budgetAndRequestForReview(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const raw =
+      req.body?.agreedAmount !== undefined && req.body?.agreedAmount !== null && req.body?.agreedAmount !== ""
+        ? req.body.agreedAmount
+        : request.requestedAmount;
+    const amount = variance.money(raw);
+    if (amount === null || amount < 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "agreedAmount must be a number ≥ 0" });
+    }
+
+    request.agreedAmount = amount;
+    request.state = "agreed";
+    if (req.body?.financeNote !== undefined) request.financeNote = req.body.financeNote;
+    request.updatedAt = new Date();
+    request.updatedBy = actorOf(req);
+
+    const { item, created } = syncAllocationFromRequest(budget, request);
+    recacheBudgetTotals(budget);
+    await budget.save();
+
+    res.json({
+      success: true,
+      request,
+      item,
+      created,
+      totals: {
+        totalAllocated: budget.totalAllocated,
+        totalRevenueAllocated: budget.totalRevenueAllocated,
+        totalExpenseAllocated: budget.totalExpenseAllocated,
+      },
+    });
+  } catch (error) {
+    console.error("[budgets] agree request error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── COUNTER ─────────────────────────────────────────────────────────────────
+ * Finance offering a different number. Explicitly does NOT allocate: a counter
+ * is an open question, and money must not move on one side of a conversation.
+ * The department answers by editing the request, or finance agrees the
+ * countered figure. */
+router.post("/:id/requests/:requestId/counter", async (req, res) => {
+  try {
+    const { budget, request, error } = await budgetAndRequestForReview(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const amount = variance.money(req.body?.counterAmount);
+    if (amount === null || amount < 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "counterAmount must be a number ≥ 0" });
+    }
+
+    request.counterAmount = amount;
+    request.state = "countered";
+    if (req.body?.financeNote !== undefined) request.financeNote = req.body.financeNote;
+    request.updatedAt = new Date();
+    request.updatedBy = actorOf(req);
+
+    await budget.save();
+    res.json({ success: true, request });
+  } catch (error) {
+    console.error("[budgets] counter request error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── REOPEN ──────────────────────────────────────────────────────────────────
+ * Undo an agreement. This MUST withdraw the allocation it created, or the
+ * budget keeps money allocated against a request that is no longer agreed —
+ * a number nobody approved, sitting in the totals. Reopening is the only
+ * supported way to edit an agreed request, which is why it exists. */
+router.post("/:id/requests/:requestId/reopen", async (req, res) => {
+  try {
+    const { budget, request, error } = await budgetAndRequestForReview(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const before = (budget.items || []).length;
+    budget.items = (budget.items || []).filter(
+      (i) => !(i.sourceRequestId && String(i.sourceRequestId) === String(request._id)),
+    );
+    const withdrew = before - budget.items.length;
+
+    request.state = "submitted";
+    request.agreedAmount = undefined;
+    if (req.body?.financeNote !== undefined) request.financeNote = req.body.financeNote;
+    request.updatedAt = new Date();
+    request.updatedBy = actorOf(req);
+
+    recacheBudgetTotals(budget);
+    await budget.save();
+
+    res.json({
+      success: true,
+      request,
+      withdrewAllocations: withdrew,
+      totals: {
+        totalAllocated: budget.totalAllocated,
+        totalRevenueAllocated: budget.totalRevenueAllocated,
+        totalExpenseAllocated: budget.totalExpenseAllocated,
+      },
+    });
+  } catch (error) {
+    console.error("[budgets] reopen request error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });

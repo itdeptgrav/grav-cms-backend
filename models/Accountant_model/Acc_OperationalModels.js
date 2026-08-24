@@ -325,6 +325,23 @@ const budgetItemSchema = new mongoose.Schema(
 
     category: { type: String, trim: true },
 
+    /* ── WHERE THIS LINE CAME FROM (Chunk 3) ──────────────────────────────
+     * Set when finance agrees a department request and the agreement becomes
+     * an approved allocation. It is what makes agreeing the SAME request twice
+     * update one line instead of quietly adding a second: without it, finance
+     * revising an agreed amount from 3L to 4L would leave 7L allocated.
+     *
+     * Deliberately NOT unique and NOT a merge key across requests. Two
+     * separate requests from the same department against the same head are
+     * legitimate — two purposes, two asks — and collapsing them would destroy
+     * the distinction the requests were raised to make. One request, one line.
+     *
+     * Absent on every hand-written line, which is the normal case. */
+    sourceRequestId: {
+      type: mongoose.Schema.Types.ObjectId,
+      index: true,
+    },
+
     /* Snapshot of the ledger group's nature at the time the line was written.
      * The ledger tree stays the authority at read time (see
      * budgetActuals.service.js); this exists so an unbound legacy line and an
