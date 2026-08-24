@@ -51,6 +51,62 @@ function companyOf(req) {
   );
 }
 
+/**
+ * The company-ownership filter for a BY-ID budget operation.
+ *
+ * ── THE GAP THIS CLOSES ─────────────────────────────────────────────────────
+ * The list endpoint has always been company-scoped, but every by-id route
+ * below used a bare `findById`/`findByIdAndUpdate`/`findByIdAndDelete`. So a
+ * budget was invisible in another company's list yet fully readable,
+ * editable and deletable by anyone who had its id — and ids are not secrets:
+ * they appear in URLs, exports and logs. Scoping the read is what makes the
+ * list's scoping mean anything.
+ *
+ * ── WHY THIS MIRRORS THE LIST RULE EXACTLY, INCLUDING ITS PERMISSIVENESS ────
+ * The rule is deliberately the SAME `$or` the list builds, legacy clause and
+ * all: a row whose `companyId` is missing or null predates the field and must
+ * stay reachable by the books that own it, exactly as it stays visible in
+ * their list. Anything stricter here would produce a budget a company can SEE
+ * in its list but gets a 404 for when it clicks — a worse failure than the one
+ * being fixed, and one that would look like data loss to the person using it.
+ *
+ * It also inherits the list's behaviour when NO company is selected (no
+ * scoping at all) and when the selected company is malformed (`oid()` returns
+ * null → no scoping). Both are the pre-existing list semantics; diverging from
+ * them here would leave list and detail disagreeing about what is visible.
+ * They are recorded as a known remaining risk rather than silently changed,
+ * because tightening them is a change to what the LIST shows, which is outside
+ * this guard's scope.
+ *
+ * ── 404, NOT 403 ────────────────────────────────────────────────────────────
+ * A cross-company id is answered "not found", matching how the rest of this
+ * module already refuses out-of-scope records (Acc_parties' credit-terms
+ * route, Acc_recurringItems, Acc_billTerms all 404 rather than 403). A 403
+ * would confirm that a budget with that id exists in some other company,
+ * which is precisely what a caller probing ids is trying to learn.
+ */
+function scopeFilter(req, id) {
+  const filter = { _id: id };
+  const cid = actuals.oid(companyOf(req));
+  if (cid) {
+    // Rows written before companyId existed must stay reachable by their books.
+    filter.$or = [{ companyId: cid }, { companyId: { $exists: false } }, { companyId: null }];
+  }
+  return filter;
+}
+
+/**
+ * Is this a usable ObjectId?
+ *
+ * A malformed `:id` previously reached Mongoose and surfaced as a CastError →
+ * bare 500. It was never a security hole (nothing can match it), but it left
+ * one by-id path answering differently from the rest. Answering 404 keeps
+ * every "you cannot have this record" outcome identical, whatever the reason.
+ */
+function isUsableId(id) {
+  return !!actuals.oid(id);
+}
+
 /** Recompute a budget's derived figures. Shared by the detail and list reads. */
 async function evaluate(budget, { asOf } = {}) {
   const lines = await actuals.hydrateLines({
@@ -175,7 +231,10 @@ router.get("/ledger-options", async (req, res) => {
 /* ── DETAIL ──────────────────────────────────────────────────────────────── */
 router.get("/:id", async (req, res) => {
   try {
-    const budget = await Acc_Budget.findById(req.params.id).lean();
+    if (!isUsableId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Budget not found" });
+    }
+    const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id)).lean();
     if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
     const asOf = req.query.asOf ? new Date(req.query.asOf) : undefined;
     res.json({ success: true, budget: await evaluate(budget, { asOf }) });
@@ -214,9 +273,30 @@ router.put("/:id", async (req, res) => {
     const statusError = invalidEnumField(Acc_Budget, "status", req.body?.status);
     if (statusError) return res.status(400).json({ success: false, message: statusError });
 
+    if (!isUsableId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Budget not found" });
+    }
+
     const data = { ...req.body };
     if (data.items) cacheTotals(data);
-    const budget = await Acc_Budget.findByIdAndUpdate(req.params.id, data, {
+
+    // `companyId` is scope, not an editable field. Without this, scoping the
+    // LOOKUP would still leave a way to move a budget between companies: read
+    // a legacy (companyId-less) row — which the rule above deliberately
+    // allows — and PUT a companyId onto it, or re-tenant your own row into
+    // somebody else's books. Dropping the key means an update can never
+    // change which company owns a budget.
+    //
+    // Dropped silently rather than refused, on purpose: the existing
+    // frontend round-trips the whole budget object back on save, so its
+    // payload legitimately carries the row's CURRENT companyId. Refusing that
+    // would break saving with no security gain, since ignoring it is already
+    // a no-op for the only value a well-behaved client sends. Adopting a
+    // legacy row into a company is a real (and deliberate) operation that
+    // would need its own endpoint.
+    delete data.companyId;
+
+    const budget = await Acc_Budget.findOneAndUpdate(scopeFilter(req, req.params.id), data, {
       new: true,
       runValidators: true,
     });
@@ -245,7 +325,15 @@ router.post("/:id/submissions", async (req, res) => {
       return res.status(400).json({ success: false, message: "requestedAmount must be a number ≥ 0" });
     }
 
-    const budget = await Acc_Budget.findById(req.params.id);
+    // Same ownership guard as detail/update/delete. Not named in this task's
+    // brief, but it is the identical hole on a route that WRITES: an
+    // unguarded submission lets anyone holding an id enter a requested amount
+    // into another company's budget negotiation. Fixing three by-id routes
+    // and leaving this one would have looked complete while still being open.
+    if (!isUsableId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Budget not found" });
+    }
+    const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id));
     if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
     if (["closed", "active"].includes(budget.status)) {
       return res.status(409).json({
@@ -286,7 +374,12 @@ router.post("/:id/submissions", async (req, res) => {
  * department must not be able to stall the company's budget indefinitely. */
 router.post("/:id/close-collection", async (req, res) => {
   try {
-    const budget = await Acc_Budget.findById(req.params.id);
+    // As with submissions above: the same guard, on a route that mutates
+    // every submission's agreed amount and moves the budget to `review`.
+    if (!isUsableId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Budget not found" });
+    }
+    const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id));
     if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
 
     let defaulted = 0;
@@ -312,7 +405,10 @@ router.post("/:id/close-collection", async (req, res) => {
 /* ── DELETE ──────────────────────────────────────────────────────────────── */
 router.delete("/:id", async (req, res) => {
   try {
-    const budget = await Acc_Budget.findByIdAndDelete(req.params.id);
+    if (!isUsableId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Budget not found" });
+    }
+    const budget = await Acc_Budget.findOneAndDelete(scopeFilter(req, req.params.id));
     if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
     res.json({ success: true, message: "Budget deleted" });
   } catch (error) {

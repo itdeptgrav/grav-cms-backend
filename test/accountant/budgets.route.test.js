@@ -279,3 +279,274 @@ describe("basic budget read, create and update", () => {
     await expect(Acc_Budget.findById(created.body.budget._id).lean()).resolves.toBeNull();
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Chunk 1A — COMPANY OWNERSHIP ON BY-ID ROUTES
+ *
+ * The list endpoint was always company-scoped, but detail/update/delete (and
+ * the two by-id submission routes) used a bare `findById`, so a budget was
+ * invisible in another company's list yet fully readable, editable and
+ * deletable by anyone holding its id. These tests pin both halves of the
+ * fixed rule: your own company's rows work exactly as before, another
+ * company's are 404, and LEGACY rows with no companyId stay reachable —
+ * because that is what the list has always shown them as.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("company ownership on by-id routes", () => {
+  /** Monotonic, so each legacy seed gets its own `budgetId`. */
+  let legacySeq = 0;
+
+  /** Two companies, each with a budget, plus one legacy row owned by neither. */
+  async function seedTwoCompanies() {
+    const a = await seedCompany();
+    const b = await seedCompany();
+
+    const madeA = await call("/", {
+      method: "POST",
+      body: validPayload({
+        companyId: a.company._id.toString(),
+        revenueLedger: a.revenueLedger,
+        expenseLedger: a.expenseLedger,
+      }),
+    });
+    const madeB = await call("/", {
+      method: "POST",
+      body: {
+        ...validPayload({
+          companyId: b.company._id.toString(),
+          revenueLedger: b.revenueLedger,
+          expenseLedger: b.expenseLedger,
+        }),
+        name: "B's budget",
+      },
+    });
+
+    // Written straight to the collection so it genuinely carries NO
+    // companyId — the shape that predates the field.
+    //
+    // `budgetId` is supplied explicitly because the schema's own default is
+    // `BUD-${Date.now().toString(36)}` with NO random component, so two rows
+    // created in the same millisecond collide on its unique index. That is a
+    // real latent bug in the model (see the summary's remaining risks), not
+    // something these tests should be exposed to.
+    const legacy = await Acc_Budget.create({
+      budgetId: `BUD-LEGACY-${legacySeq++}`,
+      name: "Legacy budget",
+      financialYear: "2025-26",
+      period: "yearly",
+      status: "draft",
+      startDate: new Date("2025-04-01"),
+      endDate: new Date("2026-03-31"),
+      createdBy: OWNER.id,
+      items: [],
+    });
+
+    return { a, b, budgetA: madeA.body.budget, budgetB: madeB.body.budget, legacy };
+  }
+
+  test("sanity: the seeded budgets really do carry the companyIds under test", async () => {
+    const { a, b, budgetA, budgetB, legacy } = await seedTwoCompanies();
+    expect(String(budgetA.companyId)).toBe(a.company._id.toString());
+    expect(String(budgetB.companyId)).toBe(b.company._id.toString());
+    const storedLegacy = await Acc_Budget.findById(legacy._id).lean();
+    expect(storedLegacy.companyId == null).toBe(true);
+  });
+
+  /* ── Same company: everything still works ──────────────────────────────── */
+
+  test("a same-company budget can be READ", async () => {
+    const { a, budgetA } = await seedTwoCompanies();
+    const { status, body } = await call(`/${budgetA._id}?companyId=${a.company._id}`);
+    expect(status).toBe(200);
+    expect(body.budget._id).toBe(String(budgetA._id));
+  });
+
+  test("a same-company budget can be UPDATED", async () => {
+    const { a, budgetA } = await seedTwoCompanies();
+    const { status, body } = await call(`/${budgetA._id}?companyId=${a.company._id}`, {
+      method: "PUT",
+      body: { name: "Renamed by its owner" },
+    });
+    expect(status).toBe(200);
+    expect(body.budget.name).toBe("Renamed by its owner");
+
+    const stored = await Acc_Budget.findById(budgetA._id).lean();
+    expect(stored.name).toBe("Renamed by its owner");
+  });
+
+  test("a same-company budget can be DELETED", async () => {
+    const { a, budgetA } = await seedTwoCompanies();
+    const { status } = await call(`/${budgetA._id}?companyId=${a.company._id}`, {
+      method: "DELETE",
+    });
+    expect(status).toBe(200);
+    await expect(Acc_Budget.findById(budgetA._id).lean()).resolves.toBeNull();
+  });
+
+  /* ── Other company: refused, and nothing is mutated ────────────────────── */
+
+  test("another company's budget cannot be READ — 404, not 403", async () => {
+    const { a, budgetB } = await seedTwoCompanies();
+    const { status, body } = await call(`/${budgetB._id}?companyId=${a.company._id}`);
+    expect(status).toBe(404);
+    // 404 rather than 403 on purpose: a 403 would confirm the id exists
+    // somewhere, which is exactly what probing ids is meant to learn.
+    expect(body.message).toMatch(/not found/i);
+  });
+
+  test("another company's budget cannot be UPDATED, and the document is untouched", async () => {
+    const { a, budgetB } = await seedTwoCompanies();
+    const before = await Acc_Budget.findById(budgetB._id).lean();
+
+    const { status } = await call(`/${budgetB._id}?companyId=${a.company._id}`, {
+      method: "PUT",
+      body: { name: "Hijacked", status: "active" },
+    });
+    expect(status).toBe(404);
+
+    const after = await Acc_Budget.findById(budgetB._id).lean();
+    expect(after.name).toBe(before.name);
+    expect(after.status).toBe(before.status);
+  });
+
+  test("another company's budget cannot be DELETED, and it survives", async () => {
+    const { a, budgetB } = await seedTwoCompanies();
+    const { status } = await call(`/${budgetB._id}?companyId=${a.company._id}`, {
+      method: "DELETE",
+    });
+    expect(status).toBe(404);
+    await expect(Acc_Budget.findById(budgetB._id).lean()).resolves.not.toBeNull();
+  });
+
+  test("another company's budget cannot receive a SUBMISSION", async () => {
+    const { a, budgetB } = await seedTwoCompanies();
+    const { status } = await call(`/${budgetB._id}/submissions?companyId=${a.company._id}`, {
+      method: "POST",
+      body: { department: "Logistics", requestedAmount: 1 },
+    });
+    expect(status).toBe(404);
+
+    const after = await Acc_Budget.findById(budgetB._id).lean();
+    expect(after.submissions || []).toHaveLength(0);
+  });
+
+  test("another company's budget cannot have its collection CLOSED", async () => {
+    const { a, budgetB } = await seedTwoCompanies();
+    const before = await Acc_Budget.findById(budgetB._id).lean();
+
+    const { status } = await call(`/${budgetB._id}/close-collection?companyId=${a.company._id}`, {
+      method: "POST",
+    });
+    expect(status).toBe(404);
+
+    const after = await Acc_Budget.findById(budgetB._id).lean();
+    expect(after.status).toBe(before.status); // never moved to "review"
+  });
+
+  /* ── Legacy rows: reachable, matching the list ─────────────────────────── */
+
+  test("a LEGACY budget with no companyId is visible in the list — the behaviour being matched", async () => {
+    const { a, legacy } = await seedTwoCompanies();
+    const { body } = await call(`/?companyId=${a.company._id}`);
+    const ids = body.budgets.map((b) => String(b._id));
+    expect(ids).toContain(String(legacy._id));
+  });
+
+  test("a LEGACY budget can be read, updated and deleted — exactly as the list implies", async () => {
+    const { a, legacy } = await seedTwoCompanies();
+
+    const read = await call(`/${legacy._id}?companyId=${a.company._id}`);
+    expect(read.status).toBe(200);
+
+    const updated = await call(`/${legacy._id}?companyId=${a.company._id}`, {
+      method: "PUT",
+      body: { name: "Legacy, adopted" },
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.body.budget.name).toBe("Legacy, adopted");
+
+    const deleted = await call(`/${legacy._id}?companyId=${a.company._id}`, { method: "DELETE" });
+    expect(deleted.status).toBe(200);
+  });
+
+  test("a legacy row is reachable by EITHER company — it belongs to no one, as the list already shows", async () => {
+    const { b, legacy } = await seedTwoCompanies();
+    const { status } = await call(`/${legacy._id}?companyId=${b.company._id}`);
+    expect(status).toBe(200);
+  });
+
+  /* ── An update cannot re-tenant a budget ───────────────────────────────── */
+
+  test("PUT cannot move a budget into another company", async () => {
+    const { a, b, budgetA } = await seedTwoCompanies();
+    const { status } = await call(`/${budgetA._id}?companyId=${a.company._id}`, {
+      method: "PUT",
+      body: { name: "Still A's", companyId: b.company._id.toString() },
+    });
+    expect(status).toBe(200);
+
+    const stored = await Acc_Budget.findById(budgetA._id).lean();
+    expect(String(stored.companyId)).toBe(a.company._id.toString());
+    expect(stored.name).toBe("Still A's"); // the rest of the update still applied
+  });
+
+  test("PUT cannot claim a legacy row into a company either", async () => {
+    const { a, legacy } = await seedTwoCompanies();
+    const { status } = await call(`/${legacy._id}?companyId=${a.company._id}`, {
+      method: "PUT",
+      body: { name: "Claimed", companyId: a.company._id.toString() },
+    });
+    expect(status).toBe(200);
+
+    const stored = await Acc_Budget.findById(legacy._id).lean();
+    expect(stored.companyId == null).toBe(true); // adoption needs its own endpoint
+  });
+
+  /* ── A rejected update must not mutate ─────────────────────────────────── */
+
+  test("an invalid same-company update is rejected and mutates nothing", async () => {
+    const { a, budgetA } = await seedTwoCompanies();
+    const before = await Acc_Budget.findById(budgetA._id).lean();
+
+    const { status } = await call(`/${budgetA._id}?companyId=${a.company._id}`, {
+      method: "PUT",
+      body: { name: "Should not stick", period: "annual" }, // schema says "yearly"
+    });
+    expect(status).toBe(400);
+
+    const after = await Acc_Budget.findById(budgetA._id).lean();
+    expect(after.name).toBe(before.name);
+    expect(after.period).toBe(before.period);
+  });
+
+  /* ── No company selected: unchanged, permissive, list-consistent ───────── */
+
+  test("with NO company selected, by-id access is unscoped — matching the list", async () => {
+    // Not an oversight: the list applies no filter at all when no company is
+    // given, and detail must not disagree with it. Recorded as a known
+    // remaining risk rather than tightened here, because changing it changes
+    // what the LIST shows.
+    const { budgetB } = await seedTwoCompanies();
+    const { status } = await call(`/${budgetB._id}`);
+    expect(status).toBe(200);
+
+    const list = await call("/");
+    expect(list.body.budgets.map((x) => String(x._id))).toContain(String(budgetB._id));
+  });
+
+  /* ── Malformed id ──────────────────────────────────────────────────────── */
+
+  test("a malformed id is a clean 404 on every by-id route, not a 500", async () => {
+    const { a } = await seedTwoCompanies();
+    const q = `?companyId=${a.company._id}`;
+    expect((await call(`/not-an-id${q}`)).status).toBe(404);
+    expect((await call(`/not-an-id${q}`, { method: "PUT", body: { name: "x" } })).status).toBe(404);
+    expect((await call(`/not-an-id${q}`, { method: "DELETE" })).status).toBe(404);
+    expect(
+      (await call(`/not-an-id/submissions${q}`, {
+        method: "POST",
+        body: { department: "D", requestedAmount: 1 },
+      })).status,
+    ).toBe(404);
+    expect((await call(`/not-an-id/close-collection${q}`, { method: "POST" })).status).toBe(404);
+  });
+});
