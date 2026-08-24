@@ -1505,6 +1505,336 @@ router.post("/:id/requests/:requestId/reopen", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ADJUSTMENTS — supplementary budget and revisions (Chunk 7)
+ *
+ * Chunk 6 made over-budget spend require a written override. That was the
+ * point, but an override is meant to be EXCEPTIONAL: a team that needs more
+ * money every week writes the same excuse every week, and a control everyone
+ * routinely waves through has stopped being a control. This is the path that
+ * fixes the number instead of excusing the breach.
+ *
+ * Not a transfer. Nothing here moves money BETWEEN heads — every adjustment
+ * changes exactly one line, up or down, on its own terms.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* When an allocation may still be adjusted. Deliberately the live statuses,
+ * NOT the ones under which requests are collected: the whole point is that
+ * this is how you change a budget that is already running. `exceeded` is
+ * included because a blown budget is the single most likely thing anyone
+ * needs to adjust — refusing there would force the override path we are
+ * trying to replace. */
+const ADJUSTABLE_STATES = ["review", "active", "exceeded"];
+
+/** Resolve budget + adjustment for a review action, with the same 404/409
+ *  vocabulary the request-review helpers use. */
+async function budgetAndAdjustment(req, { mutating = true } = {}) {
+  if (!isUsableId(req.params.id)) {
+    return { error: { status: 404, message: "Budget not found" } };
+  }
+  const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id));
+  if (!budget) return { error: { status: 404, message: "Budget not found" } };
+
+  if (mutating && !ADJUSTABLE_STATES.includes(budget.status)) {
+    return {
+      error: {
+        status: 409,
+        message: `This budget is ${budget.status}; its allocations can no longer be adjusted.`,
+      },
+    };
+  }
+
+  if (req.params.adjustmentId !== undefined) {
+    if (!isUsableId(req.params.adjustmentId)) {
+      return { error: { status: 404, message: "Adjustment not found" } };
+    }
+    const adjustment = budget.adjustments.id(req.params.adjustmentId);
+    if (!adjustment) return { error: { status: 404, message: "Adjustment not found" } };
+    return { budget, adjustment };
+  }
+
+  return { budget };
+}
+
+/**
+ * Both shapes, resolved to both numbers.
+ *
+ * A supplementary states a delta, a revision states a destination — but a
+ * reader should never have to know which to answer "what does this become?",
+ * so whichever was given, the other is derived from the snapshot and both are
+ * stored. Returns `{ ok }` or `{ ok: false, message }`.
+ */
+function resolveAmounts({ type, currentAllocatedAmount, requestedDeltaAmount, requestedNewAmount }) {
+  const current = variance.money(currentAllocatedAmount) ?? 0;
+
+  if (type === "supplementary") {
+    const delta = variance.money(requestedDeltaAmount);
+    if (delta === null) {
+      return { ok: false, message: "requestedDeltaAmount must be a number" };
+    }
+    /* A supplementary is by definition MORE. A negative one is a revision
+     * downward wearing the wrong label, and letting it through would mean two
+     * names for one operation and a list nobody can read at a glance. */
+    if (delta <= 0) {
+      return {
+        ok: false,
+        message: "requestedDeltaAmount must be greater than 0 — to reduce an allocation, request a revision instead",
+      };
+    }
+    return { ok: true, delta, next: current + delta };
+  }
+
+  const next = variance.money(requestedNewAmount);
+  if (next === null) return { ok: false, message: "requestedNewAmount must be a number" };
+  if (next < 0) return { ok: false, message: "requestedNewAmount must be ≥ 0" };
+  return { ok: true, delta: next - current, next };
+}
+
+/* ── LIST ──────────────────────────────────────────────────────────────── */
+router.get("/:id/adjustments", async (req, res) => {
+  try {
+    const { budget, error } = await budgetAndAdjustment(req, { mutating: false });
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    res.json({
+      success: true,
+      adjustments: budget.adjustments || [],
+      budgetStatus: budget.status,
+      adjustable: ADJUSTABLE_STATES.includes(budget.status),
+    });
+  } catch (error) {
+    console.error("[budgets] list adjustments error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── SUBMIT ────────────────────────────────────────────────────────────────
+ * Asking changes nothing. The allocation moves on approval and only there —
+ * a request that quietly raised the number would make the review meaningless
+ * and let anyone with the endpoint spend whatever they liked. */
+router.post("/:id/adjustments", async (req, res) => {
+  try {
+    const { budget, error } = await budgetAndAdjustment(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const body = req.body || {};
+    const type = body.type;
+    if (!["supplementary", "revision"].includes(type)) {
+      return res.status(400).json({
+        success: false,
+        message: 'type must be "supplementary" or "revision"',
+      });
+    }
+
+    if (!isUsableId(body.targetItemId)) {
+      return res.status(404).json({ success: false, message: "Budget line not found" });
+    }
+    const item = budget.items.id(body.targetItemId);
+    if (!item) {
+      return res.status(404).json({ success: false, message: "Budget line not found" });
+    }
+
+    const current = variance.money(item.allocatedAmount) ?? 0;
+    const amounts = resolveAmounts({
+      type,
+      currentAllocatedAmount: current,
+      requestedDeltaAmount: body.requestedDeltaAmount,
+      requestedNewAmount: body.requestedNewAmount,
+    });
+    if (!amounts.ok) {
+      return res.status(400).json({ success: false, message: amounts.message });
+    }
+
+    if (!String(body.reason || "").trim() && !String(body.justification || "").trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "either reason or justification is required",
+      });
+    }
+
+    const priorityError = invalidEnumField(Acc_Budget, "adjustments.priority", body.priority);
+    if (priorityError) return res.status(400).json({ success: false, message: priorityError });
+
+    /* Built field by field rather than spread from the body. Everything below
+     * is either derived from the TARGET LINE or stamped by the server; a
+     * request that could name its own approvedNewAmount, state or reviewedBy
+     * would be a request that approves itself. */
+    budget.adjustments.push({
+      type,
+      targetItemId: item._id,
+      sourceRequestId: item.sourceRequestId || undefined,
+      department: item.department || null,
+      ledgerId: item.ledgerId || undefined,
+      ledgerName: item.ledgerName || null,
+      groupName: item.groupName || null,
+      nature: item.nature || "expense",
+      currentAllocatedAmount: current,
+      requestedDeltaAmount: amounts.delta,
+      requestedNewAmount: amounts.next,
+      reason: body.reason,
+      justification: body.justification,
+      priority: body.priority || "normal",
+      state: "submitted",
+      requestedAt: new Date(),
+      requestedBy: actorOf(req),
+    });
+
+    await budget.save();
+    const created = budget.adjustments[budget.adjustments.length - 1];
+    res.status(201).json({ success: true, adjustment: created });
+  } catch (error) {
+    console.error("[budgets] create adjustment error:", error);
+    res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+/* ── APPROVE ───────────────────────────────────────────────────────────────
+ * The one operation here that moves money.
+ *
+ * `appliedAt` is the idempotency key. A double-click, a retried request or a
+ * flaky connection must not add the same ₹5L twice — and unlike a voucher,
+ * there is no ledger to reconcile against that would ever reveal it. */
+router.post("/:id/adjustments/:adjustmentId/approve", async (req, res) => {
+  try {
+    const { budget, adjustment, error } = await budgetAndAdjustment(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (adjustment.appliedAt) {
+      return res.status(409).json({
+        success: false,
+        message: "This adjustment has already been applied.",
+        adjustment,
+      });
+    }
+    if (adjustment.state === "rejected" || adjustment.state === "cancelled") {
+      return res.status(409).json({
+        success: false,
+        message: `This adjustment is ${adjustment.state} and cannot be approved.`,
+      });
+    }
+
+    /* The line may have moved since the request was raised — another
+     * adjustment approved in between, or an edit. Re-read it, and re-derive
+     * from what is TRUE NOW rather than from the snapshot: a supplementary
+     * means "₹5L more than whatever it is", and applying it against a stale
+     * base would grant an amount nobody decided on. */
+    const item = budget.items.id(adjustment.targetItemId);
+    if (!item) {
+      return res.status(409).json({
+        success: false,
+        message: "The budget line this adjustment targets no longer exists.",
+      });
+    }
+    const liveCurrent = variance.money(item.allocatedAmount) ?? 0;
+
+    /* Finance may grant something other than what was asked, stated the same
+     * way the request was. Omitting both approves the request as it stands. */
+    const amounts = resolveAmounts({
+      type: adjustment.type,
+      currentAllocatedAmount: liveCurrent,
+      requestedDeltaAmount:
+        req.body?.approvedDeltaAmount !== undefined && req.body?.approvedDeltaAmount !== null && req.body?.approvedDeltaAmount !== ""
+          ? req.body.approvedDeltaAmount
+          : adjustment.requestedDeltaAmount,
+      requestedNewAmount:
+        req.body?.approvedNewAmount !== undefined && req.body?.approvedNewAmount !== null && req.body?.approvedNewAmount !== ""
+          ? req.body.approvedNewAmount
+          : adjustment.requestedNewAmount,
+    });
+    if (!amounts.ok) {
+      return res.status(400).json({ success: false, message: amounts.message });
+    }
+
+    item.allocatedAmount = amounts.next;
+
+    adjustment.approvedDeltaAmount = amounts.delta;
+    adjustment.approvedNewAmount = amounts.next;
+    adjustment.currentAllocatedAmount = liveCurrent;
+    adjustment.state = "approved";
+    adjustment.appliedAt = new Date();
+    adjustment.reviewedAt = new Date();
+    adjustment.reviewedBy = actorOf(req);
+    if (req.body?.financeNote !== undefined) adjustment.financeNote = req.body.financeNote;
+
+    recacheBudgetTotals(budget);
+    await budget.save();
+
+    res.json({
+      success: true,
+      adjustment,
+      item,
+      totals: {
+        totalAllocated: budget.totalAllocated,
+        totalRevenueAllocated: budget.totalRevenueAllocated,
+        totalExpenseAllocated: budget.totalExpenseAllocated,
+      },
+    });
+  } catch (error) {
+    console.error("[budgets] approve adjustment error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── REJECT ────────────────────────────────────────────────────────────────
+ * Answers the request without touching a rupee. */
+router.post("/:id/adjustments/:adjustmentId/reject", async (req, res) => {
+  try {
+    const { budget, adjustment, error } = await budgetAndAdjustment(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (adjustment.appliedAt) {
+      return res.status(409).json({
+        success: false,
+        message: "This adjustment has already been applied and cannot be rejected.",
+      });
+    }
+
+    adjustment.state = "rejected";
+    adjustment.reviewedAt = new Date();
+    adjustment.reviewedBy = actorOf(req);
+    if (req.body?.financeNote !== undefined) adjustment.financeNote = req.body.financeNote;
+
+    await budget.save();
+    res.json({ success: true, adjustment });
+  } catch (error) {
+    console.error("[budgets] reject adjustment error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── CANCEL ────────────────────────────────────────────────────────────────
+ * The requester withdrawing their own ask. Distinct from `rejected`, which is
+ * finance's answer — collapsing the two would lose who decided. */
+router.post("/:id/adjustments/:adjustmentId/cancel", async (req, res) => {
+  try {
+    const { budget, adjustment, error } = await budgetAndAdjustment(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (adjustment.appliedAt) {
+      return res.status(409).json({
+        success: false,
+        message: "This adjustment has already been applied and cannot be cancelled.",
+      });
+    }
+    if (adjustment.state !== "submitted") {
+      return res.status(409).json({
+        success: false,
+        message: `Only a submitted adjustment can be withdrawn (this one is ${adjustment.state}).`,
+      });
+    }
+
+    adjustment.state = "cancelled";
+    adjustment.reviewedAt = new Date();
+    adjustment.reviewedBy = actorOf(req);
+
+    await budget.save();
+    res.json({ success: true, adjustment });
+  } catch (error) {
+    console.error("[budgets] cancel adjustment error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 /* ── DELETE ──────────────────────────────────────────────────────────────── */
 router.delete("/:id", async (req, res) => {
   try {

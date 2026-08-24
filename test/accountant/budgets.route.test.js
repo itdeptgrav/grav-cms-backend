@@ -2512,3 +2512,478 @@ describe("budget line voucher drilldown", () => {
     expect(status).toBe(401);
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * CHUNK 7 — SUPPLEMENTARY BUDGETS AND REVISIONS
+ *
+ * The legitimate way to change an allocation once the budget is live. Chunk 6
+ * made over-budget spend require a written override; this is the path that
+ * fixes the NUMBER instead of excusing the breach.
+ *
+ * Two properties carry most of the weight here:
+ *   - submitting must move nothing (or review is theatre)
+ *   - approving must move it exactly ONCE (there is no ledger to reconcile
+ *     against that would ever reveal a double-applied ₹5L)
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("adjustments — supplementary and revision", () => {
+  let seq = 0;
+
+  async function setup({ status = "active", allocated = 2500000 } = {}) {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    const budget = await Acc_Budget.create({
+      name: "FY26-27",
+      financialYear: "2026-27",
+      period: "yearly",
+      status,
+      startDate: new Date("2026-04-01"),
+      endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [
+        {
+          ledgerId: expenseLedger._id, ledgerName: expenseLedger.name,
+          groupName: expenseLedger.groupName, nature: "expense",
+          department: "Production", allocatedAmount: allocated,
+        },
+        {
+          ledgerId: revenueLedger._id, ledgerName: revenueLedger.name,
+          groupName: revenueLedger.groupName, nature: "revenue",
+          department: "Sales", allocatedAmount: 4000000,
+        },
+      ],
+    });
+    const q = `?companyId=${company._id}`;
+    return { company, budget, q, expenseLedger, revenueLedger, item: budget.items[0] };
+  }
+
+  const submit = (budget, q, body) =>
+    call(`/${budget._id}/adjustments${q}`, { method: "POST", body });
+
+  const supplementary = (item, amount, extra = {}) => ({
+    type: "supplementary",
+    targetItemId: String(item._id),
+    requestedDeltaAmount: amount,
+    reason: "Fabric prices moved after the budget was set.",
+    ...extra,
+  });
+
+  const revision = (item, amount, extra = {}) => ({
+    type: "revision",
+    targetItemId: String(item._id),
+    requestedNewAmount: amount,
+    reason: "CEO approved a larger exhibition presence.",
+    ...extra,
+  });
+
+  const allocationOf = async (budgetId, itemId) => {
+    const b = await Acc_Budget.findById(budgetId).lean();
+    return b.items.find((i) => String(i._id) === String(itemId)).allocatedAmount;
+  };
+
+  /* ── submitting ───────────────────────────────────────────────────────── */
+
+  test("a supplementary states a delta and derives what the line would become", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const { status, body } = await submit(budget, q, supplementary(item, 500000));
+
+    expect(status).toBe(201);
+    expect(body.adjustment.type).toBe("supplementary");
+    expect(body.adjustment.currentAllocatedAmount).toBe(2500000);
+    expect(body.adjustment.requestedDeltaAmount).toBe(500000);
+    // Derived, so a reader never has to know the type to answer
+    // "what does this become?".
+    expect(body.adjustment.requestedNewAmount).toBe(3000000);
+    expect(body.adjustment.state).toBe("submitted");
+    // Denormalised from the TARGET LINE, not from the request body.
+    expect(body.adjustment.ledgerName).toBe("Freight & Forwarding");
+    expect(body.adjustment.department).toBe("Production");
+    expect(body.adjustment.nature).toBe("expense");
+  });
+
+  test("a revision states a destination and derives the delta, including a reduction", async () => {
+    const { budget, q, item } = await setup({ allocated: 500000 });
+
+    const up = await submit(budget, q, revision(item, 700000));
+    expect(up.status).toBe(201);
+    expect(up.body.adjustment.requestedNewAmount).toBe(700000);
+    expect(up.body.adjustment.requestedDeltaAmount).toBe(200000);
+
+    // Revision is the only shape that can go DOWN.
+    const down = await submit(budget, q, revision(item, 300000));
+    expect(down.status).toBe(201);
+    expect(down.body.adjustment.requestedDeltaAmount).toBe(-200000);
+  });
+
+  test("SUBMITTING MOVES NOTHING", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const before = await Acc_Budget.findById(budget._id).lean();
+
+    await submit(budget, q, supplementary(item, 500000));
+    await submit(budget, q, revision(item, 9000000));
+
+    expect(await allocationOf(budget._id, item._id)).toBe(2500000);
+    const after = await Acc_Budget.findById(budget._id).lean();
+    expect(after.totalAllocated).toBe(before.totalAllocated);
+    expect(after.adjustments).toHaveLength(2);
+  });
+
+  /* ── validation ───────────────────────────────────────────────────────── */
+
+  test("a supplementary must be positive — a reduction is a revision", async () => {
+    const { budget, q, item } = await setup();
+
+    for (const bad of [0, -500000]) {
+      const { status, body } = await submit(budget, q, supplementary(item, bad));
+      expect(status).toBe(400);
+      expect(body.message).toMatch(/greater than 0/);
+      expect(body.message).toMatch(/revision instead/);
+    }
+
+    const nan = await submit(budget, q, supplementary(item, "not-a-number"));
+    expect(nan.status).toBe(400);
+  });
+
+  test("a revision may be zero but never negative", async () => {
+    const { budget, q, item } = await setup();
+
+    const zero = await submit(budget, q, revision(item, 0));
+    expect(zero.status).toBe(201);
+
+    const negative = await submit(budget, q, revision(item, -1));
+    expect(negative.status).toBe(400);
+    expect(negative.body.message).toMatch(/≥ 0/);
+  });
+
+  test("type, target, reason and priority are all validated", async () => {
+    const { budget, q, item } = await setup();
+
+    const badType = await submit(budget, q, { ...supplementary(item, 1000), type: "transfer" });
+    expect(badType.status).toBe(400);
+    expect(badType.body.message).toMatch(/supplementary.*revision/);
+
+    const missingTarget = await submit(budget, q, {
+      type: "supplementary", targetItemId: new mongoose.Types.ObjectId().toString(),
+      requestedDeltaAmount: 1000, reason: "x",
+    });
+    expect(missingTarget.status).toBe(404);
+    expect(missingTarget.body.message).toMatch(/line not found/i);
+
+    const junkTarget = await submit(budget, q, { ...supplementary(item, 1000), targetItemId: "nope" });
+    expect(junkTarget.status).toBe(404);
+
+    const noReason = await submit(budget, q, {
+      type: "supplementary", targetItemId: String(item._id), requestedDeltaAmount: 1000,
+    });
+    expect(noReason.status).toBe(400);
+    expect(noReason.body.message).toMatch(/reason or justification/);
+
+    const badPriority = await submit(budget, q, supplementary(item, 1000, { priority: "urgent" }));
+    expect(badPriority.status).toBe(400);
+    expect(badPriority.body.message).toMatch(/priority must be one of/);
+  });
+
+  test("a closed budget can no longer be adjusted; a live or blown one can", async () => {
+    for (const status of ["draft", "collecting", "closed"]) {
+      const { budget, q, item } = await setup({ status });
+      const { status: code, body } = await submit(budget, q, supplementary(item, 1000));
+      expect(code).toBe(409);
+      expect(body.message).toMatch(/no longer be adjusted/);
+    }
+
+    // An exceeded budget is the single most likely thing anyone needs to
+    // adjust — refusing there would force the override path this replaces.
+    for (const status of ["review", "active", "exceeded"]) {
+      const { budget, q, item } = await setup({ status });
+      const { status: code } = await submit(budget, q, supplementary(item, 1000));
+      expect(code).toBe(201);
+    }
+  });
+
+  test("a requester cannot smuggle approved fields through the create body", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const { status, body } = await submit(budget, q, {
+      ...supplementary(item, 500000),
+      // Everything a self-approving request would need.
+      state: "approved",
+      approvedDeltaAmount: 9999999,
+      approvedNewAmount: 9999999,
+      appliedAt: new Date().toISOString(),
+      reviewedBy: "someone.else@example.com",
+      requestedBy: "not.me@example.com",
+      financeNote: "Approved by me, obviously.",
+      currentAllocatedAmount: 1,
+      department: "Not Production",
+      ledgerName: "Something Else",
+    });
+
+    expect(status).toBe(201);
+    const a = body.adjustment;
+    expect(a.state).toBe("submitted");
+    expect(a.approvedDeltaAmount).toBeUndefined();
+    expect(a.approvedNewAmount).toBeUndefined();
+    expect(a.appliedAt).toBeUndefined();
+    expect(a.reviewedBy).toBeUndefined();
+    expect(a.financeNote).toBeUndefined();
+    // Derived from the target line, not accepted from the caller.
+    expect(a.currentAllocatedAmount).toBe(2500000);
+    expect(a.department).toBe("Production");
+    expect(a.ledgerName).toBe("Freight & Forwarding");
+    // And nothing moved.
+    expect(await allocationOf(budget._id, item._id)).toBe(2500000);
+  });
+
+  /* ── approving ────────────────────────────────────────────────────────── */
+
+  test("approving a supplementary raises the allocation by the delta, once", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const created = await submit(budget, q, supplementary(item, 500000));
+
+    const { status, body } = await call(
+      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`,
+      { method: "POST" },
+    );
+
+    expect(status).toBe(200);
+    expect(body.adjustment.state).toBe("approved");
+    expect(body.adjustment.approvedDeltaAmount).toBe(500000);
+    expect(body.adjustment.approvedNewAmount).toBe(3000000);
+    expect(body.adjustment.appliedAt).toBeTruthy();
+    expect(body.adjustment.reviewedBy).toBe(OWNER.name);
+    expect(await allocationOf(budget._id, item._id)).toBe(3000000);
+  });
+
+  test("approving a revision SETS the allocation, it does not add to it", async () => {
+    const { budget, q, item } = await setup({ allocated: 500000 });
+    const created = await submit(budget, q, revision(item, 700000));
+
+    await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" });
+    // 700000, not 1200000.
+    expect(await allocationOf(budget._id, item._id)).toBe(700000);
+  });
+
+  test("APPROVING TWICE APPLIES ONCE", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const created = await submit(budget, q, supplementary(item, 500000));
+    const url = `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`;
+
+    const first = await call(url, { method: "POST" });
+    expect(first.status).toBe(200);
+    expect(await allocationOf(budget._id, item._id)).toBe(3000000);
+
+    // A double-click, a retry, a flaky connection. There is no ledger to
+    // reconcile against that would ever reveal a double-applied ₹5L.
+    const second = await call(url, { method: "POST" });
+    expect(second.status).toBe(409);
+    expect(second.body.message).toMatch(/already been applied/);
+    expect(await allocationOf(budget._id, item._id)).toBe(3000000);
+
+    // And three concurrent retries still land once.
+    await Promise.all([call(url, { method: "POST" }), call(url, { method: "POST" })]);
+    expect(await allocationOf(budget._id, item._id)).toBe(3000000);
+  });
+
+  test("finance may grant a different amount from the one requested", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const created = await submit(budget, q, supplementary(item, 500000));
+
+    const { body } = await call(
+      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`,
+      { method: "POST", body: { approvedDeltaAmount: 300000, financeNote: "Half now, revisit in Q3." } },
+    );
+
+    expect(body.adjustment.approvedDeltaAmount).toBe(300000);
+    expect(body.adjustment.approvedNewAmount).toBe(2800000);
+    expect(body.adjustment.financeNote).toMatch(/Half now/);
+    // The REQUEST is preserved beside the decision.
+    expect(body.adjustment.requestedDeltaAmount).toBe(500000);
+    expect(await allocationOf(budget._id, item._id)).toBe(2800000);
+  });
+
+  test("a second supplementary applies on top of the first, not against a stale base", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+
+    // Both raised BEFORE either is approved, so both snapshot 25L.
+    const a = await submit(budget, q, supplementary(item, 500000));
+    const b = await submit(budget, q, supplementary(item, 300000));
+    expect(a.body.adjustment.currentAllocatedAmount).toBe(2500000);
+    expect(b.body.adjustment.currentAllocatedAmount).toBe(2500000);
+
+    await call(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`, { method: "POST" });
+    expect(await allocationOf(budget._id, item._id)).toBe(3000000);
+
+    // "₹3L more" must mean more than whatever it is NOW — 33L, not 28L.
+    const second = await call(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`, { method: "POST" });
+    expect(second.body.adjustment.currentAllocatedAmount).toBe(3000000);
+    expect(await allocationOf(budget._id, item._id)).toBe(3300000);
+  });
+
+  test("totals recalculate after approval", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    /* `setup` builds the budget through the model directly, which skips the
+       create route's cacheTotals — so the cached figures start unset. That is
+       the interesting case: approving must recompute them from `items[]`
+       rather than incrementing whatever was cached. */
+    const before = await Acc_Budget.findById(budget._id).lean();
+    expect(before.totalExpenseAllocated || 0).toBe(0);
+
+    const created = await submit(budget, q, supplementary(item, 500000));
+    const { body } = await call(
+      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" },
+    );
+
+    expect(body.totals.totalExpenseAllocated).toBe(3000000);
+    expect(body.totals.totalRevenueAllocated).toBe(4000000);
+    expect(body.totals.totalAllocated).toBe(7000000);
+
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.totalAllocated).toBe(7000000);
+  });
+
+  test("evaluated variance reflects the revised allocation immediately", async () => {
+    const { company, budget, q, item, expenseLedger } = await setup({ allocated: 100000 });
+    await Acc_Voucher.create({
+      companyId: company._id, voucherType: "purchase",
+      voucherNumber: `ADJ/${seq++}/${Date.now()}`,
+      voucherDate: new Date("2026-06-15"), status: "posted", grandTotal: 150000,
+      ledgerEntries: [{ ledgerId: expenseLedger._id, ledgerName: expenseLedger.name, type: "Dr", amount: 150000 }],
+    });
+
+    // Over budget before the revision.
+    const before = await call(`/${budget._id}${q}&asOf=2027-03-31`);
+    const lineBefore = before.body.budget.items.find((i) => String(i._id) === String(item._id));
+    expect(lineBefore.variance).toBe(-50000);
+    expect(lineBefore.pace).toBe("over_budget");
+
+    const created = await submit(budget, q, revision(item, 200000));
+    await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" });
+
+    // Within budget after it — same spend, revised number.
+    const after = await call(`/${budget._id}${q}&asOf=2027-03-31`);
+    const lineAfter = after.body.budget.items.find((i) => String(i._id) === String(item._id));
+    expect(lineAfter.allocated).toBe(200000);
+    expect(lineAfter.variance).toBe(50000);
+    expect(lineAfter.pace).not.toBe("over_budget");
+  });
+
+  /* ── refusing ─────────────────────────────────────────────────────────── */
+
+  test("rejecting answers the request without touching a rupee", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const created = await submit(budget, q, supplementary(item, 500000));
+
+    const { status, body } = await call(
+      `/${budget._id}/adjustments/${created.body.adjustment._id}/reject${q}`,
+      { method: "POST", body: { financeNote: "Re-plan within the existing envelope." } },
+    );
+
+    expect(status).toBe(200);
+    expect(body.adjustment.state).toBe("rejected");
+    expect(body.adjustment.financeNote).toMatch(/Re-plan/);
+    expect(body.adjustment.appliedAt).toBeUndefined();
+    expect(await allocationOf(budget._id, item._id)).toBe(2500000);
+  });
+
+  test("an applied adjustment can no longer be rejected or cancelled", async () => {
+    const { budget, q, item } = await setup();
+    const created = await submit(budget, q, supplementary(item, 500000));
+    const id = created.body.adjustment._id;
+    await call(`/${budget._id}/adjustments/${id}/approve${q}`, { method: "POST" });
+
+    const rejected = await call(`/${budget._id}/adjustments/${id}/reject${q}`, { method: "POST" });
+    expect(rejected.status).toBe(409);
+
+    const cancelled = await call(`/${budget._id}/adjustments/${id}/cancel${q}`, { method: "POST" });
+    expect(cancelled.status).toBe(409);
+  });
+
+  test("a rejected adjustment cannot then be approved", async () => {
+    const { budget, q, item } = await setup({ allocated: 2500000 });
+    const created = await submit(budget, q, supplementary(item, 500000));
+    const id = created.body.adjustment._id;
+
+    await call(`/${budget._id}/adjustments/${id}/reject${q}`, { method: "POST" });
+    const { status, body } = await call(`/${budget._id}/adjustments/${id}/approve${q}`, { method: "POST" });
+    expect(status).toBe(409);
+    expect(body.message).toMatch(/rejected/);
+    expect(await allocationOf(budget._id, item._id)).toBe(2500000);
+  });
+
+  test("the requester can withdraw their own submitted ask, but not once decided", async () => {
+    const { budget, q, item } = await setup();
+    const created = await submit(budget, q, supplementary(item, 500000));
+    const id = created.body.adjustment._id;
+
+    const { status, body } = await call(`/${budget._id}/adjustments/${id}/cancel${q}`, { method: "POST" });
+    expect(status).toBe(200);
+    // Distinct from `rejected`, which is finance's answer — collapsing the two
+    // would lose who decided.
+    expect(body.adjustment.state).toBe("cancelled");
+
+    const again = await call(`/${budget._id}/adjustments/${id}/cancel${q}`, { method: "POST" });
+    expect(again.status).toBe(409);
+  });
+
+  /* ── reading and scoping ──────────────────────────────────────────────── */
+
+  test("the list returns every adjustment with whether the budget can still take one", async () => {
+    const { budget, q, item } = await setup();
+    await submit(budget, q, supplementary(item, 500000));
+    await submit(budget, q, revision(item, 900000));
+
+    const { status, body } = await call(`/${budget._id}/adjustments${q}`);
+    expect(status).toBe(200);
+    expect(body.adjustments).toHaveLength(2);
+    expect(body.adjustable).toBe(true);
+    expect(body.budgetStatus).toBe("active");
+
+    await Acc_Budget.updateOne({ _id: budget._id }, { $set: { status: "closed" } });
+    const closed = await call(`/${budget._id}/adjustments${q}`);
+    // Still readable — history does not disappear when a budget closes.
+    expect(closed.status).toBe(200);
+    expect(closed.body.adjustments).toHaveLength(2);
+    expect(closed.body.adjustable).toBe(false);
+  });
+
+  test("another company can neither see nor adjust this budget", async () => {
+    const { budget, item } = await setup();
+    const other = await seedCompany();
+    const oq = `?companyId=${other.company._id}`;
+
+    expect((await call(`/${budget._id}/adjustments${oq}`)).status).toBe(404);
+    expect((await submit(budget, oq, supplementary(item, 500000))).status).toBe(404);
+
+    const mine = await submit(budget, `?companyId=${budget.companyId}`, supplementary(item, 500000));
+    expect(mine.status).toBe(201);
+    const id = mine.body.adjustment._id;
+
+    expect((await call(`/${budget._id}/adjustments/${id}/approve${oq}`, { method: "POST" })).status).toBe(404);
+    expect((await call(`/${budget._id}/adjustments/${id}/reject${oq}`, { method: "POST" })).status).toBe(404);
+  });
+
+  test("an unknown or malformed budget or adjustment id is a clean 404", async () => {
+    const { budget, q } = await setup();
+
+    expect((await call(`/${new mongoose.Types.ObjectId()}/adjustments${q}`)).status).toBe(404);
+    expect((await call(`/not-an-id/adjustments${q}`)).status).toBe(404);
+    expect(
+      (await call(`/${budget._id}/adjustments/${new mongoose.Types.ObjectId()}/approve${q}`, { method: "POST" })).status,
+    ).toBe(404);
+    expect(
+      (await call(`/${budget._id}/adjustments/nope/approve${q}`, { method: "POST" })).status,
+    ).toBe(404);
+  });
+
+  test("a revenue target can be revised too — this is not a spend-only path", async () => {
+    const { budget, q } = await setup();
+    const revenueItem = budget.items[1];
+
+    const created = await submit(budget, q, revision(revenueItem, 5000000));
+    expect(created.status).toBe(201);
+    expect(created.body.adjustment.nature).toBe("revenue");
+
+    const { body } = await call(
+      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" },
+    );
+    expect(body.totals.totalRevenueAllocated).toBe(5000000);
+    expect(await allocationOf(budget._id, revenueItem._id)).toBe(5000000);
+  });
+});

@@ -553,6 +553,105 @@ const budgetSchema = new mongoose.Schema(
       },
     ],
 
+    /* ── ADJUSTMENTS (Chunk 7) ───────────────────────────────────────────────
+     * The legitimate way to change an allocation after the budget is live.
+     *
+     * Chunk 6 made over-budget spend require a written override. That was the
+     * point, but an override is meant to be exceptional — a team that needs
+     * more money every week ends up writing the same excuse every week, and a
+     * control everyone routinely waves through has stopped being a control.
+     * This is the path that fixes the NUMBER instead of excusing the breach.
+     *
+     * Deliberately a separate array from `budgetRequests`. A request asks for
+     * a head to be funded in the first place and produces a NEW `items[]`
+     * line; an adjustment changes an allocation that already exists and
+     * targets one. Widening `budgetRequests` to carry both would have made
+     * `sourceRequestId` mean two different things and left every consumer
+     * guessing which kind it was holding.
+     *
+     * Two shapes, one array, because they differ only in how the new number
+     * is stated and share every rule about who may ask, who may approve, and
+     * what approving does:
+     *   supplementary — "₹5L MORE on top of what we have"  (delta)
+     *   revision      — "make it ₹7L"                       (absolute) */
+    adjustments: [
+      {
+        type: {
+          type: String,
+          enum: ["supplementary", "revision"],
+          required: true,
+        },
+
+        /* The line being changed. An adjustment with no target is meaningless:
+         * it is the whole difference between this and a budget request. */
+        targetItemId: {
+          type: mongoose.Schema.Types.ObjectId,
+          required: true,
+          index: true,
+        },
+        /* Set when the targeted line itself came from an agreed department
+         * request, so the ask → allocation → top-up chain stays traceable. */
+        sourceRequestId: { type: mongoose.Schema.Types.ObjectId },
+
+        /* Denormalised from the target line at submit time, exactly as
+         * `items[]` and `budgetRequests[]` denormalise theirs: the request has
+         * to stay readable after a ledger rename or a re-parent. */
+        department: { type: String, trim: true },
+        ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+        ledgerName: { type: String, trim: true },
+        groupName: { type: String, trim: true },
+        nature: { type: String, enum: ["revenue", "expense"] },
+
+        /* What the line was worth when this was asked for. A SNAPSHOT, not a
+         * live read: finance approving next week must be able to see the
+         * number the requester was actually looking at, and a supplementary
+         * that silently re-based itself on a since-changed allocation would
+         * approve an amount nobody asked for. */
+        currentAllocatedAmount: { type: Number, default: 0 },
+
+        /* Supplementary states the delta; revision states the destination.
+         * Both are stored on every row — whichever the requester gave, the
+         * route derives the other from the snapshot above — so a reader never
+         * has to know the type to answer "what does this become?". */
+        requestedDeltaAmount: { type: Number },
+        requestedNewAmount: { type: Number },
+
+        /* What finance actually granted, which need not be what was asked.
+         * Absent until approval. */
+        approvedDeltaAmount: { type: Number },
+        approvedNewAmount: { type: Number },
+
+        reason: { type: String, trim: true },
+        justification: { type: String, trim: true },
+        priority: {
+          type: String,
+          enum: ["low", "normal", "high", "critical"],
+          default: "normal",
+        },
+
+        state: {
+          type: String,
+          enum: ["submitted", "reviewed", "approved", "rejected", "cancelled"],
+          default: "submitted",
+          index: true,
+        },
+
+        /* `appliedAt` is the idempotency key, not a decoration. Approving is
+         * the only operation here that MOVES money, and a double-click or a
+         * retried request must not apply the delta twice — so the route
+         * refuses to re-apply a row that already carries one. */
+        appliedAt: { type: Date },
+
+        /* Server-derived on every path. A client that could set these could
+         * claim any author for a number, which is the whole audit trail. */
+        requestedBy: { type: String, trim: true },
+        requestedAt: { type: Date },
+        reviewedBy: { type: String, trim: true },
+        reviewedAt: { type: Date },
+        financeNote: { type: String, trim: true },
+      },
+    ],
+
     alerts: [
       {
         message: String,
