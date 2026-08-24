@@ -12,104 +12,15 @@ const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddlew
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const { sendPayslipPdf } = require("../../services/payslipPdf.service");
 
-const MONTH_NAMES = [
-    "", "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-];
-
-function fmtDate(d) {
-    if (!d) return "";
-    const dt = new Date(d);
-    if (Number.isNaN(dt.getTime())) return "";
-    return `${String(dt.getDate()).padStart(2, "0")}.${String(dt.getMonth() + 1).padStart(2, "0")}.${dt.getFullYear()}`;
-}
-
-function buildPayslipPayload(item, employee) {
-    const fullName = [employee.firstName, employee.middleName, employee.lastName]
-        .filter(Boolean).join(" ").trim();
-
-    const e = item.earnings || {};
-    const d = item.deductions || {};
-
-    const earningsLines = [
-        { label: "Basic Salary", amount: e.basicSalary || 0 },
-        { label: "House Rent Allowance", amount: e.houseRentAllowance || 0 },
-        { label: "Travel Allowance", amount: e.travelAllowance || 0 },
-        { label: "Medical Allowance", amount: e.medicalAllowance || 0 },
-        { label: "Special Allowance", amount: e.specialAllowance || 0 },
-        { label: "Overtime", amount: e.overtime || 0 },
-        { label: "Bonus", amount: e.bonus || 0 },
-        { label: "Incentives", amount: e.incentives || 0 },
-        { label: "Other Earnings", amount: e.otherEarnings || 0 },
-    ].filter((r) => r.amount > 0);
-
-    const deductionsLines = [
-        { label: "Provident Fund", amount: d.providentFund || 0 },
-        { label: "ESIC (Employee)", amount: d.esic || 0 },
-        { label: "Income Tax (TDS)", amount: d.incomeTax || 0 },
-        { label: "Loan Deduction", amount: d.loanDeduction || 0 },
-        { label: "Advance Deduction", amount: d.advanceDeduction || 0 },
-        { label: "Loss of Pay", amount: d.lopDeduction || 0 },
-        { label: "Other Deductions", amount: d.otherDeductions || 0 },
-    ].filter((r) => r.amount > 0);
-
-    const payableDays = item.payableDays ?? item.presentDays ?? 0;
-    const workingDays = item.workingDays ?? 31;
-    const daysInMonth = item.daysInMonth ?? new Date(item.year, item.month, 0).getDate();
-
-    return {
-        company: {
-            name: "Grav Clothing",
-            tagline: "GRAV CLOTHING LIMITED",
-            logoUrl: "../../grav-logo.png"
-        },
-        period: {
-            month: item.month,
-            year: item.year,
-            label: `${MONTH_NAMES[item.month]} ${item.year}`
-        },
-        employee: {
-            id: employee._id,
-            name: fullName,
-            empNo: employee.biometricId || employee.identityId || "",
-            payPeriod: `${MONTH_NAMES[item.month]} ${item.year}`,
-            doj: fmtDate(employee.dateOfJoining),
-            dob: fmtDate(employee.dateOfBirth),
-            bankName: employee.bankDetails?.bankName || item.bankDetails?.bankName || "",
-            bankAccountNo: employee.bankDetails?.accountNumber || item.bankDetails?.accountNumber || "",
-            panNo: employee.documents?.panNumber || "",
-            pfNo: employee.documents?.pfNumber || "",
-            uanNo: employee.documents?.uanNumber || "",
-            esiNo: employee.documents?.esicNumber || "",
-            department: employee.department || item.department || "",
-            designation: employee.designation || employee.jobTitle || item.designation || "",
-        },
-        attendance: {
-            payableDays,
-            workingDays,
-            daysInMonth,
-            presentDays: item.presentDays || 0,
-            absentDays: item.absentDays || 0,
-            lopDays: item.lopDays || 0,
-            paidLeaveDays: item.paidLeaveDays || 0,
-        },
-        summary: {
-            grossEarnings: Math.round(e.grossEarnings || 0),
-            totalDeduction: Math.round(d.totalDeductions || 0),
-            netPay: Math.round(item.roundedNetPay ?? item.netPay ?? 0),
-            takeHomePay: Math.round(item.roundedNetPay ?? item.netPay ?? 0),
-        },
-        employerContributions: {
-            epf: d.employerPF || d.providentFund || 0,
-            esic: d.employerESIC || 0,
-        },
-        earnings: earningsLines,
-        deductions: deductionsLines,
-        status: item.status,
-        paymentDate: item.paymentDate,
-        processedAt: item.processedAt,
-    };
-}
+// The payload builder is shared with the HR dashboard's payslip route. It used
+// to be a second copy of the same function, and the two had drifted: this one
+// headed the payslip "Grav Clothing" with a tagline and a logo path that
+// resolved to nothing, while HR's said "Grav Clothing ( OPC ) Pvt Ltd".
+// Employees were downloading a different document from the one HR saw.
+const {
+    buildPayslipPayload,
+    MONTH_NAMES,
+} = require("../../services/payslipPayload.service");
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ★ EMPLOYEE-FACING ROUTES — use AllEmployeeAppMiddleware (cookie auth)

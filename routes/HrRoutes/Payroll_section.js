@@ -1208,6 +1208,21 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
     const plDef = leaveCfg?.plPerYear ?? 15;
 
     items.forEach((it) => {
+      // Interns accrue nothing. Without this they would pick up the config
+      // defaults below — clEligible gates CL, but SL and PL fall straight
+      // through to 12 and 15, and the saved Interns tab would show a leave
+      // balance the payroll engine has already established they do not have.
+      if (it.isIntern) {
+        it.leaveBalanceSnapshot = {
+          hasRecord: false,
+          clEligible: false,
+          daysSinceDOJ: it.daysSinceDOJ ?? null,
+          entitlement: { CL: 0, SL: 0, PL: 0 },
+          consumed: { CL: 0, SL: 0, PL: 0 },
+          available: { CL: 0, SL: 0, PL: 0 },
+        };
+        return;
+      }
       const b = byEmp.get(String(it.employeeId));
       const clEligible = it.clEligible !== false;
       const clEnt = clEligible ? (b?.entitlement?.CL ?? clDef) : 0;
@@ -1983,6 +1998,139 @@ function formatVal(v) {
   return String(v);
 }
 
+/**
+ * The interns' stipend sheet.
+ *
+ * A separate worksheet rather than the staff layout with the statutory
+ * columns left at zero. That sheet has twenty-two columns — Rate of Basic,
+ * Rate of HRA, ESIC employee, ESIC employer, PF employee, PF employer — and
+ * every one of them would read 0.00 against a net of 15,500. An accountant
+ * opening that does not see "interns have no PF"; they see a broken export
+ * and come asking which figure to trust.
+ *
+ * So: the columns an internship actually has. Stipend, days, earned, paid.
+ *
+ * @param {import("exceljs").Workbook} wb
+ * @param {Array} items   payroll items, already filtered to interns
+ */
+function buildInternStipendSheet(wb, items, { month, year }) {
+  const ws = wb.addWorksheet("StipendSheet", {
+    views: [{ state: "frozen", ySplit: 3 }],
+    pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
+  });
+
+  const COLS = [
+    { header: "#", width: 5, key: "sl" },
+    { header: "Emp No", width: 12, key: "bid" },
+    { header: "Name", width: 30, key: "name" },
+    { header: "Department", width: 20, key: "dept" },
+    { header: "Designation", width: 22, key: "desig" },
+    { header: "Arrangement", width: 13, key: "kind" },
+    { header: "Monthly Stipend", width: 16, key: "rate", money: true },
+    { header: "Days", width: 8, key: "days", days: true },
+    { header: "Payable", width: 10, key: "payable", days: true },
+    { header: "LOP", width: 9, key: "lop", days: true },
+    { header: "Stipend Earned", width: 16, key: "earned", money: true },
+    { header: "Paid", width: 15, key: "net", money: true },
+  ];
+  COLS.forEach((c, i) => (ws.getColumn(i + 1).width = c.width));
+
+  const solid = (argb) => ({ type: "pattern", pattern: "solid", fgColor: { argb } });
+  const money = "#,##0.00";
+  const daysFmt = "0.##";
+  const LABEL = { paid: "Paid", unpaid: "Unpaid", self_paid: "Self-paid" };
+
+  ws.mergeCells(1, 1, 1, COLS.length);
+  const title = ws.getCell(1, 1);
+  title.value = `GRAV CLOTHING  ·  Intern Stipends  ·  ${MONTH_NAMES[month]} ${year}`;
+  title.font = { name: "Arial", size: 13, bold: true, color: { argb: "FFFFFFFF" } };
+  title.fill = solid("FF92400E");
+  title.alignment = { horizontal: "center", vertical: "middle" };
+  ws.getRow(1).height = 30;
+
+  ws.mergeCells(2, 1, 2, COLS.length);
+  const note = ws.getCell(2, 1);
+  note.value =
+    "Stipends carry no basic, HRA, provident fund or ESI — interns are not enrolled in either scheme.";
+  note.font = { name: "Arial", size: 9, italic: true, color: { argb: "FF78350F" } };
+  note.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
+  note.fill = solid("FFFEF3C7");
+
+  const head = ws.getRow(3);
+  COLS.forEach((c, i) => {
+    const cell = head.getCell(i + 1);
+    cell.value = c.header;
+    cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+    cell.fill = solid("FF1E293B");
+    cell.alignment = {
+      horizontal: c.money || c.days ? "right" : "left",
+      vertical: "middle",
+      wrapText: true,
+      indent: 1,
+    };
+  });
+  head.height = 26;
+
+  items.forEach((it, idx) => {
+    const row = ws.getRow(4 + idx);
+    const earned = it.earnings?.stipend || it.earnings?.grossEarnings || 0;
+    const values = {
+      sl: idx + 1,
+      bid: it.biometricId || "",
+      name: it.employeeName || "",
+      dept: it.department || "",
+      desig: it.designation || "",
+      kind: LABEL[it.internshipType] || "Paid",
+      rate: it.rateGross || 0,
+      days: it.daysInMonth || 0,
+      payable: it.payableDays || 0,
+      lop: it.lopDays || 0,
+      earned,
+      net: it.roundedNetPay ?? it.netPay ?? 0,
+    };
+    COLS.forEach((c, i) => {
+      const cell = row.getCell(i + 1);
+      cell.value = values[c.key];
+      cell.font = { name: "Arial", size: 9 };
+      cell.fill = solid(idx % 2 ? "FFF8FAFC" : "FFFFFFFF");
+      cell.alignment = {
+        horizontal: c.money || c.days ? "right" : "left",
+        vertical: "middle",
+        indent: 1,
+      };
+      if (c.money) cell.numFmt = money;
+      if (c.days) cell.numFmt = daysFmt;
+    });
+  });
+
+  const sum = ws.getRow(4 + items.length);
+  const total = (f) => items.reduce((a, i) => a + (f(i) || 0), 0);
+  sum.getCell(3).value = `${items.length} intern${items.length === 1 ? "" : "s"}`;
+  sum.getCell(7).value = total((i) => i.rateGross);
+  sum.getCell(9).value = total((i) => i.payableDays);
+  sum.getCell(10).value = total((i) => i.lopDays);
+  sum.getCell(11).value = total((i) => i.earnings?.stipend || i.earnings?.grossEarnings);
+  sum.getCell(12).value = total((i) => i.roundedNetPay ?? i.netPay);
+  COLS.forEach((c, i) => {
+    const cell = sum.getCell(i + 1);
+    cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FF065F46" } };
+    cell.fill = solid("FFD1FAE5");
+    cell.alignment = {
+      horizontal: c.money || c.days ? "right" : "left",
+      vertical: "middle",
+      indent: 1,
+    };
+    if (c.money) cell.numFmt = money;
+    if (c.days) cell.numFmt = daysFmt;
+    cell.border = {
+      top: { style: "medium", color: { argb: "FF000000" } },
+      bottom: { style: "medium", color: { argb: "FF000000" } },
+    };
+  });
+
+  return ws;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  GET /export
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1992,15 +2140,46 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
     const month = parseInt(req.query.month) || new Date().getMonth() + 1;
     const year = parseInt(req.query.year) || new Date().getFullYear();
 
-    const items = await PayrollItem.find({ month, year })
+    // Which tab the HR page is on. Defaults to "all" so every existing caller
+    // — and anyone with the URL bookmarked — keeps getting the whole month.
+    const segment = ["staff", "interns"].includes(req.query.segment)
+      ? req.query.segment
+      : "all";
+    const segmentFilter =
+      segment === "interns"
+        ? { isIntern: true }
+        : segment === "staff"
+          ? { isIntern: { $ne: true } }
+          : {};
+
+    const items = await PayrollItem.find({ month, year, ...segmentFilter })
       .sort({ department: 1, employeeName: 1 })
       .lean();
 
     if (items.length === 0) {
       return res.status(404).json({
         success: false,
-        message: `No payroll items for ${MONTH_NAMES[month]} ${year}. Process payroll first.`,
+        message:
+          segment === "interns"
+            ? `No interns in the ${MONTH_NAMES[month]} ${year} payroll.`
+            : `No payroll items for ${MONTH_NAMES[month]} ${year}. Process payroll first.`,
       });
+    }
+
+    // Interns get their own sheet — see buildInternStipendSheet for why the
+    // staff layout is not reused.
+    if (segment === "interns") {
+      const internWb = new (require("exceljs").Workbook)();
+      internWb.creator = "Grav Clothing HRMS";
+      buildInternStipendSheet(internWb, items, { month, year });
+      const internBuf = await internWb.xlsx.writeBuffer();
+      const internName = `intern_stipends_${year}-${String(month).padStart(2, "0")}.xlsx`;
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+      res.setHeader("Content-Disposition", `attachment; filename="${internName}"`);
+      return res.send(Buffer.from(internBuf));
     }
 
     const employees = await Employee.find({
