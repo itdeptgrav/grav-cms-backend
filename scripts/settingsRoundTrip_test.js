@@ -12,7 +12,7 @@ const posted = {
   shifts: {
     operator:  { start:"09:00", end:"18:00", lateGraceMins:10, halfDayThresholdMins:390, otGraceMins:15 },
     executive: { start:"09:30", end:"18:30", lateGraceMins:10, halfDayThresholdMins:450, otGraceMins:60 },
-    custom:    { lateGraceMins:5,  halfDayThresholdMins:270, halfDayBasis:"span", otGraceMins:45, punchPattern:"production" },
+    custom:    { lateGraceMins:5,  halfDayThresholdMins:270, halfDayBasis:"span", otGraceMins:45 },
   },
   nonWorkingDay: { halfDayThresholdMins: 210, basis: "span" },
   departmentCategories: { core:["PRODUCTION"], general:["IT"] },
@@ -47,14 +47,13 @@ console.log('  OT grace       ', sh.otGraceMins, '(HR set 45)');
 const ok1 = sh.lateGraceMins===5 && sh.halfDayThresholdMins===270 && sh.halfDayBasis==='span' && sh.otGraceMins===45;
 console.log('  ', ok1 ? 'PASS — the form reaches the engine' : '*** FAIL ***');
 
-// The punch pattern travels the same road, and it is the one field on this tab
-// that is not about hours: it says how many times a custom-shift employee is
-// expected to touch the reader. A schema that dropped it would look fine here
-// and quietly flag every one of their days as a miss-punch.
-const { resolveEmployeeType } = require(path.join(ROOT, 'routes/HrRoutes/Attendance_section'));
-const et = resolveEmployeeType(hk, saved);
-console.log('\npunch pattern         :', saved.shifts.custom.punchPattern, '-> employeeType', et);
-console.log('  ', saved.shifts.custom.punchPattern==='production' && et==='operator' ? 'PASS' : '*** FAIL ***');
+// The punch count is NOT on this tab. It is the one thing about a custom
+// shift that does not follow from the hours — two people on 06:00-14:00 can
+// punch two times or six — so it lives on the employee, and
+// scripts/punchPattern_test.js covers it. Asserted here so a settings field
+// cannot quietly reappear and start overruling the person.
+console.log('\npunch count is not a setting:',
+  saved.shifts.custom.punchPattern === undefined ? 'PASS' : '*** FAIL ***');
 
 // And the day-off threshold HR set.
 const sun = P.classifyDayKind('2026-08-30', saved, {});

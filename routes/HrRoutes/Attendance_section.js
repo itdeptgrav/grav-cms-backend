@@ -306,6 +306,33 @@ function designationMatches(designation, list) {
     return e && (d === e || d.includes(e));
   });
 }
+/**
+ * How many punches this person's day is expected to have.
+ *
+ * Core is the 2-punch office day and General the 6-punch production one, so
+ * those two answer it by themselves. Custom does not: two people on the same
+ * 06:00-14:00 hours can punch two times or six, and nothing about the hours
+ * says which. So it is asked per person, on their own record.
+ *
+ * Getting it wrong is not cosmetic. `hasMissPunch` is `punches < expected`,
+ * so expecting six from somebody who makes two flags EVERY one of their days
+ * for HR to clear by hand — which is why an unanswered custom shift falls back
+ * to 2 rather than to the higher number.
+ */
+function resolvePunchCount(emp, settings) {
+  const mode = emp?.workShift?.mode;
+  if (mode === "core") return 2;
+  if (mode === "general") return 6;
+  if (mode === "custom") {
+    const n = Number(emp?.workShift?.punches);
+    if (Number.isFinite(n) && n >= 1) return Math.round(n);
+    return 2;
+  }
+  // No shift category yet — pre-backfill. Fall back to the department-derived
+  // classification, which is what these people were being measured by before.
+  return resolveEmployeeType(emp, settings) === "operator" ? 6 : 2;
+}
+
 function resolveEmployeeType(emp, settings) {
   if (!settings) return "executive";
   if (emp?.employeeType) {
@@ -320,9 +347,11 @@ function resolveEmployeeType(emp, settings) {
   if (mode === "core") return "executive";
   if (mode === "general") return "operator";
   if (mode === "custom") {
-    return settings.shifts?.custom?.punchPattern === "production"
-      ? "operator"
-      : "executive";
+    // employeeType decides how the day is MEASURED — an operator's day is net
+    // of punched breaks, an executive's is the whole span. The punch count
+    // answers that on its own: somebody who punches out for lunch has a break
+    // to exclude, somebody who touches the reader twice does not.
+    return resolvePunchCount(emp, settings) > 2 ? "operator" : "executive";
   }
   // Below here is the pre-categories fallback, and it should never fire:
   // scripts/backfillWorkShift.js gives every existing employee a mode and the
@@ -366,7 +395,14 @@ function resolveEmployeeType(emp, settings) {
  * already expect, so nothing downstream changes.
  */
 function shiftFor(emp, settings) {
-  return resolveShift(emp || {}, settings);
+  // expectedPunches rides along on the shift object rather than becoming a
+  // seventh positional argument to computeDay. It belongs to the same answer:
+  // "what is this person's working day", which is hours AND how many times
+  // they touch the reader in it.
+  return {
+    ...resolveShift(emp || {}, settings),
+    expectedPunches: resolvePunchCount(emp || {}, settings),
+  };
 }
 
 /**
@@ -399,7 +435,15 @@ function shiftMidpointMins(shift) {
 }
 
 function assignPunchTypes(punches, employeeType, shift, settings) {
-  const expected = employeeType === "operator" ? 6 : 2;
+  // Set per person for custom shifts — see resolvePunchCount. The
+  // employeeType fallback is for the merge path, which rebuilds a shift from
+  // stored times and has no employee to ask.
+  const expected =
+    Number(shift?.expectedPunches) > 0
+      ? Math.round(Number(shift.expectedPunches))
+      : employeeType === "operator"
+        ? 6
+        : 2;
   const sorted = [...punches].sort((a, b) => a.time - b.time);
   if (sorted.length === 0)
     return {
@@ -461,7 +505,10 @@ function assignPunchTypes(punches, employeeType, shift, settings) {
     } else if (middle.length === 2) {
       middle[0].punchType = "lunch_out";
       middle[1].punchType = "lunch_in";
-      missingPunchType = "tea_out";
+      // Only a 6-punch day is short a tea pair here. Somebody set to 4
+      // punches has made all of theirs, and naming a missing one would put a
+      // miss-punch flag on a complete day.
+      missingPunchType = expected >= 6 ? "tea_out" : null;
     } else if (middle.length === 1) {
       middle[0].punchType = "lunch_out";
       missingPunchType = "lunch_in";
@@ -2710,7 +2757,6 @@ function buildSettingsChanges(oldCfg, body) {
     );
     diff("Custom half-day measured on", oc.halfDayBasis, cs.halfDayBasis);
     diff("Custom OT grace (mins)", oc.otGraceMins, cs.otGraceMins);
-    diff("Custom punch pattern", oc.punchPattern, cs.punchPattern);
   }
   const nwd = body.nonWorkingDay;
   if (nwd) {
@@ -8243,6 +8289,14 @@ module.exports.syncTodayOnly = syncTodayOnly;
 // Custom the punch pattern in attendance settings — rather than a second,
 // drifting copy of the rules.
 module.exports.resolveEmployeeType = resolveEmployeeType;
+// Exported for the same reason, and for the tests: how many punches a day is
+// expected to have is now a per-person answer, not one derived from a
+// department or a global setting.
+module.exports.resolvePunchCount = resolvePunchCount;
+// Exported for the tests. It is the function that turns raw punches into a
+// day — resolving the punch count correctly and then failing to thread it in
+// here would pass every resolver test and change nothing.
+module.exports.computeDay = computeDay;
 // Exported so the read-only Daily Attendance AI assistant builds its context
 // from the SAME computation the HR daily page uses, rather than a second copy.
 module.exports.getDailyAttendance = getDailyAttendance;

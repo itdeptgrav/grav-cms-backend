@@ -203,6 +203,19 @@ const employeeSchema = new mongoose.Schema({
     mode: { type: String, enum: ["core", "general", "custom"], default: undefined },
     start: { type: String, trim: true }, // "HH:MM", custom only
     end: { type: String, trim: true },   // "HH:MM", custom only
+
+    // How many times this person is expected to touch the reader in a day.
+    // Custom only: Core is the 2-punch office day and General the 6-punch
+    // production one, so those two answer it by themselves.
+    //
+    // Per person, and not a setting, because it does not follow from the
+    // hours. Two people can both be on 06:00-14:00 and one of them punches
+    // for lunch while the other does not — a housekeeper and a night guard
+    // are the example that started this. A shared default would be wrong for
+    // whichever of them lost the coin toss, and getting it wrong is not
+    // cosmetic: a day with fewer punches than expected is flagged as a
+    // miss-punch for HR to clear by hand, every day, forever.
+    punches: { type: Number, min: 1, max: 12 },
   },
 
   status: { type: String, default: "active" },

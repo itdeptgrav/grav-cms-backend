@@ -29,19 +29,6 @@ const CustomShiftRulesSchema = new mongoose.Schema(
     // not depend on whether this person punches their breaks.
     halfDayBasis: { type: String, enum: ["net", "span"], default: "net" },
     otGraceMins: { type: Number, default: 30 },
-    // How many punches a custom day is expected to have. Core is always the
-    // 2-punch office day and General always the 6-punch production one, so
-    // this is the only category that has to be told — and it is told once,
-    // here, rather than inferred from the employee's department.
-    //
-    // "office" is the default because guessing high is the expensive mistake:
-    // expecting 6 punches from someone who makes 2 flags every one of their
-    // days as a miss-punch for HR to clear by hand.
-    punchPattern: {
-      type: String,
-      enum: ["office", "production"],
-      default: "office",
-    },
   },
   { _id: false },
 );
@@ -194,8 +181,6 @@ AttendanceSettingsSchema.statics.getConfig = async function () {
     doc.shifts.custom.halfDayThresholdMins = 300;
   if (doc.shifts.custom.halfDayBasis == null) doc.shifts.custom.halfDayBasis = "net";
   if (doc.shifts.custom.otGraceMins == null) doc.shifts.custom.otGraceMins = 30;
-  if (doc.shifts.custom.punchPattern == null)
-    doc.shifts.custom.punchPattern = "office";
   if (!doc.nonWorkingDay) doc.nonWorkingDay = {};
   if (doc.nonWorkingDay.halfDayThresholdMins == null)
     doc.nonWorkingDay.halfDayThresholdMins = 240;
