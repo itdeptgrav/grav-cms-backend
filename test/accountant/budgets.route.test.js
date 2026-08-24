@@ -4011,20 +4011,30 @@ describe("dashboard monthly series", () => {
     expect(byKey["2026-09"].revenue).toBe(0);
   });
 
-  test("every month of the window is present, including the empty ones", async () => {
+  test("empty months INSIDE the range are kept; the empty ends are trimmed", async () => {
     const { company, expenseLedger } = await setup();
+    // A quiet stretch between two months of movement.
     await post({ company, ledger: expenseLedger, amount: 1000, type: "Dr", date: "2026-06-15" });
+    await post({ company, ledger: expenseLedger, amount: 2000, type: "Dr", date: "2026-09-15" });
 
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
-    // Apr 2026 → Mar 2027 inclusive. A chart that skipped empty months would
-    // compress the gaps and misdraw the shape of the year.
-    expect(body.monthly).toHaveLength(12);
-    expect(body.monthly[0].key).toBe("2026-04");
-    expect(body.monthly[11].key).toBe("2027-03");
-    expect(body.monthly[0]).toEqual({ key: "2026-04", revenue: 0, expense: 0 });
+
+    // Jun → Sep. Apr, May and Oct-Mar carry nothing and are dropped: an old
+    // budget in scope otherwise stretches the axis across financial years.
+    expect(body.monthly.map((m) => m.key)).toEqual(["2026-06", "2026-07", "2026-08", "2026-09"]);
+    // But the quiet months between them stay — a flat quarter is part of the
+    // shape of the year, and skipping it would compress the gap.
+    expect(body.monthly[1]).toEqual({ key: "2026-07", revenue: 0, expense: 0 });
+    expect(body.monthly[2]).toEqual({ key: "2026-08", revenue: 0, expense: 0 });
   });
 
-  test("the series agrees with the totals printed beside it", async () => {
+  test("a budget period with no movement at all yields an empty series", async () => {
+    const { company } = await setup();
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.monthly).toEqual([]);
+  });
+
+  test("the series agrees with the totals when budgets do not overlap", async () => {
     const { company, expenseLedger, revenueLedger } = await setup();
     await post({ company, ledger: expenseLedger, amount: 120000, type: "Dr", date: "2026-06-15" });
     await post({ company, ledger: expenseLedger, amount: 80000, type: "Dr", date: "2026-09-02" });
@@ -4034,8 +4044,38 @@ describe("dashboard monthly series", () => {
     const sum = (k) => body.monthly.reduce((s, m) => s + m[k], 0);
 
     // A chart that disagreed with the figures above it is worse than no chart.
+    // This holds while one head belongs to one budget — see the next test for
+    // where it stops holding, and why that is the totals' problem not the
+    // chart's.
     expect(sum("expense")).toBe(body.totals.expense.actual);
     expect(sum("revenue")).toBe(body.totals.revenue.actual);
+  });
+
+  test("KNOWN: overlapping budgets double-count actuals in the totals, not in the series", async () => {
+    const { company, budget, expenseLedger } = await setup();
+    await post({ company, ledger: expenseLedger, amount: 100000, type: "Dr", date: "2026-08-15" });
+
+    /* A quarterly budget on the SAME head, inside the yearly one's period —
+     * an ordinary thing to do, and how most companies run a tight quarter. */
+    await Acc_Budget.create({
+      name: "Q2 top-up", financialYear: "2026-27", period: "quarterly", quarter: 2, status: "active",
+      startDate: new Date("2026-07-01"), endDate: new Date("2026-09-30"), companyId: company._id,
+      items: [{ ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 200000 }],
+    });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    const sum = body.monthly.reduce((s, m) => s + m.expense, 0);
+
+    /* The voucher is ONE ₹1L payment. The series counts it once, which is
+     * right. `totals` rolls up each budget's own evaluated lines, so the same
+     * payment lands in both budgets and the headline reads ₹2L.
+     *
+     * This predates the chart — it is how the Chunk 4 roll-up has always
+     * worked — and it is pinned here rather than quietly worked around,
+     * because the honest fix changes a figure four surfaces read and deserves
+     * its own change. The chart is the deduplicated truth of the two. */
+    expect(sum).toBe(100000);
+    expect(body.totals.expense.actual).toBe(200000);
   });
 
   test("a voucher on an IST month boundary buckets by IST, not UTC", async () => {
@@ -4046,8 +4086,11 @@ describe("dashboard monthly series", () => {
     await post({ company, ledger: expenseLedger, amount: 50000, type: "Dr", date: "2026-06-30T18:30:00Z" });
 
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
-    expect(body.monthly.find((m) => m.key === "2026-07").expense).toBe(50000);
-    expect(body.monthly.find((m) => m.key === "2026-06").expense).toBe(0);
+    // July is the only month with movement, so after trimming it is the only
+    // month in the series at all — which is itself the assertion: bucketed on
+    // UTC this voucher would have produced a June bucket instead.
+    expect(body.monthly).toHaveLength(1);
+    expect(body.monthly[0]).toEqual({ key: "2026-07", revenue: 0, expense: 50000 });
   });
 
   test("the window itself is the budget's, so spend just outside it is excluded", async () => {
@@ -4063,10 +4106,12 @@ describe("dashboard monthly series", () => {
     await post({ company, ledger: expenseLedger, amount: 50000, type: "Dr", date: "2026-03-31T18:30:00Z" });
 
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
-    expect(body.monthly.find((m) => m.key === "2026-04").expense).toBe(0);
+    // Nothing inside the window, so nothing to draw.
+    expect(body.monthly).toEqual([]);
     // And the series still agrees with the totals, which is the real contract.
     const sum = body.monthly.reduce((s, m) => s + m.expense, 0);
     expect(sum).toBe(body.totals.expense.actual);
+    expect(body.totals.expense.actual).toBe(0);
   });
 
   test("another company's postings never reach the series", async () => {

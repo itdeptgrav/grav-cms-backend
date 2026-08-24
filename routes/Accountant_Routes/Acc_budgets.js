@@ -491,7 +491,17 @@ async function monthlySeries(evaluated, allLines, req) {
   const lastKey = istKey(end);
   if (!seen.has(lastKey)) out.push(byMonth.get(lastKey) || { key: lastKey, revenue: 0, expense: 0 });
 
-  return out;
+  /* Empty months INSIDE the range stay — a quiet quarter is part of the shape
+   * of the year. Empty months at the ENDS are trimmed: an old closed budget in
+   * scope stretches the union across financial years, and two thirds of the
+   * axis showing nothing tells the reader less than the same chart drawn over
+   * the months that actually have movement. */
+  const active = (m) => m.revenue !== 0 || m.expense !== 0;
+  const first = out.findIndex(active);
+  if (first === -1) return [];
+  let last = out.length - 1;
+  while (last > first && !active(out[last])) last--;
+  return out.slice(first, last + 1);
 }
 
 /** Enough of a line to act on it, without shipping the whole document. */
