@@ -2636,6 +2636,28 @@ function buildSettingsChanges(oldCfg, body) {
     );
     diff("Executive OT grace (mins)", oe.otGraceMins, es.otGraceMins);
   }
+  const cs = body.shifts?.custom;
+  if (cs) {
+    const oc = oldCfg.shifts?.custom || {};
+    diff("Custom late grace (mins)", oc.lateGraceMins, cs.lateGraceMins);
+    diff(
+      "Custom half-day threshold (mins)",
+      oc.halfDayThresholdMins,
+      cs.halfDayThresholdMins,
+    );
+    diff("Custom half-day measured on", oc.halfDayBasis, cs.halfDayBasis);
+    diff("Custom OT grace (mins)", oc.otGraceMins, cs.otGraceMins);
+  }
+  const nwd = body.nonWorkingDay;
+  if (nwd) {
+    const on = oldCfg.nonWorkingDay || {};
+    diff(
+      "Non-working day half-day threshold (mins)",
+      on.halfDayThresholdMins,
+      nwd.halfDayThresholdMins,
+    );
+    diff("Non-working day measured on", on.basis, nwd.basis);
+  }
   const lhp = body.lateHalfDayPolicy;
   if (lhp) {
     const ol = oldCfg.lateHalfDayPolicy || {};
@@ -2739,9 +2761,13 @@ router.put("/settings", EmployeeAuthMiddlewear, async (req, res) => {
       singlePunchHandling,
       graceCarryForward,
       displayLabels,
+      nonWorkingDay,
     } = req.body;
     const update = {};
+    // shifts carries operator, executive AND custom — the custom profile holds
+    // only the rules, since a custom shift's hours live on the employee.
     if (shifts) update.shifts = shifts;
+    if (nonWorkingDay) update.nonWorkingDay = nonWorkingDay;
     if (lateHalfDayPolicy) update.lateHalfDayPolicy = lateHalfDayPolicy;
     if (operatorDepartments)
       update.operatorDepartments = operatorDepartments.map((d) =>

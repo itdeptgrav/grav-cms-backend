@@ -28,10 +28,33 @@ const Attendance = require("../models/HR_Models/Attendance");
 const Employee = require("../models/Employee");
 
 // ── Read all config from env ──────────────────────────────────────────────────
+const mongoose = require("mongoose");
+const AttendanceSettings = require("../models/HR_Models/Attendancesettings");
+const {
+    resolveShift,
+    classifyDayKind,
+    classifyDay,
+} = require("./shiftPolicy");
+
+// shiftPolicy speaks the attendance codes the rest of HR uses; the Attendance
+// collection has its own longer enum. One map, here, rather than a string
+// comparison at each write.
+const STATUS_CODE_TO_DB = {
+    P: "present",
+    "P*": "late",
+    "P~": "early_departure",
+    HD: "half_day",
+    AB: "absent",
+    WO: "weekend",
+    PH: "holiday",
+};
+
 const BIO_URL = process.env.ETIMEOFFICE_URL || "https://api.etimeoffice.com/api/DownloadPunchData";
 const BIO_USER = process.env.ETIMEOFFICE_USERNAME || "";
 const BIO_PASS = process.env.ETIMEOFFICE_PASSWORD || "";
 const SYNC_INTERVAL = parseInt(process.env.BIOMETRIC_SYNC_INTERVAL_MINUTES || "30", 10);
+// Kept only as the last-resort default inside shiftPolicy; nothing here reads
+// them to judge a day any more. See the note in processPunches.
 const SHIFT_START = process.env.SHIFT_START || "09:00";
 const SHIFT_END = process.env.SHIFT_END || "18:00";
 const LATE_THRESH = parseInt(process.env.LATE_THRESHOLD_MINS || "15", 10);
@@ -139,23 +162,24 @@ function processPunches(rawPunches) {
         const breakMins = breaks.reduce((s, b) => s + b.durationMins, 0);
         const effectiveMins = Math.max(0, workingMins - breakMins);
 
-        const shiftStartMins = parseHHMM(SHIFT_START);
-        const shiftEndMins = parseHHMM(SHIFT_END);
+        // NO status here any more.
+        //
+        // This function does not know who the employee is, and until it does
+        // there is no shift to judge them against. It used to reach for
+        // SHIFT_START and SHIFT_END — module-level constants read out of the
+        // environment at boot — which meant one shift for the whole company.
+        // Housekeeping finish at 14:00, the constant said 18:00, so every
+        // single day was an early departure. Measured: 237 phantom EO minutes
+        // per person per day.
+        //
+        // Status is decided in upsertRecords, where the employee, their shift
+        // and the company calendar are all in hand.
         const ciMins = checkIn.getHours() * 60 + checkIn.getMinutes();
-        const coMins = checkOut ? checkOut.getHours() * 60 + checkOut.getMinutes() : 0;
-
-        const lateBy = Math.max(0, ciMins - shiftStartMins);
-        const isLate = lateBy > LATE_THRESH;
-        const isEarlyOut = checkOut ? coMins < shiftEndMins - EARLY_THRESH : false;
-        const overtimeMins = checkOut ? Math.max(0, coMins - shiftEndMins) : 0;
-
-        let status = "present";
-        if (effectiveMins <= 0) status = "absent";
-        else if (effectiveMins < HALF_THRESH) status = "half_day";
-        else if (isLate && !isEarlyOut) status = "late";
-        else if (isEarlyOut) status = "early_departure";
+        const coMins = checkOut ? checkOut.getHours() * 60 + checkOut.getMinutes() : null;
 
         results.push({
+            checkInMins: ciMins,
+            checkOutMins: coMins,
             name: g.name,
             empcode: g.empcode,
             date: g.date,
@@ -166,12 +190,6 @@ function processPunches(rawPunches) {
             workingMinutes: workingMins,
             breakMinutes: breakMins,
             effectiveMinutes: effectiveMins,
-            overtimeMinutes: overtimeMins,
-            hasOvertime: overtimeMins > 0,
-            lateByMinutes: lateBy,
-            isLate,
-            isEarlyOut,
-            status,
             allPunches: sorted.map(p => p.toISOString()),
             breaks: breaks.map(b => ({
                 out: b.out.toISOString(),
@@ -202,7 +220,7 @@ async function upsertRecords(records) {
     // Pre-fetch all employees with biometricIds in one query for performance
     const allEmpcodes = [...new Set(records.map(r => r.empcode))];
     const employees = await Employee.find({ biometricId: { $in: allEmpcodes } })
-        .select("_id department designation gender biometricId firstName lastName")
+        .select("_id department designation gender biometricId firstName lastName workShift")
         .lean();
 
     const empMap = {};
@@ -210,9 +228,42 @@ async function upsertRecords(records) {
         empMap[e.biometricId] = e;
     }
 
+    // Attendance policy and the company calendar, fetched ONCE for the batch
+    // rather than per record — a sync can carry a month of punches for the
+    // whole workforce.
+    const settings = await AttendanceSettings.getConfig().catch(() => ({}));
+    const dates = [...new Set(records.map((r) => r.date))].sort();
+    const holidayByDate = new Map();
+    if (dates.length) {
+        try {
+            const CompanyHoliday = mongoose.model("CompanyHoliday");
+            const hols = await CompanyHoliday.find({
+                date: { $gte: dates[0], $lte: dates[dates.length - 1] },
+            }).lean();
+            for (const h of hols) holidayByDate.set(h.date, h);
+        } catch (err) {
+            // No calendar is survivable — every day falls back to the weekly
+            // pattern. Silently mislabelling a declared holiday is not, so say so.
+            console.warn("[Biometric] Company calendar unavailable:", err.message);
+        }
+    }
+
     for (const r of records) {
         try {
             const emp = empMap[r.empcode] || null;
+
+            // THE fix: this employee's shift, this date's kind, then a verdict.
+            const shift = resolveShift(emp, settings);
+            const day = classifyDayKind(r.date, settings, holidayByDate);
+            const verdict = classifyDay({
+                inMins: r.checkInMins,
+                outMins: r.checkOutMins,
+                netMins: r.effectiveMinutes,
+                spanMins: r.workingMinutes,
+                shift,
+                settings,
+                day,
+            });
 
             const doc = {
                 // Link employee if found
@@ -232,19 +283,31 @@ async function upsertRecords(records) {
                 workingMinutes: r.workingMinutes,
                 breakMinutes: r.breakMinutes,
                 effectiveMinutes: r.effectiveMinutes,
-                overtimeMinutes: r.overtimeMinutes,
-                hasOvertime: r.hasOvertime,
-                isLate: r.isLate,
-                isEarlyCheckout: r.isEarlyOut,
-                status: r.status,
-                shiftStart: SHIFT_START,
-                shiftEnd: SHIFT_END,
+                overtimeMinutes: verdict.otMins,
+                hasOvertime: verdict.otMins > 0,
+                isLate: verdict.isLate,
+                lateByMinutes: verdict.lateMins,
+                isEarlyDeparture: verdict.isEarlyOut,
+                isEarlyCheckout: verdict.isEarlyOut,
+                earlyByMinutes: verdict.earlyOutMins,
+                isHalfDay: verdict.status === "HD",
+                status: STATUS_CODE_TO_DB[verdict.status] || "present",
+                // The shift this day was actually judged against, stored so a
+                // dispute can be settled from the record rather than by
+                // guessing what the settings were at the time.
+                shiftStart: shift.start,
+                shiftEnd: shift.end,
                 // Store full punch detail for timeline view
                 remarks: JSON.stringify({
                     allPunches: r.allPunches,
                     breaks: r.breaks,
                     totalPunches: r.totalPunches,
-                    lateByMinutes: r.lateByMinutes,
+                    lateByMinutes: verdict.lateMins,
+                    shiftMode: shift.mode,
+                    shiftSource: shift.source,
+                    dayKind: day.kind,
+                    workingDayOverride: day.override || false,
+                    compOffEligible: verdict.compOffEligible,
                 }),
             };
 
@@ -329,4 +392,15 @@ function getSyncStatus() {
     };
 }
 
-module.exports = { syncBiometricData, startAutoSync, stopAutoSync, getSyncStatus };
+// processPunches and upsertRecords carry the whole attendance decision between
+// them, so they are exported to be exercised directly. Driving them through
+// syncBiometricData would mean standing up the biometric device API just to
+// test whether housekeeping gets marked early-out.
+module.exports = {
+    processPunches,
+    upsertRecords,
+    syncBiometricData,
+    startAutoSync,
+    stopAutoSync,
+    getSyncStatus,
+};
