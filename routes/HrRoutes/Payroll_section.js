@@ -162,7 +162,20 @@ function computeEmployeePayroll(employee, ctx) {
     month,
     year,
   );
-  const clEligible = daysSinceDOJ >= 24;
+
+  // An intern is paid a stipend, and that is the whole of their arrangement.
+  // Two things follow, and both are enforced below rather than trusted to the
+  // caller: they accrue no leave, and their pay has no statutory components.
+  const isIntern = employee.employmentType === "intern";
+
+  // Employees become eligible for casual leave 24 days after joining. Interns
+  // never do — no CL, no SL, no PL, and so nothing for the auto-adjustment
+  // below to spend. An absence is simply an unpaid day.
+  //
+  // This kills the automatic machinery only. A day HR has explicitly marked
+  // L-CL on an intern's attendance is still honoured as paid, because that is
+  // a decision somebody made and recorded, not an entitlement being accrued.
+  const clEligible = !isIntern && daysSinceDOJ >= 24;
 
   const CL_ENT_DEFAULT = leaveConfig?.clPerYear ?? 12;
   const SL_ENT_DEFAULT = leaveConfig?.slPerYear ?? 12;
@@ -474,9 +487,16 @@ function computeEmployeePayroll(employee, ctx) {
 
   const divisor = daysInMonth;
 
-  const fullGross = Number(employee.salary?.gross || 0);
-  const fullBasic = Number(employee.salary?.basic || 0);
-  const fullHra = Number(employee.salary?.hra || 0);
+  // For an intern the stipend IS the gross: one figure, prorated the same way
+  // as a salary so a month with absences pays less, and no basic/HRA split
+  // because there is nothing to split. An unpaid or self-paid internship has
+  // no stipend, so every figure below falls out as zero on its own — they
+  // still get a row, with their attendance on it, and a payout of nothing.
+  const fullGross = isIntern
+    ? Number(employee.salary?.stipend || 0)
+    : Number(employee.salary?.gross || 0);
+  const fullBasic = isIntern ? 0 : Number(employee.salary?.basic || 0);
+  const fullHra = isIntern ? 0 : Number(employee.salary?.hra || 0);
 
   const perDayRate = fullGross / Math.max(1, divisor);
 
@@ -495,11 +515,14 @@ function computeEmployeePayroll(employee, ctx) {
   const basicRatio = fullGross > 0 ? fullBasic / fullGross : 0.5;
   const hraRatio = fullGross > 0 ? fullHra / fullGross : 0.5;
 
-  const basicEarned = roundMoney(
-    grossEarned * basicRatio,
-    settings.roundingMode,
-  );
-  const hraEarned = grossEarned - basicEarned;
+  // The 0.5 fallbacks above are for an employee with no gross on file. An
+  // intern always has fullBasic 0, and must not inherit that fallback: it
+  // would split their stipend into a basic and an HRA that do not exist, and
+  // the basic is what every deduction below is computed from.
+  const basicEarned = isIntern
+    ? 0
+    : roundMoney(grossEarned * basicRatio, settings.roundingMode);
+  const hraEarned = isIntern ? 0 : grossEarned - basicEarned;
   const specialEarned = 0;
 
   const epfCap = salaryCfg?.epfCapAmount ?? 1800;
@@ -511,24 +534,83 @@ function computeEmployeePayroll(employee, ctx) {
   // bears to the full gross (so LOP days reduce it proportionally, like every
   // other earned figure). When not overridden, it's the usual statutory
   // ROUND(MIN(earned basic * 12%, cap)).
-  const epfOverridden = !!employee.salary?.epfOverride;
+  const epfOverridden = !isIntern && !!employee.salary?.epfOverride;
   const overrideEpfFull = Number(employee.salary?.epf || 0);
   const earnedRatio = fullGross > 0 ? grossEarned / fullGross : 1;
-  const epf = epfOverridden
-    ? Math.round(overrideEpfFull * earnedRatio)
-    : Math.round(Math.min(basicEarned * eepfPct, epfCap));
+
+  // Nothing is deducted from a stipend. An intern is not enrolled in the
+  // provident fund or in ESI, so a deduction here would not be a smaller
+  // payout — it would be money withheld and remitted to a scheme that has no
+  // record of them.
+  //
+  // Note computeEsi would return zero for an intern anyway, since it tests
+  // the full basic and theirs is zero. It is short-circuited regardless: the
+  // reason it must not apply is the enrolment, not the arithmetic, and a
+  // future change to that function should not be able to start deducting.
+  const epf = isIntern
+    ? 0
+    : epfOverridden
+      ? Math.round(overrideEpfFull * earnedRatio)
+      : Math.round(Math.min(basicEarned * eepfPct, epfCap));
   // Eligibility on the FULL basic, amount on the earned basic — see computeEsi.
-  const { esic, erEsic } = computeEsi(fullBasic, basicEarned, salaryCfg);
+  const { esic, erEsic } = isIntern
+    ? { esic: 0, erEsic: 0 }
+    : computeEsi(fullBasic, basicEarned, salaryCfg);
   const pt =
-    settings.ptEnabled && settings.ptForBasic
+    !isIntern && settings.ptEnabled && settings.ptForBasic
       ? settings.ptForBasic(basicEarned)
       : 0;
 
-  const totalDeductions = epf + esic + pt;
+  // ── Other deduction ───────────────────────────────────────────────────────
+  // A standing monthly recovery — canteen, transport, whatever the company
+  // takes back — charged for the days they were THERE.
+  //
+  // "There" is payableDays: the SAME figure the payroll drawer prints at the
+  // top as "Payable: 29 / 31", and the same one the gross is prorated on. It
+  // was briefly computed as daysInMonth minus leave days instead, which is a
+  // different number — a screen reading "Payable 29 / 31" above a deduction
+  // charged for 28 is a screen nobody can reconcile, and the two figures
+  // being derived separately is exactly how they came to disagree.
+  //
+  // Sundays, week-offs and holidays are all payable, so all charged: the
+  // month is the month. Unpaid days are not.
+  const otherDeductionFull = Number(employee.salary?.otherDeduction || 0);
+  const chargeableDays = Math.min(daysInMonth, Math.max(0, payableDays));
+  const rawOtherDeduction =
+    otherDeductionFull > 0
+      ? roundMoney(
+          (otherDeductionFull * chargeableDays) / Math.max(1, divisor),
+          settings.roundingMode,
+        )
+      : 0;
+
+  // Nothing can be recovered from pay that was never earned. Without this an
+  // unpaid intern — or anybody whose month came out at zero — takes the full
+  // deduction against a gross of zero and lands on a NEGATIVE net pay, which
+  // is not a payslip anybody can act on. Whatever cannot be collected this
+  // month is simply not collected.
+  const roomForOther = Math.max(0, grossEarned - epf - esic - pt);
+  const otherDeduction = Math.min(rawOtherDeduction, roomForOther);
+
+  const totalDeductions = epf + esic + pt + otherDeduction;
   const netPay = grossEarned - totalDeductions;
   const roundedNetPay = settings.roundNetPay ? Math.round(netPay) : netPay;
 
   const leaveBalanceSnapshot = (() => {
+    // Interns have no leave to report. Returning the usual shape with zeros —
+    // rather than the default 12/12/15 entitlements — is what stops the
+    // payslip and the salary register showing an intern a CL balance they can
+    // never take.
+    if (isIntern) {
+      return {
+        hasRecord: false,
+        clEligible: false,
+        daysSinceDOJ: daysSinceDOJ === Infinity ? null : daysSinceDOJ,
+        entitlement: { CL: 0, SL: 0, PL: 0 },
+        consumed: { CL: 0, SL: 0, PL: 0 },
+        available: { CL: 0, SL: 0, PL: 0 },
+      };
+    }
     const clEnt = clEligible
       ? (leaveBalance?.entitlement?.CL ?? CL_ENT_DEFAULT)
       : 0;
@@ -564,6 +646,14 @@ function computeEmployeePayroll(employee, ctx) {
     designation: employee.designation || employee.jobTitle || "",
     jobTitle: employee.jobTitle || "",
     employmentType: employee.employmentType || "",
+    // Carried on the item, not re-derived from employmentType at read time.
+    // A payroll run is a record of what was paid and why, and the employee's
+    // type can change after it — an intern promoted in April must not make
+    // their March payslip re-render as a salaried one.
+    isIntern,
+    internshipType: isIntern
+      ? employee.internship?.stipendType || "paid"
+      : undefined,
     dateOfJoining: employee.dateOfJoining || null,
 
     month,
@@ -602,6 +692,16 @@ function computeEmployeePayroll(employee, ctx) {
     slUsedDays: stats.slUsedDays,
     plUsedDays: stats.plUsedDays,
 
+    // The working behind otherDeductions, so the payroll drawer can show why
+    // the figure is what it is rather than presenting a bare number.
+    otherDeductionFull,
+    otherDeductionRecurring: otherDeduction,
+    // What was waived because there was no pay to take it from. Recorded
+    // rather than dropped: an amount that quietly vanishes is one nobody can
+    // explain when the canteen account does not tie out.
+    otherDeductionUncollected: +(rawOtherDeduction - otherDeduction).toFixed(2),
+    otherDeductionChargeableDays: +chargeableDays.toFixed(2),
+
     payableDays: +payableDays.toFixed(2),
     effectivePayableDays: +effectivePayableDays.toFixed(2),
     sundayExtraPayDays,
@@ -609,6 +709,11 @@ function computeEmployeePayroll(employee, ctx) {
     divisorBasis: settings.payableDaysBasis,
 
     earnings: {
+      // Exactly one of stipend and basicSalary is ever non-zero. Keeping them
+      // as separate fields rather than reusing basicSalary is what lets the
+      // payslip print "Stipend" instead of "Basic Salary" — an intern's
+      // payslip claiming a basic would misdescribe their arrangement.
+      stipend: isIntern ? grossEarned : 0,
       basicSalary: basicEarned,
       houseRentAllowance: hraEarned,
       travelAllowance: 0,
@@ -630,7 +735,7 @@ function computeEmployeePayroll(employee, ctx) {
       loanDeduction: 0,
       advanceDeduction: 0,
       lateDeduction: 0,
-      otherDeductions: 0,
+      otherDeductions: otherDeduction,
       totalDeductions,
     },
     netPay,
@@ -979,6 +1084,8 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
           designation: computed.designation,
           jobTitle: computed.jobTitle,
           employmentType: computed.employmentType,
+          isIntern: computed.isIntern,
+          internshipType: computed.internshipType || null,
           dateOfJoining: computed.dateOfJoining,
           payrollId: payrollRun._id,
           month,
@@ -1024,6 +1131,10 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
 
           leaveBalanceSnapshot: computed.leaveBalanceSnapshot,
 
+          otherDeductionFull: computed.otherDeductionFull,
+          otherDeductionRecurring: computed.otherDeductionRecurring,
+          otherDeductionUncollected: computed.otherDeductionUncollected,
+          otherDeductionChargeableDays: computed.otherDeductionChargeableDays,
           earnings: computed.earnings,
           deductions: computed.deductions,
           netPay: computed.netPay,
@@ -1142,6 +1253,21 @@ router.get("/items", EmployeeAuthMiddlewear, async (req, res) => {
     const plDef = leaveCfg?.plPerYear ?? 15;
 
     items.forEach((it) => {
+      // Interns accrue nothing. Without this they would pick up the config
+      // defaults below — clEligible gates CL, but SL and PL fall straight
+      // through to 12 and 15, and the saved Interns tab would show a leave
+      // balance the payroll engine has already established they do not have.
+      if (it.isIntern) {
+        it.leaveBalanceSnapshot = {
+          hasRecord: false,
+          clEligible: false,
+          daysSinceDOJ: it.daysSinceDOJ ?? null,
+          entitlement: { CL: 0, SL: 0, PL: 0 },
+          consumed: { CL: 0, SL: 0, PL: 0 },
+          available: { CL: 0, SL: 0, PL: 0 },
+        };
+        return;
+      }
       const b = byEmp.get(String(it.employeeId));
       const clEligible = it.clEligible !== false;
       const clEnt = clEligible ? (b?.entitlement?.CL ?? clDef) : 0;
@@ -1474,11 +1600,28 @@ router.patch(
           .json({ success: false, message: "Employee not found" });
       const employee = decryptEmployeeDoc(employeeRaw);
 
-      const newGross = Number(employee.salary?.gross || 0);
-      if (newGross <= 0) {
+      // An intern's pay figure is the stipend, and it is legitimately zero
+      // for an unpaid or self-paid internship — so the "no salary set" guard
+      // asks a different question for them, and only refuses the case that is
+      // actually a mistake: someone marked as a PAID intern with no amount.
+      const isInternItem = employee.employmentType === "intern";
+      const newGross = isInternItem
+        ? Number(employee.salary?.stipend || 0)
+        : Number(employee.salary?.gross || 0);
+      if (!isInternItem && newGross <= 0) {
         return res.status(400).json({
           success: false,
           message: "Employee has no gross salary set",
+        });
+      }
+      if (
+        isInternItem &&
+        employee.internship?.stipendType === "paid" &&
+        newGross <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "This intern is marked as paid but has no stipend set",
         });
       }
 
@@ -1550,8 +1693,11 @@ router.patch(
         const perDay = fullGross / Math.max(1, divisor);
         const basicRatio = fullGross > 0 ? fullBasic / fullGross : 0.5;
         grossEarnedBase = Math.round(perDay * payableDays);
-        basicEarned = Math.round(grossEarnedBase * basicRatio);
-        hraEarned = grossEarnedBase - basicEarned;
+        // Same reason as in computeEmployeePayroll: an intern's fullBasic is
+        // zero, so the 0.5 fallback would invent a basic out of their stipend
+        // — and every deduction below is computed from the basic.
+        basicEarned = isInternItem ? 0 : Math.round(grossEarnedBase * basicRatio);
+        hraEarned = isInternItem ? 0 : grossEarnedBase - basicEarned;
       } else {
         grossEarnedBase = computed.earnings.grossEarnings;
       }
@@ -1573,22 +1719,61 @@ router.patch(
 
       // EPF — respect the employee's HR override. When set, prorate the stored
       // full-month EPF by the earned-gross ratio; otherwise statutory on basic.
-      const epfOverridden = !!employee.salary?.epfOverride;
+      const epfOverridden = !isInternItem && !!employee.salary?.epfOverride;
       const overrideEpfFull = Number(employee.salary?.epf || 0);
       const earnedRatio = fullGross > 0 ? grossEarnedBase / fullGross : 1;
-      const epf = epfOverridden
-        ? Math.round(overrideEpfFull * earnedRatio)
-        : Math.round(Math.min(basicEarned * eepfPct, epfCap));
+      // Interns are enrolled in neither scheme — see computeEmployeePayroll.
+      // Recalculating an item is also the path that CLEARS these: someone
+      // converted from employee to intern has PF and ESI on their existing
+      // draft row, and this is what takes them off.
+      const epf = isInternItem
+        ? 0
+        : epfOverridden
+          ? Math.round(overrideEpfFull * earnedRatio)
+          : Math.round(Math.min(basicEarned * eepfPct, epfCap));
       // Eligibility is re-tested against the employee's CURRENT full basic, so
       // a recalculate is what clears a stale ESIC that an earlier run wrote on
       // the prorated basic (or that a since-raised salary made inapplicable).
-      const { esic, erEsic } = computeEsi(fullBasic, basicEarned, salaryCfg);
+      const { esic, erEsic } = isInternItem
+        ? { esic: 0, erEsic: 0 }
+        : computeEsi(fullBasic, basicEarned, salaryCfg);
       const pt =
-        ctxSettings.ptEnabled && ctxSettings.ptForBasic
+        !isInternItem && ctxSettings.ptEnabled && ctxSettings.ptForBasic
           ? ctxSettings.ptForBasic(basicEarned)
           : 0;
 
-      const totalDeductions = epf + esic + pt + loan + advance + otherD;
+      // Other deduction is RE-DERIVED, not carried over from the item like
+      // loan and advance are. Those are one-off figures HR typed for this
+      // month; this one is a standing amount on the employee prorated by
+      // their leave, and a recalculate exists precisely to pick up a change
+      // to either. Carrying the old figure forward would make the button
+      // silently not do the thing it is for.
+      const otherFromEmployee = Number(employee.salary?.otherDeduction || 0);
+      // Payable days — the figure shown at the top of the drawer, and the one
+      // the gross itself is prorated on. Honours a manual day-count override
+      // for the same reason the earnings above do.
+      const otherChargeable = Math.min(divisor, Math.max(0, payableDays));
+      const rawOtherRecurring =
+        otherFromEmployee > 0
+          ? Math.round((otherFromEmployee * otherChargeable) / Math.max(1, divisor))
+          : 0;
+
+      // otherD is what is stored on the item, and on any recalculate after
+      // the first that ALREADY contains the recurring part. Subtracting the
+      // recurring amount recorded last time leaves the one-off figure HR
+      // actually typed, which is the only part worth carrying forward.
+      const otherManual = Math.max(
+        0,
+        otherD - (item.otherDeductionRecurring || 0),
+      );
+
+      // Capped at what is left after everything statutory, so a month with no
+      // earnings cannot produce a negative net pay. See computeEmployeePayroll.
+      const roomForOther = Math.max(0, grossTotal - epf - esic - pt - loan - advance - otherManual);
+      const otherRecurring = Math.min(rawOtherRecurring, roomForOther);
+
+      const totalDeductions =
+        epf + esic + pt + loan + advance + otherManual + otherRecurring;
       const netPay = grossTotal - totalDeductions;
 
       // ── Persist ─────────────────────────────────────────────────────────
@@ -1599,8 +1784,14 @@ router.patch(
       item.rateGross = computed.rateGross;
       item.perDayRate = computed.perDayRate;
 
+      // The flags come from the fresh compute, so a recalculate is how an
+      // item catches up with a change of employment type.
+      item.isIntern = computed.isIntern;
+      item.internshipType = computed.internshipType || null;
+
       item.earnings = {
         ...(item.earnings || {}),
+        stipend: isInternItem ? grossEarnedBase : 0,
         basicSalary: basicEarned,
         houseRentAllowance: hraEarned,
         specialAllowance: computed.earnings.specialAllowance || 0,
@@ -1610,6 +1801,11 @@ router.patch(
         otherEarnings: oth,
         grossEarnings: grossTotal,
       };
+      item.otherDeductionFull = otherFromEmployee;
+      item.otherDeductionRecurring = otherRecurring;
+      item.otherDeductionUncollected = +(rawOtherRecurring - otherRecurring).toFixed(2);
+      item.otherDeductionChargeableDays = +otherChargeable.toFixed(2);
+
       item.deductions = {
         ...(item.deductions || {}),
         providentFund: epf,
@@ -1619,7 +1815,7 @@ router.patch(
         professionalTax: pt,
         loanDeduction: loan,
         advanceDeduction: advance,
-        otherDeductions: otherD,
+        otherDeductions: otherManual + otherRecurring,
         totalDeductions,
       };
       item.netPay = netPay;
@@ -1883,6 +2079,139 @@ function formatVal(v) {
   return String(v);
 }
 
+/**
+ * The interns' stipend sheet.
+ *
+ * A separate worksheet rather than the staff layout with the statutory
+ * columns left at zero. That sheet has twenty-two columns — Rate of Basic,
+ * Rate of HRA, ESIC employee, ESIC employer, PF employee, PF employer — and
+ * every one of them would read 0.00 against a net of 15,500. An accountant
+ * opening that does not see "interns have no PF"; they see a broken export
+ * and come asking which figure to trust.
+ *
+ * So: the columns an internship actually has. Stipend, days, earned, paid.
+ *
+ * @param {import("exceljs").Workbook} wb
+ * @param {Array} items   payroll items, already filtered to interns
+ */
+function buildInternStipendSheet(wb, items, { month, year }) {
+  const ws = wb.addWorksheet("StipendSheet", {
+    views: [{ state: "frozen", ySplit: 3 }],
+    pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
+  });
+
+  const COLS = [
+    { header: "#", width: 5, key: "sl" },
+    { header: "Emp No", width: 12, key: "bid" },
+    { header: "Name", width: 30, key: "name" },
+    { header: "Department", width: 20, key: "dept" },
+    { header: "Designation", width: 22, key: "desig" },
+    { header: "Arrangement", width: 13, key: "kind" },
+    { header: "Monthly Stipend", width: 16, key: "rate", money: true },
+    { header: "Days", width: 8, key: "days", days: true },
+    { header: "Payable", width: 10, key: "payable", days: true },
+    { header: "LOP", width: 9, key: "lop", days: true },
+    { header: "Stipend Earned", width: 16, key: "earned", money: true },
+    { header: "Paid", width: 15, key: "net", money: true },
+  ];
+  COLS.forEach((c, i) => (ws.getColumn(i + 1).width = c.width));
+
+  const solid = (argb) => ({ type: "pattern", pattern: "solid", fgColor: { argb } });
+  const money = "#,##0.00";
+  const daysFmt = "0.##";
+  const LABEL = { paid: "Paid", unpaid: "Unpaid", self_paid: "Self-paid" };
+
+  ws.mergeCells(1, 1, 1, COLS.length);
+  const title = ws.getCell(1, 1);
+  title.value = `GRAV CLOTHING  ·  Intern Stipends  ·  ${MONTH_NAMES[month]} ${year}`;
+  title.font = { name: "Arial", size: 13, bold: true, color: { argb: "FFFFFFFF" } };
+  title.fill = solid("FF92400E");
+  title.alignment = { horizontal: "center", vertical: "middle" };
+  ws.getRow(1).height = 30;
+
+  ws.mergeCells(2, 1, 2, COLS.length);
+  const note = ws.getCell(2, 1);
+  note.value =
+    "Stipends carry no basic, HRA, provident fund or ESI — interns are not enrolled in either scheme.";
+  note.font = { name: "Arial", size: 9, italic: true, color: { argb: "FF78350F" } };
+  note.alignment = { horizontal: "left", vertical: "middle", indent: 1 };
+  note.fill = solid("FFFEF3C7");
+
+  const head = ws.getRow(3);
+  COLS.forEach((c, i) => {
+    const cell = head.getCell(i + 1);
+    cell.value = c.header;
+    cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FFFFFFFF" } };
+    cell.fill = solid("FF1E293B");
+    cell.alignment = {
+      horizontal: c.money || c.days ? "right" : "left",
+      vertical: "middle",
+      wrapText: true,
+      indent: 1,
+    };
+  });
+  head.height = 26;
+
+  items.forEach((it, idx) => {
+    const row = ws.getRow(4 + idx);
+    const earned = it.earnings?.stipend || it.earnings?.grossEarnings || 0;
+    const values = {
+      sl: idx + 1,
+      bid: it.biometricId || "",
+      name: it.employeeName || "",
+      dept: it.department || "",
+      desig: it.designation || "",
+      kind: LABEL[it.internshipType] || "Paid",
+      rate: it.rateGross || 0,
+      days: it.daysInMonth || 0,
+      payable: it.payableDays || 0,
+      lop: it.lopDays || 0,
+      earned,
+      net: it.roundedNetPay ?? it.netPay ?? 0,
+    };
+    COLS.forEach((c, i) => {
+      const cell = row.getCell(i + 1);
+      cell.value = values[c.key];
+      cell.font = { name: "Arial", size: 9 };
+      cell.fill = solid(idx % 2 ? "FFF8FAFC" : "FFFFFFFF");
+      cell.alignment = {
+        horizontal: c.money || c.days ? "right" : "left",
+        vertical: "middle",
+        indent: 1,
+      };
+      if (c.money) cell.numFmt = money;
+      if (c.days) cell.numFmt = daysFmt;
+    });
+  });
+
+  const sum = ws.getRow(4 + items.length);
+  const total = (f) => items.reduce((a, i) => a + (f(i) || 0), 0);
+  sum.getCell(3).value = `${items.length} intern${items.length === 1 ? "" : "s"}`;
+  sum.getCell(7).value = total((i) => i.rateGross);
+  sum.getCell(9).value = total((i) => i.payableDays);
+  sum.getCell(10).value = total((i) => i.lopDays);
+  sum.getCell(11).value = total((i) => i.earnings?.stipend || i.earnings?.grossEarnings);
+  sum.getCell(12).value = total((i) => i.roundedNetPay ?? i.netPay);
+  COLS.forEach((c, i) => {
+    const cell = sum.getCell(i + 1);
+    cell.font = { name: "Arial", size: 9, bold: true, color: { argb: "FF065F46" } };
+    cell.fill = solid("FFD1FAE5");
+    cell.alignment = {
+      horizontal: c.money || c.days ? "right" : "left",
+      vertical: "middle",
+      indent: 1,
+    };
+    if (c.money) cell.numFmt = money;
+    if (c.days) cell.numFmt = daysFmt;
+    cell.border = {
+      top: { style: "medium", color: { argb: "FF000000" } },
+      bottom: { style: "medium", color: { argb: "FF000000" } },
+    };
+  });
+
+  return ws;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  GET /export
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1892,15 +2221,46 @@ router.get("/export", EmployeeAuthMiddlewear, async (req, res) => {
     const month = parseInt(req.query.month) || new Date().getMonth() + 1;
     const year = parseInt(req.query.year) || new Date().getFullYear();
 
-    const items = await PayrollItem.find({ month, year })
+    // Which tab the HR page is on. Defaults to "all" so every existing caller
+    // — and anyone with the URL bookmarked — keeps getting the whole month.
+    const segment = ["staff", "interns"].includes(req.query.segment)
+      ? req.query.segment
+      : "all";
+    const segmentFilter =
+      segment === "interns"
+        ? { isIntern: true }
+        : segment === "staff"
+          ? { isIntern: { $ne: true } }
+          : {};
+
+    const items = await PayrollItem.find({ month, year, ...segmentFilter })
       .sort({ department: 1, employeeName: 1 })
       .lean();
 
     if (items.length === 0) {
       return res.status(404).json({
         success: false,
-        message: `No payroll items for ${MONTH_NAMES[month]} ${year}. Process payroll first.`,
+        message:
+          segment === "interns"
+            ? `No interns in the ${MONTH_NAMES[month]} ${year} payroll.`
+            : `No payroll items for ${MONTH_NAMES[month]} ${year}. Process payroll first.`,
       });
+    }
+
+    // Interns get their own sheet — see buildInternStipendSheet for why the
+    // staff layout is not reused.
+    if (segment === "interns") {
+      const internWb = new (require("exceljs").Workbook)();
+      internWb.creator = "Grav Clothing HRMS";
+      buildInternStipendSheet(internWb, items, { month, year });
+      const internBuf = await internWb.xlsx.writeBuffer();
+      const internName = `intern_stipends_${year}-${String(month).padStart(2, "0")}.xlsx`;
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+      res.setHeader("Content-Disposition", `attachment; filename="${internName}"`);
+      return res.send(Buffer.from(internBuf));
     }
 
     const employees = await Employee.find({
@@ -2334,9 +2694,16 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       existing &&
       ["processed", "paid", "approved"].includes(existing.status)
     ) {
+      // The advice has to match the buttons that actually exist. A processed
+      // run can be reverted; a paid or approved one cannot be reverted,
+      // removed or re-drafted at all, and telling somebody to "remove it
+      // first" sends them looking for a control that is deliberately absent.
       return res.status(400).json({
         success: false,
-        message: `Payroll for ${MONTH_NAMES[month]} ${year} is already ${existing.status}. Remove it first if you need to re-draft.`,
+        message:
+          existing.status === "processed"
+            ? `Payroll for ${MONTH_NAMES[month]} ${year} is already processed. Use Revert to Draft on the saved run if you need to change it.`
+            : `Payroll for ${MONTH_NAMES[month]} ${year} is ${existing.status} and locked. It cannot be re-drafted — contact an admin if a correction is genuinely needed.`,
       });
     }
 
@@ -2448,6 +2815,15 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
             dateOfJoining: computed.dateOfJoining,
             daysSinceDOJ: computed.daysSinceDOJ,
             clEligible: computed.clEligible,
+            // In $set, not $setOnInsert: a draft re-saved after HR corrects
+            // somebody's employment type has to pick the change up, and this
+            // is the flag the Interns tab and the payslip both read.
+            isIntern: computed.isIntern,
+            internshipType: computed.internshipType || null,
+            otherDeductionFull: computed.otherDeductionFull,
+            otherDeductionRecurring: computed.otherDeductionRecurring,
+            otherDeductionUncollected: computed.otherDeductionUncollected,
+            otherDeductionChargeableDays: computed.otherDeductionChargeableDays,
             earnings: computed.earnings,
             deductions: computed.deductions,
             netPay: computed.netPay,

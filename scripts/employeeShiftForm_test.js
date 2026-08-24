@@ -19,7 +19,11 @@ const cases = [
   ['Custom 06:00-14:00', { workShift:{ mode:'custom', start:'06:00', end:'14:00' } }],
   ['Core',               { workShift:{ mode:'core' } }],
   ['General',            { workShift:{ mode:'general' } }],
-  ['left blank (dept)',  { department:'PRODUCTION' }],
+  // Not a choice on the form any more — the dropdown has exactly three and
+  // one must be picked. This is the pre-categories fallback, kept so an
+  // employee the backfill has not reached yet is judged the way they were
+  // yesterday instead of silently landing on office hours.
+  ['pre-backfill (dept)', { department:'PRODUCTION' }],
 ];
 
 for (const [label, body] of cases) {

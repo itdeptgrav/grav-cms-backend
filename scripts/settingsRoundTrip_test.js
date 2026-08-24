@@ -14,14 +14,12 @@ const posted = {
     executive: { start:"09:30", end:"18:30", lateGraceMins:10, halfDayThresholdMins:450, otGraceMins:60 },
     custom:    { lateGraceMins:5,  halfDayThresholdMins:270, halfDayBasis:"span", otGraceMins:45 },
   },
-  nonWorkingDay: { halfDayThresholdMins: 210, basis: "span" },
   departmentCategories: { core:["PRODUCTION"], general:["IT"] },
 };
 
 // Mirror the PUT /settings handler's update construction.
 const update = {};
 if (posted.shifts) update.shifts = posted.shifts;
-if (posted.nonWorkingDay) update.nonWorkingDay = posted.nonWorkingDay;
 if (posted.departmentCategories) update.departmentCategories = {
   core: posted.departmentCategories.core.map(d=>d.toUpperCase()),
   general: posted.departmentCategories.general.map(d=>d.toUpperCase()),
@@ -34,7 +32,6 @@ const err = doc.validateSync();
 console.log('schema validation:', err ? 'FAILED — ' + err.message : 'clean');
 const saved = doc.toObject();
 console.log('stored shifts.custom  :', JSON.stringify(saved.shifts.custom));
-console.log('stored nonWorkingDay  :', JSON.stringify(saved.nonWorkingDay));
 
 const P = require(path.join(ROOT, 'services/shiftPolicy'));
 const hk = { department:'HOUSEKEEPING', workShift:{ mode:'custom', start:'06:00', end:'14:00' } };
@@ -47,9 +44,20 @@ console.log('  OT grace       ', sh.otGraceMins, '(HR set 45)');
 const ok1 = sh.lateGraceMins===5 && sh.halfDayThresholdMins===270 && sh.halfDayBasis==='span' && sh.otGraceMins===45;
 console.log('  ', ok1 ? 'PASS — the form reaches the engine' : '*** FAIL ***');
 
-// And the day-off threshold HR set.
+// The punch count is NOT on this tab. It is the one thing about a custom
+// shift that does not follow from the hours — two people on 06:00-14:00 can
+// punch two times or six — so it lives on the employee, and
+// scripts/punchPattern_test.js covers it. Asserted here so a settings field
+// cannot quietly reappear and start overruling the person.
+console.log('\npunch count is not a setting:',
+  saved.shifts.custom.punchPattern === undefined ? 'PASS' : '*** FAIL ***');
+
+// A worked Sunday takes the SHIFT's threshold now, not a day-off one of its
+// own — that setting is gone. HR set 270 on span for custom shifts above.
 const sun = P.classifyDayKind('2026-08-30', saved, {});
-const r200 = P.classifyDay({ inMins:540, outMins:740, netMins:200, spanMins:200, shift:sh, settings:saved, day:sun });
-const r220 = P.classifyDay({ inMins:540, outMins:760, netMins:220, spanMins:220, shift:sh, settings:saved, day:sun });
-console.log('\nSunday, 200 mins ->', r200.status, '| 220 mins ->', r220.status, '(HR set the line at 210)');
-console.log('  ', r200.status==='HD' && r220.status==='P' ? 'PASS' : '*** FAIL ***');
+const under = P.classifyDay({ inMins:360, outMins:620, netMins:260, spanMins:260, shift:sh, settings:saved, day:sun });
+const over  = P.classifyDay({ inMins:360, outMins:640, netMins:280, spanMins:280, shift:sh, settings:saved, day:sun });
+console.log('\nSunday, 260 mins ->', under.status, '| 280 mins ->', over.status, '(shift line is 270)');
+console.log('  ', under.status==='HD' && over.status!=='HD' ? 'PASS' : '*** FAIL ***');
+console.log('day-off settings are gone:',
+  saved.nonWorkingDay === undefined ? 'PASS' : '*** FAIL ***');

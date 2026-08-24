@@ -16,6 +16,18 @@ const payrollItemSchema = new mongoose.Schema(
         jobTitle: { type: String },
         employmentType: { type: String },
 
+        // Whether this row was paid as an intern, decided when the run was
+        // computed and frozen here. Not re-derived from employmentType on
+        // read: someone promoted from intern to staff in April must not make
+        // their March payslip re-render with a basic and a PF deduction.
+        // It is also what the Interns tab filters on.
+        isIntern: { type: Boolean, default: false },
+        internshipType: {
+            type: String,
+            enum: ["paid", "unpaid", "self_paid", null],
+            default: null,
+        },
+
         // ── Pay Period ─────────────────────────────────────────────────
         payrollId: {
             // Parent payroll run reference
@@ -66,6 +78,11 @@ const payrollItemSchema = new mongoose.Schema(
 
         // ── Earnings ───────────────────────────────────────────────────
         earnings: {
+            // An intern's whole pay, prorated. Mutually exclusive with
+            // basicSalary + houseRentAllowance: a stipend has no components,
+            // so it is carried as one figure rather than split into a basic
+            // and an HRA that describe an arrangement they do not have.
+            stipend: { type: Number, default: 0 },
             basicSalary: { type: Number, default: 0 },
             houseRentAllowance: { type: Number, default: 0 },
             travelAllowance: { type: Number, default: 0 },
@@ -89,7 +106,10 @@ const payrollItemSchema = new mongoose.Schema(
             loanDeduction: { type: Number, default: 0 },
             advanceDeduction: { type: Number, default: 0 },
             lateDeduction: { type: Number, default: 0 },
-            lopDeduction: { type: Number, default: 0 }, // Loss of Pay
+                lopDeduction: { type: Number, default: 0 }, // Loss of Pay
+            // Auto-computed from the employee's standing monthly deduction,
+            // prorated by approved leave — see computeEmployeePayroll. HR can
+            // still override it on the item; a recalculate puts it back.
             otherDeductions: { type: Number, default: 0 },
             totalDeductions: { type: Number, default: 0 }, // auto-calculated
         },
@@ -102,6 +122,21 @@ const payrollItemSchema = new mongoose.Schema(
         // Array of { dateStr, dayOfWeek, category, paid, lopWeight, note, ... }
         // Kept as Mixed so engine can evolve fields without migrations.
         dayBreakdown: { type: [mongoose.Schema.Types.Mixed], default: undefined },
+
+        // ── Other-deduction working ────────────────────────────────────
+        // Stored so the payroll drawer can show WHY otherDeductions is what
+        // it is — a bare figure invites "where did that come from".
+        otherDeductionFull: { type: Number, default: 0 },
+        // The prorated amount actually charged. Stored separately from
+        // deductions.otherDeductions because that field also holds whatever
+        // one-off figure HR typed for the month — without this, a second
+        // recalculate would add the recurring part on top of itself.
+        otherDeductionRecurring: { type: Number, default: 0 },
+        // What could not be taken because there was no pay to take it from.
+        // Recorded rather than dropped: an amount that quietly vanishes is one
+        // nobody can explain when the canteen account does not tie out.
+        otherDeductionUncollected: { type: Number, default: 0 },
+        otherDeductionChargeableDays: { type: Number, default: 0 },
 
         // ── Manual Override ────────────────────────────────────────────
         isManuallyOverridden: { type: Boolean, default: false },
@@ -138,6 +173,7 @@ const payrollItemSchema = new mongoose.Schema(
 payrollItemSchema.pre("save", function (next) {
     const e = this.earnings;
     e.grossEarnings =
+        (e.stipend || 0) +
         (e.basicSalary || 0) +
         (e.houseRentAllowance || 0) +
         (e.travelAllowance || 0) +
