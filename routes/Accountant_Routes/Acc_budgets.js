@@ -448,6 +448,324 @@ router.post("/:id/close-collection", async (req, res) => {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DEPARTMENT BUDGET REQUESTS (Chunk 2)
+ *
+ * A department asking for an amount against a specific head, with a stated
+ * purpose and priority. An INPUT to finance review — deliberately NOT an
+ * allocation: nothing here writes to `items[]`. Converting an agreed request
+ * into a budget line is its own step, and doing it implicitly here would mean
+ * a department could allocate its own budget by asking for it.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Requests are an input to a budget still being built. Once a budget is
+ * `active` the allocations are the agreed number and a new ask is a
+ * supplementary request, not an edit to this cycle — a different product
+ * object. `review` is excluded too: finance is deciding on what it already
+ * has, and a request arriving mid-review changes the thing being reviewed. */
+const REQUESTABLE_STATES = ["draft", "collecting"];
+
+/** Who is acting, for the audit fields. Server-derived, never client-supplied. */
+function actorOf(req) {
+  return req.user?.email || req.user?.name || req.user?.id || null;
+}
+
+/**
+ * Resolve a ledger for a request, enforcing company and nature.
+ *
+ * Returns `{ ok: true, ledger }` or `{ ok: false, status, message }`.
+ *
+ * The GROUP is the authority on nature, not `Acc_Ledger.nature` — the ledger's
+ * own field carries no enum and the group's does, and budgetActuals.service
+ * already resolves nature this way for exactly that reason. Budgeting against
+ * an asset or liability head is meaningless (you do not budget Sundry
+ * Debtors), which is the same rule /ledger-options applies when it offers only
+ * revenue and expense heads.
+ */
+async function resolveRequestLedger({ ledgerId, companyId }) {
+  const lid = actuals.oid(ledgerId);
+  if (!lid) return { ok: false, status: 400, message: "ledgerId is not a valid id" };
+
+  const filter = { _id: lid };
+  // Only scope by company where there IS company context, matching how every
+  // other read in this file treats an absent selection.
+  const cid = actuals.oid(companyId);
+  if (cid) filter.companyId = cid;
+
+  const ledger = await Acc_Ledger.findOne(filter).select("_id name groupId groupName").lean();
+  if (!ledger) {
+    // 404-flavoured wording even at 400: a cross-company ledger id must not be
+    // distinguishable from one that does not exist.
+    return { ok: false, status: 400, message: "Ledger not found for this company" };
+  }
+
+  const group = ledger.groupId
+    ? await Acc_Group.findById(ledger.groupId).select("_id name nature").lean()
+    : null;
+  const nature = group?.nature || null;
+  if (nature !== "revenue" && nature !== "expense") {
+    return {
+      ok: false,
+      status: 400,
+      message: "A budget request must target a revenue or expense head",
+    };
+  }
+
+  return {
+    ok: true,
+    ledger: {
+      ledgerId: ledger._id,
+      ledgerName: ledger.name,
+      groupName: ledger.groupName || group?.name || null,
+      nature,
+    },
+  };
+}
+
+/**
+ * Validate the caller-supplied half of a request.
+ *
+ * `partial` is for PUT, where an untouched field is absent rather than being
+ * an instruction to clear it.
+ */
+function validateRequestBody(body = {}, { partial = false } = {}) {
+  const errors = [];
+
+  const has = (k) => body[k] !== undefined && body[k] !== null && String(body[k]).trim() !== "";
+
+  if (!partial || body.department !== undefined) {
+    if (!has("department")) errors.push("department is required");
+  }
+  if (!partial || body.ledgerId !== undefined) {
+    if (!has("ledgerId")) errors.push("ledgerId is required");
+  }
+
+  if (!partial || body.requestedAmount !== undefined) {
+    const amount = variance.money(body.requestedAmount);
+    if (amount === null) errors.push("requestedAmount must be a number");
+    else if (amount < 0) errors.push("requestedAmount must be ≥ 0");
+  }
+
+  /* Purpose OR justification — a request with neither is a number nobody can
+   * review, and finance declining it would have nothing to answer. On a PUT
+   * this is only re-checked when the caller touches one of them, so an edit
+   * that just changes the amount is not forced to restate the reason. */
+  if (!partial) {
+    if (!has("purpose") && !has("justification")) {
+      errors.push("either purpose or justification is required");
+    }
+  } else if (body.purpose !== undefined || body.justification !== undefined) {
+    const purpose = body.purpose !== undefined ? body.purpose : undefined;
+    const justification = body.justification !== undefined ? body.justification : undefined;
+    const stillHasOne =
+      (purpose !== undefined && String(purpose).trim() !== "") ||
+      (justification !== undefined && String(justification).trim() !== "");
+    if (!stillHasOne) errors.push("either purpose or justification is required");
+  }
+
+  for (const [field, allowed] of [
+    ["priority", ["low", "normal", "high", "critical"]],
+    ["state", ["awaiting", "submitted", "countered", "agreed", "defaulted"]],
+  ]) {
+    if (body[field] !== undefined && !allowed.includes(body[field])) {
+      errors.push(`${field} must be one of: ${allowed.join(", ")}`);
+    }
+  }
+
+  if (body.expectedMonth !== undefined && body.expectedMonth !== null && body.expectedMonth !== "") {
+    const m = Number(body.expectedMonth);
+    if (!Number.isInteger(m) || m < 1 || m > 12) {
+      errors.push("expectedMonth must be a whole number between 1 and 12");
+    }
+  }
+
+  for (const f of ["counterAmount", "agreedAmount"]) {
+    if (body[f] !== undefined && body[f] !== null && body[f] !== "") {
+      const v = variance.money(body[f]);
+      if (v === null || v < 0) errors.push(`${f} must be a number ≥ 0`);
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Load a budget for a REQUEST operation: in company scope, and in a state that
+ * still accepts requests. Shared so read and write cannot drift apart.
+ */
+async function budgetForRequests(req, { mutating }) {
+  if (!isUsableId(req.params.id)) {
+    return { error: { status: 404, message: "Budget not found" } };
+  }
+  const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id));
+  if (!budget) return { error: { status: 404, message: "Budget not found" } };
+
+  if (mutating && !REQUESTABLE_STATES.includes(budget.status)) {
+    return {
+      error: {
+        status: 409,
+        message: `This budget is ${budget.status}; it is no longer collecting requests.`,
+      },
+    };
+  }
+  return { budget };
+}
+
+/* ── LIST REQUESTS ───────────────────────────────────────────────────────── */
+router.get("/:id/requests", async (req, res) => {
+  try {
+    const { budget, error } = await budgetForRequests(req, { mutating: false });
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    let requests = budget.budgetRequests || [];
+    // Cheap, obvious filters. Anything richer belongs in a query layer, not here.
+    if (req.query.department) {
+      requests = requests.filter((r) => r.department === req.query.department);
+    }
+    if (req.query.state) {
+      requests = requests.filter((r) => r.state === req.query.state);
+    }
+
+    res.json({ success: true, requests, budgetStatus: budget.status });
+  } catch (error) {
+    console.error("[budgets] list requests error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── CREATE REQUEST ──────────────────────────────────────────────────────── */
+router.post("/:id/requests", async (req, res) => {
+  try {
+    const { budget, error } = await budgetForRequests(req, { mutating: true });
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    const errors = validateRequestBody(req.body);
+    if (errors.length) {
+      return res.status(400).json({ success: false, message: errors.join("; "), errors });
+    }
+
+    const resolved = await resolveRequestLedger({
+      ledgerId: req.body.ledgerId,
+      companyId: companyOf(req),
+    });
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ success: false, message: resolved.message });
+    }
+
+    const now = new Date();
+    /* Built field by field rather than spreading req.body: a spread would let
+     * a caller set agreedAmount or submittedBy on their own request, which is
+     * finance's side of the exchange and the server's respectively. */
+    budget.budgetRequests.push({
+      department: String(req.body.department).trim(),
+      ...resolved.ledger,
+      requestedAmount: variance.money(req.body.requestedAmount),
+      priority: req.body.priority || "normal",
+      purpose: req.body.purpose,
+      justification: req.body.justification,
+      expectedMonth: req.body.expectedMonth || undefined,
+      expectedFrom: req.body.expectedFrom || undefined,
+      expectedTo: req.body.expectedTo || undefined,
+      note: req.body.note,
+      state: "submitted",
+      submittedAt: now,
+      submittedBy: actorOf(req),
+    });
+
+    await budget.save();
+    const created = budget.budgetRequests[budget.budgetRequests.length - 1];
+    res.status(201).json({ success: true, request: created, requests: budget.budgetRequests });
+  } catch (error) {
+    console.error("[budgets] create request error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── UPDATE REQUEST ──────────────────────────────────────────────────────── */
+router.put("/:id/requests/:requestId", async (req, res) => {
+  try {
+    const { budget, error } = await budgetForRequests(req, { mutating: true });
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (!isUsableId(req.params.requestId)) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+    const row = budget.budgetRequests.id(req.params.requestId);
+    if (!row) return res.status(404).json({ success: false, message: "Request not found" });
+
+    const errors = validateRequestBody(req.body, { partial: true });
+    if (errors.length) {
+      return res.status(400).json({ success: false, message: errors.join("; "), errors });
+    }
+
+    // Re-resolve only when the head is actually being changed — an edit to the
+    // amount must not silently re-derive nature from a ledger that has since
+    // been re-parented.
+    if (req.body.ledgerId !== undefined) {
+      const resolved = await resolveRequestLedger({
+        ledgerId: req.body.ledgerId,
+        companyId: companyOf(req),
+      });
+      if (!resolved.ok) {
+        return res.status(resolved.status).json({ success: false, message: resolved.message });
+      }
+      Object.assign(row, resolved.ledger);
+    }
+
+    const assignable = [
+      "department", "requestedAmount", "priority", "purpose", "justification",
+      "expectedMonth", "expectedFrom", "expectedTo", "note",
+      // Finance's side. Stored here so the negotiation has a memory; the UI
+      // that drives it is a later chunk, but the field must exist first.
+      "financeNote", "counterAmount", "agreedAmount", "state",
+    ];
+    for (const key of assignable) {
+      if (req.body[key] !== undefined) row[key] = req.body[key];
+    }
+
+    row.updatedAt = new Date();
+    row.updatedBy = actorOf(req);
+
+    await budget.save();
+    res.json({ success: true, request: row, requests: budget.budgetRequests });
+  } catch (error) {
+    console.error("[budgets] update request error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/* ── DELETE REQUEST ──────────────────────────────────────────────────────────
+ * Only while the budget still collects, and only for a request finance has not
+ * yet settled. Withdrawing your own un-negotiated ask is housekeeping; deleting
+ * one that has been countered or agreed would erase finance's side of a
+ * conversation, and that needs a decision, not a DELETE. */
+router.delete("/:id/requests/:requestId", async (req, res) => {
+  try {
+    const { budget, error } = await budgetForRequests(req, { mutating: true });
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+
+    if (!isUsableId(req.params.requestId)) {
+      return res.status(404).json({ success: false, message: "Request not found" });
+    }
+    const row = budget.budgetRequests.id(req.params.requestId);
+    if (!row) return res.status(404).json({ success: false, message: "Request not found" });
+
+    if (["countered", "agreed"].includes(row.state)) {
+      return res.status(409).json({
+        success: false,
+        message: `This request is ${row.state}; it can no longer be withdrawn.`,
+      });
+    }
+
+    row.deleteOne();
+    await budget.save();
+    res.json({ success: true, requests: budget.budgetRequests });
+  } catch (error) {
+    console.error("[budgets] delete request error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 /* ── DELETE ──────────────────────────────────────────────────────────────── */
 router.delete("/:id", async (req, res) => {
   try {

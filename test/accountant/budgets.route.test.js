@@ -749,3 +749,474 @@ describe("actuals are scoped to a company", () => {
     expect(expense.favourable).toBe(true);
   });
 });
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Chunk 2 — DEPARTMENT BUDGET REQUESTS
+ *
+ * A department asking for an amount against a head. An INPUT to finance
+ * review, not an allocation — the tests below pin that nothing here writes to
+ * `items[]`, because a department that could allocate its own budget by
+ * asking for it is the failure this whole workflow exists to prevent.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("department budget requests", () => {
+  let seq = 0;
+
+  async function makeBudget({ companyId, status = "collecting", name = "Requestable" }) {
+    return Acc_Budget.create({
+      budgetId: `BUD-C2-${seq++}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      financialYear: "2026-27",
+      period: "yearly",
+      status,
+      startDate: new Date("2026-04-01"),
+      endDate: new Date("2027-03-31"),
+      createdBy: OWNER.id,
+      ...(companyId ? { companyId } : {}),
+      items: [],
+    });
+  }
+
+  function validRequest(expenseLedger, over = {}) {
+    return {
+      department: "Logistics",
+      ledgerId: expenseLedger._id.toString(),
+      requestedAmount: 250000,
+      priority: "high",
+      purpose: "Export freight for the Diwali shipping peak",
+      ...over,
+    };
+  }
+
+  /* ── Create ────────────────────────────────────────────────────────────── */
+
+  test("a valid request is created, with the head resolved server-side", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger),
+    });
+
+    expect(status).toBe(201);
+    expect(body.request.department).toBe("Logistics");
+    expect(body.request.requestedAmount).toBe(250000);
+    expect(body.request.priority).toBe("high");
+    // Name/group/nature are derived from the ledger tree, not trusted from
+    // the client — a caller cannot label a freight head "revenue".
+    expect(body.request.ledgerName).toBe("Freight & Forwarding");
+    expect(body.request.groupName).toBe("Indirect Expenses");
+    expect(body.request.nature).toBe("expense");
+    expect(body.request.state).toBe("submitted");
+    expect(body.request.submittedAt).toBeTruthy();
+  });
+
+  test("submittedBy is server-derived and cannot be spoofed by the caller", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, { submittedBy: "someone.else@example.com" }),
+    });
+    expect(body.request.submittedBy).not.toBe("someone.else@example.com");
+  });
+
+  test("a request never becomes a budget line — allocation is a separate step", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger),
+    });
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests).toHaveLength(1);
+    expect(stored.items).toHaveLength(0); // the whole point of Chunk 2 vs 3
+    expect(stored.totalAllocated).toBe(0);
+  });
+
+  test("the existing submissions array is untouched by a request", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger),
+    });
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.submissions || []).toHaveLength(0);
+  });
+
+  test("one department can request against several heads — the cardinality submissions cannot hold", async () => {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+    const q = `?companyId=${company._id}`;
+
+    await call(`/${budget._id}/requests${q}`, { method: "POST", body: validRequest(expenseLedger) });
+    await call(`/${budget._id}/requests${q}`, {
+      method: "POST",
+      body: validRequest(revenueLedger, { purpose: "Export sales target", requestedAmount: 900000 }),
+    });
+
+    const { body } = await call(`/${budget._id}/requests${q}`);
+    expect(body.requests).toHaveLength(2);
+    expect(body.requests.map((r) => r.department)).toEqual(["Logistics", "Logistics"]);
+    expect(body.requests.map((r) => r.nature).sort()).toEqual(["expense", "revenue"]);
+  });
+
+  /* ── Required fields ───────────────────────────────────────────────────── */
+
+  test.each([
+    ["department", { department: "" }],
+    ["ledgerId", { ledgerId: "" }],
+    ["requestedAmount", { requestedAmount: undefined }],
+  ])("a request missing %s is rejected", async (_label, override) => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, override),
+    });
+    expect(status).toBe(400);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests || []).toHaveLength(0);
+  });
+
+  test("a request with neither purpose nor justification is rejected", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, { purpose: undefined, justification: undefined }),
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/purpose or justification/i);
+  });
+
+  test("justification alone is enough — the two are alternatives", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, {
+        purpose: undefined,
+        justification: "Rates confirmed with the forwarder for Q3.",
+      }),
+    });
+    expect(status).toBe(201);
+  });
+
+  /* ── Amount ────────────────────────────────────────────────────────────── */
+
+  test.each([
+    ["a negative amount", -1],
+    ["a non-numeric amount", "plenty"],
+  ])("%s is rejected", async (_label, amount) => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, { requestedAmount: amount }),
+    });
+    expect(status).toBe(400);
+  });
+
+  test("zero is a legitimate request — a department asking for nothing on a head", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, { requestedAmount: 0 }),
+    });
+    expect(status).toBe(201);
+  });
+
+  test("an invalid priority is rejected rather than silently defaulted", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, { priority: "URGENT!!" }),
+    });
+    expect(status).toBe(400);
+  });
+
+  /* ── Budget state ──────────────────────────────────────────────────────── */
+
+  test.each(["draft", "collecting"])(
+    "a %s budget accepts requests",
+    async (budgetStatus) => {
+      const { company, expenseLedger } = await seedCompany();
+      const budget = await makeBudget({ companyId: company._id, status: budgetStatus });
+      const { status } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+        method: "POST",
+        body: validRequest(expenseLedger),
+      });
+      expect(status).toBe(201);
+    },
+  );
+
+  test.each(["review", "active", "closed", "exceeded"])(
+    "a %s budget refuses new requests with 409",
+    async (budgetStatus) => {
+      const { company, expenseLedger } = await seedCompany();
+      const budget = await makeBudget({ companyId: company._id, status: budgetStatus });
+
+      const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+        method: "POST",
+        body: validRequest(expenseLedger),
+      });
+      expect(status).toBe(409);
+      expect(body.message).toMatch(new RegExp(budgetStatus, "i"));
+
+      const stored = await Acc_Budget.findById(budget._id).lean();
+      expect(stored.budgetRequests || []).toHaveLength(0);
+    },
+  );
+
+  test("requests stay READABLE on an active budget — only writing is closed", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, status: "collecting" });
+    await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(expenseLedger),
+    });
+
+    await Acc_Budget.findByIdAndUpdate(budget._id, { status: "active" });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`);
+    expect(status).toBe(200);
+    expect(body.requests).toHaveLength(1);
+  });
+
+  /* ── Company scope ─────────────────────────────────────────────────────── */
+
+  test("another company's budget cannot receive a request", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    const budgetB = await makeBudget({ companyId: b.company._id });
+
+    const { status } = await call(`/${budgetB._id}/requests?companyId=${a.company._id}`, {
+      method: "POST",
+      body: validRequest(b.expenseLedger),
+    });
+    expect(status).toBe(404);
+
+    const stored = await Acc_Budget.findById(budgetB._id).lean();
+    expect(stored.budgetRequests || []).toHaveLength(0);
+  });
+
+  test("another company's LEDGER cannot be requested against", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    const budgetA = await makeBudget({ companyId: a.company._id });
+
+    const { status, body } = await call(`/${budgetA._id}/requests?companyId=${a.company._id}`, {
+      method: "POST",
+      body: validRequest(b.expenseLedger), // B's head, A's budget
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/not found for this company/i);
+
+    const stored = await Acc_Budget.findById(budgetA._id).lean();
+    expect(stored.budgetRequests || []).toHaveLength(0);
+  });
+
+  test("another company's budget requests cannot be LISTED", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    const budgetB = await makeBudget({ companyId: b.company._id });
+
+    const { status } = await call(`/${budgetB._id}/requests?companyId=${a.company._id}`);
+    expect(status).toBe(404);
+  });
+
+  /* ── Ledger nature ─────────────────────────────────────────────────────── */
+
+  test("a balance-sheet head is refused — you do not budget Sundry Debtors", async () => {
+    const { company } = await seedCompany();
+    const assetGroup = await Acc_Group.create({
+      companyId: company._id,
+      name: "Sundry Debtors",
+      nature: "asset",
+    });
+    const assetLedger = await Acc_Ledger.create({
+      companyId: company._id,
+      name: "A Buyer Pvt Ltd",
+      groupId: assetGroup._id,
+      groupName: assetGroup.name,
+      nature: "asset",
+    });
+    const budget = await makeBudget({ companyId: company._id });
+
+    const { status, body } = await call(`/${budget._id}/requests?companyId=${company._id}`, {
+      method: "POST",
+      body: validRequest(assetLedger),
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/revenue or expense/i);
+  });
+
+  /* ── The list is per-budget ────────────────────────────────────────────── */
+
+  test("listing returns only THAT budget's requests", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const one = await makeBudget({ companyId: company._id, name: "One" });
+    const two = await makeBudget({ companyId: company._id, name: "Two" });
+    const q = `?companyId=${company._id}`;
+
+    await call(`/${one._id}/requests${q}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, { purpose: "For budget one" }),
+    });
+    await call(`/${two._id}/requests${q}`, {
+      method: "POST",
+      body: validRequest(expenseLedger, { purpose: "For budget two" }),
+    });
+
+    const first = await call(`/${one._id}/requests${q}`);
+    expect(first.body.requests).toHaveLength(1);
+    expect(first.body.requests[0].purpose).toBe("For budget one");
+
+    const second = await call(`/${two._id}/requests${q}`);
+    expect(second.body.requests).toHaveLength(1);
+    expect(second.body.requests[0].purpose).toBe("For budget two");
+  });
+
+  /* ── Update ────────────────────────────────────────────────────────────── */
+
+  async function seedOneRequest(status = "collecting") {
+    const seeded = await seedCompany();
+    const budget = await makeBudget({ companyId: seeded.company._id, status });
+    const created = await call(`/${budget._id}/requests?companyId=${seeded.company._id}`, {
+      method: "POST",
+      body: validRequest(seeded.expenseLedger),
+    });
+    return { ...seeded, budget, request: created.body.request };
+  }
+
+  test("a request can be updated while the budget still collects", async () => {
+    const { company, budget, request } = await seedOneRequest();
+    const { status, body } = await call(
+      `/${budget._id}/requests/${request._id}?companyId=${company._id}`,
+      { method: "PUT", body: { requestedAmount: 310000, priority: "critical" } },
+    );
+    expect(status).toBe(200);
+    expect(body.request.requestedAmount).toBe(310000);
+    expect(body.request.priority).toBe("critical");
+    expect(body.request.updatedAt).toBeTruthy();
+    // The untouched fields survive a partial update.
+    expect(body.request.purpose).toMatch(/Diwali/);
+  });
+
+  test.each(["review", "active", "closed"])(
+    "a request cannot be updated once the budget is %s",
+    async (budgetStatus) => {
+      const { company, budget, request } = await seedOneRequest();
+      await Acc_Budget.findByIdAndUpdate(budget._id, { status: budgetStatus });
+
+      const { status } = await call(
+        `/${budget._id}/requests/${request._id}?companyId=${company._id}`,
+        { method: "PUT", body: { requestedAmount: 999999 } },
+      );
+      expect(status).toBe(409);
+
+      const stored = await Acc_Budget.findById(budget._id).lean();
+      expect(stored.budgetRequests[0].requestedAmount).toBe(250000);
+    },
+  );
+
+  test("an invalid update is rejected and the stored request is untouched", async () => {
+    const { company, budget, request } = await seedOneRequest();
+    const { status } = await call(
+      `/${budget._id}/requests/${request._id}?companyId=${company._id}`,
+      { method: "PUT", body: { requestedAmount: -5 } },
+    );
+    expect(status).toBe(400);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests[0].requestedAmount).toBe(250000);
+  });
+
+  test("an update cannot move the request onto another company's head", async () => {
+    const { company, budget, request } = await seedOneRequest();
+    const other = await seedCompany();
+
+    const { status } = await call(
+      `/${budget._id}/requests/${request._id}?companyId=${company._id}`,
+      { method: "PUT", body: { ledgerId: other.expenseLedger._id.toString() } },
+    );
+    expect(status).toBe(400);
+  });
+
+  test("a request on another company's budget cannot be updated", async () => {
+    const { budget, request } = await seedOneRequest();
+    const other = await seedCompany();
+
+    const { status } = await call(
+      `/${budget._id}/requests/${request._id}?companyId=${other.company._id}`,
+      { method: "PUT", body: { requestedAmount: 1 } },
+    );
+    expect(status).toBe(404);
+  });
+
+  test("an unknown requestId is a clean 404, and a malformed one too", async () => {
+    const { company, budget } = await seedOneRequest();
+    const q = `?companyId=${company._id}`;
+    const ghost = new mongoose.Types.ObjectId().toString();
+
+    expect(
+      (await call(`/${budget._id}/requests/${ghost}${q}`, { method: "PUT", body: { note: "x" } }))
+        .status,
+    ).toBe(404);
+    expect(
+      (await call(`/${budget._id}/requests/not-an-id${q}`, { method: "PUT", body: { note: "x" } }))
+        .status,
+    ).toBe(404);
+  });
+
+  /* ── Delete ────────────────────────────────────────────────────────────── */
+
+  test("an un-negotiated request can be withdrawn", async () => {
+    const { company, budget, request } = await seedOneRequest();
+    const { status } = await call(
+      `/${budget._id}/requests/${request._id}?companyId=${company._id}`,
+      { method: "DELETE" },
+    );
+    expect(status).toBe(200);
+
+    const stored = await Acc_Budget.findById(budget._id).lean();
+    expect(stored.budgetRequests).toHaveLength(0);
+  });
+
+  test.each(["countered", "agreed"])(
+    "a %s request cannot be withdrawn — that would erase finance's side",
+    async (state) => {
+      const { company, budget, request } = await seedOneRequest();
+      await call(`/${budget._id}/requests/${request._id}?companyId=${company._id}`, {
+        method: "PUT",
+        body: { state },
+      });
+
+      const { status } = await call(
+        `/${budget._id}/requests/${request._id}?companyId=${company._id}`,
+        { method: "DELETE" },
+      );
+      expect(status).toBe(409);
+
+      const stored = await Acc_Budget.findById(budget._id).lean();
+      expect(stored.budgetRequests).toHaveLength(1);
+    },
+  );
+});

@@ -441,6 +441,101 @@ const budgetSchema = new mongoose.Schema(
         note: { type: String, trim: true },
       },
     ],
+    /* ── DEPARTMENT BUDGET REQUESTS (Chunk 2) ─────────────────────────────
+     * A department saying: "for this period and this head, we need this much,
+     * for this purpose, at this priority." An INPUT to finance review — not an
+     * approved allocation. Nothing here becomes a budget line; converting a
+     * request into `items[]` is a separate, deliberate step (Chunk 3).
+     *
+     * ── WHY A NEW ARRAY AND NOT MORE FIELDS ON `submissions` ──────────────
+     * They have different cardinality, and that is not a stylistic preference.
+     * `submissions` is ONE ROW PER DEPARTMENT: POST /:id/submissions upserts
+     * by `.find(s => s.department === department)`, and close-collection walks
+     * every row assuming it is that department's single answer, defaulting the
+     * ones that never replied. A request is one row per department PER LEDGER
+     * HEAD — Logistics asking for freight AND courier is two requests. Putting
+     * those in `submissions` would make the upsert match the wrong row and
+     * make close-collection mark a department "agreed" off whichever head it
+     * happened to hit first. Existing rows, routes and tests are untouched by
+     * a new array; they could not be by a widened one.
+     *
+     * The two are related but not the same conversation: `submissions` is the
+     * envelope finance offers a department, `budgetRequests` is what the
+     * department asks for against specific heads. */
+    budgetRequests: [
+      {
+        /* Who is asking. Free-form slug, matching `items[].department` and
+         * `submissions[].department` — the department registry is not seeded,
+         * and a hard ref would make requests undeployable until it is. */
+        department: { type: String, trim: true, required: true },
+
+        /* WHAT is being asked for. `ledgerId` is the real binding, for the
+         * same reason budget lines bind to one: a head, not a free-text
+         * category. Name and group are denormalised so a request stays
+         * readable after a rename, exactly as `items[]` does. */
+        ledgerId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Acc_Ledger",
+          required: true,
+          index: true,
+        },
+        ledgerName: { type: String, trim: true },
+        groupName: { type: String, trim: true },
+        nature: {
+          type: String,
+          enum: ["revenue", "expense"],
+          default: "expense",
+        },
+
+        requestedAmount: { type: Number, required: true, min: 0 },
+
+        priority: {
+          type: String,
+          enum: ["low", "normal", "high", "critical"],
+          default: "normal",
+        },
+
+        /* Why. One of these is required at the route — a number with no stated
+         * reason is not reviewable, and finance rejecting it has nothing to
+         * respond to. */
+        purpose: { type: String, trim: true },
+        justification: { type: String, trim: true },
+
+        /* When the department expects to need it. `expectedMonth` (1-12) is
+         * the convenience for a single-month ask; from/to covers a spread.
+         * Both optional — plenty of requests are simply "this period". */
+        expectedMonth: { type: Number, min: 1, max: 12 },
+        expectedFrom: { type: Date },
+        expectedTo: { type: Date },
+
+        /* Same vocabulary as `submissions[].state`, deliberately: it is the
+         * same negotiation shape, and two different words for "countered"
+         * across one module would be worse than the duplication. */
+        state: {
+          type: String,
+          enum: ["awaiting", "submitted", "countered", "agreed", "defaulted"],
+          default: "submitted",
+          index: true,
+        },
+
+        /* Finance's side of the exchange. Written by finance, not the
+         * requester — Chunk 2 stores them; the UI that drives them is later. */
+        financeNote: { type: String, trim: true },
+        counterAmount: { type: Number, min: 0 },
+        agreedAmount: { type: Number, min: 0 },
+
+        note: { type: String, trim: true },
+
+        /* Audit-friendly without inventing an audit system: who and when, for
+         * both the original submission and the last edit. Server-derived — a
+         * client that could set these could claim any author for a number. */
+        submittedAt: { type: Date },
+        submittedBy: { type: String, trim: true },
+        updatedAt: { type: Date },
+        updatedBy: { type: String, trim: true },
+      },
+    ],
+
     alerts: [
       {
         message: String,
