@@ -1675,3 +1675,508 @@ describe("finance review", () => {
     expect(line.favourable).toBe(true);
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * CHUNK 4 — DASHBOARD / VARIANCE VIEW
+ *
+ * The dashboard is a read across MANY budgets, which is exactly where the
+ * guarantees the by-id routes already prove can quietly stop holding: company
+ * scoping has to survive a fan-out, legacy budgets have to keep falling back
+ * to the caller's company, and actuals still have to come from posted vouchers
+ * rather than the cached figures on the documents.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("dashboard", () => {
+  let seq = 0;
+
+  async function postVoucher({ companyId, ledger, amount, type = "Dr", date = "2026-06-15" }) {
+    return Acc_Voucher.create({
+      companyId,
+      voucherType: type === "Cr" ? "sales" : "purchase",
+      voucherNumber: `DB/${seq++}/${Date.now()}`,
+      voucherDate: new Date(date),
+      status: "posted",
+      grandTotal: amount,
+      ledgerEntries: [{ ledgerId: ledger._id, ledgerName: ledger.name, type, amount }],
+    });
+  }
+
+  /** A budget with whatever lines the caller wants, for a full FY. */
+  async function makeBudget({ companyId, name, items, status = "active" }) {
+    return Acc_Budget.create({
+      name,
+      financialYear: "2026-27",
+      period: "yearly",
+      status,
+      startDate: new Date("2026-04-01"),
+      endDate: new Date("2027-03-31"),
+      ...(companyId ? { companyId } : {}),
+      items,
+    });
+  }
+
+  const dash = (companyId, extra = "") =>
+    call(`/dashboard?companyId=${companyId}${extra}`);
+
+  /* ── totals ───────────────────────────────────────────────────────────── */
+
+  test("totals cover expense and revenue, recomputed from posted vouchers", async () => {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id,
+      name: "FY26-27",
+      items: [
+        { ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 500000 },
+        { ledgerId: revenueLedger._id, nature: "revenue", department: "Sales", allocatedAmount: 4000000 },
+      ],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 120000 });
+    await postVoucher({ companyId: company._id, ledger: revenueLedger, amount: 1000000, type: "Cr" });
+
+    const { status, body } = await dash(company._id, "&asOf=2027-03-31");
+    expect(status).toBe(200);
+
+    expect(body.totals.expense.allocated).toBe(500000);
+    expect(body.totals.expense.actual).toBe(120000);
+    expect(body.totals.expenseRemaining).toBe(380000);
+
+    expect(body.totals.revenue.allocated).toBe(4000000);
+    expect(body.totals.revenue.actual).toBe(1000000);
+    expect(body.totals.revenueToGo).toBe(3000000);
+
+    expect(body.totals.budgetedNet).toBe(3500000);
+    expect(body.totals.actualNet).toBe(880000);
+    expect(body.totals.netVariance).toBe(880000 - 3500000);
+    expect(body.totals.budgetCount).toBe(1);
+    expect(body.totals.lineCount).toBe(2);
+  });
+
+  test("totals add up across several budgets, not just one", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "A",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 200000 }],
+    });
+    await makeBudget({
+      companyId: company._id, name: "B",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Admin", allocatedAmount: 300000 }],
+    });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    expect(body.totals.expense.allocated).toBe(500000);
+    expect(body.totals.budgetCount).toBe(2);
+    expect(body.budgets).toHaveLength(2);
+  });
+
+  test("an empty dashboard is zeroes and empty lists, not a crash", async () => {
+    const { company } = await seedCompany();
+    const { status, body } = await dash(company._id);
+    expect(status).toBe(200);
+    expect(body.totals.expense.allocated).toBe(0);
+    expect(body.totals.revenue.allocated).toBe(0);
+    expect(body.totals.budgetCount).toBe(0);
+    expect(body.byDepartment).toEqual([]);
+    expect(body.byHead).toEqual([]);
+    expect(body.budgets).toEqual([]);
+    expect(body.attention.count).toBe(0);
+    expect(body.truncated).toBeNull();
+  });
+
+  /* ── grouping ─────────────────────────────────────────────────────────── */
+
+  test("department grouping splits allocation, actual and remaining per department", async () => {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [
+        { ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 500000 },
+        { ledgerId: revenueLedger._id, nature: "revenue", department: "Sales", allocatedAmount: 4000000 },
+      ],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 120000 });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    const logistics = body.byDepartment.find((d) => d.department === "Logistics");
+    const sales = body.byDepartment.find((d) => d.department === "Sales");
+
+    expect(logistics.expense.allocated).toBe(500000);
+    expect(logistics.expense.actual).toBe(120000);
+    expect(logistics.expenseRemaining).toBe(380000);
+    expect(sales.revenue.allocated).toBe(4000000);
+    expect(sales.revenueToGo).toBe(4000000);
+  });
+
+  test("a line with no department groups under Unassigned rather than vanishing", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", allocatedAmount: 100000 }],
+    });
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    expect(body.byDepartment.map((d) => d.department)).toContain("Unassigned");
+    expect(body.totals.expense.allocated).toBe(100000);
+  });
+
+  test("head grouping merges the same ledger across budgets and names both", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "A",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 200000 }],
+    });
+    await makeBudget({
+      companyId: company._id, name: "B",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Admin", allocatedAmount: 300000 }],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 50000 });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    const head = body.byHead.find((h) => h.ledgerName === "Freight & Forwarding");
+
+    expect(head.lineCount).toBe(2);
+    expect(head.allocated).toBe(500000);
+    expect(head.groupName).toBe("Indirect Expenses");
+    expect(head.budgets.map((b) => b.name).sort()).toEqual(["A", "B"]);
+    // Two budgets naming different departments for one head says so.
+    expect(head.department).toBe("Multiple");
+    expect(head.utilizationPct).toBeCloseTo((head.actual / 500000) * 100, 6);
+  });
+
+  test("head rows carry the full variance vocabulary the detail view uses", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 400000 }],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 100000 });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    const head = body.byHead[0];
+    for (const field of [
+      "ledgerId", "ledgerName", "groupName", "department", "nature",
+      "allocated", "actual", "expectedToDate", "remaining", "toGo",
+      "variance", "utilizationPct", "pace", "severity",
+    ]) {
+      expect(head).toHaveProperty(field);
+    }
+    expect(head.remaining).toBe(300000);
+    expect(head.toGo).toBeNull(); // expense has no "to go"
+  });
+
+  /* ── company scoping ──────────────────────────────────────────────────── */
+
+  test("another company's budgets never appear, and never move the totals", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+    await makeBudget({
+      companyId: a.company._id, name: "A's budget",
+      items: [{ ledgerId: a.expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 100000 }],
+    });
+    await makeBudget({
+      companyId: b.company._id, name: "B's budget",
+      items: [{ ledgerId: b.expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 999999 }],
+    });
+
+    const { body } = await dash(a.company._id, "&asOf=2027-03-31");
+    expect(body.budgets.map((x) => x.name)).toEqual(["A's budget"]);
+    expect(body.totals.expense.allocated).toBe(100000);
+  });
+
+  test("a legacy budget with no companyId reads ONLY the selected company's postings", async () => {
+    const a = await seedCompany();
+    const b = await seedCompany();
+
+    // Both companies post against the SAME head id. Without company scoping on
+    // the actuals, B's spend lands in A's dashboard.
+    await postVoucher({ companyId: a.company._id, ledger: a.expenseLedger, amount: 100000 });
+    await postVoucher({ companyId: b.company._id, ledger: a.expenseLedger, amount: 777777 });
+
+    await makeBudget({
+      companyId: null, name: "Legacy — no companyId",
+      items: [{ ledgerId: a.expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 500000 }],
+    });
+
+    const { body } = await dash(a.company._id, "&asOf=2027-03-31");
+    expect(body.budgets.map((x) => x.name)).toEqual(["Legacy — no companyId"]);
+    expect(body.totals.expense.actual).toBe(100000);
+    expect(body.totals.expense.actual).not.toBe(877777);
+  });
+
+  /* ── filters ──────────────────────────────────────────────────────────── */
+
+  test("financialYear, status and period filters all narrow the dashboard", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const line = [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 100000 }];
+    await makeBudget({ companyId: company._id, name: "Active", items: line, status: "active" });
+    await makeBudget({ companyId: company._id, name: "Draft", items: line, status: "draft" });
+
+    const active = await dash(company._id, "&status=active&asOf=2027-03-31");
+    expect(active.body.budgets.map((b) => b.name)).toEqual(["Active"]);
+    expect(active.body.totals.expense.allocated).toBe(100000);
+
+    const fy = await dash(company._id, "&financialYear=2026-27&asOf=2027-03-31");
+    expect(fy.body.budgets).toHaveLength(2);
+
+    const otherFy = await dash(company._id, "&financialYear=2099-00&asOf=2027-03-31");
+    expect(otherFy.body.budgets).toHaveLength(0);
+
+    const yearly = await dash(company._id, "&period=yearly&asOf=2027-03-31");
+    expect(yearly.body.budgets).toHaveLength(2);
+  });
+
+  test("a bad period or status is a clean 400, not a 500", async () => {
+    const { company } = await seedCompany();
+    const bad = await dash(company._id, "&period=annual");
+    expect(bad.status).toBe(400);
+    expect(bad.body.message).toMatch(/period must be one of/i);
+
+    const badStatus = await dash(company._id, "&status=expired");
+    expect(badStatus.status).toBe(400);
+
+    const badDate = await dash(company._id, "&asOf=not-a-date");
+    expect(badDate.status).toBe(400);
+  });
+
+  test("the department filter narrows the LINES, not just the budgets", async () => {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [
+        { ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 500000 },
+        { ledgerId: revenueLedger._id, nature: "revenue", department: "Sales", allocatedAmount: 4000000 },
+      ],
+    });
+
+    const { body } = await dash(company._id, "&department=Logistics&asOf=2027-03-31");
+    expect(body.budgets).toHaveLength(1);
+    // Without line-level filtering this would still report Sales' 40L target.
+    expect(body.totals.revenue.allocated).toBe(0);
+    expect(body.totals.expense.allocated).toBe(500000);
+    expect(body.byDepartment.map((d) => d.department)).toEqual(["Logistics"]);
+  });
+
+  /* ── attention lists ──────────────────────────────────────────────────── */
+
+  test("an over-budget expense line lands in the overBudget list", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 100000 }],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 150000 });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    expect(body.attention.overBudget).toHaveLength(1);
+
+    const hit = body.attention.overBudget[0];
+    expect(hit.ledgerName).toBe("Freight & Forwarding");
+    expect(hit.budgetName).toBe("FY26-27");
+    expect(hit.actual).toBe(150000);
+    expect(hit.variance).toBe(-50000);
+    expect(hit.pace).toBe("over_budget");
+    expect(hit.severity).toBe("critical");
+
+    // Reported once, in the louder list — not also under high utilisation.
+    expect(body.attention.highUtilization).toHaveLength(0);
+  });
+
+  test("a revenue line behind pace lands in the revenueBehind list", async () => {
+    const { company, revenueLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [{ ledgerId: revenueLedger._id, nature: "revenue", department: "Sales", allocatedAmount: 4000000 }],
+    });
+    // Half the year gone, a tenth of the target earned.
+    await postVoucher({ companyId: company._id, ledger: revenueLedger, amount: 400000, type: "Cr" });
+
+    const { body } = await dash(company._id, "&asOf=2026-10-01");
+    expect(body.attention.revenueBehind).toHaveLength(1);
+
+    const hit = body.attention.revenueBehind[0];
+    expect(hit.nature).toBe("revenue");
+    expect(hit.pace).toBe("behind");
+    expect(hit.actual).toBe(400000);
+    expect(hit.toGo).toBe(3600000);
+    expect(hit.severity).toBe("critical");
+    expect(body.attention.overBudget).toHaveLength(0);
+  });
+
+  test("a revenue line that has earned NOTHING is behind, not invisible", async () => {
+    const { company, revenueLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [{ ledgerId: revenueLedger._id, nature: "revenue", department: "Sales", allocatedAmount: 4000000 }],
+    });
+    // No revenue voucher at all, half the period gone. paceState calls this
+    // "not_started" rather than "behind" — matching only "behind" hid the
+    // worst case there is.
+    const { body } = await dash(company._id, "&asOf=2026-10-01");
+    expect(body.attention.revenueBehind).toHaveLength(1);
+    expect(body.attention.revenueBehind[0].pace).toBe("not_started");
+    expect(body.attention.revenueBehind[0].actual).toBe(0);
+  });
+
+  test("a high-utilisation expense line that is NOT yet over budget is flagged separately", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 100000 }],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 95000 });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    expect(body.attention.overBudget).toHaveLength(0);
+    expect(body.attention.highUtilization).toHaveLength(1);
+    expect(body.attention.highUtilization[0].utilizationPct).toBe(95);
+  });
+
+  test("an unbound legacy line appears in the unbound list and reads zero actual", async () => {
+    const { company } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "Marketing — legacy",
+      items: [{ nature: "expense", category: "marketing", allocatedAmount: 200000 }],
+    });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    expect(body.attention.unbound).toHaveLength(1);
+    expect(body.attention.unbound[0].ledgerId).toBeNull();
+    expect(body.attention.unbound[0].actual).toBe(0);
+    // It still counts toward what was allocated — it is real money planned.
+    expect(body.totals.expense.allocated).toBe(200000);
+  });
+
+  test("a budget with no approved allocations is flagged, with its request count", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const empty = await makeBudget({ companyId: company._id, name: "Nothing approved yet", items: [], status: "collecting" });
+    await Acc_Budget.updateOne(
+      { _id: empty._id },
+      {
+        $push: {
+          budgetRequests: {
+            department: "Logistics",
+            ledgerId: expenseLedger._id,
+            ledgerName: expenseLedger.name,
+            nature: "expense",
+            requestedAmount: 320000,
+            state: "submitted",
+          },
+        },
+      },
+    );
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    expect(body.attention.noAllocations).toHaveLength(1);
+
+    const hit = body.attention.noAllocations[0];
+    expect(hit.name).toBe("Nothing approved yet");
+    expect(hit.requestCount).toBe(1);
+    expect(hit.pendingRequestCount).toBe(1);
+  });
+
+  test("agreeing a request removes the budget from the no-allocations list", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({ companyId: company._id, name: "Collecting", items: [], status: "collecting" });
+    const q = `?companyId=${company._id}`;
+
+    const created = await call(`/${budget._id}/requests${q}`, {
+      method: "POST",
+      body: {
+        department: "Logistics",
+        ledgerId: expenseLedger._id.toString(),
+        requestedAmount: 320000,
+        purpose: "Export freight for the Diwali shipping peak",
+      },
+    });
+    expect(created.status).toBe(201);
+
+    const before = await dash(company._id, "&asOf=2027-03-31");
+    expect(before.body.attention.noAllocations).toHaveLength(1);
+
+    const agreed = await call(
+      `/${budget._id}/requests/${created.body.request._id}/agree${q}`,
+      { method: "POST", body: { agreedAmount: 300000 } },
+    );
+    expect(agreed.status).toBe(200);
+
+    const after = await dash(company._id, "&asOf=2027-03-31");
+    expect(after.body.attention.noAllocations).toHaveLength(0);
+    expect(after.body.totals.expense.allocated).toBe(300000);
+    expect(after.body.byDepartment.find((d) => d.department === "Logistics").expense.allocated).toBe(300000);
+  });
+
+  test("the attention count is the sum of every list", async () => {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [
+        { ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 100000 },
+        { ledgerId: revenueLedger._id, nature: "revenue", department: "Sales", allocatedAmount: 4000000 },
+        { nature: "expense", category: "marketing", department: "Marketing", allocatedAmount: 50000 },
+      ],
+    });
+    await makeBudget({ companyId: company._id, name: "Empty", items: [] });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 150000 });
+
+    const { body } = await dash(company._id, "&asOf=2026-10-01");
+    const a = body.attention;
+    expect(a.count).toBe(
+      a.overBudget.length + a.revenueBehind.length + a.highUtilization.length +
+      a.unbound.length + a.noAllocations.length,
+    );
+    expect(a.overBudget).toHaveLength(1);
+    expect(a.revenueBehind).toHaveLength(1);
+    expect(a.unbound).toHaveLength(1);
+    expect(a.noAllocations).toHaveLength(1);
+  });
+
+  /* ── budget list summary ──────────────────────────────────────────────── */
+
+  test("each budget summary carries its own totals and worst severity", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await makeBudget({
+      companyId: company._id, name: "Healthy",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Admin", allocatedAmount: 1000000 }],
+    });
+    const sick = await makeBudget({
+      companyId: company._id, name: "Blown",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 10000 }],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 50000 });
+
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+    const blown = body.budgets.find((b) => b.name === "Blown");
+
+    expect(String(blown._id)).toBe(String(sick._id));
+    expect(blown.status).toBe("active");
+    expect(blown.period).toBe("yearly");
+    expect(blown.financialYear).toBe("2026-27");
+    expect(blown.startDate).toBeTruthy();
+    expect(blown.endDate).toBeTruthy();
+    expect(blown.totals.expense.allocated).toBe(10000);
+    expect(blown.severity).toBe("critical");
+    expect(blown.lineCount).toBe(1);
+  });
+
+  test("dashboard figures agree with the same budget's detail view", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await makeBudget({
+      companyId: company._id, name: "FY26-27",
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 400000 }],
+    });
+    await postVoucher({ companyId: company._id, ledger: expenseLedger, amount: 250000 });
+
+    const detail = await call(`/${budget._id}?companyId=${company._id}&asOf=2027-03-31`);
+    const { body } = await dash(company._id, "&asOf=2027-03-31");
+
+    expect(body.totals.expense.actual).toBe(detail.body.budget.totals.expense.actual);
+    expect(body.totals.expense.allocated).toBe(detail.body.budget.totals.expense.allocated);
+    expect(body.byHead[0].severity).toBe(detail.body.budget.items[0].severity);
+    expect(body.byHead[0].pace).toBe(detail.body.budget.items[0].pace);
+  });
+
+  /* ── auth ─────────────────────────────────────────────────────────────── */
+
+  test("the dashboard requires authentication like every other budget route", async () => {
+    const { company } = await seedCompany();
+    const { status } = await call(`/dashboard?companyId=${company._id}`, { user: null });
+    expect(status).toBe(401);
+  });
+});

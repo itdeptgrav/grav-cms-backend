@@ -274,6 +274,329 @@ router.get("/ledger-options", async (req, res) => {
   }
 });
 
+/* ── DASHBOARD ───────────────────────────────────────────────────────────────
+ * "Which departments and heads are over budget, under budget, on pace, or at
+ * risk?" — read-only, across every budget the caller's filters select.
+ *
+ * MUST be declared before `/:id`, or Express hands "dashboard" to the detail
+ * route as a budget id and this endpoint becomes a 404 that looks like a
+ * missing record.
+ *
+ * This route invents no arithmetic. Every figure comes out of
+ * budgetVariance.service.js through the same `evaluate()` the list and detail
+ * routes use, so a number here can never disagree with the same number on the
+ * budget it came from. Where a total is needed that the service does not
+ * itself produce (spend remaining, revenue still to go), it is SUMMED from the
+ * per-line values the service returned rather than re-derived — the per-line
+ * `toGo` is clamped at zero and a re-derived version would not be.
+ *
+ * COST: one aggregation pair per budget, because `evaluate()` hydrates against
+ * each budget's own date window and each budget's own company (a legacy row
+ * falls back to the caller's, which is the whole point of actualsCompanyFor).
+ * Budgets are tens per financial year, not thousands, and correctness across
+ * legacy rows matters more here than saving round trips. MAX_BUDGETS caps the
+ * work and `truncated` says so out loud when it bites.
+ */
+
+/* Mirrors the `warnAtPct` default in budgetVariance.service.js. A line at or
+ * above it has consumed enough of its number to be worth a manager's eye even
+ * when the pace maths says it is fine. */
+const HIGH_UTILIZATION_PCT = 90;
+
+/* A dashboard is a screen, not an export. */
+const MAX_BUDGETS = 200;
+
+/** Worst severity across a set of evaluated lines. `worseOf` is the service's
+ *  own combining rule: signals combine by taking the worst, never by
+ *  averaging, because an averaged alarm is one that fails to ring. */
+function worstSeverity(lines = []) {
+  return lines.reduce((acc, l) => variance.worseOf(acc, l.severity || "info"), "info");
+}
+
+const sumOf = (lines, field) =>
+  lines.reduce((s, l) => s + (variance.money(l[field]) ?? 0), 0);
+
+/** Enough of a line to act on it, without shipping the whole document. */
+function attentionLine(line, budget) {
+  return {
+    budgetId: budget._id,
+    budgetName: budget.name,
+    ledgerId: line.ledgerId || null,
+    ledgerName: line.ledgerName || null,
+    groupName: line.groupName || null,
+    department: line.department || null,
+    nature: line.nature,
+    allocated: line.allocated,
+    actual: line.actual,
+    expectedToDate: line.expectedToDate,
+    remaining: line.remaining,
+    toGo: line.toGo,
+    variance: line.variance,
+    utilizationPct: line.utilizationPct,
+    pace: line.pace,
+    severity: line.severity,
+  };
+}
+
+router.get("/dashboard", async (req, res) => {
+  try {
+    const { financialYear, status, period, department } = req.query;
+
+    const periodError = invalidEnumField(Acc_Budget, "period", period);
+    if (periodError) return res.status(400).json({ success: false, message: periodError });
+    const statusError = invalidEnumField(Acc_Budget, "status", status);
+    if (statusError) return res.status(400).json({ success: false, message: statusError });
+
+    let asOf;
+    if (req.query.asOf) {
+      asOf = new Date(req.query.asOf);
+      if (Number.isNaN(asOf.getTime())) {
+        return res.status(400).json({ success: false, message: "asOf must be a valid date" });
+      }
+    }
+
+    /* The SAME filter the list endpoint builds, legacy clause included. A
+     * dashboard scoped differently from the list would report totals for
+     * budgets the list refuses to show you. */
+    const filter = {};
+    if (financialYear) filter.financialYear = financialYear;
+    if (status) filter.status = status;
+    if (period) filter.period = period;
+    if (department) filter["items.department"] = department;
+
+    const companyId = companyOf(req);
+    if (companyId) {
+      const cid = actuals.oid(companyId);
+      if (cid) filter.$or = [{ companyId: cid }, { companyId: { $exists: false } }, { companyId: null }];
+    }
+
+    const matched = await Acc_Budget.countDocuments(filter);
+    const budgets = await Acc_Budget.find(filter).sort({ createdAt: -1 }).limit(MAX_BUDGETS).lean();
+    const evaluated = await Promise.all(budgets.map((b) => evaluate(b, req, { asOf })));
+
+    /* `department` selects which BUDGETS are in scope (any line naming it),
+     * exactly as the list route does. Once a budget is in scope the dashboard
+     * shows only that department's lines — otherwise asking about Logistics
+     * returns Logistics-shaped totals padded with every other department that
+     * happens to share the budget. */
+    const linesOf = (b) =>
+      department ? (b.items || []).filter((l) => l.department === department) : b.items || [];
+
+    const allLines = evaluated.flatMap(linesOf);
+    const expenseLines = allLines.filter((l) => l.nature === "expense");
+    const revenueLines = allLines.filter((l) => l.nature === "revenue");
+
+    /* ── 1. Overall ─────────────────────────────────────────────────────── */
+    const totals = {
+      ...variance.rollUp(allLines),
+      /* Named for what a manager asks for, and summed from the service's own
+       * per-line figures rather than re-derived here. */
+      expenseRemaining: sumOf(expenseLines, "remaining"),
+      revenueToGo: sumOf(revenueLines, "toGo"),
+      budgetCount: evaluated.length,
+      lineCount: allLines.length,
+    };
+
+    /* ── 2. By department ───────────────────────────────────────────────── */
+    const linesByDept = new Map();
+    for (const l of allLines) {
+      const k = l.department || "Unassigned";
+      if (!linesByDept.has(k)) linesByDept.set(k, []);
+      linesByDept.get(k).push(l);
+    }
+    const byDepartment = variance.groupBy(allLines, "department").map((d) => {
+      const group = linesByDept.get(d.name) || [];
+      return {
+        ...d,
+        department: d.name,
+        expenseRemaining: sumOf(group.filter((l) => l.nature === "expense"), "remaining"),
+        revenueToGo: sumOf(group.filter((l) => l.nature === "revenue"), "toGo"),
+        severity: worstSeverity(group),
+      };
+    });
+
+    /* ── 3. By head ─────────────────────────────────────────────────────────
+     * One row per ledger head, across budgets. The same head budgeted twice is
+     * one management question, not two — but the allocations still have to add
+     * up, so the contributing budgets are named. An unbound legacy line has no
+     * head to merge on and keeps its own row. */
+    const heads = new Map();
+    for (const b of evaluated) {
+      for (const l of linesOf(b)) {
+        const key = l.ledgerId ? String(l.ledgerId) : `unbound:${b._id}:${l._id}`;
+        if (!heads.has(key)) {
+          heads.set(key, {
+            ledgerId: l.ledgerId || null,
+            ledgerName: l.ledgerName || null,
+            groupName: l.groupName || null,
+            department: l.department || null,
+            nature: l.nature,
+            unbound: !!l.unbound,
+            budgets: [],
+            _lines: [],
+          });
+        }
+        const head = heads.get(key);
+        head._lines.push(l);
+        head.budgets.push({ _id: b._id, name: b.name });
+        /* Two budgets can name different departments for one head. Say so
+         * rather than silently keeping whichever was read first. */
+        if (!head.department) head.department = l.department || null;
+        else if (l.department && head.department !== l.department) head.department = "Multiple";
+      }
+    }
+
+    const byHead = [...heads.values()]
+      .map(({ _lines, ...head }) => {
+        const allocated = sumOf(_lines, "allocated");
+        const actual = sumOf(_lines, "actual");
+
+        /* Each line's expectation is already computed against its OWN budget
+         * window, so the sum is meaningful — but only if every line has one.
+         * A partial sum would understate the expectation and make the head
+         * look ahead of pace when it is not. */
+        const expectedToDate = _lines.every((l) => l.expectedToDate !== null)
+          ? sumOf(_lines, "expectedToDate")
+          : null;
+
+        /* Date-independent arithmetic (remaining / toGo / variance /
+         * utilisation) comes from the service on the merged figures. Pace and
+         * severity do NOT: pace is re-derived from the summed expectation via
+         * the service's own paceState, and severity takes the worst of the
+         * lines, each of which judged itself against its own period. */
+        const v = variance.evaluateLine({ allocated, actual, nature: head.nature, asOf });
+
+        return {
+          ...head,
+          allocated,
+          actual,
+          expectedToDate,
+          remaining: v.remaining,
+          toGo: v.toGo,
+          variance: v.variance,
+          variancePct: v.variancePct,
+          utilizationPct: v.utilizationPct,
+          pace: variance.paceState({
+            kind: head.nature,
+            alloc: allocated,
+            act: actual,
+            expected: expectedToDate,
+          }),
+          severity: worstSeverity(_lines),
+          lineCount: _lines.length,
+        };
+      })
+      .sort((a, b) => b.allocated - a.allocated);
+
+    /* ── 4. Attention ───────────────────────────────────────────────────── */
+    const overBudget = [];
+    const revenueBehind = [];
+    const highUtilization = [];
+    const unbound = [];
+    const noAllocations = [];
+
+    for (const b of evaluated) {
+      for (const l of linesOf(b)) {
+        if (l.unbound) unbound.push(attentionLine(l, b));
+
+        if (l.nature === "expense") {
+          if (l.pace === "over_budget") overBudget.push(attentionLine(l, b));
+          else if (l.utilizationPct !== null && l.utilizationPct >= HIGH_UTILIZATION_PCT) {
+            /* `else`: a line already over budget is reported once, in the
+             * louder list. Two entries for one line reads as two problems. */
+            highUtilization.push(attentionLine(l, b));
+          }
+        } else if (l.pace === "behind" || l.pace === "not_started") {
+          /* `not_started` too: paceState reports it instead of "behind" when
+           * nothing at all has been earned, and a revenue head still at zero
+           * halfway through its period is the most behind a line can be.
+           * Matching only "behind" hid exactly the worst case. */
+          revenueBehind.push(attentionLine(l, b));
+        }
+      }
+
+      /* Deliberately the budget's FULL line list, not the department-filtered
+       * one: having no approved allocations is a fact about the budget, and a
+       * department filter must not manufacture it. */
+      if (!(b.items || []).length) {
+        /* Nothing approved here. With requests against it, that is finance
+         * owing departments an answer; without, it is a budget nobody has
+         * filled in. The counts tell the two apart. */
+        const requests = b.budgetRequests || [];
+        noAllocations.push({
+          _id: b._id,
+          name: b.name,
+          status: b.status,
+          period: b.period,
+          financialYear: b.financialYear,
+          requestCount: requests.length,
+          pendingRequestCount: requests.filter((r) => r.state !== "agreed" && r.state !== "defaulted").length,
+        });
+      }
+    }
+
+    /* Biggest problem first in each list — nobody scrolls a dashboard. */
+    overBudget.sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance));
+    revenueBehind.sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance));
+    highUtilization.sort((a, b) => (b.utilizationPct ?? 0) - (a.utilizationPct ?? 0));
+
+    const attention = {
+      overBudget,
+      revenueBehind,
+      highUtilization,
+      unbound,
+      noAllocations,
+      count:
+        overBudget.length +
+        revenueBehind.length +
+        highUtilization.length +
+        unbound.length +
+        noAllocations.length,
+    };
+
+    /* ── 5. Budget list ─────────────────────────────────────────────────── */
+    const budgetList = evaluated.map((b) => {
+      const lines = linesOf(b);
+      return {
+        _id: b._id,
+        budgetId: b.budgetId,
+        name: b.name,
+        status: b.status,
+        period: b.period,
+        financialYear: b.financialYear,
+        startDate: b.startDate,
+        endDate: b.endDate,
+        totals: variance.rollUp(lines),
+        lineCount: lines.length,
+        requestCount: (b.budgetRequests || []).length,
+        severity: worstSeverity(lines),
+      };
+    });
+
+    res.json({
+      success: true,
+      asOf: evaluated[0]?.asOf || asOf || new Date(),
+      filters: {
+        financialYear: financialYear || null,
+        status: status || null,
+        period: period || null,
+        department: department || null,
+      },
+      totals,
+      byDepartment,
+      byHead,
+      attention,
+      budgets: budgetList,
+      /* Never truncate silently — a dashboard that quietly dropped budgets
+       * would read as "this is everything". */
+      truncated: matched > budgets.length ? { matched, returned: budgets.length } : null,
+    });
+  } catch (error) {
+    console.error("[budgets] dashboard error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 /* ── DETAIL ──────────────────────────────────────────────────────────────── */
 router.get("/:id", async (req, res) => {
   try {
