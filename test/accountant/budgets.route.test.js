@@ -4006,31 +4006,38 @@ describe("dashboard monthly series", () => {
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
     const byKey = Object.fromEntries(body.monthly.map((m) => [m.key, m]));
 
-    expect(byKey["2026-06"]).toEqual({ key: "2026-06", revenue: 900000, expense: 120000 });
+    expect(byKey["2026-06"]).toMatchObject({ key: "2026-06", revenue: 900000, expense: 120000 });
     expect(byKey["2026-09"].expense).toBe(80000);
     expect(byKey["2026-09"].revenue).toBe(0);
   });
 
-  test("empty months INSIDE the range are kept; the empty ends are trimmed", async () => {
+  test("quiet months are kept; only months carrying neither spend NOR plan are trimmed", async () => {
     const { company, expenseLedger } = await setup();
-    // A quiet stretch between two months of movement.
     await post({ company, ledger: expenseLedger, amount: 1000, type: "Dr", date: "2026-06-15" });
     await post({ company, ledger: expenseLedger, amount: 2000, type: "Dr", date: "2026-09-15" });
 
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
 
-    // Jun → Sep. Apr, May and Oct-Mar carry nothing and are dropped: an old
-    // budget in scope otherwise stretches the axis across financial years.
-    expect(body.monthly.map((m) => m.key)).toEqual(["2026-06", "2026-07", "2026-08", "2026-09"]);
-    // But the quiet months between them stay — a flat quarter is part of the
-    // shape of the year, and skipping it would compress the gap.
-    expect(body.monthly[1]).toEqual({ key: "2026-07", revenue: 0, expense: 0 });
-    expect(body.monthly[2]).toEqual({ key: "2026-08", revenue: 0, expense: 0 });
+    // The budget allocates across all twelve months, so all twelve carry a
+    // plan and none is empty. A month with no spend still has a line to be
+    // read against, which is the whole point of drawing the plan.
+    expect(body.monthly).toHaveLength(12);
+    expect(body.monthly[0].key).toBe("2026-04");
+    // Quiet months are genuinely quiet on the actuals.
+    const jul = body.monthly.find((m) => m.key === "2026-07");
+    expect(jul.expense).toBe(0);
+    expect(jul.plannedExpense).toBeGreaterThan(0);
   });
 
-  test("a budget period with no movement at all yields an empty series", async () => {
-    const { company } = await setup();
+  test("a period with neither spend nor allocation yields an empty series", async () => {
+    const { company } = await seedCompany();
+    await Acc_Budget.create({
+      name: "Empty", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id, items: [],
+    });
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    // Nothing allocated and nothing spent — there is genuinely nothing to draw.
     expect(body.monthly).toEqual([]);
   });
 
@@ -4086,11 +4093,9 @@ describe("dashboard monthly series", () => {
     await post({ company, ledger: expenseLedger, amount: 50000, type: "Dr", date: "2026-06-30T18:30:00Z" });
 
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
-    // July is the only month with movement, so after trimming it is the only
-    // month in the series at all — which is itself the assertion: bucketed on
-    // UTC this voucher would have produced a June bucket instead.
-    expect(body.monthly).toHaveLength(1);
-    expect(body.monthly[0]).toEqual({ key: "2026-07", revenue: 0, expense: 50000 });
+    // Bucketed on the UTC month this would land in June instead.
+    expect(body.monthly.find((m) => m.key === "2026-07").expense).toBe(50000);
+    expect(body.monthly.find((m) => m.key === "2026-06").expense).toBe(0);
   });
 
   test("the window itself is the budget's, so spend just outside it is excluded", async () => {
@@ -4106,12 +4111,11 @@ describe("dashboard monthly series", () => {
     await post({ company, ledger: expenseLedger, amount: 50000, type: "Dr", date: "2026-03-31T18:30:00Z" });
 
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
-    // Nothing inside the window, so nothing to draw.
-    expect(body.monthly).toEqual([]);
-    // And the series still agrees with the totals, which is the real contract.
+    // The plan still draws, but not one rupee of that voucher reaches it.
     const sum = body.monthly.reduce((s, m) => s + m.expense, 0);
+    expect(sum).toBe(0);
+    // And the series still agrees with the totals, which is the real contract.
     expect(sum).toBe(body.totals.expense.actual);
-    expect(body.totals.expense.actual).toBe(0);
   });
 
   test("another company's postings never reach the series", async () => {
@@ -4149,5 +4153,104 @@ describe("dashboard monthly series", () => {
     // A series of zeroes draws along the axis and reads as "we spent nothing",
     // which is a different and wrong claim from "there is nothing here".
     expect(body.monthly).toEqual([]);
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * THE PLANNED PACE — what the curve is read against
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("dashboard planned series", () => {
+  let seq = 0;
+
+  async function yearly({ expense = 1200000, revenue = 0 } = {}) {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    const items = [
+      { ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: expense },
+    ];
+    if (revenue) {
+      items.push({ ledgerId: revenueLedger._id, ledgerName: "B", nature: "revenue", department: "Sales", allocatedAmount: revenue });
+    }
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id, items,
+    });
+    return { company, budget, expenseLedger, revenueLedger };
+  }
+
+  const post = ({ company, ledger, amount, type = "Dr", date }) =>
+    Acc_Voucher.create({
+      companyId: company._id, voucherType: type === "Cr" ? "sales" : "purchase",
+      voucherNumber: `PL/${seq++}/${Date.now()}`,
+      voucherDate: new Date(date), status: "posted", grandTotal: amount,
+      ledgerEntries: [{ ledgerId: ledger._id, ledgerName: ledger.name, type, amount }],
+    });
+
+  test("a yearly allocation spreads evenly across the twelve months it covers", async () => {
+    const { company, expenseLedger } = await yearly({ expense: 1200000 });
+    await post({ company, ledger: expenseLedger, amount: 1, date: "2026-04-05" });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.monthly).toHaveLength(12);
+    // ₹12L over twelve months is ₹1L a month.
+    body.monthly.forEach((m) => expect(Math.round(m.plannedExpense)).toBe(100000));
+    // And the whole plan adds back up to the allocation.
+    const planned = body.monthly.reduce((s, m) => s + m.plannedExpense, 0);
+    expect(Math.round(planned)).toBe(1200000);
+  });
+
+  test("the plan sums to what was allocated, and revenue plans separately", async () => {
+    const { company, expenseLedger } = await yearly({ expense: 1200000, revenue: 6000000 });
+    await post({ company, ledger: expenseLedger, amount: 1, date: "2026-04-05" });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    const sum = (k) => Math.round(body.monthly.reduce((s, m) => s + m[k], 0));
+
+    expect(sum("plannedExpense")).toBe(body.totals.expense.allocated);
+    expect(sum("plannedRevenue")).toBe(body.totals.revenue.allocated);
+    // Never netted together — they are different kinds of claim.
+    expect(sum("plannedRevenue")).toBe(6000000);
+  });
+
+  test("a quarterly budget plans only across its own three months", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await Acc_Budget.create({
+      name: "Q2", financialYear: "2026-27", period: "quarterly", quarter: 2, status: "active",
+      startDate: new Date("2026-07-01"), endDate: new Date("2026-09-30"), companyId: company._id,
+      items: [{ ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 300000 }],
+    });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    const planned = Object.fromEntries(body.monthly.map((m) => [m.key, Math.round(m.plannedExpense)]));
+    expect(planned).toEqual({ "2026-07": 100000, "2026-08": 100000, "2026-09": 100000 });
+  });
+
+  test("a budget with a plan but no spend still draws — the plan is the point", async () => {
+    const { company } = await yearly({ expense: 1200000 });
+    // Nothing posted at all.
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    // Previously the series trimmed to empty because it only looked at actuals,
+    // and a brand-new budget showed no chart at all.
+    expect(body.monthly).toHaveLength(12);
+    expect(body.monthly.every((m) => m.expense === 0)).toBe(true);
+    expect(Math.round(body.monthly[0].plannedExpense)).toBe(100000);
+  });
+
+  test("the department filter narrows the plan as well as the spend", async () => {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"), companyId: company._id,
+      items: [
+        { ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 1200000 },
+        { ledgerId: revenueLedger._id, ledgerName: "B", nature: "revenue", department: "Sales", allocatedAmount: 6000000 },
+      ],
+    });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&department=Logistics&asOf=2027-03-31`);
+    const sum = (k) => Math.round(body.monthly.reduce((s, m) => s + m[k], 0));
+    expect(sum("plannedExpense")).toBe(1200000);
+    // Sales is filtered out, so its target must not appear in the plan either.
+    expect(sum("plannedRevenue")).toBe(0);
   });
 });

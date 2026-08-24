@@ -429,7 +429,7 @@ const sumOf = (lines, field) =>
  * empty state, whereas a series of zeroes draws a flat line along the axis
  * and reads as "we spent nothing", which is a different and wrong claim.
  */
-async function monthlySeries(evaluated, allLines, req) {
+async function monthlySeries(evaluated, allLines, req, department) {
   const ledgerIds = [...new Set(allLines.map((l) => l.ledgerId).filter(Boolean).map(String))];
   if (!ledgerIds.length || !evaluated.length) return [];
 
@@ -449,13 +449,52 @@ async function monthlySeries(evaluated, allLines, req) {
   });
 
   const byMonth = new Map();
+  const bucket = (key) => {
+    if (!byMonth.has(key)) {
+      byMonth.set(key, { key, revenue: 0, expense: 0, plannedExpense: 0, plannedRevenue: 0 });
+    }
+    return byMonth.get(key);
+  };
+
   for (const r of rows) {
     const nature = natures.get(String(r.ledgerId))?.nature || "expense";
-    if (!byMonth.has(r.key)) byMonth.set(r.key, { key: r.key, revenue: 0, expense: 0 });
-    const bucket = byMonth.get(r.key);
+    const b = bucket(r.key);
     const amount = actuals.actualFrom(r, nature);
-    if (nature === "revenue") bucket.revenue += amount;
-    else bucket.expense += amount;
+    if (nature === "revenue") b.revenue += amount;
+    else b.expense += amount;
+  }
+
+  /* ── WHAT WAS PLANNED FOR EACH MONTH ──────────────────────────────────────
+   * The line a manager actually reads the curve against: not "did we spend",
+   * but "did we spend faster than the plan allowed".
+   *
+   * A budget states one number for a period, not twelve. Spreading it evenly
+   * across the months it covers is the same assumption expectedToDate already
+   * makes for every variance figure in this module — so the chart's plan line
+   * and a line's `expectedToDate` cannot tell different stories. It is an
+   * ASSUMPTION, not a fact: a budget with a real seasonal shape is not flat,
+   * which is what `phasing` exists for, and a line carrying it is spread by
+   * its own weights instead.
+   *
+   * Drawn as a hatched band rather than a solid one throughout the UI, for
+   * exactly this reason — it is the plan, not money that moved. */
+  for (const b of evaluated) {
+    const months = monthsCovered(b.startDate, b.endDate);
+    if (!months.length) continue;
+
+    for (const item of linesOfBudget(b, department)) {
+      const alloc = variance.money(item.allocatedAmount) ?? 0;
+      if (!(alloc > 0)) continue;
+      const isRevenue = item.nature === "revenue";
+      const weights = monthWeights(item.phasing, months.length);
+
+      months.forEach((key, i) => {
+        const share = alloc * weights[i];
+        const target = bucket(key);
+        if (isRevenue) target.plannedRevenue += share;
+        else target.plannedExpense += share;
+      });
+    }
   }
 
   /* Every month in the window, including the ones nothing happened in — a
@@ -466,13 +505,6 @@ async function monthlySeries(evaluated, allLines, req) {
    * Generating them from the server's local clock instead would drift by a
    * month at the boundary on any host not running IST — and the boundary is
    * 1 April, which is where every Indian financial year starts. */
-  const istKey = (d) =>
-    new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Asia/Kolkata",
-      year: "numeric",
-      month: "2-digit",
-    }).format(d);
-
   const out = [];
   const seen = new Set();
   /* Stepped in days rather than months so `setMonth` cannot skip February
@@ -496,12 +528,70 @@ async function monthlySeries(evaluated, allLines, req) {
    * scope stretches the union across financial years, and two thirds of the
    * axis showing nothing tells the reader less than the same chart drawn over
    * the months that actually have movement. */
-  const active = (m) => m.revenue !== 0 || m.expense !== 0;
+  const active = (m) =>
+    m.revenue !== 0 || m.expense !== 0 || m.plannedExpense !== 0 || m.plannedRevenue !== 0;
   const first = out.findIndex(active);
   if (first === -1) return [];
   let last = out.length - 1;
   while (last > first && !active(out[last])) last--;
   return out.slice(first, last + 1);
+}
+
+/** "2026-04" for a date, in IST. Shared so every month bucket in this file
+ *  is keyed the same way — see monthlySeries for why IST and not UTC. */
+const istKey = (d) =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+  }).format(d);
+
+/** Every IST month key a period touches, in order. */
+function monthsCovered(start, end) {
+  if (!start || !end) return [];
+  const out = [];
+  const seen = new Set();
+  const cursor = new Date(start);
+  const last = new Date(end);
+  while (cursor <= last && out.length < 120) {
+    const key = istKey(cursor);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(key);
+    }
+    cursor.setUTCDate(cursor.getUTCDate() + 15);
+  }
+  const endKey = istKey(last);
+  if (!seen.has(endKey)) out.push(endKey);
+  return out;
+}
+
+/**
+ * How one line's allocation divides across the months it covers.
+ *
+ * Flat unless the line carries `phasing`, in which case those weights are
+ * resampled onto the month count — the same weights expectedToDate uses, so
+ * the plan line and the per-line expectation agree.
+ */
+function monthWeights(phasing, monthCount) {
+  const raw = Array.isArray(phasing)
+    ? phasing.map((w) => variance.money(w)).filter((w) => w !== null && w >= 0)
+    : [];
+  const total = raw.reduce((s, w) => s + w, 0);
+  if (!raw.length || total <= 0) return Array(monthCount).fill(1 / monthCount);
+
+  /* Buckets are equal slices of the period; map each month onto the slice it
+   * sits in so a four-bucket phasing spreads sensibly over twelve months. */
+  return Array.from({ length: monthCount }, (_, i) => {
+    const idx = Math.min(raw.length - 1, Math.floor((i / monthCount) * raw.length));
+    return raw[idx] / total / (monthCount / raw.length);
+  });
+}
+
+/** A budget's lines, honouring the dashboard's department filter. */
+function linesOfBudget(budget, department) {
+  const items = budget.items || [];
+  return department ? items.filter((l) => l.department === department) : items;
 }
 
 /** Enough of a line to act on it, without shipping the whole document. */
@@ -786,7 +876,7 @@ router.get("/dashboard", async (req, res) => {
      * One aggregation for the whole set, not one per budget: the heads are
      * unioned and the window is the union of the periods, so this costs a
      * single round trip however many budgets are in scope. */
-    const monthly = await monthlySeries(evaluated, allLines, req);
+    const monthly = await monthlySeries(evaluated, allLines, req, department);
 
     /* ── 5. Budget list ─────────────────────────────────────────────────── */
     const budgetList = evaluated.map((b) => {
