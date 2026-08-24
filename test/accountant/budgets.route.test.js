@@ -34,7 +34,43 @@ const { Acc_Company, Acc_Group, Acc_Ledger } = require("../../models/Accountant_
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
 
-const OWNER = { id: new mongoose.Types.ObjectId().toString(), name: "Priya Owner", permissions: { canEdit: true } };
+/* A real owner, as AccountantAuthMiddleware would issue one: owner role,
+ * canEdit AND canApprove. The fixture used to carry canEdit alone, which
+ * meant every finance action in this file was being exercised by a user who
+ * — once the authorization guards landed — is not allowed to perform one. */
+const OWNER = {
+  id: new mongoose.Types.ObjectId().toString(),
+  name: "Priya Owner",
+  email: "priya.owner@example.com",
+  role: "owner",
+  permissions: { canEdit: true, canApprove: true, canPostDirectly: true },
+};
+
+/* The two roles the guards actually separate. An editor may raise anything and
+ * approve nothing; a viewer may not even raise. */
+const EDITOR = {
+  id: new mongoose.Types.ObjectId().toString(),
+  name: "Sam Editor",
+  email: "sam.editor@example.com",
+  role: "editor",
+  permissions: { canEdit: true },
+};
+const VIEWER = {
+  id: new mongoose.Types.ObjectId().toString(),
+  name: "Vik Viewer",
+  email: "vik.viewer@example.com",
+  role: "viewer",
+  permissions: { canView: true },
+};
+/* An approver who is NOT the owner — the only role the four-eyes rule can
+ * actually bite, since the owner is exempt by design. */
+const APPROVER = {
+  id: new mongoose.Types.ObjectId().toString(),
+  name: "Anu Approver",
+  email: "anu.approver@example.com",
+  role: "approver",
+  permissions: { canEdit: true, canApprove: true },
+};
 
 let server;
 let base;
@@ -2747,7 +2783,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(body.adjustment.approvedDeltaAmount).toBe(500000);
     expect(body.adjustment.approvedNewAmount).toBe(3000000);
     expect(body.adjustment.appliedAt).toBeTruthy();
-    expect(body.adjustment.reviewedBy).toBe(OWNER.name);
+    expect(body.adjustment.reviewedBy).toBe(OWNER.email);
     expect(await allocationOf(budget._id, item._id)).toBe(3000000);
   });
 
@@ -3220,7 +3256,7 @@ describe("transfers", () => {
     expect(status).toBe(200);
     expect(body.transfer.state).toBe("approved");
     expect(body.transfer.appliedAt).toBeTruthy();
-    expect(body.transfer.reviewedBy).toBe(OWNER.name);
+    expect(body.transfer.reviewedBy).toBe(OWNER.email);
     expect(body.transfer.financeNote).toMatch(/no repairs planned/);
     expect(await allocations(budget._id)).toEqual({ Admin: 40000, Production: 110000, Sales: 4000000 });
   });
@@ -3433,5 +3469,502 @@ describe("transfers", () => {
       (await call(`/${budget._id}/transfers/${new mongoose.Types.ObjectId()}/approve${q}`, { method: "POST" })).status,
     ).toBe(404);
     expect((await call(`/${budget._id}/transfers/nope/approve${q}`, { method: "POST" })).status).toBe(404);
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * HARDENING — AUTHORIZATION
+ *
+ * Until this pass, every authenticated accountant could do everything on this
+ * router: raise a request AND agree it, ask for extra budget AND approve it.
+ * The review steps were procedure, not control.
+ *
+ * `permissions` is role-derived and reliable, so "who may spend" and "who may
+ * sign off" separate properly. DEPARTMENT is not on the token, so
+ * "Logistics may only raise Logistics requests" is a documented gap rather
+ * than a check built on data nobody maintains.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("authorization", () => {
+  /* `status` matters: requests may only be raised while a budget is still
+     collecting, adjustments and transfers only once it is live. No single
+     status covers both, so each test picks the one its subject needs. */
+  async function liveBudgetWith(items, status = "active") {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status,
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: items({ revenueLedger, expenseLedger }),
+    });
+    return { company, budget, expenseLedger, revenueLedger, q: `?companyId=${company._id}` };
+  }
+
+  const twoLines = ({ expenseLedger, revenueLedger }) => [
+    { ledgerId: expenseLedger._id, ledgerName: "Freight & Forwarding", nature: "expense", department: "Logistics", allocatedAmount: 500000 },
+    { ledgerId: revenueLedger._id, ledgerName: "Export Sales", nature: "revenue", department: "Sales", allocatedAmount: 4000000 },
+  ];
+
+  /* ── viewers cannot write ─────────────────────────────────────────────── */
+
+  test("a viewer can read a budget but cannot change anything", async () => {
+    const { budget, q, expenseLedger } = await liveBudgetWith(twoLines);
+
+    // Reading is fine — that is what the role is for.
+    expect((await call(`/${budget._id}${q}`, { user: VIEWER })).status).toBe(200);
+    expect((await call(`/${budget._id}/adjustments${q}`, { user: VIEWER })).status).toBe(200);
+    expect((await call(`/${budget._id}/transfers${q}`, { user: VIEWER })).status).toBe(200);
+
+    const writes = [
+      [`/${budget._id}/requests${q}`, { department: "Logistics", ledgerId: String(expenseLedger._id), requestedAmount: 1000, purpose: "x" }],
+      [`/${budget._id}/adjustments${q}`, { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 1000, reason: "x" }],
+      [`/${budget._id}/transfers${q}`, { fromItemId: String(budget.items[0]._id), toItemId: String(budget.items[1]._id), amount: 1000, reason: "x" }],
+    ];
+    for (const [path, body] of writes) {
+      const { status, body: res } = await call(path, { method: "POST", body, user: VIEWER });
+      expect(status).toBe(403);
+      expect(res.message).toMatch(/read-only/);
+    }
+
+    expect((await call(`/${budget._id}${q}`, { method: "DELETE", user: VIEWER })).status).toBe(403);
+  });
+
+  /* ── editors may ask, never decide ────────────────────────────────────── */
+
+  test("an editor may raise every kind of ask and approve none of them", async () => {
+    const { budget, q, expenseLedger } = await liveBudgetWith(twoLines);
+
+    // Requests live on a still-collecting budget, so they get their own.
+    const coll = await liveBudgetWith(twoLines, "collecting");
+    const request = await call(`/${coll.budget._id}/requests${coll.q}`, {
+      method: "POST", user: EDITOR,
+      body: { department: "Logistics", ledgerId: String(coll.expenseLedger._id), requestedAmount: 100000, purpose: "Peak freight" },
+    });
+    expect(request.status).toBe(201);
+
+    const adjustment = await call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: EDITOR,
+      body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 50000, reason: "Prices moved" },
+    });
+    expect(adjustment.status).toBe(201);
+
+    const transfer = await call(`/${budget._id}/transfers${q}`, {
+      method: "POST", user: EDITOR,
+      body: { fromItemId: String(budget.items[0]._id), toItemId: String(budget.items[1]._id), amount: 1000, reason: "x" },
+    });
+    // Refused for a different reason — expense→revenue — which is fine; what
+    // matters is that it was not refused for LACK OF PERMISSION.
+    expect(transfer.status).toBe(400);
+
+    // But none of the decisions.
+    const decisions = [
+      `/${coll.budget._id}/requests/${request.body.request._id}/agree${coll.q}`,
+      `/${coll.budget._id}/requests/${request.body.request._id}/counter${coll.q}`,
+      `/${coll.budget._id}/requests/${request.body.request._id}/reopen${coll.q}`,
+      `/${budget._id}/adjustments/${adjustment.body.adjustment._id}/approve${q}`,
+      `/${budget._id}/adjustments/${adjustment.body.adjustment._id}/reject${q}`,
+      `/${coll.budget._id}/close-collection${coll.q}`,
+    ];
+    for (const path of decisions) {
+      const { status, body } = await call(path, { method: "POST", body: { counterAmount: 1, approvedDeltaAmount: 1 }, user: EDITOR });
+      expect(status).toBe(403);
+      expect(body.message).toMatch(/Only finance can approve/);
+    }
+
+    // And nothing moved.
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.items[0].allocatedAmount).toBe(500000);
+    expect(saved.adjustments[0].state).toBe("submitted");
+    const savedColl = await Acc_Budget.findById(coll.budget._id).lean();
+    expect(savedColl.budgetRequests[0].state).toBe("submitted");
+  });
+
+  /* ── four eyes ────────────────────────────────────────────────────────── */
+
+  test("an approver cannot sign off their own ask", async () => {
+    const { budget, q, expenseLedger } = await liveBudgetWith(twoLines);
+
+    const mine = await call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: APPROVER,
+      body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 50000, reason: "Prices moved" },
+    });
+    expect(mine.status).toBe(201);
+
+    const self = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/approve${q}`, {
+      method: "POST", user: APPROVER,
+    });
+    expect(self.status).toBe(403);
+    expect(self.body.message).toMatch(/cannot approve your own/);
+
+    // Another approver can. That is the point of the rule, not a blanket block.
+    const other = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/approve${q}`, {
+      method: "POST", user: OWNER,
+    });
+    expect(other.status).toBe(200);
+  });
+
+  test("the owner is exempt — one owner per org, so four eyes would deadlock", async () => {
+    const { budget, q } = await liveBudgetWith(twoLines);
+    const mine = await call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: OWNER,
+      body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 50000, reason: "x" },
+    });
+    const { status } = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/approve${q}`, {
+      method: "POST", user: OWNER,
+    });
+    expect(status).toBe(200);
+  });
+
+  test("four eyes applies to requests and transfers too, not just adjustments", async () => {
+    const { budget, q, expenseLedger } = await liveBudgetWith(twoLines, "collecting");
+
+    const request = await call(`/${budget._id}/requests${q}`, {
+      method: "POST", user: APPROVER,
+      body: { department: "Logistics", ledgerId: String(expenseLedger._id), requestedAmount: 1000, purpose: "Peak freight" },
+    });
+    expect(request.status).toBe(201);
+    const agree = await call(`/${budget._id}/requests/${request.body.request._id}/agree${q}`, {
+      method: "POST", user: APPROVER,
+    });
+    expect(agree.status).toBe(403);
+    expect(agree.body.message).toMatch(/cannot approve your own/);
+
+    // Two same-nature expense lines for a real transfer.
+    const withTwo = await liveBudgetWith(({ expenseLedger: e }) => [
+      { ledgerId: e._id, ledgerName: "A", nature: "expense", department: "Admin", allocatedAmount: 100000 },
+      { ledgerId: e._id, ledgerName: "B", nature: "expense", department: "Production", allocatedAmount: 50000 },
+    ]);
+    const transfer = await call(`/${withTwo.budget._id}/transfers${withTwo.q}`, {
+      method: "POST", user: APPROVER,
+      body: {
+        fromItemId: String(withTwo.budget.items[0]._id),
+        toItemId: String(withTwo.budget.items[1]._id),
+        amount: 10000, reason: "Admin underspent",
+      },
+    });
+    expect(transfer.status).toBe(201);
+    const selfApprove = await call(
+      `/${withTwo.budget._id}/transfers/${transfer.body.transfer._id}/approve${withTwo.q}`,
+      { method: "POST", user: APPROVER },
+    );
+    expect(selfApprove.status).toBe(403);
+  });
+
+  test("a legacy accountant/admin token still has full access", async () => {
+    /* The middleware maps legacy roles to canEdit + canApprove. Existing
+       admins must not have been locked out by any of this. */
+    const LEGACY = {
+      id: new mongoose.Types.ObjectId().toString(),
+      name: "Legacy Admin", email: "legacy@example.com", role: "admin",
+      permissions: { canEdit: true, canApprove: true, canPostDirectly: true },
+    };
+    const { budget, q } = await liveBudgetWith(twoLines);
+
+    const created = await call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: EDITOR,
+      body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 50000, reason: "x" },
+    });
+    const { status } = await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, {
+      method: "POST", user: LEGACY,
+    });
+    expect(status).toBe(200);
+  });
+
+  test("a requester may still WITHDRAW their own ask — cancelling is not approving", async () => {
+    const { budget, q } = await liveBudgetWith(twoLines);
+    const mine = await call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: EDITOR,
+      body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 50000, reason: "x" },
+    });
+    const { status, body } = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/cancel${q}`, {
+      method: "POST", user: EDITOR,
+    });
+    expect(status).toBe(200);
+    expect(body.adjustment.state).toBe("cancelled");
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * HARDENING — DUPLICATES AND CONCURRENCY
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("duplicate request guard", () => {
+  async function collecting() {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "collecting",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id, items: [],
+    });
+    return { company, budget, expenseLedger, revenueLedger, q: `?companyId=${company._id}` };
+  }
+
+  const ask = (budget, q, ledger, body) =>
+    call(`/${budget._id}/requests${q}`, {
+      method: "POST",
+      body: { department: "Logistics", ledgerId: String(ledger._id), requestedAmount: 100000, ...body },
+    });
+
+  test("the same department asking for the same head for the same reason twice is refused", async () => {
+    const { budget, q, expenseLedger } = await collecting();
+
+    const first = await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" });
+    expect(first.status).toBe(201);
+
+    const second = await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" });
+    expect(second.status).toBe(409);
+    expect(second.body.message).toMatch(/already requested this head for the same reason/);
+    // Named, so the caller can go look at it rather than guess.
+    expect(String(second.body.duplicateOf._id)).toBe(String(first.body.request._id));
+    expect(second.body.duplicateOf.state).toBe("submitted");
+
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.budgetRequests).toHaveLength(1);
+  });
+
+  test("casing and stray whitespace do not get past it", async () => {
+    const { budget, q, expenseLedger } = await collecting();
+    await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" });
+
+    for (const purpose of ["  peak freight for diwali ", "Peak  freight   for Diwali", "PEAK FREIGHT FOR DIWALI"]) {
+      const { status } = await ask(budget, q, expenseLedger, { purpose });
+      expect(status).toBe(409);
+    }
+  });
+
+  test("the SAME head with a DIFFERENT reason is legitimate and allowed", async () => {
+    const { budget, q, expenseLedger } = await collecting();
+    expect((await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" })).status).toBe(201);
+    // One department raising several asks against one head for different
+    // reasons is how careful teams plan. Collapsing those would break the
+    // module for exactly the people using it properly.
+    expect((await ask(budget, q, expenseLedger, { purpose: "Air freight for sample shipments" })).status).toBe(201);
+
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.budgetRequests).toHaveLength(2);
+  });
+
+  test("a different department may raise the same reason on the same head", async () => {
+    const { budget, q, expenseLedger } = await collecting();
+    await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" });
+    const other = await ask(budget, q, expenseLedger, { department: "Admin", purpose: "Peak freight for Diwali" });
+    expect(other.status).toBe(201);
+  });
+
+  test("a different head with the same reason is allowed", async () => {
+    const { budget, q, expenseLedger, revenueLedger } = await collecting();
+    await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" });
+    expect((await ask(budget, q, revenueLedger, { purpose: "Peak freight for Diwali" })).status).toBe(201);
+  });
+
+  test("once finance has said no, asking again is a new conversation", async () => {
+    const { budget, q, expenseLedger } = await collecting();
+    const first = await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" });
+
+    // Withdrawn by the department.
+    await call(`/${budget._id}/requests/${first.body.request._id}${q}`, { method: "DELETE" });
+    const again = await ask(budget, q, expenseLedger, { purpose: "Peak freight for Diwali" });
+    expect(again.status).toBe(201);
+  });
+
+  test("justification counts as the reason when no purpose was given", async () => {
+    const { budget, q, expenseLedger } = await collecting();
+    expect((await ask(budget, q, expenseLedger, { justification: "Two new EU buyers confirmed" })).status).toBe(201);
+    expect((await ask(budget, q, expenseLedger, { justification: "two new EU buyers confirmed" })).status).toBe(409);
+  });
+});
+
+describe("concurrency", () => {
+  async function liveBudget() {
+    const { company, expenseLedger } = await seedCompany();
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [
+        { ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Admin", allocatedAmount: 100000 },
+        { ledgerId: expenseLedger._id, ledgerName: "B", nature: "expense", department: "Production", allocatedAmount: 100000 },
+      ],
+    });
+    return { company, budget, expenseLedger, q: `?companyId=${company._id}` };
+  }
+
+  const raiseAdjustment = (budget, q, item, amount) =>
+    call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: EDITOR,
+      body: { type: "supplementary", targetItemId: String(item._id), requestedDeltaAmount: amount, reason: "More needed" },
+    });
+
+  test("TWO DIFFERENT ADJUSTMENTS APPROVED AT ONCE CANNOT SILENTLY LOSE ONE", async () => {
+    const { budget, q } = await liveBudget();
+    const a = await raiseAdjustment(budget, q, budget.items[0], 10000);
+    const b = await raiseAdjustment(budget, q, budget.items[1], 20000);
+
+    /* Both approvals read the SAME document version and then both save. Before
+       optimistic concurrency, the second save overwrote the first wholesale
+       and one department's ₹10k vanished while both callers were told it
+       worked. Now one of them is refused outright. */
+    const [r1, r2] = await Promise.all([
+      call(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`, { method: "POST" }),
+      call(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`, { method: "POST" }),
+    ]);
+
+    const codes = [r1.status, r2.status].sort();
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    const admin = saved.items.find((i) => i.department === "Admin").allocatedAmount;
+    const production = saved.items.find((i) => i.department === "Production").allocatedAmount;
+
+    if (codes[0] === 200 && codes[1] === 200) {
+      // Both landed — then BOTH must be reflected. This is the outcome that
+      // must never be "both said 200 but only one applied".
+      expect(admin).toBe(110000);
+      expect(production).toBe(120000);
+    } else {
+      // One was refused, and it was told so honestly.
+      expect(codes).toEqual([200, 409]);
+      const loser = [r1, r2].find((r) => r.status === 409);
+      expect(loser.body.code).toBe("BUDGET_CHANGED");
+      // Exactly one applied — never a lost update dressed up as success.
+      const applied = (admin === 110000 ? 1 : 0) + (production === 120000 ? 1 : 0);
+      expect(applied).toBe(1);
+      // And the refused one is still pending, so it can simply be retried.
+      const states = saved.adjustments.map((x) => x.state).sort();
+      expect(states).toEqual(["approved", "submitted"]);
+    }
+  });
+
+  test("approving the same adjustment twice is still idempotent, not a version error", async () => {
+    const { budget, q } = await liveBudget();
+    const a = await raiseAdjustment(budget, q, budget.items[0], 10000);
+    const url = `/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`;
+
+    expect((await call(url, { method: "POST" })).status).toBe(200);
+    const second = await call(url, { method: "POST" });
+    expect(second.status).toBe(409);
+    // The appliedAt guard answers first, with the message that actually
+    // explains what happened — a version error here would be misleading.
+    expect(second.body.message).toMatch(/already been applied/);
+
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.items.find((i) => i.department === "Admin").allocatedAmount).toBe(110000);
+  });
+
+  test("a stale writer is refused rather than overwriting a newer save", async () => {
+    const { budget, q } = await liveBudget();
+
+    /* Two handles on the same version. The first save wins; the second is
+       working from a document that no longer exists at that version. */
+    const stale = await Acc_Budget.findById(budget._id);
+    const fresh = await Acc_Budget.findById(budget._id);
+
+    fresh.notes = "Saved first";
+    await fresh.save();
+
+    stale.notes = "Saved second, from a stale read";
+    await expect(stale.save()).rejects.toThrow(/version|No matching document/i);
+
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    expect(saved.notes).toBe("Saved first");
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * HARDENING — PENDING WORK ON THE DASHBOARD
+ *
+ * Until now a budget with three unanswered supplementaries looked exactly like
+ * one with none unless somebody opened it. Everything else in `attention` is a
+ * problem with the numbers; this is a queue with a person waiting at the end.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("dashboard pending counts", () => {
+  async function budgetWithWork() {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [
+        { ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Admin", allocatedAmount: 100000 },
+        { ledgerId: expenseLedger._id, ledgerName: "B", nature: "expense", department: "Production", allocatedAmount: 100000 },
+      ],
+    });
+    const q = `?companyId=${company._id}`;
+
+    await call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: EDITOR,
+      body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 10000, reason: "More" },
+    });
+    await call(`/${budget._id}/adjustments${q}`, {
+      method: "POST", user: EDITOR,
+      body: { type: "revision", targetItemId: String(budget.items[1]._id), requestedNewAmount: 150000, reason: "Reset" },
+    });
+    await call(`/${budget._id}/transfers${q}`, {
+      method: "POST", user: EDITOR,
+      body: { fromItemId: String(budget.items[0]._id), toItemId: String(budget.items[1]._id), amount: 5000, reason: "Move" },
+    });
+
+    return { company, budget, q, expenseLedger };
+  }
+
+  test("pending adjustments and transfers are counted per budget and overall", async () => {
+    const { company, budget } = await budgetWithWork();
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+
+    const row = body.budgets.find((b) => String(b._id) === String(budget._id));
+    expect(row.pending).toEqual({ requests: 0, adjustments: 2, transfers: 1, total: 3 });
+    expect(body.totals.pending).toEqual({ requests: 0, adjustments: 2, transfers: 1, total: 3 });
+  });
+
+  test("a budget with work waiting appears in attention, with its counts", async () => {
+    const { company, budget } = await budgetWithWork();
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+
+    expect(body.attention.pendingChanges).toHaveLength(1);
+    const hit = body.attention.pendingChanges[0];
+    expect(String(hit._id)).toBe(String(budget._id));
+    expect(hit.name).toBe("FY26-27");
+    expect(hit.total).toBe(3);
+    expect(hit.adjustments).toBe(2);
+    expect(hit.transfers).toBe(1);
+    // And it is part of the headline count, so the strip says there is work.
+    expect(body.attention.count).toBeGreaterThanOrEqual(1);
+  });
+
+  test("ANSWERED work stops counting — otherwise the number only ever grows", async () => {
+    const { company, budget, q } = await budgetWithWork();
+
+    const before = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(before.body.totals.pending.total).toBe(3);
+
+    const saved = await Acc_Budget.findById(budget._id).lean();
+    await call(`/${budget._id}/adjustments/${saved.adjustments[0]._id}/approve${q}`, { method: "POST" });
+    await call(`/${budget._id}/adjustments/${saved.adjustments[1]._id}/reject${q}`, { method: "POST" });
+    await call(`/${budget._id}/transfers/${saved.transfers[0]._id}/reject${q}`, { method: "POST" });
+
+    const after = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    // Approved, rejected and rejected — all ANSWERED, none pending.
+    expect(after.body.totals.pending.total).toBe(0);
+    expect(after.body.attention.pendingChanges).toHaveLength(0);
+  });
+
+  test("pending requests count too, and a budget with nothing waiting is absent", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const quiet = await Acc_Budget.create({
+      name: "Quiet", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [{ ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Admin", allocatedAmount: 100000 }],
+    });
+    const busy = await Acc_Budget.create({
+      name: "Busy", financialYear: "2026-27", period: "yearly", status: "collecting",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id, items: [],
+    });
+    await call(`/${busy._id}/requests?companyId=${company._id}`, {
+      method: "POST", user: EDITOR,
+      body: { department: "Logistics", ledgerId: String(expenseLedger._id), requestedAmount: 1000, purpose: "Peak freight" },
+    });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.totals.pending.requests).toBe(1);
+    expect(body.attention.pendingChanges.map((p) => p.name)).toEqual(["Busy"]);
+    expect(body.budgets.find((b) => b.name === "Quiet").pending.total).toBe(0);
   });
 });

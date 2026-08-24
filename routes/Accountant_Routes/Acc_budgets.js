@@ -42,6 +42,92 @@ function invalidEnumField(model, field, value) {
   return `${field} must be one of: ${allowed.join(", ")} (got "${value}")`;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * AUTHORIZATION
+ *
+ * Until now every authenticated accountant could do everything on this router
+ * — raise a request AND agree it, ask for extra budget AND approve it. The
+ * review steps built in Chunks 3, 7 and 8 were procedure, not control.
+ *
+ * ── WHAT THE TOKEN ACTUALLY SUPPORTS ────────────────────────────────────────
+ * `permissions` is derived from the role by AccountantAuthMiddleware and is
+ * reliable:
+ *     owner              canEdit + canApprove
+ *     approver           canEdit + canApprove
+ *     editor             canEdit
+ *     viewer             neither
+ *     legacy admin /
+ *     accountant         canEdit + canApprove   ← existing admins keep working
+ *
+ * So "who may spend" and "who may sign off" can be separated properly today.
+ *
+ * ── WHAT IT DOES NOT SUPPORT ────────────────────────────────────────────────
+ * There is no DEPARTMENT on the token. `items[].department` and
+ * `budgetRequests[].department` are free-text slugs against an unseeded
+ * registry, so "Logistics may only raise Logistics requests" cannot be
+ * enforced without inventing a membership model — and a check built on data
+ * nobody maintains is worse than a documented gap, because it reads as
+ * protection while enforcing nothing.
+ *
+ * What CAN be enforced without that data is four-eyes: you may not sign off
+ * your own ask. That is the same rule Acc_approvals.js already applies to
+ * voucher approvals, owner-exempt for the same reason (one owner per org, so
+ * requiring a second pair would deadlock a small team).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Gate for anything that WRITES a budget, a request, or an ask. */
+function requireEdit(req, res) {
+  if (req.user?.permissions?.canEdit) return false;
+  res.status(403).json({
+    success: false,
+    message: "Your accounting role is read-only, so this change was not saved.",
+  });
+  return true;
+}
+
+/**
+ * Gate for a FINANCE DECISION — agreeing a request, approving an adjustment,
+ * approving a transfer. `author` is whoever raised the thing being decided;
+ * pass it and the four-eyes rule applies.
+ */
+function requireFinance(req, res, author) {
+  if (!req.user?.permissions?.canApprove) {
+    res.status(403).json({
+      success: false,
+      message: "Only finance can approve budget changes.",
+    });
+    return true;
+  }
+
+  if (author && req.user?.role !== "owner" && sameActor(author, req)) {
+    res.status(403).json({
+      success: false,
+      message:
+        "You cannot approve your own request. Ask another approver or the owner.",
+    });
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Is `author` the person making this request?
+ *
+ * `requestedBy`/`submittedBy` store whatever actorOf() produced — email, then
+ * name, then id — so the comparison has to try all three rather than assume
+ * one. A mismatch here fails OPEN (the action is allowed), which is the right
+ * side to err on: refusing a legitimate approver because their token carries a
+ * name and the record carries an email would block finance entirely.
+ */
+function sameActor(author, req) {
+  const a = String(author || "").trim().toLowerCase();
+  if (!a) return false;
+  return [req.user?.email, req.user?.name, req.user?.id]
+    .filter(Boolean)
+    .some((v) => String(v).trim().toLowerCase() === a);
+}
+
 /** The company whose books this request is about. Header wins, then query. */
 function companyOf(req) {
   return (
@@ -307,6 +393,22 @@ const HIGH_UTILIZATION_PCT = 90;
 /* A dashboard is a screen, not an export. */
 const MAX_BUDGETS = 200;
 
+/**
+ * What is waiting on finance for one budget.
+ *
+ * "Pending" means submitted and undecided. An agreed request, a rejected
+ * adjustment and a cancelled transfer are all ANSWERED — counting them would
+ * make the number grow forever and stop meaning "there is work here".
+ */
+function pendingCounts(budget) {
+  const requests = (budget.budgetRequests || []).filter(
+    (r) => r.state === "submitted" || r.state === "awaiting" || r.state === "countered",
+  ).length;
+  const adjustments = (budget.adjustments || []).filter((a) => a.state === "submitted").length;
+  const transfers = (budget.transfers || []).filter((t) => t.state === "submitted").length;
+  return { requests, adjustments, transfers, total: requests + adjustments + transfers };
+}
+
 /** Worst severity across a set of evaluated lines. `worseOf` is the service's
  *  own combining rule: signals combine by taking the worst, never by
  *  averaging, because an averaged alarm is one that fails to ring. */
@@ -396,6 +498,20 @@ router.get("/dashboard", async (req, res) => {
       revenueToGo: sumOf(revenueLines, "toGo"),
       budgetCount: evaluated.length,
       lineCount: allLines.length,
+      /* Across everything in scope, so the strip can say "6 waiting" without
+       * the caller re-adding the per-budget numbers. */
+      pending: evaluated.reduce(
+        (acc, b) => {
+          const p = pendingCounts(b);
+          return {
+            requests: acc.requests + p.requests,
+            adjustments: acc.adjustments + p.adjustments,
+            transfers: acc.transfers + p.transfers,
+            total: acc.total + p.total,
+          };
+        },
+        { requests: 0, adjustments: 0, transfers: 0, total: 0 },
+      ),
     };
 
     /* ── 2. By department ───────────────────────────────────────────────── */
@@ -541,18 +657,36 @@ router.get("/dashboard", async (req, res) => {
     revenueBehind.sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance));
     highUtilization.sort((a, b) => (b.utilizationPct ?? 0) - (a.utilizationPct ?? 0));
 
+    /* Budgets with something sitting on finance's desk. Deliberately its own
+     * list rather than folded into the others: everything above is a problem
+     * with the NUMBERS, this is a queue with someone waiting at the end of
+     * it — and until now a budget with three unanswered supplementaries
+     * looked identical to one with none unless you opened it. */
+    const pendingChanges = evaluated
+      .map((b) => ({
+        _id: b._id,
+        name: b.name,
+        status: b.status,
+        financialYear: b.financialYear,
+        ...pendingCounts(b),
+      }))
+      .filter((p) => p.total > 0)
+      .sort((a, b) => b.total - a.total);
+
     const attention = {
       overBudget,
       revenueBehind,
       highUtilization,
       unbound,
       noAllocations,
+      pendingChanges,
       count:
         overBudget.length +
         revenueBehind.length +
         highUtilization.length +
         unbound.length +
-        noAllocations.length,
+        noAllocations.length +
+        pendingChanges.length,
     };
 
     /* ── 5. Budget list ─────────────────────────────────────────────────── */
@@ -570,6 +704,7 @@ router.get("/dashboard", async (req, res) => {
         totals: variance.rollUp(lines),
         lineCount: lines.length,
         requestCount: (b.budgetRequests || []).length,
+        pending: pendingCounts(b),
         severity: worstSeverity(lines),
       };
     });
@@ -644,6 +779,77 @@ router.get("/:id", async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+
+/**
+ * Normalise a purpose for duplicate comparison.
+ *
+ * Case, surrounding space and runs of whitespace are noise — "Peak  freight "
+ * and "peak freight" are the same ask typed twice, usually because a submit
+ * button was pressed twice or two people in a department raised it
+ * independently. Punctuation is deliberately NOT stripped: "Q2 freight" and
+ * "Q2, freight" being treated as one would start guessing, and a false
+ * duplicate blocks legitimate work with a message that makes no sense.
+ */
+function normalisePurpose(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+/* A request that is still live enough to make a second one a duplicate. Once
+ * finance has said no — or the department withdrew it — asking again is a new
+ * conversation, not a mistake. */
+const OPEN_REQUEST_STATES = ["awaiting", "submitted", "countered", "agreed"];
+
+/**
+ * The request this one would duplicate, if any.
+ *
+ * Same budget + department + head + same purpose text. Deliberately NOT just
+ * department + head: one department legitimately raises several asks against
+ * one head for different reasons, and collapsing those would make the module
+ * unusable for exactly the teams that plan carefully.
+ */
+function duplicateRequest(budget, { department, ledgerId, purpose, justification }, ignoreId) {
+  const text = normalisePurpose(purpose) || normalisePurpose(justification);
+  if (!text) return null;
+
+  return (budget.budgetRequests || []).find((r) => {
+    if (ignoreId && String(r._id) === String(ignoreId)) return false;
+    if (!OPEN_REQUEST_STATES.includes(r.state)) return false;
+    if (String(r.department || "").trim().toLowerCase() !== String(department || "").trim().toLowerCase()) return false;
+    if (String(r.ledgerId || "") !== String(ledgerId || "")) return false;
+    const theirs = normalisePurpose(r.purpose) || normalisePurpose(r.justification);
+    return theirs === text;
+  });
+}
+
+/**
+ * Turn a lost optimistic-concurrency race into an honest answer.
+ *
+ * The budget schema runs with `optimisticConcurrency`, so a document read by
+ * two requests and saved by both fails the second save rather than letting it
+ * overwrite the first. That is the behaviour we want — approving two transfers
+ * at once must not apply one and silently drop the other — but a VersionError
+ * surfacing as a 500 would read like a server fault when it is really "someone
+ * else got there first, look again".
+ *
+ * Returns true when it handled the error, so callers can `if (...) return;`
+ * before their own catch turns it into a 500.
+ */
+function handledVersionConflict(error, res) {
+  const isVersionError =
+    error?.name === "VersionError" || /No matching document found for id/.test(error?.message || "");
+  if (!isVersionError) return false;
+
+  res.status(409).json({
+    success: false,
+    code: "BUDGET_CHANGED",
+    message:
+      "This budget changed while you were working on it — someone else saved first. Reload and try again.",
+  });
+  return true;
+}
 
 /** Just enough of the line for the drilldown to caption itself. */
 function lineSummary(item, meta) {
@@ -770,6 +976,7 @@ router.get("/:id/items/:itemId/vouchers", async (req, res) => {
 /* ── CREATE ──────────────────────────────────────────────────────────────── */
 router.post("/", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const periodError = invalidEnumField(Acc_Budget, "period", req.body?.period);
     if (periodError) return res.status(400).json({ success: false, message: periodError });
     const statusError = invalidEnumField(Acc_Budget, "status", req.body?.status);
@@ -791,6 +998,7 @@ router.post("/", async (req, res) => {
 /* ── UPDATE ──────────────────────────────────────────────────────────────── */
 router.put("/:id", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const periodError = invalidEnumField(Acc_Budget, "period", req.body?.period);
     if (periodError) return res.status(400).json({ success: false, message: periodError });
     const statusError = invalidEnumField(Acc_Budget, "status", req.body?.status);
@@ -839,6 +1047,7 @@ router.put("/:id", async (req, res) => {
  * which is the state this is here to make impossible. */
 router.post("/:id/submissions", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { department, requestedAmount, note } = req.body || {};
     if (!department) {
       return res.status(400).json({ success: false, message: "department is required" });
@@ -897,6 +1106,7 @@ router.post("/:id/submissions", async (req, res) => {
  * department must not be able to stall the company's budget indefinitely. */
 router.post("/:id/close-collection", async (req, res) => {
   try {
+    if (requireFinance(req, res)) return;
     // As with submissions above: the same guard, on a route that mutates
     // every submission's agreed amount and moves the budget to `review`.
     if (!isUsableId(req.params.id)) {
@@ -1115,6 +1325,7 @@ router.get("/:id/requests", async (req, res) => {
 /* ── CREATE REQUEST ──────────────────────────────────────────────────────── */
 router.post("/:id/requests", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { budget, error } = await budgetForRequests(req, { mutating: true });
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
@@ -1129,6 +1340,38 @@ router.post("/:id/requests", async (req, res) => {
     });
     if (!resolved.ok) {
       return res.status(resolved.status).json({ success: false, message: resolved.message });
+    }
+
+    /* ── DUPLICATE GUARD ────────────────────────────────────────────────
+     * The same department asking for the same head for the same stated
+     * reason, twice, while the first is still live. Almost always a double
+     * submit or two people in one team raising it independently — and the
+     * cost of letting it through is that finance agrees both and allocates
+     * the money twice.
+     *
+     * Scoped to the PURPOSE, not just the head: one department legitimately
+     * raises several asks against one head for different reasons, and
+     * collapsing those would break the module for exactly the teams that
+     * plan carefully. The existing request is named in the response so the
+     * caller can go look at it rather than guess. */
+    const clash = duplicateRequest(budget, {
+      department: req.body.department,
+      ledgerId: resolved.ledger.ledgerId,
+      purpose: req.body.purpose,
+      justification: req.body.justification,
+    });
+    if (clash) {
+      return res.status(409).json({
+        success: false,
+        message: `${clash.department} has already requested this head for the same reason — that request is ${clash.state}.`,
+        duplicateOf: {
+          _id: clash._id,
+          state: clash.state,
+          requestedAmount: clash.requestedAmount,
+          submittedBy: clash.submittedBy,
+          submittedAt: clash.submittedAt,
+        },
+      });
     }
 
     const now = new Date();
@@ -1163,6 +1406,7 @@ router.post("/:id/requests", async (req, res) => {
 /* ── UPDATE REQUEST ──────────────────────────────────────────────────────── */
 router.put("/:id/requests/:requestId", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { budget, error } = await budgetForRequests(req, { mutating: true });
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
@@ -1253,6 +1497,7 @@ router.put("/:id/requests/:requestId", async (req, res) => {
  * conversation, and that needs a decision, not a DELETE. */
 router.delete("/:id/requests/:requestId", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { budget, error } = await budgetForRequests(req, { mutating: true });
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
@@ -1394,6 +1639,7 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
   try {
     const { budget, request, error } = await budgetAndRequestForReview(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, request.submittedBy)) return;
 
     const raw =
       req.body?.agreedAmount !== undefined && req.body?.agreedAmount !== null && req.body?.agreedAmount !== ""
@@ -1428,6 +1674,7 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
       },
     });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] agree request error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1442,6 +1689,7 @@ router.post("/:id/requests/:requestId/counter", async (req, res) => {
   try {
     const { budget, request, error } = await budgetAndRequestForReview(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, request.submittedBy)) return;
 
     const amount = variance.money(req.body?.counterAmount);
     if (amount === null || amount < 0) {
@@ -1459,6 +1707,7 @@ router.post("/:id/requests/:requestId/counter", async (req, res) => {
     await budget.save();
     res.json({ success: true, request });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] counter request error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1473,6 +1722,7 @@ router.post("/:id/requests/:requestId/reopen", async (req, res) => {
   try {
     const { budget, request, error } = await budgetAndRequestForReview(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res)) return;
 
     const before = (budget.items || []).length;
     budget.items = (budget.items || []).filter(
@@ -1500,6 +1750,7 @@ router.post("/:id/requests/:requestId/reopen", async (req, res) => {
       },
     });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] reopen request error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1614,6 +1865,7 @@ router.get("/:id/adjustments", async (req, res) => {
  * and let anyone with the endpoint spend whatever they liked. */
 router.post("/:id/adjustments", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { budget, error } = await budgetAndAdjustment(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
@@ -1683,6 +1935,7 @@ router.post("/:id/adjustments", async (req, res) => {
     const created = budget.adjustments[budget.adjustments.length - 1];
     res.status(201).json({ success: true, adjustment: created });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] create adjustment error:", error);
     res.status(400).json({ success: false, message: error.message });
   }
@@ -1698,6 +1951,7 @@ router.post("/:id/adjustments/:adjustmentId/approve", async (req, res) => {
   try {
     const { budget, adjustment, error } = await budgetAndAdjustment(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, adjustment.requestedBy)) return;
 
     if (adjustment.appliedAt) {
       return res.status(409).json({
@@ -1770,6 +2024,7 @@ router.post("/:id/adjustments/:adjustmentId/approve", async (req, res) => {
       },
     });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] approve adjustment error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1781,6 +2036,7 @@ router.post("/:id/adjustments/:adjustmentId/reject", async (req, res) => {
   try {
     const { budget, adjustment, error } = await budgetAndAdjustment(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, adjustment.requestedBy)) return;
 
     if (adjustment.appliedAt) {
       return res.status(409).json({
@@ -1797,6 +2053,7 @@ router.post("/:id/adjustments/:adjustmentId/reject", async (req, res) => {
     await budget.save();
     res.json({ success: true, adjustment });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] reject adjustment error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1807,6 +2064,7 @@ router.post("/:id/adjustments/:adjustmentId/reject", async (req, res) => {
  * finance's answer — collapsing the two would lose who decided. */
 router.post("/:id/adjustments/:adjustmentId/cancel", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { budget, adjustment, error } = await budgetAndAdjustment(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
@@ -1830,6 +2088,7 @@ router.post("/:id/adjustments/:adjustmentId/cancel", async (req, res) => {
     await budget.save();
     res.json({ success: true, adjustment });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] cancel adjustment error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -2024,6 +2283,7 @@ router.get("/:id/transfers/available", async (req, res) => {
  * spend keeps arriving in between and that check is the authoritative one. */
 router.post("/:id/transfers", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { budget, error } = await budgetAndTransfer(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
@@ -2072,6 +2332,7 @@ router.post("/:id/transfers", async (req, res) => {
       transfer: budget.transfers[budget.transfers.length - 1],
     });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] create transfer error:", error);
     res.status(400).json({ success: false, message: error.message });
   }
@@ -2084,6 +2345,7 @@ router.post("/:id/transfers/:transferId/approve", async (req, res) => {
   try {
     const { budget, transfer, error } = await budgetAndTransfer(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, transfer.requestedBy)) return;
 
     if (transfer.appliedAt) {
       return res.status(409).json({
@@ -2158,6 +2420,7 @@ router.post("/:id/transfers/:transferId/approve", async (req, res) => {
       },
     });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] approve transfer error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -2168,6 +2431,7 @@ router.post("/:id/transfers/:transferId/reject", async (req, res) => {
   try {
     const { budget, transfer, error } = await budgetAndTransfer(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
+    if (requireFinance(req, res, transfer.requestedBy)) return;
 
     if (transfer.appliedAt) {
       return res.status(409).json({
@@ -2184,6 +2448,7 @@ router.post("/:id/transfers/:transferId/reject", async (req, res) => {
     await budget.save();
     res.json({ success: true, transfer });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] reject transfer error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -2194,6 +2459,7 @@ router.post("/:id/transfers/:transferId/reject", async (req, res) => {
  * answer — collapsing them would lose who decided. */
 router.post("/:id/transfers/:transferId/cancel", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     const { budget, transfer, error } = await budgetAndTransfer(req);
     if (error) return res.status(error.status).json({ success: false, message: error.message });
 
@@ -2217,6 +2483,7 @@ router.post("/:id/transfers/:transferId/cancel", async (req, res) => {
     await budget.save();
     res.json({ success: true, transfer });
   } catch (error) {
+    if (handledVersionConflict(error, res)) return;
     console.error("[budgets] cancel transfer error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -2225,6 +2492,7 @@ router.post("/:id/transfers/:transferId/cancel", async (req, res) => {
 /* ── DELETE ──────────────────────────────────────────────────────────────── */
 router.delete("/:id", async (req, res) => {
   try {
+    if (requireEdit(req, res)) return;
     if (!isUsableId(req.params.id)) {
       return res.status(404).json({ success: false, message: "Budget not found" });
     }

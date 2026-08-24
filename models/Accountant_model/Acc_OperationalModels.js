@@ -742,7 +742,23 @@ const budgetSchema = new mongoose.Schema(
     approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Department" },
     notes: { type: String, trim: true },
   },
-  { timestamps: true, collection: "acc_budgets" },
+  {
+    timestamps: true,
+    collection: "acc_budgets",
+    /* ── OPTIMISTIC CONCURRENCY ────────────────────────────────────────────
+     * `__v` existed but was never enforced, so a budget read by two requests
+     * and saved by both kept only the second — a whole-document overwrite,
+     * silently. That is survivable for a name edit and not survivable here:
+     * approving two transfers at once would apply one and drop the other
+     * while both told the caller they succeeded, and there is no ledger
+     * anywhere that would ever reveal the loss.
+     *
+     * With this on, the second save fails with a VersionError instead. The
+     * budget routes turn that into a 409 asking the caller to retry — the
+     * one honest answer, and a far better outcome than a number quietly
+     * going missing. */
+    optimisticConcurrency: true,
+  },
 );
 budgetSchema.index({ financialYear: 1, period: 1 });
 budgetSchema.index({ companyId: 1, status: 1, startDate: -1 });
