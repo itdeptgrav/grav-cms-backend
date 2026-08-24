@@ -309,11 +309,53 @@ bankTransactionSchema.index({ category: 1 });
 // ═══════════════════════════════════════════════════════════════
 const budgetItemSchema = new mongoose.Schema(
   {
-    category: { type: String, required: true },
+    /* ── WHAT THIS LINE IS ABOUT ──────────────────────────────────────────
+     * `ledgerId` is the real binding. Actuals are summed from posted vouchers
+     * against this head, which is the only way the budget can ever agree with
+     * the trial balance and the P&L.
+     *
+     * `category` is kept because every pre-existing row has one and nothing
+     * else. It is now a LABEL, not a join key — the old exact-string match
+     * against Acc_Expense.category read zero the moment anyone renamed a
+     * category, and counted expenses only. A line with no ledgerId still
+     * renders, flagged `unbound`, rather than silently reporting comfort. */
+    ledgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger", index: true },
+    ledgerName: { type: String, trim: true }, // denormalised — survives renames
+    groupName: { type: String, trim: true },
+
+    category: { type: String, trim: true },
+
+    /* Snapshot of the ledger group's nature at the time the line was written.
+     * The ledger tree stays the authority at read time (see
+     * budgetActuals.service.js); this exists so an unbound legacy line and an
+     * offline export still know which way the variance sign runs. */
+    nature: {
+      type: String,
+      enum: ["revenue", "expense"],
+      default: "expense",
+      index: true,
+    },
+
+    /* Which team owns the number. Free-form slug rather than a ref, because
+     * the department registry (accessdepartments) is not seeded yet and a
+     * hard ref would make budgets undeployable until it is. */
+    department: { type: String, trim: true, index: true },
+    ownerEmail: { type: String, trim: true, lowercase: true },
+
     allocatedAmount: { type: Number, required: true, min: 0 },
-    spentAmount: { type: Number, default: 0, min: 0 },
+
+    /* Optional seasonal weights, one per bucket of the period. Any scale —
+     * they are normalised. A garment exporter does not earn one twelfth of its
+     * revenue each month, and straight-lining a Diwali-heavy year makes every
+     * month until October look like a miss. Empty ⇒ straight-line. */
+    phasing: { type: [Number], default: undefined },
+
+    /* Cached figures. Recomputed from vouchers on every read, so these are a
+     * convenience for exports and list views, never the source of truth. */
+    spentAmount: { type: Number, default: 0 },
     remainingAmount: { type: Number, default: 0 },
     variance: { type: Number, default: 0 },
+
     notes: { type: String, trim: true },
   },
   { _id: true },
@@ -338,14 +380,57 @@ const budgetSchema = new mongoose.Schema(
     startDate: { type: Date, required: true },
     endDate: { type: Date, required: true },
     items: [budgetItemSchema],
+
+    /* Which books this belongs to. The app has a company selector and the
+     * voucher aggregation filters on it, so a budget without one would read
+     * every company's postings into its actuals. */
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      index: true,
+    },
+
     totalAllocated: { type: Number, default: 0, min: 0 },
     totalSpent: { type: Number, default: 0, min: 0 },
     totalRemaining: { type: Number, default: 0 },
+
+    /* Revenue and expense totals kept apart. A single "allocated" figure that
+     * adds a sales target to a freight budget is a number with no meaning. */
+    totalRevenueAllocated: { type: Number, default: 0 },
+    totalExpenseAllocated: { type: Number, default: 0 },
+
     status: {
       type: String,
-      enum: ["draft", "active", "closed", "exceeded"],
+      enum: ["draft", "collecting", "review", "active", "closed", "exceeded"],
       default: "draft",
+      index: true,
     },
+
+    /* ── THE DEPARTMENT COLLECTION CYCLE ──────────────────────────────────
+     * Budgets need inputs from every department, and a cycle that cannot close
+     * because one team never replied is the normal failure. So the cycle has a
+     * due date and an explicit per-department state, and finance can close it
+     * with whatever arrived — the departments that did not submit are recorded
+     * as such rather than quietly inheriting a number nobody argued about. */
+    submissionsDueBy: { type: Date },
+    submissions: [
+      {
+        department: { type: String, trim: true, required: true },
+        state: {
+          type: String,
+          enum: ["awaiting", "submitted", "countered", "agreed", "defaulted"],
+          default: "awaiting",
+        },
+        /* The envelope finance offered, and what the department asked for.
+         * Both are kept so the negotiation has a memory. */
+        envelopeAmount: { type: Number },
+        requestedAmount: { type: Number },
+        agreedAmount: { type: Number },
+        submittedAt: { type: Date },
+        submittedBy: { type: String, trim: true },
+        note: { type: String, trim: true },
+      },
+    ],
     alerts: [
       {
         message: String,
@@ -361,6 +446,7 @@ const budgetSchema = new mongoose.Schema(
   { timestamps: true, collection: "acc_budgets" },
 );
 budgetSchema.index({ financialYear: 1, period: 1 });
+budgetSchema.index({ companyId: 1, status: 1, startDate: -1 });
 
 // ═══════════════════════════════════════════════════════════════
 // 5. JOURNAL ENTRY MODEL
