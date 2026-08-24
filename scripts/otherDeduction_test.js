@@ -6,13 +6,21 @@
 //
 //     amount x (days in month − approved leave days) / days in month
 //
-// Approved leave only: CL, SL, PL and LWP are days somebody ARRANGED to be
-// away, and the arrangement is what makes the charge unfair. An unexplained
-// absence is not an arrangement, so it is still charged — which also stops the
-// deduction being dodged by simply not turning up.
+//     amount x payableDays / daysInMonth
 //
-// The divisor is the real length of the month, the same one gross pay uses, so
-// a February deduction and a February salary prorate identically.
+// "There" is payableDays — the SAME figure the payroll drawer prints at the
+// top as "Payable: 29 / 31", and the one the gross itself is prorated on. It
+// was briefly computed as daysInMonth minus leave days, a different number: a
+// screen reading "Payable 29 / 31" above a deduction charged for 28 days is
+// one nobody can reconcile, and deriving the two separately is exactly how
+// they came to disagree.
+//
+// A consequence worth stating: PAID leave is a payable day, so it is charged.
+// Only unpaid days — LWP, LOP, absence — reduce the figure.
+//
+// And nothing can be recovered from pay that was never earned, so the charge
+// is capped at what is left after the statutory deductions. Without that an
+// unpaid intern lands on a negative net pay.
 //
 // Runs the REAL engine over a fabricated month — no DB, no network.
 //
@@ -81,31 +89,30 @@ console.log("\n=== a clean month: charged in full ===");
 let r = run(staff, []);
 check("charged", r.deductions.otherDeductions, 3100);
 check("chargeable days", r.otherDeductionChargeableDays, 31);
-check("counted in the total", r.deductions.totalDeductions >= 3100, true);
 // 3100 / 31 = exactly 100 a day, which makes every figure below readable.
 check("rate is 100/day", 3100 / 31, 100);
+check("week-offs are payable, so charged", r.weekOffDays > 0, true);
 
-console.log("\n=== approved leave is not charged ===");
-for (const [code, name] of [["L-CL", "casual"], ["L-SL", "sick"], ["L-EL", "earned"], ["LWP", "unpaid"]]) {
+console.log("\n=== chargeable days ARE the payable days on screen ===");
+for (const [code, name, payable] of [
+  ["LWP", "unpaid leave", 26],
+  ["AB", "absence", 26],
+]) {
   const five = run(staff, [code, code, code, code, code]);
-  check(`5 days ${name} leave -> 26 days`, five.otherDeductionChargeableDays, 26);
-  check(`  charged`, five.deductions.otherDeductions, 2600);
+  check(`5 days ${name}: payable`, five.payableDays, payable);
+  check(`  chargeable matches it exactly`, five.otherDeductionChargeableDays, payable);
+  check(`  charged`, five.deductions.otherDeductions, payable * 100);
 }
 
-console.log("\n=== an unexplained absence IS charged ===");
-// Not an arrangement. Charging it is also what stops the deduction being
-// avoided by simply not turning up.
-const absent = run(staff, ["AB", "AB", "AB", "AB", "AB"]);
-check("5 days absent -> still 31", absent.otherDeductionChargeableDays, 31);
-check("  charged in full", absent.deductions.otherDeductions, 3100);
-
-console.log("\n=== Sundays and holidays are charged — the month is the month ===");
-// No leave at all here; January 2025 has four Sundays that nobody worked.
-check("clean month still 31 chargeable", r.otherDeductionChargeableDays, 31);
-check("week-offs counted", r.weekOffDays > 0, true);
+console.log("\n=== paid leave is a payable day, so it is charged ===");
+// This is the consequence of following the payable figure. CL, SL and PL are
+// paid days; they do not reduce what is payable, so they do not reduce this.
+const onCl = run(staff, ["L-CL", "L-CL", "L-CL"]);
+check("3 days CL: payable", onCl.payableDays, 31);
+check("  charged in full", onCl.deductions.otherDeductions, 3100);
 
 console.log("\n=== nobody without a standing deduction is charged ===");
-const none = run({ ...staff, salary: { ...staff.salary, otherDeduction: 0 } }, ["L-CL"]);
+const none = run({ ...staff, salary: { ...staff.salary, otherDeduction: 0 } }, ["LWP"]);
 check("no amount -> nothing", none.deductions.otherDeductions, 0);
 check("  and no phantom working", none.otherDeductionFull, 0);
 
@@ -115,18 +122,43 @@ const intern = run(
     ...staff, employmentType: "intern", internship: { stipendType: "paid" },
     salary: { stipend: 15500, otherDeduction: 3100 },
   },
-  ["L-CL", "L-CL"],
+  ["LWP", "LWP"],
 );
 check("prorated the same way", intern.deductions.otherDeductions, 2900);
 check("  and it is their ONLY deduction", intern.deductions.totalDeductions, 2900);
 check("  no PF alongside it", intern.deductions.providentFund, 0);
 
+console.log("\n=== never a negative net pay ===");
+// An unpaid intern, or anybody whose month came out at zero, used to take the
+// full deduction against a gross of nothing and land on a NEGATIVE net —
+// which is not a payslip anybody can act on.
+const unpaidIntern = run(
+  {
+    ...staff, employmentType: "intern", internship: { stipendType: "unpaid" },
+    salary: { stipend: 0, otherDeduction: 764 },
+  },
+  [],
+);
+check("gross", unpaidIntern.earnings.grossEarnings, 0);
+check("nothing deducted", unpaidIntern.deductions.totalDeductions, 0);
+check("net pay is zero, not negative", unpaidIntern.roundedNetPay, 0);
+check("the shortfall is recorded", unpaidIntern.otherDeductionUncollected, 764);
+
+// Partial room: earnings smaller than the deduction.
+const thin = run(
+  { ...staff, salary: { gross: 1000, basic: 500, hra: 500, otherDeduction: 5000 } },
+  [],
+);
+check("takes only what is there", thin.netPay >= 0, true);
+check("  and says what it could not take", thin.otherDeductionUncollected > 0, true);
+
 console.log("\n=== the working is recorded, not just the figure ===");
-const five = run(staff, ["L-CL", "L-CL", "L-CL", "L-CL", "L-CL"]);
+const five = run(staff, ["LWP", "LWP", "LWP", "LWP", "LWP"]);
 check("full monthly amount", five.otherDeductionFull, 3100);
-check("leave days", five.otherDeductionLeaveDays, 5);
 check("chargeable days", five.otherDeductionChargeableDays, 26);
+check("matches payable days", five.otherDeductionChargeableDays, five.payableDays);
 check("recurring portion", five.otherDeductionRecurring, 2600);
+check("nothing uncollected", five.otherDeductionUncollected, 0);
 
 console.log(
   failures === 0 ? "\nall checks passed.\n" : `\n${failures} check(s) FAILED.\n`,

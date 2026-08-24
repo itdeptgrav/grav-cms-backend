@@ -563,29 +563,34 @@ function computeEmployeePayroll(employee, ctx) {
 
   // ── Other deduction ───────────────────────────────────────────────────────
   // A standing monthly recovery — canteen, transport, whatever the company
-  // takes back. Charged for the days they were THERE, so a week of leave is a
-  // week not charged: nobody eats the canteen food they are on leave from.
+  // takes back — charged for the days they were THERE.
   //
-  // Approved leave only. CL, SL, PL and LWP are days somebody arranged to be
-  // away, and the arrangement is what makes the charge unfair. An unexplained
-  // absence is not an arrangement, so it is still charged — which also means
-  // the deduction cannot be dodged by simply not turning up.
+  // "There" is payableDays: the SAME figure the payroll drawer prints at the
+  // top as "Payable: 29 / 31", and the same one the gross is prorated on. It
+  // was briefly computed as daysInMonth minus leave days instead, which is a
+  // different number — a screen reading "Payable 29 / 31" above a deduction
+  // charged for 28 is a screen nobody can reconcile, and the two figures
+  // being derived separately is exactly how they came to disagree.
   //
-  // The divisor is the real length of the month, the same one the gross uses
-  // above, so a February deduction and a February salary are prorated
-  // identically. Sundays, week-offs and holidays are charged: the month is
-  // the month.
+  // Sundays, week-offs and holidays are all payable, so all charged: the
+  // month is the month. Unpaid days are not.
   const otherDeductionFull = Number(employee.salary?.otherDeduction || 0);
-  const approvedLeaveDays =
-    stats.clUsedDays + stats.slUsedDays + stats.plUsedDays + stats.lwpDays;
-  const chargeableDays = Math.max(0, daysInMonth - approvedLeaveDays);
-  const otherDeduction =
+  const chargeableDays = Math.min(daysInMonth, Math.max(0, payableDays));
+  const rawOtherDeduction =
     otherDeductionFull > 0
       ? roundMoney(
-          (otherDeductionFull * chargeableDays) / Math.max(1, daysInMonth),
+          (otherDeductionFull * chargeableDays) / Math.max(1, divisor),
           settings.roundingMode,
         )
       : 0;
+
+  // Nothing can be recovered from pay that was never earned. Without this an
+  // unpaid intern — or anybody whose month came out at zero — takes the full
+  // deduction against a gross of zero and lands on a NEGATIVE net pay, which
+  // is not a payslip anybody can act on. Whatever cannot be collected this
+  // month is simply not collected.
+  const roomForOther = Math.max(0, grossEarned - epf - esic - pt);
+  const otherDeduction = Math.min(rawOtherDeduction, roomForOther);
 
   const totalDeductions = epf + esic + pt + otherDeduction;
   const netPay = grossEarned - totalDeductions;
@@ -691,7 +696,10 @@ function computeEmployeePayroll(employee, ctx) {
     // the figure is what it is rather than presenting a bare number.
     otherDeductionFull,
     otherDeductionRecurring: otherDeduction,
-    otherDeductionLeaveDays: +approvedLeaveDays.toFixed(2),
+    // What was waived because there was no pay to take it from. Recorded
+    // rather than dropped: an amount that quietly vanishes is one nobody can
+    // explain when the canteen account does not tie out.
+    otherDeductionUncollected: +(rawOtherDeduction - otherDeduction).toFixed(2),
     otherDeductionChargeableDays: +chargeableDays.toFixed(2),
 
     payableDays: +payableDays.toFixed(2),
@@ -1125,7 +1133,7 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
 
           otherDeductionFull: computed.otherDeductionFull,
           otherDeductionRecurring: computed.otherDeductionRecurring,
-          otherDeductionLeaveDays: computed.otherDeductionLeaveDays,
+          otherDeductionUncollected: computed.otherDeductionUncollected,
           otherDeductionChargeableDays: computed.otherDeductionChargeableDays,
           earnings: computed.earnings,
           deductions: computed.deductions,
@@ -1741,13 +1749,11 @@ router.patch(
       // to either. Carrying the old figure forward would make the button
       // silently not do the thing it is for.
       const otherFromEmployee = Number(employee.salary?.otherDeduction || 0);
-      const otherLeaveDays =
-        (computed.clUsedDays || 0) +
-        (computed.slUsedDays || 0) +
-        (computed.plUsedDays || 0) +
-        (computed.lwpDays || 0);
-      const otherChargeable = Math.max(0, divisor - otherLeaveDays);
-      const otherRecurring =
+      // Payable days — the figure shown at the top of the drawer, and the one
+      // the gross itself is prorated on. Honours a manual day-count override
+      // for the same reason the earnings above do.
+      const otherChargeable = Math.min(divisor, Math.max(0, payableDays));
+      const rawOtherRecurring =
         otherFromEmployee > 0
           ? Math.round((otherFromEmployee * otherChargeable) / Math.max(1, divisor))
           : 0;
@@ -1760,6 +1766,11 @@ router.patch(
         0,
         otherD - (item.otherDeductionRecurring || 0),
       );
+
+      // Capped at what is left after everything statutory, so a month with no
+      // earnings cannot produce a negative net pay. See computeEmployeePayroll.
+      const roomForOther = Math.max(0, grossTotal - epf - esic - pt - loan - advance - otherManual);
+      const otherRecurring = Math.min(rawOtherRecurring, roomForOther);
 
       const totalDeductions =
         epf + esic + pt + loan + advance + otherManual + otherRecurring;
@@ -1792,7 +1803,7 @@ router.patch(
       };
       item.otherDeductionFull = otherFromEmployee;
       item.otherDeductionRecurring = otherRecurring;
-      item.otherDeductionLeaveDays = +otherLeaveDays.toFixed(2);
+      item.otherDeductionUncollected = +(rawOtherRecurring - otherRecurring).toFixed(2);
       item.otherDeductionChargeableDays = +otherChargeable.toFixed(2);
 
       item.deductions = {
@@ -2683,9 +2694,16 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
       existing &&
       ["processed", "paid", "approved"].includes(existing.status)
     ) {
+      // The advice has to match the buttons that actually exist. A processed
+      // run can be reverted; a paid or approved one cannot be reverted,
+      // removed or re-drafted at all, and telling somebody to "remove it
+      // first" sends them looking for a control that is deliberately absent.
       return res.status(400).json({
         success: false,
-        message: `Payroll for ${MONTH_NAMES[month]} ${year} is already ${existing.status}. Remove it first if you need to re-draft.`,
+        message:
+          existing.status === "processed"
+            ? `Payroll for ${MONTH_NAMES[month]} ${year} is already processed. Use Revert to Draft on the saved run if you need to change it.`
+            : `Payroll for ${MONTH_NAMES[month]} ${year} is ${existing.status} and locked. It cannot be re-drafted — contact an admin if a correction is genuinely needed.`,
       });
     }
 
@@ -2804,7 +2822,7 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
             internshipType: computed.internshipType || null,
             otherDeductionFull: computed.otherDeductionFull,
             otherDeductionRecurring: computed.otherDeductionRecurring,
-            otherDeductionLeaveDays: computed.otherDeductionLeaveDays,
+            otherDeductionUncollected: computed.otherDeductionUncollected,
             otherDeductionChargeableDays: computed.otherDeductionChargeableDays,
             earnings: computed.earnings,
             deductions: computed.deductions,

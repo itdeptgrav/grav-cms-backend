@@ -132,7 +132,10 @@ const payrollItemSchema = new mongoose.Schema(
         // one-off figure HR typed for the month — without this, a second
         // recalculate would add the recurring part on top of itself.
         otherDeductionRecurring: { type: Number, default: 0 },
-        otherDeductionLeaveDays: { type: Number, default: 0 },
+        // What could not be taken because there was no pay to take it from.
+        // Recorded rather than dropped: an amount that quietly vanishes is one
+        // nobody can explain when the canteen account does not tie out.
+        otherDeductionUncollected: { type: Number, default: 0 },
         otherDeductionChargeableDays: { type: Number, default: 0 },
 
         // ── Manual Override ────────────────────────────────────────────
