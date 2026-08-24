@@ -44,6 +44,8 @@ function recalculateSalary(salary = {}, cfg = {}, employmentType = "") {
       totalDeduction: 0,
       netSalary: stipend,
       allowances: 0, deductions: 0,
+      // HR's input, not a derived figure — and it applies to interns too.
+      otherDeduction: Number(s.otherDeduction) || 0,
     };
   }
 
@@ -112,6 +114,8 @@ function recalculateSalary(salary = {}, cfg = {}, employmentType = "") {
     // object, so an intern promoted to staff would otherwise keep a stipend
     // sitting beside their new gross.
     stipend: 0,
+    // Kept, not zeroed: HR's input, and it survives a change of type.
+    otherDeduction: Number(s.otherDeduction) || 0,
   };
 }
 
@@ -405,12 +409,41 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // never logged.
     const beforeDoc = await Employee.findById(id)
       .select(
-        "firstName lastName department designation jobTitle status email phone salary employmentType primaryManager secondaryManager",
+        "firstName lastName department designation jobTitle status email phone salary employmentType biometricId primaryManager secondaryManager",
       )
       .lean();
     const beforeGross = beforeDoc?.salary
       ? decryptSalaryFields(beforeDoc.salary)?.gross
       : undefined;
+
+    // ── The biometric ID is write-once ──────────────────────────────────────
+    // It is the join key across both datastores — Mongo's employee record and
+    // the Firestore cowork document share it, and every attendance row, punch
+    // and payroll item is keyed on it. Changing it does not rename those; it
+    // orphans them, and the employee silently stops having a history.
+    //
+    // So: set it once, on an employee who has none, and never again. Sent
+    // unchanged is fine and common — the form posts the whole record back —
+    // and only an actual attempt to change one is refused, loudly, because
+    // silently ignoring it would leave HR believing it had been renamed.
+    //
+    // identityId is deliberately NOT locked. It is a display/HR number with
+    // nothing keyed on it.
+    if (updateData.biometricId !== undefined && beforeDoc?.biometricId) {
+      const next = String(updateData.biometricId || "").trim().toUpperCase();
+      const current = String(beforeDoc.biometricId).trim().toUpperCase();
+      if (next && next !== current) {
+        return res.status(400).json({
+          success: false,
+          code: "BIOMETRIC_ID_IMMUTABLE",
+          message:
+            `Biometric ID cannot be changed. ${beforeDoc.biometricId} is the ` +
+            `key their attendance, punches and payroll are stored under — ` +
+            `renaming it here would orphan all of it, not move it.`,
+        });
+      }
+      delete updateData.biometricId;
+    }
 
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
     if (

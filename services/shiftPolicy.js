@@ -245,22 +245,6 @@ function classifyDayKind(dateStr, settings, holidayByDate) {
   };
 }
 
-/**
- * The half-day threshold to use on a day that is not a working day.
- *
- * Its own setting, because the shift's threshold answers a different question.
- * A Core employee's 450 minutes means "you were in the office for less than
- * your day" — but on a Sunday there is no day to be short of. What HR wants to
- * say is "turn up for at least this long and it counts as a full day", which is
- * a separate number and theirs to choose.
- */
-function nonWorkingDayRule(settings) {
-  const cfg = settings?.nonWorkingDay || {};
-  return {
-    halfDayThresholdMins: num(cfg.halfDayThresholdMins, 240),
-    basis: cfg.basis === "span" ? "span" : "net",
-  };
-}
 
 /**
  * Decide what a day counts as.
@@ -290,35 +274,28 @@ function classifyDay({ inMins, outMins, netMins, spanMins, shift, settings, day 
 
   const worked = inMins != null && outMins != null;
 
-  // ── Not a working day ───────────────────────────────────────────────────
-  if (day.kind !== DAY_KIND.WORKING) {
-    if (!worked) {
-      return {
-        ...nothing,
-        status: day.kind === DAY_KIND.HOLIDAY ? "PH" : "WO",
-      };
-    }
-    // Somebody came in on their day off. Every minute of it is overtime, and
-    // NONE of the shift rules apply: there is no start time to be late for and
-    // no end time to leave before. Judging this day by a shift is what produced
-    // "Late" and "Early out" on a Sunday.
-    const rule = nonWorkingDayRule(settings);
-    const measured = rule.basis === "span" ? spanMins : netMins;
+  // ── Nobody came in ──────────────────────────────────────────────────────
+  const offDay = day.kind !== DAY_KIND.WORKING;
+  if (!worked) {
+    if (!offDay) return { ...nothing, status: "AB" };
     return {
       ...nothing,
-      status: measured < rule.halfDayThresholdMins ? "HD" : "P",
-      otMins: Math.max(0, netMins),
-      onNonWorkingDay: true,
-      // A holiday or weekly off worked earns comp-off. A working-day override
-      // does not reach here at all — classifyDayKind returns WORKING for it —
-      // which is the "no comp-off on a swapped day" rule, enforced by the day
-      // never being non-working in the first place.
-      compOffEligible: true,
+      status: day.kind === DAY_KIND.HOLIDAY ? "PH" : "WO",
     };
   }
 
-  // ── A normal working day, judged against THIS employee's shift ──────────
-  if (!worked) return { ...nothing, status: "AB" };
+  // ── Somebody came in ────────────────────────────────────────────────────
+  // Judged against their shift, whatever kind of day it is.
+  //
+  // A worked Sunday used to get its own threshold, its own net-or-span basis,
+  // and no Late or Early Out at all, on the reasoning that there is no start
+  // time to be late for on a day you were not expected in. HR asked for that
+  // to go: a day worked is a day worked, measured the way every other day is,
+  // and the timings shown rather than suppressed.
+  //
+  // Two things about a day off survive, because neither is a measurement:
+  // comp-off is earned, and every minute counts as overtime rather than only
+  // the minutes past the shift end.
 
   // An overnight shift's out-time lands after midnight, so it comes back as a
   // small number. Carry it forward the same way the shift end was carried.
@@ -333,8 +310,14 @@ function classifyDay({ inMins, outMins, netMins, spanMins, shift, settings, day 
   // a separate early grace is a field HR would have to reason about twice.
   const isEarlyOut = earlyBy > shift.lateGraceMins;
 
+  // On a day off the whole attendance is overtime — they were not due in at
+  // all, so there is no ordinary portion of it to net off first.
   const otStart = shift.endMins == null ? null : shift.endMins + shift.otGraceMins;
-  const otMins = otStart == null ? 0 : Math.max(0, out - otStart);
+  const otMins = offDay
+    ? Math.max(0, netMins)
+    : otStart == null
+      ? 0
+      : Math.max(0, out - otStart);
 
   const measured = shift.halfDayBasis === "span" ? spanMins : netMins;
 
@@ -351,8 +334,13 @@ function classifyDay({ inMins, outMins, netMins, spanMins, shift, settings, day 
     isEarlyOut,
     earlyOutMins: isEarlyOut ? Math.max(0, earlyBy) : 0,
     otMins,
-    onNonWorkingDay: false,
-    compOffEligible: false,
+    onNonWorkingDay: offDay,
+    // A holiday or weekly off worked earns comp-off. A Sunday HR has declared
+    // a working day does not reach here as an off day at all —
+    // classifyDayKind returns WORKING for it — which is how "no comp-off on a
+    // swapped day" is enforced: the day is never non-working in the first
+    // place, so the weekday off they already took was the compensation.
+    compOffEligible: offDay,
   };
 }
 
@@ -365,5 +353,4 @@ module.exports = {
   resolveShift,
   classifyDayKind,
   classifyDay,
-  nonWorkingDayRule,
 };

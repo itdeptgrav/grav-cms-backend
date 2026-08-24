@@ -33,20 +33,6 @@ const CustomShiftRulesSchema = new mongoose.Schema(
   { _id: false },
 );
 
-// What a day counts as when it is NOT a working day and somebody worked it.
-//
-// Its own threshold, because the shift's answers a different question. A Core
-// employee's 450 minutes means "short of your day" — but on a Sunday there is
-// no day to be short of. This says "turn up for at least this long and it is a
-// full day", which is HR's to set.
-const NonWorkingDaySchema = new mongoose.Schema(
-  {
-    halfDayThresholdMins: { type: Number, default: 240 },
-    basis: { type: String, enum: ["net", "span"], default: "net" },
-  },
-  { _id: false },
-);
-
 const LateHalfDayPolicySchema = new mongoose.Schema(
   {
     enabled: { type: Boolean, default: true },
@@ -127,8 +113,6 @@ const AttendanceSettingsSchema = new mongoose.Schema(
       custom: { type: CustomShiftRulesSchema, default: () => ({}) },
     },
 
-    nonWorkingDay: { type: NonWorkingDaySchema, default: () => ({}) },
-
     lateHalfDayPolicy: { type: LateHalfDayPolicySchema, default: () => ({}) },
     graceCarryForward: { type: GraceCarryForwardSchema, default: () => ({}) },
     singlePunchHandling: {
@@ -181,10 +165,6 @@ AttendanceSettingsSchema.statics.getConfig = async function () {
     doc.shifts.custom.halfDayThresholdMins = 300;
   if (doc.shifts.custom.halfDayBasis == null) doc.shifts.custom.halfDayBasis = "net";
   if (doc.shifts.custom.otGraceMins == null) doc.shifts.custom.otGraceMins = 30;
-  if (!doc.nonWorkingDay) doc.nonWorkingDay = {};
-  if (doc.nonWorkingDay.halfDayThresholdMins == null)
-    doc.nonWorkingDay.halfDayThresholdMins = 240;
-  if (doc.nonWorkingDay.basis == null) doc.nonWorkingDay.basis = "net";
   if (doc.shifts?.operator?.halfDayThresholdMins === 240)
     doc.shifts.operator.halfDayThresholdMins = 390;
   if (doc.shifts?.executive?.halfDayThresholdMins === 240)

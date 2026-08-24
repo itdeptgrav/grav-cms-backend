@@ -106,7 +106,10 @@ const payrollItemSchema = new mongoose.Schema(
             loanDeduction: { type: Number, default: 0 },
             advanceDeduction: { type: Number, default: 0 },
             lateDeduction: { type: Number, default: 0 },
-            lopDeduction: { type: Number, default: 0 }, // Loss of Pay
+                lopDeduction: { type: Number, default: 0 }, // Loss of Pay
+            // Auto-computed from the employee's standing monthly deduction,
+            // prorated by approved leave — see computeEmployeePayroll. HR can
+            // still override it on the item; a recalculate puts it back.
             otherDeductions: { type: Number, default: 0 },
             totalDeductions: { type: Number, default: 0 }, // auto-calculated
         },
@@ -119,6 +122,18 @@ const payrollItemSchema = new mongoose.Schema(
         // Array of { dateStr, dayOfWeek, category, paid, lopWeight, note, ... }
         // Kept as Mixed so engine can evolve fields without migrations.
         dayBreakdown: { type: [mongoose.Schema.Types.Mixed], default: undefined },
+
+        // ── Other-deduction working ────────────────────────────────────
+        // Stored so the payroll drawer can show WHY otherDeductions is what
+        // it is — a bare figure invites "where did that come from".
+        otherDeductionFull: { type: Number, default: 0 },
+        // The prorated amount actually charged. Stored separately from
+        // deductions.otherDeductions because that field also holds whatever
+        // one-off figure HR typed for the month — without this, a second
+        // recalculate would add the recurring part on top of itself.
+        otherDeductionRecurring: { type: Number, default: 0 },
+        otherDeductionLeaveDays: { type: Number, default: 0 },
+        otherDeductionChargeableDays: { type: Number, default: 0 },
 
         // ── Manual Override ────────────────────────────────────────────
         isManuallyOverridden: { type: Boolean, default: false },

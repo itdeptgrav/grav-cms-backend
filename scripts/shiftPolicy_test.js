@@ -30,17 +30,37 @@ let ro = P.classifyDay({ inMins:m(5,58), outMins:m(14,3), netMins:445, spanMins:
 row('status', ro.status); row('early-out mins', ro.earlyOutMins);
 console.log(ro.isEarlyOut ? '    (this is the bug being fixed — EO by ' + ro.earlyOutMins + ' mins)' : '    ?');
 
-console.log('\n=== 3. Sunday worked (no calendar entry) ===');
+// A worked Sunday USED to be exempt from the shift: no late, no early-out,
+// its own half-day threshold. HR asked for that to go — a day worked is a day
+// worked, measured like every other day, with the timings shown rather than
+// suppressed. Two things survive, because neither is a measurement: comp-off
+// is earned, and the whole attendance is overtime rather than only the part
+// past the shift end.
+console.log('\n=== 3. Sunday worked — judged against the shift, like any day ===');
 const sun = P.classifyDayKind('2026-08-23', S, {});   // Sunday
 row('day kind', sun.kind);
+// Shift is 06:00–14:00. In at 07:10 is 70 mins late; out at 15:30 is not early.
 let rs = P.classifyDay({ inMins:m(7,10), outMins:m(15,30), netMins:500, spanMins:500, shift:sh, settings:S, day:sun });
 row('status', rs.status); row('late / early-out', `${rs.isLate} / ${rs.isEarlyOut}`);
+row('late mins', rs.lateMins);
 row('overtime mins', rs.otMins); row('comp-off eligible', rs.compOffEligible);
-console.log(rs.status==='P' && !rs.isLate && !rs.isEarlyOut && rs.otMins===500 && rs.compOffEligible ? '    PASS' : '    *** FAIL ***');
+console.log(rs.status==='P*' && rs.isLate && rs.lateMins===70 && !rs.isEarlyOut
+  && rs.otMins===500 && rs.compOffEligible
+  ? '    PASS — late is shown, whole day is OT, comp-off still earned'
+  : '    *** FAIL ***');
 
-console.log('\n=== 4. Sunday worked only 3h (below the 240-min setting) ===');
+console.log('\n=== 3b. Sunday, left early — that shows too ===');
+let rs1b = P.classifyDay({ inMins:m(6,0), outMins:m(12,0), netMins:360, spanMins:360, shift:sh, settings:S, day:sun });
+row('status', rs1b.status); row('early-out mins', rs1b.earlyOutMins);
+console.log(rs1b.status==='P~' && rs1b.earlyOutMins===120 ? '    PASS' : '    *** FAIL ***');
+
+console.log('\n=== 4. Sunday half day — by the SHIFT threshold, not its own ===');
+// The shift's threshold is what decides it now; there is no separate day-off
+// number to fall below.
 let rs2 = P.classifyDay({ inMins:m(9), outMins:m(12), netMins:180, spanMins:180, shift:sh, settings:S, day:sun });
-row('status', rs2.status); console.log(rs2.status==='HD' ? '    PASS — half day by hours only' : '    *** FAIL ***');
+row('shift threshold', sh.halfDayThresholdMins);
+row('status', rs2.status);
+console.log(rs2.status==='HD' ? '    PASS — half day on the shift threshold' : '    *** FAIL ***');
 
 console.log('\n=== 5. Sunday nobody came ===');
 let rs3 = P.classifyDay({ inMins:null, outMins:null, netMins:0, spanMins:0, shift:sh, settings:S, day:sun });

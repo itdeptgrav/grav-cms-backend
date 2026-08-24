@@ -263,6 +263,20 @@ const employeeSchema = new mongoose.Schema({
     totalDeduction: { type: mongoose.Schema.Types.Mixed, default: 0 },
     netSalary: { type: mongoose.Schema.Types.Mixed, default: 0 },
 
+    // ── Other deduction ───────────────────────────────────────────────────────
+    // A standing monthly deduction — canteen, transport, whatever the company
+    // recovers from pay. Optional, and zero for most people.
+    //
+    // Charged for the days they were THERE, not as a flat monthly figure:
+    // payroll prorates it by (days in month − approved leave days) ÷ days in
+    // month. Somebody on leave for a week is not consuming the thing being
+    // deducted for, so they are not charged for that week. Sundays, week-offs
+    // and holidays ARE charged — the month is the month.
+    //
+    // Encrypted like every other pay figure. See Payroll_section.js for the
+    // proration, which is where the leave days come from.
+    otherDeduction: { type: mongoose.Schema.Types.Mixed, default: 0 },
+
     // ── Legacy ────────────────────────────────────────────────────────────────
     allowances: { type: mongoose.Schema.Types.Mixed, default: 0 },
     deductions: { type: mongoose.Schema.Types.Mixed, default: 0 },
@@ -499,6 +513,9 @@ employeeSchema.pre("save", async function (next) {
         netSalary: stipend,
         allowances: 0,
         deductions: 0,
+        // Carried through: it is HR's input, not a derived figure, and this
+        // hook replaces the whole salary object.
+        otherDeduction: Number(prev.otherDeduction) || 0,
       });
       encrypted.epfOverride = false;
       encrypted.edliOverride = false;
@@ -572,6 +589,9 @@ employeeSchema.pre("save", async function (next) {
       // wholesale, so an intern promoted to staff would otherwise keep a
       // stipend sitting beside their new gross.
       stipend: 0,
+      // Kept, not zeroed — unlike the stipend, this is HR's input and applies
+      // to staff and interns alike.
+      otherDeduction: Number(s.otherDeduction) || 0,
     };
 
     // ── 3. Encrypt all monetary fields before persisting ─────────────────────

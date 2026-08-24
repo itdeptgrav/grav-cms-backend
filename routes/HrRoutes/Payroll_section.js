@@ -561,7 +561,33 @@ function computeEmployeePayroll(employee, ctx) {
       ? settings.ptForBasic(basicEarned)
       : 0;
 
-  const totalDeductions = epf + esic + pt;
+  // ── Other deduction ───────────────────────────────────────────────────────
+  // A standing monthly recovery — canteen, transport, whatever the company
+  // takes back. Charged for the days they were THERE, so a week of leave is a
+  // week not charged: nobody eats the canteen food they are on leave from.
+  //
+  // Approved leave only. CL, SL, PL and LWP are days somebody arranged to be
+  // away, and the arrangement is what makes the charge unfair. An unexplained
+  // absence is not an arrangement, so it is still charged — which also means
+  // the deduction cannot be dodged by simply not turning up.
+  //
+  // The divisor is the real length of the month, the same one the gross uses
+  // above, so a February deduction and a February salary are prorated
+  // identically. Sundays, week-offs and holidays are charged: the month is
+  // the month.
+  const otherDeductionFull = Number(employee.salary?.otherDeduction || 0);
+  const approvedLeaveDays =
+    stats.clUsedDays + stats.slUsedDays + stats.plUsedDays + stats.lwpDays;
+  const chargeableDays = Math.max(0, daysInMonth - approvedLeaveDays);
+  const otherDeduction =
+    otherDeductionFull > 0
+      ? roundMoney(
+          (otherDeductionFull * chargeableDays) / Math.max(1, daysInMonth),
+          settings.roundingMode,
+        )
+      : 0;
+
+  const totalDeductions = epf + esic + pt + otherDeduction;
   const netPay = grossEarned - totalDeductions;
   const roundedNetPay = settings.roundNetPay ? Math.round(netPay) : netPay;
 
@@ -661,6 +687,13 @@ function computeEmployeePayroll(employee, ctx) {
     slUsedDays: stats.slUsedDays,
     plUsedDays: stats.plUsedDays,
 
+    // The working behind otherDeductions, so the payroll drawer can show why
+    // the figure is what it is rather than presenting a bare number.
+    otherDeductionFull,
+    otherDeductionRecurring: otherDeduction,
+    otherDeductionLeaveDays: +approvedLeaveDays.toFixed(2),
+    otherDeductionChargeableDays: +chargeableDays.toFixed(2),
+
     payableDays: +payableDays.toFixed(2),
     effectivePayableDays: +effectivePayableDays.toFixed(2),
     sundayExtraPayDays,
@@ -694,7 +727,7 @@ function computeEmployeePayroll(employee, ctx) {
       loanDeduction: 0,
       advanceDeduction: 0,
       lateDeduction: 0,
-      otherDeductions: 0,
+      otherDeductions: otherDeduction,
       totalDeductions,
     },
     netPay,
@@ -1090,6 +1123,10 @@ router.post("/run", EmployeeAuthMiddlewear, async (req, res) => {
 
           leaveBalanceSnapshot: computed.leaveBalanceSnapshot,
 
+          otherDeductionFull: computed.otherDeductionFull,
+          otherDeductionRecurring: computed.otherDeductionRecurring,
+          otherDeductionLeaveDays: computed.otherDeductionLeaveDays,
+          otherDeductionChargeableDays: computed.otherDeductionChargeableDays,
           earnings: computed.earnings,
           deductions: computed.deductions,
           netPay: computed.netPay,
@@ -1697,7 +1734,35 @@ router.patch(
           ? ctxSettings.ptForBasic(basicEarned)
           : 0;
 
-      const totalDeductions = epf + esic + pt + loan + advance + otherD;
+      // Other deduction is RE-DERIVED, not carried over from the item like
+      // loan and advance are. Those are one-off figures HR typed for this
+      // month; this one is a standing amount on the employee prorated by
+      // their leave, and a recalculate exists precisely to pick up a change
+      // to either. Carrying the old figure forward would make the button
+      // silently not do the thing it is for.
+      const otherFromEmployee = Number(employee.salary?.otherDeduction || 0);
+      const otherLeaveDays =
+        (computed.clUsedDays || 0) +
+        (computed.slUsedDays || 0) +
+        (computed.plUsedDays || 0) +
+        (computed.lwpDays || 0);
+      const otherChargeable = Math.max(0, divisor - otherLeaveDays);
+      const otherRecurring =
+        otherFromEmployee > 0
+          ? Math.round((otherFromEmployee * otherChargeable) / Math.max(1, divisor))
+          : 0;
+
+      // otherD is what is stored on the item, and on any recalculate after
+      // the first that ALREADY contains the recurring part. Subtracting the
+      // recurring amount recorded last time leaves the one-off figure HR
+      // actually typed, which is the only part worth carrying forward.
+      const otherManual = Math.max(
+        0,
+        otherD - (item.otherDeductionRecurring || 0),
+      );
+
+      const totalDeductions =
+        epf + esic + pt + loan + advance + otherManual + otherRecurring;
       const netPay = grossTotal - totalDeductions;
 
       // ── Persist ─────────────────────────────────────────────────────────
@@ -1725,6 +1790,11 @@ router.patch(
         otherEarnings: oth,
         grossEarnings: grossTotal,
       };
+      item.otherDeductionFull = otherFromEmployee;
+      item.otherDeductionRecurring = otherRecurring;
+      item.otherDeductionLeaveDays = +otherLeaveDays.toFixed(2);
+      item.otherDeductionChargeableDays = +otherChargeable.toFixed(2);
+
       item.deductions = {
         ...(item.deductions || {}),
         providentFund: epf,
@@ -1734,7 +1804,7 @@ router.patch(
         professionalTax: pt,
         loanDeduction: loan,
         advanceDeduction: advance,
-        otherDeductions: otherD,
+        otherDeductions: otherManual + otherRecurring,
         totalDeductions,
       };
       item.netPay = netPay;
@@ -2732,6 +2802,10 @@ router.post("/run/save-draft", EmployeeAuthMiddlewear, async (req, res) => {
             // is the flag the Interns tab and the payslip both read.
             isIntern: computed.isIntern,
             internshipType: computed.internshipType || null,
+            otherDeductionFull: computed.otherDeductionFull,
+            otherDeductionRecurring: computed.otherDeductionRecurring,
+            otherDeductionLeaveDays: computed.otherDeductionLeaveDays,
+            otherDeductionChargeableDays: computed.otherDeductionChargeableDays,
             earnings: computed.earnings,
             deductions: computed.deductions,
             netPay: computed.netPay,
