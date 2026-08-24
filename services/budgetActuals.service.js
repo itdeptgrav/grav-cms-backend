@@ -281,6 +281,71 @@ async function voucherMovementsForLedger({
   };
 }
 
+/**
+ * The same posted movement, bucketed by CALENDAR MONTH.
+ *
+ * For the budget page's one large graphic. Everything about what counts is
+ * identical to movementByLedger — posted only, optional excluded, same company
+ * clause, same date bounds — because a chart that disagreed with the totals
+ * printed beside it would be worse than no chart.
+ *
+ * Bucketed in IST, not UTC. `$month` on a UTC date puts a 1-April IST voucher
+ * (which is 31-March 18:30 UTC) in March, so the first month of every Indian
+ * financial year would silently under-report.
+ *
+ * Returns [{ key: "2026-04", revenue, expense }] ascending. The caller decides
+ * the sign convention; both natures are returned raw as debit/credit sums per
+ * bucket so `actualFrom` stays the one place the rule lives.
+ */
+async function monthlyMovement({ companyId, ledgerIds = [], from, to }) {
+  const ids = ledgerIds.map(oid).filter(Boolean);
+  if (ids.length === 0) return [];
+
+  const match = {
+    status: "posted",
+    isOptional: { $ne: true },
+    "ledgerEntries.ledgerId": { $in: ids },
+  };
+  const cid = oid(companyId);
+  if (cid) match.companyId = cid;
+
+  const fromT = from ? new Date(from) : null;
+  const toT = to ? new Date(to) : null;
+  if (fromT && !Number.isNaN(fromT.getTime())) match.voucherDate = { $gte: fromT };
+  if (toT && !Number.isNaN(toT.getTime())) {
+    match.voucherDate = { ...(match.voucherDate || {}), $lte: toT };
+  }
+
+  const rows = await Acc_Voucher.aggregate([
+    { $match: match },
+    { $unwind: "$ledgerEntries" },
+    { $match: { "ledgerEntries.ledgerId": { $in: ids } } },
+    {
+      $group: {
+        _id: {
+          /* IST, explicitly — see the header. */
+          month: { $dateToString: { date: "$voucherDate", format: "%Y-%m", timezone: "Asia/Kolkata" } },
+          ledgerId: "$ledgerEntries.ledgerId",
+        },
+        debit: {
+          $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", 0] },
+        },
+        credit: {
+          $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Cr"] }, "$ledgerEntries.amount", 0] },
+        },
+      },
+    },
+  ]);
+
+  return rows.map((r) => ({
+    key: r._id.month,
+    ledgerId: r._id.ledgerId,
+    debit: r.debit || 0,
+    credit: r.credit || 0,
+    signed: (r.debit || 0) - (r.credit || 0),
+  }));
+}
+
 /** Turn raw movement into a budget "actual", given the line's nature. */
 function actualFrom(movement, nature) {
   if (!movement) return 0;
@@ -330,6 +395,7 @@ module.exports = {
   oid,
   natureByLedger,
   movementByLedger,
+  monthlyMovement,
   voucherMovementsForLedger,
   actualFrom,
   hydrateLines,

@@ -419,6 +419,81 @@ function worstSeverity(lines = []) {
 const sumOf = (lines, field) =>
   lines.reduce((s, l) => s + (variance.money(l[field]) ?? 0), 0);
 
+/**
+ * Actual revenue and expense per calendar month, for the dashboard chart.
+ *
+ * `allLines` is already department-filtered, so the chart narrows with the
+ * rest of the screen rather than quietly showing everything.
+ *
+ * Returns [] when there is nothing to draw — an empty array renders as an
+ * empty state, whereas a series of zeroes draws a flat line along the axis
+ * and reads as "we spent nothing", which is a different and wrong claim.
+ */
+async function monthlySeries(evaluated, allLines, req) {
+  const ledgerIds = [...new Set(allLines.map((l) => l.ledgerId).filter(Boolean).map(String))];
+  if (!ledgerIds.length || !evaluated.length) return [];
+
+  /* The union of every in-scope budget's period. */
+  const from = evaluated.reduce((min, b) => (!min || b.startDate < min ? b.startDate : min), null);
+  const to = evaluated.reduce((max, b) => (!max || b.endDate > max ? b.endDate : max), null);
+
+  /* Nature per head, from the ledger tree — the same authority the actuals
+   * use, so a re-parented head moves sides here too. */
+  const natures = await actuals.natureByLedger(ledgerIds);
+
+  const rows = await actuals.monthlyMovement({
+    companyId: actualsCompanyFor(evaluated[0], req),
+    ledgerIds,
+    from,
+    to,
+  });
+
+  const byMonth = new Map();
+  for (const r of rows) {
+    const nature = natures.get(String(r.ledgerId))?.nature || "expense";
+    if (!byMonth.has(r.key)) byMonth.set(r.key, { key: r.key, revenue: 0, expense: 0 });
+    const bucket = byMonth.get(r.key);
+    const amount = actuals.actualFrom(r, nature);
+    if (nature === "revenue") bucket.revenue += amount;
+    else bucket.expense += amount;
+  }
+
+  /* Every month in the window, including the ones nothing happened in — a
+   * chart that skipped empty months would compress the gaps and misdraw the
+   * shape of the year.
+   *
+   * The keys are built in IST, matching how the aggregation bucketed them.
+   * Generating them from the server's local clock instead would drift by a
+   * month at the boundary on any host not running IST — and the boundary is
+   * 1 April, which is where every Indian financial year starts. */
+  const istKey = (d) =>
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric",
+      month: "2-digit",
+    }).format(d);
+
+  const out = [];
+  const seen = new Set();
+  /* Stepped in days rather than months so `setMonth` cannot skip February
+     from a 31st, and clamped so a corrupt date range cannot spin. */
+  const cursor = new Date(from);
+  const end = new Date(to);
+  while (cursor <= end && out.length < 120) {
+    const key = istKey(cursor);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(byMonth.get(key) || { key, revenue: 0, expense: 0 });
+    }
+    cursor.setUTCDate(cursor.getUTCDate() + 15);
+  }
+  /* The final month can be missed when the window ends inside it. */
+  const lastKey = istKey(end);
+  if (!seen.has(lastKey)) out.push(byMonth.get(lastKey) || { key: lastKey, revenue: 0, expense: 0 });
+
+  return out;
+}
+
 /** Enough of a line to act on it, without shipping the whole document. */
 function attentionLine(line, budget) {
   return {
@@ -689,6 +764,20 @@ router.get("/dashboard", async (req, res) => {
         pendingChanges.length,
     };
 
+    /* ── 4b. Monthly series ──────────────────────────────────────────────
+     * The page's one large graphic: what actually came in and went out, month
+     * by month, across the whole span the filtered budgets cover.
+     *
+     * Drawn from the SAME posted vouchers as every figure above it — a chart
+     * that disagreed with the totals printed beside it would be worse than no
+     * chart. Bucketed in IST, so a 1-April voucher lands in April rather than
+     * in the previous financial year.
+     *
+     * One aggregation for the whole set, not one per budget: the heads are
+     * unioned and the window is the union of the periods, so this costs a
+     * single round trip however many budgets are in scope. */
+    const monthly = await monthlySeries(evaluated, allLines, req);
+
     /* ── 5. Budget list ─────────────────────────────────────────────────── */
     const budgetList = evaluated.map((b) => {
       const lines = linesOf(b);
@@ -719,6 +808,7 @@ router.get("/dashboard", async (req, res) => {
         department: department || null,
       },
       totals,
+      monthly,
       byDepartment,
       byHead,
       attention,

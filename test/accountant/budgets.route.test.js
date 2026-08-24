@@ -3968,3 +3968,141 @@ describe("dashboard pending counts", () => {
     expect(body.budgets.find((b) => b.name === "Quiet").pending.total).toBe(0);
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * DASHBOARD MONTHLY SERIES — the data behind the page's one large graphic
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("dashboard monthly series", () => {
+  let seq = 0;
+
+  async function setup() {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    const budget = await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [
+        { ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 500000 },
+        { ledgerId: revenueLedger._id, ledgerName: "B", nature: "revenue", department: "Sales", allocatedAmount: 4000000 },
+      ],
+    });
+    return { company, budget, expenseLedger, revenueLedger };
+  }
+
+  const post = ({ company, ledger, amount, type, date }) =>
+    Acc_Voucher.create({
+      companyId: company._id, voucherType: type === "Cr" ? "sales" : "purchase",
+      voucherNumber: `MS/${seq++}/${Date.now()}`,
+      voucherDate: new Date(date), status: "posted", grandTotal: amount,
+      ledgerEntries: [{ ledgerId: ledger._id, ledgerName: ledger.name, type, amount }],
+    });
+
+  test("spend and revenue land in the months they happened, nature-corrected", async () => {
+    const { company, expenseLedger, revenueLedger } = await setup();
+    await post({ company, ledger: expenseLedger, amount: 120000, type: "Dr", date: "2026-06-15" });
+    await post({ company, ledger: expenseLedger, amount: 80000, type: "Dr", date: "2026-09-02" });
+    await post({ company, ledger: revenueLedger, amount: 900000, type: "Cr", date: "2026-06-20" });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    const byKey = Object.fromEntries(body.monthly.map((m) => [m.key, m]));
+
+    expect(byKey["2026-06"]).toEqual({ key: "2026-06", revenue: 900000, expense: 120000 });
+    expect(byKey["2026-09"].expense).toBe(80000);
+    expect(byKey["2026-09"].revenue).toBe(0);
+  });
+
+  test("every month of the window is present, including the empty ones", async () => {
+    const { company, expenseLedger } = await setup();
+    await post({ company, ledger: expenseLedger, amount: 1000, type: "Dr", date: "2026-06-15" });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    // Apr 2026 → Mar 2027 inclusive. A chart that skipped empty months would
+    // compress the gaps and misdraw the shape of the year.
+    expect(body.monthly).toHaveLength(12);
+    expect(body.monthly[0].key).toBe("2026-04");
+    expect(body.monthly[11].key).toBe("2027-03");
+    expect(body.monthly[0]).toEqual({ key: "2026-04", revenue: 0, expense: 0 });
+  });
+
+  test("the series agrees with the totals printed beside it", async () => {
+    const { company, expenseLedger, revenueLedger } = await setup();
+    await post({ company, ledger: expenseLedger, amount: 120000, type: "Dr", date: "2026-06-15" });
+    await post({ company, ledger: expenseLedger, amount: 80000, type: "Dr", date: "2026-09-02" });
+    await post({ company, ledger: revenueLedger, amount: 900000, type: "Cr", date: "2026-06-20" });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    const sum = (k) => body.monthly.reduce((s, m) => s + m[k], 0);
+
+    // A chart that disagreed with the figures above it is worse than no chart.
+    expect(sum("expense")).toBe(body.totals.expense.actual);
+    expect(sum("revenue")).toBe(body.totals.revenue.actual);
+  });
+
+  test("a voucher on an IST month boundary buckets by IST, not UTC", async () => {
+    const { company, expenseLedger } = await setup();
+    /* 30-Jun 18:30 UTC IS 1-Jul 00:00 IST. Bucketed on the UTC month this
+       lands in June and every month boundary in the year is off by one
+       evening's trading. */
+    await post({ company, ledger: expenseLedger, amount: 50000, type: "Dr", date: "2026-06-30T18:30:00Z" });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.monthly.find((m) => m.key === "2026-07").expense).toBe(50000);
+    expect(body.monthly.find((m) => m.key === "2026-06").expense).toBe(0);
+  });
+
+  test("the window itself is the budget's, so spend just outside it is excluded", async () => {
+    const { company, expenseLedger } = await setup();
+    /* 31-Mar 18:30 UTC is 1-Apr 00:00 IST — the first moment of the financial
+     * year in local terms, but BEFORE a startDate stored as 2026-04-01T00:00Z.
+     *
+     * It is excluded, and that is deliberate here rather than fixed: the same
+     * UTC bounds govern hydrateLines, the drilldown and budget control. The
+     * chart matching them is the property that matters — a chart disagreeing
+     * with the totals beside it would be worse than one that clips an evening.
+     * Shifting the window to IST is a module-wide change, not a chart change. */
+    await post({ company, ledger: expenseLedger, amount: 50000, type: "Dr", date: "2026-03-31T18:30:00Z" });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.monthly.find((m) => m.key === "2026-04").expense).toBe(0);
+    // And the series still agrees with the totals, which is the real contract.
+    const sum = body.monthly.reduce((s, m) => s + m.expense, 0);
+    expect(sum).toBe(body.totals.expense.actual);
+  });
+
+  test("another company's postings never reach the series", async () => {
+    const { company, expenseLedger } = await setup();
+    const other = await seedCompany();
+    await post({ company, ledger: expenseLedger, amount: 10000, type: "Dr", date: "2026-06-15" });
+    await Acc_Voucher.create({
+      companyId: other.company._id, voucherType: "purchase",
+      voucherNumber: `MSX/${seq++}/${Date.now()}`,
+      voucherDate: new Date("2026-06-15"), status: "posted", grandTotal: 999999,
+      ledgerEntries: [{ ledgerId: expenseLedger._id, ledgerName: "A", type: "Dr", amount: 999999 }],
+    });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.monthly.find((m) => m.key === "2026-06").expense).toBe(10000);
+  });
+
+  test("draft and optional vouchers are not in the series either", async () => {
+    const { company, expenseLedger } = await setup();
+    await post({ company, ledger: expenseLedger, amount: 10000, type: "Dr", date: "2026-06-15" });
+    await Acc_Voucher.create({
+      companyId: company._id, voucherType: "purchase",
+      voucherNumber: `MSD/${seq++}/${Date.now()}`,
+      voucherDate: new Date("2026-06-15"), status: "draft", grandTotal: 500000,
+      ledgerEntries: [{ ledgerId: expenseLedger._id, ledgerName: "A", type: "Dr", amount: 500000 }],
+    });
+
+    const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.monthly.find((m) => m.key === "2026-06").expense).toBe(10000);
+  });
+
+  test("no budgets in scope means an empty series, not a flat line of zeroes", async () => {
+    const { company } = await seedCompany();
+    const { body } = await call(`/dashboard?companyId=${company._id}`);
+    // A series of zeroes draws along the axis and reads as "we spent nothing",
+    // which is a different and wrong claim from "there is nothing here".
+    expect(body.monthly).toEqual([]);
+  });
+});
