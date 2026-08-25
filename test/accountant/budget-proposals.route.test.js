@@ -127,6 +127,69 @@ describe("authentication", () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * THE HEADS A DEPARTMENT MAY ASK AGAINST
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+describe("the offered heads are classified by the chart of accounts", () => {
+  /** A company with one head under each of the four natures that matter. */
+  async function seedChart() {
+    const company = await Acc_Company.create({
+      companyName: `Chart Co ${seq++}`,
+      booksFromDate: new Date("2026-04-01"),
+    });
+    const mk = async (name, nature, ledgerName, rowNature = nature) => {
+      const g = await Acc_Group.create({ companyId: company._id, name, nature });
+      const l = await Acc_Ledger.create({
+        companyId: company._id, name: ledgerName, groupId: g._id, groupName: g.name,
+        nature: rowNature,
+      });
+      return l;
+    };
+    await mk("Indirect Expenses", "expense", "Freight & Forwarding");
+    /* The row says expense, the group says revenue. Tally allows that
+       override; the budget module does not honour it — natureByLedger reads
+       the group, so every figure downstream calls this a target. The picker
+       has to agree with the figures. */
+    await mk("Sales Accounts", "revenue", "Domestic Sales", "expense");
+    await mk("Bank Accounts", "asset", "HDFC Current A/c");
+    await mk("Current Liabilities", "liability", "Sundry Creditors");
+    await link(company, { name: "Logistics", accessSlug: "sales" });
+    return company;
+  }
+
+  test("a head is classified by its group, not by the copy on the ledger row", async () => {
+    const company = await seedChart();
+    const { status, body } = await call(`/heads?companyId=${company._id}`, {
+      token: tokenFor({ deptSlug: "sales" }),
+    });
+    expect(status).toBe(200);
+    const byName = Object.fromEntries(body.heads.map((h) => [h.ledgerName, h.nature]));
+    expect(byName["Freight & Forwarding"]).toBe("expense");
+    expect(byName["Domestic Sales"]).toBe("revenue");
+  });
+
+  test("an asset or liability head is not offered as a budget head at all", async () => {
+    const company = await seedChart();
+    const { body } = await call(`/heads?companyId=${company._id}`, {
+      token: tokenFor({ deptSlug: "sales" }),
+    });
+    const names = body.heads.map((h) => h.ledgerName);
+    expect(names).not.toContain("HDFC Current A/c");
+    expect(names).not.toContain("Sundry Creditors");
+    expect(names).toHaveLength(2);
+  });
+
+  test("a department mapped to nothing is offered no heads", async () => {
+    const company = await seedChart();
+    const { status, body } = await call(`/heads?companyId=${company._id}`, {
+      token: tokenFor({ deptSlug: "production" }),
+    });
+    expect(status).toBe(200);
+    expect(body.heads).toEqual([]);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * THE MAPPING — AND ITS FAIL-CLOSED DEFAULT
  * ══════════════════════════════════════════════════════════════════════════ */
 

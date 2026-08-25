@@ -40,7 +40,7 @@ const router = express.Router();
 
 const { SECRET, LEGACY_SECRETS, readToken } = require("../../config/jwt");
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
-const { Acc_Company, Acc_Ledger } = require("../../models/Accountant_model/Acc_MasterModels");
+const { Acc_Company, Acc_Ledger, Acc_Group } = require("../../models/Accountant_model/Acc_MasterModels");
 const { Acc_BudgetDepartment } = require("../../models/Accountant_model/Acc_BudgetDepartment");
 const departments = require("../../services/budgetDepartment.service");
 const proposals = require("../../services/budgetProposals.service");
@@ -202,15 +202,40 @@ router.get("/my-requests", async (req, res) => {
 
 /* ── HEADS A DEPARTMENT MAY ASK AGAINST ──────────────────────────────────────
  * The company's expense/revenue ledgers, so the form can offer a real head.
- * Names and natures only — no balances, no budget figures. */
+ * Names and natures only — no balances, no budget figures.
+ *
+ * ── NATURE COMES FROM THE GROUP, NOT THE LEDGER ROW ─────────────────────────
+ * `nature` on a ledger is inherited from its group but can be overridden per
+ * ledger (Tally allows it), and the budget module does not honour that
+ * override anywhere: budgetActuals.natureByLedger reads the GROUP, so every
+ * allocation, roll-up and variance figure in the module is classified that
+ * way. Offering heads by the row's own copy would let this picker call a head
+ * one thing and every figure downstream call it another.
+ *
+ * Same rule, same query shape as /budgets/ledger-options, so the portal's
+ * picker and finance's picker offer the same heads.
+ */
 router.get("/heads", async (req, res) => {
   try {
     const s = await scope(req, res);
     if (!s) return;
     if (!s.slugs.length) return res.json({ success: true, heads: [] });
 
-    const heads = await Acc_Ledger.find({ companyId: s.companyId })
-      .select("_id name groupName nature")
+    const groups = await Acc_Group.find({
+      companyId: s.companyId,
+      nature: { $in: ["revenue", "expense"] },
+    })
+      .select("_id name nature")
+      .lean();
+    if (!groups.length) return res.json({ success: true, heads: [] });
+
+    const natureOf = new Map(groups.map((g) => [String(g._id), g]));
+
+    const heads = await Acc_Ledger.find({
+      companyId: s.companyId,
+      groupId: { $in: groups.map((g) => g._id) },
+    })
+      .select("_id name groupId groupName isActive")
       .sort({ name: 1 })
       .limit(500)
       .lean();
@@ -218,13 +243,16 @@ router.get("/heads", async (req, res) => {
     res.json({
       success: true,
       heads: heads
-        .filter((l) => l.nature === "expense" || l.nature === "revenue")
-        .map((l) => ({
-          ledgerId: l._id,
-          ledgerName: l.name,
-          groupName: l.groupName || null,
-          nature: l.nature,
-        })),
+        .filter((l) => l.isActive !== false)
+        .map((l) => {
+          const g = natureOf.get(String(l.groupId));
+          return {
+            ledgerId: l._id,
+            ledgerName: l.name,
+            groupName: l.groupName || (g && g.name) || null,
+            nature: g ? g.nature : "expense",
+          };
+        }),
     });
   } catch (error) {
     console.error("[budget-proposals] heads error:", error);
