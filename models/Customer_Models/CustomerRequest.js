@@ -544,6 +544,46 @@ const quotationSchema = new mongoose.Schema(
       },
       notes: String,
     },
+
+    /**
+     * The customer's own purchase order, as evidence that they approved this
+     * quotation (25 Aug 2026, explicit request: "at the time of asking for
+     * the Customer approve button it is needed to ask for the upload PO
+     * proof, so here the file upload will happen, or else the customer
+     * approve button will not be enabled").
+     *
+     * Sales recording an approval ON BEHALF of a customer is an assertion
+     * about someone who is not in the room. Until now that assertion had
+     * nothing behind it — approve-on-behalf wrote `customerApproval.approved
+     * = true` on a click. The PO is the document the customer actually sent,
+     * so it is the thing that makes the claim checkable later, which is why
+     * the route now refuses without it rather than merely the button being
+     * disabled.
+     *
+     * Either `fileId` (Google Drive, legacy) or `publicId`/`url`
+     * (Cloudinary, current) identifies the file — same dual shape every other
+     * upload in this app stores; see grav-clothing/lib/driveImage.js.
+     *
+     * NOT required for the two deliberate internal overrides — sales-approve
+     * with `acknowledgeNoCustomerApproval`, and mark-internal-order — because
+     * those exist precisely for orders with no customer approval to evidence.
+     */
+    poProof: {
+      fileId: { type: String, trim: true },
+      publicId: { type: String, trim: true },
+      url: { type: String, trim: true },
+      name: { type: String, trim: true },
+      mimeType: { type: String, trim: true },
+      /** What the customer calls this PO on their side, and its own date/value. */
+      poNumber: { type: String, trim: true },
+      poDate: Date,
+      poValue: { type: Number, min: 0 },
+      uploadedAt: Date,
+      uploadedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "SalesDepartment",
+      },
+    },
     salesApproval: {
       approved: {
         type: Boolean,

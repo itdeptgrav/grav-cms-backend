@@ -3528,16 +3528,16 @@ router.delete("/requests/:requestId", async (req, res) => {
 router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res) => {
   try {
     const { requestId } = req.params;
-    const { approvalNotes, customerInfoOverride, payment } = req.body;
- 
+    const { approvalNotes, customerInfoOverride, payment, poProof } = req.body;
+
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
- 
+
     if (request.quotations.length === 0)
       return res.status(400).json({ success: false, message: "No quotation found for this request" });
- 
+
     const quotation = request.quotations[0];
- 
+
     // Allow on-behalf approval only when the quotation is sent_to_customer
     if (!["sent_to_customer", "draft"].includes(quotation.status)) {
       return res.status(400).json({
@@ -3545,7 +3545,42 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
         message: `Cannot approve on behalf — quotation is already '${quotation.status}'`,
       });
     }
- 
+
+    // ── THE CUSTOMER'S PO IS THE EVIDENCE, AND IT IS REQUIRED ───────────────
+    // (25 Aug 2026, explicit request.) This route records that a customer
+    // approved a price, while acting as Sales — an assertion about someone
+    // who is not here, which until now took nothing but a click. The PO is
+    // the document the customer actually sent, so it is what makes the claim
+    // checkable afterwards.
+    //
+    // Enforced HERE and not only by disabling the button: a disabled button
+    // is a courtesy, not a control, and this endpoint is reachable without
+    // the UI. An upload with no usable address is rejected too — a record
+    // pointing at nothing is worse than an honest refusal, because it reads
+    // as evidence on every screen that lists it.
+    const poFile = poProof && (poProof.url || poProof.fileId || poProof.publicId) ? poProof : null;
+    if (!poFile) {
+      return res.status(400).json({
+        success: false,
+        message: "Upload the customer's PO before recording their approval — it is the proof of what they agreed to.",
+        code: "PO_PROOF_REQUIRED",
+      });
+    }
+    quotation.poProof = {
+      fileId: poFile.fileId || undefined,
+      publicId: poFile.publicId || undefined,
+      url: poFile.url || undefined,
+      name: poFile.name || undefined,
+      mimeType: poFile.mimeType || undefined,
+      poNumber: poFile.poNumber ? String(poFile.poNumber).trim() : undefined,
+      poDate: poFile.poDate ? new Date(poFile.poDate) : undefined,
+      poValue: Number.isFinite(Number(poFile.poValue)) && Number(poFile.poValue) >= 0
+        ? Number(poFile.poValue)
+        : undefined,
+      uploadedAt: new Date(),
+      uploadedBy: req.user?.id || undefined,
+    };
+
     // 1. Mark customer approval
     quotation.customerApproval = {
       approved:   true,

@@ -657,6 +657,13 @@ const SALES_JOURNEY_STAGES = [
   pair("enquiry", "Enquiry/RFQ"),
   pair("styleSample", "Style & Sample"),
   pair("costQuote", "Cost & Invoicing"),
+  // The customer's proforma invoices for this journey's account — raising
+  // one, sending it, and recording the customer's approval against their PO
+  // (25 Aug 2026, explicit request for a fourth Pipeline tab). Added AFTER
+  // costQuote so the stored codes keep lifecycle order; `poContract` stays
+  // where it is because existing journeys carry it and the enum below is
+  // what validates them.
+  pair("purchaseInvoice", "Purchase Invoice"),
   pair("poContract", "PO/Contract"),
   pair("production", "Production"),
   pair("shipment", "Shipment"),
