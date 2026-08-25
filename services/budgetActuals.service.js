@@ -282,6 +282,97 @@ async function voucherMovementsForLedger({
 }
 
 /**
+ * Posted movement per (ledger, voucher) across MANY heads at once.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ * movementByLedger answers "how much moved on this head", which is all a
+ * single budget needs. The dashboard needs a harder question: when two budgets
+ * both cover a head over overlapping dates, WHICH voucher belongs to which
+ * budget, so the roll-up counts each payment once instead of once per budget.
+ * That cannot be answered from a per-head sum — it needs the vouchers
+ * themselves, for every contested head, in one round trip.
+ *
+ * Every filter here is byte-for-byte movementByLedger's: same `posted`, same
+ * `isOptional` exclusion, same company clause, same inclusive date bounds,
+ * same Dr/Cr arithmetic. If they diverge the dashboard dedupes a set of
+ * vouchers that is not the set it is correcting, and the headline moves for a
+ * reason nobody can trace.
+ *
+ * One row per (ledger, voucher) pair, not per ledger entry — a voucher that
+ * touches the same head twice is ONE voucher, which is how movementByLedger
+ * counts it via $addToSet. A voucher touching two different contested heads
+ * yields two rows, correctly: those are two separate movements to assign.
+ *
+ * `limit` caps the rows returned. The caller MUST check `truncated` and skip
+ * deduplication rather than publish a half-deduplicated total, which would be
+ * wrong in a new and less obvious way than the double-count it replaces.
+ */
+async function voucherMovementsByLedgers({
+  companyId,
+  ledgerIds = [],
+  from,
+  to,
+  limit = 20000,
+}) {
+  const ids = ledgerIds.map(oid).filter(Boolean);
+  if (ids.length === 0) return { rows: [], truncated: false };
+
+  const match = {
+    status: "posted",
+    isOptional: { $ne: true },
+    "ledgerEntries.ledgerId": { $in: ids },
+  };
+  const cid = oid(companyId);
+  if (cid) match.companyId = cid;
+
+  const fromT = from ? new Date(from) : null;
+  const toT = to ? new Date(to) : null;
+  if (fromT && !Number.isNaN(fromT.getTime())) match.voucherDate = { $gte: fromT };
+  if (toT && !Number.isNaN(toT.getTime())) {
+    match.voucherDate = { ...(match.voucherDate || {}), $lte: toT };
+  }
+
+  const cap = Math.max(1, Number(limit) || 20000);
+
+  const rows = await Acc_Voucher.aggregate([
+    { $match: match },
+    { $unwind: "$ledgerEntries" },
+    { $match: { "ledgerEntries.ledgerId": { $in: ids } } },
+    {
+      $group: {
+        _id: { ledgerId: "$ledgerEntries.ledgerId", voucherId: "$_id" },
+        voucherDate: { $first: "$voucherDate" },
+        debit: {
+          $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", 0] },
+        },
+        credit: {
+          $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Cr"] }, "$ledgerEntries.amount", 0] },
+        },
+      },
+    },
+    /* Sorted so the assignment below is reproducible run to run: an unsorted
+     * aggregate may return rows in any order, and an ambiguity broken by
+     * arrival order would make the same data total differently on a retry. */
+    { $sort: { "_id.voucherId": 1, "_id.ledgerId": 1 } },
+    { $limit: cap + 1 },
+  ]);
+
+  const truncated = rows.length > cap;
+
+  return {
+    rows: rows.slice(0, cap).map((r) => ({
+      ledgerId: String(r._id.ledgerId),
+      voucherId: String(r._id.voucherId),
+      voucherDate: r.voucherDate || null,
+      debit: r.debit || 0,
+      credit: r.credit || 0,
+      signed: (r.debit || 0) - (r.credit || 0),
+    })),
+    truncated,
+  };
+}
+
+/**
  * The same posted movement, bucketed by CALENDAR MONTH.
  *
  * For the budget page's one large graphic. Everything about what counts is
@@ -397,6 +488,7 @@ module.exports = {
   movementByLedger,
   monthlyMovement,
   voucherMovementsForLedger,
+  voucherMovementsByLedgers,
   actualFrom,
   hydrateLines,
 };

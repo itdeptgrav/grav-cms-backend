@@ -21,6 +21,7 @@ const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalMod
 const { Acc_Ledger, Acc_Group } = require("../../models/Accountant_model/Acc_MasterModels");
 const variance = require("../../services/budgetVariance.service");
 const actuals = require("../../services/budgetActuals.service");
+const overlap = require("../../services/budgetOverlap.service");
 const control = require("../../services/budgetControl.service");
 
 router.use(AccountantAuthMiddleware.accountantAuth);
@@ -599,6 +600,188 @@ function linesOfBudget(budget, department) {
   return department ? items.filter((l) => l.department === department) : items;
 }
 
+/* ── OVERLAP DEDUPLICATION ───────────────────────────────────────────────────
+ * A head budgeted in two overlapping budgets had its spend counted once per
+ * budget, so the dashboard headline read double. See budgetOverlap.service.js
+ * for the rule and for why allocations are deliberately NOT deduplicated.
+ *
+ * This runs on the dashboard only. Opening a single budget still shows the
+ * actuals of that budget's own lines — that figure answers "what has been
+ * spent against this head in this period", which is true of both budgets and
+ * is what someone reading one budget is asking. It is the SUM across budgets
+ * that cannot count the same payment twice.
+ */
+
+/* One aggregation row per (contested head, voucher). A dashboard is a screen:
+ * past this the honest move is to publish the un-deduplicated figure and say
+ * so, rather than a half-corrected one nobody can reconcile. */
+/* Read per request rather than captured at module load, so the truncation
+ * branch can be exercised in a test — it changes a headline figure, and an
+ * untested branch that does that is the kind that is found in production. */
+const maxDedupeRows = () => Number(process.env.BUDGET_MAX_DEDUPE_ROWS) || 20000;
+
+/**
+ * Recompute every line's actual so each voucher is counted exactly once.
+ *
+ * Takes the evaluated budgets and returns a NEW array with contested lines
+ * re-evaluated against their won share. Uncontested lines are returned
+ * untouched — their hydrated actual is already exclusive, and re-deriving it
+ * would risk drift for no gain.
+ *
+ * `contestSet` is deliberately WIDER than `evaluated`: it drops the department
+ * filter, because `department` is the one filter that slices INSIDE a budget
+ * rather than deciding whether a budget is in force. Asking "what did
+ * Logistics spend" must not hand Logistics a payment that Admin's budget
+ * actually won just because Admin was filtered off the screen — the same line
+ * would then report different actuals depending on what the reader was
+ * looking at. It only needs each budget's window, scope, createdAt and line
+ * heads, so it is a plain find() with no aggregation behind it.
+ *
+ * The other filters (financialYear, status, period, scope) DO narrow the
+ * contest, and that is intended: they select which budgets the reader is
+ * treating as in force, and a budget excluded from that set is not competing
+ * for the money.
+ */
+async function dedupeOverlappingActuals(evaluated, contestSet, req, asOf) {
+  const empty = {
+    evaluated,
+    overlap: {
+      dedupeApplied: false,
+      contestedHeads: 0,
+      contestedMovements: 0,
+      ambiguousMovements: 0,
+      duplicateExpense: 0,
+      duplicateRevenue: 0,
+      reason: "no overlapping heads",
+    },
+  };
+  if (!evaluated.length) return empty;
+
+  /* Candidates grouped by the company their actuals are read from — a legacy
+   * row falls back to the caller's, exactly as evaluate() does. Two budgets in
+   * different companies are never in contest: they read different vouchers. */
+  const groups = new Map();
+
+  for (const b of contestSet) {
+    const key = String(actualsCompanyFor(b, req) ?? "__any__");
+    if (!groups.has(key)) groups.set(key, { companyId: actualsCompanyFor(b, req), candidates: [] });
+    for (const line of b.items || []) {
+      const c = overlap.candidateFrom(b, line);
+      if (c) groups.get(key).candidates.push(c);
+    }
+  }
+
+  const cap = maxDedupeRows();
+  const won = new Map();
+  const stats = { contestedHeads: 0, contestedMovements: 0, ambiguousMovements: 0, duplicateSigned: 0 };
+  let touchedAny = false;
+
+  for (const { companyId, candidates } of groups.values()) {
+    const contested = overlap.contestedLedgers(candidates);
+    if (!contested.length) continue;
+
+    /* Only the lines on contested heads take part. A head claimed once is
+     * already exclusive, and querying its vouchers would cost a round trip to
+     * arrive back at the number it already has. */
+    const inPlay = candidates.filter((c) => contested.includes(c.ledgerId));
+    const from = new Date(Math.min(...inPlay.map((c) => c.startMs)));
+    const to = new Date(Math.max(...inPlay.map((c) => c.endMs)));
+
+    const { rows, truncated } = await actuals.voucherMovementsByLedgers({
+      companyId,
+      ledgerIds: contested,
+      from,
+      to,
+      limit: cap,
+    });
+
+    /* Half a deduplication is wrong in a newer and less traceable way than the
+     * double-count it replaces. Publish the old figure and say why. */
+    if (truncated) {
+      return {
+        ...empty,
+        overlap: {
+          ...empty.overlap,
+          contestedHeads: contested.length,
+          reason: `more than ${cap} contested voucher movements`,
+        },
+      };
+    }
+
+    const assigned = overlap.assignMovements({ candidates: inPlay, movements: rows });
+    for (const [key, value] of assigned.won) won.set(key, value);
+
+    stats.contestedHeads += contested.length;
+    stats.contestedMovements += assigned.stats.contestedMovements;
+    stats.ambiguousMovements += assigned.stats.ambiguousMovements;
+    stats.duplicateSigned += assigned.stats.duplicateSigned;
+    touchedAny = true;
+  }
+
+  if (!touchedAny) return empty;
+
+  /* Re-evaluate only the lines whose actual moved. Everything derived from an
+   * actual — remaining, variance, pace, severity, utilisation — comes back out
+   * of the same evaluateLine the rest of the module uses, against the line's
+   * OWN budget window, so a deduplicated line is judged exactly as an
+   * untouched one is. */
+  let duplicateExpense = 0;
+  let duplicateRevenue = 0;
+
+  const out = evaluated.map((b) => {
+    const items = (b.items || []).map((line) => {
+      const key = `${b._id}:${line._id}`;
+      const share = won.get(key);
+      if (!share) return line;
+
+      const deduped = actuals.actualFrom(
+        { debit: share.debit, credit: share.credit, signed: share.debit - share.credit },
+        line.nature,
+      );
+      const removed = (variance.money(line.actual) ?? 0) - deduped;
+      if (line.nature === "revenue") duplicateRevenue += removed;
+      else duplicateExpense += removed;
+
+      const v = variance.evaluateLine({
+        allocated: line.allocatedAmount,
+        actual: deduped,
+        nature: line.nature,
+        startDate: b.startDate,
+        endDate: b.endDate,
+        asOf: asOf || b.asOf,
+        phasing: line.phasing,
+      });
+      return {
+        ...line,
+        ...v,
+        _id: line._id,
+        department: line.department || null,
+        voucherCount: share.voucherCount,
+        /* So a surprising figure can be traced without re-deriving the rule:
+         * this line's actual is its won share, not everything on the head. */
+        dedupedActual: true,
+      };
+    });
+
+    return { ...b, items, totals: variance.rollUp(items) };
+  });
+
+  return {
+    evaluated: out,
+    overlap: {
+      dedupeApplied: true,
+      contestedHeads: stats.contestedHeads,
+      contestedMovements: stats.contestedMovements,
+      ambiguousMovements: stats.ambiguousMovements,
+      /* How much the headline used to overstate by. Kept because the first
+       * question on seeing the number change is "by how much, and where". */
+      duplicateExpense,
+      duplicateRevenue,
+      reason: null,
+    },
+  };
+}
+
 /** Enough of a line to act on it, without shipping the whole document. */
 function attentionLine(line, budget) {
   return {
@@ -663,7 +846,32 @@ router.get("/dashboard", async (req, res) => {
 
     const matched = await Acc_Budget.countDocuments(filter);
     const budgets = await Acc_Budget.find(filter).sort({ createdAt: -1 }).limit(MAX_BUDGETS).lean();
-    const evaluated = await Promise.all(budgets.map((b) => evaluate(b, req, { asOf })));
+    const raw = await Promise.all(budgets.map((b) => evaluate(b, req, { asOf })));
+
+    /* Each budget's own figures are right; their SUM was not, because a head
+     * budgeted twice had its spend counted twice. Every surface below reads
+     * `evaluated`, so correcting the lines here corrects the totals, the
+     * department roll-up, the head roll-up, the attention lists and the
+     * per-budget summaries together — they cannot drift apart. */
+    /* Same selection as above minus the department clause — see
+     * dedupeOverlappingActuals for why ownership must not depend on it.
+     * Projected to the decision fields only; no actuals are read for these. */
+    const contestFilter = { ...filter };
+    delete contestFilter["items.department"];
+    const contestSet = department
+      ? await Acc_Budget.find(contestFilter)
+          .select("_id companyId scope startDate endDate createdAt items._id items.ledgerId")
+          .sort({ createdAt: -1 })
+          .limit(MAX_BUDGETS)
+          .lean()
+      : raw;
+
+    const { evaluated, overlap: overlapMeta } = await dedupeOverlappingActuals(
+      raw,
+      contestSet,
+      req,
+      asOf,
+    );
 
     /* `department` selects which BUDGETS are in scope (any line naming it),
      * exactly as the list route does. Once a budget is in scope the dashboard
@@ -934,6 +1142,11 @@ router.get("/dashboard", async (req, res) => {
       byHead,
       attention,
       budgets: budgetList,
+      /* Says out loud whether the figures above count each voucher once, and
+       * how much the old roll-up was overstating by. `dedupeApplied: false`
+       * with a reason means the totals are the un-deduplicated ones — better
+       * to publish that plainly than to imply a correction that did not run. */
+      overlap: overlapMeta,
       /* Never truncate silently — a dashboard that quietly dropped budgets
        * would read as "this is everything". */
       truncated: matched > budgets.length ? { matched, returned: budgets.length } : null,

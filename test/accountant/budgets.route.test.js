@@ -121,7 +121,7 @@ async function seedCompany() {
     groupName: expGroup.name,
     nature: "expense",
   });
-  return { company, revenueLedger, expenseLedger };
+  return { company, revenueLedger, expenseLedger, revGroup, expGroup };
 }
 
 function validPayload({ companyId, revenueLedger, expenseLedger }) {
@@ -2166,10 +2166,18 @@ describe("dashboard", () => {
   /* ── budget list summary ──────────────────────────────────────────────── */
 
   test("each budget summary carries its own totals and worst severity", async () => {
-    const { company, expenseLedger } = await seedCompany();
+    const { company, expenseLedger, expGroup } = await seedCompany();
+    /* A head of its own. Both budgets on ONE head would be an overlap, and the
+       dashboard now hands that head's spend to a single budget — which is the
+       point of the overlap block below, but is not what this test is asking:
+       it wants two independent budgets, one comfortable and one blown. */
+    const otherHead = await Acc_Ledger.create({
+      companyId: company._id, name: "Repairs & Maintenance",
+      groupId: expGroup._id, groupName: expGroup.name, nature: "expense",
+    });
     await makeBudget({
       companyId: company._id, name: "Healthy",
-      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Admin", allocatedAmount: 1000000 }],
+      items: [{ ledgerId: otherHead._id, nature: "expense", department: "Admin", allocatedAmount: 1000000 }],
     });
     const sick = await makeBudget({
       companyId: company._id, name: "Blown",
@@ -4058,8 +4066,8 @@ describe("dashboard monthly series", () => {
     expect(sum("revenue")).toBe(body.totals.revenue.actual);
   });
 
-  test("KNOWN: overlapping budgets double-count actuals in the totals, not in the series", async () => {
-    const { company, budget, expenseLedger } = await setup();
+  test("overlapping budgets count one voucher once, and the series agrees", async () => {
+    const { company, expenseLedger } = await setup();
     await post({ company, ledger: expenseLedger, amount: 100000, type: "Dr", date: "2026-08-15" });
 
     /* A quarterly budget on the SAME head, inside the yearly one's period —
@@ -4073,16 +4081,21 @@ describe("dashboard monthly series", () => {
     const { body } = await call(`/dashboard?companyId=${company._id}&asOf=2027-03-31`);
     const sum = body.monthly.reduce((s, m) => s + m.expense, 0);
 
-    /* The voucher is ONE ₹1L payment. The series counts it once, which is
-     * right. `totals` rolls up each budget's own evaluated lines, so the same
-     * payment lands in both budgets and the headline reads ₹2L.
+    /* The voucher is ONE ₹1L payment. It used to land in both budgets'
+     * roll-ups and the headline read ₹2L, while the chart beside it read ₹1L
+     * — this test pinned that disagreement rather than working around it,
+     * because the fix moves a figure four surfaces read.
      *
-     * This predates the chart — it is how the Chunk 4 roll-up has always
-     * worked — and it is pinned here rather than quietly worked around,
-     * because the honest fix changes a figure four surfaces read and deserves
-     * its own change. The chart is the deduplicated truth of the two. */
+     * Now the Q2 budget owns it (narrower period, same scope) and the two
+     * agree, which is the contract that matters. */
     expect(sum).toBe(100000);
-    expect(body.totals.expense.actual).toBe(200000);
+    expect(body.totals.expense.actual).toBe(100000);
+    expect(body.overlap).toMatchObject({ dedupeApplied: true, contestedMovements: 1 });
+
+    /* And the money did not merely vanish — it moved to the narrower budget. */
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+    expect(byName["Q2 top-up"].totals.expense.actual).toBe(100000);
+    expect(byName["FY26-27"].totals.expense.actual).toBe(0);
   });
 
   test("a voucher on an IST month boundary buckets by IST, not UTC", async () => {
@@ -4564,5 +4577,448 @@ describe("budget scope", () => {
     expect(b.utilizationPct).toBe(a.utilizationPct);
     expect(b.pace).toBe(a.pace);
     expect(a.actual).toBe(120000);
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * OVERLAP DEDUPLICATION — one voucher, one budget, one place in the headline
+ *
+ * Two budgets covering the same head over overlapping dates both used to claim
+ * the same posted voucher, so the dashboard's roll-up read double. Precedence:
+ * project ▸ department ▸ company, then narrower period, then later createdAt.
+ *
+ * Per-budget detail is deliberately NOT deduplicated — see the last block.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("dashboard overlap deduplication", () => {
+  let seq = 0;
+
+  const YEAR = { startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31") };
+  const Q2 = { startDate: new Date("2026-07-01"), endDate: new Date("2026-09-30") };
+
+  const mkBudget = ({ company, ledger, name, scope, dates = YEAR, amount = 500000, extra = {}, nature = "expense", department = "Logistics" }) =>
+    Acc_Budget.create({
+      name,
+      financialYear: "2026-27",
+      period: dates === Q2 ? "quarterly" : "yearly",
+      ...(dates === Q2 ? { quarter: 2 } : {}),
+      status: "active",
+      companyId: company._id,
+      ...dates,
+      ...(scope ? { scope } : {}),
+      ...extra,
+      items: [{ ledgerId: ledger._id, ledgerName: ledger.name, nature, department, allocatedAmount: amount }],
+    });
+
+  const post = ({ company, ledger, amount, type = "Dr", date, status = "posted", isOptional = false }) =>
+    Acc_Voucher.create({
+      companyId: company._id,
+      voucherType: type === "Cr" ? "sales" : "purchase",
+      voucherNumber: `OV/${seq++}/${Date.now()}`,
+      voucherDate: new Date(date),
+      status,
+      isOptional,
+      grandTotal: amount,
+      ledgerEntries: [{ ledgerId: ledger._id, ledgerName: ledger.name, type, amount }],
+    });
+
+  const dash = (company, extra = "") =>
+    call(`/dashboard?companyId=${company._id}&asOf=2027-03-31${extra}`);
+
+  /* ── The core defect ───────────────────────────────────────────────────── */
+
+  test("company + department budgets on one head and date count the voucher once", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Logistics FY", scope: "department", extra: { department: "Logistics" } });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+
+    expect(body.totals.expense.actual).toBe(100000);
+    expect(body.overlap.dedupeApplied).toBe(true);
+    expect(body.overlap.contestedMovements).toBe(1);
+    // The figure the old roll-up was overstating by, kept for tracing.
+    expect(body.overlap.duplicateExpense).toBe(100000);
+  });
+
+  test("department beats company", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    /* The department budget is created FIRST and both cover the same year, so
+       every later tie-break (narrower period, then later createdAt) points at
+       the COMPANY budget. Only scope precedence can pick the department one —
+       created the other way round this test passes with the rule removed. */
+    await mkBudget({ company, ledger: expenseLedger, name: "Logistics FY", scope: "department", extra: { department: "Logistics" } });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+
+    expect(byName["Logistics FY"].totals.expense.actual).toBe(100000);
+    expect(byName["Company FY"].totals.expense.actual).toBe(0);
+  });
+
+  test("project beats department and company", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    /* Created most-specific first, so createdAt favours the company budget and
+       cannot be what decides this. Same year on all three, so period cannot
+       either. */
+    await mkBudget({ company, ledger: expenseLedger, name: "Greenfield", scope: "project", extra: { costCentreName: "Greenfield" } });
+    await mkBudget({ company, ledger: expenseLedger, name: "Logistics FY", scope: "department", extra: { department: "Logistics" } });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+
+    expect(byName["Greenfield"].totals.expense.actual).toBe(100000);
+    expect(byName["Logistics FY"].totals.expense.actual).toBe(0);
+    expect(byName["Company FY"].totals.expense.actual).toBe(0);
+    expect(body.totals.expense.actual).toBe(100000);
+    // Two losers were each adding it to the headline.
+    expect(body.overlap.duplicateExpense).toBe(200000);
+  });
+
+  test("scope outranks period: a yearly project budget beats a quarterly company one", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await mkBudget({ company, ledger: expenseLedger, name: "Greenfield FY", scope: "project", extra: { costCentreName: "Greenfield" } });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+
+    expect(byName["Greenfield FY"].totals.expense.actual).toBe(100000);
+    expect(byName["Company Q2"].totals.expense.actual).toBe(0);
+  });
+
+  test("within one scope the narrower period wins", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+
+    expect(byName["Company Q2"].totals.expense.actual).toBe(100000);
+    expect(byName["Company FY"].totals.expense.actual).toBe(0);
+  });
+
+  test("a voucher outside the narrower window still belongs to the wider budget", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" }); // in Q2
+    await post({ company, ledger: expenseLedger, amount: 70000, date: "2026-11-20" });  // outside Q2
+
+    const { body } = await dash(company);
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+
+    expect(byName["Company Q2"].totals.expense.actual).toBe(100000);
+    expect(byName["Company FY"].totals.expense.actual).toBe(70000);
+    // Neither payment is lost and neither is counted twice.
+    expect(body.totals.expense.actual).toBe(170000);
+    expect(body.overlap.contestedMovements).toBe(1);
+  });
+
+  /* ── Allocations are NOT deduplicated ──────────────────────────────────── */
+
+  test("allocation totals still sum every approved line — two budgets do authorise the sum", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company", amount: 500000 });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2, amount: 200000 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+
+    /* A supplementary quarter budget MEANS more money is authorised. Only the
+       one payment that followed is one payment. */
+    expect(body.totals.expense.allocated).toBe(700000);
+    expect(body.totals.expense.actual).toBe(100000);
+  });
+
+  /* ── Every surface moves together ──────────────────────────────────────── */
+
+  test("byDepartment, byHead and the totals all read the deduplicated figure", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+
+    const logistics = body.byDepartment.find((d) => d.department === "Logistics");
+    expect(logistics.expense.actual).toBe(100000);
+
+    const head = body.byHead.find((h) => String(h.ledgerId) === String(expenseLedger._id));
+    expect(head.actual).toBe(100000);
+    // The head still names both budgets — the allocations genuinely are two.
+    expect(head.lineCount).toBe(2);
+    expect(head.allocated).toBe(1000000);
+
+    expect(body.totals.expense.actual).toBe(100000);
+  });
+
+  test("the attention lists judge lines on their deduplicated actual", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    /* Alone, ₹1L against ₹80k is over budget. Deduplicated, the yearly budget
+       owns none of it and must not be reported as overspent. */
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company", amount: 80000 });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2, amount: 500000 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+
+    const over = body.attention.overBudget.map((l) => l.budgetName);
+    expect(over).not.toContain("Company FY");
+    // And the winner, comfortably inside its own number, is not flagged either.
+    expect(over).not.toContain("Company Q2");
+  });
+
+  test("a losing line reports zero spend and full remaining, not a stale figure", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company", amount: 500000 });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    const loser = body.budgets.find((b) => b.name === "Company FY");
+
+    expect(loser.totals.expense.actual).toBe(0);
+    // Everything derived from the actual moved with it.
+    expect(loser.totals.expense.allocated).toBe(500000);
+    expect(loser.totals.expense.variance).toBe(500000);
+  });
+
+  /* ── Sign, scoping and what counts ─────────────────────────────────────── */
+
+  test("revenue keeps its sign through deduplication", async () => {
+    const { company, revenueLedger } = await seedCompany();
+    const opts = { nature: "revenue", department: "Sales", amount: 4000000 };
+    await mkBudget({ company, ledger: revenueLedger, name: "Company FY", scope: "company", ...opts });
+    await mkBudget({ company, ledger: revenueLedger, name: "Company Q2", scope: "company", dates: Q2, ...opts });
+    await post({ company, ledger: revenueLedger, amount: 900000, type: "Cr", date: "2026-08-15" });
+
+    const { body } = await dash(company);
+
+    // Credit on a revenue head is POSITIVE earned revenue, not negative spend.
+    expect(body.totals.revenue.actual).toBe(900000);
+    expect(body.overlap.duplicateRevenue).toBe(900000);
+    expect(body.budgets.find((b) => b.name === "Company Q2").totals.revenue.actual).toBe(900000);
+  });
+
+  test("draft and optional vouchers are excluded, exactly as before", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+    await post({ company, ledger: expenseLedger, amount: 999999, date: "2026-08-16", status: "draft" });
+    await post({ company, ledger: expenseLedger, amount: 888888, date: "2026-08-17", isOptional: true });
+
+    const { body } = await dash(company);
+    expect(body.totals.expense.actual).toBe(100000);
+  });
+
+  test("another company's postings never reach the deduplicated totals", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const other = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+    await post({ company: other.company, ledger: expenseLedger, amount: 500000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    expect(body.totals.expense.actual).toBe(100000);
+  });
+
+  test("a legacy budget carrying no companyId is still scoped to the selected company", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const other = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    /* No companyId at all — a pre-multi-company row. Its actuals fall back to
+       the caller's company, and deduplication must use the same fallback or it
+       would compare vouchers from two different sets of books. */
+    await Acc_Budget.create({
+      name: "Legacy FY", financialYear: "2026-27", period: "yearly", status: "active", ...YEAR,
+      items: [{ ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 500000 }],
+    });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+    await post({ company: other.company, ledger: expenseLedger, amount: 500000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    expect(body.totals.expense.actual).toBe(100000);
+    expect(body.budgets.map((b) => b.name).sort()).toEqual(["Company Q2", "Legacy FY"]);
+  });
+
+  test("an unset scope is treated as company, so pre-scope rows lose to a department budget", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    /* Department budget first, so createdAt would hand it to the pre-scope row
+       if the unset scope were not being read as company. */
+    await mkBudget({ company, ledger: expenseLedger, name: "Logistics FY", scope: "department", extra: { department: "Logistics" } });
+    // Created without a scope field at all, as every row did before Chunk A.
+    await Acc_Budget.create({
+      name: "Pre-scope FY", financialYear: "2026-27", period: "yearly", status: "active",
+      companyId: company._id, ...YEAR,
+      items: [{ ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 500000 }],
+    });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+
+    expect(byName["Logistics FY"].totals.expense.actual).toBe(100000);
+    expect(byName["Pre-scope FY"].totals.expense.actual).toBe(0);
+  });
+
+  /* ── Not a contest ─────────────────────────────────────────────────────── */
+
+  test("non-overlapping budgets are left alone and say so", async () => {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Spend FY", scope: "company" });
+    await mkBudget({ company, ledger: revenueLedger, name: "Earn FY", scope: "company", nature: "revenue", department: "Sales", amount: 4000000 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+    await post({ company, ledger: revenueLedger, amount: 900000, type: "Cr", date: "2026-08-15" });
+
+    const { body } = await dash(company);
+
+    expect(body.totals.expense.actual).toBe(100000);
+    expect(body.totals.revenue.actual).toBe(900000);
+    expect(body.overlap.dedupeApplied).toBe(false);
+    expect(body.overlap.reason).toBe("no overlapping heads");
+  });
+
+  test("two budgets on different heads never contest each other", async () => {
+    const { company, expenseLedger, revenueLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "A", scope: "company" });
+    await mkBudget({ company, ledger: revenueLedger, name: "B", scope: "department", nature: "revenue", department: "Sales", amount: 4000000, extra: { department: "Sales" } });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+    expect(body.overlap.dedupeApplied).toBe(false);
+    expect(body.totals.expense.actual).toBe(100000);
+  });
+
+  /* ── Ambiguity is admitted to, not hidden ──────────────────────────────── */
+
+  test("two indistinguishable budgets still total correctly, and say the pick was arbitrary", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const at = new Date("2026-02-01T00:00:00.000Z");
+    /* Same scope, same period, same createdAt — nothing about either budget
+       distinguishes it. The pick falls to the id tie-break, which keeps the
+       figure stable run to run, but it IS arbitrary and the response says so
+       rather than letting it look like a considered decision. */
+    for (const name of ["Twin A", "Twin B"]) {
+      await Acc_Budget.create({
+        name, financialYear: "2026-27", period: "yearly", status: "active",
+        scope: "company", companyId: company._id, createdAt: at, ...YEAR,
+        items: [{ ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 500000 }],
+      });
+    }
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company);
+
+    expect(body.totals.expense.actual).toBe(100000);
+    expect(body.overlap.ambiguousMovements).toBe(1);
+    // Exactly one of them owns it — never both, never neither.
+    const owned = body.budgets.map((b) => b.totals.expense.actual).sort();
+    expect(owned).toEqual([0, 100000]);
+  });
+
+  test("the same data deduplicates the same way on a repeat read", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const at = new Date("2026-02-01T00:00:00.000Z");
+    for (const name of ["Twin A", "Twin B"]) {
+      await Acc_Budget.create({
+        name, financialYear: "2026-27", period: "yearly", status: "active",
+        scope: "company", companyId: company._id, createdAt: at, ...YEAR,
+        items: [{ ledgerId: expenseLedger._id, ledgerName: "A", nature: "expense", department: "Logistics", allocatedAmount: 500000 }],
+      });
+    }
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const winner = async () =>
+      (await dash(company)).body.budgets.find((b) => b.totals.expense.actual > 0).name;
+
+    /* An arbitrary pick that moved between reads would make the same page show
+       different numbers on a refresh. */
+    expect(await winner()).toBe(await winner());
+  });
+
+  /* ── Too much to decide ────────────────────────────────────────────────── */
+
+  test("past the cap it publishes the un-deduplicated figure and says so", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+    await post({ company, ledger: expenseLedger, amount: 60000, date: "2026-08-20" });
+
+    const before = process.env.BUDGET_MAX_DEDUPE_ROWS;
+    process.env.BUDGET_MAX_DEDUPE_ROWS = "1";
+    try {
+      const { body } = await dash(company);
+
+      /* Half a deduplication is wrong in a newer and less traceable way than
+         the double-count it replaces, so it does neither — it publishes the
+         old figure and labels it. Both budgets still claim both payments. */
+      expect(body.overlap.dedupeApplied).toBe(false);
+      expect(body.overlap.contestedHeads).toBe(1);
+      expect(body.overlap.reason).toMatch(/more than 1 contested voucher movements/);
+      expect(body.totals.expense.actual).toBe(320000);
+    } finally {
+      if (before === undefined) delete process.env.BUDGET_MAX_DEDUPE_ROWS;
+      else process.env.BUDGET_MAX_DEDUPE_ROWS = before;
+    }
+  });
+
+  /* ── The filter must not change who owns what ──────────────────────────── */
+
+  test("a department filter narrows what is shown without handing it money it lost", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    /* Same head, two departments, overlapping windows. Logistics' line sits in
+       the wider budget and loses; filtering to Logistics must not resurrect
+       it, or the same line would report differently depending on the filter. */
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company", department: "Logistics" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Admin Q2", scope: "company", dates: Q2, department: "Admin" });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await dash(company, "&department=Logistics");
+    expect(body.totals.expense.actual).toBe(0);
+
+    const { body: admin } = await dash(company, "&department=Admin");
+    expect(admin.totals.expense.actual).toBe(100000);
+  });
+
+  /* ── Per-budget detail is deliberately untouched ───────────────────────── */
+
+  test("opening one budget still shows the actuals of its own lines", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    const year = await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    /* The dashboard says the year owns none of it. The year's own page still
+       says ₹1L was spent on this head in this period — which is true, and is
+       the question someone reading one budget is asking. Only the SUM across
+       budgets cannot count the payment twice. */
+    const { body } = await call(`/${year._id}?companyId=${company._id}&asOf=2027-03-31`);
+    expect(body.budget.items[0].actual).toBe(100000);
+
+    const { body: dashboard } = await dash(company);
+    expect(dashboard.budgets.find((b) => b.name === "Company FY").totals.expense.actual).toBe(0);
+  });
+
+  test("the list endpoint is unchanged too — deduplication is a dashboard concern", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await mkBudget({ company, ledger: expenseLedger, name: "Company FY", scope: "company" });
+    await mkBudget({ company, ledger: expenseLedger, name: "Company Q2", scope: "company", dates: Q2 });
+    await post({ company, ledger: expenseLedger, amount: 100000, date: "2026-08-15" });
+
+    const { body } = await call(`/?companyId=${company._id}&withTotals=true&asOf=2027-03-31`);
+    const byName = Object.fromEntries(body.budgets.map((b) => [b.name, b]));
+    expect(byName["Company FY"].totals.expense.actual).toBe(100000);
+    expect(byName["Company Q2"].totals.expense.actual).toBe(100000);
   });
 });

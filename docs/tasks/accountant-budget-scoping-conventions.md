@@ -1,6 +1,18 @@
 # Accountant — Budget scoping: company, department and project
 
-> **Status:** Proposed spec. No code written.
+> **Status:** §4 and the `scope` field are BUILT. §5 (project spend
+> attribution) and §6 (the department master) are still proposed.
+>
+> - **Chunk A — shipped.** `Acc_Budget.scope` (`company | department |
+>   project`) with its owner fields, the list/dashboard scope filter, and the
+>   scoping UI. An unset scope on a pre-existing row reads as `company`, so no
+>   migration was needed.
+> - **Chunk B — shipped.** §4's double-count. The dashboard roll-up now gives
+>   each voucher to one budget, by the precedence recommended in §4.2(b):
+>   `project ▸ department ▸ company`, then the narrower period, then the later
+>   `createdAt`, then a stable id. Lives in
+>   `services/budgetOverlap.service.js`. Per-budget detail and budget control
+>   are deliberately unchanged — see below.
 >
 > **Backend:** `/Users/risheeray/grav-cms-backend`
 >
@@ -11,12 +23,19 @@
 > that can be used together, rather than three shapes that happen to fit in the
 > same collection.
 >
-> **Headline constraint, established by inspecting the live database:** the
-> module today assumes **each rupee of spend belongs to exactly one budget**.
-> Two budgets covering the same head over the same dates both claim the same
-> voucher, and the dashboard headline reads double. Until that is fixed, the
-> three conventions are not three options — they are three ways to get the same
-> total wrong. §4 is the prerequisite for everything else.
+> **Headline constraint — RESOLVED by Chunk B.** The module used to assume
+> each rupee of spend belonged to exactly one budget: two budgets covering the
+> same head over the same dates both claimed the same voucher, and the
+> dashboard headline read double. That was the prerequisite for using the three
+> conventions together, and it is now fixed. On the demo dataset the correction
+> removed ₹14,30,000 of double-counted spend, and the dashboard headline now
+> matches the monthly chart exactly — the two disagreed for as long as the
+> defect existed.
+>
+> **Still true:** a *project* budget cannot yet attribute spend to its project
+> (§5). Scope decides which budget owns a voucher; it does not decide which
+> project the money was for. A project budget's actuals are still every rupee
+> on its heads.
 
 ---
 
@@ -109,6 +128,11 @@ Checked against the production Atlas cluster, 2026-08-25:
 
 ## 4. Prerequisite — overlapping budgets double-count actuals
 
+> **BUILT (Chunk B).** What follows is the analysis that led to the fix, kept
+> as written. The recommendation at the end of §4.2 is what shipped. What
+> actually got built, and the parts of it this section did not anticipate, are
+> in §4.4.
+
 **This blocks conventions 1+2 or 1+3 coexisting. It is not optional.**
 
 ### 4.1 The defect
@@ -173,6 +197,43 @@ why it needs its own slice with its own tests, not a change made in passing.
 (`checkBudgetAvailability`) already sums the *allocations* of every matching
 line, which is correct — two budgets each allocating to a head genuinely do
 authorise the sum. Only the *actuals* double-count.
+
+### 4.4 What shipped, and three things §4.2 did not anticipate
+
+Option (b) with (a) as the tie-break, as recommended. The rule is a total
+order, so the same data always totals the same way:
+
+1. scope — `project ▸ department ▸ company` (an unset scope IS company)
+2. narrower period wins
+3. later `createdAt` wins
+4. budget id, then line id, ascending
+
+Three things this section did not foresee, each of which changed the design:
+
+**The tie-break is reached more often than expected, and is admitted to.**
+Two budgets of the same scope over the same period created in the same
+millisecond are genuinely indistinguishable — rule 4 then picks arbitrarily.
+It is deterministic, so a refresh never moves the figure, but the response
+counts those decisions as `overlap.ambiguousMovements` and the dashboard says
+so rather than letting an arbitrary pick look considered.
+
+**A department filter must not change who owns what.** `department` is the one
+dashboard filter that slices *inside* a budget rather than deciding whether a
+budget is in force. Deduplicating within the filtered subset would hand a
+Logistics line a payment that Admin's budget actually won, and the same line
+would then report different actuals depending on what was on screen. So the
+contest set deliberately drops that one filter. The others
+(`financialYear`, `status`, `period`, `scope`) do narrow the contest, and that
+is intended — they select which budgets the reader treats as in force.
+
+**Half a deduplication is worse than none.** Past a cap on contested voucher
+movements the roll-up publishes the *un-deduplicated* figure and labels it,
+rather than a partially corrected one that reconciles to nothing.
+
+**Deliberately unchanged**, and pinned by tests so they stay that way:
+per-budget detail (opening one budget still shows every rupee spent on its own
+heads — true of both budgets, and the question a reader of one budget is
+asking), the list endpoint, and budget control on posting.
 
 ---
 

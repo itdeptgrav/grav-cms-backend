@@ -847,6 +847,55 @@ describe("the control and the budget screens agree", () => {
     expect(drill.body.vouchers).toHaveLength(1);
     expect(String(drill.body.vouchers[0].voucherId)).toBe(String(created.body._id));
   });
+
+  /* ── CHUNK B GUARD ────────────────────────────────────────────────────────
+   * The dashboard now hands one voucher to ONE budget, so its roll-up counts
+   * each payment once. Control must NOT follow: two budgets each allocating to
+   * a head genuinely do authorise the sum, and that is precisely what a
+   * supplementary quarter budget means. Deduplicating here would refuse
+   * spending the company has actually approved. */
+  test("control still sums allocations across every overlapping budget", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await Acc_Budget.create({
+      name: "Q2 top-up", financialYear: "2026-27", period: "quarterly", quarter: 2,
+      status: "active", scope: "department", department: "Logistics",
+      startDate: new Date("2026-07-01"), endDate: new Date("2026-09-30"), companyId: company._id,
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 250000 }],
+    });
+
+    const check = await call("/budgets/check-availability", {
+      method: "POST",
+      body: checkBody({ company, ledger: expenseLedger, amount: 0 }),
+    });
+
+    /* ₹1L + ₹2.5L. If control ever deduplicated the way the dashboard does,
+       this would read ₹2.5L and the last ₹1L of approved budget would become
+       unspendable without an override. */
+    expect(check.body.results[0].allocated).toBe(350000);
+  });
+
+  test("control counts the spend itself once, even against overlapping budgets", async () => {
+    const { company, expenseLedger } = await seedCompany();
+    await liveBudget({ companyId: company._id, ledger: expenseLedger, allocated: 100000 });
+    await Acc_Budget.create({
+      name: "Q2 top-up", financialYear: "2026-27", period: "quarterly", quarter: 2,
+      status: "active", startDate: new Date("2026-07-01"), endDate: new Date("2026-09-30"),
+      companyId: company._id,
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 250000 }],
+    });
+    await postedSpend({ companyId: company._id, ledger: expenseLedger, amount: 80000 });
+
+    const check = await call("/budgets/check-availability", {
+      method: "POST",
+      body: checkBody({ company, ledger: expenseLedger, amount: 0 }),
+    });
+
+    /* Actuals come from the ledger once, per head — control reads the head,
+       not the budgets, so overlapping budgets never doubled the spend here
+       even before Chunk B. Pinned so the dedupe cannot leak into this path. */
+    expect(check.body.results[0].actual).toBe(80000);
+  });
 });
 
 /* ─────────────────────────────────────────────────────────────────────────────
