@@ -382,6 +382,7 @@ router.patch("/:id/toggle-status", salesAuth, async (req, res) => {
 router.get("/:id/orders", salesAuth, async (req, res) => {
   try {
     const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
+const { nextRequestId } = require("../../../services/requestId");
     const mongoose = require("mongoose");
 
     let custObjectId;
@@ -657,8 +658,7 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
         .status(400)
         .json({ success: false, message: "No valid items in request" });
 
-    const count = await CustomerRequest.countDocuments();
-    const requestId = `REQ-${new Date().getFullYear()}-${String(count + 1).padStart(4, "0")}`;
+    const requestId = await nextRequestId(CustomerRequest);
 
     const newRequest = new CustomerRequest({
       requestId,

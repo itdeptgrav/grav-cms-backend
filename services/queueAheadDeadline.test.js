@@ -68,8 +68,12 @@ test("a task never waits for itself", () => {
 test("equal ranks are broken by which was raised first", () => {
   /* Two P2s with no tie-break each see the other as "not ahead of me", so both
      claim the same hour and neither waits. */
-  assert.match(src, /if \(theirRank === myRank\)/);
-  assert.match(src, /theirCreated >= myCreated/);
+  /* The pairwise comparison became a sort when the walk started ordering the
+     whole queue — the promotion of workable work above blocked work is a
+     property of the list, not of any two tasks. The tie-break is unchanged and
+     is now the sort's second key. */
+  assert.match(src, /a\.rank - b\.rank \|\| a\.createdMs - b\.createdMs/);
+  assert.match(src, /createdMs: readMs\(other\.createdAtISO\) \?\? readMs\(other\.createdAt\) \?\? 0/);
 });
 
 test("every accept surface passes the task id", () => {
@@ -115,7 +119,7 @@ test("a fixed calendar date does not occupy the queue", () => {
    * The guarantee is unchanged and is now asserted where the read lives, so
    * this still fails if a fixed calendar date creeps back into queue time.
    */
-  assert.match(src, /const end = effectiveEndMs\(other\);/);
+  assert.match(src, /endMs: effectiveEndMs\(other\)/);
 
   const body = src.slice(
     src.indexOf("function effectiveEndMs"),

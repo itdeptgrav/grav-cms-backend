@@ -31,7 +31,7 @@ const { createWithRef } = require("./sampleStyleRef");
  * @param {object}   deps.enquiry      Enquiry document/lean object with `products`
  * @param {Function} deps.briefFromProduct  (product) => brief subdocument
  * @param {object}   deps.actor        { employeeId, name } audit stamp
- * @returns {Promise<{styles: Array, created: number, renamed: number, backfilled: number}>}
+ * @returns {Promise<{styles: Array, created: number, renamed: number, backfilled: number, waived: number}>}
  */
 async function provisionJourneyStyles({
   SampleStyle,
@@ -39,10 +39,33 @@ async function provisionJourneyStyles({
   enquiry,
   briefFromProduct,
   actor,
+  /**
+   * `(product) => Promise<{proven: boolean}>` — has this garment actually been
+   * made before? Injected so this service stays DB-free and unit-testable.
+   *
+   * OMITTED MEANS NOTHING IS WAIVED, deliberately. Failing closed costs a
+   * sample nobody needed; failing open sends an unmade garment to a customer
+   * with no sample and no tech sheet, which costs an order.
+   */
+  assessDevelopment = null,
 }) {
   const products = (enquiry?.products || []).filter((p) => p && p.product);
 
-  const existing = await SampleStyle.find({ journeyId: journey._id, isActive: true });
+  // BASE VARIANTS ONLY.
+  //
+  // A product can now be developed as several styles at once (see the
+  // `variantKey` field on SampleStyle). Provisioning owns exactly one of them:
+  // the base, raised straight from the enquiry product. If it saw the variants
+  // too it would match one of them by name, overwrite its brief with the
+  // enquiry's on every sync, and undo the very thing that makes it a variant.
+  //
+  // It also must not CREATE anything for a product that already has a base, so
+  // the maps are built from base rows and the "not found" path stays correct.
+  const existing = await SampleStyle.find({
+    journeyId: journey._id,
+    isActive: true,
+    $or: [{ variantKey: "" }, { variantKey: { $exists: false } }],
+  });
   const byProductId = new Map(
     existing.filter((s) => s.enquiryProductId).map((s) => [String(s.enquiryProductId), s]),
   );
@@ -52,6 +75,7 @@ async function provisionJourneyStyles({
   let created = 0;
   let renamed = 0;
   let backfilled = 0;
+  let waived = 0;
 
   for (let i = 0; i < products.length; i++) {
     const p = products[i];
@@ -59,6 +83,37 @@ async function provisionJourneyStyles({
 
     // Identity first, name only as a fallback for pre-existing rows.
     let style = (pid && byProductId.get(pid)) || byName.get(p.product);
+
+    // SAMPLING IS WAIVED BY THE PRODUCT, NOT BY THE CUSTOMER (22 Aug 2026).
+    //
+    // A row linked to a registered stock item names a garment that has been
+    // made before — it carries a costed bill of materials and a measured SAM,
+    // so a physical sample would establish nothing that is not already known.
+    // A row typed by hand names something new, and that is what sampling is
+    // for. The journey's business type says nothing about this either way: a
+    // repeat customer can perfectly well ask for a garment nobody has made,
+    // which is why the old businessType check in salesJourneys.js was removed.
+    //
+    // Applied only where the style is CREATED. Re-provisioning must never reach
+    // into a style already being sampled and cancel it.
+    //
+    // BEING REGISTERED IS NOT ENOUGH (22 Aug 2026, corrected same day).
+    //
+    // The first cut of this waived the step on `Boolean(p.stockItemId)` alone.
+    // That is too loose: a stock item is created the moment someone types a
+    // name, so a garment nobody has ever cut would skip both the tech sheet and
+    // the sample on the strength of existing in a dropdown.
+    //
+    // The test is now whether it has actually BEEN MADE — a prior approved
+    // sample, or operations with measured times. See services/developmentRecord
+    // .js for why a bill of materials does not count.
+    //
+    // A registered-but-unproven product still gets its register link recorded,
+    // so the stage can show what IS known while asking for the sample anyway.
+    const registered = Boolean(p.stockItemId);
+    const proven = registered && assessDevelopment
+      ? Boolean((await assessDevelopment(p))?.proven)
+      : false;
 
     if (!style) {
       try {
@@ -72,10 +127,47 @@ async function provisionJourneyStyles({
           ownerId: journey.ownerId,
           ownerName: journey.ownerName,
           brief: briefFromProduct(p),
+          sourceStockItemId: p.stockItemId || undefined,
+          sourceStockItemReference: p.stockItemReference || undefined,
+          // The product is now normally registered AT the enquiry stage (see
+          // routes/CMS_Routes/Sales/enquiries.js's product-wise requirement —
+          // 24 Aug 2026, explicit request), not later through R&D's own
+          // Production wizard — so the style already knows which stock item
+          // it's developing INTO from the moment it's raised. This is
+          // `production.stockItemId` (the TARGET, filled in as development
+          // happens), not `sourceStockItemId` above (a DIFFERENT, older
+          // product this style proves against) — the two answer different
+          // questions and can both be set. R&D's wizard skips straight to
+          // Quantities once this is here (see its own `step` computation).
+          production: p.stockItemId
+            ? {
+              stockItemId: p.stockItemId,
+              status: "stock_item_linked",
+              log: [{
+                kind: "stock_item_linked",
+                note: `Registered at the enquiry stage${p.stockItemReference ? ` (${p.stockItemReference})` : ""}.`,
+                by: actor,
+                at: new Date(),
+              }],
+            }
+            : undefined,
+          techSheet: proven ? { status: "notApplicable", revisions: [] } : undefined,
+          sample: proven ? { status: "notApplicable", rounds: [], revisions: [] } : undefined,
+          // Recorded in the shared timeline, because "why was this never
+          // sampled" is exactly the question somebody asks six months later.
+          history: proven
+            ? [{
+              kind: "development_waived",
+              note: `Already made before${p.stockItemReference ? ` (${p.stockItemReference})` : ""} — no tech sheet or sample needed.`,
+              by: actor,
+              at: new Date(),
+            }]
+            : undefined,
           createdBy: actor,
           updatedBy: actor,
         });
         created += 1;
+        if (proven) waived += 1;
       } catch (err) {
         // Two callers racing to provision the same journey (React StrictMode's
         // double effect-invoke, or Sales and R&D opening it within
@@ -102,8 +194,32 @@ async function provisionJourneyStyles({
       // The rename case this whole change exists for: the product's text moved,
       // so carry the style with it instead of stranding it.
       if (style.productName !== p.product) {
+        // Carry the SIBLINGS too. productName is what groups a family, so
+        // renaming only the base would split it: the variants would keep the
+        // old name, stop appearing under the product, and be free to collide
+        // with a future style of that name.
+        await SampleStyle.updateMany(
+          { journeyId: journey._id, productName: style.productName, variantKey: { $nin: ["", null] } },
+          { $set: { productName: p.product } },
+        );
         style.productName = p.product;
         renamed += 1;
+      }
+      // Backfill for a row registered AFTER its style already existed (the
+      // salesperson added the product first, came back and registered it
+      // later) — never overwrites a stockItemId R&D's own wizard already set
+      // by hand, and never touches anything past that first link.
+      if (p.stockItemId && !style.production?.stockItemId) {
+        if (!style.production) style.production = {};
+        style.production.stockItemId = p.stockItemId;
+        if (!style.production.status || style.production.status === "not_started") style.production.status = "stock_item_linked";
+        style.production.log = style.production.log || [];
+        style.production.log.push({
+          kind: "stock_item_linked",
+          note: `Registered at the enquiry stage${p.stockItemReference ? ` (${p.stockItemReference})` : ""}.`,
+          by: actor,
+          at: new Date(),
+        });
       }
       style.brief = briefFromProduct(p);
       style.updatedBy = actor;
@@ -112,7 +228,7 @@ async function provisionJourneyStyles({
     out.push(style);
   }
 
-  return { styles: out, created, renamed, backfilled };
+  return { styles: out, created, renamed, backfilled, waived };
 }
 
 module.exports = { provisionJourneyStyles };

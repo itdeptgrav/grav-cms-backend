@@ -1,4 +1,15 @@
-> **Status:** Active
+> **Status:** Paused by new request.
+>
+> **Current requested work:** Redesign the full Accounting app in
+> `/Users/risheeray/grav-cms` so it follows the current Sales app design
+> language. The active planning brief is
+> `docs/tasks/accountant-sales-design-redesign.md`.
+>
+> **Important:** The Sales lead/journey scope below remains durable context, but
+> it is not the active implementation target while the Accounting redesign is
+> being planned or executed.
+
+> **Previous status before pause:** Active
 >
 > **Product model (current, supersedes the older 6-chunk plan below):**
 > Prospect (a possible buyer we've found and are still preparing to work) and

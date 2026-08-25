@@ -573,6 +573,22 @@ router.post("/employee/:employeeId/priority-order", verifyCoworkToken, verifyEmp
     //
     // Only when somebody ELSE did it: a person dragging their own list already
     // knows, and notifying them would make every drag ring their own bell.
+    /* **Whoever moved it, if the TOP changed they are told.**
+     *
+     * The reorder notice below is deliberately only for somebody ELSE's edit —
+     * a person dragging their own list does not need telling they dragged it.
+     * But "what am I supposed to be doing now" is a different question from
+     * "who rearranged my day", and it is the one the queue exists to answer.
+     * Deduped on the task id, so a reorder that leaves the same task on top
+     * says nothing at all. */
+    await svc._notifyP1Changed({
+      employeeId,
+      p1TaskId: orderedTaskIds[0] || null,
+      cause: actor !== employeeId
+        ? `${req.coworkUser.name || "your manager"} reordered your work`
+        : null,
+    }).catch(() => {});
+
     if (actor !== employeeId) {
       await _notify({
         recipientIds: [employeeId],
@@ -1835,6 +1851,66 @@ router.post("/task/:taskId/submit-completion", verifyCoworkToken, verifyEmployee
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// ── OUTPUTS ──────────────────────────────────────────────────────────────────
+// What a task hands over, delivered and reviewed one at a time. See
+// `taskForward.service.js` under OUTPUTS for why these are separate from
+// `requirements` and from the task-level submission.
+
+// Every output in the workspace, with labels and approval state. The one read
+// that lets a task know whether ITS inputs have landed — see `listOutputIndex`.
+router.get("/task-outputs/index", verifyCoworkToken, verifyEmployeeToken, async (_req, res) => {
+  try {
+    res.json(await svc.listOutputIndex());
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Declare (or re-declare) a task's outputs.
+router.put("/task/:taskId/outputs", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { outputs } = req.body;
+    const result = await svc.setTaskOutputs({
+      taskId: req.params.taskId,
+      employeeId: req.coworkUser.employeeId,
+      outputs: Array.isArray(outputs) ? outputs : [],
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Hand ONE output over for review. The task itself does not move.
+router.post("/task/:taskId/outputs/:outputId/submit", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { message, imageUrls, pdfAttachments } = req.body;
+    const result = await svc.submitOutput({
+      taskId: req.params.taskId,
+      outputId: req.params.outputId,
+      employeeId: req.coworkUser.employeeId,
+      employeeName: req.coworkUser.name,
+      message: message || "",
+      imageUrls: imageUrls || [],
+      pdfAttachments: pdfAttachments || [],
+    });
+    res.status(201).json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// Approve or return ONE output. Approving releases whatever was waiting on it,
+// and the last approval finishes the task.
+router.post("/task/:taskId/outputs/:outputId/review", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { approved, note } = req.body;
+    const result = await svc.reviewOutput({
+      taskId: req.params.taskId,
+      outputId: req.params.outputId,
+      reviewerId: req.coworkUser.employeeId,
+      reviewerName: req.coworkUser.name,
+      approved: !!approved,
+      note: note || "",
+    });
+    res.json(result);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // ── POST /task/:taskId/rework — TL sends task back for rework ────────────────
 router.post("/task/:taskId/rework", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
@@ -2793,6 +2869,32 @@ router.post("/task/:taskId/goal-activity/:activityId/request-report", verifyCowo
 
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── RESTORE DEADLINES WHOSE BLOCK HAS CLEARED ────────────────────────────────
+// Self only. Re-walks this person's queue with the engine's own
+// `rechainQueueFor` so their deadlines match the order actually shown. It adds
+// no deadline rule of its own — the dependency feature only swaps priority, and
+// the ordinary chain follows.
+router.post("/employee/:employeeId/restore-blocked-deadlines", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    if (req.coworkUser.employeeId !== employeeId) {
+      return res.status(403).json({ error: "You can only refresh your own deadlines." });
+    }
+    /* The client derived the queue, so it is the only side that knows what is
+       actually first — `workableFirst` reorders for display without touching a
+       stored rank, so re-deriving it here would need the whole queue again and
+       could disagree. */
+    const result = await svc.restoreUnblockedDeadlines({
+      employeeId,
+      effectiveP1TaskId: req.body?.effectiveP1TaskId || null,
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error("[restore-blocked-deadlines]", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── P1 CONFLICT CHECK — called from frontend when employee starts a P1 task ──

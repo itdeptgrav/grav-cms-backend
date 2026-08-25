@@ -20,6 +20,7 @@
 const express = require("express");
 const router = express.Router();
 const Request = require("../../models/Customer_Models/CustomerRequest");
+const { nextRequestId } = require("../../services/requestId");
 const CustomerRequest = Request; // alias used by edit-request handlers below
 const Customer = require("../../models/Customer_Models/Customer");
 const StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
@@ -479,8 +480,7 @@ router.post("/", verifyCustomerToken, async (req, res) => {
     }
 
     // ── Generate request ID ──────────────────────────────────────────
-    const requestCount = await Request.countDocuments();
-    const requestId = `REQ-${new Date().getFullYear()}-${String(requestCount + 1).padStart(4, "0")}`;
+    const requestId = await nextRequestId(Request);
 
     // ── Create new request ───────────────────────────────────────────
     const newRequest = new Request({

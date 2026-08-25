@@ -87,6 +87,22 @@ const enquirySchema = new mongoose.Schema(
       new mongoose.Schema(
         {
           product: { type: String, trim: true, required: true },
+          /**
+           * The item-master record this row names, when it names one.
+           *
+           * `product` stays the identity and stays required: an enquiry
+           * routinely asks for a garment nobody has entered into the master
+           * yet, and a row that could not be typed would stop the work. The
+           * picker is an OPTION, so this is optional too.
+           *
+           * What it buys when it is set: everything downstream can join on an
+           * id instead of a name. Style provisioning, the costing sheet and the
+           * work order all match products by trimmed text today, which breaks
+           * on a rename and on two spellings of one garment.
+           */
+          stockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem", index: true, sparse: true },
+          /** The master's own code, kept for display without a populate. */
+          stockItemReference: { type: String, trim: true },
           quantity: { type: Number, min: 0 },
           note: { type: String, trim: true },
 
@@ -110,6 +126,31 @@ const enquirySchema = new mongoose.Schema(
           specialConstruction: { type: String, trim: true },
           existingUniform: { type: String, trim: true }, // existing garment details / what they wear now
 
+          /**
+           * Specification the fixed fields above have no room for — the
+           * salesperson names the question AND answers it (24 Aug 2026,
+           * explicit request: "in the product specification input ask for the
+           * custom input also, so the sales person will define the inputs and
+           * he will fill the answers").
+           *
+           * Deliberately free-form label/value pairs rather than an ever-
+           * growing list of named columns: every customer asks for something
+           * the last one didn't (a pantone reference, a collar style, a
+           * washing standard), and each of those becoming a schema field is
+           * how this subdocument reaches sixty fields nobody fills in. These
+           * ride through to R&D with the rest of the brief — see
+           * briefFromProduct in routes/CMS_Routes/Sales/sampleStyles.js.
+           */
+          customSpecs: [
+            new mongoose.Schema(
+              {
+                label: { type: String, trim: true, required: true },
+                value: { type: String, trim: true, default: "" },
+              },
+              { _id: false },
+            ),
+          ],
+
           // Reference images — what the garment should look like, so Merchandising
           // + Industrial Engineering can cost it. Previewed inline. Uploaded via
           // Cloudinary (`publicId` set) since 19 Aug 2026 — see
@@ -128,6 +169,44 @@ const enquirySchema = new mongoose.Schema(
           ],
         },
         { _id: true },
+      ),
+    ],
+
+    // ── Cost ledger — what Sales keyed, and what they quoted ────────────────
+    //
+    // MOVED OFF THE BROWSER (22 Aug 2026). This lived in localStorage under
+    // `crm_pnl_<journeyId>`, so a deal's cost, price and margin existed only on
+    // the machine that typed them: a second salesperson saw an empty stage, the
+    // same person on another laptop saw an empty stage, and no report, approval
+    // or margin standard could ever read them. A number management is supposed
+    // to hold people to cannot live in one browser.
+    //
+    // KEYED BY PRODUCT NAME, and top-level, for exactly the reason the costing
+    // sheets below are: sanitizeProducts() in routes/.../enquiries.js rebuilds
+    // the whole `products` array on every requirement save and reassigns each
+    // row a fresh _id, so anything stored ON a row is lost on the next quantity
+    // edit. Name survives that — and a rename is carried across by the same
+    // `renames` hint the sheets use.
+    //
+    // NOT the costing itself. The build-up is `costingSheets`; this is the one
+    // figure Sales reads off the Master tab plus the price they decided to
+    // quote. Deliberately two plain numbers — see docs/enquiry-costing-sheet-plan.md
+    // for why the cost is keyed by a person and never auto-scraped.
+    costLedger: [
+      new mongoose.Schema(
+        {
+          productName: { type: String, trim: true, required: true },
+          /** Unit cost, as read off the costing workbook's Master tab. */
+          cost: { type: Number, min: 0 },
+          /** Unit price being quoted. Margin is derived, never stored. */
+          price: { type: Number, min: 0 },
+          updatedBy: {
+            id: { type: mongoose.Schema.Types.ObjectId },
+            name: { type: String, trim: true },
+          },
+          updatedAt: { type: Date },
+        },
+        { _id: false },
       ),
     ],
 
@@ -336,6 +415,17 @@ const enquirySchema = new mongoose.Schema(
           sentToCustomerAt: { type: Date },
           sentToCustomerBy: actorRef(),
 
+          // ── The customer's own review link (24 Aug 2026, explicit request:
+          // "via mail the verification request will sent to the customer").
+          // Same shape as Cowork's external-share tokens — a random value
+          // whose hash alone is stored, so a leaked database yields no usable
+          // link — but Mongo-backed here since this record already is.
+          // Single-use: cleared the moment a decision is recorded through it
+          // (below), so a link can't be replayed to flip a decision after
+          // the fact; sending again mints a fresh one.
+          customerApprovalTokenHash: { type: String, index: true },
+          customerApprovalTokenExpiresAt: { type: Date },
+
           // ── Customer approval — a LOG, not a switch (20 Aug 2026, explicit
           // request: "it seems like u are making it just normally so that the
           // user can change anytime he want ok, so don't do that ok, keep an
@@ -513,6 +603,42 @@ const enquirySchema = new mongoose.Schema(
     estimatedPriceMin: { type: Number, min: 0 },
     estimatedPriceMax: { type: Number, min: 0 },
     pricingNote: { type: String, trim: true },
+
+    // ── What the Lead believed, at the moment it converted ──────────────────
+    //
+    // The same commercial fact is stated four times across a journey, each time
+    // with more certainty behind it:
+    //
+    //   Lead        researched annual quantity / revenue / unit price, each
+    //               carrying HOW it was arrived at (assumed → document_confirmed)
+    //   Enquiry     an indicative range and a derived opportunity size
+    //   Cost&Quote  a costed, quotable number
+    //   Closing     what was actually invoiced and received
+    //
+    // Until now only the bare unit price survived the first hop — it was copied
+    // into estimatedPriceMin/Max and everything that made it MEAN something was
+    // dropped. So the enquiry showed a number nobody could account for, and the
+    // Lead's careful "researched vs assumed" distinction died at conversion.
+    //
+    // A SNAPSHOT, not a live join. `sourceLeadId` still points at the Lead and
+    // the Lead stays editable; what belongs here is what was believed when this
+    // enquiry was opened, so that a later refinement can be read AGAINST it.
+    // A live read would make the baseline move with the thing it is a baseline
+    // for, which is the one thing it must not do.
+    leadEstimate: {
+      annualQuantity: { type: Number, min: 0 },
+      annualQuantityConfidence: { type: String, trim: true },
+      annualQuantitySource: { type: String, trim: true },
+      annualRevenue: { type: Number, min: 0 },
+      annualRevenueConfidence: { type: String, trim: true },
+      annualRevenueSource: { type: String, trim: true },
+      unitPrice: { type: Number, min: 0 },
+      unitPriceConfidence: { type: String, trim: true },
+      unitPriceSource: { type: String, trim: true },
+      /** Stamped at conversion so the baseline can be dated in the UI. */
+      capturedAt: { type: Date },
+      capturedFromLeadRef: { type: String, trim: true },
+    },
 
     // ── Sales qualification (Chunk 4) ───────────────────────────────────────
     // Is this worth pursuing, and how hard? Opportunity size is a whole-deal

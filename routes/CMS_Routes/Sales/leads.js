@@ -44,6 +44,7 @@ const router = express.Router();
 const Lead = require("../../../models/CMS_Models/Sales/Lead");
 const Account = require("../../../models/CMS_Models/Sales/Account");
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
+const { nextFollowUpAt } = require("../../../services/leadNextAction");
 const SalesDepartment = require("../../../models/SalesDepartment");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
@@ -1072,16 +1073,25 @@ router.patch("/:id/next-action", salesAuth, async (req, res) => {
     // by createdAt) — the SAME one the frontend picks. Any other open follow-up
     // is a competing leftover; we CANCEL those (keeping the record as history),
     // never delete, so exactly one open follow-up remains after this call.
+    //
+    // ── CORRECTED: THE HEADLINE IS DERIVED, NOT ENFORCED ────────────────────
+    // This block used to CANCEL every open follow-up but the earliest, so a
+    // salesperson who planned "call Monday" and then planned "email the
+    // quotation" silently lost the call and was told "Next action set."
+    //
+    // A Lead still has exactly one HEADLINE next action — the Leads page bands
+    // on it — but that is now computed from what is open
+    // (services/leadNextAction.js), not achieved by destroying the rest. Real
+    // work on a lead branches; a second intention is not a correction of the
+    // first. To retire one deliberately, complete or cancel it.
     const open = await Activity.find({ leadId: lead._id, isActive: true, activityType: "follow_up", status: "planned" }).sort({ dueDate: 1, createdAt: 1 });
     const canonical = open[0] || null;
-    const others = open.slice(1);
 
     // Snapshots for compensation — transactions aren't available on the
     // standalone dev/test Mongo, so if the Lead update fails after the Activity
     // writes we roll them back by hand rather than leave them inconsistent.
     const leadPrevNext = lead.nextFollowUpAt;
     const canonPrev = canonical ? { subject: canonical.subject, dueDate: canonical.dueDate, status: canonical.status } : null;
-    const othersPrev = others.map((a) => ({ id: a._id, status: a.status }));
     let createdId = null;
     let activity;
 
@@ -1098,15 +1108,21 @@ router.patch("/:id/next-action", salesAuth, async (req, res) => {
         });
         createdId = activity._id;
       }
-      for (const a of others) { a.status = "cancelled"; a.updatedBy = actor(req); await a.save(); }
-      lead.nextFollowUpAt = due; lead.updatedBy = actor(req);
+      // Recomputed from everything still open, never just set to what was
+      // typed: editing the headline to a LATER date can hand the headline to a
+      // different follow-up, and `= due` would have left the Leads page banding
+      // on an item that is no longer next.
+      const openNow = await Activity.find({
+        leadId: lead._id, isActive: true, activityType: "follow_up", status: "planned",
+      }).lean();
+      lead.nextFollowUpAt = nextFollowUpAt(openNow);
+      lead.updatedBy = actor(req);
       await lead.save();
     } catch (err) {
       // Best-effort rollback so Activity and Lead never drift apart.
       try {
         if (createdId) await Activity.deleteOne({ _id: createdId });
         else if (canonical && canonPrev) { await Activity.updateOne({ _id: canonical._id }, { $set: { subject: canonPrev.subject, dueDate: canonPrev.dueDate, status: canonPrev.status } }); }
-        for (const p of othersPrev) await Activity.updateOne({ _id: p.id }, { $set: { status: p.status } });
         await Lead.updateOne({ _id: lead._id }, leadPrevNext ? { $set: { nextFollowUpAt: leadPrevNext } } : { $unset: { nextFollowUpAt: "" } });
       } catch { /* leave the thrown error as the reported cause */ }
       return res.status(400).json({ success: false, message: err.message || "Could not set the next action." });
@@ -1356,6 +1372,122 @@ router.post("/:id/submit", salesAuth, async (req, res) => {
   }
 });
 
+// POST /api/cms/crm/leads/:id/convert-to-active — the DIRECT path.
+//
+// Prospect Setup's own button (DraftWorkspace.js) has called this since the
+// review hop was dropped on 20 Aug 2026 — "Send to HOD and then HOD approval…
+// these are not needed" — but the route was never written, so the button has
+// been posting into a 404 and no Prospect could reach Active Leads through the
+// UI at all. Written 22 Aug 2026.
+//
+// It is /approve minus the review state machine, and nothing else:
+//
+//   • No applyApprove — that asserts the Prospect is AWAITING REVIEW, which is
+//     exactly the hop this path removes. `reviewStatus` is still stamped
+//     "approved" so the record reads consistently to everything that displays
+//     it (leadReview.js, the Prospects filters, the workspace chip).
+//   • The readiness CHECKLIST still gates it. The review hop was removed; the
+//     bar was not. The UI disables the button on the same computation, so this
+//     is the server refusing what the client already refuses — not a new rule.
+//   • Same create-Activity-then-flip-then-rollback order as /approve, for the
+//     same reason: an Active Lead must never exist without its first follow-up,
+//     and a failed flip must not strand an Activity.
+//
+// /approve stays exactly as it is. Nothing is torn out — a workflow that does
+// route Prospects through a reviewer still works.
+router.post("/:id/convert-to-active", salesAuth, async (req, res) => {
+  try {
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
+    if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
+      return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
+    }
+    if (lead.captureStatus !== "draft") {
+      return res.status(400).json({
+        success: false,
+        message: lead.captureStatus === "active"
+          ? "This is already an Active Lead."
+          : "Only a Prospect can be converted to an Active Lead.",
+      });
+    }
+
+    const { checks, ready } = computeSubmissionReadiness(lead);
+    if (!ready) {
+      return res.status(400).json({
+        success: false,
+        message: "This Prospect isn't ready to become an Active Lead yet.",
+        checks,
+      });
+    }
+
+    // Belt and braces: readiness covers the first action, but this route
+    // dereferences it below and a 500 would be a poor way to say so.
+    const first = lead.pendingFirstAction || {};
+    if (!String(first.subject || "").trim() || !first.dueDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Set the first follow-up — an Active Lead starts with something scheduled.",
+      });
+    }
+
+    const before = lead.toObject();
+
+    // Activity FIRST, flip second, roll the Activity back if the flip fails.
+    const activity = await Activity.create({
+      leadId: lead._id,
+      activityType: "follow_up",
+      subject: String(first.subject).trim(),
+      description: first.notes ? String(first.notes).trim() : undefined,
+      dueDate: first.dueDate,
+      status: "planned",
+      ownerId: lead.assignedTo || req.user?.id,
+      ownerName: lead.assignedToName || req.user?.name,
+      createdBy: actor(req),
+      updatedBy: actor(req),
+    });
+
+    try {
+      lead.captureStatus = "active";
+      // qualificationState is untouched — it stays "new". Converting says this
+      // is worth working, not that it has been qualified.
+      lead.reviewStatus = "approved";
+      lead.reviewedAt = new Date();
+      lead.reviewedBy = actor(req);
+      lead.reviewReason = undefined;
+      lead.nextFollowUpAt = first.dueDate;
+      lead.updatedBy = actor(req);
+      await lead.save();
+    } catch (err) {
+      await Activity.deleteOne({ _id: activity._id });
+      throw err;
+    }
+
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "lead",
+      entityId: lead._id,
+      entityLabel: displayName(lead),
+      action: "update",
+      summary: `Prospect converted to Active Lead: ${lead.leadId}`,
+      before,
+      after: lead.toObject(),
+    });
+    await recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-activity",
+      entityId: activity._id,
+      entityLabel: activity.subject,
+      action: "create",
+      summary: `follow_up: ${activity.subject} (Lead ${displayName(lead)}, created on conversion)`,
+      after: activity.toObject(),
+    });
+
+    res.json({ success: true, lead, activity });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
 // POST /api/cms/crm/leads/:id/approve — approves a submitted Prospect AS an
 // Active Lead. The ONLY path from Prospect to Active Lead.
 // Optional `assignedTo` lets the approver assign a different owner IN the
@@ -1563,6 +1695,66 @@ router.get("/:id/activities", salesAuth, async (req, res) => {
 // req.body) so a client cannot attach an accountId or override leadId.
 // Supports the same interaction metadata the Account-Activity router does —
 // outcome and nextActionDate included, previously missing here.
+// PATCH /api/cms/crm/leads/:id/activities/:activityId
+//
+// Edit ONE of a Lead's open items — the specific one, not whichever happens to
+// be the headline.
+//
+// `next-action` deliberately always edits the canonical item, because that is
+// what "plan the next move" means. Once a Lead can hold several open items that
+// is no longer enough: "Update" on the third deadline has to change the third
+// deadline. The generic PATCH /activities/:id would edit the row but leave
+// `nextFollowUpAt` stale, so this lives here, where the Lead's headline is
+// recomputed alongside it.
+router.patch("/:id/activities/:activityId", salesAuth, async (req, res) => {
+  try {
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ success: false, message: "Lead not found" });
+    if (isRestricted(lead) && !(await canSeeRestricted(lead, req))) {
+      return res.status(403).json({ success: false, message: "You don't have access to this Lead." });
+    }
+    if (refuseIfLocked(res, lead)) return;
+
+    // Scoped to THIS lead on purpose: an activity id from another record must
+    // not be editable through this lead's URL.
+    const activity = await Activity.findOne({ _id: req.params.activityId, leadId: lead._id, isActive: true });
+    if (!activity) return res.status(404).json({ success: false, message: "No such item on this Lead." });
+
+    if (req.body?.subject !== undefined) {
+      const subject = String(req.body.subject || "").trim();
+      if (!subject) return res.status(400).json({ success: false, message: "A next action needs a short description." });
+      activity.subject = subject;
+    }
+    if (req.body?.dueDate !== undefined) {
+      const due = req.body.dueDate ? new Date(req.body.dueDate) : null;
+      if (!due || Number.isNaN(due.getTime())) {
+        return res.status(400).json({ success: false, message: "A next action needs a valid due date." });
+      }
+      activity.dueDate = due;
+    }
+    activity.updatedBy = actor(req);
+    await activity.save();
+
+    // Moving any follow-up can change which one is the headline.
+    if (activity.activityType === "follow_up") {
+      const openNow = await Activity.find({
+        leadId: lead._id, isActive: true, activityType: "follow_up", status: "planned",
+      }).lean();
+      lead.nextFollowUpAt = nextFollowUpAt(openNow);
+      lead.updatedBy = actor(req);
+      await lead.save();
+    }
+
+    await recordChange(req, {
+      departmentSlug: "sales", entity: "lead", entityId: lead._id, entityLabel: displayName(lead),
+      action: "update", summary: `Updated: ${activity.subject} (${lead.leadId})`,
+    });
+    res.json({ success: true, lead, activity });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/:id/activities", salesAuth, async (req, res) => {
   try {
     const lead = await Lead.findById(req.params.id)
@@ -1652,6 +1844,23 @@ router.post("/:id/activities", salesAuth, async (req, res) => {
       await Lead.updateOne(
         { _id: lead._id },
         { $set: { lastContactedAt: data.activityDate || new Date(), updatedBy: actor(req) } },
+      );
+    }
+
+    // A planned FOLLOW-UP added here can be sooner than whatever the Lead was
+    // banding on, so the headline has to be recomputed. This route created the
+    // Activity and then left `nextFollowUpAt` untouched, which was survivable
+    // only while `next-action` cancelled everything else — with several open
+    // follow-ups now legal, a stale date would put the Lead in the wrong
+    // urgency band. An internal `task` deliberately does not move it; see
+    // services/leadNextAction.js for why.
+    if (isTask && data.activityType === "follow_up") {
+      const openNow = await Activity.find({
+        leadId: lead._id, isActive: true, activityType: "follow_up", status: "planned",
+      }).lean();
+      await Lead.updateOne(
+        { _id: lead._id },
+        { $set: { nextFollowUpAt: nextFollowUpAt(openNow), updatedBy: actor(req) } },
       );
     }
 

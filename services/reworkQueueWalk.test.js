@@ -104,6 +104,19 @@ const budgeted = (over) => ({
 
 /* ── the reported bug, executed ─────────────────────────────────────────── */
 
+/**
+ * NOTE on `writes.get(id)` below.
+ *
+ * The walk now also records `effectivePriority` — the position a task actually
+ * holds once blocked work has been dropped past, which the stored rank cannot
+ * express because it is never overwritten. That means a task can be WRITTEN
+ * without its deadline changing, and these tests used "was it written at all"
+ * as a stand-in for "did its deadline move".
+ *
+ * So the guards ask about `dueDate` specifically. The guarantees are unchanged
+ * — a deadline that IS written still must not be earlier, and a handed-in task
+ * still must not receive one.
+ */
 test("B chains from A's 1pm handover, not from A's 2pm deadline", async () => {
   /**
    * The case that started this. A is due 2pm and was handed in at 1pm; B is
@@ -221,9 +234,11 @@ test("a task already handed in is never given a new deadline", async () => {
   });
 
   await svc.rechainQueueFor("GR1");
+  /* Its DEADLINE, specifically — the walk may still record the position it
+     holds, which is not a claim about its date. */
   assert.equal(
-    writes.has("A"),
-    false,
+    writes.get("A")?.dueDate,
+    undefined,
     "the submitted task's deadline was rewritten — the leftover hour is now wrong",
   );
 });
@@ -256,7 +271,7 @@ test("a REAL anchor is never pulled earlier", async () => {
 
   await svc.rechainQueueFor("GR1");
   const b = writes.get("B");
-  if (b) {
+  if (b && b.dueDate !== undefined) {
     assert.ok(
       Date.parse(b.dueDate) >= Date.parse(at("16:00")),
       `a real anchor was pulled earlier, to ${b.dueDate}`,
@@ -312,8 +327,9 @@ test("T069/T070: a stale queue anchor corrects itself downward", async () => {
   assert.equal(t070.clockStartsAtSource, "after_priority_work");
 
   /* And T069, which is submitted, is still not re-dated — the leftover rule
-     depends on its deadline staying put. */
-  assert.equal(writes.has("T069"), false);
+     depends on its deadline staying put. It may still be given the position it
+     holds; that is not a claim about its date. */
+  assert.equal(writes.get("T069")?.dueDate, undefined);
 });
 
 test("a deadline set by something else is left alone", async () => {
@@ -352,9 +368,11 @@ test("a deadline set by something else is left alone", async () => {
   });
 
   await svc.rechainQueueFor("GR1");
+  /* Its DEADLINE, specifically — the walk may still record the position it
+     holds, which is not a claim about its date. */
   assert.equal(
-    writes.has("EXTENDED"),
-    false,
+    writes.get("EXTENDED")?.dueDate,
+    undefined,
     "a deadline granted elsewhere was overwritten by the queue walk",
   );
 });
@@ -426,7 +444,7 @@ test("a fixed-date task occupies nobody's queue", async () => {
 
   await svc.rechainQueueFor("GR1");
   const b = writes.get("B");
-  if (b) {
+  if (b && b.dueDate !== undefined) {
     assert.ok(
       Date.parse(b.dueDate) < Date.parse(at("00:00", 25)),
       `B was pushed to next week by a fixed-date task: ${b.dueDate}`,

@@ -1191,6 +1191,50 @@ class CustomerEmailService {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // PER-PRODUCT COSTING APPROVAL — one product's finalized price, sent
+  // straight to the customer's inbox with a one-click, no-login review link
+  // (24 Aug 2026, explicit request: "via mail the verification request will
+  // sent to the customer"). Deliberately shows ONLY the total — never the
+  // raw-item/operation cost build-up behind it ("don't inform the raw item
+  // or operation wise decoding... just the direct total price need to
+  // showcase to the customer").
+  // ─────────────────────────────────────────────────────────────────────────
+  async sendCostingApprovalEmail({ toEmail, toName, productName, price, currency, quantity, enquiryRef, reviewUrl }) {
+    try {
+      const s = await getSettings();
+      const apiKey = process.env.BREVO_API_KEY;
+      if (!apiKey) return { success: false, reason: "no_api_key" };
+
+      const amount = new Intl.NumberFormat("en-IN", { style: "currency", currency: currency || "INR", maximumFractionDigits: 2 }).format(price || 0);
+      const title = "Price confirmation needed";
+      const subject = `Please confirm the price for "${productName}"${enquiryRef ? ` (${enquiryRef})` : ""}`;
+
+      const html = layout(title, `
+        <p class="subtitle">Price ready for your review</p>
+        <h1 class="title">${title}</h1>
+        <p>Dear ${toName || "Customer"},</p>
+        <p style="color:#374151;">We've finalized the price for the product below. Please review and confirm so we can move forward.</p>
+        <div class="info-box">
+          ${infoRow("Product", productName)}
+          ${quantity ? infoRow("Quantity", `${quantity} pcs`) : ""}
+        </div>
+        <div class="total-row">${amount}</div>
+        <p style="text-align:center;"><a href="${reviewUrl}" class="btn">Review &amp; Respond &rarr;</a></p>
+        <div class="box-blue">This link is personal to you and expires in 7 days.</div>
+      `, s);
+
+      const text = `${title}\n\nDear ${toName || "Customer"},\n\nWe've finalized the price for "${productName}": ${amount}${quantity ? ` (Qty: ${quantity} pcs)` : ""}.\n\nReview and respond: ${reviewUrl}\n\nThis link is personal to you and expires in 7 days.`;
+
+      const res = await brevoSend(apiKey, toEmail, toName, subject, html, text, "costing_approval_request");
+      console.log(`[CustomerEmailService] costingApproval sent to ${toEmail} for "${productName}":`, res.messageId);
+      return { success: true, messageId: res.messageId };
+    } catch (err) {
+      console.error("[CustomerEmailService] sendCostingApprovalEmail:", err.response?.data || err.message);
+      return { success: false, error: err.response?.data?.message || err.message };
+    }
+  }
+
   // ── Stubs (future implementation) ────────────────────────────────────────
   async sendOrderConfirmationEmail(orderData) { return { success: true }; }
   async sendMeasurementReminderEmail(customerData) { return { success: true }; }

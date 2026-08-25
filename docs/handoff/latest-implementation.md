@@ -2,60 +2,52 @@
 
 ---
 
-## Raw-item labels printed at goods receipt
+## Personal Planner — chunk 1: foundation, Today, Ladder, Review
 
-> **A storekeeper can now label a delivery as it is unpacked, and a scan of any
-> label answers what the lot is, who supplied it, when it arrived and what it
-> cost.** Nothing committed.
->
-> Note this sits outside `docs/tasks/current-task.md`, which describes the
-> Prospect/Active-Lead chunk plan — it was requested directly.
-
-### What was reused rather than built
-
-A `Barcode` model, a `POST /api/cms/inventory/barcodes` endpoint and a
-50 mm × 25 mm sticker printer already existed behind the store's **Product
-Marking** page, and cutting-master already scans those stickers. This extends
-that: no second label model, no second print routine, no new dependency.
+> **One employee's own Vision → Mission → Project → Task ladder, private to
+> them, reachable from inside any department.** Backend models + API + two pure
+> services, frontend route with three views. Nothing committed.
 
 ### Backend (`grav-cms-backend`)
 
-| File | Change |
+| File | Purpose |
 |---|---|
-| `models/CMS_Models/Inventory/Operations/Barcode.js` | Added `vendor` + `vendorName`, `unitPrice`, `purchaseOrderItemId`. The price is stored rather than looked up later because a vendor's rate moves — a scan months on must report what *this* lot cost. The PO line is recorded because one PO can carry the same item twice at different prices, so the order id alone cannot pin a price. |
-| `routes/CMS_Routes/Inventory/Operations/barcodes.js` | `POST /` now also accepts `unitName` (goods receipt only knows the unit as the string on the PO line) and `purchaseOrderItemId`. **Vendor and price are read off the PO line server-side, never taken from the request** — a price is a financial fact and the client has no business asserting it. `GET /:id` populates vendor and PO, resolves the variant out of the raw item's subdocument array, and strips the full `variants` array from the response (it was the largest thing in it and is never read). |
+| `constants/planner.js` | **New.** The vocabulary — three levels with the ladder encoded as `childLevel` data rather than an if-chain, four goal statuses, three task statuses. Kept separate from `constants/crm.js` on purpose: nothing here is a business record, and sharing a constants file is how a privacy boundary quietly stops being true. |
+| `models/Planner/PlannerGoal.js` | **New.** One collection for all three goal levels. A pre-validate hook enforces the ladder (vision rootless, mission under vision, project under mission), which makes the tree exactly three deep **by construction** — so unlike `services/crmHierarchy.js` there is no cycle to guard. No `percentComplete` field anywhere: progress is derived, never stored. |
+| `models/Planner/PlannerTask.js` | **New.** `goalId` is **nullable** — a task with no goal is the Inbox. This is the load-bearing decision: requiring every task to ladder up to a vision is what kills a personal planner, because capture has to be free. `doneAt` is maintained in a pre-save hook so it can never disagree with `status`. |
+| `services/plannerRollup.js` | **New**, pure. Builds the tree and derives progress: project = done/total tasks, mission = mean of its projects, vision = mean of its missions. Achieved is 100% whatever the tasks say; **dropped leaves the denominator** rather than scoring zero, so honestly abandoning something never damages the number above it. `hasBasis` distinguishes "no tasks in it" from a real 0%. |
+| `services/plannerAttention.js` | **New**, pure. The Review engine, modelled on `services/journeyAttention.js` — six triggers (`overdue`, `stale`, `empty`, `barren`, `pausedLong`, `nearlyDone`), one reason per goal, ranked by reason then age. `nearlyDone` is the only positive item; a review that only nags is one people stop opening. |
+| `routes/Planner/planner.js` | **New**, `EmployeeAuthMiddleware` on the whole router. `GET /tree`, `GET /review`, `GET /tasks`, `GET /lookups`, plus goal and task CRUD. **`ownerId` comes from the verified JWT and never from the body**, every read filters on it, and every id the client names is re-checked against it. Delete is narrow: a goal holding anything refuses with a count and points at `dropped`; deleting a project **unfiles** its tasks rather than destroying them. |
+| `server.js` | One mount at `/api/planner`. Not gated on a department role — your own goals should not disappear because you moved from Sales to HR for an hour. |
 
 ### Frontend (`grav-cms`)
 
-| File | Change |
+> **Rebuilt on the Sales design system after review.** The first pass used the
+> `--g-*` portal tokens from `/onboarding` and a ~700-line stylesheet of its own.
+> That was the wrong system: Sales runs FrostShell over `.grav-ui`
+> ("Chrome Under Frost", `app/grav-ui.css`) with the shared kit in
+> `components/ceo/ui/Primitives.tsx`. The bespoke stylesheet is deleted and the
+> Planner now composes the same primitives Sales does.
+
+| File | Purpose |
 |---|---|
-| `lib/barcodeSticker.js` | **New.** The single sticker implementation, lifted out of the Product Marking page: QR generation, the hidden-iframe 50 × 25 mm print job, and the code helpers `itemQrPayload` / `parseItemQr` / `isItemQr`. User-entered item names are HTML-escaped before going into the print document. |
-| `components/inventory/GenerateBarcodeModal.js` | **New.** Number of labels × quantity per label, with the arithmetic stated back ("20 labels × 500 Pcs = 10,000 Pcs") because those two fields are easy to enter the wrong way round. Warns — without blocking — when the total does not match what the line is receiving. |
-| `app/store/dashboard/operations/purchase-order/[id]/receive/page.js` | A per-row **Generate Barcode** button, and the dialog mounted outside the `<form>` so its buttons can never submit the delivery. |
-| `app/store/dashboard/item-info/{page.js,ItemInfoClient.js}` | **New.** Where a scan lands. Split into a Suspense boundary + client component, matching how every other query-string page here is built. Accepts a wedge scanner, a typed id, or a `?itemid=` deep link from a phone camera. |
-| `app/store/dashboard/operations/barcode-generator/page.js` | Now imports the shared module (62 lines of duplicated helpers removed) and emits the new payload. |
-| `StockAdjustmentDrawer.js`, both `raw-item-tracker/page.js` | Read through `isItemQr`/`parseItemQr` instead of a local `RawItem=` constant; on-screen format hints updated. |
-| `components/Store_DashboardLayout.js` | **Item Info** added under Product Tracking, so a torn label can still be looked up by typing its id. |
-
-### The payload format, and why both are accepted
-
-New labels encode **`itemid=<barcodeId>`** as requested. The established format
-was `RawItem=<barcodeId>`, and three scanner screens rejected anything else
-outright — so every reader now accepts both. Labels already stuck to stock in
-the warehouse keep scanning; had this been a straight swap they would have
-stopped dead.
+| `components/Planner_DashboardLayout.js` | **New.** FrostShell nav config, same arrangement as `Sales_DashboardLayout.js` — `variant="top"`, three items. **No `guardSlug`**: DepartmentGuard's first branch is `if (!slug \|\| …) → ok`, so the Planner still requires a valid session but asks no question about which department it is in. The left rail stays (Sales opts out of it) because this is the one surface people reach from inside another department. |
+| `lib/planner/vocabulary.js` · `lib/planner/api.js` · `lib/planner/usePlanner.js` | **New.** The client mirror of the constants (server validates, client labels — the `stageConfig.js` pattern), one function per endpoint (the `coworkApi.js` pattern), and one shared read so Today, Ladder and Review cannot disagree about a percentage. |
+| `app/planner/{,ladder/,review/}page.js` · `layout.js` | **New.** Three thin routes that name a view; `components/planner/PlannerScreen.js` holds the shell, `PageHead`, the shared read and the drawer once. Content sits in the same `mx-auto max-w-[1400px] px-4 pt-6 pb-10 deck:px-6` container every Sales page uses. |
+| `components/planner/{TodayView,LadderView,ReviewView,EditDrawer}.js` | **New.** Built from `Panel`, `PanelHead`, `Rows`, `Button`, `Chip`, `Field`, `Input`, `Select`, `Textarea`, `EmptyState`, `ErrorState`, `InlineError`, `SkeletonRows`. The drawer is `CrmDrawer` — the same dialog every Sales screen opens — rather than a second one. |
+| `components/planner/plannerBits.js` | **New.** Only what the kit genuinely lacks: a task tick, the ladder line under a title, and a progress figure that can say "nothing in it yet" instead of "0%". |
+| `components/shell/DepartmentRail.js` | One fixed Planner control beside "Apps". Not added to the department list, which is data (PRODUCT.md: "Departments are data"). Needed `usePathname` — the rail's existing `current` prop is a department slug and cannot answer "are we on /planner". |
 
 ### Verification
 
-- Created a barcode against real PO `PO26089303` and read it back the way a scan
-  does: item, variant, vendor (ANANDI ENTERPRISES), PO, order date, receipt
-  timestamp and unit price (₹2,775.42) all resolved. Test document deleted.
-- 17 parser cases pass: new prefix, legacy prefix, mixed case, trailing newline
-  from a wedge scanner, bare id, camera URL, and rejection of work-order and
-  employee codes.
-- All five affected routes compile and render 200 with no build errors.
-- **Not verified:** a physical print. The browser cannot report whether a
-  thermal printer produced anything, so the first real run should be watched.
+- **47 backend tests, all passing**: `services/plannerRollup.test.js` (15, `node --test`), `services/plannerAttention.test.js` (20, `node --test`), `test/planner/planner.route.test.js` (27, jest + in-memory Mongo — counted 27 with the 4 review cases).
+- The privacy boundary is covered per handler, not sampled: another owner's goal cannot be read, patched, deleted, reparented onto, filed against, or have a task touched, and `ownerId` in a request body is ignored.
+- Full backend suite: **6 suites fail, and all 6 are pre-existing** — they die on `FIREBASE_SERVICE_ACCOUNT` missing from this environment's `.env` (CRM enquiry, lead-review, sales-journey ×2, sample-style, hr-ai). None touch the Planner, which needs no Firebase.
+- **Not verified in a browser**: no logged-in session was available in this environment, so the three views, the drawer and the tick animation have not been exercised against real data.
+
+### Preserved / no commit
+
+Purely additive apart from two one-line-scale edits (`server.js` mount, the rail control). The uncommitted Sales-journey work in both repos was not touched, and `docs/tasks/current-task.md` was deliberately left alone — it still scopes the Lead chunks.
 
 ---
 

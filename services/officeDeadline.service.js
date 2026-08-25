@@ -252,6 +252,172 @@ function rankOf(task, employeeId) {
   return Number.isFinite(n) && n > 0 ? n : 99;
 }
 
+
+
+/**
+ * The order the SCREEN shows — `workableFirst`, ported from
+ * `lib/rules/tasks/priorityQueue.ts` and deliberately identical to it.
+ *
+ * Blocked work does not lead a queue: whatever can actually be started takes
+ * the top spot, and the blocked task drops exactly one place. Nothing else
+ * moves, and no stored rank is touched — which is what returns the task to its
+ * own position the moment its input is approved.
+ *
+ * **The chain must walk THIS order, not the stored one.** Both were being used:
+ * the screen showed T101 first and the chain believed T099 was, so T101 kept a
+ * deadline computed for second place and T099 kept one computed from T101's
+ * old date. If this ever diverges from the frontend's copy, that is the bug.
+ */
+function workableFirst(order) {
+  if (order.length === 0 || order[0].workable !== false) return order;
+  const firstWorkable = order.findIndex((c) => c.workable !== false);
+  if (firstWorkable === -1) return order;
+  return [
+    order[firstWorkable],
+    ...order.slice(0, firstWorkable),
+    ...order.slice(firstWorkable + 1),
+  ];
+}
+
+/**
+ * **Work you are blocked from starting does not occupy your queue.**
+ *
+ * The sibling of the `fixedDeadline` rule below it: only work somebody can
+ * actually spend an hour on pushes the work beneath it. A task waiting on
+ * another person's unapproved output is not time being spent — it is time
+ * being waited on — and counting it as queue-occupying gives the task below a
+ * deadline built around hours nobody can work.
+ *
+ * Reported with real data: T099 was P1 and blocked on Umung's design; T101 was
+ * raised beneath it and anchored `after_priority_work` at T099's 15:06 finish,
+ * coming out due 16:06. But T099 could not be started at all, so T101 was
+ * really first and its honest deadline was 12:28 — nearly four hours earlier.
+ *
+ * **This is what keeps ONE order.** `workableFirst` in the frontend promotes
+ * past a blocked task for display without touching a stored rank, deliberately,
+ * so the task returns to its own place when its input lands. Every deadline
+ * path here walked the STORED order instead, so the chain believed a blocked
+ * task was first while the screen said it was second. Same question, two
+ * answers — the exact fault this codebase keeps paying for.
+ *
+ * A task with no outputs occupies the queue exactly as before: every task that
+ * predates the feature takes the first branch and nothing changes for it.
+ */
+function occupiesQueue(task, approvedOutputIds) {
+  const outputs = Array.isArray(task.outputs) ? task.outputs : [];
+  if (outputs.length === 0) return true;
+  const subs = task.outputSubmissions || {};
+  return outputs.some((o) => {
+    const needs = Array.isArray(o.needsOutputIds) ? o.needsOutputIds : [];
+    /* An unknown id counts as NOT approved: releasing on missing data would
+       start a clock against work whose input may not exist. */
+    if (!needs.every((id) => approvedOutputIds.has(id))) return false;
+    const sub = subs[o.id];
+    /* Already handed over, or already approved — nothing left to sit down to. */
+    if (sub && (!sub.review || sub.review.approved === true)) return false;
+    return true;
+  });
+}
+
+/**
+ * Every output approved ANYWHERE, because an input is by definition somebody
+ * else's output. Cached for a few seconds: a re-chain asks once per walk and a
+ * queue read asks once per task, and the answer cannot meaningfully change
+ * between them.
+ */
+let _approvedCache = { at: 0, ids: null, times: null };
+async function _approvedIndex() {
+  if (_approvedCache.ids && Date.now() - _approvedCache.at < 5000) return _approvedCache;
+  const ids = new Set();
+  /** outputId -> the instant its approval was recorded. */
+  const times = new Map();
+  try {
+    const { db } = require("../config/firebaseAdmin");
+    const snap = await db.collection("cowork_tasks").where("hasOutputs", "==", true).get();
+    snap.forEach((d) => {
+      const subs = d.data().outputSubmissions || {};
+      for (const [oid, sub] of Object.entries(subs))
+        if (sub && sub.review && sub.review.approved === true) {
+          ids.add(oid);
+          const at = readMs(sub.review.reviewedAt);
+          if (Number.isFinite(at)) times.set(oid, at);
+        }
+    });
+  } catch (e) {
+    /* An unreadable index means "nothing is approved", which keeps blocked work
+       OUT of the chain. That is the safe direction: it can only ever pull a
+       deadline earlier, never push one past a date somebody was promised. */
+    console.warn("[officeDeadline] output index read failed:", e.message);
+  }
+  _approvedCache = { at: Date.now(), ids, times };
+  return _approvedCache;
+}
+
+/** Every output approved anywhere. */
+async function approvedOutputIdsNow() {
+  return (await _approvedIndex()).ids;
+}
+
+/**
+ * **When this task could FIRST have been started.**
+ *
+ * A task blocked on somebody else's output cannot begin before that output is
+ * approved, so its clock must not start earlier — otherwise it is charged hours
+ * it was forbidden to work. The chain handles this whenever something sits
+ * ABOVE it (that task finishes later anyway); the hole is a blocked task that
+ * reaches the FRONT, where the queue start would otherwise apply.
+ *
+ * **The EARLIEST unblocking, not the last.** OWNER DECISION, 21 Aug 2026. An
+ * output whose own inputs are all approved is startable, and a task is workable
+ * when ANY one of them is — the same rule `occupiesQueue` uses. So a task
+ * waiting on Gopalpur (approved 14:00) and Puri (approved 17:00) could have
+ * begun at 14:00, and 14:00 is its start.
+ *
+ * Returns null where the rule has nothing to say: no outputs, an output that
+ * needs no input (startable from the beginning, so never constrained), or
+ * nothing approved yet.
+ */
+function unblockedAtMs(task, approvedAt, nowMs) {
+  const outputs = Array.isArray(task.outputs) ? task.outputs : [];
+  if (outputs.length === 0) return null;
+  let earliest = null;
+  for (const o of outputs) {
+    const needs = Array.isArray(o.needsOutputIds) ? o.needsOutputIds : [];
+    /* Nothing to wait for — this task was never held up. */
+    if (needs.length === 0) return null;
+    let lastOfThisOutput = 0;
+    let allApproved = true;
+    for (const n of needs) {
+      const at = approvedAt.get(n);
+      if (!Number.isFinite(at)) { allApproved = false; break; }
+      if (at > lastOfThisOutput) lastOfThisOutput = at;
+    }
+    /* Still waiting on something: this output cannot be the one that freed it. */
+    if (!allApproved) continue;
+    if (earliest === null || lastOfThisOutput < earliest) earliest = lastOfThisOutput;
+  }
+
+  /**
+   * **Nothing freed yet, so it still cannot start — and the floor is NOW.**
+   *
+   * Without this a task waiting with no approval at all had no floor: it fell
+   * back to the queue's start and its deadline burned down while it sat unable
+   * to touch the work. With nothing above it in the queue that is the whole of
+   * its clock, running against a wait somebody else owns.
+   *
+   * So while it waits the floor moves with the clock and the deadline keeps
+   * pushing out. The moment an input is approved the branch above answers
+   * instead — a FIXED instant — and the date stops moving. Waiting costs the
+   * assignee nothing; being free and idle costs them normally.
+   *
+   * This is a deliberate exception to "a due date is decided once and then
+   * holds still". It is the one case where holding still would be a promise the
+   * person was forbidden to keep.
+   */
+  if (earliest === null && Number.isFinite(nowMs)) return nowMs;
+  return earliest;
+}
+
 /**
  * When the work already AHEAD of this task in its assignee's queue finishes.
  *
@@ -273,6 +439,7 @@ function rankOf(task, employeeId) {
  */
 async function queueAheadEndMs(task, taskId, employeeId, nowMs) {
   if (!employeeId) return null;
+  const approvedOutputIds = await approvedOutputIdsNow();
   let snap;
   try {
     const { db } = require("../config/firebaseAdmin");
@@ -287,55 +454,73 @@ async function queueAheadEndMs(task, taskId, employeeId, nowMs) {
     return null;
   }
 
-  const myRank = rankOf(task, employeeId);
   const myCreated = readMs(task.createdAtISO) ?? readMs(task.createdAt) ?? nowMs;
+  const ME = "\u0000me";
 
-  let latestMs = null;
-  let latestId = null;
-  let latestTitle = null;
-
+  /**
+   * **Built as a list and ordered, rather than compared pair by pair.**
+   *
+   * The pairwise form could only ask "does this one out-rank me", which is a
+   * question about STORED rank — and the promotion that puts workable work
+   * above blocked work is a property of the whole queue, not of any two tasks
+   * in it. Asking it pairwise gave the blocked task no one ahead of it and the
+   * promoted task everyone, which is how T099 kept a date computed from T101's
+   * old deadline while T101 kept one computed from T099's.
+   *
+   * Same list, same sort, same `workableFirst` as `rechainQueueFor`, so the
+   * anchor a task is given on acceptance and the date the walk later computes
+   * for it cannot disagree.
+   */
+  const candidates = [];
   snap.forEach((doc) => {
     if (taskId && doc.id === taskId) return;
     const other = doc.data();
     if (TERMINAL_STATUSES.includes(other.status)) return;
-
-    /* Ahead of me: a stronger rank, or the same rank raised earlier. Equal
-       ranks need the tie-break or two P2s would each ignore the other and
-       both claim the same hour. */
-    const theirRank = rankOf(other, employeeId);
-    if (theirRank > myRank) return;
-    if (theirRank === myRank) {
-      const theirCreated = readMs(other.createdAtISO) ?? readMs(other.createdAt);
-      if (!Number.isFinite(theirCreated) || theirCreated >= myCreated) return;
-    }
-
     /**
      * **A fixed calendar date does not occupy your queue.** OWNER DECISION,
-     * 17 Aug 2026.
-     *
-     * Only BUDGETED work pushes. A task given a date rather than hours — a
-     * report due next Friday — is a deadline, not time being spent: it does
-     * not stop you working today, and treating it as queue-occupying would
-     * push every lower-priority task past next Friday. Two of the ten live
-     * tasks carried such a date when this was decided, so it is not a
-     * theoretical case.
-     *
-     * `hasTimer === false` is the same statement in the engine's other
-     * vocabulary — no timer means no hours to spend — and both are read
-     * because deadline-mode tasks are written by more than one path.
+     * 17 Aug 2026. Only BUDGETED work pushes: a task given a date rather than
+     * hours — a report due next Friday — is a deadline, not time being spent.
      */
     if (other.fixedDeadline || other.hasTimer === false) return;
+    candidates.push({
+      id: doc.id,
+      rank: rankOf(other, employeeId),
+      createdMs: readMs(other.createdAtISO) ?? readMs(other.createdAt) ?? 0,
+      workable: occupiesQueue(other, approvedOutputIds),
+      endMs: effectiveEndMs(other),
+      title: other.title || null,
+    });
+  });
 
+  /* The asking task takes its own place in the order — it may be promoted
+     above blocked work, or demoted below workable work, and either changes
+     who is in front of it. */
+  candidates.push({
+    id: ME,
+    rank: rankOf(task, employeeId),
+    createdMs: myCreated,
+    workable: occupiesQueue(task, approvedOutputIds),
+    endMs: null,
+    title: null,
+  });
+
+  candidates.sort((a, b) => a.rank - b.rank || a.createdMs - b.createdMs);
+  const ordered = workableFirst(candidates);
+  const myIndex = ordered.findIndex((c) => c.id === ME);
+
+  let latestMs = null;
+  let latestId = null;
+  let latestTitle = null;
+  for (const ahead of ordered.slice(0, myIndex)) {
     /* Submitted work stops occupying the person at the moment it was handed
        over, not at the deadline it was given — see `effectiveEndMs`. */
-    const end = effectiveEndMs(other);
-    if (!Number.isFinite(end)) return;
-    if (latestMs === null || end > latestMs) {
-      latestMs = end;
-      latestId = doc.id;
-      latestTitle = other.title || null;
+    if (!Number.isFinite(ahead.endMs)) continue;
+    if (latestMs === null || ahead.endMs > latestMs) {
+      latestMs = ahead.endMs;
+      latestId = ahead.id;
+      latestTitle = ahead.title;
     }
-  });
+  }
 
   return latestMs === null
     ? null
@@ -359,10 +544,27 @@ async function resolveAcceptanceAnchor(task, nowMs = Date.now(), taskId = null) 
       if (snap.exists) {
         const d = snap.data();
         dutyMode = d.mode ?? null;
-        /* `updatedAt` is written only on a mode change, so while the mode is
-           online it IS the session start — the same reading the Cowork
-           frontend's `queueAnchorMs` uses. */
-        dutySessionStartMs = readMs(d.updatedAt);
+        /**
+         * **`since` is the session start. `updatedAt` is the last write.**
+         *
+         * This read `updatedAt`, on the stated assumption that it "is written
+         * only on a mode change, so while the mode is online it IS the session
+         * start". The assumption does not hold: heartbeats and the break-credit
+         * ledger write the duty document continuously, so `updatedAt` tracks
+         * NOW.
+         *
+         * The anchor is `max(createdAt, sessionStart)`, so a session start that
+         * creeps forward drags every anchor with it and the deadline walks all
+         * day — the exact fault `anchorMsFor` documents and refuses for its own
+         * origin. Observed on GR0045: `since` 12:01:41, `updatedAt` 17:00:11 at
+         * 17:04, and a task raised at 16:19 anchored to 16:57.
+         *
+         * `since` is a Timestamp set when the mode last changed, which is what
+         * "the first provable moment they were online" means. `updatedAt` stays
+         * as a fallback for a document written before `since` existed — worse,
+         * but better than no anchor at all.
+         */
+        dutySessionStartMs = readMs(d.since) ?? readMs(d.updatedAt);
       }
     } catch (e) {
       /* An unreadable duty doc costs the first_online refinement, never the
@@ -482,12 +684,31 @@ async function rechainQueueFor(employeeId, opts = {}) {
     throw new Error("simulate requires dryRun — a preview must not write.");
   }
 
+  const { ids: approvedOutputIds, times: approvedAtById } = await _approvedIndex();
+
+  /**
+   * Stamped ONCE for the whole walk, so every task in one pass is anchored
+   * against the same instant.
+   *
+   * Declared here, above everything that reads it — the entry build, the
+   * re-anchor, the unblocking floor. Putting it lower has now caused the same
+   * fault three times in this file: a value used before its `const`, which
+   * throws at runtime while every source-assertion test passes.
+   */
+  const nowMs = Date.now();
+
   const live = [];
+  /* Every document this person holds, collected in the pass that is already
+     happening — `snap.docs` is not part of the shape the walk is given. Used
+     only to clear a position from work that has left the queue. */
+  const seen = [];
   snap.forEach((doc) => {
     const t = doc.data();
+    seen.push({ id: doc.id, ref: doc.ref, effectivePriority: t.effectivePriority });
     const simulated = sim && doc.id === String(sim.taskId);
     if (TERMINAL_STATUSES.includes(t.status)) return;
     if (t.fixedDeadline || t.hasTimer === false) return;
+
     const anchorMs = simulated ? sim.startMs : readMs(t.clockStartsAtMs);
     const secs = simulated
       ? Number(sim.secs) || 0
@@ -514,6 +735,13 @@ async function rechainQueueFor(employeeId, opts = {}) {
          walk wrote it on a previous run — see the anchor decision below. */
       anchorSource: t.clockStartsAtSource ?? null,
       parentTaskId: t.parentTaskId || null,
+      /* Decides the ORDER only. A blocked task still gets a deadline — it is
+         simply chained after the work that overtook it, which is the ordinary
+         rule that one person does one task at a time. */
+      workable: simulated ? true : occupiesQueue(t, approvedOutputIds),
+      /* When this task could first have been started, where it was held up by
+         somebody else's output. Null where it never was. */
+      unblockedAtMs: simulated ? null : unblockedAtMs(t, approvedAtById, nowMs),
       raw: t,
     });
   });
@@ -522,12 +750,68 @@ async function rechainQueueFor(employeeId, opts = {}) {
      tie-break `queueAheadEndMs` uses. Two orderings would eventually disagree
      about who waits for whom. */
   live.sort((a, b) => a.rank - b.rank || a.createdMs - b.createdMs);
+  /* Then the one adjustment the screen makes, so the dates agree with the
+     positions shown beside them. */
+  const ordered = workableFirst(live);
+  /* 1..N over the work that actually holds a slot, in the order walked below.
+     Folded into the deadline update where there is one, so a task is never
+     written twice in a pass. */
+  const positionOf = new Map(ordered.map((t, i) => [t.id, i + 1]));
+  const wroteFor = new Set();
 
   const calendar = await readOfficeCalendar();
+
+  /**
+   * **One start per person, not per task.** OWNER RULE, 21 Aug 2026.
+   *
+   * `acceptanceAnchorMs` answers per task — `max(createdAt, sessionStart)` —
+   * so two tasks raised 85 seconds apart got starts 85 seconds apart, and the
+   * queue's "counted from" moved every time a different one led. Reported on
+   * T102/T103: 12:28:55 when Cowork Meet was first, 12:30:20 when Development
+   * was.
+   *
+   * So the HEAD of the queue is anchored at the moment this person became
+   * available to the queue at all: their duty session, floored at the earliest
+   * task in it. Whichever task leads, the number is the same. Everything below
+   * the head chains from the head, exactly as before.
+   *
+   * The floor is what stops it handing out time: without it a queue would be
+   * anchored at a session start hours before any of its work existed. It
+   * cannot precede the first task, and it can only ever be EARLIER than that
+   * task's own anchor — never later, so nothing gains time from this.
+   */
+  let queueAnchorMs = null;
+  if (ordered.length > 0) {
+    const earliestCreated = Math.min(
+      ...ordered.map((t) => t.createdMs).filter((n) => Number.isFinite(n) && n > 0),
+    );
+    let sessionStartMs = null;
+    try {
+      const { db } = require("../config/firebaseAdmin");
+      const duty = await db.collection("cowork_duty_status").doc(String(employeeId)).get();
+      if (duty.exists && duty.data().mode === "online") {
+        /* `since`, not `updatedAt` — the same correction as
+           `resolveAcceptanceAnchor`, and for the same reason: `updatedAt`
+           tracks the last write, so using it here made the queue's start creep
+           forward all day and took every deadline with it. */
+        sessionStartMs = readMs(duty.data().since) ?? readMs(duty.data().updatedAt);
+      }
+    } catch (e) {
+      /* No duty document is not a reason to move anybody's deadline. Without
+         it there is no queue start and every task keeps its own anchor —
+         exactly the behaviour that predates this rule. */
+      console.warn("[officeDeadline] duty read failed for queue anchor:", e.message);
+    }
+    if (Number.isFinite(earliestCreated)) {
+      queueAnchorMs = Number.isFinite(sessionStartMs)
+        ? Math.max(sessionStartMs, earliestCreated)
+        : earliestCreated;
+    }
+  }
   const moved = [];
   let previousEndMs = null;
 
-  for (const task of live) {
+  for (const task of ordered) {
     /**
      * **A task already handed in is not recomputed.**
      *
@@ -567,12 +851,119 @@ async function rechainQueueFor(employeeId, opts = {}) {
      * cannot be recovered.
      */
     const anchorIsQueueDerived = task.anchorSource === "after_priority_work";
-    const anchorMs =
+
+    /**
+     * **Nothing ahead any more, and the anchor only ever meant "something was".**
+     *
+     * The note above says such an anchor "cannot be recovered". It can:
+     * `resolveAcceptanceAnchor` derives the personal one from the task's
+     * creation and the holder's live duty document, neither of which the
+     * overwrite touched. Keeping the stale value instead is what left T101
+     * due 16:06 — a time computed from T099 finishing at 15:06 — after T099
+     * was blocked and dropped BELOW it. The reason for the anchor had gone and
+     * the anchor had not.
+     *
+     * Only when the stored anchor is this walk's own output. A `first_online`
+     * or `hours_granted` anchor is a real statement about when the person could
+     * have started, and it still stands.
+     *
+     * This can only ever move a deadline EARLIER, and only for a task that has
+     * reached the front of its own queue — which is the honest direction: the
+     * work ahead is gone, so the extra hours it was buying are gone with it.
+     */
+    let personalAnchorMs = null;
+    let personalAnchorSource = null;
+    if (previousEndMs === null && anchorIsQueueDerived) {
+      try {
+        const re = await resolveAcceptanceAnchor(task.raw, nowMs, task.id);
+        /**
+         * **It may only ever pull the anchor EARLIER.**
+         *
+         * The whole job here is undoing a queue push, and a queue push always
+         * moves an anchor later — so the personal anchor it displaced must lie
+         * before it. Anything later is not a recovery, it is drift, and drift
+         * here hands out time nobody granted.
+         *
+         * Two ways that happened. `acceptanceAnchorMs` falls back to
+         * `{ anchorMs: nowMs, source: "acceptance" }` whenever nothing is
+         * provable — an unreadable duty document is enough — and "now" passes
+         * every other test while being the one answer that is certainly wrong
+         * for a task raised hours ago. And `first_online` reads the duty
+         * document's `updatedAt` as the session start, which moves whenever
+         * anything else writes that document.
+         *
+         * So: a real, PAST anchor, or the stored one stands.
+         */
+        const isRecovery =
+          Number.isFinite(re?.anchorMs) &&
+          re.source !== "after_priority_work" &&
+          re.source !== "acceptance" &&
+          re.anchorMs < task.anchorMs;
+        if (isRecovery) {
+          personalAnchorMs = re.anchorMs;
+          personalAnchorSource = re.source;
+        }
+      } catch (e) {
+        /* Unrecoverable costs the correction, never the walk — the task keeps
+           the anchor it already had, which is the old behaviour exactly. */
+        console.warn(`[officeDeadline] re-anchor failed for ${task.id}:`, e.message);
+      }
+    }
+
+    /* The head carries the QUEUE's start, so the number does not change with
+       whichever task happens to lead. Never later than the task's own anchor —
+       this rule may tighten a deadline, never loosen one. */
+    /**
+     * **The head takes the queue's start, whichever direction that moves it.**
+     *
+     * This used to adopt the queue start only when it was EARLIER, a guard
+     * against the anchor creeping forward. That creep had a different cause —
+     * the session start was read from `updatedAt`, which tracks the last write
+     * — and it is fixed at the source now that `since` is read instead.
+     *
+     * What the guard did instead was freeze ghosts. The queue start is
+     * `max(session, earliest task in the queue)`, so DELETING the earliest task
+     * moves it later; a stored anchor derived from the deleted task then could
+     * never be corrected. Reported exactly that way: Cowork anchored 16:19:02,
+     * the creation time of a Dev task that no longer existed, while the queue's
+     * earliest surviving task was Cowork itself at 16:33:46. The engine held
+     * 18:19 and the confirm dialog — which recomputes from scratch — showed
+     * 09:33 the next morning. Both were internally consistent and they
+     * disagreed, which is the failure this whole area keeps producing.
+     *
+     * The queue start is now stable in its own right: `since` does not move
+     * while the mode holds, and creation times do not move at all. So adopting
+     * it unconditionally cannot drift — it can only follow the queue it
+     * describes.
+     */
+    const headAnchorMs =
+      /* A simulation carries its own `startMs` — the rejection preview asks
+         "what if I sent this back, starting now", and answering from the
+         queue's start instead would answer a different question. */
+      !task.isRework && Number.isFinite(queueAnchorMs)
+        ? queueAnchorMs
+        : (personalAnchorMs ?? task.anchorMs);
+
+    /* `let`, because the unblocking floor below may raise it. */
+    let anchorMs =
       previousEndMs === null
-        ? task.anchorMs
+        ? headAnchorMs
         : anchorIsQueueDerived
           ? previousEndMs
           : Math.max(task.anchorMs, previousEndMs);
+    /**
+     * **Nothing starts before it was allowed to.** OWNER RULE, 21 Aug 2026.
+     *
+     * Applied AFTER the chain has had its say, and as a `max`, so it can only
+     * ever push a start later — never pull one earlier, and never reorder
+     * anything. Where the task above already finishes after the approval this
+     * changes nothing, which is the ordinary case; it bites where a blocked
+     * task reaches the FRONT and would otherwise take the queue's start.
+     */
+    if (Number.isFinite(task.unblockedAtMs) && task.unblockedAtMs > anchorMs) {
+      anchorMs = task.unblockedAtMs;
+    }
+
     let dueIso = addWorkingSecsIST(
       anchorMs,
       task.secs,
@@ -626,17 +1017,54 @@ async function rechainQueueFor(employeeId, opts = {}) {
      * stored deadline and what this walk would compute — that disagreement is
      * somebody else's decision, not a fault to correct.
      */
+    /**
+     * **The head moving onto the queue's own start is a correction too.**
+     *
+     * Without this the rule only half-applies: pulling an anchor earlier is not
+     * `movesLater`, and `correctsItself` alone wants a queue-derived anchor —
+     * so a task sitting on its own `first_online` kept it until some unrelated
+     * event forced a rewrite. That is the reported symptom exactly: 12:30:20 in
+     * one state, 12:28:55 in another, for the same task.
+     *
+     * It can only ever tighten, never loosen: `headAnchorMs` takes the queue
+     * start only when it is EARLIER than the anchor the task already had.
+     */
+    const headTakesQueueStart =
+      /* Never inside a preview. "What if I sent this back at P4" must report
+         the consequences of THAT, not an unrelated correction to somebody
+         else's head — the rejection screen asks on every keystroke. */
+      !sim &&
+      previousEndMs === null &&
+      Number.isFinite(queueAnchorMs) &&
+      anchorMs === queueAnchorMs &&
+      anchorMs !== task.anchorMs;
+
     const correctsItself =
-      anchorIsQueueDerived &&
+      (anchorIsQueueDerived || headTakesQueueStart) &&
       Number.isFinite(dueMs) &&
       anchorMs !== task.anchorMs &&
       dueMs !== task.dueMs;
 
     if (movesLater || correctsItself || task.isRework) {
       if (!opts.dryRun) {
+        wroteFor.add(task.id);
         await task.ref.update({
+          effectivePriority: positionOf.get(task.id),
           clockStartsAtMs: anchorMs,
-          clockStartsAtSource: "after_priority_work",
+          /**
+           * The source has to describe the anchor actually written.
+           *
+           * Stamping `after_priority_work` on a re-derived PERSONAL anchor
+           * would be a lie with teeth: the label is what `anchorIsQueueDerived`
+           * reads on the next walk, and a real personal anchor must survive
+           * `Math.max` against the queue rather than being replaced by it.
+           * Mislabelling it would let a later walk overwrite a true statement
+           * about when somebody could start.
+           */
+          clockStartsAtSource:
+            personalAnchorMs !== null && anchorMs === personalAnchorMs
+              ? personalAnchorSource
+              : "after_priority_work",
           dueDate: dueIso,
         });
       }
@@ -670,6 +1098,61 @@ async function rechainQueueFor(employeeId, opts = {}) {
       : Math.max(dueMs, task.dueMs ?? dueMs);
   }
 
+
+  /**
+   * **The derived position, written where anybody can read it.**
+   *
+   * `assigneePriorities` is never touched — it is the rank a manager chose, and
+   * it is the only reason a task blocked out of P1 climbs back the moment its
+   * input lands. But that means the stored rank and the shown position can
+   * legitimately differ, and until now the difference lived nowhere: the
+   * documents said Development was P1 while every screen said P2, and each
+   * consumer had to re-derive workability for itself to find out.
+   *
+   * So the two facts get two fields. `assigneePriorities` stays the DECISION;
+   * `effectivePriority` is the CONSEQUENCE — 1..N over the work that actually
+   * holds a queue slot, in the order this walk uses. Anything reading the
+   * documents now sees what the person sees, without re-deriving anything.
+   *
+   * Written outside the deadline update on purpose: a swap can change what is
+   * first without moving any date at all, and that still has to be recorded.
+   */
+  if (!opts.dryRun) {
+    const admin = require("firebase-admin");
+    const held = new Set();
+    await Promise.all(
+      ordered
+        .map((t) => {
+          if (t.isRework) return null; /* a simulation, not a real placement */
+          held.add(t.id);
+          const position = positionOf.get(t.id);
+          /* Already carried by this pass's deadline update, or already right. */
+          if (wroteFor.has(t.id)) return null;
+          if (Number(t.raw?.effectivePriority) === position) return null;
+          return t.ref.update({ effectivePriority: position }).catch((e) => {
+            console.warn(
+              `[officeDeadline] effectivePriority write failed for ${t.id}:`,
+              e.message,
+            );
+          });
+        })
+        .filter(Boolean),
+    );
+
+    /* Anything that has LEFT the queue — finished, cancelled, blocked out of a
+       slot — must not keep a position it no longer holds. A stale number here
+       reads exactly like a live one. */
+    await Promise.all(
+      seen
+        .filter((d) => !held.has(d.id) && d.effectivePriority !== undefined)
+        .map((d) =>
+          d.ref
+            .update({ effectivePriority: admin.firestore.FieldValue.delete() })
+            .catch(() => {}),
+        ),
+    );
+  }
+
   return moved;
 }
 
@@ -696,6 +1179,9 @@ function reworkLeftoverSecs(task) {
 
 module.exports = {
   addWorkingSecsIST,
+  occupiesQueue,
+  approvedOutputIdsNow,
+  unblockedAtMs,
   rechainQueueFor,
   readOfficeCalendar,
   computeWorkingDeadline,

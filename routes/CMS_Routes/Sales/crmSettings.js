@@ -44,6 +44,16 @@ router.patch("/", salesAuth, async (req, res) => {
       "productInterestOptions",
     ];
 
+    // Nested, so it cannot ride the flat allow-list above. Merged rather than
+    // replaced: sending only `marginFloorPct` must not blank a sibling setting
+    // added here later.
+    if (req.body?.commercial && typeof req.body.commercial === "object") {
+      const markup = Number(req.body.commercial.markupPct);
+      if (Number.isFinite(markup) && markup >= 0 && markup <= 500) {
+        settings.commercial = { ...(settings.commercial?.toObject?.() || settings.commercial || {}), markupPct: markup };
+      }
+    }
+
     allowed.forEach((key) => {
       if (req.body[key] !== undefined) settings[key] = req.body[key];
     });

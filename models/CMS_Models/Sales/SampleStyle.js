@@ -27,6 +27,7 @@ const {
   SAMPLE_TECHSHEET_STATUS_CODES,
   SAMPLE_SAMPLING_STATUS_CODES,
   SAMPLE_ROUND_TYPE_CODES,
+  SAMPLE_ROUND_OUTCOME_CODES,
   SAMPLE_STYLE_STATUS_CODES,
   SAMPLE_STYLE_STAGE_CODES,
   GARMENT_GENDER_CODES,
@@ -37,31 +38,79 @@ const actorRef = () => ({
   name: { type: String, trim: true },
 });
 
+const imageSchema = new mongoose.Schema(
+  { fileId: { type: String, trim: true }, name: { type: String, trim: true }, url: { type: String, trim: true } },
+  { _id: false },
+);
+
+// One raw item picked for this style, variant-wise — the Merchandiser's
+// materials pick AND R&D's sample consumption both use this exact shape
+// (24 Aug 2026), so the same sync-onto-the-stock-item logic handles either
+// source without a case-by-case translation.
+const rawItemPickSchema = new mongoose.Schema(
+  {
+    rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem" },
+    rawItemName: { type: String, trim: true },
+    rawItemSku: { type: String, trim: true },
+    // The RAW ITEM's own physical variant (colour/vendor combination) —
+    // distinct from productVariantId below.
+    variantId: { type: mongoose.Schema.Types.ObjectId },
+    variantCombination: [{ type: String, trim: true }],
+    // Which variant of the LINKED STOCK ITEM this row is for — absent means
+    // "every variant" (a trim like a button is usually the same across
+    // sizes; a fabric quantity usually is not, which is exactly why this
+    // exists instead of one flat list for the whole product).
+    productVariantId: { type: mongoose.Schema.Types.ObjectId },
+    productVariantLabel: { type: String, trim: true },
+    // Optional — the Merchandiser is picking WHAT'S needed, not always
+    // measuring HOW MUCH yet; R&D fills the real consumption later. Present
+    // when they do know it.
+    quantity: { type: Number, min: 0 },
+    unit: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
 // A revision bounced back from a Sales gate — the note + who/when.
+//
+// `roundId` says WHICH round was rejected. Without it the revisions and the
+// rounds were two parallel lists that could only be lined up by comparing
+// timestamps, so "what was wrong with the second fit sample" had no answer.
+// Absent on tech-sheet revisions, which are not about a round.
 const revisionSchema = new mongoose.Schema(
-  { note: { type: String, trim: true }, at: { type: Date, default: Date.now }, by: actorRef() },
+  {
+    note: { type: String, trim: true },
+    roundId: { type: mongoose.Schema.Types.ObjectId },
+    at: { type: Date, default: Date.now },
+    by: actorRef(),
+  },
   { _id: false },
 );
 
 // One physical sample round on the ladder (Proto → Fit → … → PP).
+//
+// A round used to be four fields — number, type, note, date — which recorded
+// THAT a sample happened and nothing about it. It is now the record of the
+// sample itself: what was made (`images`), how it was judged (`outcome`) and
+// what was said (`feedback`, in the customer's or Sales' words).
+//
+// `outcome` moves on its own, not with sample.status: a style can be back in
+// progress on round 4 while rounds 1–3 stay individually rejected or
+// superseded. "superseded" is for a round nobody ruled on before the next one
+// was made — common, and not the same as rejected.
 const roundSchema = new mongoose.Schema(
   {
     roundNo: { type: Number, min: 1 },
     type: { type: String, enum: SAMPLE_ROUND_TYPE_CODES },
     note: { type: String, trim: true },
+    images: [imageSchema],
+    outcome: { type: String, enum: SAMPLE_ROUND_OUTCOME_CODES, default: "pending" },
+    feedback: { type: String, trim: true },
+    judgedAt: { type: Date },
+    judgedBy: actorRef(),
     madeAt: { type: Date, default: Date.now },
   },
   { _id: true },
-);
-
-const imageSchema = new mongoose.Schema(
-  {
-    fileId: { type: String, trim: true }, // Drive file id (legacy)
-    publicId: { type: String, trim: true }, // Cloudinary public id — dropped before 19 Aug 2026, see briefFromProduct
-    name: { type: String, trim: true },
-    url: { type: String, trim: true },
-  },
-  { _id: false },
 );
 
 // One event on the style's shared timeline — every hop and bounce, so Sales,
@@ -109,6 +158,50 @@ const sampleStyleSchema = new mongoose.Schema(
     // matched by name and backfilled on the next provision.
     enquiryProductId: { type: mongoose.Schema.Types.ObjectId, index: true, sparse: true },
 
+    // ── Raised from a registered product ────────────────────────────────────
+    //
+    // The item-master entry the enquiry row named, when it named one. Distinct
+    // from `production.stockItemId` further down, which is the OPPOSITE
+    // direction: that is the product this style became after being developed.
+    // This is the product it came from, already developed.
+    //
+    // It is what lets the Style & Sample stage prove the claim it makes. Saying
+    // "no development needed" without being able to show WHY would be worse
+    // than asking for the work: the reader has to take it on trust, and six
+    // months later nobody can tell a waived style from a forgotten one.
+    sourceStockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem", index: true, sparse: true },
+    sourceStockItemReference: { type: String, trim: true },
+
+    // ── Variants ────────────────────────────────────────────────────────────
+    //
+    // One enquiry product can be developed as SEVERAL styles at once — the same
+    // polo in navy poly-cotton and in white PC, offered together so the
+    // customer picks. Each is its own record with its own tech sheet, its own
+    // sample ladder and its own gates, because that is what they are: separate
+    // things being made. What makes them siblings is sharing a product.
+    //
+    // `variantKey` is the empty string for the BASE variant — the style
+    // provisioning raises straight from the enquiry product. Every existing row
+    // is therefore a base variant with no migration, and a journey that never
+    // asks for a variant behaves exactly as it did.
+    //
+    // The uniqueness that used to be { journeyId, productName } is now
+    // { journeyId, productName, variantKey }, so two variants of one product
+    // can coexist while two BASE styles for one product still cannot.
+    variantKey: { type: String, trim: true, default: "", index: true },
+    /** What to call it on screen: "White PC", "Heavier GSM", "Contrast collar". */
+    variantLabel: { type: String, trim: true },
+    /** Why this variant exists — the ask it answers. */
+    variantNote: { type: String, trim: true },
+    /** The style it was branched from, for ordering and for "same as X, but…". */
+    variantOf: { type: mongoose.Schema.Types.ObjectId, ref: "SampleStyle", index: true, sparse: true },
+    /**
+     * Set once the customer picks between siblings. Only one per product should
+     * ever be true; the route that sets it clears the others in the same save.
+     * Not a status — a style can be approved and still not be the one chosen.
+     */
+    variantChosen: { type: Boolean, default: false },
+
     // Routing position (kanban): brief → materials → rnd. Created at "brief"
     // (carried from the enquiry, sent nowhere yet); the R&D app only lists
     // styles at "rnd". The finer Tech sheet / Sampling / Done columns derive
@@ -139,6 +232,21 @@ const sampleStyleSchema = new mongoose.Schema(
       // currently wears, which is exactly the kind of context that shapes a
       // tech pack.
       existingUniform: { type: String, trim: true },
+      // The rest of what the enquiry row knows, snapshotted so R&D reads the
+      // WHOLE product rather than the subset this brief used to carry
+      // (24 Aug 2026, explicit request). Mongoose strips anything not
+      // declared here, so briefFromProduct's additions have to be mirrored.
+      logo: { type: Boolean, default: false },
+      embroidery: { type: Boolean, default: false },
+      printing: { type: Boolean, default: false },
+      stockItemReference: { type: String, trim: true },
+      /** Salesperson-defined spec — see Enquiry's products[].customSpecs. */
+      customSpecs: [
+        new mongoose.Schema(
+          { label: { type: String, trim: true }, value: { type: String, trim: true, default: "" } },
+          { _id: false },
+        ),
+      ],
       images: [imageSchema],
     },
 
@@ -146,7 +254,18 @@ const sampleStyleSchema = new mongoose.Schema(
     // tech sheet until these are selected.
     materials: {
       status: { type: String, enum: SAMPLE_MATERIALS_STATUS_CODES, default: "pending" },
+      // Free-text "Item — Vendor" rows — the ORIGINAL shape, kept for the
+      // history already recorded this way and for callers that only need a
+      // name to show, not a real BOM entry.
       items: [{ type: String, trim: true }],
+      // The structured, variant-wise sibling of `items` above (24 Aug 2026,
+      // explicit request — "the raw item are goona fill as per the variant
+      // wise... keep the consumption input... optional"). This is what syncs
+      // onto the linked stock item's BOM once approved, and what R&D's own
+      // sample-submission step reads to auto-suggest what's already known —
+      // `items` alone (a name and a vendor, no real rawItemId/variantId/
+      // quantity) can't drive either.
+      rawItems: [rawItemPickSchema],
       selectedBy: actorRef(),
       selectedAt: { type: Date },
     },
@@ -160,6 +279,7 @@ const sampleStyleSchema = new mongoose.Schema(
       new mongoose.Schema(
         {
           items: [{ type: String, trim: true }],
+          rawItems: [rawItemPickSchema],
           status: { type: String, trim: true, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
           submittedBy: actorRef(),
           submittedAt: { type: Date, default: Date.now },
@@ -212,6 +332,23 @@ const sampleStyleSchema = new mongoose.Schema(
           // bare consumed number (20 Aug 2026, explicit request).
           allowancePercent: { type: Number, default: 0, min: 0 },
           notes: { type: String, trim: true, default: "" },
+        },
+      ],
+      // The operations (process steps + time) R&D actually ran making this
+      // sample — raised alongside consumptionRawItems (24 Aug 2026, explicit
+      // request), same shape as StockItem.operations so it can be synced
+      // straight onto the product on approval. Deliberately NOT required —
+      // R&D may not always time every step, and the raw-item evidence above
+      // is what approval actually gates on.
+      operations: [
+        {
+          type: { type: String, trim: true },
+          operationCode: { type: String, trim: true, default: "" },
+          machine: { type: String, trim: true },
+          machineType: { type: String, trim: true },
+          minutes: { type: Number, min: 0, default: 0 },
+          seconds: { type: Number, min: 0, default: 0 },
+          totalSeconds: { type: Number, min: 0, default: 0 },
         },
       ],
       photos: [imageSchema],
@@ -282,26 +419,14 @@ const sampleStyleSchema = new mongoose.Schema(
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } },
 );
 
-// One ACTIVE style per product per journey. Partial (scoped to isActive:true)
-// rather than a flat unique index: a soft-deactivated duplicate must never
-// block provisioning a fresh style under the same name.
+// One style per product per journey.
+// One BASE style per product per journey, and one style per named variant of
+// it. See the `variantKey` field for why the key grew a third part.
 //
-// BUG FIX (19 Aug 2026): this index was declared here all along but had never
-// actually been built on the live database — only the single-field indexes
-// Mongoose derives from `index: true` on individual fields existed. Two
-// concurrent provision calls (React StrictMode's double effect-invoke on
-// mount, or Sales and R&D opening the same journey within milliseconds of
-// each other) both passed provisionJourneyStyles' "does this already exist"
-// read before either had committed its write, and with no unique index to
-// stop the second insert, both landed — one SampleStyle per product turned
-// into two, which is exactly the duplicate rows the R&D board showed. Cleaned
-// up the existing duplicates in the database directly; this index plus the
-// catch-and-requery guard in services/sampleStyleProvision.js close the race
-// itself so it can't recur.
-sampleStyleSchema.index(
-  { journeyId: 1, productName: 1 },
-  { unique: true, partialFilterExpression: { isActive: true } },
-);
+// NOTE for deploys: this replaces a unique { journeyId, productName }. Mongo
+// does not drop a renamed index on its own — run scripts/dropLegacyStyleIndex.js
+// once, or the old one keeps refusing the second variant.
+sampleStyleSchema.index({ journeyId: 1, productName: 1, variantKey: 1 }, { unique: true });
 
 // Heal legacy routing values (an earlier build used brief/merchandiser) so old
 // rows validate against the current enum instead of throwing on save.
