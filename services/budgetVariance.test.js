@@ -20,10 +20,23 @@ test("nature comes straight from a ledger group when it has one", () => {
   assert.equal(natureOf({ nature: "expense" }), "expense");
 });
 
-test("an unrecognised nature falls back to expense, not to a crash", () => {
-  assert.equal(natureOf({ nature: "asset" }), "expense");
+test("a head that is not a budget is 'other', never silently expense", () => {
+  /* The chart of accounts has five natures and only two of them are a budget.
+     These used to normalise to "expense", which added a bank account or a loan
+     to the company's spend — a figure that could never be reconciled against
+     the P&L, and nothing on screen said why. */
+  assert.equal(natureOf({ nature: "asset" }), "other");
+  assert.equal(natureOf({ nature: "liability" }), "other");
+  assert.equal(natureOf({ nature: "equity" }), "other");
+});
+
+test("a line that says nothing at all is still expense, not a crash", () => {
+  /* A legacy row with no ledger and no snapshot. Still a guess, but the one
+     the module has always made and the one the row's own default implies —
+     unlike an asset head, which is a positive statement that it is not spend. */
   assert.equal(natureOf({}), "expense");
   assert.equal(natureOf(undefined), "expense");
+  assert.equal(natureOf({ nature: "nonsense" }), "expense");
 });
 
 test("the legacy isRevenue flag is honoured when nature is absent", () => {
@@ -249,4 +262,44 @@ test("expense pace escalation also respects the warm-up floor", () => {
 test("modest overspend pace warns without crying critical", () => {
   const r = evaluateLine({ allocated: 120000, actual: 78000, nature: "expense", ...YEAR, asOf: HALFWAY });
   assert.equal(r.severity, "warning");
+});
+
+/* ── Nature comes from the head, the centre comes from the lines ──────────── */
+
+const { centreOf, rollUp: roll } = require("./budgetVariance.service");
+
+test("an 'other' line is counted but kept out of both totals and out of net", () => {
+  const out = roll([
+    { nature: "expense", allocated: 100, actual: 40, variance: 60 },
+    { nature: "revenue", allocated: 500, actual: 300, variance: -200 },
+    { nature: "asset", allocated: 900, actual: 900, variance: 0 },
+  ]);
+  assert.equal(out.expense.allocated, 100, "the bank line must not be spend");
+  assert.equal(out.revenue.allocated, 500);
+  assert.equal(out.other.allocated, 900);
+  assert.equal(out.other.count, 1);
+  /* Net is revenue minus expense and nothing else. */
+  assert.equal(out.budgetedNet, 400);
+  assert.equal(out.actualNet, 260);
+});
+
+test("hasRevenue tells an absent side apart from a met one", () => {
+  /* Both total zero on revenue. They are not the same thing, and a screen
+     that cannot tell them apart prints "₹0 earned" at a department that was
+     never asked to earn anything. */
+  const none = roll([{ nature: "expense", allocated: 100, actual: 40, variance: 60 }]);
+  const met = roll([{ nature: "revenue", allocated: 0, actual: 0, variance: 0 }]);
+  assert.equal(none.hasRevenue, false);
+  assert.equal(met.hasRevenue, true);
+  assert.equal(none.hasExpense, true);
+});
+
+test("a department's type is read off its lines, never declared", () => {
+  assert.equal(centreOf([{ nature: "expense" }, { nature: "expense" }]), "cost");
+  assert.equal(centreOf([{ nature: "revenue" }]), "revenue");
+  assert.equal(centreOf([{ nature: "revenue" }, { nature: "expense" }]), "contribution");
+  /* No lines is an absence, not a classification — calling it a cost centre
+     would be inventing a fact about a department nobody has budgeted yet. */
+  assert.equal(centreOf([]), "unclassified");
+  assert.equal(centreOf([{ nature: "asset" }]), "unclassified");
 });

@@ -348,6 +348,11 @@ function groupLinesByDepartment(lines, resolver) {
       const name = g.slug === "" ? "Unassigned" : g.name || commonest?.[0] || g.slug;
       return {
         ...variance.rollUp(g.lines),
+        /* What this department IS, read off its own lines. Nobody declares it:
+         * only expense lines make a cost centre, only revenue a revenue
+         * centre, both a contribution centre, and none at all is an absence
+         * rather than a classification. See variance.centreOf. */
+        centre: variance.centreOf(g.lines),
         /* `name` and `department` stay the display string every existing
          * consumer already reads; `departmentSlug` is the identity, for a
          * caller that wants to filter without guessing the spelling. */
@@ -1112,6 +1117,10 @@ router.get("/dashboard", async (req, res) => {
 
         return {
           ...head,
+          /* A head the chart of accounts calls an asset or a liability is
+           * neither a spend limit nor a target. Marked so the UI can stop
+           * drawing it as an ordinary budget. */
+          supported: head.nature === "expense" || head.nature === "revenue",
           allocated,
           actual,
           expectedToDate,

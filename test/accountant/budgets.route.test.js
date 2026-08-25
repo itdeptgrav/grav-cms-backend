@@ -5022,3 +5022,174 @@ describe("dashboard overlap deduplication", () => {
     expect(byName["Company Q2"].totals.expense.actual).toBe(100000);
   });
 });
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * NATURE COMES FROM THE ACCOUNT HEAD
+ *
+ * Not from the department, and not from a flag someone set on the row. The
+ * chart of accounts has five natures and only two of them are a budget; the
+ * other three used to be coerced to "expense", which added a bank account to
+ * the company's spend with nothing on screen saying so.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("budget line nature is read off the ledger", () => {
+  let seq2 = 0;
+
+  async function company() {
+    const c = await Acc_Company.create({
+      companyName: `Nature Co ${seq2++}`, booksFromDate: new Date("2026-04-01"),
+    });
+    const mk = async (name, nature) => {
+      const g = await Acc_Group.create({ companyId: c._id, name: `${name} group`, nature });
+      return Acc_Ledger.create({
+        companyId: c._id, name, groupId: g._id, groupName: g.name, nature,
+      });
+    };
+    return {
+      company: c,
+      expense: await mk("Freight & Forwarding", "expense"),
+      revenue: await mk("Export Sales", "revenue"),
+      bank: await mk("HDFC Current", "asset"),
+    };
+  }
+
+  const budget = (c, items) =>
+    Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: c._id, items,
+    });
+
+  const line = (ledger, department, allocatedAmount, natureSnapshot) => ({
+    ledgerId: ledger._id, ledgerName: ledger.name, department, allocatedAmount,
+    ...(natureSnapshot ? { nature: natureSnapshot } : {}),
+  });
+
+  test("the LEDGER decides, even when the row's snapshot disagrees", async () => {
+    const { company: c, revenue } = await company();
+    /* The row says expense; the head says revenue. The head wins — a head
+       re-parented in the chart of accounts must move sides everywhere. */
+    const b = await budget(c, [line(revenue, "Sales", 4000000, "expense")]);
+
+    const { body } = await call(`/${b._id}?companyId=${c._id}&asOf=2027-03-31`);
+    expect(body.budget.items[0].nature).toBe("revenue");
+    expect(body.budget.totals.revenue.allocated).toBe(4000000);
+    expect(body.budget.totals.expense.allocated).toBe(0);
+  });
+
+  test("an asset head is 'other' — not spend, and out of both totals", async () => {
+    const { company: c, expense, bank } = await company();
+    const b = await budget(c, [
+      line(expense, "Logistics", 500000),
+      line(bank, "Admin", 900000),
+    ]);
+
+    const { body } = await call(`/${b._id}?companyId=${c._id}&asOf=2027-03-31`);
+    const bankLine = body.budget.items.find((i) => i.ledgerName === "HDFC Current");
+
+    expect(bankLine.nature).toBe("other");
+    /* The whole point: 9,00,000 on a bank account is not 9,00,000 of spend. */
+    expect(body.budget.totals.expense.allocated).toBe(500000);
+    expect(body.budget.totals.other.allocated).toBe(900000);
+    expect(body.budget.totals.budgetedNet).toBe(-500000);
+  });
+
+  test("hasRevenue tells an absent revenue side from a met one", async () => {
+    const { company: c, expense } = await company();
+    const b = await budget(c, [line(expense, "Admin", 500000)]);
+
+    const { body } = await call(`/${b._id}?companyId=${c._id}&asOf=2027-03-31`);
+    /* An expense-only budget has no revenue side. A screen that reads the
+       zero instead prints "₹0 earned" at a department never asked to earn. */
+    expect(body.budget.totals.hasRevenue).toBe(false);
+    expect(body.budget.totals.hasExpense).toBe(true);
+  });
+});
+
+describe("a department's type is derived from its lines", () => {
+  let seq3 = 0;
+
+  async function setup(items) {
+    const c = await Acc_Company.create({
+      companyName: `Centre Co ${seq3++}`, booksFromDate: new Date("2026-04-01"),
+    });
+    const mk = async (name, nature) => {
+      const g = await Acc_Group.create({ companyId: c._id, name: `${name} g`, nature });
+      return Acc_Ledger.create({ companyId: c._id, name, groupId: g._id, groupName: g.name, nature });
+    };
+    const expense = await mk("Freight", "expense");
+    const revenue = await mk("Export Sales", "revenue");
+    await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: c._id,
+      items: items({ expense, revenue }),
+    });
+    const { body } = await call(`/dashboard?companyId=${c._id}&asOf=2027-03-31`);
+    return body;
+  }
+
+  const at = (body, name) => body.byDepartment.find((d) => d.department === name);
+
+  test("expense-only is a cost centre; HR is never shown as earning", async () => {
+    const body = await setup(({ expense }) => [
+      { ledgerId: expense._id, department: "HR", allocatedAmount: 500000 },
+    ]);
+    const hr = at(body, "HR");
+    expect(hr.centre).toBe("cost");
+    /* Not "₹0 earned" — HR has no revenue side at all. */
+    expect(hr.hasRevenue).toBe(false);
+  });
+
+  test("revenue-only is a revenue centre", async () => {
+    const body = await setup(({ revenue }) => [
+      { ledgerId: revenue._id, department: "Sales", allocatedAmount: 4000000 },
+    ]);
+    const sales = at(body, "Sales");
+    expect(sales.centre).toBe("revenue");
+    expect(sales.hasExpense).toBe(false);
+  });
+
+  test("both sides make a contribution centre", async () => {
+    const body = await setup(({ expense, revenue }) => [
+      { ledgerId: revenue._id, department: "Sales", allocatedAmount: 4000000 },
+      { ledgerId: expense._id, department: "Sales", allocatedAmount: 600000 },
+    ]);
+    const sales = at(body, "Sales");
+    expect(sales.centre).toBe("contribution");
+    expect(sales.hasRevenue).toBe(true);
+    expect(sales.hasExpense).toBe(true);
+    expect(sales.budgetedNet).toBe(3400000);
+  });
+
+  test("nobody is asked — the department carries no stored type", async () => {
+    const body = await setup(({ expense }) => [
+      { ledgerId: expense._id, department: "Admin", allocatedAmount: 100000 },
+    ]);
+    /* Derived per read. Nothing about a department's nature is persisted, so
+       adding a revenue line reclassifies it with no migration. */
+    const stored = await Acc_Budget.findOne({ "items.department": "Admin" }).lean();
+    expect(stored.items[0].centre).toBeUndefined();
+    expect(at(body, "Admin").centre).toBe("cost");
+  });
+
+  test("an unsupported head is flagged on the head roll-up", async () => {
+    const c = await Acc_Company.create({
+      companyName: `Head Co ${seq3++}`, booksFromDate: new Date("2026-04-01"),
+    });
+    const g = await Acc_Group.create({ companyId: c._id, name: "Bank", nature: "asset" });
+    const bank = await Acc_Ledger.create({
+      companyId: c._id, name: "HDFC Current", groupId: g._id, groupName: g.name, nature: "asset",
+    });
+    await Acc_Budget.create({
+      name: "FY26-27", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: c._id,
+      items: [{ ledgerId: bank._id, department: "Admin", allocatedAmount: 900000 }],
+    });
+
+    const { body } = await call(`/dashboard?companyId=${c._id}&asOf=2027-03-31`);
+    const head = body.byHead.find((h) => h.ledgerName === "HDFC Current");
+    expect(head.supported).toBe(false);
+    expect(head.nature).toBe("other");
+  });
+});

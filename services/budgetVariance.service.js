@@ -48,7 +48,19 @@ function time(v) {
   return Number.isFinite(t) ? t : null;
 }
 
-const NATURES = new Set(["revenue", "expense"]);
+/* ── THE THREE THINGS A BUDGET LINE CAN BE ───────────────────────────────────
+ * "other" is new, and it exists because the ledger tree has five natures —
+ * asset, liability, equity, revenue, expense — and only two of them are a
+ * budget. A line on a bank account or a loan used to be normalised to
+ * "expense" and quietly added to the company's spend, which is a figure nobody
+ * could reconcile against the P&L.
+ *
+ * It is NOT a fourth kind of budget. It is a line the module cannot control,
+ * kept visible and kept out of the totals. */
+const NATURES = new Set(["revenue", "expense", "other"]);
+
+/** The ledger natures that are not a budget at all. */
+const UNSUPPORTED = new Set(["asset", "liability", "equity"]);
 
 /**
  * Normalise whatever the caller has into "revenue" or "expense".
@@ -59,7 +71,13 @@ const NATURES = new Set(["revenue", "expense"]);
 function natureOf(source = {}) {
   const raw = typeof source === "string" ? source : source.nature;
   if (NATURES.has(raw)) return raw;
+  /* A head the chart of accounts calls an asset or a liability is not spend.
+   * Saying so is the whole point; the old fallthrough said "expense". */
+  if (UNSUPPORTED.has(raw)) return "other";
   if (source && source.isRevenue === true) return "revenue";
+  /* Still expense for a line that says nothing at all — a legacy row with no
+   * ledger and no snapshot. That is a guess, but it is the guess the module
+   * has always made and the one the snapshot on the row implies. */
   return "expense";
 }
 
@@ -264,10 +282,15 @@ function rollUp(lines = []) {
   const seed = () => ({ allocated: 0, actual: 0, variance: 0, count: 0 });
   const revenue = seed();
   const expense = seed();
+  /* Counted so the line is not lost, but deliberately outside both totals and
+   * outside net: a budget line on a bank account is not revenue, is not spend,
+   * and adding it to either produces a figure that cannot be reconciled. */
+  const other = seed();
 
   for (const l of lines) {
     if (!l) continue;
-    const bucket = natureOf(l) === "revenue" ? revenue : expense;
+    const kind = natureOf(l);
+    const bucket = kind === "revenue" ? revenue : kind === "other" ? other : expense;
     bucket.allocated += money(l.allocated) ?? 0;
     bucket.actual += money(l.actual) ?? 0;
     bucket.variance += money(l.variance) ?? 0;
@@ -280,6 +303,13 @@ function rollUp(lines = []) {
   return {
     revenue,
     expense,
+    other,
+    /* What each side actually has, so a caller can ask "is there a revenue
+     * side at all" without inferring it from a zero — a company with no
+     * revenue targets and a company whose targets are all met both total
+     * zero, and they are not the same thing. */
+    hasRevenue: revenue.count > 0,
+    hasExpense: expense.count > 0,
     budgetedNet,
     actualNet,
     netVariance: actualNet - budgetedNet,
@@ -287,6 +317,30 @@ function rollUp(lines = []) {
     budgetedMarginPct: revenue.allocated > 0 ? (budgetedNet / revenue.allocated) * 100 : null,
     actualMarginPct: revenue.actual > 0 ? (actualNet / revenue.actual) * 100 : null,
   };
+}
+
+/**
+ * What a department IS, read off the lines it owns rather than declared.
+ *
+ * Nobody should be asked "is HR a revenue department". The chart of accounts
+ * already knows: a department with only expense lines is a cost centre, only
+ * revenue lines a revenue centre, both a contribution centre. No lines yet is
+ * not a classification, it is an absence — and saying "unclassified" is more
+ * honest than defaulting it to cost centre and printing ₹0 earned.
+ */
+function centreOf(lines = []) {
+  let rev = 0;
+  let exp = 0;
+  for (const l of lines) {
+    if (!l) continue;
+    const kind = natureOf(l);
+    if (kind === "revenue") rev += 1;
+    else if (kind === "expense") exp += 1;
+  }
+  if (rev && exp) return "contribution";
+  if (rev) return "revenue";
+  if (exp) return "cost";
+  return "unclassified";
 }
 
 /** The same consolidation, split by whatever key each line carries. */
@@ -305,6 +359,8 @@ function groupBy(lines = [], key = "department") {
 
 module.exports = {
   natureOf,
+  centreOf,
+  UNSUPPORTED,
   worseOf,
   money,
   elapsedFraction,

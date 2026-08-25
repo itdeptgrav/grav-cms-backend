@@ -29,6 +29,7 @@
 const mongoose = require("mongoose");
 const { Acc_Voucher } = require("../models/Accountant_model/Acc_VoucherModels");
 const { Acc_Ledger, Acc_Group } = require("../models/Accountant_model/Acc_MasterModels");
+const variance = require("./budgetVariance.service");
 
 /** Cast to ObjectId, or null when the value cannot be one. Never throws. */
 function oid(v) {
@@ -665,8 +666,13 @@ async function hydrateLines({ companyId, lines = [], from, to }) {
       return { ...line, actual: 0, unbound: true, voucherCount: 0 };
     }
     const meta = natures.get(key) || {};
-    /* Ledger tree wins over the snapshot on the row — see natureByLedger. */
-    const nature = meta.nature || line.nature || "expense";
+    /* ── NATURE COMES FROM THE HEAD ────────────────────────────────────────
+     * The ledger tree wins over the snapshot on the row — see natureByLedger.
+     * `variance.natureOf` maps the tree's five natures onto the three a budget
+     * can be: an asset, liability or equity head becomes "other" rather than
+     * being coerced to expense, which used to add a bank account or a loan to
+     * the company's spend with nothing on screen saying so. */
+    const nature = variance.natureOf({ nature: meta.nature || line.nature });
 
     const headMovement = movements.get(key) || null;
     const costCentreId = line.costCentreId ? String(line.costCentreId) : null;
