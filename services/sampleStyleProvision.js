@@ -129,6 +129,28 @@ async function provisionJourneyStyles({
           brief: briefFromProduct(p),
           sourceStockItemId: p.stockItemId || undefined,
           sourceStockItemReference: p.stockItemReference || undefined,
+          // The product is now normally registered AT the enquiry stage (see
+          // routes/CMS_Routes/Sales/enquiries.js's product-wise requirement —
+          // 24 Aug 2026, explicit request), not later through R&D's own
+          // Production wizard — so the style already knows which stock item
+          // it's developing INTO from the moment it's raised. This is
+          // `production.stockItemId` (the TARGET, filled in as development
+          // happens), not `sourceStockItemId` above (a DIFFERENT, older
+          // product this style proves against) — the two answer different
+          // questions and can both be set. R&D's wizard skips straight to
+          // Quantities once this is here (see its own `step` computation).
+          production: p.stockItemId
+            ? {
+              stockItemId: p.stockItemId,
+              status: "stock_item_linked",
+              log: [{
+                kind: "stock_item_linked",
+                note: `Registered at the enquiry stage${p.stockItemReference ? ` (${p.stockItemReference})` : ""}.`,
+                by: actor,
+                at: new Date(),
+              }],
+            }
+            : undefined,
           techSheet: proven ? { status: "notApplicable", revisions: [] } : undefined,
           sample: proven ? { status: "notApplicable", rounds: [], revisions: [] } : undefined,
           // Recorded in the shared timeline, because "why was this never
@@ -182,6 +204,22 @@ async function provisionJourneyStyles({
         );
         style.productName = p.product;
         renamed += 1;
+      }
+      // Backfill for a row registered AFTER its style already existed (the
+      // salesperson added the product first, came back and registered it
+      // later) — never overwrites a stockItemId R&D's own wizard already set
+      // by hand, and never touches anything past that first link.
+      if (p.stockItemId && !style.production?.stockItemId) {
+        if (!style.production) style.production = {};
+        style.production.stockItemId = p.stockItemId;
+        if (!style.production.status || style.production.status === "not_started") style.production.status = "stock_item_linked";
+        style.production.log = style.production.log || [];
+        style.production.log.push({
+          kind: "stock_item_linked",
+          note: `Registered at the enquiry stage${p.stockItemReference ? ` (${p.stockItemReference})` : ""}.`,
+          by: actor,
+          at: new Date(),
+        });
       }
       style.brief = briefFromProduct(p);
       style.updatedBy = actor;

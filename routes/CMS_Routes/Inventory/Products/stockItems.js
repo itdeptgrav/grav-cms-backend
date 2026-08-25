@@ -196,6 +196,45 @@ function updateStockItemAggregates(stockItem) {
   });
 }
 
+/**
+ * Derive each variant's `cost` from what it is actually MADE OF — the sum of
+ * its BOM rows' totalCost, plus the shared operations' operator cost.
+ *
+ * WHY THIS EXISTS (24 Aug 2026, explicit bug report — "whatever the raw
+ * items/operations are filled from here, the pricing or like some data are
+ * not gonna put properly in the stock item hence it is showing 0 rupees").
+ * Every writer of `variants[].rawItems` — the Merchandiser's Materials tab,
+ * R&D's sample approval, this file's own create/update routes — was storing
+ * correctly-priced BOM rows (unitCost and totalCost both resolved) while
+ * leaving `variant.cost` at whatever it was seeded with, normally 0. Since
+ * updateStockItemAggregates() reads `v.cost` and nothing else, averageCost /
+ * inventoryValue / profitMargin all stayed 0 no matter how complete the BOM
+ * was. Verified against the dev data before fixing: TECHNOSPORT Maroon
+ * T-Shirt carried three variants each holding ₹880 of priced BOM rows and
+ * still reported cost=0, averageCost=0.
+ *
+ * ONLY EVER RAISES A COST OFF A REAL FIGURE. A BOM that prices to zero — a
+ * raw item nobody has quoted yet — leaves the existing cost alone rather
+ * than wiping a manually-entered one back to 0. So this can add information
+ * but never destroy it, which is what makes it safe to run on every sync.
+ *
+ * Returns true when something actually changed.
+ */
+function recomputeVariantCostsFromBom(stockItem) {
+  const operationsCost = (stockItem.operations || [])
+    .reduce((sum, o) => sum + (Number(o.operatorCost) || 0), 0);
+  let changed = false;
+  for (const v of stockItem.variants || []) {
+    const bomCost = (v.rawItems || []).reduce((sum, r) => sum + (Number(r.totalCost) || 0), 0);
+    const total = Math.round((bomCost + operationsCost) * 100) / 100;
+    if (total > 0 && total !== v.cost) {
+      v.cost = total;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Operation routes (keep existing — unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -891,6 +930,11 @@ router.post("/", async (req, res) => {
       createdBy: req.user.id
     });
 
+    // BOM first, then the aggregates that read off it — a variant's cost is
+    // what it is made of (see recomputeVariantCostsFromBom), and
+    // updateStockItemAggregates only ever reads `v.cost`, so the order here
+    // is load-bearing.
+    recomputeVariantCostsFromBom(newStockItem);
     updateStockItemAggregates(newStockItem);
     await newStockItem.save();
 
@@ -1002,6 +1046,7 @@ router.put("/:id", async (req, res) => {
 
     if (images !== undefined) stockItem.images = images || [];
     stockItem.updatedBy = req.user.id;
+    recomputeVariantCostsFromBom(stockItem);
     updateStockItemAggregates(stockItem);
     await stockItem.save();
 
@@ -1074,3 +1119,10 @@ router.delete("/:id", async (req, res) => {
 });
 
 module.exports = router;
+// Reused by routes/CMS_Routes/Sales/sampleStyles.js — the "production" pipeline
+// registers/updates a StockItem's BOM from R&D's sample submission and needs
+// the exact same rawItem-cost resolution and aggregate recompute this file
+// already does for its own create/update routes, not a second copy of it.
+module.exports.processVariantRawItems = processVariantRawItems;
+module.exports.updateStockItemAggregates = updateStockItemAggregates;
+module.exports.recomputeVariantCostsFromBom = recomputeVariantCostsFromBom;
