@@ -1683,12 +1683,32 @@ app.use(
   require("./routes/Accountant_Routes/Acc_parties"),
 );
 app.use(
-  "/api/accountant/budget-departments",
-  require("./routes/Accountant_Routes/Acc_budgetDepartments"),
+  "/api/accountant/bill-terms",
+  require("./routes/Accountant_Routes/Acc_billTerms"),
+);
+app.use(
+  "/api/accountant/recurring-items",
+  require("./routes/Accountant_Routes/Acc_recurringItems"),
+);
+app.use(
+  "/api/accountant/cash-flow-forecast",
+  require("./routes/Accountant_Routes/Acc_cashFlowForecast"),
+);
+app.use(
+  "/api/accountant/forecast-cash-ledger-config",
+  require("./routes/Accountant_Routes/Acc_forecastCashLedgerConfig"),
+);
+app.use(
+  "/api/accountant/forecast/party-terms-impact",
+  require("./routes/Accountant_Routes/Acc_partyTermsImpact"),
 );
 app.use(
   "/api/accountant/cost-centres",
   require("./routes/Accountant_Routes/Acc_costCentres"),
+);
+app.use(
+  "/api/accountant/budget-departments",
+  require("./routes/Accountant_Routes/Acc_budgetDepartments"),
 );
 app.use(
   "/api/accountant/merge",

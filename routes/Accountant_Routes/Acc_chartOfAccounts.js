@@ -16,6 +16,7 @@ const {
 // read. Without this bridge, customers with a properly-saved state code in
 // contactDetails still trigger "no state code" errors on the voucher form.
 const { applyGstAutoState } = require("../../services/gstState.util");
+const openItems = require("../../services/openItems.service");
 // Payroll models live in the HR module. We require them lazily inside the
 // payroll endpoints below so this route file still loads on systems that don't
 // have the HR module installed yet.
@@ -1852,125 +1853,26 @@ router.get("/ledgers/:id/statement", async (req, res) => {
       groupName.includes("sundry creditor") ||
       groupName.includes("debtor") ||
       groupName.includes("creditor");
+    // C0-D — migrated onto services/openItems.service.js. What follows is
+    // transport only: fetch this ledger's folded bills, hand them to the
+    // shared `agedBillsForLedger` for the aging/bucket/reconciliation math,
+    // and assemble the SAME response shape the inline version returned.
+    // Every threshold and edge case (the ₹0.01 settled cutoff, the
+    // dueDate-captured-only-at-first-encounter rule, the "Opening /
+    // Unallocated" reconciliation line) now lives in the shared service —
+    // this route no longer has its own copy of any of it.
     if (isPartyLedger) {
-      // Pull ALL allocations across history for this ledger, irrespective of period
-      const allAlloc = await Acc_Voucher.aggregate([
-        { $match: { "ledgerEntries.ledgerId": ledger._id, status: "posted" } },
-        { $unwind: "$ledgerEntries" },
-        { $match: { "ledgerEntries.ledgerId": ledger._id } },
-        { $unwind: "$ledgerEntries.billAllocations" },
-        {
-          $project: {
-            billName: "$ledgerEntries.billAllocations.billName",
-            amount: "$ledgerEntries.billAllocations.amount",
-            billType: "$ledgerEntries.billAllocations.billType",
-            dueDate: "$ledgerEntries.billAllocations.dueDate",
-            creditDays: "$ledgerEntries.billAllocations.creditDays",
-            entryType: "$ledgerEntries.type",
-            voucherDate: 1,
-            voucherNumber: 1,
-            voucherType: 1,
-          },
-        },
+      const foldedBills = await openItems.billsByLedger(ledger.companyId, [
+        ledger._id,
       ]);
-
-      const billMap = new Map();
-      for (const a of allAlloc) {
-        if (!a.billName) continue;
-        const key = a.billName;
-        if (!billMap.has(key)) {
-          billMap.set(key, {
-            billName: a.billName,
-            originalAmount: 0,
-            settled: 0,
-            remaining: 0,
-            firstDate: a.voucherDate,
-            dueDate: a.dueDate,
-            creditDays: a.creditDays || 0,
-            voucherNumbers: new Set(),
-          });
-        }
-        const bill = billMap.get(key);
-        bill.voucherNumbers.add(a.voucherNumber);
-        // new_ref = original invoice (increases outstanding); agst_ref = payment against (decreases)
-        const signed = (a.entryType === "Dr" ? 1 : -1) * (a.amount || 0);
-        bill.remaining += signed;
-        if (a.billType === "new_ref") bill.originalAmount += a.amount || 0;
-        if (
-          !bill.firstDate ||
-          new Date(a.voucherDate) < new Date(bill.firstDate)
-        )
-          bill.firstDate = a.voucherDate;
-      }
-
-      const today = new Date();
-      const buckets = {
-        current: 0,
-        "0-30": 0,
-        "31-60": 0,
-        "61-90": 0,
-        "90+": 0,
-      };
-      const openBills = [];
-      for (const bill of billMap.values()) {
-        if (Math.abs(bill.remaining) < 0.01) continue; // settled
-        const daysOverdue = bill.dueDate
-          ? Math.max(0, Math.floor((today - new Date(bill.dueDate)) / 86400000))
-          : Math.max(
-              0,
-              Math.floor((today - new Date(bill.firstDate)) / 86400000) -
-                (bill.creditDays || 0),
-            );
-        let bucket = "current";
-        if (daysOverdue > 0) bucket = "0-30";
-        if (daysOverdue > 30) bucket = "31-60";
-        if (daysOverdue > 60) bucket = "61-90";
-        if (daysOverdue > 90) bucket = "90+";
-        buckets[bucket] += Math.abs(bill.remaining);
-
-        openBills.push({
-          billName: bill.billName,
-          firstDate: bill.firstDate,
-          dueDate: bill.dueDate || null,
-          creditDays: bill.creditDays,
-          originalAmount: bill.originalAmount,
-          remaining: bill.remaining,
-          remainingAbs: Math.abs(bill.remaining),
-          remainingType: bill.remaining >= 0 ? "Dr" : "Cr",
-          daysOverdue,
-          bucket,
-          voucherCount: bill.voucherNumbers.size,
-        });
-      }
-      // ── Reconcile to the ledger's ACTUAL closing balance ───────────────
-      // Bill allocations alone miss opening balances and imported entries
-      // that carry no bill refs, so the bill-wise sum can be 0 even when the
-      // ledger clearly has a balance. The headline outstanding must equal the
-      // ledger's real closing balance (Dr positive / Cr negative) — the same
-      // number shown on the header card — and any gap is surfaced as an
-      // "Opening / Unallocated" line in the Current bucket so it reconciles.
-      const billSigned = openBills.reduce(
-        (s, b) => s + b.remainingAbs * (b.remainingType === "Dr" ? 1 : -1),
-        0,
+      const { bills: openBills, buckets } = openItems.agedBillsForLedger(
+        [...foldedBills.values()],
+        {
+          asOf: new Date(),
+          closingBalance: closing,
+          fallbackFirstDate: ledger.openingBalanceDate || startDate || null,
+        },
       );
-      const unallocated = parseFloat((closing - billSigned).toFixed(2));
-      if (Math.abs(unallocated) >= 0.01) {
-        openBills.push({
-          billName: "Opening / Unallocated",
-          firstDate: ledger.openingBalanceDate || startDate || null,
-          dueDate: null,
-          creditDays: 0,
-          originalAmount: Math.abs(unallocated),
-          remaining: unallocated,
-          remainingAbs: Math.abs(unallocated),
-          remainingType: unallocated >= 0 ? "Dr" : "Cr",
-          daysOverdue: 0,
-          bucket: "current",
-          voucherCount: 0,
-        });
-        buckets.current += Math.abs(unallocated);
-      }
-      openBills.sort((a, b) => b.daysOverdue - a.daysOverdue);
 
       billWiseOutstanding = {
         applicable: true,

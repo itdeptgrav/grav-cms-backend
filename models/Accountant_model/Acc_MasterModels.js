@@ -65,6 +65,26 @@ const tallyCompanySchema = new mongoose.Schema(
     isPrimary: { type: Boolean, default: false }, // set on the GRAV Clothing record itself
     isActive: { type: Boolean, default: true },
 
+    /* The company-wide fallback credit period, used only when a bill's
+       party ledger carries no term of its own — C0-F's historical backfill
+       is the first consumer. `null` is the ONLY meaning of "unset". There is
+       deliberately NO built-in default (not 30, not any other number): a
+       bill dated off a number nobody at the company approved is a worse
+       outcome than one left undated, because it looks authoritative while
+       being invented. See docs/tasks/accountant-cash-flow-forecast.md
+       §C1.4/§6.0 for the reasoning this repeats from the party-level
+       credit-terms rule. Written only by
+       `PATCH /api/accountant/tally/companies/:id/default-credit-days`
+       (Acc_companies.js) — the Settings → Credit Terms section of the
+       accountant app. */
+    defaultCreditDays: { type: Number, default: null },
+    defaultCreditDaysUpdatedAt: { type: Date, default: null },
+    defaultCreditDaysUpdatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
+    defaultCreditDaysUpdatedByName: { type: String, default: null },
+
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Acc_Department",
@@ -468,8 +488,31 @@ const tallyLedgerSchema = new mongoose.Schema(
 
     // Bill-wise tracking (Tally calls this "Maintain balances bill-by-bill")
     billWiseEnabled: { type: Boolean, default: false },
+
+    /* `creditPeriodDays` predates the cash-flow work. Its default of 0 means
+       UNSET, not "due on receipt" — every one of the 441 ledgers held that
+       default when credit-terms editing was added, so reading 0 as same-day
+       terms would date every open bill to its own invoice date. Due-on-receipt,
+       if it is ever wanted, needs to be its own explicit concept.
+       See services/creditTerms.service.js. */
     creditPeriodDays: { type: Number, default: 0 },
     creditLimit: { type: Number, default: 0 },
+
+    /* Provenance for the credit term. Written server-side only — a client that
+       could set these could claim any origin for a number it invented.
+       `creditTermsSource` is null while the term is unset, which is what
+       separates "explicitly cleared" from "never touched". */
+    creditTermsSource: {
+      type: String,
+      enum: ["manual", "inherited", "default", null],
+      default: null,
+    },
+    creditTermsUpdatedAt: { type: Date },
+    creditTermsUpdatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Department",
+    },
+    creditTermsUpdatedByName: { type: String, trim: true },
 
     // Cost centre allocation
     costCentreApplicable: { type: Boolean, default: false },
