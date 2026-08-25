@@ -52,7 +52,13 @@ async function getFormattedEmployee(employeeId) {
       "firstName lastName email phone biometricId",
     );
 
-  if (!employee || !employee.isActive) return null;
+  // Interns are refused at /login, but /verify and /profile parse the token
+  // themselves rather than going through AllEmployeeAppMiddleware, so the
+  // check has to be here too — this is the pair of routes the app calls on
+  // launch to restore a session. Returning null sends it to the login screen,
+  // where the plain message is waiting.
+  if (!employee || !employee.isActive || employee.employmentType === "intern")
+    return null;
 
   const responseData = employee.toObject();
   responseData.phoneNumber = employee.phone || "";
@@ -111,6 +117,22 @@ router.post("/login", async (req, res) => {
       return res
         .status(401)
         .json({ success: false, message: "Invalid phone number or password" });
+
+    // Interns have no app account. Checked BEFORE the password so a wrong
+    // password on an intern's number does not answer a different question
+    // than a right one — and told plainly, because "invalid phone number or
+    // password" would send them round the reset loop for an account that is
+    // never going to open. The lock lifts by itself the day HR changes their
+    // employment type, which is what "as long as they are not an employee"
+    // means in practice.
+    if (employee.employmentType === "intern")
+      return res.status(403).json({
+        success: false,
+        code: "INTERN_NO_APP_ACCESS",
+        message:
+          "The GRAV app is for employees. Interns do not have app access — " +
+          "please speak to HR.",
+      });
 
     let isMatch = false;
     if (employee.password) {

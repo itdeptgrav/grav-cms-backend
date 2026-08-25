@@ -193,9 +193,24 @@ router.get("/", AllEmployeeAppMiddleware, async (req, res) => {
       .filter((d) => d.away > 0)
       .sort((a, b) => a.dateStr.localeCompare(b.dateStr));
 
+    // Headcount turns every count on this screen from a bare number into a
+    // proportion. "6 away" means nothing on its own — 6 out of 40 is a
+    // staffing problem and 6 out of 400 is a Tuesday. One cheap count query
+    // per month view is a fair price for numbers that can actually be read.
+    const headcount = await Employee.countDocuments({
+      $or: [{ isActive: true }, { isActive: { $exists: false } }],
+    });
+
+    // The peak needs its DATE to be useful. "Busiest day: 6" tells a planner
+    // nothing they can act on; "6 on Mon 17" tells them which day to look at.
+    const peak = days.reduce(
+      (best, d) => (d.away > (best?.away ?? 0) ? d : best),
+      null,
+    );
+
     return res.json({
       success: true,
-      data: { month, year, from, to, today, days },
+      data: { month, year, from, to, today, days, headcount, peak },
     });
   } catch (err) {
     console.error("[employee/absence-calendar]", err);

@@ -2664,6 +2664,13 @@ const gracefulShutdown = (signal) => {
 
   productionSyncService.stop();
 
+  // Close the payslip renderer's Chromium. It is a child process, so without
+  // this a restart leaves one behind every time — and on a small box a handful
+  // of orphaned Chromiums is the whole machine's memory.
+  require("./services/pdfRender.service")
+    .shutdown()
+    .catch((err) => console.warn("⚠️  PDF renderer shutdown:", err.message));
+
   server.close(() => {
     console.log("✅ HTTP server closed");
     mongoose.connection

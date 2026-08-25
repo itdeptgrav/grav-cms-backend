@@ -10,105 +10,17 @@ const { PayrollItem } = require("../../models/HR_Models/Payroll");
 // EmployeeAuthMiddlewear works with Authorization header (used by HR dashboard)
 const AllEmployeeAppMiddleware = require("../../Middlewear/AllEmployeeAppMiddleware");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
+const { sendPayslipPdf } = require("../../services/payslipPdf.service");
 
-const MONTH_NAMES = [
-    "", "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-];
-
-function fmtDate(d) {
-    if (!d) return "";
-    const dt = new Date(d);
-    if (Number.isNaN(dt.getTime())) return "";
-    return `${String(dt.getDate()).padStart(2, "0")}.${String(dt.getMonth() + 1).padStart(2, "0")}.${dt.getFullYear()}`;
-}
-
-function buildPayslipPayload(item, employee) {
-    const fullName = [employee.firstName, employee.middleName, employee.lastName]
-        .filter(Boolean).join(" ").trim();
-
-    const e = item.earnings || {};
-    const d = item.deductions || {};
-
-    const earningsLines = [
-        { label: "Basic Salary", amount: e.basicSalary || 0 },
-        { label: "House Rent Allowance", amount: e.houseRentAllowance || 0 },
-        { label: "Travel Allowance", amount: e.travelAllowance || 0 },
-        { label: "Medical Allowance", amount: e.medicalAllowance || 0 },
-        { label: "Special Allowance", amount: e.specialAllowance || 0 },
-        { label: "Overtime", amount: e.overtime || 0 },
-        { label: "Bonus", amount: e.bonus || 0 },
-        { label: "Incentives", amount: e.incentives || 0 },
-        { label: "Other Earnings", amount: e.otherEarnings || 0 },
-    ].filter((r) => r.amount > 0);
-
-    const deductionsLines = [
-        { label: "Provident Fund", amount: d.providentFund || 0 },
-        { label: "ESIC (Employee)", amount: d.esic || 0 },
-        { label: "Income Tax (TDS)", amount: d.incomeTax || 0 },
-        { label: "Loan Deduction", amount: d.loanDeduction || 0 },
-        { label: "Advance Deduction", amount: d.advanceDeduction || 0 },
-        { label: "Loss of Pay", amount: d.lopDeduction || 0 },
-        { label: "Other Deductions", amount: d.otherDeductions || 0 },
-    ].filter((r) => r.amount > 0);
-
-    const payableDays = item.payableDays ?? item.presentDays ?? 0;
-    const workingDays = item.workingDays ?? 31;
-    const daysInMonth = item.daysInMonth ?? new Date(item.year, item.month, 0).getDate();
-
-    return {
-        company: {
-            name: "Grav Clothing",
-            tagline: "GRAV CLOTHING LIMITED",
-            logoUrl: "../../grav-logo.png"
-        },
-        period: {
-            month: item.month,
-            year: item.year,
-            label: `${MONTH_NAMES[item.month]} ${item.year}`
-        },
-        employee: {
-            id: employee._id,
-            name: fullName,
-            empNo: employee.biometricId || employee.identityId || "",
-            payPeriod: `${MONTH_NAMES[item.month]} ${item.year}`,
-            doj: fmtDate(employee.dateOfJoining),
-            dob: fmtDate(employee.dateOfBirth),
-            bankName: employee.bankDetails?.bankName || item.bankDetails?.bankName || "",
-            bankAccountNo: employee.bankDetails?.accountNumber || item.bankDetails?.accountNumber || "",
-            panNo: employee.documents?.panNumber || "",
-            pfNo: employee.documents?.pfNumber || "",
-            uanNo: employee.documents?.uanNumber || "",
-            esiNo: employee.documents?.esicNumber || "",
-            department: employee.department || item.department || "",
-            designation: employee.designation || employee.jobTitle || item.designation || "",
-        },
-        attendance: {
-            payableDays,
-            workingDays,
-            daysInMonth,
-            presentDays: item.presentDays || 0,
-            absentDays: item.absentDays || 0,
-            lopDays: item.lopDays || 0,
-            paidLeaveDays: item.paidLeaveDays || 0,
-        },
-        summary: {
-            grossEarnings: Math.round(e.grossEarnings || 0),
-            totalDeduction: Math.round(d.totalDeductions || 0),
-            netPay: Math.round(item.roundedNetPay ?? item.netPay ?? 0),
-            takeHomePay: Math.round(item.roundedNetPay ?? item.netPay ?? 0),
-        },
-        employerContributions: {
-            epf: d.employerPF || d.providentFund || 0,
-            esic: d.employerESIC || 0,
-        },
-        earnings: earningsLines,
-        deductions: deductionsLines,
-        status: item.status,
-        paymentDate: item.paymentDate,
-        processedAt: item.processedAt,
-    };
-}
+// The payload builder is shared with the HR dashboard's payslip route. It used
+// to be a second copy of the same function, and the two had drifted: this one
+// headed the payslip "Grav Clothing" with a tagline and a logo path that
+// resolved to nothing, while HR's said "Grav Clothing ( OPC ) Pvt Ltd".
+// Employees were downloading a different document from the one HR saw.
+const {
+    buildPayslipPayload,
+    MONTH_NAMES,
+} = require("../../services/payslipPayload.service");
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ★ EMPLOYEE-FACING ROUTES — use AllEmployeeAppMiddleware (cookie auth)
@@ -155,6 +67,59 @@ router.get("/:employeeId/history", AllEmployeeAppMiddleware, async (req, res) =>
     } catch (err) {
         console.error("[PAYSLIP-HISTORY]", err);
         res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ── GET /:employeeId/pdf — the payslip as a downloaded file ───────────────
+//
+// Registered BEFORE /:employeeId so Express does not match "pdf" as an id.
+//
+// This exists so the download is a download. The clients used to build the PDF
+// themselves: expo-print on Android and iOS, and on the web nothing at all —
+// expo-print's web printToFileAsync is `window.print()`, so a browser could
+// only ever offer a print dialog the user had to click through. One renderer
+// here gives all three the same bytes and a real file.
+router.get("/:employeeId/pdf", AllEmployeeAppMiddleware, async (req, res) => {
+    try {
+        const { user } = req;
+        const { employeeId } = req.params;
+        const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+        const year = parseInt(req.query.year) || new Date().getFullYear();
+
+        // Same gate as the JSON route. Worth restating rather than sharing:
+        // this one streams a finished document, so a mistake here hands one
+        // employee another's salary rather than a payload they still have to
+        // render.
+        if (user.role !== "hr_manager" && String(user.id) !== String(employeeId)) {
+            return res.status(403).json({ success: false, message: "Access denied" });
+        }
+
+        const employee = await Employee.findById(employeeId)
+            .select("-password -temporaryPassword -__v")
+            .lean();
+        if (!employee) {
+            return res.status(404).json({ success: false, message: "Employee not found" });
+        }
+
+        const item = await PayrollItem.findOne({ employeeId, month, year }).lean();
+        if (!item) {
+            return res.status(404).json({
+                success: false,
+                code: "PAYROLL_NOT_RUN",
+                message: `Payroll not yet processed for ${MONTH_NAMES[month]} ${year}. Please contact HR.`,
+            });
+        }
+
+        await sendPayslipPdf(res, buildPayslipPayload(item, employee));
+    } catch (err) {
+        console.error("[PAYSLIP-PDF]", err);
+        if (err.name === "CastError") {
+            return res.status(400).json({ success: false, message: "Invalid employee ID" });
+        }
+        // If the headers are already out the response is half a PDF; there is
+        // nothing useful left to say, so just end it.
+        if (res.headersSent) return res.end();
+        res.status(500).json({ success: false, message: "Could not build the payslip PDF" });
     }
 });
 

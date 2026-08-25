@@ -2942,6 +2942,23 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
     ["provisions", "current liab", "salary"],
     "liability",
   );
+  // An intern is paid a stipend, not a salary, and the two are kept apart in
+  // the books the same way Salaries A/c and Salary Payable are kept apart
+  // from everything else: one expense ledger and one payable, mirroring the
+  // staff pair. Folding stipends into Salaries A/c would make them
+  // permanently unrecoverable from any report.
+  const stipendExpense = await findOrCreateLedger(
+    companyId,
+    ["Stipend to Interns", "Intern Stipend", "Stipends"],
+    ["administrative expenses", "indirect expense", "employee", "expenses"],
+    "expense",
+  );
+  const stipendPayable = await findOrCreateLedger(
+    companyId,
+    ["Stipend Payable", "Intern Stipend Payable"],
+    ["provisions", "current liab", "salary"],
+    "liability",
+  );
 
   // Aggregate totals from items (re-derive in case the run-level totals are stale)
   const totals = items.reduce(
@@ -2959,9 +2976,22 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
         ),
       net: a.net + (i.netPay || 0),
       count: a.count + 1,
+      // Same figures again, split by who they belong to. The unsplit totals
+      // above stay the run's grand total — the reconciliation check below and
+      // every existing report read them.
+      internGross: a.internGross + (i.isIntern ? i.earnings?.grossEarnings || 0 : 0),
+      internNet: a.internNet + (i.isIntern ? i.netPay || 0 : 0),
+      internCount: a.internCount + (i.isIntern ? 1 : 0),
     }),
-    { gross: 0, pf: 0, esi: 0, tdsOther: 0, net: 0, count: 0 },
+    {
+      gross: 0, pf: 0, esi: 0, tdsOther: 0, net: 0, count: 0,
+      internGross: 0, internNet: 0, internCount: 0,
+    },
   );
+  const staffGross = parseFloat((totals.gross - totals.internGross).toFixed(2));
+  const staffNet = parseFloat((totals.net - totals.internNet).toFixed(2));
+  totals.staffGross = staffGross;
+  totals.staffNet = staffNet;
 
   // Sanity-check
   const computedNet = totals.gross - totals.pf - totals.esi - totals.tdsOther;
@@ -3123,15 +3153,26 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
 
   // ── Voucher 1: PROCESSING (always created) ────────────────────────────
   const processingDate = new Date(run.year, run.month, 0); // last day of the pay-period month
-  const processingEntries = [
-    {
+  const processingEntries = [];
+  // Each Dr line is omitted when it is zero rather than posted as a nil entry:
+  // a company with no interns should not grow a Stipend line in every month's
+  // journal, and one with only interns should not carry an empty Salaries A/c.
+  if (staffGross > 0)
+    processingEntries.push({
       ledgerId: salariesLedger._id,
       ledgerName: salariesLedger.name,
       groupName: salariesLedger.groupName,
       type: "Dr",
-      amount: totals.gross,
-    },
-  ];
+      amount: staffGross,
+    });
+  if (totals.internGross > 0)
+    processingEntries.push({
+      ledgerId: stipendExpense._id,
+      ledgerName: stipendExpense.name,
+      groupName: stipendExpense.groupName,
+      type: "Dr",
+      amount: parseFloat(totals.internGross.toFixed(2)),
+    });
   if (totals.pf > 0)
     processingEntries.push({
       ledgerId: pfPayable._id,
@@ -3168,13 +3209,21 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
         amount: parseFloat(amount.toFixed(2)),
       });
   }
-  if (totals.net > 0)
+  if (staffNet > 0)
     processingEntries.push({
       ledgerId: salaryPayable._id,
       ledgerName: salaryPayable.name,
       groupName: salaryPayable.groupName,
       type: "Cr",
-      amount: totals.net,
+      amount: staffNet,
+    });
+  if (totals.internNet > 0)
+    processingEntries.push({
+      ledgerId: stipendPayable._id,
+      ledgerName: stipendPayable.name,
+      groupName: stipendPayable.groupName,
+      type: "Cr",
+      amount: parseFloat(totals.internNet.toFixed(2)),
     });
 
   const vouchers = [
@@ -3185,7 +3234,11 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       voucherDate: processingDate,
       entries: processingEntries,
       grandTotal: totals.gross,
-      narration: `Salary processed for ${run.payPeriod || `${run.year}-${run.month}`} — ${items.length} employees`,
+      narration:
+        `Salary processed for ${run.payPeriod || `${run.year}-${run.month}`} — ` +
+        (totals.internCount > 0
+          ? `${items.length - totals.internCount} employees, ${totals.internCount} intern${totals.internCount === 1 ? "" : "s"}`
+          : `${items.length} employees`),
     },
   ];
 
@@ -3201,14 +3254,32 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       voucherType: "payment",
       voucherTypeName: "Payment",
       voucherDate: paymentDate,
+      // Both payables are cleared, each by its own amount. Clearing only
+      // Salary Payable for the whole net would leave Stipend Payable standing
+      // on the balance sheet after the interns had actually been paid.
       entries: [
-        {
-          ledgerId: salaryPayable._id,
-          ledgerName: salaryPayable.name,
-          groupName: salaryPayable.groupName,
-          type: "Dr",
-          amount: totals.net,
-        },
+        ...(staffNet > 0
+          ? [
+              {
+                ledgerId: salaryPayable._id,
+                ledgerName: salaryPayable.name,
+                groupName: salaryPayable.groupName,
+                type: "Dr",
+                amount: staffNet,
+              },
+            ]
+          : []),
+        ...(totals.internNet > 0
+          ? [
+              {
+                ledgerId: stipendPayable._id,
+                ledgerName: stipendPayable.name,
+                groupName: stipendPayable.groupName,
+                type: "Dr",
+                amount: parseFloat(totals.internNet.toFixed(2)),
+              },
+            ]
+          : []),
         {
           ledgerId: bankLedger._id,
           ledgerName: bankLedger.name,
@@ -3232,6 +3303,8 @@ async function buildPayrollVouchers(companyId, run, items, opts = {}) {
       esiPayable,
       otherDeductionsPayable,
       salaryPayable,
+      stipendExpense,
+      stipendPayable,
     },
   };
 }
@@ -3930,6 +4003,9 @@ const MANUFACTURING_CHART = [
 
   // Provisions
   { kind: "ledger", parent: "Provisions", name: "Salary Payable" },
+  // Interns are paid a stipend, not a salary, and the books keep the two
+  // apart — see buildPayrollVouchers.
+  { kind: "ledger", parent: "Provisions", name: "Stipend Payable" },
   { kind: "ledger", parent: "Provisions", name: "Expenses Payable" },
   { kind: "ledger", parent: "Provisions", name: "Gratuity Provision" },
   { kind: "ledger", parent: "Provisions", name: "Deferred Tax Liability" },
@@ -4006,6 +4082,11 @@ const MANUFACTURING_CHART = [
     kind: "ledger",
     parent: "Administrative Expenses",
     name: "Salaries (Office Staff)",
+  },
+  {
+    kind: "ledger",
+    parent: "Administrative Expenses",
+    name: "Stipend to Interns",
   },
   { kind: "ledger", parent: "Administrative Expenses", name: "Office Rent" },
   {
@@ -5345,3 +5426,7 @@ router.post("/ledgers/:id/merge", async (req, res) => {
 
 module.exports = router;
 module.exports.postPayrollRunById = postPayrollRunById;
+// Exported for scripts/payrollVoucher_test.js. The journal is the one place
+// where a mistake becomes an accounting entry rather than a screen, so it is
+// worth being able to build one without a database.
+module.exports.buildPayrollVouchers = buildPayrollVouchers;
