@@ -126,6 +126,31 @@ const enquirySchema = new mongoose.Schema(
           specialConstruction: { type: String, trim: true },
           existingUniform: { type: String, trim: true }, // existing garment details / what they wear now
 
+          /**
+           * Specification the fixed fields above have no room for — the
+           * salesperson names the question AND answers it (24 Aug 2026,
+           * explicit request: "in the product specification input ask for the
+           * custom input also, so the sales person will define the inputs and
+           * he will fill the answers").
+           *
+           * Deliberately free-form label/value pairs rather than an ever-
+           * growing list of named columns: every customer asks for something
+           * the last one didn't (a pantone reference, a collar style, a
+           * washing standard), and each of those becoming a schema field is
+           * how this subdocument reaches sixty fields nobody fills in. These
+           * ride through to R&D with the rest of the brief — see
+           * briefFromProduct in routes/CMS_Routes/Sales/sampleStyles.js.
+           */
+          customSpecs: [
+            new mongoose.Schema(
+              {
+                label: { type: String, trim: true, required: true },
+                value: { type: String, trim: true, default: "" },
+              },
+              { _id: false },
+            ),
+          ],
+
           // Reference images — what the garment should look like, so Merchandising
           // + Industrial Engineering can cost it. Previewed inline. Uploaded via
           // Cloudinary (`publicId` set) since 19 Aug 2026 — see
@@ -389,6 +414,17 @@ const enquirySchema = new mongoose.Schema(
           productName: { type: String, trim: true, required: true },
           sentToCustomerAt: { type: Date },
           sentToCustomerBy: actorRef(),
+
+          // ── The customer's own review link (24 Aug 2026, explicit request:
+          // "via mail the verification request will sent to the customer").
+          // Same shape as Cowork's external-share tokens — a random value
+          // whose hash alone is stored, so a leaked database yields no usable
+          // link — but Mongo-backed here since this record already is.
+          // Single-use: cleared the moment a decision is recorded through it
+          // (below), so a link can't be replayed to flip a decision after
+          // the fact; sending again mints a fresh one.
+          customerApprovalTokenHash: { type: String, index: true },
+          customerApprovalTokenExpiresAt: { type: Date },
 
           // ── Customer approval — a LOG, not a switch (20 Aug 2026, explicit
           // request: "it seems like u are making it just normally so that the

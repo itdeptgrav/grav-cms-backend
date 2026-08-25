@@ -163,7 +163,9 @@ router.get("/requests/export", async (req, res) => {
         if (startDate && endDate) {
             filter.createdAt = { $gte: new Date(startDate), $lte: new Date(endDate) };
         }
-        if (status && status !== 'all') filter.status = status;
+        // Same stage-vs-status handling as the list route below, so an export
+        // taken with a filter on screen contains the rows that were on screen.
+        applyStatusFilter(filter, status);
 
         const requests = await CustomerRequest.find(filter)
             .sort({ createdAt: -1 })
@@ -186,6 +188,48 @@ router.get("/requests/export", async (req, res) => {
     }
 });
 
+/**
+ * Apply the `status` query param to a Mongo filter.
+ *
+ * `customer_approved` is a STAGE, not a status value (24 Aug 2026 bug fix —
+ * "the filter is not working for this customer approved"). The Order Book was
+ * defaulted to `status: "quotation_customer_approved"` and came back empty,
+ * because request.status walks a ONE-WAY ladder:
+ *
+ *   quotation_draft → quotation_sent → quotation_customer_approved
+ *                                    → quotation_sales_approved → production → …
+ *
+ * (see REQUEST_STATUS_FOR_QUOTATION in quotationRoutes.js). The customer's
+ * approval advances it to `quotation_customer_approved`, and Sales'
+ * counter-approval — normally moments later — advances it again, so that
+ * value only exists inside that window. Measured against the live data: of
+ * 30 requests, 16 had a customer-approved quotation and NOT ONE still read
+ * `quotation_customer_approved`; they had all moved on to
+ * `quotation_sales_approved`.
+ *
+ * So the question "has the customer approved this?" is answered by the
+ * QUOTATION's own status, which does not get overwritten when the request
+ * moves to production — not by the request's current status. That is also
+ * what the page is asking for literally: requests "whose quotation is
+ * approved by the customer".
+ *
+ * Every other value stays an exact status match, so existing callers of this
+ * endpoint are untouched.
+ */
+const CUSTOMER_APPROVED_QUOTATION_STATES = ["customer_approved", "sales_approved"];
+function applyStatusFilter(filter, status) {
+    if (!status || status === "all") return filter;
+    if (status === "customer_approved") {
+        filter["quotations.status"] = { $in: CUSTOMER_APPROVED_QUOTATION_STATES };
+        // A cancelled order is not an approved one, whatever its quotation
+        // still says.
+        filter.status = { $ne: "cancelled" };
+        return filter;
+    }
+    filter.status = status;
+    return filter;
+}
+
 // GET all customer requests — NOW with WO completion enrichment + deadline risk
 router.get("/requests", async (req, res) => {
     try {
@@ -200,7 +244,7 @@ router.get("/requests", async (req, res) => {
                 { 'customerInfo.phone': { $regex: search, $options: "i" } }
             ];
         }
-        if (status && status !== 'all') filter.status = status;
+        applyStatusFilter(filter, status);
         if (priority && priority !== 'all') filter.priority = priority;
 
         if (dateRange && dateRange !== 'all') {

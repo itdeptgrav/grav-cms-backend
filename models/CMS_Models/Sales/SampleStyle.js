@@ -43,6 +43,34 @@ const imageSchema = new mongoose.Schema(
   { _id: false },
 );
 
+// One raw item picked for this style, variant-wise — the Merchandiser's
+// materials pick AND R&D's sample consumption both use this exact shape
+// (24 Aug 2026), so the same sync-onto-the-stock-item logic handles either
+// source without a case-by-case translation.
+const rawItemPickSchema = new mongoose.Schema(
+  {
+    rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem" },
+    rawItemName: { type: String, trim: true },
+    rawItemSku: { type: String, trim: true },
+    // The RAW ITEM's own physical variant (colour/vendor combination) —
+    // distinct from productVariantId below.
+    variantId: { type: mongoose.Schema.Types.ObjectId },
+    variantCombination: [{ type: String, trim: true }],
+    // Which variant of the LINKED STOCK ITEM this row is for — absent means
+    // "every variant" (a trim like a button is usually the same across
+    // sizes; a fabric quantity usually is not, which is exactly why this
+    // exists instead of one flat list for the whole product).
+    productVariantId: { type: mongoose.Schema.Types.ObjectId },
+    productVariantLabel: { type: String, trim: true },
+    // Optional — the Merchandiser is picking WHAT'S needed, not always
+    // measuring HOW MUCH yet; R&D fills the real consumption later. Present
+    // when they do know it.
+    quantity: { type: Number, min: 0 },
+    unit: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
 // A revision bounced back from a Sales gate — the note + who/when.
 //
 // `roundId` says WHICH round was rejected. Without it the revisions and the
@@ -204,6 +232,21 @@ const sampleStyleSchema = new mongoose.Schema(
       // currently wears, which is exactly the kind of context that shapes a
       // tech pack.
       existingUniform: { type: String, trim: true },
+      // The rest of what the enquiry row knows, snapshotted so R&D reads the
+      // WHOLE product rather than the subset this brief used to carry
+      // (24 Aug 2026, explicit request). Mongoose strips anything not
+      // declared here, so briefFromProduct's additions have to be mirrored.
+      logo: { type: Boolean, default: false },
+      embroidery: { type: Boolean, default: false },
+      printing: { type: Boolean, default: false },
+      stockItemReference: { type: String, trim: true },
+      /** Salesperson-defined spec — see Enquiry's products[].customSpecs. */
+      customSpecs: [
+        new mongoose.Schema(
+          { label: { type: String, trim: true }, value: { type: String, trim: true, default: "" } },
+          { _id: false },
+        ),
+      ],
       images: [imageSchema],
     },
 
@@ -211,7 +254,18 @@ const sampleStyleSchema = new mongoose.Schema(
     // tech sheet until these are selected.
     materials: {
       status: { type: String, enum: SAMPLE_MATERIALS_STATUS_CODES, default: "pending" },
+      // Free-text "Item — Vendor" rows — the ORIGINAL shape, kept for the
+      // history already recorded this way and for callers that only need a
+      // name to show, not a real BOM entry.
       items: [{ type: String, trim: true }],
+      // The structured, variant-wise sibling of `items` above (24 Aug 2026,
+      // explicit request — "the raw item are goona fill as per the variant
+      // wise... keep the consumption input... optional"). This is what syncs
+      // onto the linked stock item's BOM once approved, and what R&D's own
+      // sample-submission step reads to auto-suggest what's already known —
+      // `items` alone (a name and a vendor, no real rawItemId/variantId/
+      // quantity) can't drive either.
+      rawItems: [rawItemPickSchema],
       selectedBy: actorRef(),
       selectedAt: { type: Date },
     },
@@ -225,6 +279,7 @@ const sampleStyleSchema = new mongoose.Schema(
       new mongoose.Schema(
         {
           items: [{ type: String, trim: true }],
+          rawItems: [rawItemPickSchema],
           status: { type: String, trim: true, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
           submittedBy: actorRef(),
           submittedAt: { type: Date, default: Date.now },
@@ -277,6 +332,23 @@ const sampleStyleSchema = new mongoose.Schema(
           // bare consumed number (20 Aug 2026, explicit request).
           allowancePercent: { type: Number, default: 0, min: 0 },
           notes: { type: String, trim: true, default: "" },
+        },
+      ],
+      // The operations (process steps + time) R&D actually ran making this
+      // sample — raised alongside consumptionRawItems (24 Aug 2026, explicit
+      // request), same shape as StockItem.operations so it can be synced
+      // straight onto the product on approval. Deliberately NOT required —
+      // R&D may not always time every step, and the raw-item evidence above
+      // is what approval actually gates on.
+      operations: [
+        {
+          type: { type: String, trim: true },
+          operationCode: { type: String, trim: true, default: "" },
+          machine: { type: String, trim: true },
+          machineType: { type: String, trim: true },
+          minutes: { type: Number, min: 0, default: 0 },
+          seconds: { type: Number, min: 0, default: 0 },
+          totalSeconds: { type: Number, min: 0, default: 0 },
         },
       ],
       photos: [imageSchema],
