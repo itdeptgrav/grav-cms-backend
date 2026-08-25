@@ -1255,6 +1255,15 @@ router.get("/dashboard", async (req, res) => {
         endDate: b.endDate,
         totals: variance.rollUp(lines),
         lineCount: lines.length,
+        /* How many departments actually have a section in this cycle. Counted
+         * on the resolved slug, not the stored string, so one department
+         * spelled two ways is one section — the same rule byDepartment groups
+         * on. Derived per read; nothing is stored. */
+        departmentCount: new Set(
+          lines
+            .map((l) => resolver.resolve(l.department)?.slug)
+            .filter(Boolean),
+        ).size,
         requestCount: (b.budgetRequests || []).length,
         pending: pendingCounts(b),
         severity: worstSeverity(lines),
