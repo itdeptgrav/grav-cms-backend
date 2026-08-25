@@ -393,11 +393,29 @@ test("each person is walked once, and a failure cannot fail the approval", () =>
  * was anchored 14:00, not 10:00 and not 17:00.
  */
 
-test("the floor is the earliest approval that frees any output", () => {
+test("the anchor is the LATEST approval that frees an output", () => {
+  /**
+   * **Superseded by an OWNER RULE of 26 Aug 2026.** This took the EARLIEST
+   * approval until then, which meant one task carrying two dependent outputs
+   * was anchored by whichever input happened to land first and never moved
+   * again:
+   *
+   *   puri approved 10:00, paradeep approved 13:00  ->  anchored 10:00
+   *   the 13:00 approval changed nothing at all
+   *
+   * The half of the work that only became possible at 13:00 was then scheduled
+   * as though it could have started at 10:00, and the assignee lost three
+   * hours of budget to a wait somebody else owned.
+   *
+   * The latest approval is the moment the task became FULLY workable, and the
+   * walk counts the REMAINING budget from it — see `secsToSchedule`, which is
+   * the other half of this rule and stops the hours already worked on the
+   * unblocked part being handed back.
+   */
   const body = officeFn("unblockedAtMs");
   assert.notEqual(body, "", "unblockedAtMs not found — renamed?");
-  /* Earliest across outputs... */
-  assert.match(body, /if \(earliest === null \|\| lastOfThisOutput < earliest\) earliest = lastOfThisOutput;/);
+  /* Latest across outputs... */
+  assert.match(body, /if \(latest === null \|\| lastOfThisOutput > latest\) latest = lastOfThisOutput;/);
   /* ...but an output is not free until ALL of ITS inputs are. */
   assert.match(body, /if \(at > lastOfThisOutput\) lastOfThisOutput = at;/);
   assert.match(body, /if \(!allApproved\) continue;/);
@@ -411,14 +429,42 @@ test("a task that was never held up is not constrained", () => {
   assert.match(body, /if \(outputs\.length === 0\) return null;/);
 });
 
-test("it can only push a start later, never pull one earlier", () => {
-  /* Applied after the chain has decided, as a max — so it cannot reorder
-     anything or make a deadline harder than the queue already made it. */
+test("the approval IS the anchor — it replaces what the chain decided", () => {
+  /**
+   * **Superseded by an OWNER RULE of 26 Aug 2026.** This read the other way
+   * round until then — the approval was applied as a `max`, on the reasoning
+   * that it must never make a deadline harder than the queue already had.
+   *
+   * The owner's case retired that reasoning. Two of one person's tasks, each
+   * waiting on a different output of somebody else's:
+   *
+   *   Puri Dev    (4h)  input approved 10:00  ->  due 14:00
+   *   Pardeep Dev (6h)  input approved 13:00  ->  due 19:00
+   *
+   * Under the `max`, Pardeep Dev chained behind Puri Dev's 14:00 finish and
+   * came out at 20:00, because 14:00 was later than its own 13:00 approval.
+   * The approval is the moment the work became possible and the instant its
+   * budget is counted from, so it decides the date outright — including where
+   * that pulls it earlier than the queue would have.
+   *
+   * It is still applied AFTER the chain, which is what lets it overrule one;
+   * the ordering assertion further down is unchanged.
+   */
   const i = office.indexOf("async function rechainQueueFor(");
   const body = office.slice(i);
   assert.match(
     body,
-    /if \(Number\.isFinite\(task\.unblockedAtMs\) && task\.unblockedAtMs > anchorMs\) \{\s*\n\s*anchorMs = task\.unblockedAtMs;/,
+    /if \(Number\.isFinite\(task\.freedAtMs\)\)[\s\S]{0,1600}?previousEndMs === null[\s\S]{0,120}?\? task\.freedAtMs[\s\S]{0,120}?: Math\.max\(anchorMs, task\.freedAtMs\)/,
+    "the approval no longer leads at the head, or no longer floors behind live work",
+  );
+  /* The `> anchorMs` form still exists, and must — but for the OTHER case.
+     A task still WAITING on its input floors at now and may only ever be
+     pushed later; applied exactly, that dragged a blocked task on top of the
+     work above it. Only a real approval replaces the anchor outright. */
+  assert.match(
+    body,
+    /task\.unblockedAtMs > anchorMs/,
+    "the waiting floor stopped being a max — a blocked task can overtake live work",
   );
   /* And the anchor must be assignable for that to work — this threw
      "Assignment to constant variable" on the first attempt, which every
@@ -464,14 +510,18 @@ test("a still-blocked task floors at now, so its deadline does not burn", () => 
    * the whole of its clock, running against a wait somebody else owns.
    *
    * While it waits the floor moves with the clock. The moment an input is
-   * approved the earliest-approval branch answers instead, a FIXED instant, and
-   * the date stops moving.
+   * approved the approval branch answers instead, a FIXED instant, and the
+   * date stops moving.
+   *
+   * The variable is `latest` rather than `earliest` since the OWNER RULE of
+   * 26 Aug 2026 — see the test above. This rule is unchanged by that: a task
+   * with NOTHING approved has neither, and still floors at now.
    */
   const body = officeFn("unblockedAtMs");
-  assert.match(body, /if \(earliest === null && Number\.isFinite\(nowMs\)\) return nowMs;/);
+  assert.match(body, /if \(latest === null && Number\.isFinite\(nowMs\)\) return nowMs;/);
   /* And it must come AFTER the approval search, so a freed task gets the fixed
      instant rather than the moving one. */
   assert.ok(
-    body.indexOf("if (!allApproved) continue;") < body.indexOf("earliest === null && Number.isFinite(nowMs)"),
+    body.indexOf("if (!allApproved) continue;") < body.indexOf("latest === null && Number.isFinite(nowMs)"),
   );
 });
