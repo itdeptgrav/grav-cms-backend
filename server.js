@@ -1687,6 +1687,10 @@ app.use(
   require("./routes/Accountant_Routes/Acc_budgetDepartments"),
 );
 app.use(
+  "/api/accountant/cost-centres",
+  require("./routes/Accountant_Routes/Acc_costCentres"),
+);
+app.use(
   "/api/accountant/merge",
   require("./routes/Accountant_Routes/Acc_merge"),
 );

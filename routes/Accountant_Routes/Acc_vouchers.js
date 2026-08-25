@@ -2450,6 +2450,19 @@ router.post("/", auth, async (req, res) => {
         .status(400)
         .json({ error: "At least one ledger entry required" });
 
+    /* Cost-centre allocations must be arithmetically possible. Refused rather
+     * than clamped: allocating more of a line than the line holds does not
+     * mean anything, and storing it would let a project report more spend than
+     * the ledger recorded. Entries carrying no allocations — which is every
+     * voucher written before this — pass untouched. */
+    const allocationProblems = budgetControl.validateCostCentreAllocations(body.ledgerEntries);
+    if (allocationProblems.length) {
+      return res.status(400).json({
+        error: allocationProblems.join(" "),
+        costCentreAllocationErrors: allocationProblems,
+      });
+    }
+
     // Auto-number if not provided
     if (!body.voucherNumber) {
       body.voucherNumber = await Acc_Voucher.nextVoucherNumber(
@@ -2674,6 +2687,15 @@ router.put("/:id", auth, async (req, res) => {
 
     // Resolve / canonicalise ledger entries when provided.
     if (Array.isArray(body.ledgerEntries)) {
+      /* Same rule as create — an edit is another way to write the same
+       * impossible allocation. */
+      const allocationProblems = budgetControl.validateCostCentreAllocations(body.ledgerEntries);
+      if (allocationProblems.length) {
+        return res.status(400).json({
+          error: allocationProblems.join(" "),
+          costCentreAllocationErrors: allocationProblems,
+        });
+      }
       await resolveLedgerEntries(body.ledgerEntries, existing.companyId);
     }
 

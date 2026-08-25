@@ -168,6 +168,7 @@ async function movementByLedger({ companyId, ledgerIds = [], from, to, excludeVo
 async function voucherMovementsForLedger({
   companyId,
   ledgerId,
+  costCentreId = null,
   from,
   to,
   page = 1,
@@ -191,6 +192,30 @@ async function voucherMovementsForLedger({
     match.voucherDate = { ...(match.voucherDate || {}), $lte: toT };
   }
 
+  /* ── WHEN THE LINE TARGETS A COST CENTRE ────────────────────────────────
+   * The drilldown has to explain the SAME number the line reports. A bound
+   * line's actual counts only allocations tagged to its cost centre, so the
+   * list behind it must too — otherwise a user told the actual is 6,00,000
+   * counts 52,00,000 on screen and stops trusting the budget, which is the
+   * precise failure this function's header exists to prevent.
+   *
+   * The unwind changes what a "row" is: the amount becomes the ALLOCATION's,
+   * not the entry's. Everything downstream still groups per voucher. */
+  const cc = oid(costCentreId);
+  const scopeToCostCentre = cc
+    ? [
+        { $unwind: "$ledgerEntries.costCentreAllocations" },
+        { $match: { "ledgerEntries.costCentreAllocations.costCentreId": cc } },
+        {
+          $addFields: {
+            "ledgerEntries.amount": {
+              $ifNull: ["$ledgerEntries.costCentreAllocations.amount", 0],
+            },
+          },
+        },
+      ]
+    : [];
+
   /* Everything up to and including the per-voucher $group is shared, so the
    * page of rows and the window totals cannot be computed from different
    * sets of vouchers. */
@@ -198,6 +223,7 @@ async function voucherMovementsForLedger({
     { $match: match },
     { $unwind: "$ledgerEntries" },
     { $match: { "ledgerEntries.ledgerId": id } },
+    ...scopeToCostCentre,
     {
       $group: {
         _id: "$_id",
@@ -282,6 +308,119 @@ async function voucherMovementsForLedger({
 }
 
 /**
+ * Posted movement per (ledger, COST CENTRE) — what a project actually spent.
+ *
+ * ── WHY A BUDGET LINE CANNOT JUST MATCH ON THE LEDGER ───────────────────────
+ * movementByLedger answers "how much moved on this head, company-wide". For a
+ * company or department budget that is the right question. For a PROJECT it is
+ * catastrophically wrong: a budget named after one project would claim every
+ * rupee spent on that head across every project, and report an actual several
+ * times its real one. A number that looks like a control and is not one is
+ * worse than no number, which is why project budgets were held back until this
+ * existed.
+ *
+ * ── THE ALLOCATION IS PER AMOUNT, NOT PER ENTRY ─────────────────────────────
+ * `ledgerEntries[].costCentreAllocations[]` carries its own `amount`, so one
+ * 1,00,000 purchase entry can be 60,000 to a project and 40,000 elsewhere.
+ * This sums the ALLOCATIONS, never the entry, or a split voucher would credit
+ * each project with the whole thing.
+ *
+ * The Dr/Cr direction comes from the parent ENTRY: an allocation has a
+ * magnitude, not a side. Reading a sign off the allocation would make every
+ * credit note add to project spend.
+ *
+ * Every other filter is byte-for-byte movementByLedger's — same `posted`, same
+ * `isOptional` exclusion, same company clause, same inclusive date bounds — so
+ * a project line and a company line on the same head are answering the same
+ * question about the same set of vouchers.
+ *
+ * Returns a Map keyed `${ledgerId}::${costCentreId}`.
+ */
+async function movementByLedgerCostCentre({
+  companyId,
+  pairs = [],
+  from,
+  to,
+  excludeVoucherId = null,
+}) {
+  /* [{ ledgerId, costCentreId }] — only the combinations actually budgeted,
+   * so a company with a hundred cost centres does not aggregate all of them
+   * to answer a question about two. */
+  const wanted = pairs
+    .map((p) => ({ ledgerId: oid(p.ledgerId), costCentreId: oid(p.costCentreId) }))
+    .filter((p) => p.ledgerId && p.costCentreId);
+  if (!wanted.length) return new Map();
+
+  const ledgerIds = [...new Set(wanted.map((p) => String(p.ledgerId)))].map(oid).filter(Boolean);
+  const costCentreIds = [...new Set(wanted.map((p) => String(p.costCentreId)))].map(oid).filter(Boolean);
+
+  const match = {
+    status: "posted",
+    isOptional: { $ne: true },
+    "ledgerEntries.ledgerId": { $in: ledgerIds },
+  };
+  const excl = oid(excludeVoucherId);
+  if (excl) match._id = { $ne: excl };
+  const cid = oid(companyId);
+  if (cid) match.companyId = cid;
+
+  const fromT = from ? new Date(from) : null;
+  const toT = to ? new Date(to) : null;
+  if (fromT && !Number.isNaN(fromT.getTime())) match.voucherDate = { $gte: fromT };
+  if (toT && !Number.isNaN(toT.getTime())) {
+    match.voucherDate = { ...(match.voucherDate || {}), $lte: toT };
+  }
+
+  const rows = await Acc_Voucher.aggregate([
+    { $match: match },
+    { $unwind: "$ledgerEntries" },
+    { $match: { "ledgerEntries.ledgerId": { $in: ledgerIds } } },
+    { $unwind: "$ledgerEntries.costCentreAllocations" },
+    { $match: { "ledgerEntries.costCentreAllocations.costCentreId": { $in: costCentreIds } } },
+    {
+      $group: {
+        _id: {
+          ledgerId: "$ledgerEntries.ledgerId",
+          costCentreId: "$ledgerEntries.costCentreAllocations.costCentreId",
+        },
+        /* The ENTRY decides the side; the allocation only says how much. */
+        debit: {
+          $sum: {
+            $cond: [
+              { $eq: ["$ledgerEntries.type", "Dr"] },
+              { $ifNull: ["$ledgerEntries.costCentreAllocations.amount", 0] },
+              0,
+            ],
+          },
+        },
+        credit: {
+          $sum: {
+            $cond: [
+              { $eq: ["$ledgerEntries.type", "Cr"] },
+              { $ifNull: ["$ledgerEntries.costCentreAllocations.amount", 0] },
+              0,
+            ],
+          },
+        },
+        vouchers: { $addToSet: "$_id" },
+      },
+    },
+  ]);
+
+  return new Map(
+    rows.map((r) => [
+      `${r._id.ledgerId}::${r._id.costCentreId}`,
+      {
+        debit: r.debit || 0,
+        credit: r.credit || 0,
+        signed: (r.debit || 0) - (r.credit || 0),
+        voucherCount: Array.isArray(r.vouchers) ? r.vouchers.length : 0,
+      },
+    ]),
+  );
+}
+
+/**
  * Posted movement per (ledger, voucher) across MANY heads at once.
  *
  * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
@@ -348,6 +487,15 @@ async function voucherMovementsByLedgers({
         credit: {
           $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Cr"] }, "$ledgerEntries.amount", 0] },
         },
+        /* Kept per entry so the Dr/Cr side stays attached to its allocations:
+         * an allocation carries a magnitude, never a side. */
+        entries: {
+          $push: {
+            type: "$ledgerEntries.type",
+            amount: "$ledgerEntries.amount",
+            allocations: "$ledgerEntries.costCentreAllocations",
+          },
+        },
       },
     },
     /* Sorted so the assignment below is reproducible run to run: an unsorted
@@ -359,17 +507,58 @@ async function voucherMovementsByLedgers({
 
   const truncated = rows.length > cap;
 
-  return {
-    rows: rows.slice(0, cap).map((r) => ({
+  /* ── ONE ROW PER (HEAD, VOUCHER, COST-CENTRE SCOPE) ────────────────────────
+   * A voucher entry can be part-attributed: 60,000 of a 1,00,000 purchase to a
+   * project, 40,000 to nothing in particular. Those two halves belong to
+   * DIFFERENT budgets — the project's line owns the first, and only a line
+   * that does not care about projects can own the second.
+   *
+   * Splitting here means the assignment downstream never has to know about
+   * allocations; it just sees movements that happen to carry a cost centre.
+   * A voucher that tags nothing yields exactly one untagged row, which is
+   * precisely what this function returned before cost centres existed.
+   */
+  const out = [];
+  for (const r of rows.slice(0, cap)) {
+    const base = {
       ledgerId: String(r._id.ledgerId),
       voucherId: String(r._id.voucherId),
       voucherDate: r.voucherDate || null,
-      debit: r.debit || 0,
-      credit: r.credit || 0,
-      signed: (r.debit || 0) - (r.credit || 0),
-    })),
-    truncated,
-  };
+    };
+    const byScope = new Map();
+    const bucket = (costCentreId) => {
+      const key = costCentreId || "";
+      if (!byScope.has(key)) byScope.set(key, { ...base, costCentreId: costCentreId || null, debit: 0, credit: 0 });
+      return byScope.get(key);
+    };
+
+    for (const e of r.entries || []) {
+      const side = e.type === "Cr" ? "credit" : "debit";
+      const amount = Number(e.amount) || 0;
+      let tagged = 0;
+      for (const a of e.allocations || []) {
+        if (!a || !a.costCentreId) continue;
+        const amt = Number(a.amount) || 0;
+        if (!(amt > 0)) continue;
+        tagged += amt;
+        bucket(String(a.costCentreId))[side] += amt;
+      }
+      /* Clamped: an over-allocated entry is refused at write time, but a row
+       * written before that validation existed must not produce negative
+       * untagged spend. */
+      const untagged = Math.max(0, amount - tagged);
+      if (untagged > 0 || !(e.allocations || []).length) bucket(null)[side] += untagged;
+    }
+
+    for (const m of byScope.values()) {
+      /* A scope that nets to nothing contributes nothing and would only add
+       * noise to the contested counts. */
+      if (m.debit === 0 && m.credit === 0) continue;
+      out.push({ ...m, signed: m.debit - m.credit });
+    }
+  }
+
+  return { rows: out, truncated };
 }
 
 /**
@@ -453,9 +642,20 @@ function actualFrom(movement, nature) {
  */
 async function hydrateLines({ companyId, lines = [], from, to }) {
   const ledgerIds = lines.map((l) => l && l.ledgerId).filter(Boolean);
-  const [natures, movements] = await Promise.all([
+
+  /* Only the lines that actually target a cost centre need the second, more
+   * expensive aggregation. A company or department budget costs exactly what
+   * it always did. */
+  const pairs = lines
+    .filter((l) => l && l.ledgerId && l.costCentreId)
+    .map((l) => ({ ledgerId: l.ledgerId, costCentreId: l.costCentreId }));
+
+  const [natures, movements, ccMovements] = await Promise.all([
     natureByLedger(ledgerIds),
     movementByLedger({ companyId, ledgerIds, from, to }),
+    pairs.length
+      ? movementByLedgerCostCentre({ companyId, pairs, from, to })
+      : Promise.resolve(new Map()),
   ]);
 
   return lines.map((line) => {
@@ -465,19 +665,58 @@ async function hydrateLines({ companyId, lines = [], from, to }) {
       return { ...line, actual: 0, unbound: true, voucherCount: 0 };
     }
     const meta = natures.get(key) || {};
-    const movement = movements.get(key) || null;
     /* Ledger tree wins over the snapshot on the row — see natureByLedger. */
     const nature = meta.nature || line.nature || "expense";
+
+    const headMovement = movements.get(key) || null;
+    const costCentreId = line.costCentreId ? String(line.costCentreId) : null;
+
+    if (!costCentreId) {
+      return {
+        ...line,
+        nature,
+        ledgerName: meta.ledgerName || line.ledgerName || null,
+        groupName: meta.groupName || line.groupName || null,
+        actual: actualFrom(headMovement, nature),
+        debit: headMovement ? headMovement.debit : 0,
+        credit: headMovement ? headMovement.credit : 0,
+        voucherCount: headMovement ? headMovement.voucherCount : 0,
+        unbound: false,
+        costCentreBound: false,
+      };
+    }
+
+    /* ── A COST-CENTRE-BOUND LINE ──────────────────────────────────────────
+     * Counts ONLY what was tagged to its cost centre. It must never fall back
+     * to the head's total when nothing is tagged: that fallback is exactly the
+     * "project budget claims all spend on the head" failure this binding
+     * exists to prevent, and it would be invisible.
+     *
+     * A zero here therefore means "nothing was attributed to this project",
+     * which is a different and much more useful statement than "nothing was
+     * spent". `headActual` carries what DID move on the head so a caller can
+     * say which of the two it is — a bound line reading 0 beside a head that
+     * moved 52,00,000 is a data-entry problem, not an underspend. */
+    const movement = ccMovements.get(`${key}::${costCentreId}`) || null;
+    const headActual = actualFrom(headMovement, nature);
+    const actual = actualFrom(movement, nature);
+
     return {
       ...line,
       nature,
       ledgerName: meta.ledgerName || line.ledgerName || null,
       groupName: meta.groupName || line.groupName || null,
-      actual: actualFrom(movement, nature),
+      actual,
       debit: movement ? movement.debit : 0,
       credit: movement ? movement.credit : 0,
       voucherCount: movement ? movement.voucherCount : 0,
       unbound: false,
+      costCentreBound: true,
+      /* What moved on the head in total, attributed or not. */
+      headActual,
+      /* Spend on this head that carries no tag for this cost centre. Named so
+       * the UI can explain a zero rather than presenting it as achievement. */
+      unattributed: headActual - actual,
     };
   });
 }
@@ -486,6 +725,7 @@ module.exports = {
   oid,
   natureByLedger,
   movementByLedger,
+  movementByLedgerCostCentre,
   monthlyMovement,
   voucherMovementsForLedger,
   voucherMovementsByLedgers,

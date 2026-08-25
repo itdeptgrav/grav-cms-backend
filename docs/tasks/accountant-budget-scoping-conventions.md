@@ -1,7 +1,7 @@
 # Accountant — Budget scoping: company, department and project
 
-> **Status:** §4, §6.1 and the `scope` field are BUILT. §5 (project spend
-> attribution) and §6.3 (`Office Budget`) are still open.
+> **Status:** §4, §5, §6.1 and the `scope` field are BUILT. §6.3
+> (`Office Budget`) is the only item still open.
 >
 > - **Chunk A — shipped.** `Acc_Budget.scope` (`company | department |
 >   project`) with its owner fields, the list/dashboard scope filter, and the
@@ -20,6 +20,12 @@
 >   the misspellings no rule can fold. Grouping, filters and budget-control
 >   matching all compare identity rather than the stored string. See §6.1 for
 >   why none of the three existing department tables could be reused.
+> - **Chunk D+E — shipped.** §5's project attribution, all three steps
+>   together. Budget lines carry `costCentreId`; actuals, budget control, the
+>   drilldown and the overlap dedupe all count only allocations tagged to that
+>   cost centre; `Acc_CostCentre` finally has an API and a picker; and the
+>   purchase-voucher form can tag spend. A project budget bound to a cost
+>   centre no longer claims all spend on its heads. See §5.1.
 >
 > **Backend:** `/Users/risheeray/grav-cms-backend`
 >
@@ -246,6 +252,9 @@ asking), the list endpoint, and budget control on posting.
 
 ## 5. Convention 3 needs spend attribution, not a label
 
+> **BUILT (Chunk D+E).** The analysis below is kept as written. What shipped —
+> including the two things it did not anticipate — is in §5.1.
+
 Today a budget line binds to `ledgerId` + `department`, and
 `movementByLedger` matches spend on **ledger + company + date window**. A
 budget named after a project therefore claims **every rupee spent on that head
@@ -271,6 +280,52 @@ Making it real needs three things, in order:
 **Do not build 1 and 2 without a commitment to 3.** Shipping project budgets
 that silently under-report because nothing is tagged is worse than not having
 them: the number looks like a control and is not one.
+
+### 5.1 What shipped
+
+All three steps, in one slice, because 1 and 2 alone were the trap above.
+
+1. **`costCentreId` + `costCentreName` on the budget line.** A real ref this
+   time, unlike `department`: a cost centre's identity is an id, not a
+   spelling. A project-scope budget's lines INHERIT the budget's cost centre
+   when they name none, so a line cannot quietly end up unbound and claiming
+   the whole head.
+2. **Actuals count only matching allocations.**
+   `movementByLedgerCostCentre` sums `costCentreAllocations[].amount`, never
+   the entry, so a split voucher contributes only its share. The Dr/Cr
+   direction comes from the parent entry — an allocation carries a magnitude,
+   not a side, and reading a sign off it would make every credit note add to
+   project spend. Budget control, the voucher drilldown and the Chunk B
+   overlap dedupe all use the same rule, so no two surfaces can disagree.
+3. **Tagging at voucher entry.** `Acc_CostCentre` had existed since the Tally
+   import and had *no API at all* — nothing could list, create or pick one,
+   which is the real reason zero existed and zero of ~1,700 vouchers carried
+   one. It now has `GET`/`POST`/`PATCH /api/accountant/cost-centres`, a
+   picker, and a one-project-per-line control on the purchase-voucher form.
+
+**The rule that makes this honest:** a bound line NEVER falls back to the
+head's total. If nothing is tagged it reads zero — and reports `headActual`
+and `unattributed` beside it, so the drawer can say "₹8,85,000 moved on these
+heads without a project tag" instead of presenting a zero as achievement.
+Falling back would be the original defect, and it would be invisible.
+
+**Two things §5 did not anticipate:**
+
+- **Control needed a new answer, not just a stricter one.** Untagged spend on
+  a head budgeted only under a project used to come back "no approved
+  allocation" — which is false, and sends the user hunting for a budget that
+  already exists. It now returns `needs_cost_centre`, names the projects the
+  money is under, and stays overridable: a control nobody can get past in an
+  emergency is one that gets switched off.
+- **The proposal itself had to split.** A part-tagged entry is checked as two
+  proposals — the tagged part against the project's lines, the remainder
+  against lines that do not care about projects. Checking the whole entry
+  against a project's allocation would let a project budget authorise another
+  project's spend: the control-side mirror of the reporting defect.
+
+**Still the real cost, and still not a code change:** every voucher in the
+books carries no tag. The mechanism is built and proven, but a project budget
+only becomes a control once whoever books a voucher reliably tags it.
 
 ---
 

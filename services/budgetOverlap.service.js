@@ -79,6 +79,10 @@ function candidateFrom(budget, line) {
     budgetId: String(budget._id),
     lineId: String(line._id),
     ledgerId: String(line.ledgerId),
+    /* A line bound to a project claims only spend tagged to that project. An
+     * unbound line claims anything on the head, tagged or not — which is what
+     * every company and department budget line does. */
+    costCentreId: line.costCentreId ? String(line.costCentreId) : null,
     nature: line.nature === "revenue" ? "revenue" : "expense",
     scope: budget.scope || "company",
     startMs,
@@ -128,6 +132,23 @@ function covers(candidate, dateMs) {
 }
 
 /**
+ * Can this line claim this slice of spend at all?
+ *
+ * A project-bound line claims ONLY its own project's slice. Letting it claim
+ * untagged spend would be the same defect cost-centre-aware actuals just
+ * closed, arriving through the roll-up instead: a project budget quietly
+ * owning every rupee on the head.
+ *
+ * An unbound line claims any slice, tagged or not — otherwise a company budget
+ * would stop counting spend the moment someone tagged it to a project, and the
+ * headline would fall for a reason nobody could see.
+ */
+function claimsCostCentre(candidate, movementCostCentreId) {
+  if (!candidate.costCentreId) return true;
+  return !!movementCostCentreId && candidate.costCentreId === String(movementCostCentreId);
+}
+
+/**
  * Assign every movement to exactly one line.
  *
  * `movements` are (ledger, voucher) rows — one voucher touching two contested
@@ -162,7 +183,9 @@ function assignMovements({ candidates = [], movements = [] } = {}) {
     if (!list || !list.length) continue;
 
     const dateMs = ms(m.voucherDate);
-    const eligible = list.filter((c) => covers(c, dateMs));
+    const eligible = list.filter(
+      (c) => covers(c, dateMs) && claimsCostCentre(c, m.costCentreId),
+    );
 
     if (!eligible.length) {
       /* Inside the queried window but outside every line's own period — the
@@ -223,6 +246,7 @@ module.exports = {
   compareCandidates,
   isArbitraryTie,
   covers,
+  claimsCostCentre,
   assignMovements,
   contestedLedgers,
 };

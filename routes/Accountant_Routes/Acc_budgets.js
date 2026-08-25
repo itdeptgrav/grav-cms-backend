@@ -18,7 +18,7 @@ const express = require("express");
 const router = express.Router();
 const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
-const { Acc_Ledger, Acc_Group } = require("../../models/Accountant_model/Acc_MasterModels");
+const { Acc_Ledger, Acc_Group, Acc_CostCentre } = require("../../models/Accountant_model/Acc_MasterModels");
 const variance = require("../../services/budgetVariance.service");
 const actuals = require("../../services/budgetActuals.service");
 const overlap = require("../../services/budgetOverlap.service");
@@ -270,6 +270,9 @@ async function evaluate(budget, req, { asOf, resolver } = {}) {
   return {
     ...budget,
     items: evaluated,
+    /* Only present on project budgets — see attributionOf. Null everywhere
+     * else, so company and department budgets are byte-identical to before. */
+    attribution: attributionOf(budget, evaluated),
     totals: variance.rollUp(evaluated),
     /* Grouped by identity when a resolver is in hand, so a budget carrying
      * both "Logistics" and "logistics" shows one row rather than two. Falls
@@ -1500,6 +1503,10 @@ router.get("/:id/items/:itemId/vouchers", async (req, res) => {
     const { rows, totals, page, limit, pageCount } = await actuals.voucherMovementsForLedger({
       companyId: actualsCompanyFor(budget, req),
       ledgerId: item.ledgerId,
+      /* A bound line's drilldown must explain the bound line's number — see
+       * voucherMovementsForLedger. Null for every other line, which is the
+       * behaviour every existing budget already has. */
+      costCentreId: item.costCentreId || null,
       from: clampedFrom,
       to: clampedTo,
       page: req.query.page,
@@ -1567,6 +1574,142 @@ function canonicaliseLineDepartments(items, resolver) {
   });
 }
 
+/**
+ * Whether a budget's actuals can be trusted as a PROJECT figure, and if not,
+ * exactly why.
+ *
+ * ── WHY THIS IS REPORTED RATHER THAN ASSUMED ────────────────────────────────
+ * A project budget can be wrong in two quiet ways, and both look like a
+ * healthy number on screen:
+ *
+ *   unbound lines   the line has no cost centre, so it claims every rupee
+ *                   spent on that head company-wide. The actual reads far too
+ *                   HIGH and looks like overspend on a project that may not
+ *                   have started.
+ *
+ *   nothing tagged  the line is bound correctly, but no voucher carries the
+ *                   tag, so the actual reads ZERO while real money moved on
+ *                   the head. That reads like an underspend and is the one
+ *                   the module's own brief warned about: a number that looks
+ *                   like a control and is not one.
+ *
+ * Returned as data rather than rendered into a string here, so the drawer can
+ * decide how loudly to say it.
+ */
+function attributionOf(budget, lines = []) {
+  if ((budget.scope || "company") !== "project") return null;
+
+  const bound = lines.filter((l) => l && l.costCentreId);
+  const unbound = lines.filter((l) => l && l.ledgerId && !l.costCentreId);
+
+  /* Only meaningful for lines that ARE bound — an unbound line has no
+   * attribution to be missing. */
+  const unattributed = bound.reduce((sum, l) => sum + (variance.money(l.unattributed) ?? 0), 0);
+  const attributed = bound.reduce((sum, l) => sum + (variance.money(l.actual) ?? 0), 0);
+
+  return {
+    costCentreId: budget.costCentreId || null,
+    costCentreName: budget.costCentreName || null,
+    lineCount: lines.length,
+    boundLineCount: bound.length,
+    /* Lines claiming everything on their head. Each is an inflated figure. */
+    unboundLines: unbound.map((l) => ({
+      _id: l._id,
+      ledgerId: l.ledgerId || null,
+      ledgerName: l.ledgerName || null,
+      allocated: l.allocated,
+      actual: l.actual,
+    })),
+    /* Spend on the bound heads that nobody attributed to this project. Large
+     * beside a small `attributed` means the tagging is not happening, and the
+     * project's actual is understated by roughly this much. */
+    unattributed,
+    attributed,
+    /* The honest headline: is this budget's actual a project figure yet? */
+    trustworthy: unbound.length === 0 && (attributed > 0 || unattributed === 0),
+  };
+}
+
+/**
+ * Bind each line to a cost centre, and refuse ids that are not this company's.
+ *
+ * ── WHY A PROJECT BUDGET'S LINES INHERIT ────────────────────────────────────
+ * A line with no cost centre matches spend on ledger + company + date, so it
+ * claims every rupee on that head across every project. On a COMPANY budget
+ * that is exactly right. On a project budget it is the defect this whole chunk
+ * exists to close, and it would be invisible: the line would simply report a
+ * number several times too large.
+ *
+ * So a project-scope budget's lines inherit the budget's own cost centre when
+ * they name none. A line may still name a DIFFERENT one — a project budget
+ * that tracks a sub-project is a real thing — but it cannot silently end up
+ * unbound.
+ *
+ * Company and department budgets are untouched: their lines bind only if
+ * someone explicitly asks, and nothing about them changes by default.
+ */
+async function bindLineCostCentres(items, { companyId, scope, defaultCostCentreId }) {
+  if (!Array.isArray(items)) return { items };
+
+  const inherit = scope === "project" ? actuals.oid(defaultCostCentreId) : null;
+
+  const wanted = [
+    ...new Set(
+      items
+        .map((i) => i && i.costCentreId)
+        .filter(Boolean)
+        .map(String),
+    ),
+  ];
+  if (inherit) wanted.push(String(inherit));
+
+  const cid = actuals.oid(companyId);
+  const known = new Map();
+  if (wanted.length && cid) {
+    const rows = await Acc_CostCentre.find({
+      _id: { $in: [...new Set(wanted)].map(actuals.oid).filter(Boolean) },
+      companyId: cid,
+    })
+      .select("_id name")
+      .lean();
+    for (const r of rows) known.set(String(r._id), r.name);
+  }
+
+  const out = [];
+  for (const item of items) {
+    if (!item) {
+      out.push(item);
+      continue;
+    }
+    const raw = item.costCentreId ? actuals.oid(item.costCentreId) : null;
+
+    if (item.costCentreId && !raw) {
+      return { error: "A budget line's cost centre is not a valid id." };
+    }
+    /* Refused rather than dropped. A cost centre from another company would
+     * bind the line to spend it can never see, and the line would read zero
+     * forever with nothing on screen explaining why. */
+    if (raw && !known.has(String(raw))) {
+      return { error: "A budget line names a cost centre that does not belong to this company." };
+    }
+
+    const bound = raw || inherit || null;
+    if (!bound) {
+      out.push(item);
+      continue;
+    }
+    out.push({
+      ...item,
+      costCentreId: bound,
+      /* Snapshotted, so a renamed or deleted cost centre still reads on an old
+       * budget — the same reason ledgerName sits beside ledgerId. */
+      costCentreName: known.get(String(bound)) || item.costCentreName || null,
+    });
+  }
+
+  return { items: out };
+}
+
 function scopePatch(body, existing, resolver = null) {
   if (body.scope === undefined && existing === undefined) return { patch: {} };
 
@@ -1624,6 +1767,14 @@ router.post("/", async (req, res) => {
 
     const data = cacheTotals({ ...req.body, ...scoped.patch });
     data.items = canonicaliseLineDepartments(data.items, resolver);
+
+    const bound = await bindLineCostCentres(data.items, {
+      companyId: cidForDepartments,
+      scope: scoped.patch.scope,
+      defaultCostCentreId: scoped.patch.costCentreId,
+    });
+    if (bound.error) return res.status(400).json({ success: false, message: bound.error });
+    data.items = bound.items;
     data.createdBy = req.user.id;
     const cid = actuals.oid(companyOf(req));
     if (cid && !data.companyId) data.companyId = cid;
@@ -1696,6 +1847,17 @@ router.put("/:id", async (req, res) => {
       }
     }
     data.scope = scoped.patch.scope;
+
+    if (data.items) {
+      const bound = await bindLineCostCentres(data.items, {
+        companyId: current.companyId || actuals.oid(companyOf(req)),
+        scope: scoped.patch.scope,
+        defaultCostCentreId: scoped.patch.costCentreId,
+      });
+      if (bound.error) return res.status(400).json({ success: false, message: bound.error });
+      data.items = bound.items;
+      cacheTotals(data);
+    }
 
     const budget = await Acc_Budget.findOneAndUpdate(
       scopeFilter(req, req.params.id),

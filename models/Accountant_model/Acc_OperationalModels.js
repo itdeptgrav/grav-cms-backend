@@ -363,6 +363,27 @@ const budgetItemSchema = new mongoose.Schema(
     department: { type: String, trim: true, index: true },
     ownerEmail: { type: String, trim: true, lowercase: true },
 
+    /* ── WHICH PROJECT THE LINE IS FOR ──────────────────────────────────────
+     * Optional, and the ONLY thing that makes a project budget a control
+     * rather than a label.
+     *
+     * Without it a line matches spend on ledger + company + date, so a budget
+     * named after one project claims every rupee spent on that head across
+     * every project. With it, actuals count only voucher allocations tagged to
+     * this cost centre — see budgetActuals.hydrateLines.
+     *
+     * A real ref, unlike `department`: Acc_CostCentre is company-scoped,
+     * already exists, and a cost centre's identity is an id rather than a
+     * spelling, so none of the reasons department stayed text apply. The NAME
+     * is snapshotted beside it so a deleted or renamed cost centre still reads
+     * on an old budget. */
+    costCentreId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_CostCentre",
+      index: true,
+    },
+    costCentreName: { type: String, trim: true },
+
     allocatedAmount: { type: Number, required: true, min: 0 },
 
     /* Optional seasonal weights, one per bucket of the period. Any scale —

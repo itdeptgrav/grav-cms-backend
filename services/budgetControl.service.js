@@ -49,7 +49,12 @@ const STATUS_RANK = {
   unscoped: 1,
   missing_budget: 2,
   warning_near_limit: 3,
-  over_budget: 4,
+  /* The head IS budgeted, but only under a project, and this voucher says
+   * nothing about which project. Ranked above missing_budget because it is a
+   * more specific and more fixable complaint: there is money, and the user is
+   * one field away from reaching it. */
+  needs_cost_centre: 4,
+  over_budget: 5,
 };
 
 /** The louder of two statuses. Same rule as severity: worst wins, never an
@@ -60,32 +65,158 @@ function worstStatus(a, b) {
 
 /** Statuses that a human has to answer for before money moves. */
 function needsOverride(status) {
-  return status === "over_budget" || status === "missing_budget";
+  return (
+    status === "over_budget" ||
+    status === "missing_budget" ||
+    /* Overridable rather than a hard refusal, deliberately. Someone genuinely
+     * may need to book spend against a project-budgeted head before the cost
+     * centre exists, and a control nobody can get past in an emergency is one
+     * that gets switched off. The override is recorded like any other. */
+    status === "needs_cost_centre"
+  );
 }
 
 /**
- * Collapse a voucher's entries to one proposed movement per ledger head.
+ * Are this voucher's cost-centre allocations arithmetically possible?
+ *
+ * Returns a list of human-readable problems; empty means fine.
+ *
+ * ── WHY THIS IS A HARD REFUSAL AND NOT A WARNING ────────────────────────────
+ * An allocation says "this much of this entry belongs to that project".
+ * Allocating more than the entry holds does not mean anything, and if it were
+ * stored the project's actual would exceed what was actually spent on the head
+ * — a budget reporting more spend than the ledger, which is the one direction
+ * an accounting figure must never be wrong in.
+ *
+ * Under-allocating IS allowed: an entry can be partly attributed and partly
+ * not, and the remainder is simply untagged spend.
+ */
+function validateCostCentreAllocations(ledgerEntries = []) {
+  const problems = [];
+
+  ledgerEntries.forEach((e, i) => {
+    if (!e) return;
+    const allocations = Array.isArray(e.costCentreAllocations) ? e.costCentreAllocations : [];
+    if (!allocations.length) return;
+
+    const label = e.ledgerName || `line ${i + 1}`;
+    const amount = variance.money(e.amount) ?? 0;
+    let total = 0;
+    const seen = new Set();
+
+    for (const a of allocations) {
+      if (!a) continue;
+      if (!a.costCentreId) {
+        problems.push(`${label}: a cost-centre allocation has no cost centre.`);
+        continue;
+      }
+      const amt = variance.money(a.amount);
+      if (amt === null || amt < 0) {
+        problems.push(`${label}: a cost-centre allocation has an invalid amount.`);
+        continue;
+      }
+      /* Two rows for one project on one entry is almost always a UI double
+       * submit, and it would silently double that project's actual. */
+      const key = String(a.costCentreId);
+      if (seen.has(key)) {
+        problems.push(
+          `${label}: ${a.costCentreName || "a cost centre"} is allocated twice on one line.`,
+        );
+      }
+      seen.add(key);
+      total += amt;
+    }
+
+    /* A rounding tolerance, matching the one Acc_Voucher.balanceOf uses for
+     * Dr/Cr — the same class of problem and the same reason. */
+    if (total - amount > 0.01) {
+      problems.push(
+        `${label}: cost-centre allocations total ₹${Math.round(total).toLocaleString("en-IN")}, ` +
+          `more than the line's ₹${Math.round(amount).toLocaleString("en-IN")}.`,
+      );
+    }
+  });
+
+  return problems;
+}
+
+/**
+ * Collapse a voucher's entries to one proposed movement per ledger head PER
+ * COST-CENTRE SCOPE.
  *
  * A voucher can charge the same head twice (a split allocation), and checking
  * each entry separately would compare two half-amounts against the same
  * remaining balance and clear both — the classic way an over-budget voucher
- * passes a per-line check.
+ * passes a per-line check. So amounts are summed per head first.
+ *
+ * ── WHY THE COST CENTRE SPLITS THE PROPOSAL ─────────────────────────────────
+ * A project budget's allocation authorises spend ON THAT PROJECT. Checking a
+ * whole entry against it would let a project budget authorise money booked to
+ * a different project — the mirror image of the actuals defect that made
+ * project budgets a label rather than a control.
+ *
+ * So a 1,00,000 entry tagged 60,000 to a project yields TWO proposals: 60,000
+ * scoped to that cost centre, and 40,000 scoped to none. Each is checked
+ * against the lines that actually apply to it.
+ *
+ * A voucher that tags nothing — which is every voucher in the books today —
+ * yields exactly one untagged proposal per head, identical to what this
+ * function has always returned.
  */
 function proposedByLedger(ledgerEntries = []) {
   const out = new Map();
+
+  const bucket = (ledgerId, costCentreId, costCentreName) => {
+    const key = `${ledgerId}::${costCentreId || ""}`;
+    if (!out.has(key)) {
+      out.set(key, {
+        ledgerId,
+        costCentreId: costCentreId || null,
+        costCentreName: costCentreName || null,
+        debit: 0,
+        credit: 0,
+        department: null,
+      });
+    }
+    return out.get(key);
+  };
+
   for (const e of ledgerEntries) {
     if (!e || !e.ledgerId) continue;
-    const key = String(e.ledgerId);
     const amount = variance.money(e.amount) ?? 0;
-    const prev = out.get(key) || { ledgerId: e.ledgerId, debit: 0, credit: 0, department: null };
-    if (e.type === "Cr") prev.credit += amount;
-    else prev.debit += amount;
-    /* An entry may name its own department (a cost-centre style allocation).
-     * The first one wins; a head charged to two departments on one voucher is
-     * checked against the head as a whole, which is the safer reading. */
-    if (!prev.department && e.department) prev.department = e.department;
-    out.set(key, prev);
+    const side = e.type === "Cr" ? "credit" : "debit";
+
+    const allocations = Array.isArray(e.costCentreAllocations) ? e.costCentreAllocations : [];
+    let tagged = 0;
+    for (const a of allocations) {
+      if (!a || !a.costCentreId) continue;
+      const amt = variance.money(a.amount) ?? 0;
+      if (!(amt > 0)) continue;
+      tagged += amt;
+      bucket(String(e.ledgerId), String(a.costCentreId), a.costCentreName || null)[side] += amt;
+    }
+
+    /* Whatever is left over is untagged, and is checked against the budgets
+     * that do not care which project it was for. Clamped at zero so an
+     * over-allocated entry cannot manufacture negative untagged spend — the
+     * over-allocation itself is refused by the caller's validation. */
+    const untagged = Math.max(0, amount - tagged);
+    if (untagged > 0 || !allocations.length) {
+      const b = bucket(String(e.ledgerId), null, null);
+      b[side] += untagged;
+      /* An entry may name its own department. The first one wins; a head
+       * charged to two departments on one voucher is checked against the head
+       * as a whole, which is the safer reading.
+       *
+       * NOTE: `ledgerEntrySchema` has no `department` field and is strict, so
+       * this is only ever set by a caller passing an unsaved entry object.
+       * Left as-is rather than "fixed" — adding the field would change how
+       * every existing company and department budget is matched, which is out
+       * of scope here. */
+      if (!b.department && e.department) b.department = e.department;
+    }
   }
+
   return [...out.values()];
 }
 
@@ -177,6 +308,11 @@ async function checkBudgetAvailability({
       groupName: meta.groupName || null,
       nature,
       department: lineDepartment,
+      /* Which slice of this head's spend the row is about. Null on every
+       * voucher that tags nothing, which is how this endpoint has always
+       * behaved. */
+      costCentreId: p.costCentreId || null,
+      costCentreName: p.costCentreName || null,
       debit: p.debit,
       credit: p.credit,
       thisVoucher,
@@ -242,6 +378,12 @@ async function checkBudgetAvailability({
      * an override for a budget that exists and has room. */
     const wanted = lineDepartment ? resolver.resolve(lineDepartment) : null;
     const matches = [];
+    /* Lines on this head that ARE project-bound but to some other project (or
+     * to any project, when this spend is untagged). Not matches — but the
+     * reason a head can look unbudgeted while money is sitting right there,
+     * so they are collected to say so. */
+    const costCentreOnly = [];
+
     for (const b of budgets) {
       for (const item of b.items || []) {
         if (!item.ledgerId || String(item.ledgerId) !== String(p.ledgerId)) continue;
@@ -249,8 +391,56 @@ async function checkBudgetAvailability({
           const itemDept = resolver.resolve(item.department);
           if (itemDept && itemDept.slug !== wanted.slug) continue;
         }
+
+        /* ── COST-CENTRE MATCHING ──────────────────────────────────────────
+         * A line bound to a project authorises spend ON THAT PROJECT and
+         * nothing else. Letting it clear untagged spend would make a project
+         * budget authorise every rupee on the head — the same defect on the
+         * control side that cost-centre-aware actuals just closed on the
+         * reporting side.
+         *
+         * A line with no cost centre keeps authorising the head as a whole,
+         * which is what every company and department budget does today. */
+        if (item.costCentreId) {
+          if (!p.costCentreId || String(item.costCentreId) !== String(p.costCentreId)) {
+            costCentreOnly.push({ budget: b, item });
+            continue;
+          }
+        }
         matches.push({ budget: b, item });
       }
+    }
+
+    if (!matches.length && costCentreOnly.length && !p.costCentreId) {
+      /* There IS approved budget for this head — it just belongs to a project,
+       * and this voucher has not said which project the spend is for. Saying
+       * "no approved allocation" here would be false and would send the user
+       * looking for a budget that already exists. */
+      const projects = [
+        ...new Set(costCentreOnly.map((m) => m.item.costCentreName).filter(Boolean)),
+      ];
+      results.push({
+        ...base,
+        status: "needs_cost_centre",
+        allocated: null,
+        actual: null,
+        projectedActual: null,
+        remainingAfter: null,
+        /* Named so the form can offer them directly rather than making the
+         * user go and look the project up. */
+        costCentreOptions: costCentreOnly.map((m) => ({
+          budgetId: m.budget._id,
+          budgetName: m.budget.name,
+          costCentreId: m.item.costCentreId,
+          costCentreName: m.item.costCentreName || null,
+          allocated: variance.money(m.item.allocatedAmount) ?? 0,
+        })),
+        note: projects.length
+          ? `Budgeted under ${projects.join(", ")} — tag this spend to a project.`
+          : "Budgeted under a project — tag this spend to a project.",
+        budgets: [],
+      });
+      continue;
     }
 
     if (!matches.length) {
@@ -363,6 +553,10 @@ function messageFor(status, results) {
     case "missing_budget": {
       const r = worst[0];
       return `${r.ledgerName || "This head"} has no approved allocation on a live budget for this date.`;
+    }
+    case "needs_cost_centre": {
+      const r = worst[0];
+      return r.note || `${r.ledgerName || "This head"} is budgeted under a project — tag this spend to a project.`;
     }
     case "warning_near_limit": {
       const r = worst[0];
@@ -525,6 +719,7 @@ async function assertClearance(args) {
 }
 
 module.exports = {
+  validateCostCentreAllocations,
   CONTROLLING_STATUSES,
   WARN_AT_PCT,
   worstStatus,
