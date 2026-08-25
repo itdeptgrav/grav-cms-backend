@@ -33,6 +33,7 @@ const { Acc_Company, Acc_Group, Acc_Ledger } = require("../models/Accountant_mod
 const { Acc_Budget } = require("../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Voucher } = require("../models/Accountant_model/Acc_VoucherModels");
 const { Acc_BudgetDepartment } = require("../models/Accountant_model/Acc_BudgetDepartment");
+const { Acc_CostCentre } = require("../models/Accountant_model/Acc_MasterModels");
 const departments = require("../services/budgetDepartment.service");
 
 const MANIFEST = "acc_budget_demo_manifest";
@@ -159,7 +160,7 @@ async function seed(db) {
 
   /* ── vouchers ─────────────────────────────────────────────────────────── */
   let n = 0;
-  const voucher = async ({ ledger, amount, type, date, status = "posted", isOptional = false }) =>
+  const voucher = async ({ ledger, amount, type, date, status = "posted", isOptional = false, costCentre = null }) =>
     remember(
       Acc_Voucher,
       await Acc_Voucher.create({
@@ -183,7 +184,22 @@ async function seed(db) {
         sourceSystem: "manual",
         sourceReference: TAG,
         ledgerEntries: [
-          { ledgerId: ledger._id, ledgerName: ledger.name, type, amount },
+          {
+            ledgerId: ledger._id,
+            ledgerName: ledger.name,
+            type,
+            amount,
+            /* Only the spend leg is ever tagged. The bank leg is how it was
+             * PAID, not what it was spent on, and tagging it would count the
+             * same money against the project twice. */
+            ...(costCentre
+              ? {
+                  costCentreAllocations: [
+                    { costCentreId: costCentre._id, costCentreName: costCentre.name, amount },
+                  ],
+                }
+              : {}),
+          },
           { ledgerId: bank._id, ledgerName: bank.name, type: type === "Cr" ? "Dr" : "Cr", amount },
         ],
       }),
@@ -228,6 +244,19 @@ async function seed(db) {
     allocatedAmount,
     ...extra,
   });
+
+  /* ── The cost-centre master ───────────────────────────────────────────────
+   * A real project, so the project budget below can bind to it. Without one a
+   * project budget matches on ledger head alone and reports every rupee spent
+   * on that head company-wide — a label rather than a control. */
+  const greenfield = remember(
+    Acc_CostCentre,
+    await Acc_CostCentre.create({
+      companyId: company._id,
+      name: "Greenfield Industrial Park",
+      category: "Projects",
+    }),
+  );
 
   /* ── The department registry ──────────────────────────────────────────────
    * So the picker has something to pick and the Departments tab shows
@@ -386,10 +415,11 @@ async function seed(db) {
     financialYear: FY,
     period: "yearly",
     status: "collecting",
-    /* Project scope, named only — no cost centre is seeded, and naming one
-     * would imply spend can be attributed to it, which it cannot yet. */
+    /* Bound to a REAL cost centre, so its actuals are the project's spend and
+     * not everything on its heads. */
     scope: "project",
-    costCentreName: "Greenfield Industrial Park",
+    costCentreId: greenfield._id,
+    costCentreName: greenfield.name,
     startDate: FY_START,
     endDate: FY_END,
     companyId: company._id,
@@ -412,7 +442,45 @@ async function seed(db) {
     ],
   });
 
-  /* 5 — a legacy row: no companyId, an unbound line. Proves the module still
+  /* 5 — a project budget that is actually WORKING: bound to a real cost
+   * centre, with spend tagged to it.
+   *
+   * It shares the repairs head with the company budget, which is the whole
+   * demonstration. Of the repairs spend below, the tagged part belongs to this
+   * project and the untagged part stays with the company budget — the same
+   * rupee is never counted twice, and the project does not claim spend that
+   * was never attributed to it. */
+  await budget({
+    name: "Greenfield — Site Works",
+    financialYear: FY,
+    period: "yearly",
+    status: "active",
+    scope: "project",
+    costCentreId: greenfield._id,
+    costCentreName: greenfield.name,
+    startDate: FY_START,
+    endDate: FY_END,
+    companyId: company._id,
+    notes: "Demo data.",
+    items: [
+      line(repairs, "Projects", 900000, {
+        costCentreId: greenfield._id,
+        costCentreName: greenfield.name,
+      }),
+    ],
+  });
+
+  /* Repairs spend, half of it attributed to the project and half not. */
+  await voucher({
+    ledger: repairs,
+    amount: 340000,
+    type: "Dr",
+    date: ist(2026, 9, 12),
+    costCentre: greenfield,
+  });
+  await voucher({ ledger: repairs, amount: 210000, type: "Dr", date: ist(2026, 10, 8) });
+
+  /* 6 — a legacy row: no companyId, an unbound line. Proves the module still
    * reads pre-rewrite data and that "not linked to a ledger" surfaces. */
   await budget({
     name: "Marketing — FY24-25 (legacy)",
