@@ -402,6 +402,58 @@ const budgetSchema = new mongoose.Schema(
       enum: ["monthly", "quarterly", "half_yearly", "yearly"],
       required: true,
     },
+
+    /* ── WHAT KIND OF BUDGET THIS IS (Slice A) ───────────────────────────────
+     * Until now a budget was a name, a period and a list of lines, and nothing
+     * said whether "Freight & Forwarding — Q2" was the company's freight
+     * budget, Logistics' own envelope, or a site's. The list could not lead
+     * with the right thing because it could not know — which is exactly why it
+     * read as an arbitrary pile.
+     *
+     *   company     one shared envelope; departments appear as items[]
+     *   department  one department owns the whole budget
+     *   project     one project / cost centre owns the whole budget
+     *
+     * Defaults to `company` so every existing row keeps behaving exactly as it
+     * does today without a migration: that is what they all are.
+     *
+     * DELIBERATELY INERT FOR NOW. Nothing about actuals, variance, budget
+     * control or the roll-up reads this field yet. It is the identity the
+     * later slices need — precedence when budgets overlap (Chunk B) and
+     * cost-centre-aware actuals — and adding it early means those slices
+     * inherit a populated field instead of paying for the migration too. */
+    scope: {
+      type: String,
+      enum: ["company", "department", "project"],
+      default: "company",
+      index: true,
+    },
+
+    /* Owner of a `department`-scope budget.
+     *
+     * Free text, matching `items[].department` and `budgetRequests[].department`
+     * — the department registry is not seeded, and a hard ref would make this
+     * field unusable until it is. That is a known weakness written up in §6.1
+     * of the scoping brief; it is not made worse here, but it is not fixed
+     * here either. */
+    department: { type: String, trim: true },
+
+    /* Owner of a `project`-scope budget.
+     *
+     * `Acc_CostCentre` exists as a model, so the reference is real. But zero
+     * cost centres are defined and zero of ~1,700 vouchers tag one, so the id
+     * is OPTIONAL and the name is stored beside it: a project budget can be
+     * identified by name alone today and gain a real reference later without
+     * a second migration.
+     *
+     * Note this does NOT make project actuals work — spend is still matched on
+     * ledger + company + date, so a project budget still claims every rupee on
+     * its heads company-wide. That is §5 of the brief, not this slice. */
+    costCentreId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_CostCentre",
+    },
+    costCentreName: { type: String, trim: true },
     month: { type: Number, min: 1, max: 12 },
     quarter: { type: Number, min: 1, max: 4 },
     startDate: { type: Date, required: true },

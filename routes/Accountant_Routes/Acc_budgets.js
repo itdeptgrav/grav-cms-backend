@@ -290,12 +290,17 @@ function cacheTotals(data) {
 /* ── LIST ────────────────────────────────────────────────────────────────── */
 router.get("/", async (req, res) => {
   try {
-    const { financialYear, status, period, department, withTotals } = req.query;
+    const { financialYear, status, period, department, scope, withTotals } = req.query;
     const filter = {};
     if (financialYear) filter.financialYear = financialYear;
     if (status) filter.status = status;
     if (period) filter.period = period;
     if (department) filter["items.department"] = department;
+    /* Rows written before the field existed have no `scope` at all, and they
+     * are company budgets — so filtering for company has to include them, or
+     * every pre-existing budget disappears the moment someone uses the filter. */
+    if (scope === "company") filter.$and = [{ $or: [{ scope: "company" }, { scope: { $exists: false } }, { scope: null }] }];
+    else if (scope) filter.scope = scope;
 
     const companyId = companyOf(req);
     if (companyId) {
@@ -618,8 +623,10 @@ function attentionLine(line, budget) {
 
 router.get("/dashboard", async (req, res) => {
   try {
-    const { financialYear, status, period, department } = req.query;
+    const { financialYear, status, period, department, scope } = req.query;
 
+    const scopeError = invalidEnumField(Acc_Budget, "scope", scope);
+    if (scopeError) return res.status(400).json({ success: false, message: scopeError });
     const periodError = invalidEnumField(Acc_Budget, "period", period);
     if (periodError) return res.status(400).json({ success: false, message: periodError });
     const statusError = invalidEnumField(Acc_Budget, "status", status);
@@ -641,6 +648,12 @@ router.get("/dashboard", async (req, res) => {
     if (status) filter.status = status;
     if (period) filter.period = period;
     if (department) filter["items.department"] = department;
+    /* Same legacy-inclusive rule as the list: an unset scope IS company. */
+    if (scope === "company") {
+      filter.$and = [{ $or: [{ scope: "company" }, { scope: { $exists: false } }, { scope: null }] }];
+    } else if (scope) {
+      filter.scope = scope;
+    }
 
     const companyId = companyOf(req);
     if (companyId) {
@@ -843,6 +856,9 @@ router.get("/dashboard", async (req, res) => {
         name: b.name,
         status: b.status,
         financialYear: b.financialYear,
+        scope: b.scope || "company",
+        department: b.department || null,
+        costCentreName: b.costCentreName || null,
         ...pendingCounts(b),
       }))
       .filter((p) => p.total > 0)
@@ -888,6 +904,11 @@ router.get("/dashboard", async (req, res) => {
         status: b.status,
         period: b.period,
         financialYear: b.financialYear,
+        /* An unset scope on a pre-existing row IS company — normalised here so
+         * no consumer has to know that. */
+        scope: b.scope || "company",
+        department: b.department || null,
+        costCentreName: b.costCentreName || null,
         startDate: b.startDate,
         endDate: b.endDate,
         totals: variance.rollUp(lines),
@@ -1163,6 +1184,56 @@ router.get("/:id/items/:itemId/vouchers", async (req, res) => {
   }
 });
 
+/**
+ * Validate and normalise the scope trio on a create or update body.
+ *
+ * Returns `{ error }` to refuse, or `{ patch }` of fields to apply.
+ *
+ * ── WHY THIS NORMALISES RATHER THAN ONLY VALIDATING ─────────────────────────
+ * Switching a budget from department scope to company scope has to CLEAR the
+ * department, not leave it behind. A stale owner on a company budget is the
+ * kind of field that later reads as authoritative — the card would lead with a
+ * department the budget no longer belongs to — so the transition is handled
+ * here rather than trusted to the caller.
+ *
+ * ── WHY THE PROJECT CASE DOES NOT REQUIRE AN ID ─────────────────────────────
+ * `Acc_CostCentre` exists but nothing is seeded: zero cost centres, zero
+ * vouchers tagging one. Demanding a real reference would make project scope
+ * unusable on day one. A name is enough to identify the budget now; the id can
+ * arrive later without a second migration. Deliberately permissive, and the
+ * reason is that the data is not there yet — not that the reference does not
+ * matter.
+ */
+function scopePatch(body, existing) {
+  if (body.scope === undefined && existing === undefined) return { patch: {} };
+
+  const scope = body.scope !== undefined ? body.scope : existing?.scope || "company";
+
+  const scopeError = invalidEnumField(Acc_Budget, "scope", scope);
+  if (scopeError) return { error: scopeError };
+
+  const dept = (body.department !== undefined ? body.department : existing?.department) || "";
+  const ccName = (body.costCentreName !== undefined ? body.costCentreName : existing?.costCentreName) || "";
+  const ccId = body.costCentreId !== undefined ? body.costCentreId : existing?.costCentreId;
+
+  if (scope === "department" && !String(dept).trim()) {
+    return { error: "A department-scope budget needs a department." };
+  }
+  if (scope === "project" && !String(ccName).trim() && !actuals.oid(ccId)) {
+    return { error: "A project-scope budget needs a project or cost centre name." };
+  }
+
+  /* Only the owner the scope actually uses survives. */
+  return {
+    patch: {
+      scope,
+      department: scope === "department" ? String(dept).trim() : undefined,
+      costCentreName: scope === "project" ? String(ccName).trim() : undefined,
+      costCentreId: scope === "project" ? actuals.oid(ccId) || undefined : undefined,
+    },
+  };
+}
+
 /* ── CREATE ──────────────────────────────────────────────────────────────── */
 router.post("/", async (req, res) => {
   try {
@@ -1172,7 +1243,10 @@ router.post("/", async (req, res) => {
     const statusError = invalidEnumField(Acc_Budget, "status", req.body?.status);
     if (statusError) return res.status(400).json({ success: false, message: statusError });
 
-    const data = cacheTotals({ ...req.body });
+    const scoped = scopePatch(req.body || {});
+    if (scoped.error) return res.status(400).json({ success: false, message: scoped.error });
+
+    const data = cacheTotals({ ...req.body, ...scoped.patch });
     data.createdBy = req.user.id;
     const cid = actuals.oid(companyOf(req));
     if (cid && !data.companyId) data.companyId = cid;
@@ -1217,10 +1291,34 @@ router.put("/:id", async (req, res) => {
     // would need its own endpoint.
     delete data.companyId;
 
-    const budget = await Acc_Budget.findOneAndUpdate(scopeFilter(req, req.params.id), data, {
-      new: true,
-      runValidators: true,
-    });
+    /* Scope is validated against the STORED row, not the payload alone: a PUT
+     * that changes only the department must be checked against the scope the
+     * budget already has. `$unset` clears the owner the new scope does not
+     * use — `undefined` in a findOneAndUpdate payload is dropped, not applied,
+     * so switching department → company would otherwise leave the old
+     * department behind and the card would keep leading with it. */
+    const current = await Acc_Budget.findOne(scopeFilter(req, req.params.id)).lean();
+    if (!current) return res.status(404).json({ success: false, message: "Budget not found" });
+
+    const scoped = scopePatch(req.body || {}, current);
+    if (scoped.error) return res.status(400).json({ success: false, message: scoped.error });
+
+    const unset = {};
+    for (const key of ["department", "costCentreName", "costCentreId"]) {
+      if (scoped.patch[key] === undefined) {
+        delete data[key];
+        if (current[key] !== undefined && current[key] !== null) unset[key] = "";
+      } else {
+        data[key] = scoped.patch[key];
+      }
+    }
+    data.scope = scoped.patch.scope;
+
+    const budget = await Acc_Budget.findOneAndUpdate(
+      scopeFilter(req, req.params.id),
+      Object.keys(unset).length ? { $set: data, $unset: unset } : data,
+      { new: true, runValidators: true },
+    );
     if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
     res.json({ success: true, budget });
   } catch (error) {

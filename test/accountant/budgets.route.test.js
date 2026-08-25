@@ -30,7 +30,7 @@ jest.mock("../../Middlewear/AccountantAuthMiddleware", () => ({
   },
 }));
 
-const { Acc_Company, Acc_Group, Acc_Ledger } = require("../../models/Accountant_model/Acc_MasterModels");
+const { Acc_Company, Acc_Group, Acc_Ledger, Acc_CostCentre } = require("../../models/Accountant_model/Acc_MasterModels");
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
 
@@ -4252,5 +4252,317 @@ describe("dashboard planned series", () => {
     expect(sum("plannedExpense")).toBe(1200000);
     // Sales is filtered out, so its target must not appear in the plan either.
     expect(sum("plannedRevenue")).toBe(0);
+  });
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * SLICE A — BUDGET SCOPE
+ *
+ * A budget now says what KIND of budget it is: one shared company envelope,
+ * one department's, or one project's. The field is deliberately inert —
+ * nothing about actuals, variance, budget control or the roll-up reads it —
+ * so most of what is worth testing is that it is stored, validated, exposed
+ * and filterable, and that adding it changed nothing that already worked.
+ * ────────────────────────────────────────────────────────────────────────── */
+describe("budget scope", () => {
+  async function setup() {
+    const { company, revenueLedger, expenseLedger } = await seedCompany();
+    return { company, revenueLedger, expenseLedger, q: `?companyId=${company._id}` };
+  }
+
+  const base = ({ company, expenseLedger, ...rest }) => ({
+    name: "FY26-27",
+    financialYear: "2026-27",
+    period: "yearly",
+    status: "active",
+    startDate: "2026-04-01",
+    endDate: "2027-03-31",
+    companyId: String(company._id),
+    items: [
+      {
+        ledgerId: String(expenseLedger._id),
+        nature: "expense",
+        department: "Logistics",
+        allocatedAmount: 500000,
+      },
+    ],
+    ...rest,
+  });
+
+  /* ── default ──────────────────────────────────────────────────────────── */
+
+  test("a budget created without a scope is a company budget", async () => {
+    const s = await setup();
+    const { status, body } = await call("/", { method: "POST", body: base(s) });
+    expect(status).toBe(201);
+    expect(body.budget.scope).toBe("company");
+  });
+
+  test("a row written before the field existed reads as company scope", async () => {
+    const { company, expenseLedger, q } = await setup();
+    /* Straight through the model, so `scope` is genuinely absent rather than
+       defaulted — which is the state every existing budget is in. */
+    const legacy = await Acc_Budget.collection.insertOne({
+      name: "Pre-scope budget",
+      financialYear: "2026-27",
+      period: "yearly",
+      status: "active",
+      startDate: new Date("2026-04-01"),
+      endDate: new Date("2027-03-31"),
+      companyId: company._id,
+      items: [{ ledgerId: expenseLedger._id, nature: "expense", department: "Logistics", allocatedAmount: 500000 }],
+    });
+
+    const raw = await Acc_Budget.collection.findOne({ _id: legacy.insertedId });
+    expect(raw.scope).toBeUndefined();
+
+    // The dashboard normalises it so no consumer has to know.
+    const { body } = await call(`/dashboard${q}&asOf=2027-03-31`);
+    const row = body.budgets.find((b) => b.name === "Pre-scope budget");
+    expect(row.scope).toBe("company");
+  });
+
+  /* ── creating each kind ───────────────────────────────────────────────── */
+
+  test("a company budget stores no owner", async () => {
+    const s = await setup();
+    const { body } = await call("/", {
+      method: "POST",
+      body: base({ ...s, scope: "company", department: "Logistics", costCentreName: "Site A" }),
+    });
+    expect(body.budget.scope).toBe("company");
+    // The owners a company budget does not use are dropped, not carried —
+    // a stale owner would make the card lead with something untrue.
+    expect(body.budget.department).toBeUndefined();
+    expect(body.budget.costCentreName).toBeUndefined();
+  });
+
+  test("a department budget stores its department", async () => {
+    const s = await setup();
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: base({ ...s, name: "Logistics — FY26-27", scope: "department", department: "  Logistics  " }),
+    });
+    expect(status).toBe(201);
+    expect(body.budget.scope).toBe("department");
+    expect(body.budget.department).toBe("Logistics"); // trimmed
+    expect(body.budget.costCentreName).toBeUndefined();
+  });
+
+  test("a project budget is identified by name alone, because no cost centres are seeded", async () => {
+    const s = await setup();
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: base({ ...s, name: "Greenfield Park", scope: "project", costCentreName: "Greenfield Industrial Park" }),
+    });
+    expect(status).toBe(201);
+    expect(body.budget.scope).toBe("project");
+    expect(body.budget.costCentreName).toBe("Greenfield Industrial Park");
+    // No id required — Acc_CostCentre exists but nothing is seeded, so
+    // demanding a reference would make project scope unusable on day one.
+    expect(body.budget.costCentreId).toBeUndefined();
+  });
+
+  test("a project budget accepts a real cost-centre reference when there is one", async () => {
+    const s = await setup();
+    const cc = await Acc_CostCentre.create({ companyId: s.company._id, name: "Greenfield Industrial Park" });
+    const { body } = await call("/", {
+      method: "POST",
+      body: base({ ...s, scope: "project", costCentreId: String(cc._id), costCentreName: cc.name }),
+    });
+    expect(String(body.budget.costCentreId)).toBe(String(cc._id));
+  });
+
+  /* ── validation ───────────────────────────────────────────────────────── */
+
+  test("an unknown scope is refused with a clean 400", async () => {
+    const s = await setup();
+    const { status, body } = await call("/", { method: "POST", body: base({ ...s, scope: "team" }) });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/scope must be one of/i);
+    expect(body.message).toMatch(/company/);
+    await expect(Acc_Budget.countDocuments({})).resolves.toBe(0);
+  });
+
+  test("a department budget without a department is refused", async () => {
+    const s = await setup();
+    for (const dept of [undefined, "", "   "]) {
+      const { status, body } = await call("/", {
+        method: "POST",
+        body: base({ ...s, scope: "department", department: dept }),
+      });
+      expect(status).toBe(400);
+      expect(body.message).toMatch(/needs a department/i);
+    }
+  });
+
+  test("a project budget with no identity at all is refused", async () => {
+    const s = await setup();
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: base({ ...s, scope: "project" }),
+    });
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/project or cost centre name/i);
+  });
+
+  /* ── changing scope ───────────────────────────────────────────────────── */
+
+  test("switching a budget's scope clears the owner it no longer uses", async () => {
+    const s = await setup();
+    const created = await call("/", {
+      method: "POST",
+      body: base({ ...s, scope: "department", department: "Logistics" }),
+    });
+    expect(created.body.budget.department).toBe("Logistics");
+
+    const toProject = await call(`/${created.body.budget._id}${s.q}`, {
+      method: "PUT",
+      body: { scope: "project", costCentreName: "Greenfield" },
+    });
+    expect(toProject.status).toBe(200);
+    expect(toProject.body.budget.scope).toBe("project");
+    expect(toProject.body.budget.costCentreName).toBe("Greenfield");
+    /* The stale department must be GONE, not merely ignored: left behind it
+       would later read as authoritative and the card would lead with a
+       department the budget no longer belongs to. */
+    expect(toProject.body.budget.department).toBeUndefined();
+
+    const toCompany = await call(`/${created.body.budget._id}${s.q}`, {
+      method: "PUT",
+      body: { scope: "company" },
+    });
+    expect(toCompany.body.budget.department).toBeUndefined();
+    expect(toCompany.body.budget.costCentreName).toBeUndefined();
+
+    const saved = await Acc_Budget.findById(created.body.budget._id).lean();
+    expect(saved.department).toBeUndefined();
+    expect(saved.costCentreName).toBeUndefined();
+  });
+
+  test("an update that touches only the department is validated against the stored scope", async () => {
+    const s = await setup();
+    const created = await call("/", {
+      method: "POST",
+      body: base({ ...s, scope: "department", department: "Logistics" }),
+    });
+
+    const renamed = await call(`/${created.body.budget._id}${s.q}`, {
+      method: "PUT",
+      body: { department: "Admin" },
+    });
+    expect(renamed.status).toBe(200);
+    expect(renamed.body.budget.scope).toBe("department");
+    expect(renamed.body.budget.department).toBe("Admin");
+
+    // And emptying it is refused, because the stored scope still needs one.
+    const emptied = await call(`/${created.body.budget._id}${s.q}`, {
+      method: "PUT",
+      body: { department: "" },
+    });
+    expect(emptied.status).toBe(400);
+    expect(emptied.body.message).toMatch(/needs a department/i);
+  });
+
+  /* ── reading and filtering ────────────────────────────────────────────── */
+
+  test("scope comes back on list and detail", async () => {
+    const s = await setup();
+    const created = await call("/", {
+      method: "POST",
+      body: base({ ...s, scope: "department", department: "Logistics" }),
+    });
+
+    const list = await call(`/${s.q}`);
+    expect(list.body.budgets[0].scope).toBe("department");
+    expect(list.body.budgets[0].department).toBe("Logistics");
+
+    const detail = await call(`/${created.body.budget._id}${s.q}`);
+    expect(detail.body.budget.scope).toBe("department");
+    expect(detail.body.budget.department).toBe("Logistics");
+  });
+
+  test("the list and dashboard filter by scope, and company includes pre-scope rows", async () => {
+    const s = await setup();
+    await call("/", { method: "POST", body: base({ ...s, name: "Company one" }) });
+    await call("/", { method: "POST", body: base({ ...s, name: "Logistics own", scope: "department", department: "Logistics" }) });
+    await call("/", { method: "POST", body: base({ ...s, name: "Greenfield", scope: "project", costCentreName: "Greenfield" }) });
+    /* A row from before the field existed. Filtering for company MUST include
+       it, or every pre-existing budget vanishes the moment anyone filters. */
+    await Acc_Budget.collection.insertOne({
+      name: "Pre-scope", financialYear: "2026-27", period: "yearly", status: "active",
+      startDate: new Date("2026-04-01"), endDate: new Date("2027-03-31"),
+      companyId: s.company._id, items: [],
+    });
+
+    const names = async (qs) => (await call(qs)).body.budgets.map((b) => b.name).sort();
+
+    expect(await names(`/${s.q}&scope=company`)).toEqual(["Company one", "Pre-scope"]);
+    expect(await names(`/${s.q}&scope=department`)).toEqual(["Logistics own"]);
+    expect(await names(`/${s.q}&scope=project`)).toEqual(["Greenfield"]);
+    expect((await names(`/${s.q}`)).length).toBe(4);
+
+    const dash = await call(`/dashboard${s.q}&scope=department&asOf=2027-03-31`);
+    expect(dash.body.budgets.map((b) => b.name)).toEqual(["Logistics own"]);
+
+    const dashCompany = await call(`/dashboard${s.q}&scope=company&asOf=2027-03-31`);
+    expect(dashCompany.body.budgets.map((b) => b.name).sort()).toEqual(["Company one", "Pre-scope"]);
+  });
+
+  test("a bad scope on the dashboard filter is a clean 400", async () => {
+    const s = await setup();
+    const { status, body } = await call(`/dashboard${s.q}&scope=team`);
+    expect(status).toBe(400);
+    expect(body.message).toMatch(/scope must be one of/i);
+  });
+
+  test("the attention rows carry scope too, so the queue can label them", async () => {
+    const s = await setup();
+    const created = await call("/", {
+      method: "POST",
+      body: base({ ...s, name: "Logistics own", scope: "department", department: "Logistics", status: "collecting", items: [] }),
+    });
+    await call(`/${created.body.budget._id}/requests${s.q}`, {
+      method: "POST", user: EDITOR,
+      body: { department: "Logistics", ledgerId: String(s.expenseLedger._id), requestedAmount: 1000, purpose: "Peak freight" },
+    });
+
+    const { body } = await call(`/dashboard${s.q}&asOf=2027-03-31`);
+    const row = body.attention.pendingChanges.find((p) => p.name === "Logistics own");
+    expect(row.scope).toBe("department");
+    expect(row.department).toBe("Logistics");
+  });
+
+  /* ── the field is inert ───────────────────────────────────────────────── */
+
+  test("SCOPE CHANGES NO ARITHMETIC — actuals and variance are identical either way", async () => {
+    const s = await setup();
+    const spend = async (companyId) =>
+      Acc_Voucher.create({
+        companyId, voucherType: "purchase",
+        voucherNumber: `SC/${Date.now()}/${Math.round(Math.random() * 1e6)}`,
+        voucherDate: new Date("2026-06-15"), status: "posted", grandTotal: 120000,
+        ledgerEntries: [{ ledgerId: s.expenseLedger._id, ledgerName: s.expenseLedger.name, type: "Dr", amount: 120000 }],
+      });
+    await spend(s.company._id);
+
+    const asCompany = await call("/", { method: "POST", body: base({ ...s, name: "As company" }) });
+    const asDept = await call("/", {
+      method: "POST",
+      body: base({ ...s, name: "As department", scope: "department", department: "Logistics" }),
+    });
+
+    const read = async (id) => (await call(`/${id}${s.q}&asOf=2027-03-31`)).body.budget.items[0];
+    const a = await read(asCompany.body.budget._id);
+    const b = await read(asDept.body.budget._id);
+
+    /* Identical lines, identical spend, different scope. Slice A must not have
+       touched a single figure — the field exists for the later slices to read,
+       and nothing reads it yet. */
+    expect(b.actual).toBe(a.actual);
+    expect(b.variance).toBe(a.variance);
+    expect(b.utilizationPct).toBe(a.utilizationPct);
+    expect(b.pace).toBe(a.pace);
+    expect(a.actual).toBe(120000);
   });
 });
