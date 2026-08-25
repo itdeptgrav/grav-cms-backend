@@ -194,14 +194,9 @@ async function seed(db) {
     await voucher({ ledger: sales, amount: sl, type: "Cr", date: ist(y, m, 26) });
   }
 
-  /* Q2-only spend on a head no other budget touches.
-   *
-   * The quarterly budget deliberately does NOT share a head with the yearly
-   * one. It is perfectly legal to budget the same head in two overlapping
-   * budgets, but the dashboard roll-up counts such a voucher once per budget
-   * and the headline reads double — a real defect, pinned by a test in
-   * budgets.route.test.js. Demo data should show the module working, not
-   * showcase a known bug. */
+  /* Q2-only spend on a head the yearly budget does not carry, so the Q2
+   * budget's own red state is unambiguous. The DELIBERATE overlap is the
+   * freight head below — see the Q2 budget's second line. */
   await voucher({ ledger: ocean, amount: 520000, type: "Dr", date: ist(2026, 7, 16) });
   await voucher({ ledger: ocean, amount: 610000, type: "Dr", date: ist(2026, 8, 21) });
   await voucher({ ledger: ocean, amount: 405000, type: "Dr", date: ist(2026, 9, 11) });
@@ -312,7 +307,15 @@ async function seed(db) {
   await main.save();
 
   /* 2 — a quarterly budget that has been blown, so the attention lists and
-   * the red states have something real to show. */
+   * the red states have something real to show.
+   *
+   * It also carries the FREIGHT head, which the yearly budget carries too —
+   * a deliberate overlap. Running a tight quarter inside a yearly envelope is
+   * an ordinary thing to do, and until Chunk B it made the dashboard headline
+   * read double. Now the Q2 budget owns August and September's freight (same
+   * scope, narrower period) and the yearly one owns the other ten months. The
+   * demo carries it so the "Overlapping actuals deduped" note has something
+   * true to say. */
   await budget({
     name: "Freight & Forwarding — Q2",
     financialYear: FY,
@@ -324,11 +327,11 @@ async function seed(db) {
     endDate: new Date("2026-09-30T00:00:00.000Z"),
     companyId: company._id,
     notes: "Demo data.",
-    items: [line(ocean, "Logistics", 1300000)],
+    items: [line(ocean, "Logistics", 1300000), line(freight, "Logistics", 1400000)],
   });
 
-  /* 3 — near the limit but not over: the amber case between the two. Its own
-   * head, for the same no-overlap reason as the quarterly budget above. */
+  /* 3 — near the limit but not over: the amber case between the two. On its
+   * own head, so its 94% reading is its own and not a share of anything. */
   await budget({
     name: "Site Facilities — FY26-27",
     financialYear: FY,
