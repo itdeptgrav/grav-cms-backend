@@ -172,4 +172,38 @@ async function departmentResolver({ companyId } = {}) {
   };
 }
 
-module.exports = { slugify, displayOf, departmentResolver };
+/**
+ * Which budget departments a login portal may propose budget for.
+ *
+ * ── WHY THIS IS A LOOKUP AND NOT A NAME MATCH ───────────────────────────────
+ * A portal slug ("sales") and a budget department slug ("logistics") are
+ * different vocabularies — see accessSlug on Acc_BudgetDepartment. Matching
+ * them by name would work often enough to be trusted and then quietly let one
+ * department propose as another. So the link is stored, and a portal with no
+ * linked department gets an empty list rather than a guess.
+ *
+ * Returns [] for a missing company or portal, which every caller must read as
+ * "propose nothing" — never as "propose for anything".
+ */
+async function departmentsForAccessSlug({ companyId, accessSlug }) {
+  const cid = actuals.oid(companyId);
+  const slug = String(accessSlug ?? "").trim().toLowerCase();
+  if (!cid || !slug) return [];
+
+  const rows = await Acc_BudgetDepartment.find({
+    companyId: cid,
+    accessSlug: slug,
+    isActive: { $ne: false },
+  })
+    .select("_id slug name aliases")
+    .lean();
+
+  return rows.map((r) => ({
+    _id: r._id,
+    slug: r.slug,
+    name: r.name,
+    aliases: r.aliases || [],
+  }));
+}
+
+module.exports = { slugify, displayOf, departmentResolver, departmentsForAccessSlug };

@@ -988,6 +988,11 @@ app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
 // them. Mounted outside any one department's middleware because the queue spans
 // departments; it authenticates the session itself.
 app.use("/api/change-requests", require("./routes/Access/changeRequests"));
+/* Department-facing budget proposals. Mounted HERE, beside the other
+ * cross-department surface, and deliberately NOT under /api/accountant — the
+ * frontend's authFetch skips that prefix, so a department session would never
+ * reach it. The router authenticates itself; see its header. */
+app.use("/api/budget-proposals", require("./routes/Access/budgetProposals"));
 
 // Unauthenticated on purpose — backs the public /onboarding tile grid.
 // Returns names and icons only; never emails, counts or user data.
