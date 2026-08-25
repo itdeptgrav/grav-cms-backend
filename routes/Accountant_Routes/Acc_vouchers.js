@@ -278,6 +278,23 @@ function parseTaxRate(raw) {
   return m ? parseFloat(m[1]) : 0;
 }
 
+// Pick the first GST rate that is actually SPECIFIED, falling back only when
+// none of the sources carry one.
+//
+// `a || b || 18` is wrong here and was a live bug: 0% is a real, common rate
+// (exempt and nil-rated goods) but it is also falsy, so an exempt line fell
+// straight through to the 18% fallback. The voucher forms read these
+// order/PO payloads to prefill their line items, so the wrong rate arrived
+// already baked in — fixing it in the UI alone would not have helped.
+function pickGstRate(candidates, fallback = 18) {
+  for (const c of candidates) {
+    if (c === null || c === undefined || c === "") continue;
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return fallback;
+}
+
 // Lazy-require the CMS StockItem model so this file loads even where the
 // CMS inventory module isn't installed.
 function loadCMSStockItem() {
@@ -1419,7 +1436,7 @@ router.get("/dispatch-lookup", auth, async (req, res) => {
             dispatchedQuantity: dispatchedQty,
             unit: item.unit || "Nos",
             rate: item.rate || item.unitPrice || item.price || 0,
-            gstRate: item.gstRate || item.taxRate || 18,
+            gstRate: pickGstRate([item.gstRate, item.taxRate]),
             amount: item.amount || item.total || 0,
             discount: item.discount || 0,
           };
@@ -1611,7 +1628,7 @@ router.get("/po-lookup", auth, async (req, res) => {
         sku: item.rawItem?.sku || "",
         unit: item.rawItem?.unit || item.unit || "Nos",
         hsnCode: item.rawItem?.hsnCode || item.hsnCode || "",
-        gstRate: item.rawItem?.gstRate || item.gstRate || 18,
+        gstRate: pickGstRate([item.rawItem?.gstRate, item.gstRate]),
         quantity: item.quantity || 0,
         unitPrice: item.unitPrice || 0,
         totalPrice: item.totalPrice || 0,
