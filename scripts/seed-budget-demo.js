@@ -32,6 +32,8 @@ const MONGO_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clo
 const { Acc_Company, Acc_Group, Acc_Ledger } = require("../models/Accountant_model/Acc_MasterModels");
 const { Acc_Budget } = require("../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Voucher } = require("../models/Accountant_model/Acc_VoucherModels");
+const { Acc_BudgetDepartment } = require("../models/Accountant_model/Acc_BudgetDepartment");
+const departments = require("../services/budgetDepartment.service");
 
 const MANIFEST = "acc_budget_demo_manifest";
 const TAG = "budget-demo-seed";
@@ -227,6 +229,30 @@ async function seed(db) {
     ...extra,
   });
 
+  /* ── The department registry ──────────────────────────────────────────────
+   * So the picker has something to pick and the Departments tab shows
+   * canonical names. "Logistics" carries a deliberate alias for a plausible
+   * misspelling — the one case slugify cannot fold on its own, and the whole
+   * reason aliases exist. */
+  for (const [name, aliases] of [
+    ["Logistics", ["logistcs"]],
+    ["Admin", []],
+    ["Marketing", []],
+    ["Sales", []],
+    ["Facilities", []],
+  ]) {
+    remember(
+      Acc_BudgetDepartment,
+      await Acc_BudgetDepartment.create({
+        companyId: company._id,
+        slug: departments.slugify(name),
+        name,
+        aliases,
+        createdBy: "demo-seed",
+      }),
+    );
+  }
+
   /* 1 — the main one: revenue and expense, mostly healthy, work waiting. */
   const main = await budget({
     name: "FY26-27 Company Budget",
@@ -327,7 +353,12 @@ async function seed(db) {
     endDate: new Date("2026-09-30T00:00:00.000Z"),
     companyId: company._id,
     notes: "Demo data.",
-    items: [line(ocean, "Logistics", 1300000), line(freight, "Logistics", 1400000)],
+    /* "logistics" lower-case, deliberately. Until Chunk C this was a SECOND
+     * department: two rows on the Departments tab, each holding half the
+     * answer, and a voucher tagged "Logistics" would not match this line in
+     * budget control. It is left mis-spelled so the fix has something true to
+     * demonstrate — and so the "2 spellings" hint has a reason to appear. */
+    items: [line(ocean, "Logistics", 1300000), line(freight, "logistics", 1400000)],
   });
 
   /* 3 — near the limit but not over: the amber case between the two. On its
