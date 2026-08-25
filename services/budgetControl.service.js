@@ -25,6 +25,7 @@
 
 const { Acc_Budget } = require("../models/Accountant_model/Acc_OperationalModels");
 const actuals = require("./budgetActuals.service");
+const departments = require("./budgetDepartment.service");
 const variance = require("./budgetVariance.service");
 
 /**
@@ -144,6 +145,9 @@ async function checkBudgetAvailability({
   const natures = await actuals.natureByLedger(proposed.map((p) => p.ledgerId));
 
   const cid = actuals.oid(companyId);
+  /* Departments are compared on identity, not spelling — see the match loop
+   * below. Loaded once for the whole check rather than per line. */
+  const resolver = await departments.departmentResolver({ companyId: cid });
   const budgets = await Acc_Budget.find({
     status: { $in: CONTROLLING_STATUSES },
     startDate: { $lte: when },
@@ -229,12 +233,22 @@ async function checkBudgetAvailability({
      * date. Matched on department when the voucher named one; when it did
      * not, the head's TOTAL approved allocation is the cap, because that is
      * genuinely what has been approved for the head. Both sets of lines are
-     * named in `budgets` so the caller can show which. */
+     * named in `budgets` so the caller can show which.
+     *
+     * The department comparison is on IDENTITY, not on the stored string. A
+     * voucher tagged "logistics" against a line reading "Logistics" used to
+     * miss, and a miss here is not a small thing: with no matching line the
+     * spend reads as UNBUDGETED, and the posting is refused or forced through
+     * an override for a budget that exists and has room. */
+    const wanted = lineDepartment ? resolver.resolve(lineDepartment) : null;
     const matches = [];
     for (const b of budgets) {
       for (const item of b.items || []) {
         if (!item.ledgerId || String(item.ledgerId) !== String(p.ledgerId)) continue;
-        if (lineDepartment && item.department && item.department !== lineDepartment) continue;
+        if (wanted && item.department) {
+          const itemDept = resolver.resolve(item.department);
+          if (itemDept && itemDept.slug !== wanted.slug) continue;
+        }
         matches.push({ budget: b, item });
       }
     }

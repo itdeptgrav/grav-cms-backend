@@ -1,7 +1,7 @@
 # Accountant — Budget scoping: company, department and project
 
-> **Status:** §4 and the `scope` field are BUILT. §5 (project spend
-> attribution) and §6 (the department master) are still proposed.
+> **Status:** §4, §6.1 and the `scope` field are BUILT. §5 (project spend
+> attribution) and §6.3 (`Office Budget`) are still open.
 >
 > - **Chunk A — shipped.** `Acc_Budget.scope` (`company | department |
 >   project`) with its owner fields, the list/dashboard scope filter, and the
@@ -13,6 +13,13 @@
 >   `createdAt`, then a stable id. Lives in
 >   `services/budgetOverlap.service.js`. Per-budget detail and budget control
 >   are deliberately unchanged — see below.
+> - **Chunk C — shipped.** §6.1's free-text department. A department now has
+>   one identity: `services/budgetDepartment.service.js` folds case, spacing,
+>   punctuation, accents and `&`/`and` into a slug, and a new company-scoped
+>   registry (`Acc_BudgetDepartment`) supplies canonical names and aliases for
+>   the misspellings no rule can fold. Grouping, filters and budget-control
+>   matching all compare identity rather than the stored string. See §6.1 for
+>   why none of the three existing department tables could be reused.
 >
 > **Backend:** `/Users/risheeray/grav-cms-backend`
 >
@@ -271,6 +278,9 @@ them: the number looks like a control and is not one.
 
 ### 6.1 `department` is free text
 
+> **BUILT (Chunk C).** The analysis below is kept as written; what shipped and
+> what it does not cover are in §6.1.1.
+
 `items[].department` and `budgetRequests[].department` are free-text slugs
 against a registry nothing seeds. "Logistics", "logistics" and "Logistcs" are
 three departments in every roll-up.
@@ -283,6 +293,42 @@ against.
 
 Needs: a seeded department master, a picker instead of a text field, and a
 one-off normalisation of existing values.
+
+#### 6.1.1 What shipped
+
+**A new registry, not a reused one.** Three department tables already existed
+and none of them fits:
+
+| table | what it actually is | why not |
+|---|---|---|
+| `AccessDepartment` (`access_departments`) | the org-wide **login portal** registry — `accountant`, `hr`, `qc`, `cutting-master`. Seeded at boot, contrary to the code comments this chunk corrected. | deliberately global; every accounting model is company-scoped, and giving it a `companyId` would change how people log in. Its vocabulary is also not the budgets' — the live budgets name Logistics, Admin, Facilities and Projects, none of which is a login portal. |
+| `Acc_Department` (`acc_departments`) | the accountant **login table**, despite the name | its ~40 inbound refs are `createdBy`/`approvedBy` and point at people |
+| `departments` (HR) | the **factory floor** master — CUTTING, SCREEN, WASHING, PATTERN | no `companyId`, and it carries the same case problem itself (`MARKETING` beside the budgets' `Marketing`) |
+| `Acc_CostCentre` | company-scoped and accounting-owned | it is the **project** dimension §5 will attribute spend through; merging departments into it now would weld together two dimensions that must stay separable |
+
+So: `Acc_BudgetDepartment` — `companyId`, `slug`, `name`, `aliases[]`,
+`isActive`, `createdBy`/`updatedBy`, unique on `(companyId, slug)`.
+
+**Nothing was migrated, and no budget field became a ref.** Reads derive the
+slug, so every row written before the registry existed groups correctly the
+moment this shipped. Writes store the canonical *display name* when the
+registry knows the department, and exactly what was typed when it does not.
+A company that never opens the departments screen keeps working and still gets
+case- and spacing-tolerant grouping; registering only sharpens it.
+
+**What normalisation can and cannot do.** `slugify` folds case, surrounding
+and repeated whitespace, punctuation, accents, and `&` vs `and`. It cannot fold
+a *misspelling*: `Logistcs` is honestly a different word, and merging it on a
+guess would silently move money between departments. That is what `aliases[]`
+is for — a human says once what the typo means, and every past and future row
+carrying it resolves. The picker exists to stop the typo being entered at all.
+
+**Still not done: department authorization.** §6.1 named the missing registry
+as the reason per-department authorization could not be enforced. That was only
+half the reason. Knowing which departments exist is not knowing which one the
+person signing in belongs to, and `AccountantAuthMiddleware` puts no department
+on `req.user` at all. "Logistics may only raise Logistics requests" therefore
+still needs a membership model. This chunk removed one of the two blockers.
 
 ### 6.2 A `scope` field on the budget
 

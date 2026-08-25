@@ -1683,6 +1683,10 @@ app.use(
   require("./routes/Accountant_Routes/Acc_parties"),
 );
 app.use(
+  "/api/accountant/budget-departments",
+  require("./routes/Accountant_Routes/Acc_budgetDepartments"),
+);
+app.use(
   "/api/accountant/merge",
   require("./routes/Accountant_Routes/Acc_merge"),
 );

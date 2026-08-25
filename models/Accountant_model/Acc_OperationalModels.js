@@ -353,9 +353,13 @@ const budgetItemSchema = new mongoose.Schema(
       index: true,
     },
 
-    /* Which team owns the number. Free-form slug rather than a ref, because
-     * the department registry (accessdepartments) is not seeded yet and a
-     * hard ref would make budgets undeployable until it is. */
+    /* Which team owns the number. Still TEXT, and deliberately not a ref to
+     * Acc_BudgetDepartment: budgets written before that registry existed have
+     * to keep reading, and a company that never opens the departments screen
+     * has to keep working. budgetDepartment.service turns whatever is stored
+     * here into a stable identity, so "Logistics", "logistics" and
+     * "LOGISTICS " group as one department whether or not anyone registered
+     * it. Writes store the registry's spelling when it knows the department. */
     department: { type: String, trim: true, index: true },
     ownerEmail: { type: String, trim: true, lowercase: true },
 
@@ -431,11 +435,12 @@ const budgetSchema = new mongoose.Schema(
 
     /* Owner of a `department`-scope budget.
      *
-     * Free text, matching `items[].department` and `budgetRequests[].department`
-     * — the department registry is not seeded, and a hard ref would make this
-     * field unusable until it is. That is a known weakness written up in §6.1
-     * of the scoping brief; it is not made worse here, but it is not fixed
-     * here either. */
+     * Text, matching `items[].department` and `budgetRequests[].department`,
+     * and resolved through Acc_BudgetDepartment on read and write — see
+     * budgetDepartment.service.js. Soft rather than a ref on purpose: this is
+     * the IDENTITY of a department budget, so a hard ref would mean a company
+     * could not save one until someone had populated a registry, and every
+     * pre-registry budget would have to be migrated before it read again. */
     department: { type: String, trim: true },
 
     /* Owner of a `project`-scope budget.
@@ -533,9 +538,11 @@ const budgetSchema = new mongoose.Schema(
      * department asks for against specific heads. */
     budgetRequests: [
       {
-        /* Who is asking. Free-form slug, matching `items[].department` and
-         * `submissions[].department` — the department registry is not seeded,
-         * and a hard ref would make requests undeployable until it is. */
+        /* Who is asking. Text matching `items[].department` and
+         * `submissions[].department`, canonicalised on write against
+         * Acc_BudgetDepartment — two spellings of one department in a single
+         * collection round would make close-collection default one of them as
+         * never having replied. */
         department: { type: String, trim: true, required: true },
 
         /* WHAT is being asked for. `ledgerId` is the real binding, for the

@@ -23,6 +23,7 @@ const variance = require("../../services/budgetVariance.service");
 const actuals = require("../../services/budgetActuals.service");
 const overlap = require("../../services/budgetOverlap.service");
 const control = require("../../services/budgetControl.service");
+const departments = require("../../services/budgetDepartment.service");
 
 router.use(AccountantAuthMiddleware.accountantAuth);
 
@@ -63,12 +64,14 @@ function invalidEnumField(model, field, value) {
  * So "who may spend" and "who may sign off" can be separated properly today.
  *
  * ── WHAT IT DOES NOT SUPPORT ────────────────────────────────────────────────
- * There is no DEPARTMENT on the token. `items[].department` and
- * `budgetRequests[].department` are free-text slugs against an unseeded
- * registry, so "Logistics may only raise Logistics requests" cannot be
- * enforced without inventing a membership model — and a check built on data
- * nobody maintains is worse than a documented gap, because it reads as
- * protection while enforcing nothing.
+ * There is no DEPARTMENT on the token. A department REGISTRY now exists
+ * (Acc_BudgetDepartment), so "Logistics" is finally one department rather than
+ * three spellings — but knowing which departments exist is not the same as
+ * knowing which one the person signing in belongs to, and nothing on the token
+ * says. "Logistics may only raise Logistics requests" therefore still cannot
+ * be enforced: it needs a membership model, and a check built on data nobody
+ * maintains is worse than a documented gap, because it reads as protection
+ * while enforcing nothing.
  *
  * What CAN be enforced without that data is four-eyes: you may not sign off
  * your own ask. That is the same rule Acc_approvals.js already applies to
@@ -242,7 +245,7 @@ function actualsCompanyFor(budget, req) {
  * than an option: an evaluate() that can be called without it is an
  * evaluate() that can silently go back to aggregating every company.
  */
-async function evaluate(budget, req, { asOf } = {}) {
+async function evaluate(budget, req, { asOf, resolver } = {}) {
   const lines = await actuals.hydrateLines({
     companyId: actualsCompanyFor(budget, req),
     lines: budget.items || [],
@@ -268,7 +271,11 @@ async function evaluate(budget, req, { asOf } = {}) {
     ...budget,
     items: evaluated,
     totals: variance.rollUp(evaluated),
-    byDepartment: variance.groupBy(evaluated, "department"),
+    /* Grouped by identity when a resolver is in hand, so a budget carrying
+     * both "Logistics" and "logistics" shows one row rather than two. Falls
+     * back to plain slug grouping without one, which still folds case and
+     * spacing — the registry sharpens this, it is not required for it. */
+    byDepartment: groupLinesByDepartment(evaluated, resolver).map(({ _lines, ...d }) => d),
     byNature: {
       revenue: evaluated.filter((l) => l.nature === "revenue"),
       expense: evaluated.filter((l) => l.nature === "expense"),
@@ -288,6 +295,99 @@ function cacheTotals(data) {
   return data;
 }
 
+/**
+ * Roll lines up by department IDENTITY rather than by the string on the line.
+ *
+ * Grouped by string, "Logistics", "logistics" and "LOGISTICS " were three rows
+ * each holding a third of the answer. Used by the dashboard AND by a single
+ * budget's own breakdown, so one department can never read as two on either.
+ *
+ * The row is labelled with the registry's name when the department is
+ * registered, and otherwise with the spelling the most lines actually use —
+ * labelling it with the first one encountered would make the heading depend on
+ * which budget happened to be created first.
+ */
+function groupLinesByDepartment(lines, resolver) {
+  const groups = new Map();
+  for (const l of lines) {
+    if (!l) continue;
+    const hit = resolver ? resolver.resolve(l.department) : null;
+    const slug = hit ? hit.slug : departments.slugify(l.department);
+    if (!groups.has(slug)) {
+      /* Only a REGISTERED department supplies the label. An unregistered one
+       * resolves to its own raw text, and taking that would label the group
+       * with whichever line happened to be read first — which is exactly the
+       * first-seen behaviour the commonest-spelling rule below exists to
+       * avoid. */
+      groups.set(slug, {
+        slug,
+        known: !!hit?.known,
+        name: hit?.known ? hit.name : null,
+        spellings: new Map(),
+        lines: [],
+      });
+    }
+    const g = groups.get(slug);
+    g.lines.push(l);
+    if (l.department) {
+      const raw = departments.displayOf(l.department);
+      g.spellings.set(raw, (g.spellings.get(raw) || 0) + 1);
+    }
+  }
+
+  return [...groups.values()]
+    .map((g) => {
+      const commonest = [...g.spellings.entries()].sort(
+        (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+      )[0];
+      /* "Unassigned" is not a department — it is the absence of one, and it
+       * has always been the label for lines carrying none. */
+      const name = g.slug === "" ? "Unassigned" : g.name || commonest?.[0] || g.slug;
+      return {
+        ...variance.rollUp(g.lines),
+        /* `name` and `department` stay the display string every existing
+         * consumer already reads; `departmentSlug` is the identity, for a
+         * caller that wants to filter without guessing the spelling. */
+        name,
+        department: name,
+        departmentSlug: g.slug || null,
+        registered: g.known,
+        /* Said out loud when one department is on screen under more than one
+         * spelling: the row now adds up correctly, but the underlying data is
+         * still inconsistent and someone should tidy it. */
+        spellings: g.spellings.size > 1 ? [...g.spellings.keys()].sort() : undefined,
+        /* `lines` is the count groupBy has always returned under this name;
+         * `lineCount` is the same number said clearly. */
+        lines: g.lines.length,
+        lineCount: g.lines.length,
+        _lines: g.lines,
+      };
+    })
+    .sort(
+      (a, b) =>
+        b.revenue.allocated + b.expense.allocated - (a.revenue.allocated + a.expense.allocated) ||
+        a.name.localeCompare(b.name),
+    );
+}
+
+/**
+ * The budgets that name a department, whichever way it is spelled.
+ *
+ * Takes the slug of what the caller asked for and compares it against the slug
+ * of every line, so `?department=logistics`, `?department=Logistics` and a
+ * registered alias all select the same set. Done in JS deliberately: an
+ * equality match in the query would answer only for the exact spelling stored,
+ * which is the defect this chunk exists to remove.
+ */
+async function filterByDepartment(budgets, department, req) {
+  const resolver = await departments.departmentResolver({ companyId: companyOf(req) });
+  const wanted = resolver.resolve(department);
+  if (!wanted) return budgets;
+  return budgets.filter((b) =>
+    (b.items || []).some((l) => resolver.resolve(l.department)?.slug === wanted.slug),
+  );
+}
+
 /* ── LIST ────────────────────────────────────────────────────────────────── */
 router.get("/", async (req, res) => {
   try {
@@ -296,7 +396,6 @@ router.get("/", async (req, res) => {
     if (financialYear) filter.financialYear = financialYear;
     if (status) filter.status = status;
     if (period) filter.period = period;
-    if (department) filter["items.department"] = department;
     /* Rows written before the field existed have no `scope` at all, and they
      * are company budgets — so filtering for company has to include them, or
      * every pre-existing budget disappears the moment someone uses the filter. */
@@ -310,7 +409,15 @@ router.get("/", async (req, res) => {
       if (cid) filter.$or = [{ companyId: cid }, { companyId: { $exists: false } }, { companyId: null }];
     }
 
-    const budgets = await Acc_Budget.find(filter).sort({ createdAt: -1 }).lean();
+    const found = await Acc_Budget.find(filter).sort({ createdAt: -1 }).lean();
+
+    /* The department filter is applied HERE rather than in the query, because
+     * Mongo would have to match one exact string and the whole problem is that
+     * one department is written several ways. `logistics`, `Logistics` and the
+     * registry's own slug all select the same budgets. */
+    const budgets = department
+      ? await filterByDepartment(found, department, req)
+      : found;
 
     // The list is a list. Computing every budget's actuals here would run one
     // aggregation per row; opt in when the caller actually needs the figures.
@@ -318,7 +425,10 @@ router.get("/", async (req, res) => {
       return res.json({ success: true, budgets });
     }
 
-    const hydrated = await Promise.all(budgets.map((b) => evaluate(b, req)));
+    const listResolver = await departments.departmentResolver({ companyId: companyOf(req) });
+    const hydrated = await Promise.all(
+      budgets.map((b) => evaluate(b, req, { resolver: listResolver })),
+    );
     res.json({ success: true, budgets: hydrated });
   } catch (error) {
     console.error("[budgets] list error:", error);
@@ -428,14 +538,15 @@ const sumOf = (lines, field) =>
 /**
  * Actual revenue and expense per calendar month, for the dashboard chart.
  *
- * `allLines` is already department-filtered, so the chart narrows with the
- * rest of the screen rather than quietly showing everything.
+ * `allLines` is already department-filtered, and `linesOf` is the dashboard's
+ * own selector, so the chart narrows with the rest of the screen rather than
+ * quietly showing everything — and narrows by exactly the same rule.
  *
  * Returns [] when there is nothing to draw — an empty array renders as an
  * empty state, whereas a series of zeroes draws a flat line along the axis
  * and reads as "we spent nothing", which is a different and wrong claim.
  */
-async function monthlySeries(evaluated, allLines, req, department) {
+async function monthlySeries(evaluated, allLines, req, linesOf) {
   const ledgerIds = [...new Set(allLines.map((l) => l.ledgerId).filter(Boolean).map(String))];
   if (!ledgerIds.length || !evaluated.length) return [];
 
@@ -488,7 +599,7 @@ async function monthlySeries(evaluated, allLines, req, department) {
     const months = monthsCovered(b.startDate, b.endDate);
     if (!months.length) continue;
 
-    for (const item of linesOfBudget(b, department)) {
+    for (const item of linesOf(b)) {
       const alloc = variance.money(item.allocatedAmount) ?? 0;
       if (!(alloc > 0)) continue;
       const isRevenue = item.nature === "revenue";
@@ -592,12 +703,6 @@ function monthWeights(phasing, monthCount) {
     const idx = Math.min(raw.length - 1, Math.floor((i / monthCount) * raw.length));
     return raw[idx] / total / (monthCount / raw.length);
   });
-}
-
-/** A budget's lines, honouring the dashboard's department filter. */
-function linesOfBudget(budget, department) {
-  const items = budget.items || [];
-  return department ? items.filter((l) => l.department === department) : items;
 }
 
 /* ── OVERLAP DEDUPLICATION ───────────────────────────────────────────────────
@@ -830,7 +935,6 @@ router.get("/dashboard", async (req, res) => {
     if (financialYear) filter.financialYear = financialYear;
     if (status) filter.status = status;
     if (period) filter.period = period;
-    if (department) filter["items.department"] = department;
     /* Same legacy-inclusive rule as the list: an unset scope IS company. */
     if (scope === "company") {
       filter.$and = [{ $or: [{ scope: "company" }, { scope: { $exists: false } }, { scope: null }] }];
@@ -844,31 +948,42 @@ router.get("/dashboard", async (req, res) => {
       if (cid) filter.$or = [{ companyId: cid }, { companyId: { $exists: false } }, { companyId: null }];
     }
 
+    const resolver = await departments.departmentResolver({ companyId });
+    /* One spelling to compare every line against. Null when no department
+     * filter is in play, which every helper below reads as "no filter". */
+    const wantedDepartment = department ? resolver.resolve(department) : null;
+
     const matched = await Acc_Budget.countDocuments(filter);
-    const budgets = await Acc_Budget.find(filter).sort({ createdAt: -1 }).limit(MAX_BUDGETS).lean();
-    const raw = await Promise.all(budgets.map((b) => evaluate(b, req, { asOf })));
+    /* The whole in-scope set, BEFORE any department narrowing. It is both the
+     * contest set the overlap dedupe needs (which must ignore the department
+     * filter — see dedupeOverlappingActuals) and the set the filter is applied
+     * to, so the two cannot select differently. */
+    const inScope = await Acc_Budget.find(filter).sort({ createdAt: -1 }).limit(MAX_BUDGETS).lean();
+
+    /* Department narrowing happens here rather than in the query: Mongo can
+     * only match the exact string stored, and one department is written
+     * several ways. Applied BEFORE evaluate() so the budgets it excludes cost
+     * nothing to exclude. */
+    const budgets = wantedDepartment
+      ? inScope.filter((b) =>
+          (b.items || []).some((l) => resolver.resolve(l.department)?.slug === wantedDepartment.slug),
+        )
+      : inScope;
+
+    const raw = await Promise.all(budgets.map((b) => evaluate(b, req, { asOf, resolver })));
 
     /* Each budget's own figures are right; their SUM was not, because a head
      * budgeted twice had its spend counted twice. Every surface below reads
      * `evaluated`, so correcting the lines here corrects the totals, the
      * department roll-up, the head roll-up, the attention lists and the
      * per-budget summaries together — they cannot drift apart. */
-    /* Same selection as above minus the department clause — see
-     * dedupeOverlappingActuals for why ownership must not depend on it.
-     * Projected to the decision fields only; no actuals are read for these. */
-    const contestFilter = { ...filter };
-    delete contestFilter["items.department"];
-    const contestSet = department
-      ? await Acc_Budget.find(contestFilter)
-          .select("_id companyId scope startDate endDate createdAt items._id items.ledgerId")
-          .sort({ createdAt: -1 })
-          .limit(MAX_BUDGETS)
-          .lean()
-      : raw;
-
+    /* Every in-scope budget, department filter or not — see
+     * dedupeOverlappingActuals for why ownership of a voucher must not depend
+     * on what the reader is looking at. Since the filter is now applied in JS
+     * to this same list, the wider set is already in hand and costs nothing. */
     const { evaluated, overlap: overlapMeta } = await dedupeOverlappingActuals(
       raw,
-      contestSet,
+      wantedDepartment ? inScope : raw,
       req,
       asOf,
     );
@@ -879,7 +994,11 @@ router.get("/dashboard", async (req, res) => {
      * returns Logistics-shaped totals padded with every other department that
      * happens to share the budget. */
     const linesOf = (b) =>
-      department ? (b.items || []).filter((l) => l.department === department) : b.items || [];
+      wantedDepartment
+        ? (b.items || []).filter(
+            (l) => resolver.resolve(l.department)?.slug === wantedDepartment.slug,
+          )
+        : b.items || [];
 
     const allLines = evaluated.flatMap(linesOf);
     const expenseLines = allLines.filter((l) => l.nature === "expense");
@@ -910,23 +1029,21 @@ router.get("/dashboard", async (req, res) => {
       ),
     };
 
-    /* ── 2. By department ───────────────────────────────────────────────── */
-    const linesByDept = new Map();
-    for (const l of allLines) {
-      const k = l.department || "Unassigned";
-      if (!linesByDept.has(k)) linesByDept.set(k, []);
-      linesByDept.get(k).push(l);
-    }
-    const byDepartment = variance.groupBy(allLines, "department").map((d) => {
-      const group = linesByDept.get(d.name) || [];
-      return {
-        ...d,
-        department: d.name,
-        expenseRemaining: sumOf(group.filter((l) => l.nature === "expense"), "remaining"),
-        revenueToGo: sumOf(group.filter((l) => l.nature === "revenue"), "toGo"),
-        severity: worstSeverity(group),
-      };
-    });
+    /* ── 2. By department ─────────────────────────────────────────────────
+     * Grouped on the department's SLUG, not the string on the line. Grouped by
+     * string, "Logistics", "logistics" and "LOGISTICS " were three rows on the
+     * Departments tab, each holding a third of the answer.
+     *
+     * The row is labelled with the registry's name when the department is
+     * registered, and otherwise with the spelling most lines actually use —
+     * picking the first one encountered would make the label depend on which
+     * budget happened to be created first. */
+    const byDepartment = groupLinesByDepartment(allLines, resolver).map(({ _lines, ...d }) => ({
+      ...d,
+      expenseRemaining: sumOf(_lines.filter((l) => l.nature === "expense"), "remaining"),
+      revenueToGo: sumOf(_lines.filter((l) => l.nature === "revenue"), "toGo"),
+      severity: worstSeverity(_lines),
+    }));
 
     /* ── 3. By head ─────────────────────────────────────────────────────────
      * One row per ledger head, across budgets. The same head budgeted twice is
@@ -942,7 +1059,8 @@ router.get("/dashboard", async (req, res) => {
             ledgerId: l.ledgerId || null,
             ledgerName: l.ledgerName || null,
             groupName: l.groupName || null,
-            department: l.department || null,
+            department: null,
+            departmentSlug: null,
             nature: l.nature,
             unbound: !!l.unbound,
             budgets: [],
@@ -953,9 +1071,19 @@ router.get("/dashboard", async (req, res) => {
         head._lines.push(l);
         head.budgets.push({ _id: b._id, name: b.name });
         /* Two budgets can name different departments for one head. Say so
-         * rather than silently keeping whichever was read first. */
-        if (!head.department) head.department = l.department || null;
-        else if (l.department && head.department !== l.department) head.department = "Multiple";
+         * rather than silently keeping whichever was read first — but compare
+         * IDENTITY, or "Logistics" and "logistics" on one head would report as
+         * "Multiple" when they are the same department twice. */
+        if (!head.department) {
+          head.department = l.department ? resolver.resolve(l.department).name : null;
+          head.departmentSlug = l.department ? resolver.resolve(l.department).slug : null;
+        } else if (l.department) {
+          const slug = resolver.resolve(l.department).slug;
+          if (head.departmentSlug && slug !== head.departmentSlug) {
+            head.department = "Multiple";
+            head.departmentSlug = null;
+          }
+        }
       }
     }
 
@@ -1100,7 +1228,10 @@ router.get("/dashboard", async (req, res) => {
      * One aggregation for the whole set, not one per budget: the heads are
      * unioned and the window is the union of the periods, so this costs a
      * single round trip however many budgets are in scope. */
-    const monthly = await monthlySeries(evaluated, allLines, req, department);
+    /* Handed the dashboard's OWN line selector rather than the department
+     * string, so the chart's plan line and the figures printed beside it
+     * cannot select different lines. */
+    const monthly = await monthlySeries(evaluated, allLines, req, linesOf);
 
     /* ── 5. Budget list ─────────────────────────────────────────────────── */
     const budgetList = evaluated.map((b) => {
@@ -1197,7 +1328,10 @@ router.get("/:id", async (req, res) => {
     const budget = await Acc_Budget.findOne(scopeFilter(req, req.params.id)).lean();
     if (!budget) return res.status(404).json({ success: false, message: "Budget not found" });
     const asOf = req.query.asOf ? new Date(req.query.asOf) : undefined;
-    res.json({ success: true, budget: await evaluate(budget, req, { asOf }) });
+    const resolver = await departments.departmentResolver({
+      companyId: budget.companyId || actuals.oid(companyOf(req)),
+    });
+    res.json({ success: true, budget: await evaluate(budget, req, { asOf, resolver }) });
   } catch (error) {
     console.error("[budgets] detail error:", error);
     res.status(500).json({ success: false, message: error.message });
@@ -1417,7 +1551,23 @@ router.get("/:id/items/:itemId/vouchers", async (req, res) => {
  * reason is that the data is not there yet — not that the reference does not
  * matter.
  */
-function scopePatch(body, existing) {
+/**
+ * Store each line's department the registry's way.
+ *
+ * Only the SPELLING changes, and only for departments the registry knows —
+ * a line naming an unregistered department keeps exactly what was typed. So
+ * this can never lose a value, only settle on one of its forms.
+ */
+function canonicaliseLineDepartments(items, resolver) {
+  if (!Array.isArray(items) || !resolver) return items;
+  return items.map((item) => {
+    if (!item || item.department === undefined || item.department === null) return item;
+    const name = resolver.canonicalName(item.department);
+    return name === null ? item : { ...item, department: name };
+  });
+}
+
+function scopePatch(body, existing, resolver = null) {
   if (body.scope === undefined && existing === undefined) return { patch: {} };
 
   const scope = body.scope !== undefined ? body.scope : existing?.scope || "company";
@@ -1436,11 +1586,21 @@ function scopePatch(body, existing) {
     return { error: "A project-scope budget needs a project or cost centre name." };
   }
 
+  /* The department is stored the registry's way when the registry knows it,
+   * so a budget owned by "logistics" and one owned by "Logistics" are one
+   * department from the moment they are saved rather than only once something
+   * downstream normalises them. An unregistered department is stored as
+   * typed — inventing a canonical spelling for it would be worse. */
+  const ownerName =
+    scope === "department"
+      ? (resolver ? resolver.canonicalName(dept) : departments.displayOf(dept))
+      : undefined;
+
   /* Only the owner the scope actually uses survives. */
   return {
     patch: {
       scope,
-      department: scope === "department" ? String(dept).trim() : undefined,
+      department: scope === "department" ? ownerName : undefined,
       costCentreName: scope === "project" ? String(ccName).trim() : undefined,
       costCentreId: scope === "project" ? actuals.oid(ccId) || undefined : undefined,
     },
@@ -1456,10 +1616,14 @@ router.post("/", async (req, res) => {
     const statusError = invalidEnumField(Acc_Budget, "status", req.body?.status);
     if (statusError) return res.status(400).json({ success: false, message: statusError });
 
-    const scoped = scopePatch(req.body || {});
+    const cidForDepartments = actuals.oid(companyOf(req)) || actuals.oid(req.body?.companyId);
+    const resolver = await departments.departmentResolver({ companyId: cidForDepartments });
+
+    const scoped = scopePatch(req.body || {}, undefined, resolver);
     if (scoped.error) return res.status(400).json({ success: false, message: scoped.error });
 
     const data = cacheTotals({ ...req.body, ...scoped.patch });
+    data.items = canonicaliseLineDepartments(data.items, resolver);
     data.createdBy = req.user.id;
     const cid = actuals.oid(companyOf(req));
     if (cid && !data.companyId) data.companyId = cid;
@@ -1513,8 +1677,14 @@ router.put("/:id", async (req, res) => {
     const current = await Acc_Budget.findOne(scopeFilter(req, req.params.id)).lean();
     if (!current) return res.status(404).json({ success: false, message: "Budget not found" });
 
-    const scoped = scopePatch(req.body || {}, current);
+    const resolver = await departments.departmentResolver({
+      companyId: current.companyId || actuals.oid(companyOf(req)),
+    });
+
+    const scoped = scopePatch(req.body || {}, current, resolver);
     if (scoped.error) return res.status(400).json({ success: false, message: scoped.error });
+
+    if (data.items) data.items = canonicaliseLineDepartments(data.items, resolver);
 
     const unset = {};
     for (const key of ["department", "costCentreName", "costCentreId"]) {
@@ -1879,8 +2049,17 @@ router.post("/:id/requests", async (req, res) => {
     /* Built field by field rather than spreading req.body: a spread would let
      * a caller set agreedAmount or submittedBy on their own request, which is
      * finance's side of the exchange and the server's respectively. */
+    /* The asking department is stored canonically too, or "logistics" and
+     * "Logistics" would be two departments in the same collection round and
+     * close-collection would default one of them. */
+    const requestResolver = await departments.departmentResolver({
+      companyId: budget.companyId || actuals.oid(companyOf(req)),
+    });
+
     budget.budgetRequests.push({
-      department: String(req.body.department).trim(),
+      department:
+        requestResolver.canonicalName(req.body.department) ||
+        departments.displayOf(req.body.department),
       ...resolved.ledger,
       requestedAmount: variance.money(req.body.requestedAmount),
       priority: req.body.priority || "normal",
