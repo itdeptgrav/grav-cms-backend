@@ -238,6 +238,9 @@ async function seed(db) {
     financialYear: FY,
     period: "yearly",
     status: "active",
+    /* The shape the module was built for: one envelope, departments as lines,
+     * and the request → review → allocation flow asking into it. */
+    scope: "company",
     startDate: FY_START,
     endDate: FY_END,
     companyId: company._id,
@@ -316,6 +319,7 @@ async function seed(db) {
     period: "quarterly",
     quarter: 2,
     status: "review",
+    scope: "company",
     startDate: new Date("2026-07-01T00:00:00.000Z"),
     endDate: new Date("2026-09-30T00:00:00.000Z"),
     companyId: company._id,
@@ -330,6 +334,10 @@ async function seed(db) {
     financialYear: FY,
     period: "yearly",
     status: "active",
+    /* A department that owns its own envelope — so the card has something to
+     * lead with other than the year. */
+    scope: "department",
+    department: "Facilities",
     startDate: FY_START,
     endDate: FY_END,
     companyId: company._id,
@@ -344,6 +352,10 @@ async function seed(db) {
     financialYear: FY,
     period: "yearly",
     status: "collecting",
+    /* Project scope, named only — no cost centre is seeded, and naming one
+     * would imply spend can be attributed to it, which it cannot yet. */
+    scope: "project",
+    costCentreName: "Greenfield Industrial Park",
     startDate: FY_START,
     endDate: FY_END,
     companyId: company._id,
