@@ -785,19 +785,16 @@ async function rechainQueueFor(employeeId, opts = {}) {
    * terminal ones: a task submitted and since approved still occupied them
    * right up to the moment they submitted it.
    */
-  let handoverFloorMs = null;
+  const handovers = [];
   snap.forEach((doc) => {
     const t = doc.data();
     seen.push({ id: doc.id, ref: doc.ref, effectivePriority: t.effectivePriority });
     const handed = lastHandoverMs(t);
-    /* Capped at now: a stamp in the future is bad data, and letting it through
-       would push a live queue past the end of the day. */
-    if (
-      Number.isFinite(handed) &&
-      handed <= nowMs &&
-      (handoverFloorMs === null || handed > handoverFloorMs)
-    ) {
-      handoverFloorMs = handed;
+    /* Kept PER TASK rather than as one figure, so a task can be excluded from
+       its own floor below. Capped at now: a stamp in the future is bad data,
+       and letting it through would push a live queue past the end of the day. */
+    if (Number.isFinite(handed) && handed <= nowMs) {
+      handovers.push({ taskId: doc.id, atMs: handed });
     }
     const simulated = sim && doc.id === String(sim.taskId);
     if (TERMINAL_STATUSES.includes(t.status)) return;
@@ -1135,13 +1132,27 @@ async function rechainQueueFor(employeeId, opts = {}) {
      *
      * Only the HEAD reads it. Everything behind chains from the task above,
      * which already ends at or after any handover the person made.
+     *
+     * **A task's OWN handovers are excluded, and that is not a detail.**
+     * REPORTED 26 Aug 2026. Umung's task waits on nobody: both its outputs are
+     * his own work. He submitted the first at 03:11 and the second at 03:47,
+     * and each submission pushed the task's own start forward — 03:11, then
+     * 03:47 — so its deadline grew every time he made progress on it. The
+     * floor exists to say "you were busy with something ELSE until you put it
+     * down"; a task cannot have been busy with itself.
      */
+    const otherHandoverMs = handovers.reduce(
+      (latest, h) =>
+        h.taskId === task.id ? latest : latest === null || h.atMs > latest ? h.atMs : latest,
+      null,
+    );
+
     if (
       previousEndMs === null &&
-      Number.isFinite(handoverFloorMs) &&
-      handoverFloorMs > anchorMs
+      Number.isFinite(otherHandoverMs) &&
+      otherHandoverMs > anchorMs
     ) {
-      anchorMs = handoverFloorMs;
+      anchorMs = otherHandoverMs;
     }
 
     /**

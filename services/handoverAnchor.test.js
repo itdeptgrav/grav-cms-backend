@@ -81,7 +81,7 @@ test("the floor is collected across EVERY document, terminal ones included", () 
   /* A task submitted and since approved still occupied the person right up to
      the moment they submitted it, so it must be counted before the walk drops
      terminal work. */
-  const at_ = SOURCE.indexOf("let handoverFloorMs = null;");
+  const at_ = SOURCE.indexOf("const handovers = [];");
   assert.ok(at_ > 0, "the handover floor is gone");
   const collect = SOURCE.indexOf("const handed = lastHandoverMs(t);");
   const terminalSkip = SOURCE.indexOf("if (TERMINAL_STATUSES.includes(t.status)) return;");
@@ -94,10 +94,29 @@ test("the floor is collected across EVERY document, terminal ones included", () 
 test("the floor applies to the HEAD only, and as a max", () => {
   /* Everything behind the head chains from the task above it, which already
      ends at or after any handover. Applying it there would double-count. */
-  const at_ = SOURCE.indexOf("handoverFloorMs > anchorMs");
+  const at_ = SOURCE.indexOf("otherHandoverMs > anchorMs");
   assert.ok(at_ > 0, "the floor is not applied");
-  const guard = SOURCE.slice(at_ - 260, at_);
+  const guard = SOURCE.slice(at_ - 300, at_);
   assert.match(guard, /previousEndMs === null/, "the floor is not restricted to the head");
+});
+
+test("a task's OWN handovers never push its own start", () => {
+  /**
+   * REPORTED 26 Aug 2026. Umung's task waits on nobody — both outputs are his
+   * own work. He submitted the first at 03:11 and the second at 03:47, and
+   * each submission pushed the task's own start forward, so its deadline grew
+   * every time he made progress on it.
+   *
+   * The floor says "you were busy with something ELSE until you put it down".
+   * A task cannot have been busy with itself.
+   */
+  assert.match(
+    SOURCE,
+    /h\.taskId === task\.id \? latest :/,
+    "a task's own handovers are back in its floor — progress pushes its own deadline",
+  );
+  /* And the handovers are kept per task, or there would be nothing to exclude. */
+  assert.match(SOURCE, /handovers\.push\(\{ taskId: doc\.id, atMs: handed \}\)/);
 });
 
 test("a future stamp cannot push a live queue past the day", () => {

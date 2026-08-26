@@ -1083,7 +1083,7 @@ async function _syncParentProgress(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  6. TASK CHAT — completely isolated per task
 // ═════════════════════════════════════════════════════════
-async function sendTaskChat({ taskId, senderId, senderName, text, attachments = [], messageType = "text", mention = null }) {
+async function sendTaskChat({ taskId, senderId, senderName, text, attachments = [], messageType = "text", mention = null, replyTo = null }) {
   const taskDoc = await db.collection("cowork_tasks").doc(taskId).get();
   if (!taskDoc.exists) throw new Error("Task not found.");
   const task = taskDoc.data();
@@ -1097,6 +1097,9 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
     messageId, taskId, senderId, senderName,
     text: text || "", attachments, messageType,
     mention: mention || null,
+    // Denormalised quote, so a reply renders without a second read. Written
+    // only when present, so nothing already stored gains an empty field.
+    ...(replyTo ? { replyTo } : {}),
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
