@@ -930,6 +930,10 @@ function mergeEmployeeEntry(fresh, existing, shift, isToday) {
     hrFinalStatus: existing.hrFinalStatus || null,
     hrRemarks: existing.hrRemarks || null,
     hrReviewedAt: existing.hrReviewedAt || null,
+    // Who made the override. Was missing from this list while the other three
+    // hr* fields were carried, so a resync of a manually-corrected day
+    // silently blanked the reviewer's name off the record.
+    hrReviewedBy: existing.hrReviewedBy || null,
   };
 }
 
@@ -2149,7 +2153,13 @@ async function applyRegularizationToAttendance(r, actor = {}) {
   // nothing new to derive from, and recomputing would churn the day for nothing.
   if (punchChanges.length > 0) {
     const settings = await AttendanceSettings.getConfig();
-    const shift = shiftFor(emp, settings);
+    // Rebuild from the hours ALREADY STORED on the entry, not from the
+    // employee record. `emp` here is an attendance entry, so shiftFor() finds
+    // no `workShift` on it and silently falls back to department inference —
+    // which loses a custom shift. The stored shiftStart/shiftEnd are what
+    // this day was actually judged against, so they are the right basis for
+    // re-judging it.
+    const shift = shiftFromStoredTimes(emp, settings);
     const shiftStart = hhmmMins(shift.start),
       shiftEnd = hhmmMins(shift.end),
       inMins = minsOf(emp.inTime),
@@ -8272,6 +8282,17 @@ module.exports.parseTimeOnDateIST = parseTimeOnDateIST;
 module.exports.startPunchNotificationCrons = startPunchNotificationCrons;
 module.exports.startHourlyAttendanceSync = startHourlyAttendanceSync;
 module.exports.syncTodayOnly = syncTodayOnly;
+module.exports.syncDay = syncDay;
+module.exports.syncDayForce = syncDayForce;
+// The employee-field extractors. Employee documents are inconsistent — names
+// live at the top level on some records and under basicInfo/personalInfo on
+// others — and these are the versions hardened against every shape in the
+// collection. Anything reading an Employee should use them rather than write
+// a fresh guess.
+module.exports.extractName = extractName;
+module.exports.extractBiometricId = extractBiometricId;
+module.exports.extractDepartment = extractDepartment;
+module.exports.extractDesignation = extractDesignation;
 // Exported so Access Control can filter employees by operator/executive using
 // the SAME policy attendance does — the employee's own shift category, and for
 // Custom the punch pattern in attendance settings — rather than a second,
