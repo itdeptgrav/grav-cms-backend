@@ -10,7 +10,20 @@ const Operation      = require("../../../../models/CMS_Models/Inventory/Configur
 const OperationCode  = require("../../../../models/CMS_Models/Inventory/Configurations/OperationCode")
 const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup")
 const MachineType    = require("../../../../models/CMS_Models/Inventory/Configurations/MachineType")
+const StockItem      = require("../../../../models/CMS_Models/Inventory/Products/StockItem")
+const Employee       = require("../../../../models/Employee")
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear")
+const { recordChange } = require("../../../../services/changeLog")
+// Reused rather than duplicated — see stockItems.js's own module.exports for
+// why (26 Aug 2026: "assign the operation group to the product category...
+// overwrite the operations with that operation group" — every product in the
+// category needs the same cost recompute pass a normal Operations-tab save
+// already runs).
+const {
+  updateStockItemAggregates,
+  recomputeVariantCostsFromBom,
+  STOCK_ITEM_CATEGORIES,
+} = require("../Products/stockItems")
 
 router.use(EmployeeAuthMiddleware)
 
@@ -447,6 +460,108 @@ router.delete("/operation-groups/:id", async (req, res) => {
     res.json({ success: true, message: "Group deleted" })
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to delete group" })
+  }
+})
+
+// GET the product categories a group can be applied to — the same fixed list
+// the stock-item create form offers (26 Aug 2026).
+router.get("/operation-groups/categories", async (req, res) => {
+  res.json({ success: true, categories: STOCK_ITEM_CATEGORIES })
+})
+
+// POST apply a group's operations to every product in a category — the
+// GROUP → CATEGORY assignment feature (26 Aug 2026, explicit request:
+// "the user can assign the operation group to the product category...
+// select the product category... it will inherit all the product(stock
+// item) with that category in order to overwrite the operations with that
+// operation group").
+//
+// This OVERWRITES `operations` on every matching StockItem — not merges —
+// same as picking a group from the Operations tab's own group picker on a
+// single product, just applied to a whole category at once. Each product's
+// costs are recomputed the same way a normal per-product Operations save
+// does (recomputeVariantCostsFromBom + updateStockItemAggregates), and each
+// gets its own change-log entry so the bulk edit is auditable per product,
+// not just as one opaque event.
+router.post("/operation-groups/:id/apply-to-category", async (req, res) => {
+  try {
+    const { category } = req.body || {}
+    if (!category || !STOCK_ITEM_CATEGORIES.includes(category)) {
+      return res.status(400).json({ success: false, message: "A valid product category is required" })
+    }
+
+    const group = await OperationGroup.findById(req.params.id)
+      .populate("operations", "name operationCode totalSam durationSeconds machineType")
+    if (!group) return res.status(404).json({ success: false, message: "Operation group not found" })
+    if (!group.operations?.length) {
+      return res.status(400).json({ success: false, message: `Group "${group.name}" has no operations yet` })
+    }
+
+    // Same operator-salary estimate the stock-item create form uses (line
+    // ~700 of stockItems.js) — averaged over active Operator-department
+    // employees, since a bulk apply has no single product's own dept/desig
+    // context to price against.
+    const operators = await Employee.find({ department: "Operator", status: "active" }).select("salary")
+    const averageSalary = operators.length > 0
+      ? operators.reduce((sum, emp) => sum + (emp.salary?.netSalary || 0), 0) / operators.length
+      : 0
+    const MINUTES_PER_MONTH = 26 * 8 * 60 // 26 work days × 8 hours — matches the frontend's own constant
+
+    const templateOperations = group.operations.map(op => {
+      const duration = op.durationSeconds || 0
+      const minutes = Math.floor(duration / 60)
+      const seconds = duration % 60
+      return {
+        type: op.name || "",
+        operationCode: op.operationCode || "",
+        machine: "",
+        machineType: op.machineType || "",
+        minutes,
+        seconds,
+        totalSeconds: duration,
+        operatorSalary: Math.round(averageSalary),
+        operatorCost: Math.round(((averageSalary / MINUTES_PER_MONTH) * (minutes + seconds / 60)) * 100) / 100,
+        salaryDept: "",
+        salaryDesig: "",
+      }
+    })
+
+    const items = await StockItem.find({ category })
+    if (!items.length) {
+      return res.status(404).json({ success: false, message: `No products found in category "${category}"` })
+    }
+
+    let updatedCount = 0
+    for (const item of items) {
+      item.operations = templateOperations.map(op => ({ ...op }))
+      recomputeVariantCostsFromBom(item)
+      updateStockItemAggregates(item)
+      item.updatedBy = req.user.id
+      await item.save()
+      updatedCount++
+
+      await recordChange(req, {
+        departmentSlug: "inventory",
+        entity: "stock-item",
+        entityId: item._id,
+        entityLabel: item.name,
+        action: "update",
+        summary: `Operations replaced from group "${group.name}" (bulk-applied to category "${category}")`,
+        before: {},
+        after: {
+          changes: [`Operations overwritten with ${templateOperations.length} operation(s) from group "${group.name}" — applied to every product in category "${category}"`],
+        },
+      })
+    }
+
+    res.json({
+      success: true,
+      message: `Applied "${group.name}" to ${updatedCount} product(s) in "${category}"`,
+      updatedCount,
+    })
+  } catch (err) {
+    console.error("apply-to-category error:", err)
+    res.status(500).json({ success: false, message: "Failed to apply group to category: " + err.message })
   }
 })
 

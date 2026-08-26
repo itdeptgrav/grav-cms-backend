@@ -92,6 +92,29 @@ function isQuotationRegression(from, to) {
   return b < a;
 }
 
+// Normalizes a raw poProof payload into the shape stored on quotation.poProof.
+// Shared by approve-on-behalf and sales-approve (26 Aug 2026) — both are
+// places a PO can first get attached, and they must store it identically so
+// every screen that reads quotation.poProof sees one shape regardless of
+// which route wrote it. Returns null when the payload carries no actual file.
+function buildPoProof(raw, uploadedBy) {
+  if (!raw || !(raw.url || raw.fileId || raw.publicId)) return null;
+  return {
+    fileId: raw.fileId || undefined,
+    publicId: raw.publicId || undefined,
+    url: raw.url || undefined,
+    name: raw.name || undefined,
+    mimeType: raw.mimeType || undefined,
+    poNumber: raw.poNumber ? String(raw.poNumber).trim() : undefined,
+    poDate: raw.poDate ? new Date(raw.poDate) : undefined,
+    poValue: Number.isFinite(Number(raw.poValue)) && Number(raw.poValue) >= 0
+      ? Number(raw.poValue)
+      : undefined,
+    uploadedAt: new Date(),
+    uploadedBy: uploadedBy || undefined,
+  };
+}
+
 // The quotation popup posts the whole quotation back on every save, including a
 // paymentSchedule rebuilt from percentages — which has no paidAmount/status/
 // receipts on it. Carry the money state over from the stored steps so saving a
@@ -1049,7 +1072,18 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     request.taxSummary = { totalGST, sgst: totalGST / 2, cgst: totalGST / 2, igst: 0 };
     request.quotationValidUntil = new Date(quotationData.validUntil);
     request.updatedAt = new Date();
- 
+    // Every OTHER route that touches a quotation's total (sales-approve,
+    // approve-on-behalf, the customer's own approve) writes this unconditionally
+    // — this one, where the total is actually first computed, never did. So a
+    // quotation created and sent — a real total, "With customer" — showed
+    // "Invoiced ₹0" until it was later approved, on both a bulk PI and a
+    // person-wise one (26 Aug 2026, explicit report: "why it is showing 0
+    // invoiced even though this request is having an genuine price"). This is
+    // the actual source of truth for the total, so it is the actual source for
+    // this field too, not a side effect of approval.
+    request.finalOrderPrice = currentQuotation.grandTotal;
+    request.totalDueAmount = Math.max(0, (currentQuotation.grandTotal || 0) - (request.totalPaidAmount || 0));
+
     // ── Sync request.items + customerInfo when flagged by frontend ───────────
     if (quotationData._syncRequestItems) {
       console.log(`[quotationRoutes] _syncRequestItems triggered — ${itemsWithCalculations.length} item(s) in quotation`);
@@ -2829,7 +2863,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     // "no customer approval, no advance payment" warning and chose to push the
     // order to production anyway. Payment is deliberately NOT a precondition
     // here: recording money is a separate flow (record-payment / verify).
-    const { notes, acknowledgeNoCustomerApproval } = req.body;
+    const { notes, acknowledgeNoCustomerApproval, poProof } = req.body;
 
     const request = await CustomerRequest.findById(requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
@@ -2846,6 +2880,32 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
           ? "Quotation is not approved by the customer yet. Re-send with acknowledgeNoCustomerApproval to approve on their behalf."
           : `Quotation cannot be approved from status '${quotation.status}'`,
       });
+    }
+
+    // ── THE PO-PROOF RULE ALSO APPLIES HERE (26 Aug 2026, explicit request:
+    // "this same PO-proof requirement should also apply on the
+    // customer-requests page"). `customer_approved` can be reached two ways:
+    // approve-on-behalf, which already requires a PO and leaves it on
+    // quotation.poProof — or the customer's OWN portal action
+    // (Customer_Routes/QuotationRoutes.js), which records nothing at all.
+    // Sales countersigning that second case is the same unchecked assertion
+    // the on-behalf rule exists to close, so it is required here too unless
+    // one is already on file. `approvedWithoutCustomer` is exempt on
+    // purpose — that path is an explicit acknowledgement that no customer
+    // approval exists, so there is nothing to attach proof to.
+    if (!approvedWithoutCustomer) {
+      const existingProof = quotation.poProof && (quotation.poProof.url || quotation.poProof.fileId || quotation.poProof.publicId)
+        ? quotation.poProof
+        : null;
+      const newProof = buildPoProof(poProof, req.user?.id);
+      if (!existingProof && !newProof) {
+        return res.status(400).json({
+          success: false,
+          message: "Upload the customer's PO before approving this quotation — it is the proof of what they agreed to.",
+          code: "PO_PROOF_REQUIRED",
+        });
+      }
+      if (!existingProof && newProof) quotation.poProof = newProof;
     }
 
     if (approvedWithoutCustomer) {
@@ -3558,7 +3618,7 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
     // the UI. An upload with no usable address is rejected too — a record
     // pointing at nothing is worse than an honest refusal, because it reads
     // as evidence on every screen that lists it.
-    const poFile = poProof && (poProof.url || poProof.fileId || poProof.publicId) ? poProof : null;
+    const poFile = buildPoProof(poProof, req.user?.id);
     if (!poFile) {
       return res.status(400).json({
         success: false,
@@ -3566,20 +3626,7 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
         code: "PO_PROOF_REQUIRED",
       });
     }
-    quotation.poProof = {
-      fileId: poFile.fileId || undefined,
-      publicId: poFile.publicId || undefined,
-      url: poFile.url || undefined,
-      name: poFile.name || undefined,
-      mimeType: poFile.mimeType || undefined,
-      poNumber: poFile.poNumber ? String(poFile.poNumber).trim() : undefined,
-      poDate: poFile.poDate ? new Date(poFile.poDate) : undefined,
-      poValue: Number.isFinite(Number(poFile.poValue)) && Number(poFile.poValue) >= 0
-        ? Number(poFile.poValue)
-        : undefined,
-      uploadedAt: new Date(),
-      uploadedBy: req.user?.id || undefined,
-    };
+    quotation.poProof = poFile;
 
     // 1. Mark customer approval
     quotation.customerApproval = {
@@ -3595,7 +3642,22 @@ router.post("/requests/:requestId/quotation/approve-on-behalf", async (req, res)
 
     // 2. Update request status (projection of the quotation status)
     syncRequestStatusFromQuotation(request, quotation);
- 
+
+    // Every other route that moves a quotation forward (create/update,
+    // sales-approve, the customer's own approve) sets these two unconditionally
+    // — this route never did, because the only place they were ever written
+    // here was INSIDE the `payment` block below, which only runs when an
+    // advance is recorded in the same call. Once approving on behalf stopped
+    // bundling a mandatory payment (26 Aug 2026, explicit correction: "don't
+    // need to keep this approve & pay on behalf... payment will happen
+    // separately"), that block stopped running at all for the normal case,
+    // so `finalOrderPrice` was left `undefined` forever and every "Invoiced"
+    // column reading it showed ₹0 on an order with a real, approved price
+    // (26 Aug 2026, explicit report: "why it is showing 0 invoiced even
+    // though this request is having an genuine price").
+    request.finalOrderPrice = quotation.grandTotal;
+    request.totalDueAmount = Math.max(0, (quotation.grandTotal || 0) - (request.totalPaidAmount || 0));
+
     // 3. Update customer info if overrides provided
     if (customerInfoOverride) {
       if (customerInfoOverride.address)

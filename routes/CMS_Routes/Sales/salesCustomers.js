@@ -19,6 +19,14 @@ const WorkOrder = require("../../../models/CMS_Models/Manufacturing/WorkOrder/Wo
 const Measurement = require("../../../models/Customer_Models/Measurement");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { sendCustomerEmail } = require("../../../utils/salesEmailService");
+// Was required only inside GET /:id/orders's own function scope (below),
+// invisible to every other handler in this file — including POST
+// /:id/create-request, which called it at its own line 661 and threw
+// "nextRequestId is not defined" on every single call (26 Aug 2026, explicit
+// report — "this error is happening while click on the Submit Request").
+// This route had never worked; nothing before now had exercised it enough to
+// surface the missing import.
+const { nextRequestId } = require("../../../services/requestId");
 
 // ── Temp password generator ───────────────────────────────────────────────────
 const generateTempPassword = () => {
@@ -382,7 +390,8 @@ router.patch("/:id/toggle-status", salesAuth, async (req, res) => {
 router.get("/:id/orders", salesAuth, async (req, res) => {
   try {
     const CustomerRequest = require("../../../models/Customer_Models/CustomerRequest");
-const { nextRequestId } = require("../../../services/requestId");
+    // nextRequestId is unused in this handler — moved to the module-level
+    // import above, which is what create-request actually needed.
     const mongoose = require("mongoose");
 
     let custObjectId;
@@ -623,14 +632,32 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
       for (const variant of item.variants || []) {
         const qty = Number(variant.quantity) || 0;
         if (qty <= 0) continue;
-        const matchedVariant = (stockItem.variants || []).find(
-          (v) => v._id.toString() === variant.variantId,
-        );
+        // The slider's own cart never carries a variantId through to submit
+        // — it only ever sent { attributes, quantity } (26 Aug 2026,
+        // explicit report: "product pricing is showing as 0"). Falling back
+        // to matching by attributes is what makes pricing work at all for
+        // every request this route has ever created; matching by id stays
+        // the first attempt for whenever the frontend does start sending one.
+        let matchedVariant = variant.variantId
+          ? (stockItem.variants || []).find((v) => v._id.toString() === variant.variantId)
+          : null;
+        if (!matchedVariant && Array.isArray(variant.attributes) && variant.attributes.length) {
+          matchedVariant = (stockItem.variants || []).find((v) =>
+            (v.attributes || []).length === variant.attributes.length &&
+            (v.attributes || []).every((va) =>
+              variant.attributes.some((a) => a.name === va.name && a.value === va.value),
+            ),
+          );
+        }
+        // `variantSchema` (models/CMS_Models/Inventory/Products/StockItem.js)
+        // names this field `salesPrice`, not `price` — there is no `price`
+        // field on a variant at all, so this always fell through to
+        // `baseSalesPrice` (often unset for these products) and then to 0.
         const unitPrice =
-          matchedVariant?.price || stockItem.baseSalesPrice || 0;
+          matchedVariant?.salesPrice || stockItem.baseSalesPrice || 0;
         totalQuantity += qty;
         validatedVariants.push({
-          variantId: variant.variantId || null,
+          variantId: matchedVariant?._id || variant.variantId || null,
           attributes: variant.attributes || [],
           quantity: qty,
           specialInstructions: (variant.specialInstructions || []).filter(

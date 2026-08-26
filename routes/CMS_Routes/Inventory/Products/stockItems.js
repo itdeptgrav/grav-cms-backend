@@ -10,6 +10,8 @@ const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Uni
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation");
 const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup");
+const { recordChange, historyFor } = require("../../../../services/changeLog");
+const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../../services/departmentNotify.service");
 
 const STOCK_ITEM_CATEGORIES = [
   "T-Shirts", "Shirts", "Jeans", "Bottoms", "Ethnic Wear",
@@ -24,6 +26,12 @@ const OPERATION_TYPES = [
 ];
 
 router.use(EmployeeAuthMiddleware);
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Build a map of unitName → { baseUnit, conversions: [{toUnit, factor}] }
@@ -233,6 +241,189 @@ function recomputeVariantCostsFromBom(stockItem) {
     }
   }
   return changed;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Human-readable change log lines (26 Aug 2026, explicit request: "the log is
+// not representing the changes in an proper human language... make sure the
+// logs should be properly understandable").
+//
+// WHY THIS EXISTS SEPARATELY FROM services/changeLog.js's generic diff: that
+// diff compares whole top-level document fields, and ChangeLog.sanitise()
+// truncates any object/array field over 500 chars to a raw, CUT-OFF JSON
+// STRING (not even valid JSON — see models/Access/ChangeLog.js's sanitise).
+// `variants` on a real product — several variants, each with several raw
+// items — is comfortably over that limit, so the log was storing an
+// unparseable JSON fragment and the Logs tab had nothing to render but that
+// fragment. Building small, specific, English sentences here instead keeps
+// each log entry tiny (well under the truncation limit) AND actually
+// readable, rather than trying to parse/repair truncated JSON after the
+// fact on the frontend.
+// ─────────────────────────────────────────────────────────────────────────────
+function variantLabel(v) {
+  const attrs = (v.attributes || []).map(a => a.value).filter(Boolean).join("/");
+  return `variant ${v.sku || "?"}${attrs ? ` (${attrs})` : ""}`;
+}
+
+function byKey(arr, keyFn) {
+  const m = new Map();
+  (arr || []).forEach((item, i) => m.set(String(keyFn(item, i) ?? i), item));
+  return m;
+}
+
+function describeVariantsChange(before, after) {
+  const lines = [];
+  const b = byKey(before, v => v.sku);
+  const a = byKey(after, v => v.sku);
+  for (const [sku, v] of a) if (!b.has(sku)) lines.push(`Added ${variantLabel(v)}`);
+  for (const [sku, v] of b) if (!a.has(sku)) lines.push(`Removed ${variantLabel(v)}`);
+  for (const [sku, vAfter] of a) {
+    if (!b.has(sku)) continue;
+    const vBefore = b.get(sku);
+    const label = variantLabel(vAfter);
+    if (Number(vBefore.salesPrice) !== Number(vAfter.salesPrice))
+      lines.push(`${label}: sales price changed from ₹${vBefore.salesPrice ?? 0} to ₹${vAfter.salesPrice ?? 0}`);
+    if (Number(vBefore.cost) !== Number(vAfter.cost))
+      lines.push(`${label}: cost changed from ₹${vBefore.cost ?? 0} to ₹${vAfter.cost ?? 0}`);
+    if (Number(vBefore.quantityOnHand) !== Number(vAfter.quantityOnHand))
+      lines.push(`${label}: quantity on hand changed from ${vBefore.quantityOnHand ?? 0} to ${vAfter.quantityOnHand ?? 0}`);
+    if ((vBefore.status || "") !== (vAfter.status || ""))
+      lines.push(`${label}: status changed from ${vBefore.status || "—"} to ${vAfter.status || "—"}`);
+    if ((vBefore.barcode || "") !== (vAfter.barcode || ""))
+      lines.push(`${label}: barcode changed`);
+  }
+  return lines;
+}
+
+function describeRawItemsChange(beforeVariants, afterVariants) {
+  const lines = [];
+  const b = byKey(beforeVariants, v => v.sku);
+  const a = byKey(afterVariants, v => v.sku);
+  for (const [sku, vAfter] of a) {
+    const vBefore = b.get(sku);
+    if (!vBefore) continue;
+    const label = variantLabel(vAfter);
+    const bItems = byKey(vBefore.rawItems, ri => ri.rawItemId || ri.rawItemName);
+    const aItems = byKey(vAfter.rawItems, ri => ri.rawItemId || ri.rawItemName);
+    for (const [k, ri] of aItems) if (!bItems.has(k)) lines.push(`Added raw item "${ri.rawItemName || "Unnamed"}" to ${label}`);
+    for (const [k, ri] of bItems) if (!aItems.has(k)) lines.push(`Removed raw item "${ri.rawItemName || "Unnamed"}" from ${label}`);
+    for (const [k, riAfter] of aItems) {
+      if (!bItems.has(k)) continue;
+      const riBefore = bItems.get(k);
+      const name = riAfter.rawItemName || "Unnamed";
+      if (Number(riBefore.quantity) !== Number(riAfter.quantity))
+        lines.push(`Raw item "${name}" on ${label}: quantity changed from ${riBefore.quantity ?? 0} to ${riAfter.quantity ?? 0} ${riAfter.unit || ""}`.trim());
+      if ((riBefore.unit || "") !== (riAfter.unit || ""))
+        lines.push(`Raw item "${name}" on ${label}: unit changed from ${riBefore.unit || "—"} to ${riAfter.unit || "—"}`);
+      if (Number(riBefore.allowancePercent) !== Number(riAfter.allowancePercent))
+        lines.push(`Raw item "${name}" on ${label}: allowance changed from ${riBefore.allowancePercent ?? 0}% to ${riAfter.allowancePercent ?? 0}%`);
+    }
+  }
+  return lines;
+}
+
+function describeOperationsChange(before, after) {
+  const lines = [];
+  const max = Math.max((before || []).length, (after || []).length);
+  for (let i = 0; i < max; i++) {
+    const b = (before || [])[i];
+    const a = (after || [])[i];
+    if (b && !a) { lines.push(`Removed operation "${b.type || `#${i + 1}`}"`); continue; }
+    if (!b && a) { lines.push(`Added operation "${a.type || `#${i + 1}`}"`); continue; }
+    if (!b || !a) continue;
+    const label = `Operation "${a.type || `#${i + 1}`}"`;
+    if ((b.machine || "") !== (a.machine || ""))
+      lines.push(`${label}: machine changed from ${b.machine || "—"} to ${a.machine || "—"}`);
+    if (Number(b.minutes) !== Number(a.minutes) || Number(b.seconds) !== Number(a.seconds))
+      lines.push(`${label}: time changed from ${b.minutes || 0}m ${b.seconds || 0}s to ${a.minutes || 0}m ${a.seconds || 0}s`);
+    if (Number(b.operatorCost) !== Number(a.operatorCost))
+      lines.push(`${label}: cost changed from ₹${b.operatorCost || 0} to ₹${a.operatorCost || 0}`);
+    if ((b.salaryDept || "") !== (a.salaryDept || "") || (b.salaryDesig || "") !== (a.salaryDesig || ""))
+      lines.push(`${label}: salary basis changed`);
+  }
+  return lines;
+}
+
+function describeAttributesChange(before, after) {
+  const lines = [];
+  const b = byKey(before, x => x.name);
+  const a = byKey(after, x => x.name);
+  for (const [name, attr] of a) if (!b.has(name)) lines.push(`Added attribute "${name}" (${(attr.values || []).join(", ")})`);
+  for (const [name] of b) if (!a.has(name)) lines.push(`Removed attribute "${name}"`);
+  for (const [name, aAfter] of a) {
+    if (!b.has(name)) continue;
+    const beforeValues = (b.get(name).values || []).join(", ");
+    const afterValues = (aAfter.values || []).join(", ");
+    if (beforeValues !== afterValues) lines.push(`Attribute "${name}": values changed from [${beforeValues}] to [${afterValues}]`);
+  }
+  return lines;
+}
+
+const GENERAL_FIELD_LABELS = {
+  name: "Product name", category: "Category", genderCategory: "Gender",
+  hsnCode: "HSN code", baseSalesPrice: "Base sales price", baseCost: "Base cost",
+  unit: "Unit", internalNotes: "Internal notes", numberOfPanels: "Number of panels",
+  productType: "Product type",
+};
+function describeGeneralChange(before, after) {
+  const lines = [];
+  for (const [key, label] of Object.entries(GENERAL_FIELD_LABELS)) {
+    if (JSON.stringify(before[key] ?? "") !== JSON.stringify(after[key] ?? "")) {
+      lines.push(`${label} changed from "${before[key] ?? "—"}" to "${after[key] ?? "—"}"`);
+    }
+  }
+  const beforeNames = (before.additionalNames || []).join(", ");
+  const afterNames = (after.additionalNames || []).join(", ");
+  if (beforeNames !== afterNames) lines.push(`Additional names changed to [${afterNames || "—"}]`);
+  const beforeImgCount = (before.images || []).length;
+  const afterImgCount = (after.images || []).length;
+  if (beforeImgCount !== afterImgCount) lines.push(`Images: ${beforeImgCount} → ${afterImgCount}`);
+  return lines;
+}
+
+function describeMeasurementsChange(before, after) {
+  const lines = [];
+  const b = (before.measurements || []).join(", ");
+  const a = (after.measurements || []).join(", ");
+  if (b !== a) lines.push(`Measurement points changed to [${a || "—"}]`);
+  if (Number(before.numberOfPanels) !== Number(after.numberOfPanels))
+    lines.push(`Number of panels changed from ${before.numberOfPanels ?? 0} to ${after.numberOfPanels ?? 0}`);
+  return lines;
+}
+
+function describeCostsChange(before, after) {
+  const lines = [];
+  const b = byKey(before, c => c.name);
+  const a = byKey(after, c => c.name);
+  for (const [name, c] of a) if (!b.has(name)) lines.push(`Added cost "${name}" (${c.unit === "Percentage" ? `${c.amount}%` : `₹${c.amount}`})`);
+  for (const [name] of b) if (!a.has(name)) lines.push(`Removed cost "${name}"`);
+  for (const [name, cAfter] of a) {
+    if (!b.has(name)) continue;
+    const cBefore = b.get(name);
+    if (Number(cBefore.amount) !== Number(cAfter.amount) || cBefore.unit !== cAfter.unit) {
+      const fmt = (c) => c.unit === "Percentage" ? `${c.amount}%` : `₹${c.amount}`;
+      lines.push(`Cost "${name}" changed from ${fmt(cBefore)} to ${fmt(cAfter)}`);
+    }
+  }
+  return lines;
+}
+
+/** Keeps a change-lines array well under ChangeLog.sanitise's 500-char
+ * truncation threshold even on a bulk edit touching many variants/items. */
+function capLines(lines, max = 12) {
+  if (lines.length <= max) return lines;
+  return [...lines.slice(0, max), `…and ${lines.length - max} more change(s)`];
+}
+
+/** One line per attribute/variant, for the create-time log entry. */
+function describeProductCreated(stockItem) {
+  const lines = [`Created "${stockItem.name}" (${stockItem.reference}) in ${stockItem.category}`];
+  for (const attr of stockItem.attributes || []) {
+    lines.push(`Attribute "${attr.name}": ${(attr.values || []).join(", ")}`);
+  }
+  lines.push(`${(stockItem.variants || []).length} variant(s) created`);
+  if ((stockItem.operations || []).length > 0) lines.push(`${stockItem.operations.length} operation(s) defined`);
+  return lines;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -609,6 +800,11 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
     const stockItem = await StockItem.findById(id);
     if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
 
+    // Snapshot BEFORE the switch below mutates it in place — recordChange
+    // diffs this against the post-save state itself, so passing the whole
+    // document is correct (not noise): see services/changeLog.js.
+    const before = stockItem.toObject();
+
     switch (tabName) {
 
       // ── General Info ────────────────────────────────────────────────────
@@ -766,6 +962,37 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
     stockItem.updatedBy = req.user.id;
     await stockItem.save();
 
+    // Human-readable per-tab diff (26 Aug 2026) instead of handing the whole
+    // document to the generic before/after diff — see the block of
+    // describe*Change helpers above for why. `after` doc reads through
+    // stockItem's live in-memory arrays, which is correct here since nothing
+    // else mutates it between save() and this line.
+    const afterDoc = stockItem.toObject();
+    let changeLines = [];
+    switch (tabName) {
+      case "general": changeLines = describeGeneralChange(before, afterDoc); break;
+      case "attributes": changeLines = describeAttributesChange(before.attributes, afterDoc.attributes); break;
+      case "variants": changeLines = describeVariantsChange(before.variants, afterDoc.variants); break;
+      case "raw-items": changeLines = describeRawItemsChange(before.variants, afterDoc.variants); break;
+      case "operations": changeLines = describeOperationsChange(before.operations, afterDoc.operations); break;
+      case "measurements": changeLines = describeMeasurementsChange(before, afterDoc); break;
+      case "costs": changeLines = describeCostsChange(before.miscellaneousCosts, afterDoc.miscellaneousCosts); break;
+    }
+    changeLines = capLines(changeLines);
+
+    await recordChange(req, {
+      departmentSlug: "inventory",
+      entity: "stock-item",
+      entityId: stockItem._id,
+      entityLabel: stockItem.name,
+      action: "update",
+      summary: changeLines[0]
+        ? `${changeLines[0]}${changeLines.length > 1 ? ` (+${changeLines.length - 1} more)` : ""}`
+        : `Updated ${tabName} — ${stockItem.name}`,
+      before: {},
+      after: changeLines.length ? { changes: changeLines } : {},
+    });
+
     res.json({
       success: true,
       message: `${tabName} saved successfully`,
@@ -774,6 +1001,22 @@ router.patch("/:id/tab/:tabName", async (req, res) => {
   } catch (error) {
     console.error(`Error saving tab (${req.params.tabName}):`, error);
     res.status(500).json({ success: false, message: "Server error while saving tab data" });
+  }
+});
+
+/**
+ * GET /:id/history — who created this product and every change since, newest
+ * first. Powers the editor's Logs tab (26 Aug 2026, explicit request).
+ * Read-only, so no role restriction beyond the auth this whole router already
+ * requires.
+ */
+router.get("/:id/history", async (req, res) => {
+  try {
+    const logs = await historyFor("stock-item", req.params.id, 100);
+    res.json({ success: true, logs });
+  } catch (error) {
+    console.error("Error fetching stock item history:", error);
+    res.status(500).json({ success: false, message: "Server error while fetching history" });
   }
 });
 
@@ -796,7 +1039,29 @@ router.get("/", async (req, res) => {
     if (category) filter.category = category;
     if (status) filter.status = status;
 
-    const [totalItems, stockItems, statsAgg] = await Promise.all([
+    // ── Merchandiser/Production work-queue alerts (26 Aug 2026) ──────────────
+    // "showcase the alerts... for which product or like how many products are
+    // there which are not assigned any raw items" / "which product is having
+    // missing operations". Computed over the WHOLE collection (not just the
+    // current page), same as lowStock/outOfStock above, so the count is
+    // accurate regardless of pagination or filters. A product counts as
+    // missing raw items only if NONE of its variants have any.
+    const missingRawItemsFilter = {
+      $expr: {
+        $not: [{
+          $anyElementTrue: {
+            $map: {
+              input: { $ifNull: ["$variants", []] },
+              as: "v",
+              in: { $gt: [{ $size: { $ifNull: ["$$v.rawItems", []] } }, 0] }
+            }
+          }
+        }]
+      }
+    };
+    const missingOperationsFilter = { $expr: { $eq: [{ $size: { $ifNull: ["$operations", []] } }, 0] } };
+
+    const [totalItems, stockItems, statsAgg, missingRawItemsAgg, missingOperationsAgg] = await Promise.all([
       StockItem.countDocuments(filter),
       StockItem.find(filter)
         .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations genderCategory")
@@ -812,15 +1077,32 @@ router.get("/", async (req, res) => {
           totalPotentialRevenue: { $sum: { $multiply: [{ $ifNull: ["$averageSalesPrice", 0] }, { $ifNull: ["$totalQuantityOnHand", 0] }] } },
           averageMargin: { $avg: { $ifNull: ["$profitMargin", 0] } }
         }
-      }])
+      }]),
+      StockItem.aggregate([
+        { $match: missingRawItemsFilter },
+        { $group: { _id: null, count: { $sum: 1 }, samples: { $push: "$name" } } },
+        { $project: { count: 1, samples: { $slice: ["$samples", 5] } } }
+      ]),
+      StockItem.aggregate([
+        { $match: missingOperationsFilter },
+        { $group: { _id: null, count: { $sum: 1 }, samples: { $push: "$name" } } },
+        { $project: { count: 1, samples: { $slice: ["$samples", 5] } } }
+      ])
     ]);
 
     const statsData = statsAgg[0] || { total: 0, lowStock: 0, outOfStock: 0, totalVariants: 0, totalInventoryValue: 0, totalPotentialRevenue: 0, averageMargin: 0 };
+    const missingRawItemsData = missingRawItemsAgg[0] || { count: 0, samples: [] };
+    const missingOperationsData = missingOperationsAgg[0] || { count: 0, samples: [] };
     const totalPages = Math.ceil(totalItems / limitNum);
 
     res.json({
       success: true, stockItems,
-      stats: { total: statsData.total, lowStock: statsData.lowStock, outOfStock: statsData.outOfStock, totalVariants: statsData.totalVariants, totalInventoryValue: statsData.totalInventoryValue, totalPotentialRevenue: statsData.totalPotentialRevenue, averageMargin: statsData.averageMargin, totalStockItems: statsData.total },
+      stats: {
+        total: statsData.total, lowStock: statsData.lowStock, outOfStock: statsData.outOfStock, totalVariants: statsData.totalVariants,
+        totalInventoryValue: statsData.totalInventoryValue, totalPotentialRevenue: statsData.totalPotentialRevenue, averageMargin: statsData.averageMargin, totalStockItems: statsData.total,
+        missingRawItems: { count: missingRawItemsData.count, samples: missingRawItemsData.samples },
+        missingOperations: { count: missingOperationsData.count, samples: missingOperationsData.samples }
+      },
       filters: { categories: STOCK_ITEM_CATEGORIES, statuses: ["In Stock", "Low Stock", "Out of Stock"] },
       pagination: { currentPage: pageNum, totalPages, totalItems, itemsPerPage: limitNum, hasNextPage: pageNum < totalPages, hasPrevPage: pageNum > 1 }
     });
@@ -938,7 +1220,75 @@ router.post("/", async (req, res) => {
     updateStockItemAggregates(newStockItem);
     await newStockItem.save();
 
+    // Who created this product, and with what — the first entry in the Logs
+    // tab (26 Aug 2026, explicit request: "proper logs need to keep so that
+    // in future if the data changed then we can easily keep the record ki
+    // who did the modify/add"). recordChange never throws, so a logging
+    // failure can never take the actual creation down with it.
+    const createLines = capLines(describeProductCreated(newStockItem));
+    await recordChange(req, {
+      departmentSlug: "inventory",
+      entity: "stock-item",
+      entityId: newStockItem._id,
+      entityLabel: newStockItem.name,
+      action: "create",
+      summary: `Created ${newStockItem.name} (${newStockItem.reference})`,
+      before: {},
+      after: { changes: createLines },
+    });
+
     res.status(201).json({ success: true, message: "Stock item created successfully", stockItem: newStockItem });
+
+    // ── Notify Merchandiser + Production of the new product (26 Aug 2026,
+    // explicit request: "while an new product(stock item) is goona created,
+    // then notify to the merchantiser and the production manager... u can
+    // track the email id form the access control"). Recipients are resolved
+    // from Access Control (AccessDepartment/Employee grants), same as every
+    // other departmentNotify event — nothing new to maintain per person.
+    // Fired AFTER the response is sent and never awaited: a Brevo outage must
+    // never slow down or fail product creation. notifyEvent() itself never
+    // throws, but the whole block is still wrapped so a bug in building ctx
+    // can't surface as an unhandled rejection either. ────────────────────────
+    (async () => {
+      const attributeSummary = (processedAttributes || [])
+        .map((a) => `${a.name}: ${a.values.join(", ")}`).join(" · ");
+      const priceRange = (newStockItem.variants || []).length
+        ? `₹${Math.min(...newStockItem.variants.map((v) => v.salesPrice))} – ₹${Math.max(...newStockItem.variants.map((v) => v.salesPrice))}`
+        : undefined;
+      const creatorName = req.user?.name || "A team member";
+      const imageUrl = newStockItem.images?.[0];
+      const ctaUrl = `${DEPT_NOTIFY_APP_URL}/merchandiser/products/new-stock-item/${newStockItem._id}`;
+      const sharedDetails = [
+        ["Reference", newStockItem.reference],
+        ["Category", newStockItem.category],
+        ["Gender", newStockItem.genderCategory || undefined],
+        ["Attributes", attributeSummary || undefined],
+        ["Variants", `${(newStockItem.variants || []).length} variant(s)`],
+        ["Price range", priceRange],
+        ["Created by", creatorName],
+      ];
+
+      await Promise.all([
+        notifyEvent("stock_item_created_merchandiser", {
+          heading: `New product created: ${escapeHtml(newStockItem.name)}`,
+          bodyHtml: `<p><strong>${escapeHtml(creatorName)}</strong> just created this product. Your task now is to <strong>fill in the pricing and build the BOM (raw items)</strong> for each variant so it's ready to manufacture.</p>`,
+          details: sharedDetails,
+          imageUrl,
+          bodyText: `${creatorName} just created "${newStockItem.name}" (${newStockItem.reference}). Your task: fill in pricing and build the BOM (raw items) for each variant.`,
+          ctaLabel: "Open product",
+          ctaUrl,
+        }),
+        notifyEvent("stock_item_created_production", {
+          heading: `New product created: ${escapeHtml(newStockItem.name)}`,
+          bodyHtml: `<p><strong>${escapeHtml(creatorName)}</strong> just created this product. Your task now is to <strong>put in the manufacturing operations, measurement parameters, company costing and CMP costing</strong> for it.</p>`,
+          details: sharedDetails,
+          imageUrl,
+          bodyText: `${creatorName} just created "${newStockItem.name}" (${newStockItem.reference}). Your task: add operations, measurement parameters, company costing and CMP costing.`,
+          ctaLabel: "Open product",
+          ctaUrl: `${DEPT_NOTIFY_APP_URL}/production-supervisor/products/new-stock-item/${newStockItem._id}`,
+        }),
+      ]);
+    })().catch((err) => console.error("[stockItems] new-product notify failed:", err.message));
   } catch (error) {
     console.error("Error creating stock item:", error);
     if (error.code === 11000) return res.status(400).json({ success: false, message: "Product with this reference already exists" });
@@ -1126,3 +1476,8 @@ module.exports = router;
 module.exports.processVariantRawItems = processVariantRawItems;
 module.exports.updateStockItemAggregates = updateStockItemAggregates;
 module.exports.recomputeVariantCostsFromBom = recomputeVariantCostsFromBom;
+// Reused by routes/CMS_Routes/Inventory/Configurations/operations.js — the
+// "apply operation group to category" bulk action needs the same category
+// list the create form offers, and the same cost-recompute pass every other
+// operations write here already runs (26 Aug 2026).
+module.exports.STOCK_ITEM_CATEGORIES = STOCK_ITEM_CATEGORIES;

@@ -102,6 +102,26 @@ const EVENT_REGISTRY = [
     description: "Sales is notified when Merchandising approves or rejects a stock-item request.",
     departments: ["sales"],
   },
+  // Split into two keys, not one "stock_item_created" fired at both
+  // departments, because each needs a DIFFERENT task message in the body
+  // (26 Aug 2026, explicit request: "if the id is for merchantiser then
+  // represent it like for the ur task is to now fill the pricing, BOM
+  // creation... and for the production manager, represent the message for
+  // put the operations, measurements parameters, company costing, cmp
+  // costings"). notifyEvent() sends one ctx to every department an event
+  // lists, so two audiences with two different messages need two events.
+  {
+    key: "stock_item_created_merchandiser",
+    label: "New product created — Merchandiser task",
+    description: "Merchandising is notified when a new product is created, with pricing/BOM as their next step.",
+    departments: ["merchandiser"],
+  },
+  {
+    key: "stock_item_created_production",
+    label: "New product created — Production task",
+    description: "The Production Supervisor is notified when a new product is created, with operations/costing as their next step.",
+    departments: ["production-supervisor"],
+  },
 ];
 const EVENT_BY_KEY = new Map(EVENT_REGISTRY.map((e) => [e.key, e]));
 
