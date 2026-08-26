@@ -1593,7 +1593,7 @@ router.post("/task/:taskId/daily-report", verifyCoworkToken, verifyEmployeeToken
 // ── 8. TASK CHAT — SEND ───────────────────────────────────────────────────────
 router.post("/task/:taskId/chat", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { text, attachments, messageType, mention } = req.body;
+    const { text, attachments, messageType, mention, replyTo } = req.body;
     if (!text?.trim() && (!attachments || !attachments.length)) return res.status(400).json({ error: "text or attachments required" });
     const msg = await svc.sendTaskChat({
       taskId: req.params.taskId,
@@ -1603,6 +1603,10 @@ router.post("/task/:taskId/chat", verifyCoworkToken, verifyEmployeeToken, async 
       attachments: attachments || [],
       messageType: messageType || "text",
       mention: mention || null,
+      // The message this one answers, quoted onto it — same shape the direct
+      // threads use. Optional: a client that does not send it is unaffected,
+      // and a message without one simply has no quote.
+      replyTo: replyTo || null,
     });
     res.status(201).json({ success: true, message: msg });
   } catch (e) { res.status(400).json({ error: e.message }); }
