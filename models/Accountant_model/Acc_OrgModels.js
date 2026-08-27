@@ -291,6 +291,26 @@ const approvalRequestSchema = new mongoose.Schema(
   { timestamps: true, collection: "acc_approval_requests" },
 );
 
+/* ── SIGNATURES ON AN OVER-BUDGET REQUEST ───────────────────────────────────
+ * Approving a request that spends past a budget takes two people, one of them
+ * the CEO — see budgetEscalation.service. The first approver's signature is
+ * kept here so their click is not wasted, and the request stays pending until
+ * the second one arrives. Absent on every request that is within budget, which
+ * is nearly all of them. */
+approvalRequestSchema.add({
+  budgetSignatures: [
+    {
+      _id: false,
+      slot: { type: String },
+      userId: { type: String },
+      name: { type: String, trim: true },
+      role: { type: String },
+      reason: { type: String, trim: true },
+      at: { type: Date },
+    },
+  ],
+});
+
 approvalRequestSchema.index({ organizationId: 1, status: 1, createdAt: -1 });
 
 // ─────────────────────────────────────────────────────────────────────────────

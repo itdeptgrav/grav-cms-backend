@@ -45,6 +45,15 @@ const OWNER = {
   role: "owner",
   permissions: { canEdit: true, canApprove: true, canPostDirectly: true },
 };
+/* ── THE SECOND SIGNATURE ────────────────────────────────────────────────────
+ * Raising an allocation now takes the same two people as spending past one:
+ * finance and the CEO, and they must be different people. The owner above is
+ * the CEO; this is finance. */
+const APPROVER_USER = {
+  id: new (require("mongoose").Types.ObjectId)().toString(),
+  name: "Anil Approver", email: "anil.approver@example.com", role: "approver",
+  permissions: { canEdit: true, canApprove: true, canPostDirectly: true },
+};
 
 /* The two roles the guards actually separate. An editor may raise anything and
  * approve nothing; a viewer may not even raise. */
@@ -100,6 +109,21 @@ async function call(path, { method = "GET", body, user = OWNER } = {}) {
   });
   const text = await res.text();
   return { status: res.status, body: text ? JSON.parse(text) : null };
+}
+
+/**
+ * Approve an adjustment the way the rule now requires.
+ *
+ * Raising an allocation takes the same two people as spending past one —
+ * finance and then the CEO — because a CEO gate on overspending that a
+ * supplementary can walk around is not a gate. A refusal on the first call
+ * (404, 403, already applied) is handed straight back, so the tests about
+ * those are unaffected.
+ */
+async function approveAdj(url, opts = {}) {
+  const first = await call(url, { method: "POST", user: APPROVER_USER, ...opts });
+  if (first.status !== 202) return first;
+  return call(url, { method: "POST", ...opts });
 }
 
 /** One company with a revenue head and an expense head to budget against. */
@@ -244,6 +268,194 @@ describe("period and status validation", () => {
 });
 
 /* ── basic read / create / update, and line shape ──────────────────────────── */
+
+/* ── OPENING A ROUND ────────────────────────────────────────────────────────
+ * The form no longer asks finance to type a title for a company round, so the
+ * server has to be able to name one that arrives without a name. `name` is
+ * required on the schema; before this, a client that omitted it got a 500. */
+describe("a company round names itself", () => {
+  const open = async (over = {}) => {
+    const { company } = await seedCompany();
+    const res = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27",
+        period: "yearly",
+        scope: "company",
+        status: "collecting",
+        startDate: "2026-04-01",
+        endDate: "2027-03-31",
+        items: [],
+        ...over,
+      },
+    });
+    return res;
+  };
+
+  test("an annual round with no name is called Budget FY 2026-27", async () => {
+    const { status, body } = await open();
+    expect(status).toBe(201);
+    expect(body.budget.name).toBe("Budget FY 2026-27");
+  });
+
+  test("a quarterly round carries its quarter, counted from April", async () => {
+    const { body } = await open({
+      period: "quarterly", startDate: "2026-07-01", endDate: "2026-09-30",
+    });
+    expect(body.budget.name).toBe("Budget FY 2026-27 Q2");
+  });
+
+  test("a monthly round carries its month", async () => {
+    const { body } = await open({
+      period: "monthly", startDate: "2026-04-01", endDate: "2026-04-30",
+    });
+    expect(body.budget.name).toBe("Budget FY 2026-27 Apr");
+  });
+
+  test("a round opens with no allocations at all", async () => {
+    /* The normal case: lines arrive by approving department asks, so demanding
+       one up front made finance invent a figure nobody agreed to. */
+    const { status, body } = await open();
+    expect(status).toBe(201);
+    expect(body.budget.items).toEqual([]);
+    expect(body.budget.status).toBe("collecting");
+  });
+
+  test("a name that WAS sent is kept exactly", async () => {
+    const { body } = await open({ name: "Diwali contingency round" });
+    expect(body.budget.name).toBe("Diwali contingency round");
+  });
+
+  test("a round sent with only a year and a period gets both its dates and its name", async () => {
+    /* The form derives these and sends them; this is the API caller that does
+       not. Dates are filled first, because the name reads the start date. */
+    const { company } = await seedCompany();
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "quarterly", quarter: 1,
+        scope: "company", status: "collecting", items: [],
+      },
+    });
+    expect(status).toBe(201);
+    expect(body.budget.startDate.slice(0, 10)).toBe("2026-07-01");
+    expect(body.budget.endDate.slice(0, 10)).toBe("2026-09-30");
+    expect(body.budget.name).toBe("Budget FY 2026-27 Q2");
+  });
+
+  test("an annual round with no dates covers the whole financial year", async () => {
+    const { company } = await seedCompany();
+    const { body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "yearly",
+        scope: "company", status: "collecting", items: [],
+      },
+    });
+    expect(body.budget.startDate.slice(0, 10)).toBe("2026-04-01");
+    expect(body.budget.endDate.slice(0, 10)).toBe("2027-03-31");
+    expect(body.budget.name).toBe("Budget FY 2026-27");
+  });
+
+  test("dates that WERE sent are kept exactly", async () => {
+    const { company } = await seedCompany();
+    const { body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "yearly", scope: "company",
+        status: "collecting", startDate: "2026-05-15", endDate: "2027-02-14", items: [],
+      },
+    });
+    expect(body.budget.startDate.slice(0, 10)).toBe("2026-05-15");
+    expect(body.budget.endDate.slice(0, 10)).toBe("2027-02-14");
+  });
+
+  test("a second round for the same financial year is refused, and says which", async () => {
+    /* One year, one budget. Quarterly and monthly planning lives in a line's
+       monthly phasing, not in parallel envelopes that split a department's
+       asks and make "the FY 26-27 budget" ambiguous in every roll-up. */
+    const { company } = await seedCompany();
+    const body = {
+      companyId: company._id.toString(),
+      financialYear: "2026-27", scope: "company", status: "collecting", items: [],
+    };
+    const first = await call("/", { method: "POST", body });
+    expect(first.status).toBe(201);
+    expect(first.body.budget.name).toBe("Budget FY 2026-27");
+    /* No period sent — a company round IS the year. */
+    expect(first.body.budget.period).toBe("yearly");
+
+    const second = await call("/", { method: "POST", body });
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe("FY_BUDGET_EXISTS");
+    expect(second.body.message).toBe("Budget FY 2026-27 already exists. Open that budget instead.");
+    /* Carries the id, so the screen can offer the round rather than the error. */
+    expect(second.body.budgetId).toBe(String(first.body.budget._id));
+  });
+
+  test("a different year, and a different company, are both fine", async () => {
+    const { company } = await seedCompany();
+    const other = await seedCompany();
+    const mk = (companyId, financialYear) =>
+      call("/", { method: "POST", body: {
+        companyId: companyId.toString(), financialYear, scope: "company",
+        status: "collecting", items: [],
+      }});
+    expect((await mk(company._id, "2026-27")).status).toBe(201);
+    expect((await mk(company._id, "2027-28")).status).toBe(201);
+    expect((await mk(other.company._id, "2026-27")).status).toBe(201);
+  });
+
+  test("a project budget may share the year with the company round", async () => {
+    /* The rule is about COMPANY rounds. A site or a campaign is a different
+       object and several may legitimately run inside one year. */
+    const { company } = await seedCompany();
+    /* `period` is sent explicitly here: the yearly default is a COMPANY-round
+       rule, and a project's period is real information — a site may run for a
+       quarter inside a year the company budgets annually. */
+    const base = { companyId: company._id.toString(), financialYear: "2026-27",
+      period: "yearly", status: "collecting",
+      startDate: "2026-04-01", endDate: "2027-03-31", items: [] };
+    expect((await call("/", { method: "POST", body: { ...base, scope: "company" } })).status).toBe(201);
+    const project = await call("/", { method: "POST", body: {
+      ...base, scope: "project", costCentreName: "Greenfield Park", name: "Greenfield site works",
+    }});
+    expect(project.status).toBe(201);
+  });
+
+  test("a closed round still blocks a second one for its year", async () => {
+    /* A finished FY is still that FY's budget. "Re-open the old one" is the
+       honest answer rather than quietly starting a parallel history. */
+    const { company } = await seedCompany();
+    const body = { companyId: company._id.toString(), financialYear: "2026-27",
+      scope: "company", items: [] };
+    expect((await call("/", { method: "POST", body: { ...body, status: "closed" } })).status).toBe(201);
+    const again = await call("/", { method: "POST", body: { ...body, status: "collecting" } });
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe("FY_BUDGET_EXISTS");
+  });
+
+  test("a project budget is never auto-named — its name is real information", async () => {
+    const { company } = await seedCompany();
+    const { status, body } = await call("/", {
+      method: "POST",
+      body: {
+        companyId: company._id.toString(),
+        financialYear: "2026-27", period: "yearly", scope: "project",
+        costCentreName: "Greenfield Park",
+        status: "collecting", startDate: "2026-04-01", endDate: "2027-03-31", items: [],
+      },
+    });
+    /* No name, no derivation: the server refuses rather than calling a project
+       "Budget FY 2026-27", which would say nothing about which project. */
+    expect(status).toBe(500);
+    expect(body.success).toBe(false);
+  });
+});
 
 describe("basic budget read, create and update", () => {
   test("a created budget's lines round-trip ledger, nature, department, owner and notes", async () => {
@@ -2781,10 +2993,7 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup({ allocated: 2500000 });
     const created = await submit(budget, q, supplementary(item, 500000));
 
-    const { status, body } = await call(
-      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`,
-      { method: "POST" },
-    );
+    const { status, body } = await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
 
     expect(status).toBe(200);
     expect(body.adjustment.state).toBe("approved");
@@ -2799,7 +3008,7 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup({ allocated: 500000 });
     const created = await submit(budget, q, revision(item, 700000));
 
-    await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
     // 700000, not 1200000.
     expect(await allocationOf(budget._id, item._id)).toBe(700000);
   });
@@ -2809,7 +3018,7 @@ describe("adjustments — supplementary and revision", () => {
     const created = await submit(budget, q, supplementary(item, 500000));
     const url = `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`;
 
-    const first = await call(url, { method: "POST" });
+    const first = await approveAdj(url);
     expect(first.status).toBe(200);
     expect(await allocationOf(budget._id, item._id)).toBe(3000000);
 
@@ -2829,9 +3038,9 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup({ allocated: 2500000 });
     const created = await submit(budget, q, supplementary(item, 500000));
 
-    const { body } = await call(
+    const { body } = await approveAdj(
       `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`,
-      { method: "POST", body: { approvedDeltaAmount: 300000, financeNote: "Half now, revisit in Q3." } },
+      { body: { approvedDeltaAmount: 300000, financeNote: "Half now, revisit in Q3." } },
     );
 
     expect(body.adjustment.approvedDeltaAmount).toBe(300000);
@@ -2851,11 +3060,11 @@ describe("adjustments — supplementary and revision", () => {
     expect(a.body.adjustment.currentAllocatedAmount).toBe(2500000);
     expect(b.body.adjustment.currentAllocatedAmount).toBe(2500000);
 
-    await call(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`);
     expect(await allocationOf(budget._id, item._id)).toBe(3000000);
 
     // "₹3L more" must mean more than whatever it is NOW — 33L, not 28L.
-    const second = await call(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`, { method: "POST" });
+    const second = await approveAdj(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`);
     expect(second.body.adjustment.currentAllocatedAmount).toBe(3000000);
     expect(await allocationOf(budget._id, item._id)).toBe(3300000);
   });
@@ -2870,9 +3079,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(before.totalExpenseAllocated || 0).toBe(0);
 
     const created = await submit(budget, q, supplementary(item, 500000));
-    const { body } = await call(
-      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" },
-    );
+    const { body } = await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
 
     expect(body.totals.totalExpenseAllocated).toBe(3000000);
     expect(body.totals.totalRevenueAllocated).toBe(4000000);
@@ -2898,7 +3105,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(lineBefore.pace).toBe("over_budget");
 
     const created = await submit(budget, q, revision(item, 200000));
-    await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
 
     // Within budget after it — same spend, revised number.
     const after = await call(`/${budget._id}${q}&asOf=2027-03-31`);
@@ -2930,7 +3137,7 @@ describe("adjustments — supplementary and revision", () => {
     const { budget, q, item } = await setup();
     const created = await submit(budget, q, supplementary(item, 500000));
     const id = created.body.adjustment._id;
-    await call(`/${budget._id}/adjustments/${id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${id}/approve${q}`);
 
     const rejected = await call(`/${budget._id}/adjustments/${id}/reject${q}`, { method: "POST" });
     expect(rejected.status).toBe(409);
@@ -2945,7 +3152,7 @@ describe("adjustments — supplementary and revision", () => {
     const id = created.body.adjustment._id;
 
     await call(`/${budget._id}/adjustments/${id}/reject${q}`, { method: "POST" });
-    const { status, body } = await call(`/${budget._id}/adjustments/${id}/approve${q}`, { method: "POST" });
+    const { status, body } = await approveAdj(`/${budget._id}/adjustments/${id}/approve${q}`);
     expect(status).toBe(409);
     expect(body.message).toMatch(/rejected/);
     expect(await allocationOf(budget._id, item._id)).toBe(2500000);
@@ -2999,7 +3206,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(mine.status).toBe(201);
     const id = mine.body.adjustment._id;
 
-    expect((await call(`/${budget._id}/adjustments/${id}/approve${oq}`, { method: "POST" })).status).toBe(404);
+    expect((await approveAdj(`/${budget._id}/adjustments/${id}/approve${oq}`)).status).toBe(404);
     expect((await call(`/${budget._id}/adjustments/${id}/reject${oq}`, { method: "POST" })).status).toBe(404);
   });
 
@@ -3009,10 +3216,10 @@ describe("adjustments — supplementary and revision", () => {
     expect((await call(`/${new mongoose.Types.ObjectId()}/adjustments${q}`)).status).toBe(404);
     expect((await call(`/not-an-id/adjustments${q}`)).status).toBe(404);
     expect(
-      (await call(`/${budget._id}/adjustments/${new mongoose.Types.ObjectId()}/approve${q}`, { method: "POST" })).status,
+      (await approveAdj(`/${budget._id}/adjustments/${new mongoose.Types.ObjectId()}/approve${q}`)).status,
     ).toBe(404);
     expect(
-      (await call(`/${budget._id}/adjustments/nope/approve${q}`, { method: "POST" })).status,
+      (await approveAdj(`/${budget._id}/adjustments/nope/approve${q}`)).status,
     ).toBe(404);
   });
 
@@ -3024,9 +3231,7 @@ describe("adjustments — supplementary and revision", () => {
     expect(created.status).toBe(201);
     expect(created.body.adjustment.nature).toBe("revenue");
 
-    const { body } = await call(
-      `/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, { method: "POST" },
-    );
+    const { body } = await approveAdj(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`);
     expect(body.totals.totalRevenueAllocated).toBe(5000000);
     expect(await allocationOf(budget._id, revenueItem._id)).toBe(5000000);
   });
@@ -3607,7 +3812,11 @@ describe("authorization", () => {
     const other = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/approve${q}`, {
       method: "POST", user: OWNER,
     });
-    expect(other.status).toBe(200);
+    /* Accepted — 202 rather than 200 because raising an allocation also needs
+       the second signature now. Four eyes and the CEO rule are different
+       rules; what matters here is that this one did not refuse. */
+    expect(other.status).toBe(202);
+    expect(other.body.escalation.waitingOn).toBe("finance");
   });
 
   test("the owner is exempt — one owner per org, so four eyes would deadlock", async () => {
@@ -3619,7 +3828,10 @@ describe("authorization", () => {
     const { status } = await call(`/${budget._id}/adjustments/${mine.body.adjustment._id}/approve${q}`, {
       method: "POST", user: OWNER,
     });
-    expect(status).toBe(200);
+    /* Not 403 — that is the exemption working. It is 202 because the owner is
+       exempt from four eyes and NOT from the CEO rule: raising an allocation
+       still wants a second, different signature. */
+    expect(status).toBe(202);
   });
 
   test("four eyes applies to requests and transfers too, not just adjustments", async () => {
@@ -3671,8 +3883,15 @@ describe("authorization", () => {
       method: "POST", user: EDITOR,
       body: { type: "supplementary", targetItemId: String(budget.items[0]._id), requestedDeltaAmount: 50000, reason: "x" },
     });
-    const { status } = await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, {
+    const legacy = await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, {
       method: "POST", user: LEGACY,
+    });
+    /* Accepted, not locked out — a legacy admin still signs. They are not the
+       owner, so theirs is the finance signature and the CEO closes it. */
+    expect(legacy.status).toBe(202);
+    expect(legacy.body.escalation.waitingOn).toBe("ceo");
+    const { status } = await call(`/${budget._id}/adjustments/${created.body.adjustment._id}/approve${q}`, {
+      method: "POST", user: OWNER,
     });
     expect(status).toBe(200);
   });
@@ -3811,8 +4030,8 @@ describe("concurrency", () => {
        and one department's ₹10k vanished while both callers were told it
        worked. Now one of them is refused outright. */
     const [r1, r2] = await Promise.all([
-      call(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`, { method: "POST" }),
-      call(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`, { method: "POST" }),
+      approveAdj(`/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`),
+      approveAdj(`/${budget._id}/adjustments/${b.body.adjustment._id}/approve${q}`),
     ]);
 
     const codes = [r1.status, r2.status].sort();
@@ -3844,7 +4063,7 @@ describe("concurrency", () => {
     const a = await raiseAdjustment(budget, q, budget.items[0], 10000);
     const url = `/${budget._id}/adjustments/${a.body.adjustment._id}/approve${q}`;
 
-    expect((await call(url, { method: "POST" })).status).toBe(200);
+    expect((await approveAdj(url)).status).toBe(200);
     const second = await call(url, { method: "POST" });
     expect(second.status).toBe(409);
     // The appliedAt guard answers first, with the message that actually
@@ -3942,7 +4161,7 @@ describe("dashboard pending counts", () => {
     expect(before.body.totals.pending.total).toBe(3);
 
     const saved = await Acc_Budget.findById(budget._id).lean();
-    await call(`/${budget._id}/adjustments/${saved.adjustments[0]._id}/approve${q}`, { method: "POST" });
+    await approveAdj(`/${budget._id}/adjustments/${saved.adjustments[0]._id}/approve${q}`);
     await call(`/${budget._id}/adjustments/${saved.adjustments[1]._id}/reject${q}`, { method: "POST" });
     await call(`/${budget._id}/transfers/${saved.transfers[0]._id}/reject${q}`, { method: "POST" });
 

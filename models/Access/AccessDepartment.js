@@ -87,6 +87,20 @@ const accessDepartmentSchema = new mongoose.Schema(
 
     sortOrder: { type: Number, default: 100 },
 
+    /* ── MAY PEOPLE SUBMIT A BUDGET FOR THIS DEPARTMENT ──────────────────────
+     * On by default, because a real department that spends money is one people
+     * budget for, and making somebody tick a box per department before the
+     * Budget app works would be the same setup tax this replaced.
+     *
+     * Turn it off for a department that is an app rather than a cost centre —
+     * the Budget app itself, platform-admin, a shared workspace. Those are
+     * excluded on their own merits below, so this flag exists for the real
+     * cases: a department that exists in the org but does not hold a budget.
+     *
+     * Access is a PERSON-level grant (DepartmentRole.budgetDepartments); this
+     * only decides what Command Centre offers in that picker. */
+    budgetEnabled: { type: Boolean, default: true },
+
     // Forward-looking. The long-term replacement for role-string comparisons:
     // a route asks "does this user have capability X" rather than "is this
     // user's role literally 'hr_manager'". Empty for the seeded 12 — they are

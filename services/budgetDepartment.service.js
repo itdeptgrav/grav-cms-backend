@@ -165,6 +165,10 @@ async function departmentResolver({ companyId } = {}) {
           slug: r.slug,
           name: r.name,
           aliases: r.aliases || [],
+          /* The access link. Carried here because this list IS what the
+             mapping screen renders — without it every row read as unlinked
+             whatever was actually stored. */
+          accessSlug: r.accessSlug || null,
           isActive: r.isActive !== false,
         }))
         .sort((a, b) => a.name.localeCompare(b.name)),
@@ -206,4 +210,157 @@ async function departmentsForAccessSlug({ companyId, accessSlug }) {
   }));
 }
 
-module.exports = { slugify, displayOf, departmentResolver, departmentsForAccessSlug };
+/**
+ * The same lookup for SEVERAL access slugs at once.
+ *
+ * The standalone Budget app needs this: a user reaching `/budget` from the
+ * launcher is not "in" one portal, so their entitlement is the union of every
+ * department they are granted — see grantedAccessSlugs in
+ * routes/Access/budgetProposals.js.
+ *
+ * Fails closed exactly as the single-slug version does: no slugs in, nothing
+ * out. Blank and duplicate slugs are dropped rather than queried, so an empty
+ * grant list can never widen into `{ accessSlug: { $in: [""] } }`.
+ */
+async function departmentsForAccessSlugs({ companyId, accessSlugs }) {
+  const cid = actuals.oid(companyId);
+  const slugs = [
+    ...new Set(
+      (Array.isArray(accessSlugs) ? accessSlugs : [])
+        .map((v) => String(v ?? "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+  if (!cid || slugs.length === 0) return [];
+
+  const rows = await Acc_BudgetDepartment.find({
+    companyId: cid,
+    accessSlug: { $in: slugs },
+    isActive: { $ne: false },
+  })
+    .select("_id slug name aliases accessSlug")
+    .lean();
+
+  return rows.map((r) => ({
+    _id: r._id,
+    slug: r.slug,
+    name: r.name,
+    aliases: r.aliases || [],
+    accessSlug: r.accessSlug || null,
+  }));
+}
+
+/**
+ * Budget departments named DIRECTLY on an access grant, by their own slug.
+ *
+ * ── WHY THIS EXISTS ALONGSIDE departmentsForAccessSlugs ─────────────────────
+ * That function answers "which budget departments has finance linked to the
+ * portal this person signs into" — an indirection that has to be set up twice:
+ * once to give somebody the Budget app, once more to link a portal to a
+ * department. Granting the app was not enough, and the person was told their
+ * account was "not linked" with no way to tell what was missing.
+ *
+ * This one answers the question the grant itself now carries: which budget
+ * departments was this person actually given. One grant, one setup step.
+ *
+ * Company-scoped like everything here, so a slug granted in one company's
+ * books can never resolve in another's. Fails closed on an empty list for the
+ * same reason: an empty `$in` must never widen into everything.
+ */
+async function departmentsForSlugs({ companyId, slugs }) {
+  const cid = actuals.oid(companyId);
+  const wanted = [
+    ...new Set(
+      (Array.isArray(slugs) ? slugs : [])
+        .map((v) => String(v ?? "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+  if (!cid || wanted.length === 0) return [];
+
+  const rows = await Acc_BudgetDepartment.find({
+    companyId: cid,
+    slug: { $in: wanted },
+    isActive: { $ne: false },
+  })
+    .select("_id slug name aliases accessSlug")
+    .lean();
+
+  return rows.map((r) => ({
+    _id: r._id,
+    slug: r.slug,
+    name: r.name,
+    aliases: r.aliases || [],
+    accessSlug: r.accessSlug || null,
+  }));
+}
+
+/**
+ * The departments a person was granted, as budget departments.
+ *
+ * ── WHY THIS READS THE ACCESS LIST AND NOT THE FINANCE REGISTRY ─────────────
+ * A budget department used to have to exist in `Acc_BudgetDepartment` before
+ * anybody could be given it, and finance had to link it to a portal on a
+ * separate screen. That was two setup steps in two consoles for one question —
+ * "may Rakesh submit budget for Logistics" — and it is the reason granting the
+ * app appeared to do nothing.
+ *
+ * The company's own departments are the source now. `Acc_BudgetDepartment` is
+ * still consulted when a row happens to exist, purely for its display name and
+ * aliases, so books that already say "Logistics" keep saying it. A missing row
+ * is not an error and never blocks access: the access grant is the authority.
+ *
+ * Fails closed on an empty grant, and drops the two slugs that are apps rather
+ * than cost centres, so a grant can never widen into everything.
+ */
+async function budgetDepartmentsForGrant({ companyId, slugs }) {
+  const wanted = [
+    ...new Set(
+      (Array.isArray(slugs) ? slugs : [])
+        .map((v) => String(v ?? "").trim().toLowerCase())
+        .filter(Boolean)
+        .filter((v) => v !== "budget" && v !== "platform-admin"),
+    ),
+  ];
+  if (wanted.length === 0) return [];
+
+  const AccessDepartment = require("../models/Access/AccessDepartment");
+  const [access, registered] = await Promise.all([
+    AccessDepartment.find({ slug: { $in: wanted }, isActive: true, budgetEnabled: { $ne: false } })
+      .select("slug name")
+      .lean(),
+    /* Company-scoped, and only for the nicer name. A department granted in
+       Access Control but never registered in these books still resolves. */
+    actuals.oid(companyId)
+      ? Acc_BudgetDepartment.find({
+          companyId: actuals.oid(companyId),
+          slug: { $in: wanted },
+          isActive: { $ne: false },
+        })
+          .select("_id slug name aliases accessSlug")
+          .lean()
+      : [],
+  ]);
+
+  const byRegistered = new Map(registered.map((r) => [r.slug, r]));
+  return access.map((a) => {
+    const hit = byRegistered.get(a.slug);
+    return {
+      _id: hit?._id ?? null,
+      slug: a.slug,
+      name: hit?.name || a.name,
+      aliases: hit?.aliases || [],
+      accessSlug: hit?.accessSlug || null,
+    };
+  });
+}
+
+module.exports = {
+  slugify,
+  displayOf,
+  departmentResolver,
+  departmentsForAccessSlug,
+  departmentsForAccessSlugs,
+  departmentsForSlugs,
+  budgetDepartmentsForGrant,
+};

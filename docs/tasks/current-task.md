@@ -1,14 +1,14 @@
-> **Status:** Active planning.
+> **Status:** Active implementation, chunk by chunk.
 >
-> **Current requested work:** Study the Sales Accounts app in
-> `/Users/risheeray/grav-cms` and `/Users/risheeray/grav-cms-backend`, then
-> scope a proper customer/account budget feature for the Account workspace.
-> The active planning brief is
-> `docs/tasks/sales-account-budget-feature.md`.
+> **Current requested work:** Build a department-head budget app whose UI
+> matches the finance/accountant budget app. The active planning brief is
+> `docs/tasks/department-head-budget-app.md`.
 >
-> **Important:** This is a product/architecture planning task. Do not change
-> application code for the Account Budget feature until an implementation slice
-> is explicitly requested.
+> **Chunk 1:** Shipped. Department app entry + proposals, reusing the existing
+> `/api/budget-proposals` server boundary and shared frontend body.
+>
+> **Next:** Chunk 2 - approved-budget tracking for the department's own
+> approved lines and evaluated actuals.
 >
 > ---
 >

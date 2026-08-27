@@ -33,6 +33,8 @@ const { Acc_Company, Acc_Group, Acc_Ledger } = require("../models/Accountant_mod
 const { Acc_Budget } = require("../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Voucher } = require("../models/Accountant_model/Acc_VoucherModels");
 const { Acc_BudgetDepartment } = require("../models/Accountant_model/Acc_BudgetDepartment");
+const DepartmentRole = require("../models/Access/DepartmentRole");
+const AccessDepartment = require("../models/Access/AccessDepartment");
 const { Acc_CostCentre } = require("../models/Accountant_model/Acc_MasterModels");
 const departments = require("../services/budgetDepartment.service");
 
@@ -263,12 +265,27 @@ async function seed(db) {
    * canonical names. "Logistics" carries a deliberate alias for a plausible
    * misspelling — the one case slugify cannot fold on its own, and the whole
    * reason aliases exist. */
-  for (const [name, aliases] of [
-    ["Logistics", ["logistcs"]],
-    ["Admin", []],
-    ["Marketing", []],
-    ["Sales", []],
-    ["Facilities", []],
+  /* ── WHY EVERY ROW CARRIES AN accessSlug ──────────────────────────────────
+   * `accessSlug` is the ONLY link between a budget department ("Logistics")
+   * and a portal a human actually signs into ("packaging-dispatch"). The
+   * department app resolves it from the database on every request and maps an
+   * unlinked caller to NOTHING — see routes/Access/budgetProposals.js.
+   *
+   * Seeded without it, every document below is invisible to the half of the
+   * feature the demo exists to show: finance sees a full queue, the
+   * department app shows an empty screen, and the flow looks broken rather
+   * than unmapped. Clear one of these to exercise the mapping screen — that
+   * is the state it was built for. */
+  for (const [name, aliases, accessSlug] of [
+    ["Logistics", ["logistcs"], "packaging-dispatch"],
+    ["Admin", [], "hr"],
+    ["Marketing", [], "merchandiser"],
+    ["Sales", [], "sales"],
+    ["Facilities", [], "store"],
+    /* Carried a request from the day this seed was written, but was never in
+       the registry — so `resolver.resolve("Projects")` returned null and the
+       Greenfield ask below could not be seen by anybody. */
+    ["Projects", [], "project-manager"],
   ]) {
     remember(
       Acc_BudgetDepartment,
@@ -277,7 +294,76 @@ async function seed(db) {
         slug: departments.slugify(name),
         name,
         aliases,
+        accessSlug,
         createdBy: "demo-seed",
+      }),
+    );
+  }
+
+  /* ── ACCESS, THE WAY IT IS GRANTED NOW ────────────────────────────────────
+   * One record per demo head: the Budget app, plus the departments it covers.
+   * This is what Access Control writes, so the demo exercises the same path a
+   * real grant takes rather than a shape only the seed produces.
+   *
+   * The `accessSlug` values above stay: they are the older indirection, still
+   * honoured as a fallback, and leaving them here is what proves both paths
+   * resolve at once without producing two rows for one department.
+   *
+   * These grant nothing to anybody real — the addresses are @demo.example and
+   * no login exists for them. Recorded in the manifest, so --purge removes
+   * them precisely. */
+  /* ── THE DEPARTMENTS COMMAND CENTRE OFFERS ────────────────────────────────
+   * Access resolves against the company's own department list, so the demo
+   * has to put its departments there too — otherwise a grant naming
+   * "logistics" refers to something that does not exist and resolves to
+   * nothing, which is exactly the failure this seed is meant to prevent.
+   *
+   * Upserted rather than created: `slug` is globally unique and a real
+   * installation may already have some of these. Only ever ADDS — an existing
+   * row keeps its own name, path and flags untouched. That is also why these
+   * are NOT recorded in the manifest: --purge must not delete a department the
+   * company was already using. */
+  for (const [slug, name] of [
+    ["logistics", "Logistics"],
+    ["admin", "Admin"],
+    ["marketing", "Marketing"],
+    ["facilities", "Facilities"],
+    ["projects", "Projects"],
+  ]) {
+    await AccessDepartment.updateOne(
+      { slug },
+      {
+        $setOnInsert: {
+          key: slug.toUpperCase(),
+          slug,
+          name,
+          dashboardPath: `/d/${slug}`,
+          isActive: true,
+          budgetEnabled: true,
+          showOnOnboarding: false,
+        },
+      },
+      { upsert: true },
+    );
+  }
+
+  for (const [email, name, depts] of [
+    ["logistics.head@demo.example", "Logistics Head", ["logistics"]],
+    ["marketing.head@demo.example", "Marketing Head", ["marketing"]],
+    ["projects.head@demo.example", "Projects Head", ["projects"]],
+    /* Two departments on one grant — the case the picker has to handle. */
+    ["admin@demo.example", "Admin & Facilities", ["admin", "facilities"]],
+  ]) {
+    remember(
+      DepartmentRole,
+      await DepartmentRole.create({
+        departmentSlug: "budget",
+        email,
+        name,
+        role: "editor",
+        isActive: true,
+        budgetDepartments: depts,
+        grantedByEmail: "demo-seed",
       }),
     );
   }
@@ -315,6 +401,38 @@ async function seed(db) {
         priority: "high",
         state: "submitted",
         purpose: "Diwali peak carrier surcharge, not in the original plan",
+        /* A surcharge is the textbook case for phasing: straight-lining it
+           would make every month before the festival read as underspend and
+           the festival itself read as a breach. Sums to requestedAmount —
+           budgetPhasing.service refuses a split that does not. */
+        phasingMode: "custom_monthly",
+        monthlyPhasing: [
+          { month: "2026-09", amount: 60000 },
+          { month: "2026-10", amount: 150000 },
+          { month: "2026-11", amount: 150000 },
+          { month: "2026-12", amount: 90000 },
+        ],
+        /* And the derivation, so the number is reviewable rather than
+           asserted. Recomputed server-side on any edit — quantity × rate ×
+           multiplier — so these amounts must be the honest product. */
+        workingLines: [
+          {
+            label: "Peak-season container surcharge",
+            quantity: 30,
+            unit: "container",
+            rate: 12000,
+            multiplier: 1,
+            amount: 360000,
+          },
+          {
+            label: "Expedited last-mile, metro deliveries",
+            quantity: 900,
+            unit: "shipment",
+            rate: 100,
+            multiplier: 1,
+            amount: 90000,
+          },
+        ],
         submittedBy: "logistics.head@demo.example",
         submittedAt: ist(2026, 8, 20),
       },
@@ -330,6 +448,10 @@ async function seed(db) {
         counterAmount: 180000,
         financeNote: "Half now; revisit after the Q3 review.",
         justification: "Two additional trade shows confirmed for H2.",
+        workingLines: [
+          { label: "Stand build and fit-out", quantity: 2, unit: "show", rate: 110000, multiplier: 1, amount: 220000 },
+          { label: "Travel and per-diem", quantity: 4, unit: "person", rate: 20000, multiplier: 1, amount: 80000 },
+        ],
         submittedBy: "marketing.head@demo.example",
         submittedAt: ist(2026, 8, 19),
       },
@@ -349,16 +471,54 @@ async function seed(db) {
         reason: "Compressor replacement was not foreseen at planning.",
         priority: "high",
         state: "submitted",
+        /* Raised by the department, not by finance. Without it the review
+           queue cannot tell its own housekeeping from somebody's ask, and the
+           four-eyes rule has nothing to check. */
+        origin: "department",
         requestedBy: "admin@demo.example",
         requestedAt: ist(2026, 9, 5),
       },
     ],
-    transfers: [],
+    /* Wired to real lines below — the ids do not exist until Mongo assigns
+       them. A transfer moves budget between two lines and changes no total,
+       which is the one shape neither a request nor an adjustment covers. */
+    transfers: [
+      {
+        fromItemId: new mongoose.Types.ObjectId(), // rewritten below
+        toItemId: new mongoose.Types.ObjectId(), // rewritten below
+        amount: 120000,
+        reason: "Repairs will not use its full year; freight peak needs it.",
+        origin: "department",
+        state: "submitted",
+        requestedBy: "logistics.head@demo.example",
+        requestedAt: ist(2026, 9, 8),
+      },
+    ],
   });
 
-  /* The adjustment has to point at a REAL line, and the line ids only exist
-   * once Mongo has assigned them. */
+  /* The adjustment and the transfer have to point at REAL lines, and the line
+   * ids only exist once Mongo has assigned them. */
   main.adjustments[0].targetItemId = main.items[1]._id;
+  main.transfers[0].fromItemId = main.items[1]._id; // Repairs & Maintenance
+  main.transfers[0].toItemId = main.items[0]._id; // Freight & Forwarding
+  /* The case the requester was actually looking at, snapshotted. Finance
+     reviewing next week reads these, not a re-read that has since moved. */
+  main.transfers[0].fromSnapshot = {
+    department: main.items[1].department,
+    ledgerId: main.items[1].ledgerId,
+    ledgerName: main.items[1].ledgerName,
+    groupName: main.items[1].groupName,
+    nature: main.items[1].nature,
+    allocatedAmount: main.items[1].allocatedAmount,
+  };
+  main.transfers[0].toSnapshot = {
+    department: main.items[0].department,
+    ledgerId: main.items[0].ledgerId,
+    ledgerName: main.items[0].ledgerName,
+    groupName: main.items[0].groupName,
+    nature: main.items[0].nature,
+    allocatedAmount: main.items[0].allocatedAmount,
+  };
   await main.save();
 
   /* 2 — a quarterly budget that has been blown, so the attention lists and
@@ -438,6 +598,32 @@ async function seed(db) {
         purpose: "Site establishment and temporary works",
         submittedBy: "projects.head@demo.example",
         submittedAt: ist(2026, 8, 23),
+      },
+      /* ── A LINE WITH NO LEDGER ─────────────────────────────────────────────
+       * The department needs to budget for something the chart of accounts
+       * has no head for. It may not create one — that is an accounting
+       * decision — so it asks, and the line carries `requestedHead` instead
+       * of a `ledgerId`. Agreeing it returns 409 HEAD_UNRESOLVED until
+       * finance maps or creates the ledger, which is the point. */
+      {
+        department: "Projects",
+        ledgerId: undefined,
+        requestedHead: {
+          name: "Site Security & Watch-and-Ward",
+          nature: "expense",
+          reason: "Round-the-clock guarding for the site; nothing existing fits.",
+          suggestedGroupName: "Indirect Expenses",
+          state: "requested",
+          requestedBy: "projects.head@demo.example",
+          requestedAt: ist(2026, 8, 24),
+        },
+        nature: "expense",
+        requestedAmount: 640000,
+        priority: "normal",
+        state: "submitted",
+        purpose: "Two shifts of guarding for the build period",
+        submittedBy: "projects.head@demo.example",
+        submittedAt: ist(2026, 8, 24),
       },
     ],
   });

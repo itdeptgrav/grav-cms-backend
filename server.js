@@ -993,6 +993,10 @@ app.use("/api/change-requests", require("./routes/Access/changeRequests"));
  * frontend's authFetch skips that prefix, so a department session would never
  * reach it. The router authenticates itself; see its header. */
 app.use("/api/budget-proposals", require("./routes/Access/budgetProposals"));
+/* The company drive's bytes. Self-protecting: every endpoint in it verifies
+   the session itself, and /download additionally requires a short-lived
+   signed token — see routes/Access/files.js. */
+app.use("/api/files", require("./routes/Access/files"));
 
 // Unauthenticated on purpose — backs the public /onboarding tile grid.
 // Returns names and icons only; never emails, counts or user data.
@@ -1379,10 +1383,21 @@ app.use(
   require("./routes/CMS_Routes/Inventory/Operations/storeSettingsRoutes")
 );
 
-app.use(
-  "/api/cowork/mrf",
-  require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes"),
-);
+const mrfRequesterRoutes = require("./routes/CMS_Routes/Inventory/Operations/coworkMrfRoutes");
+
+/* The Firebase door — the Cowork app, unchanged behaviour. */
+app.use("/api/cowork/mrf", mrfRequesterRoutes.firebaseChain, mrfRequesterRoutes);
+
+/* ── THE CMS DOOR ────────────────────────────────────────────────────────────
+ * The same handlers, behind the CMS's own employee login, for the Material
+ * Requests app in the launcher. One router, two authentications: the approval
+ * flow, the notifications and the chat are literally the same code, so they
+ * cannot drift the way two copies of them would.
+ *
+ * `EmployeeAuth` first — it verifies the CMS session and puts the employee on
+ * `req.user`; the attach step then restates that in the shape the handlers read.
+ */
+app.use("/api/cms/mrf", mrfRequesterRoutes.cmsChain, mrfRequesterRoutes);
 
 // Role enforcement + the editor-needs-approval queue for the routes PRODUCTION
 // actually owns. Deliberately NOT applied to /api/cms/manufacturing/* at large:
@@ -1669,6 +1684,12 @@ app.use(
 app.use(
   "/api/accountant/tally/companies",
   require("./routes/Accountant_Routes/Acc_companies"),
+);
+/* GSTIN verification for the parties in the books — reads are free, the
+   sweep is the only thing that spends. See the route file's header. */
+app.use(
+  "/api/accountant/gst-verification",
+  require("./routes/Accountant_Routes/Acc_gstVerification"),
 );
 app.use(
   "/api/accountant/tally/import",

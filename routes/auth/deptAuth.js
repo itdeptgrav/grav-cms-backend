@@ -1451,14 +1451,29 @@ router.post("/cowork-sso", async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    // Found by `externalBaseUrl` being SET, not by slug or name. A department
-    // is identified as "the CoWork one" by what it DOES (opens an external
-    // app via this bridge), never by an admin having typed an exact string —
-    // an admin renaming "CoWork" to "Co-Workspace" (a real case this was
-    // debugged against) must not silently break sign-in.
+    // ── WHICH EXTERNAL APP IS BEING OPENED ────────────────────────────────
+    //
+    // A department is identified as "external" by what it DOES — it has an
+    // `externalBaseUrl`, so opening it means handing the browser to another
+    // origin — never by an admin having typed an exact name. An admin renaming
+    // "CoWork" to "Co-Workspace" (a real case this was debugged against) must
+    // not silently break sign-in.
+    //
+    // There is now more than one such app. Material Requests runs on the same
+    // origin as CoWork but is its own department with its own grant, so a
+    // person can raise a material request without being given the whole
+    // workspace. `findOne` with no slug would pick whichever came back first
+    // and check the caller against THAT one's grant, which is the wrong
+    // question and, half the time, the wrong answer.
+    //
+    // So the caller names the tile it is opening. No slug means the request
+    // came from a client written before this, and the old behaviour — the one
+    // external app there used to be — is exactly right for it.
+    const wantedSlug = String(req.body?.slug || "").trim().toLowerCase();
     const coworkDept = await AccessDepartment.findOne({
       isActive: true,
       externalBaseUrl: { $nin: [null, ""] },
+      ...(wantedSlug ? { slug: wantedSlug } : {}),
     });
     if (!coworkDept) {
       return res.status(500).json({
@@ -1468,13 +1483,16 @@ router.post("/cowork-sso", async (req, res) => {
       });
     }
 
+    /* The grant is checked against the department actually being opened, so
+       holding Material Requests does not open CoWork and holding CoWork does
+       not open Material Requests. Each tile is its own decision. */
     const holdsIt = (await resolveEmployeeDepartments(employee))
       .some((d) => String(d._id) === String(coworkDept._id));
     if (!holdsIt) {
       return res.status(403).json({
         success: false,
         code: "NO_COWORK_ACCESS",
-        message: "You do not have CoWork access. Ask an administrator to grant it.",
+        message: `You do not have ${coworkDept.name} access. Ask an administrator to grant it.`,
       });
     }
 
@@ -1542,6 +1560,16 @@ router.post("/cowork-sso", async (req, res) => {
       success: true,
       token: customToken,
       redirectBaseUrl: coworkDept.externalBaseUrl,
+      /* Where inside that app to land. A workspace tile has no path and lands
+         on its own home; Material Requests carries "/mrf" and opens straight
+         into the app rather than by way of somebody else's dashboard.
+
+         A PATH, never a URL: the destination is always inside the origin above,
+         and accepting a full URL here would make this an open redirect. */
+      redirectPath:
+        coworkDept.dashboardPath && coworkDept.dashboardPath.startsWith("/")
+          ? coworkDept.dashboardPath
+          : null,
     });
   } catch (error) {
     console.error("[auth] cowork-sso error:", error);

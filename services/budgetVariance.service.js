@@ -29,6 +29,8 @@
  * passed in. That keeps it testable and keeps the maths honest.
  */
 
+const budgetPhasing = require("./budgetPhasing.service");
+
 /* ── Tolerant readers ───────────────────────────────────────────────────────
  * `Number(null)` is 0 and `new Date(null)` is the epoch. Both have bitten this
  * codebase before: an unset field read as a deliberate zero. Everything that
@@ -107,9 +109,33 @@ function elapsedFraction({ startDate, endDate, asOf }) {
  * year makes every month until October look like a miss. With no phasing the
  * line straight-lines, which is the right default and what most rows will use.
  */
-function expectedToDate({ allocated, startDate, endDate, asOf, phasing }) {
+function expectedToDate({
+  allocated,
+  startDate,
+  endDate,
+  asOf,
+  phasing,
+  phasingMode,
+  monthlyPhasing,
+}) {
   const alloc = money(allocated);
   if (alloc === null) return null;
+
+  /* An absolute monthly split is a different question from positional
+     weights: it names calendar months, so "how much of it has run" is answered
+     month by month with the part-month counted by day — not by slicing the
+     period into equal buckets. Delegated so the chart's plan line and this
+     figure cannot disagree. */
+  if (phasingMode === "custom_monthly" && Array.isArray(monthlyPhasing) && monthlyPhasing.length) {
+    return budgetPhasing.expectedToDate({
+      amount: alloc,
+      startDate,
+      endDate,
+      asOf,
+      phasingMode,
+      monthlyPhasing,
+    });
+  }
 
   const weights = Array.isArray(phasing)
     ? phasing.map((w) => money(w)).filter((w) => w !== null && w >= 0)
@@ -146,6 +172,8 @@ function evaluateLine({
   endDate,
   asOf,
   phasing,
+  phasingMode,
+  monthlyPhasing,
   warnAtPct = 90,
   criticalAtPct = 100,
 } = {}) {
@@ -160,7 +188,15 @@ function evaluateLine({
      same ratio for both natures — only its desirability differs. */
   const utilizationPct = alloc > 0 ? (act / alloc) * 100 : null;
 
-  const expected = expectedToDate({ allocated: alloc, startDate, endDate, asOf, phasing });
+  const expected = expectedToDate({
+    allocated: alloc,
+    startDate,
+    endDate,
+    asOf,
+    phasing,
+    phasingMode,
+    monthlyPhasing,
+  });
   const paceGap = expected === null ? null : kind === "revenue" ? act - expected : expected - act;
   const elapsed = elapsedFraction({ startDate, endDate, asOf });
 
@@ -287,15 +323,39 @@ function rollUp(lines = []) {
    * and adding it to either produces a figure that cannot be reconciled. */
   const other = seed();
 
+  /* ── HOW MANY HEADS ARE OVER, AND BY HOW MUCH ────────────────────────────
+     Counted per head and never netted. Allocations are not fungible — moving
+     money between heads is a transfer, and a transfer needs approving — so a
+     round where freight is ₹30,000 over and stationery ₹30,000 under has not
+     stayed within budget. It overspent freight without permission and was
+     lucky elsewhere, and a netted total would report that as healthy.
+
+     Expense only. A revenue head below its target is a shortfall, not an
+     overspend; adding the two would produce a figure that describes nothing.
+
+     Derived here rather than stored on the budget, like every other number in
+     this module: actuals come from posted vouchers and move whenever one is
+     edited, cancelled or unposted, so a saved verdict would go stale with no
+     one to notice. */
+  const overrun = { heads: 0, amount: 0 };
+
   for (const l of lines) {
     if (!l) continue;
     const kind = natureOf(l);
     const bucket = kind === "revenue" ? revenue : kind === "other" ? other : expense;
-    bucket.allocated += money(l.allocated) ?? 0;
-    bucket.actual += money(l.actual) ?? 0;
+    const allocated = money(l.allocated) ?? 0;
+    const actual = money(l.actual) ?? 0;
+    bucket.allocated += allocated;
+    bucket.actual += actual;
     bucket.variance += money(l.variance) ?? 0;
     bucket.count += 1;
+
+    if (kind === "expense" && actual > allocated) {
+      overrun.heads += 1;
+      overrun.amount += actual - allocated;
+    }
   }
+  overrun.amount = Math.round(overrun.amount * 100) / 100;
 
   const budgetedNet = revenue.allocated - expense.allocated;
   const actualNet = revenue.actual - expense.actual;
@@ -304,6 +364,11 @@ function rollUp(lines = []) {
     revenue,
     expense,
     other,
+    /* The health of the round, said in figures rather than as a status word.
+       `status` stays the lifecycle — what the round is DOING — because a
+       single flag is either alarmist on a ₹5,000 slip or misleading when it
+       nets a real overspend away. "3 heads over · ₹42,000" is neither. */
+    overrun,
     /* What each side actually has, so a caller can ask "is there a revenue
      * side at all" without inferring it from a zero — a company with no
      * revenue targets and a company whose targets are all met both total

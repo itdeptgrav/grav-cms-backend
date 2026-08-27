@@ -27,6 +27,7 @@ const { Acc_Budget } = require("../models/Accountant_model/Acc_OperationalModels
 const actuals = require("./budgetActuals.service");
 const departments = require("./budgetDepartment.service");
 const variance = require("./budgetVariance.service");
+const escalation = require("./budgetEscalation.service");
 
 /**
  * Which budgets are live enough to control spend.
@@ -581,8 +582,36 @@ function messageFor(status, results) {
  * warning. An unexpected failure logs and lets the voucher through; the
  * budget screens will still show the overspend afterwards.
  */
-async function clearanceFor({ voucher, overrideReason, department = null, user = null } = {}) {
+/**
+ * ── A REASON IS NO LONGER ENOUGH ────────────────────────────────────────────
+ * This used to let anything through the moment somebody typed a sentence. But
+ * posting vouchers is the accounts job and every role that does it may post
+ * directly, so the person spending past the budget was always the person
+ * allowed to wave it through. It read like an approval and was a log.
+ *
+ * Now an overspend needs two signatures, one of them the CEO's — see
+ * budgetEscalation.service. `clearanceFor` blocks until it has both, and
+ * because every gate in the app already refuses on `blocked`, all five of them
+ * inherit the rule without knowing it exists.
+ *
+ * `signatures` are the ones already collected on this voucher. A reason from
+ * somebody who may sign counts as THEIR signature, so finance writing "here is
+ * why" is finance approving it and not a separate click.
+ */
+async function clearanceFor({
+  voucher,
+  overrideReason,
+  department = null,
+  user = null,
+  signatures = null,
+  /* True when this call IS somebody approving, rather than a check on the way
+     past. Approving is signing, so it collects a signature whether or not a
+     sentence came with it — the second signer is allowed to add nothing, and
+     it is the escalation service that decides the FIRST one must speak. */
+  signing = false,
+} = {}) {
   const reason = String(overrideReason || "").trim();
+  const held = signatures || voucher?.budgetOverride?.signatures || [];
   try {
     const check = await checkBudgetAvailability({
       companyId: voucher.companyId,
@@ -600,52 +629,90 @@ async function clearanceFor({ voucher, overrideReason, department = null, user =
       excludeVoucherId: voucher.status === "posted" ? voucher._id : null,
     });
 
-    if (check.requiredOverride && !reason) {
-      return {
-        blocked: true,
-        check,
-        payload: {
-          error: check.message,
-          code: "BUDGET_OVERRIDE_REQUIRED",
-          budgetCheck: check,
-        },
-      };
+    if (check.requiredOverride) {
+      /* A reason from somebody who may sign is their signature. From anybody
+         else it is the case they are making, and it travels on the voucher
+         for the two who do have to sign. */
+      let collected = held;
+      let signatureError = null;
+      if ((signing || reason) && escalation.maySign(user)) {
+        const added = escalation.addSignature(held, { user, reason });
+        if (added.signatures) collected = added.signatures;
+        /* Kept rather than swallowed: somebody clicking approve a second time
+           has to be told they are the same person, not handed the same
+           "waiting for the CEO" they saw a moment ago. */
+        else signatureError = added;
+      }
+
+      if (!escalation.isComplete(collected)) {
+        return {
+          blocked: true,
+          check,
+          signatures: collected,
+          signatureError,
+          payload: {
+            error: signatureError?.error || check.message,
+            /* The old code is kept alongside the new one. Clients written
+               before this still recognise the refusal; the new one tells them
+               it is now a queue rather than a prompt for a sentence. */
+            code: "BUDGET_OVERRIDE_REQUIRED",
+            escalation: {
+              required: true,
+              code: signatureError?.code || "BUDGET_ESCALATION_REQUIRED",
+              waitingOn: escalation.waitingOn(collected),
+              message: escalation.describe(collected),
+              signatures: collected,
+            },
+            budgetCheck: check,
+          },
+        };
+      }
+      /* Both signatures are in — fall through and let it post. */
+      return { blocked: false, check, signatures: collected, override: overrideRecord(check, collected) };
     }
 
-    /* Metadata is written whenever an override was NEEDED. A voucher that
-     * says "over budget, and here is who said yes and why" is the entire
-     * point; one that posts silently is what we had before this chunk. */
-    if (!check.requiredOverride) return { blocked: false, check, override: null };
-
-    return {
-      blocked: false,
-      check,
-      override: {
-        required: true,
-        reason,
-        status: check.overallStatus,
-        checkedAt: check.checkedAt,
-        overriddenBy: user?.id,
-        overriddenByName: user?.name || "",
-        results: (check.results || [])
-          .filter((r) => r.status !== "ok")
-          .map((r) => ({
-            ledgerId: r.ledgerId,
-            ledgerName: r.ledgerName,
-            department: r.department,
-            status: r.status,
-            allocated: r.allocated,
-            actual: r.actual,
-            thisVoucher: r.thisVoucher,
-            projectedActual: r.projectedActual,
-            remainingAfter: r.remainingAfter,
-          })),
-      },
-    };
+    /* Within budget: nothing to record. */
+    return { blocked: false, check, override: null };
   } catch (e) {
     console.error("[budgetControl] check failed, allowing post:", e.message);
     return { blocked: false, check: null, override: null };
   }
+}
+
+/**
+ * What a posted-over-budget voucher permanently carries.
+ *
+ * The named fields stay as they were — everything written before signatures
+ * existed still reads the same way — and are filled from the completed set:
+ * the CEO is the one recorded as having overridden it, and the case made by
+ * whoever signed first is the reason. The full set travels alongside, so the
+ * record shows both names rather than only the last.
+ */
+function overrideRecord(check, signatures = []) {
+  const ceo = signatures.find((s) => s.slot === escalation.CEO);
+  const stated = signatures.find((s) => s.reason);
+  return {
+    required: true,
+    reason: stated?.reason || "",
+    status: check.overallStatus,
+    checkedAt: check.checkedAt,
+    overriddenBy: ceo?.userId || signatures[signatures.length - 1]?.userId,
+    overriddenByName: ceo?.name || signatures[signatures.length - 1]?.name || "",
+    signatures,
+    results: (check.results || [])
+      .filter((r) => r.status !== "ok")
+      .map((r) => ({
+        ledgerId: r.ledgerId,
+        ledgerName: r.ledgerName,
+        department: r.department,
+        status: r.status,
+        allocated: r.allocated,
+        actual: r.actual,
+        thisVoucher: r.thisVoucher,
+        projectedActual: r.projectedActual,
+        remainingAfter: r.remainingAfter,
+      })),
+  };
 }
 
 /**
@@ -728,6 +795,7 @@ module.exports = {
   checkBudgetAvailability,
   clearanceFor,
   assertClearance,
+  overrideRecord,
   proposedVoucher,
   affectsBudget,
   BudgetOverrideRequiredError,

@@ -17,6 +17,22 @@ const { ROLES, ROLE_KEYS, roleAtLeast } = DepartmentRole;
 
 const ACCOUNTING = "accountant";
 
+/* The standalone Budget app's own slug. Its grant is the only one that carries
+   which departments it covers — see DepartmentRole.budgetDepartments. */
+const BUDGET = "budget";
+
+/** Slugs, deduped, blanks dropped. An empty list is stored as an empty list:
+ *  "granted the app, no departments yet" is a real state the app explains. */
+function normaliseBudgetDepartments(value) {
+  return [
+    ...new Set(
+      (Array.isArray(value) ? value : [])
+        .map((v) => String(v ?? "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ];
+}
+
 /* ------------------------------------------------------------------ */
 /* Reading                                                             */
 /* ------------------------------------------------------------------ */
@@ -56,11 +72,14 @@ async function listRoles(departmentSlug) {
   }
 
   const rows = await DepartmentRole.find({ departmentSlug: slug })
-    .select("name email role isActive updatedAt")
+    .select("name email role isActive updatedAt budgetDepartments")
     .sort({ role: 1, name: 1 })
     .lean();
   return rows.map((r) => ({
     email: r.email, name: r.name, role: r.role, isActive: r.isActive !== false, updatedAt: r.updatedAt,
+    /* Only ever populated on the Budget grant; the admin screen reads it to
+       show which departments a person may submit for. */
+    budgetDepartments: r.budgetDepartments || [],
   }));
 }
 
@@ -74,7 +93,7 @@ async function listRoles(departmentSlug) {
  * @param actor  the administrator doing it, recorded on the row so the change
  *               log and the row itself agree about who is responsible
  */
-async function setRole({ departmentSlug, email, name, role, password, actor }) {
+async function setRole({ departmentSlug, email, name, role, password, budgetDepartments, actor }) {
   const slug = String(departmentSlug || "").toLowerCase().trim();
   const mail = String(email || "").toLowerCase().trim();
   if (!slug) throw new Error("A department is required");
@@ -123,6 +142,12 @@ async function setRole({ departmentSlug, email, name, role, password, actor }) {
         role,
         isActive: true,
         ...(name ? { name } : {}),
+        /* Only the Budget grant carries departments. Sending them on any other
+           slug is ignored rather than refused — one admin route serves every
+           department, and a 400 here would make the caller special-case it. */
+        ...(slug === BUDGET && budgetDepartments !== undefined
+          ? { budgetDepartments: normaliseBudgetDepartments(budgetDepartments) }
+          : {}),
         grantedBy: actor?._id,
         grantedByEmail: actor?.email || "",
       },

@@ -20,10 +20,17 @@ const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddlew
 const { Acc_Budget } = require("../../models/Accountant_model/Acc_OperationalModels");
 const { Acc_Ledger, Acc_Group, Acc_CostCentre } = require("../../models/Accountant_model/Acc_MasterModels");
 const variance = require("../../services/budgetVariance.service");
+const phasing = require("../../services/budgetPhasing.service");
+const working = require("../../services/budgetWorking.service");
+const adjustments = require("../../services/budgetAdjustment.service");
+const transfersvc = require("../../services/budgetTransfer.service");
 const actuals = require("../../services/budgetActuals.service");
 const overlap = require("../../services/budgetOverlap.service");
 const control = require("../../services/budgetControl.service");
+const escalation = require("../../services/budgetEscalation.service");
 const departments = require("../../services/budgetDepartment.service");
+const roundNames = require("../../services/budgetRoundName.service");
+const subWindow = require("../../services/budgetSubmissionWindow.service");
 
 router.use(AccountantAuthMiddleware.accountantAuth);
 
@@ -263,6 +270,8 @@ async function evaluate(budget, req, { asOf, resolver } = {}) {
       endDate: budget.endDate,
       asOf: when,
       phasing: line.phasing,
+      phasingMode: line.phasingMode,
+      monthlyPhasing: line.monthlyPhasing,
     });
     return { ...line, ...v, _id: line._id, department: line.department || null };
   });
@@ -611,14 +620,25 @@ async function monthlySeries(evaluated, allLines, req, linesOf) {
       const alloc = variance.money(item.allocatedAmount) ?? 0;
       if (!(alloc > 0)) continue;
       const isRevenue = item.nature === "revenue";
-      const weights = monthWeights(item.phasing, months.length);
 
-      months.forEach((key, i) => {
-        const share = alloc * weights[i];
+      /* One spreading rule for the whole module. This used to compute its own
+         weights, and agreed with `expectedToDate` only because both happened
+         to be even — a line with a custom split would have made the chart's
+         plan line and the line's own pace figure tell different stories. */
+      const byMonth = phasing.plannedByMonth({
+        amount: alloc,
+        startDate: b.startDate,
+        endDate: b.endDate,
+        phasingMode: item.phasingMode,
+        monthlyPhasing: item.monthlyPhasing,
+        phasing: item.phasing,
+      });
+
+      for (const [key, share] of byMonth) {
         const target = bucket(key);
         if (isRevenue) target.plannedRevenue += share;
         else target.plannedExpense += share;
-      });
+      }
     }
   }
 
@@ -692,6 +712,10 @@ function monthsCovered(start, end) {
 }
 
 /**
+ * SUPERSEDED by budgetPhasing.plannedByMonth, which handles the same legacy
+ * weights plus the absolute monthly split. Kept only because removing an
+ * exported-looking helper mid-chunk is a separate change; nothing calls it.
+ *
  * How one line's allocation divides across the months it covers.
  *
  * Flat unless the line carries `phasing`, in which case those weights are
@@ -863,6 +887,8 @@ async function dedupeOverlappingActuals(evaluated, contestSet, req, asOf) {
         endDate: b.endDate,
         asOf: asOf || b.asOf,
         phasing: line.phasing,
+        phasingMode: line.phasingMode,
+        monthlyPhasing: line.monthlyPhasing,
       });
       return {
         ...line,
@@ -1768,6 +1794,52 @@ function scopePatch(body, existing, resolver = null) {
   };
 }
 
+/**
+ * Validate and normalise every line's monthly phasing against the budget's
+ * own period.
+ *
+ * Refused rather than corrected: a split that does not add up, or names a
+ * month outside the period, is a disagreement between two numbers a person
+ * entered — silently rescaling it would store a shape nobody agreed to and
+ * make the total on screen stop matching the total in the books.
+ *
+ * Lines without phasing pass straight through, which is every line written
+ * before this existed.
+ */
+function validateLinePhasing(items, { startDate, endDate }) {
+  if (!Array.isArray(items)) return { items };
+  const out = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") {
+      out.push(item);
+      continue;
+    }
+    if (item.phasingMode !== "custom_monthly") {
+      // Normalising even-mode too, so flipping custom → even clears the split
+      // rather than leaving one that reactivates on the next flip.
+      out.push({ ...item, phasingMode: "even", monthlyPhasing: [] });
+      continue;
+    }
+    try {
+      const stored = phasing.normalisePhasing({
+        phasingMode: item.phasingMode,
+        monthlyPhasing: item.monthlyPhasing,
+        amount: item.allocatedAmount,
+        startDate,
+        endDate,
+      });
+      out.push({ ...item, ...stored });
+    } catch (e) {
+      if (e instanceof phasing.PhasingError) {
+        const who = item.ledgerName || item.department || "a line";
+        return { error: `${who}: ${e.message}`, code: e.code };
+      }
+      throw e;
+    }
+  }
+  return { items: out };
+}
+
 /* ── CREATE ──────────────────────────────────────────────────────────────── */
 router.post("/", async (req, res) => {
   try {
@@ -1793,6 +1865,113 @@ router.post("/", async (req, res) => {
     });
     if (bound.error) return res.status(400).json({ success: false, message: bound.error });
     data.items = bound.items;
+
+    const phased = validateLinePhasing(data.items, {
+      startDate: data.startDate,
+      endDate: data.endDate,
+    });
+    if (phased.error) {
+      return res.status(400).json({ success: false, message: phased.error, code: phased.code });
+    }
+    data.items = phased.items;
+
+    /* ── A COMPANY ROUND NAMES ITSELF ─────────────────────────────────────
+     * `name` is required on the schema, so a client that does not send one
+     * would fail validation and surface as a 500. For a company round the
+     * name is fully determined by the year and the period, so deriving it is
+     * strictly better than refusing: nobody has to invent a title, and two
+     * people opening the same quarter cannot spell it differently.
+     *
+     * Defensive, not authoritative — the form sends the same string from the
+     * same rules. A department- or project-scope budget is NOT named this
+     * way: those are one-off documents whose name is real information, and
+     * they still say what they are for. */
+    if (scoped.patch.scope === "company") {
+      /* ── ONE COMPANY ROUND PER FINANCIAL YEAR ───────────────────────────
+       * A year has one budget. Opening a second one for the same FY splits
+       * every department's asks across two envelopes and makes "the FY 26-27
+       * budget" ambiguous in every report that rolls up by year — quarterly
+       * and monthly planning belong in a line's monthly phasing, which the
+       * proposal form already collects.
+       *
+       * Checked before anything is written, and only for COMPANY scope: a
+       * project or standalone department budget is a different object and
+       * several may legitimately run inside one year.
+       *
+       * Deliberately blocks on a closed round too. A finished FY is still
+       * that FY's budget, and "re-open the old one" is the honest answer
+       * rather than quietly starting a parallel history. */
+      const fy = String(data.financialYear || "").trim();
+      if (fy) {
+        const clash = await Acc_Budget.findOne({
+          companyId: cidForDepartments,
+          financialYear: fy,
+          $or: [{ scope: "company" }, { scope: { $exists: false } }, { scope: null }],
+        })
+          .select("_id name")
+          .lean();
+        if (clash) {
+          return res.status(409).json({
+            success: false,
+            code: "FY_BUDGET_EXISTS",
+            budgetId: String(clash._id),
+            message: `${clash.name || `Budget FY ${fy}`} already exists. Open that budget instead.`,
+          });
+        }
+      }
+
+      /* A company round IS the financial year. `period` stays on the document
+         because reports, the date maths and older rows all read it — it is
+         simply no longer a question anybody is asked. An explicit period is
+         still honoured so an importer or an older client is not broken. */
+      if (!data.period) data.period = "yearly";
+
+      /* Dates first — the name is derived FROM the start date, so filling a
+         missing range before naming means a caller that sent only a year and
+         a period still gets "Q2" rather than the bare year. `quarter` and
+         `month` are the FY-relative indices the schema already carries. */
+      if (!data.startDate || !data.endDate) {
+        const idx = data.period === "monthly" ? data.month : data.quarter;
+        const range = roundNames.roundDates({
+          financialYear: data.financialYear,
+          period: data.period,
+          index: Number(idx) || 0,
+        });
+        if (range.startDate && range.endDate) {
+          data.startDate = data.startDate || range.startDate;
+          data.endDate = data.endDate || range.endDate;
+        }
+      }
+
+      if (!String(data.name || "").trim()) {
+        data.name = roundNames.roundName({
+          financialYear: data.financialYear,
+          period: data.period,
+          startDate: data.startDate,
+        });
+      }
+
+      /* The asking season, when nobody set one: the month before the money
+         starts applying. Only filled for a round that named neither end — a
+         caller setting one end deliberately is not corrected. */
+      if (!data.submissionStartDate && !data.submissionEndDate) {
+        /* Never a window that closed before the round existed — see
+           windowForNewRound. */
+        const w = subWindow.windowForNewRound(data.startDate);
+        if (w.submissionStartDate) {
+          data.submissionStartDate = w.submissionStartDate;
+          data.submissionEndDate = w.submissionEndDate;
+        }
+      }
+    }
+
+    const windowError = subWindow.validateWindow(data);
+    if (windowError.error) {
+      return res
+        .status(400)
+        .json({ success: false, message: windowError.error, code: windowError.code });
+    }
+
     data.createdBy = req.user.id;
     const cid = actuals.oid(companyOf(req));
     if (cid && !data.companyId) data.companyId = cid;
@@ -1846,6 +2025,23 @@ router.put("/:id", async (req, res) => {
     const current = await Acc_Budget.findOne(scopeFilter(req, req.params.id)).lean();
     if (!current) return res.status(404).json({ success: false, message: "Budget not found" });
 
+    /* Checked against the row this patch will LEAVE, not the patch alone:
+       moving only the closing date has to be judged against the opening date
+       already stored, or a backwards window slips through one field at a
+       time. */
+    const nextWindow = {
+      submissionStartDate:
+        data.submissionStartDate !== undefined ? data.submissionStartDate : current.submissionStartDate,
+      submissionEndDate:
+        data.submissionEndDate !== undefined ? data.submissionEndDate : current.submissionEndDate,
+    };
+    const windowError = subWindow.validateWindow(nextWindow);
+    if (windowError.error) {
+      return res
+        .status(400)
+        .json({ success: false, message: windowError.error, code: windowError.code });
+    }
+
     const resolver = await departments.departmentResolver({
       companyId: current.companyId || actuals.oid(companyOf(req)),
     });
@@ -1874,6 +2070,20 @@ router.put("/:id", async (req, res) => {
       });
       if (bound.error) return res.status(400).json({ success: false, message: bound.error });
       data.items = bound.items;
+
+      /* Checked against the EFFECTIVE period — the one this PUT is setting if
+         it changes the dates, otherwise the stored one. Validating against the
+         old period would let a shortened year keep a split that now names a
+         month it no longer covers. */
+      const phased = validateLinePhasing(data.items, {
+        startDate: data.startDate ?? current.startDate,
+        endDate: data.endDate ?? current.endDate,
+      });
+      if (phased.error) {
+        return res.status(400).json({ success: false, message: phased.error, code: phased.code });
+      }
+      data.items = phased.items;
+
       cacheTotals(data);
     }
 
@@ -2236,6 +2446,26 @@ router.post("/:id/requests", async (req, res) => {
       companyId: budget.companyId || actuals.oid(companyOf(req)),
     });
 
+    /* The department's PROPOSED split, checked against the budget's period and
+       its own requested amount. A department may propose any shape; what it
+       may not do is propose one that does not add up, because finance would
+       then be agreeing two different numbers. */
+    let proposed;
+    try {
+      proposed = phasing.normalisePhasing({
+        phasingMode: req.body.phasingMode,
+        monthlyPhasing: req.body.monthlyPhasing,
+        amount: variance.money(req.body.requestedAmount),
+        startDate: budget.startDate,
+        endDate: budget.endDate,
+      });
+    } catch (e) {
+      if (e instanceof phasing.PhasingError) {
+        return res.status(400).json({ success: false, message: e.message, code: e.code });
+      }
+      throw e;
+    }
+
     budget.budgetRequests.push({
       department:
         requestResolver.canonicalName(req.body.department) ||
@@ -2249,6 +2479,7 @@ router.post("/:id/requests", async (req, res) => {
       expectedFrom: req.body.expectedFrom || undefined,
       expectedTo: req.body.expectedTo || undefined,
       note: req.body.note,
+      ...proposed,
       state: "submitted",
       submittedAt: now,
       submittedBy: actorOf(req),
@@ -2458,7 +2689,23 @@ function syncAllocationFromRequest(budget, request) {
     typeof request.submittedBy === "string" && request.submittedBy.includes("@")
       ? request.submittedBy
       : undefined;
-  const why = request.purpose || request.justification || undefined;
+  /* The line's own one-line explanation. When a request carries a structured
+     breakdown, the note says so and names the biggest rows — an allocation
+     line reading "Software subscriptions" tells a reader nothing six months
+     later, and "Built from 3 lines: Claude Team, Codex usage, Copilot" points
+     them back at the request that still holds the arithmetic.
+
+     Only ever used to FILL an empty note; a note finance has since written is
+     never clobbered. The request remains the audit source for the detail —
+     the full breakdown is deliberately not copied onto the line. */
+  const why =
+    working.summarise({
+      purpose: request.purpose || request.justification,
+      lines: request.workingLines || [],
+      total: (request.workingLines || []).length
+        ? (request.workingLines || []).reduce((s, l) => s + (Number(l.amount) || 0), 0)
+        : null,
+    }) || undefined;
 
   const shape = {
     sourceRequestId: request._id,
@@ -2468,6 +2715,14 @@ function syncAllocationFromRequest(budget, request) {
     nature: request.nature,
     department: request.department,
     allocatedAmount: variance.money(request.agreedAmount) ?? 0,
+    /* The agreed shape, not the requested one. Without this the line would
+       straight-line money that finance agreed to phase, and the plan curve
+       would disagree with the decision that produced it. */
+    phasingMode: request.agreedPhasingMode || "even",
+    monthlyPhasing:
+      request.agreedPhasingMode === "custom_monthly"
+        ? (request.agreedMonthlyPhasing || []).map((r) => ({ month: r.month, amount: r.amount }))
+        : [],
   };
 
   if (existing) {
@@ -2501,6 +2756,24 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
     if (error) return res.status(error.status).json({ success: false, message: error.message });
     if (requireFinance(req, res, request.submittedBy)) return;
 
+    /* ── NO ALLOCATION WITHOUT A REAL HEAD ─────────────────────────────────
+     * A request that asked for a head finance has not decided on yet cannot
+     * be agreed: `syncAllocationFromRequest` posts against `ledgerId`, and a
+     * line with none is a number that can never reach a report. Resolve the
+     * head first — map it, or create the ledger and map it — which writes the
+     * real ledger onto the request and makes this check pass. */
+    if (!request.ledgerId) {
+      const state = request.requestedHead?.state || "requested";
+      return res.status(409).json({
+        success: false,
+        code: "HEAD_UNRESOLVED",
+        message:
+          state === "rejected"
+            ? "The requested budget head was refused, so there is nothing to allocate against."
+            : "This line asked for a new budget head. Map it to a ledger before agreeing it.",
+      });
+    }
+
     const raw =
       req.body?.agreedAmount !== undefined && req.body?.agreedAmount !== null && req.body?.agreedAmount !== ""
         ? req.body.agreedAmount
@@ -2512,7 +2785,40 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
         .json({ success: false, message: "agreedAmount must be a number ≥ 0" });
     }
 
+    /* The phasing finance is agreeing to. Explicit body wins; otherwise the
+       department's proposal is accepted along with its amount — the same rule
+       `agreedAmount` already follows.
+
+       Re-validated against the AGREED amount, not the requested one: finance
+       agreeing 4L against a split that adds up to 3L must be refused, or the
+       line would carry a shape that disagrees with its own total. That is
+       also why an amount change without a matching split falls back to even
+       rather than keeping a split that no longer sums. */
+    const wantsOwnSplit = req.body?.phasingMode !== undefined || req.body?.monthlyPhasing !== undefined;
+    const proposedMode = wantsOwnSplit ? req.body?.phasingMode : request.phasingMode;
+    const proposedRows = wantsOwnSplit ? req.body?.monthlyPhasing : request.monthlyPhasing;
+
+    let agreedPhasing = { phasingMode: "even", monthlyPhasing: [] };
+    if (proposedMode === "custom_monthly" && Array.isArray(proposedRows) && proposedRows.length) {
+      try {
+        agreedPhasing = phasing.normalisePhasing({
+          phasingMode: proposedMode,
+          monthlyPhasing: proposedRows,
+          amount,
+          startDate: budget.startDate,
+          endDate: budget.endDate,
+        });
+      } catch (e) {
+        if (e instanceof phasing.PhasingError) {
+          return res.status(400).json({ success: false, message: e.message, code: e.code });
+        }
+        throw e;
+      }
+    }
+
     request.agreedAmount = amount;
+    request.agreedPhasingMode = agreedPhasing.phasingMode;
+    request.agreedMonthlyPhasing = agreedPhasing.monthlyPhasing;
     request.state = "agreed";
     if (req.body?.financeNote !== undefined) request.financeNote = req.body.financeNote;
     request.updatedAt = new Date();
@@ -2545,6 +2851,107 @@ router.post("/:id/requests/:requestId/agree", async (req, res) => {
  * is an open question, and money must not move on one side of a conversation.
  * The department answers by editing the request, or finance agrees the
  * countered figure. */
+/* ── RESOLVE A REQUESTED BUDGET HEAD ─────────────────────────────────────────
+ * A department asked to budget for something the chart of accounts has no
+ * head for. This is where that becomes an accounting decision.
+ *
+ * ── WHY MAPPING WRITES THE LEDGER ONTO THE REQUEST ─────────────────────────
+ * `map` sets `request.ledgerId` to a real ledger. From that moment the
+ * request is indistinguishable from one that named a ledger in the first
+ * place: agree works, `syncAllocationFromRequest` posts against a real head,
+ * the department's tracker finds it. Nothing downstream needed changing, and
+ * the requestedHead subdocument survives as the record of how it got there.
+ *
+ * ── WHY THERE IS NO "CREATE LEDGER" ACTION HERE ────────────────────────────
+ * Creating a ledger is a chart-of-accounts decision with consequences for
+ * every report, and it already has a screen and an endpoint. Duplicating it
+ * inside the budget module would be a second way to write the same object,
+ * with its own idea of validation. Finance creates the ledger where ledgers
+ * are created, then maps it here — and the mapping records that it was newly
+ * made, so the trail says so.
+ */
+router.post("/:id/requests/:requestId/resolve-head", async (req, res) => {
+  try {
+    const { budget, request, error } = await budgetAndRequestForReview(req);
+    if (error) return res.status(error.status).json({ success: false, message: error.message });
+    /* Deciding what belongs in the chart of accounts is finance's, and it is
+     * a decision ABOUT the department's ask — so the four-eyes rule applies
+     * exactly as it does to agreeing. */
+    if (requireFinance(req, res, request.submittedBy)) return;
+
+    if (!request.requestedHead?.name) {
+      return res.status(400).json({
+        success: false,
+        message: "This request did not ask for a new budget head.",
+      });
+    }
+
+    const action = String(req.body?.action || "").trim();
+    const note = req.body?.financeNote ? String(req.body.financeNote).trim().slice(0, 500) : undefined;
+    const actor = actorOf(req);
+    const now = new Date();
+
+    if (action === "reject" || action === "clarification") {
+      /* Neither refusal nor a question allocates anything, and neither may
+       * leave a ledger behind — a request that was mapped and then refused
+       * would still agree, which is the opposite of what was decided. */
+      request.ledgerId = undefined;
+      request.requestedHead.state = action === "reject" ? "rejected" : "clarification";
+      request.requestedHead.resolvedLedgerId = undefined;
+      request.requestedHead.resolvedLedgerName = undefined;
+      if (note !== undefined) request.requestedHead.financeNote = note;
+      request.requestedHead.resolvedBy = actor;
+      request.requestedHead.resolvedAt = now;
+      request.updatedAt = now;
+      request.updatedBy = actor;
+      await budget.save();
+      return res.json({ success: true, request: request });
+    }
+
+    if (action !== "map") {
+      return res.status(400).json({
+        success: false,
+        message: 'action must be "map", "reject" or "clarification".',
+      });
+    }
+
+    const ledger = await Acc_Ledger.findOne({
+      _id: req.body?.ledgerId,
+      companyId: budget.companyId || companyOf(req),
+    })
+      .select("_id name groupName nature")
+      .lean();
+    if (!ledger) {
+      return res.status(400).json({ success: false, message: "Pick a ledger in this company." });
+    }
+
+    /* The ledger tree decides nature, not the department's guess. A head the
+     * department called an expense that lives under Direct Income is revenue,
+     * and letting the two disagree is how a sales target is counted as spend. */
+    const nature = ledger.nature === "revenue" ? "revenue" : "expense";
+
+    request.ledgerId = ledger._id;
+    request.ledgerName = ledger.name;
+    request.groupName = ledger.groupName;
+    request.nature = nature;
+
+    request.requestedHead.state = req.body?.created === true ? "created" : "mapped";
+    request.requestedHead.resolvedLedgerId = ledger._id;
+    request.requestedHead.resolvedLedgerName = ledger.name;
+    if (note !== undefined) request.requestedHead.financeNote = note;
+    request.requestedHead.resolvedBy = actor;
+    request.requestedHead.resolvedAt = now;
+    request.updatedAt = now;
+    request.updatedBy = actor;
+
+    await budget.save();
+    res.json({ success: true, request: request });
+  } catch (err) {
+    console.error("[budgets] resolve-head error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/:id/requests/:requestId/counter", async (req, res) => {
   try {
     const { budget, request, error } = await budgetAndRequestForReview(req);
@@ -2556,6 +2963,29 @@ router.post("/:id/requests/:requestId/counter", async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "counterAmount must be a number ≥ 0" });
+    }
+
+    /* A counter may carry a different SHAPE as well as a different number —
+       "yes to 12L, but not all of it in April" is the common case, and
+       without this finance could only argue about the total. Checked against
+       the countered amount, since that is what this split would fund. */
+    if (req.body?.phasingMode !== undefined || req.body?.monthlyPhasing !== undefined) {
+      try {
+        const counterPhasing = phasing.normalisePhasing({
+          phasingMode: req.body?.phasingMode,
+          monthlyPhasing: req.body?.monthlyPhasing,
+          amount,
+          startDate: budget.startDate,
+          endDate: budget.endDate,
+        });
+        request.agreedPhasingMode = counterPhasing.phasingMode;
+        request.agreedMonthlyPhasing = counterPhasing.monthlyPhasing;
+      } catch (e) {
+        if (e instanceof phasing.PhasingError) {
+          return res.status(400).json({ success: false, message: e.message, code: e.code });
+        }
+        throw e;
+      }
     }
 
     request.counterAmount = amount;
@@ -2635,7 +3065,10 @@ router.post("/:id/requests/:requestId/reopen", async (req, res) => {
  * included because a blown budget is the single most likely thing anyone
  * needs to adjust — refusing there would force the override path we are
  * trying to replace. */
-const ADJUSTABLE_STATES = ["review", "active", "exceeded"];
+/* Both re-exported from the service so the department route and this one
+ * cannot drift about what a supplementary is or when a budget is still
+ * adjustable. */
+const { ADJUSTABLE_STATES, resolveAmounts } = adjustments;
 
 /** Resolve budget + adjustment for a review action, with the same 404/409
  *  vocabulary the request-review helpers use. */
@@ -2667,39 +3100,6 @@ async function budgetAndAdjustment(req, { mutating = true } = {}) {
   return { budget };
 }
 
-/**
- * Both shapes, resolved to both numbers.
- *
- * A supplementary states a delta, a revision states a destination — but a
- * reader should never have to know which to answer "what does this become?",
- * so whichever was given, the other is derived from the snapshot and both are
- * stored. Returns `{ ok }` or `{ ok: false, message }`.
- */
-function resolveAmounts({ type, currentAllocatedAmount, requestedDeltaAmount, requestedNewAmount }) {
-  const current = variance.money(currentAllocatedAmount) ?? 0;
-
-  if (type === "supplementary") {
-    const delta = variance.money(requestedDeltaAmount);
-    if (delta === null) {
-      return { ok: false, message: "requestedDeltaAmount must be a number" };
-    }
-    /* A supplementary is by definition MORE. A negative one is a revision
-     * downward wearing the wrong label, and letting it through would mean two
-     * names for one operation and a list nobody can read at a glance. */
-    if (delta <= 0) {
-      return {
-        ok: false,
-        message: "requestedDeltaAmount must be greater than 0 — to reduce an allocation, request a revision instead",
-      };
-    }
-    return { ok: true, delta, next: current + delta };
-  }
-
-  const next = variance.money(requestedNewAmount);
-  if (next === null) return { ok: false, message: "requestedNewAmount must be a number" };
-  if (next < 0) return { ok: false, message: "requestedNewAmount must be ≥ 0" };
-  return { ok: true, delta: next - current, next };
-}
 
 /* ── LIST ──────────────────────────────────────────────────────────────── */
 router.get("/:id/adjustments", async (req, res) => {
@@ -2859,6 +3259,52 @@ router.post("/:id/adjustments/:adjustmentId/approve", async (req, res) => {
       return res.status(400).json({ success: false, message: amounts.message });
     }
 
+    /* ── AN INCREASE TAKES THE SAME TWO PEOPLE AS AN OVERSPEND ──────────────
+       Otherwise the CEO gate on spending past a budget is one hop away from
+       useless: raise a supplementary, have finance approve it alone, and the
+       money goes out inside budget with nobody escalating anything. One rule,
+       both doors.
+
+       A REDUCTION is not escalated. Giving budget back does not need the CEO,
+       and asking for two signatures to hand money in is how a control teaches
+       people not to use it. */
+    if (amounts.delta > 0) {
+      const held = adjustment.signatures || [];
+      const added = escalation.addSignature(held, {
+        user: req.user,
+        reason: req.body?.financeNote || adjustment.reason,
+      });
+      if (added.error) {
+        return res.status(409).json({
+          success: false,
+          message: added.error,
+          code: added.code,
+          escalation: {
+            required: true,
+            waitingOn: escalation.waitingOn(held),
+            message: escalation.describe(held),
+            signatures: held,
+          },
+        });
+      }
+      if (!escalation.isComplete(added.signatures)) {
+        adjustment.signatures = added.signatures;
+        await budget.save();
+        return res.status(202).json({
+          success: false,
+          adjustment,
+          escalation: {
+            required: true,
+            code: "BUDGET_ESCALATION_REQUIRED",
+            waitingOn: escalation.waitingOn(added.signatures),
+            message: escalation.describe(added.signatures),
+            signatures: added.signatures,
+          },
+        });
+      }
+      adjustment.signatures = added.signatures;
+    }
+
     item.allocatedAmount = amounts.next;
 
     adjustment.approvedDeltaAmount = amounts.delta;
@@ -2975,89 +3421,24 @@ router.post("/:id/adjustments/:adjustmentId/cancel", async (req, res) => {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** Same live-enough-to-change rule as adjustments. */
-const TRANSFERABLE_STATES = ADJUSTABLE_STATES;
+/* All four from the service, so the department route and this one cannot
+ * drift about what a line can give away or when a budget is still movable. */
+const { TRANSFERABLE_STATES, snapshotOf } = transfersvc;
 
-/**
- * What one line can actually give away, right now.
- *
- * Returns the line's evaluated actual and `remaining` = allocated − actual,
- * floored at zero: a line already over budget has nothing to give, and a
- * negative "available" would let an overspent line fund another one.
- *
- * Revenue lines are included for completeness but a transfer between natures
- * is refused below — moving a sales target into a freight budget is not a
- * thing that means anything.
- */
-async function availabilityFor(budget, req, items) {
-  const hydrated = await actuals.hydrateLines({
-    companyId: actualsCompanyFor(budget, req),
-    lines: items.map((i) => ({
-      _id: i._id,
-      ledgerId: i.ledgerId,
-      nature: i.nature,
-      allocatedAmount: i.allocatedAmount,
-    })),
-    from: budget.startDate,
-    to: budget.endDate,
+const availabilityFor = (budget, req, items) =>
+  transfersvc.availabilityFor({ companyId: companyOf(req), budget, items });
+
+const resolveTransferSides = (budget, req, { fromItemId, toItemId }) =>
+  transfersvc.resolveSides({
+    companyId: companyOf(req),
+    budget,
+    fromItemId,
+    toItemId,
+    isUsableId,
   });
 
-  return new Map(
-    hydrated.map((h) => {
-      const allocated = variance.money(h.allocatedAmount) ?? 0;
-      const actual = variance.money(h.actual) ?? 0;
-      return [
-        String(h._id),
-        { allocated, actual, remaining: Math.max(0, allocated - actual) },
-      ];
-    }),
-  );
-}
 
-/** Both sides of a transfer, resolved and validated. */
-async function resolveTransferSides(budget, req, { fromItemId, toItemId }) {
-  if (!isUsableId(fromItemId) || !isUsableId(toItemId)) {
-    return { error: { status: 404, message: "Budget line not found" } };
-  }
-  if (String(fromItemId) === String(toItemId)) {
-    return {
-      error: { status: 400, message: "A transfer needs two different lines." },
-    };
-  }
 
-  const from = budget.items.id(fromItemId);
-  const to = budget.items.id(toItemId);
-  if (!from || !to) {
-    return { error: { status: 404, message: "Budget line not found" } };
-  }
-
-  /* Expense and revenue are not the same currency of decision. Moving a sales
-   * target into a freight budget would make both numbers meaningless and the
-   * net figure silently wrong. */
-  const fromNature = from.nature === "revenue" ? "revenue" : "expense";
-  const toNature = to.nature === "revenue" ? "revenue" : "expense";
-  if (fromNature !== toNature) {
-    return {
-      error: {
-        status: 400,
-        message: `Cannot transfer between a ${fromNature} line and a ${toNature} one — they are different kinds of number.`,
-      },
-    };
-  }
-
-  const avail = await availabilityFor(budget, req, [from, to]);
-  return { from, to, avail };
-}
-
-const snapshotOf = (item, a) => ({
-  department: item.department || null,
-  ledgerId: item.ledgerId || undefined,
-  ledgerName: item.ledgerName || null,
-  groupName: item.groupName || null,
-  nature: item.nature || "expense",
-  allocatedAmount: a.allocated,
-  actual: a.actual,
-  remaining: a.remaining,
-});
 
 /** Budget + transfer for a review action. */
 async function budgetAndTransfer(req, { mutating = true } = {}) {

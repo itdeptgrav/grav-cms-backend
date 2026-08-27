@@ -34,18 +34,69 @@ const {
   verifyEmployeeToken,
 } = require("../../../../Middlewear/coworkAuth")
 
-router.use(verifyCoworkToken)
-router.use(verifyEmployeeToken)
-
-// ── Normalise coworkUser → standard user shape used by helpers ────────────────
-router.use((req, _res, next) => {
+// ── TWO FRONT DOORS, ONE SET OF HANDLERS ─────────────────────────────────────
+//
+// Everything below is the requester-and-TL half of MRF: raise a request, track
+// it, approve or reject the ones routed to you. It runs on the CMS's own Mongo
+// data, the same collection the store side reads at /api/cms/inventory/mrf —
+// the only thing that was ever "Cowork" about it was the door it came in by.
+//
+// Material Requests is a CMS app now, opened from the launcher with a CMS
+// login, and a person may hold it without holding Cowork at all. So the same
+// handlers are mounted twice, behind two different authentications:
+//
+//   /api/cowork/mrf   Firebase session   — the Cowork app, unchanged
+//   /api/cms/mrf      CMS employee JWT   — the Material Requests app
+//
+// Each door only has to end up at the same `req.user`: an employee's
+// biometricId, their role, and their name. That is the whole of what the
+// handlers below read — TL routing keys on biometricId and `primaryManager`,
+// neither of which knows or cares which door was used.
+//
+// Deliberately NOT a copy of the file. Two copies of an approval flow is two
+// approval flows, and the second one is always the one nobody remembers to fix.
+const attach = (req, _res, next) => {
   req.user = {
     id: req.coworkUser.employeeId,  // biometricId string
     role: req.coworkUser.role,
     name: req.coworkUser.name,
   }
   next()
-})
+}
+
+/**
+ * The CMS door.
+ *
+ * `EmployeeAuth` has already verified the CMS cookie or bearer token and put
+ * the employee on `req.user`; this restates it in the shape the handlers read.
+ *
+ * `employeeId` is the biometricId, which is what every approver lookup keys on
+ * — an employee whose token carries no biometricId cannot be routed to a TL,
+ * so they are refused here rather than silently landing in nobody's queue.
+ *
+ * The role is mapped, not trusted: the CMS has a dozen department roles and
+ * this file understands three. Anything that is not the executive office is an
+ * ordinary requester, and whether they can approve is decided by the approver
+ * service from the org chart, not by the word in their token.
+ */
+function cmsAttach(req, res, next) {
+  const employeeId = req.user?.employeeId
+  if (!employeeId) {
+    return res.status(403).json({
+      success: false,
+      message:
+        "Your staff record has no employee ID, so material requests cannot be routed to an approver. Ask HR to add one.",
+    })
+  }
+  const role = String(req.user.role || "").toLowerCase()
+  req.coworkUser = {
+    employeeId,
+    role: role === "ceo" ? "ceo" : "employee",
+    name: req.user.name || "",
+  }
+  req.user = { id: employeeId, role: req.coworkUser.role, name: req.coworkUser.name }
+  next()
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -1112,3 +1163,14 @@ router.patch("/:id/chat/read", async (req, res) => {
 })
 
 module.exports = router
+
+/* ── THE TWO DOORS, APPLIED AT THE MOUNT ─────────────────────────────────────
+ * Neither chain may live on the router itself: `router.use` runs for every
+ * mount of that router, so a Firebase check installed here would run on the
+ * CMS door too — which is exactly what happened, and it refused a perfectly
+ * good CMS session for having no "kid" claim.
+ *
+ * So the router carries handlers only, and server.js puts the right chain in
+ * front of each mount. */
+module.exports.firebaseChain = [verifyCoworkToken, verifyEmployeeToken, attach]
+module.exports.cmsChain = [require("../../../../Middlewear/EmployeeAuthMiddlewear"), cmsAttach]

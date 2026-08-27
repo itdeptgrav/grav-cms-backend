@@ -392,6 +392,39 @@ const budgetItemSchema = new mongoose.Schema(
      * month until October look like a miss. Empty ⇒ straight-line. */
     phasing: { type: [Number], default: undefined },
 
+    /* ── HOW THE AMOUNT DIVIDES ACROSS THE MONTHS ──────────────────────────
+     * `even` — the default and what every existing row behaves as: the amount
+     * straight-lines across the months the period covers.
+     * `custom_monthly` — `monthlyPhasing` carries absolute rupees per calendar
+     * month, and must add up to `allocatedAmount`. A garment exporter does not
+     * earn one twelfth of its revenue each month, and marketing does not spend
+     * one twelfth against a festival; straight-lining either makes every month
+     * before the spike read as a miss and the spike itself read as a breach.
+     *
+     * Applies to BOTH natures. An expense plan and a revenue target are the
+     * same arithmetic here, and phasing only sales would leave every seasonal
+     * cost straight-lined.
+     *
+     * Absolute amounts rather than weights on purpose: "do these twelve
+     * figures add up to what was approved" is a question with one answer and
+     * it is the one finance asks, where "is 3,1,1,1 right" has none. See
+     * services/budgetPhasing.service.js — the only place this is interpreted. */
+    phasingMode: {
+      type: String,
+      enum: ["even", "custom_monthly"],
+      default: "even",
+    },
+    monthlyPhasing: {
+      type: [
+        {
+          _id: false,
+          month: { type: String, trim: true }, // "YYYY-MM", IST
+          amount: { type: Number, min: 0 },
+        },
+      ],
+      default: undefined,
+    },
+
     /* Cached figures. Recomputed from vouchers on every read, so these are a
      * convenience for exports and list views, never the source of truth. */
     spentAmount: { type: Number, default: 0 },
@@ -482,8 +515,26 @@ const budgetSchema = new mongoose.Schema(
     costCentreName: { type: String, trim: true },
     month: { type: Number, min: 1, max: 12 },
     quarter: { type: Number, min: 1, max: 4 },
+    /* WHEN THE MONEY APPLIES. */
     startDate: { type: Date, required: true },
     endDate: { type: Date, required: true },
+
+    /* ── WHEN DEPARTMENTS MAY ASK ────────────────────────────────────────────
+     * A different range from the two above, and normally not overlapping them
+     * at all: departments budget for a year in the March BEFORE it starts.
+     * Collapsing the two — which is what this module did until now — forced a
+     * choice between letting departments submit into a year already half
+     * spent, or bending "period" to mean the asking season and making the
+     * money dates untrue.
+     *
+     * Optional, and absent means UNRESTRICTED. Every round created before this
+     * existed keeps behaving exactly as it did: open whenever its status says
+     * collecting. Setting a date is what begins enforcing one.
+     *
+     * Not required to sit inside the budget period, and deliberately not
+     * validated against it — see budgetSubmissionWindow.service. */
+    submissionStartDate: { type: Date },
+    submissionEndDate: { type: Date },
     items: [budgetItemSchema],
 
     /* Which books this belongs to. The app has a company selector and the
@@ -570,14 +621,60 @@ const budgetSchema = new mongoose.Schema(
          * same reason budget lines bind to one: a head, not a free-text
          * category. Name and group are denormalised so a request stays
          * readable after a rename, exactly as `items[]` does. */
+        /* NOT required, because a department may be budgeting for something
+         * the chart of accounts has no head for yet — see `requestedHead`.
+         * The invariant is "one of the two", enforced by the validator on
+         * this subdocument and again at the route. An allocation is still
+         * NEVER written without a real ledger: finance resolves the requested
+         * head onto this very field before agree will run. */
         ledgerId: {
           type: mongoose.Schema.Types.ObjectId,
           ref: "Acc_Ledger",
-          required: true,
           index: true,
         },
         ledgerName: { type: String, trim: true },
         groupName: { type: String, trim: true },
+
+        /* ── A HEAD THAT DOES NOT EXIST YET ───────────────────────────────
+         * A tech department budgeting for Claude, Copilot and Codex should
+         * not have to file all three under "Software Expenses" because that
+         * is the only head on the list — a budget whose heads are the wrong
+         * shape stops being a plan and becomes a formality.
+         *
+         * So the department asks for a head. It does NOT create a ledger:
+         * that is an accounting decision with consequences for every report,
+         * and it stays finance's. Finance maps the ask to an existing ledger,
+         * creates one through the chart of accounts and maps it, or refuses.
+         *
+         * On resolution the real ledger is written onto `ledgerId` above, so
+         * everything downstream — agree, syncAllocationFromRequest, the
+         * department tracker — carries on unchanged. This subdocument is the
+         * record of the conversation, not a second binding. */
+        requestedHead: {
+          type: {
+            _id: false,
+            name: { type: String, trim: true },
+            nature: { type: String, enum: ["revenue", "expense"] },
+            reason: { type: String, trim: true },
+            suggestedGroupName: { type: String, trim: true },
+            /* What the department thinks it might belong under, if anything.
+             * A hint for finance, never a binding. */
+            suggestedLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+            state: {
+              type: String,
+              enum: ["requested", "mapped", "created", "rejected", "clarification"],
+              default: "requested",
+            },
+            resolvedLedgerId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Ledger" },
+            resolvedLedgerName: { type: String, trim: true },
+            financeNote: { type: String, trim: true },
+            requestedBy: { type: String, trim: true },
+            requestedAt: { type: Date },
+            resolvedBy: { type: String, trim: true },
+            resolvedAt: { type: Date },
+          },
+          default: undefined,
+        },
         nature: {
           type: String,
           enum: ["revenue", "expense"],
@@ -585,6 +682,33 @@ const budgetSchema = new mongoose.Schema(
         },
 
         requestedAmount: { type: Number, required: true, min: 0 },
+
+        /* The department's PROPOSED split, and finance's counter to it.
+         * Same shape as the allocation line's, so agreeing a request can hand
+         * the phasing straight over without a translation step that could
+         * disagree with itself.
+         *
+         * `monthlyPhasing` is what was asked for; `agreedMonthlyPhasing` is
+         * what finance settled on. Kept apart for the same reason
+         * `requestedAmount` and `agreedAmount` are: overwriting the ask with
+         * the answer destroys the record of what was actually requested. */
+        phasingMode: {
+          type: String,
+          enum: ["even", "custom_monthly"],
+          default: "even",
+        },
+        monthlyPhasing: {
+          type: [{ _id: false, month: { type: String, trim: true }, amount: { type: Number, min: 0 } }],
+          default: undefined,
+        },
+        agreedPhasingMode: {
+          type: String,
+          enum: ["even", "custom_monthly"],
+        },
+        agreedMonthlyPhasing: {
+          type: [{ _id: false, month: { type: String, trim: true }, amount: { type: Number, min: 0 } }],
+          default: undefined,
+        },
 
         priority: {
           type: String,
@@ -597,6 +721,66 @@ const budgetSchema = new mongoose.Schema(
          * respond to. */
         purpose: { type: String, trim: true },
         justification: { type: String, trim: true },
+
+        /* ── THE LINE-BY-LINE DERIVATION ──────────────────────────────────
+         * How the requested figure was built: 5 users × ₹6,000 × 12 months,
+         * and so on. `justification` is prose a reviewer reads; this is
+         * arithmetic a reviewer can argue with a row at a time.
+         *
+         * Every non-manual row's `amount` is RECOMPUTED server-side from its
+         * own quantity, rate and multiplier — see budgetWorking.service.js.
+         * A stored amount that disagrees with its own inputs would be a
+         * derivation that does not derive, which is worse than no breakdown.
+         *
+         * `manualAmount` marks a row that genuinely does not fit the shape —
+         * a negotiated lump sum, a quoted figure — so a reviewer can see which
+         * numbers were computed and which were asserted. */
+        workingLines: {
+          type: [
+            {
+              _id: false,
+              label: { type: String, trim: true },
+              description: { type: String, trim: true },
+              quantity: { type: Number, min: 0 },
+              unit: { type: String, trim: true },
+              rate: { type: Number, min: 0 },
+              multiplier: { type: Number, min: 0 },
+              multiplierUnit: { type: String, trim: true },
+              amount: { type: Number, min: 0 },
+              manualAmount: { type: Boolean, default: false },
+
+              /* ── A ROW THAT CARRIES ITS OWN MONTHS ───────────────────────
+               * A month-wise line describes what each item costs in each
+               * month rather than a quantity times a rate. The row's amount
+               * is then the sum of these, and the line's monthly phasing is
+               * the sum of every row's — so the plan and the working that
+               * produced it can never drift apart.
+               *
+               * Optional and additive. A row without it behaves exactly as it
+               * always has, which is what every existing proposal relies on.
+               * Recomputed server-side like every other figure here — see
+               * budgetWorking.service. */
+              monthly: {
+                type: [
+                  {
+                    _id: false,
+                    month: { type: String, trim: true },
+                    amount: { type: Number, min: 0 },
+                  },
+                ],
+                default: undefined,
+              },
+            },
+          ],
+          default: undefined,
+        },
+
+        /* Set only when the ask deliberately differs from what its own rows
+         * add up to. The reason is required at the route — an unexplained
+         * mismatch is refused rather than stored, because it reads as a
+         * derivation while not being one. */
+        manualAmountOverride: { type: Boolean, default: false },
+        manualOverrideReason: { type: String, trim: true },
 
         /* When the department expects to need it. `expectedMonth` (1-12) is
          * the convenience for a single-month ask; from/to covers a spread.
@@ -633,6 +817,16 @@ const budgetSchema = new mongoose.Schema(
       },
     ],
 
+    /* ── ONE OF THE TWO, ALWAYS ──────────────────────────────────────────────
+     * A request names either a real ledger or a head it wants finance to
+     * create. Neither is not a request — it is a number with nothing to post
+     * against, and the route that let one through would be found weeks later
+     * by a report that silently omitted it.
+     *
+     * Enforced on the schema as well as the route, because the route is one
+     * of several places a request could be written from (an import, a script,
+     * a future endpoint) and this invariant is the one that keeps
+     * `syncAllocationFromRequest` honest. */
     /* ── ADJUSTMENTS (Chunk 7) ───────────────────────────────────────────────
      * The legitimate way to change an allocation after the budget is live.
      *
@@ -701,12 +895,87 @@ const budgetSchema = new mongoose.Schema(
         approvedDeltaAmount: { type: Number },
         approvedNewAmount: { type: Number },
 
+        /* ── RAISING A BUDGET NEEDS THE SAME TWO PEOPLE AS BREAKING ONE ─────
+         * Overspending escalates to finance and the CEO. If topping the
+         * budget up did not, the way round the CEO would be obvious: ask the
+         * department to raise a supplementary, have finance approve it alone,
+         * and the same money goes out inside budget with nobody escalating
+         * anything. One rule, both doors — see budgetEscalation.service. */
+        signatures: [
+          {
+            _id: false,
+            slot: { type: String },
+            userId: { type: String },
+            name: { type: String, trim: true },
+            role: { type: String },
+            reason: { type: String, trim: true },
+            at: { type: Date },
+          },
+        ],
+
         reason: { type: String, trim: true },
         justification: { type: String, trim: true },
+
+        /* The same line-by-line derivation a proposal can carry. "We need ₹5L
+         * more" is not reviewable; "₹5L more because the seat count went from
+         * 5 to 12" is. Optional, recomputed server-side by
+         * budgetWorking.service exactly as a proposal's rows are — a stored
+         * amount that disagrees with its own inputs is a derivation that does
+         * not derive. */
+        workingLines: {
+          type: [
+            {
+              _id: false,
+              label: { type: String, trim: true },
+              description: { type: String, trim: true },
+              quantity: { type: Number, min: 0 },
+              unit: { type: String, trim: true },
+              rate: { type: Number, min: 0 },
+              multiplier: { type: Number, min: 0 },
+              multiplierUnit: { type: String, trim: true },
+              amount: { type: Number, min: 0 },
+              manualAmount: { type: Boolean, default: false },
+
+              /* ── A ROW THAT CARRIES ITS OWN MONTHS ───────────────────────
+               * A month-wise line describes what each item costs in each
+               * month rather than a quantity times a rate. The row's amount
+               * is then the sum of these, and the line's monthly phasing is
+               * the sum of every row's — so the plan and the working that
+               * produced it can never drift apart.
+               *
+               * Optional and additive. A row without it behaves exactly as it
+               * always has, which is what every existing proposal relies on.
+               * Recomputed server-side like every other figure here — see
+               * budgetWorking.service. */
+              monthly: {
+                type: [
+                  {
+                    _id: false,
+                    month: { type: String, trim: true },
+                    amount: { type: Number, min: 0 },
+                  },
+                ],
+                default: undefined,
+              },
+            },
+          ],
+          default: undefined,
+        },
         priority: {
           type: String,
           enum: ["low", "normal", "high", "critical"],
           default: "normal",
+        },
+
+        /* WHO RAISED IT. Not the same question as `sourceRequestId`, which
+         * says the target LINE came from a department proposal — true whether
+         * finance or the department later asked to change it. Finance weighs
+         * a department's ask differently from its own, and the queue could
+         * not tell them apart without this. */
+        origin: {
+          type: String,
+          enum: ["finance", "department"],
+          default: "finance",
         },
 
         state: {
@@ -762,6 +1031,15 @@ const budgetSchema = new mongoose.Schema(
         amount: { type: Number, required: true },
 
         reason: { type: String, trim: true },
+        /* WHO RAISED IT — the same distinction adjustments carry. Finance
+         * weighs a department's ask differently from one of its own, and the
+         * queue cannot tell them apart without this. */
+        origin: {
+          type: String,
+          enum: ["finance", "department"],
+          default: "finance",
+        },
+
         state: {
           type: String,
           enum: ["submitted", "approved", "rejected", "cancelled"],
@@ -840,6 +1118,29 @@ const budgetSchema = new mongoose.Schema(
     optimisticConcurrency: true,
   },
 );
+/**
+ * A budget request names either a real ledger or a head it wants finance to
+ * create — never neither.
+ *
+ * On the schema as well as the route, because a request can be written from
+ * more than one place and this is the invariant that keeps
+ * `syncAllocationFromRequest` honest: it allocates against `ledgerId`, so a
+ * row with no binding at all is a number that can never be posted.
+ */
+budgetSchema.pre("validate", function ensureRequestHasAHead(next) {
+  for (const [i, r] of (this.budgetRequests || []).entries()) {
+    if (!r) continue;
+    if (!r.ledgerId && !r.requestedHead?.name) {
+      return next(
+        new Error(
+          `budgetRequests.${i}: a request needs a budget head — either an existing ledger or a requested head.`,
+        ),
+      );
+    }
+  }
+  next();
+});
+
 budgetSchema.index({ financialYear: 1, period: 1 });
 budgetSchema.index({ companyId: 1, status: 1, startDate: -1 });
 

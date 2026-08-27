@@ -56,6 +56,40 @@ const tallyCompanySchema = new mongoose.Schema(
     baseCurrency: { type: String, default: "INR" },
     currencySymbol: { type: String, default: "₹" },
 
+    /* ── STATUTORY DOCUMENTS ────────────────────────────────────────────
+     * The certificates behind the identifiers above: the GST registration,
+     * the PAN card, the certificate of incorporation. A sub-document array
+     * rather than its own collection, and rather than rows in the /files
+     * drive, for the reason models/Files/Doc_File.js states from the other
+     * side — a file that exists only as evidence FOR one record belongs to
+     * that record. Nobody browses to a company's PAN card; they open the
+     * company and find it there.
+     *
+     * The bytes are on Drive and PRIVATE. There is deliberately no `url`
+     * column: a provider URL is a permanent grant to anyone who ever sees
+     * it, so reads go through the download route, which re-checks the
+     * session every time. Same posture as employee letters and the drive. */
+    documents: [
+      {
+        /* What the file IS, not what it is called. Free text would give us
+           "pan", "PAN card", "Pan Card.pdf" and no way to ask whether the
+           GST certificate is on file. */
+        kind: {
+          type: String,
+          enum: ["gst", "pan", "cin", "tan", "incorporation", "address-proof", "bank", "other"],
+          default: "other",
+        },
+        name: { type: String, trim: true, maxlength: 260 },
+        mimeType: { type: String, default: "application/octet-stream" },
+        bytes: { type: Number, default: 0 },
+        driveFileId: { type: String, default: "" },
+        note: { type: String, trim: true, maxlength: 300 },
+        uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+        uploadedByName: { type: String, trim: true, default: "" },
+        uploadedAt: { type: Date, default: Date.now },
+      },
+    ],
+
     // Tally provenance
     isImportedFromTally: { type: Boolean, default: false },
     tallyCompanyGuid: { type: String }, // Tally's internal UUID if available
@@ -451,6 +485,39 @@ const tallyLedgerSchema = new mongoose.Schema(
         state: { type: String, trim: true },
       },
     ],
+    /* ── WHAT THE GST NETWORK SAYS ABOUT THIS PARTY ─────────────────────
+     * Stored, not merely displayed, because it is a fact about the books
+     * rather than a state of a screen.
+     *
+     * A supplier whose registration was CANCELLED is not a cosmetic problem:
+     * input tax credit claimed against a cancelled GSTIN is disallowed, and
+     * it is found at assessment, long after the money is spent. A customer
+     * with a dead GSTIN gets the wrong invoice treatment. Neither is visible
+     * anywhere in the ledger today.
+     *
+     * `checkedAt` matters as much as `status`: a registration cancelled last
+     * month makes a check from last year worthless, so every reader can see
+     * how old the answer is and decide for itself.
+     */
+    gstVerification: {
+      /* unchecked | active | cancelled | not-found | mismatch | unavailable
+         `mismatch` = the register knows this GSTIN but under another name.
+         `unavailable` = we could not ask; NOT a verdict on the party. */
+      status: { type: String, default: "unchecked" },
+      /* The name the register holds, kept verbatim so a mismatch can be read
+         rather than just flagged. */
+      legalName: { type: String, trim: true, default: "" },
+      tradeName: { type: String, trim: true, default: "" },
+      registrationDate: { type: String, trim: true, default: "" },
+      taxpayerType: { type: String, trim: true, default: "" },
+      cancelledDate: { type: String, trim: true, default: "" },
+      /* Which provider answered, so a bad batch can be traced to its source. */
+      source: { type: String, trim: true, default: "" },
+      checkedAt: { type: Date, default: null },
+      /* Why it could not be checked, when it could not be. */
+      note: { type: String, trim: true, default: "" },
+    },
+
     hsnCode: { type: String, trim: true },
     taxRate: { type: Number, default: 0 }, // for income/expense ledgers
 

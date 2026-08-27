@@ -51,6 +51,10 @@ const shape = (d) => ({
   slug: d.slug,
   name: d.name,
   aliases: d.aliases || [],
+  /* The link to an access-control department, which is what lets a head reach
+     the standalone Budget app and act for this department. Null until finance
+     maps it; see routes/Access/budgetProposals.js. */
+  accessSlug: d.accessSlug || null,
   isActive: d.isActive !== false,
   createdBy: d.createdBy || null,
   updatedBy: d.updatedBy || null,
@@ -159,6 +163,10 @@ router.post("/", async (req, res) => {
       slug,
       name,
       aliases,
+      /* Optional at creation — most departments are mapped later, once someone
+         knows which portal owns them. Slugified rather than trusted verbatim so
+         "Sales " and "sales" cannot become two different links. */
+      accessSlug: departments.slugify(req.body?.accessSlug) || undefined,
       createdBy: actorOf(req),
       updatedBy: actorOf(req),
     });
@@ -238,6 +246,22 @@ router.patch("/:id", async (req, res) => {
           message: `"${clash.name}" is a department in its own right, so it cannot also be an alias of "${current.name}".`,
         });
       }
+    }
+
+    /* ── THE ACCESS LINK ──────────────────────────────────────────────────
+     * Which access-control department may propose for this budget department.
+     * Empty string CLEARS it, which is the revocation path: one field, no
+     * token to wait out — routes/Access/budgetProposals.js re-reads this on
+     * every request.
+     *
+     * Slugified rather than stored as typed, so it matches the portal slug the
+     * token carries. Not validated against the AccessDepartment registry on
+     * purpose: a department can legitimately be mapped before its portal row
+     * is seeded, and refusing that would make ordering the setup steps a
+     * puzzle. An unmatched slug simply resolves to nobody. */
+    if (req.body?.accessSlug !== undefined) {
+      const raw = String(req.body.accessSlug ?? "").trim();
+      patch.accessSlug = raw ? departments.slugify(raw) : "";
     }
 
     if (req.body?.isActive !== undefined) patch.isActive = !!req.body.isActive;

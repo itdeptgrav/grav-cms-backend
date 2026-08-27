@@ -303,3 +303,73 @@ test("a department's type is read off its lines, never declared", () => {
   assert.equal(centreOf([]), "unclassified");
   assert.equal(centreOf([{ nature: "asset" }]), "unclassified");
 });
+
+/* ── HEADS OVER BUDGET ──────────────────────────────────────────────────────
+   The round's health, derived rather than stored. There is an `exceeded`
+   value in the budget status enum that nothing has ever written; these figures
+   are what the rounds list shows instead. */
+
+test("a round with every head inside its number reports no overrun", () => {
+  const { overrun } = rollUp([
+    { nature: "expense", allocated: 400000, actual: 310000 },
+    { nature: "expense", allocated: 100000, actual: 100000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 0, amount: 0 });
+});
+
+test("a head spent past its allocation is counted, with the overage", () => {
+  const { overrun } = rollUp([
+    { nature: "expense", allocated: 400000, actual: 430000 },
+    { nature: "expense", allocated: 100000, actual: 20000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 1, amount: 30000 });
+});
+
+test("overspends are never netted against underspends", () => {
+  /* The reason this is counted per head. Moving money between heads is a
+     transfer and a transfer needs approving, so a round that overspent one
+     head and underspent another by the same amount has NOT stayed within
+     budget — and must not report that it has. */
+  const { overrun, expense } = rollUp([
+    { nature: "expense", allocated: 400000, actual: 430000 },
+    { nature: "expense", allocated: 100000, actual: 70000 },
+  ]);
+  assert.equal(expense.allocated, expense.actual, "the totals do net out");
+  assert.deepEqual(overrun, { heads: 1, amount: 30000 }, "the heads do not");
+});
+
+test("several heads over are all counted", () => {
+  const { overrun } = rollUp([
+    { nature: "expense", allocated: 100000, actual: 120000 },
+    { nature: "expense", allocated: 50000, actual: 55000 },
+    { nature: "expense", allocated: 80000, actual: 80000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 2, amount: 25000 });
+});
+
+test("a revenue head short of its target is not an overspend", () => {
+  /* A shortfall and an overspend are opposite kinds of miss. Counting them
+     together would produce a figure that describes nothing. */
+  const { overrun } = rollUp([
+    { nature: "revenue", allocated: 2000000, actual: 500000 },
+  ]);
+  assert.deepEqual(overrun, { heads: 0, amount: 0 });
+});
+
+test("and a revenue head far past its target is not one either", () => {
+  const { overrun } = rollUp([
+    { nature: "revenue", allocated: 2000000, actual: 9000000 },
+    { nature: "expense", allocated: 100000, actual: 100001 },
+  ]);
+  assert.deepEqual(overrun, { heads: 1, amount: 1 });
+});
+
+test("a head with no allocation but real spend is over by all of it", () => {
+  const { overrun } = rollUp([{ nature: "expense", allocated: 0, actual: 5000 }]);
+  assert.deepEqual(overrun, { heads: 1, amount: 5000 });
+});
+
+test("an empty round has nothing over", () => {
+  assert.deepEqual(rollUp([]).overrun, { heads: 0, amount: 0 });
+  assert.deepEqual(rollUp().overrun, { heads: 0, amount: 0 });
+});

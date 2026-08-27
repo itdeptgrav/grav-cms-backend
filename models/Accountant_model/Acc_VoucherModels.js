@@ -426,6 +426,26 @@ const tallyVoucherSchema = new mongoose.Schema(
           remainingAfter: { type: Number },
         },
       ],
+
+      /* ── WHO AGREED THE BUDGET COULD BE BROKEN ────────────────────────────
+       * Going past a budget takes two people and one of them is the CEO — see
+       * budgetEscalation.service. The signatures collect here while the
+       * voucher waits, and the voucher cannot post until both are in.
+       *
+       * The fields above (`reason`, `overriddenBy`, `checkedAt`) are filled
+       * from the completed set at the moment it finally posts, so everything
+       * written before this change still reads the same way. */
+      signatures: [
+        {
+          _id: false,
+          slot: { type: String }, // "finance" | "ceo"
+          userId: { type: String },
+          name: { type: String, trim: true },
+          role: { type: String },
+          reason: { type: String, trim: true },
+          at: { type: Date },
+        },
+      ],
     },
 
     // Uniqueness gate for the voucher-number index. TRUE for "live" vouchers

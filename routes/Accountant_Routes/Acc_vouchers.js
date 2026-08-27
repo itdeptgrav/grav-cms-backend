@@ -40,6 +40,79 @@ const auth = accountantAuth;
  * ────────────────────────────────────────────────────────────────────────── */
 const budgetControl = require("../../services/budgetControl.service");
 
+/**
+ * Run work inside a transaction, retrying the ones Mongo says to retry.
+ *
+ * ── WHY ─────────────────────────────────────────────────────────────────────
+ * Mongo gives a transaction a few milliseconds to acquire its write locks and
+ * then gives up. That is not an error about the request — it is two writers
+ * arriving at once — and it arrived at the caller as a bare 400 carrying a
+ * sentence about IX locks. An approver clicking approve got a database message
+ * instead of an approval, and clicking again would usually have worked.
+ *
+ * Which is exactly what this does, up to a small number of times. Only for the
+ * errors the driver itself labels transient (or the lock-timeout that carries
+ * no label): anything else is a real failure and is thrown straight out.
+ */
+async function inTransaction(work, { attempts = 3 } = {}) {
+  let lastError;
+  for (let i = 0; i < attempts; i += 1) {
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const out = await work(session);
+      await session.commitTransaction();
+      return out;
+    } catch (e) {
+      try {
+        await session.abortTransaction();
+      } catch (_) {}
+      lastError = e;
+      const transient =
+        e?.errorLabels?.includes("TransientTransactionError") ||
+        /unable to acquire .*lock/i.test(e?.message || "");
+      if (!transient) throw e;
+    } finally {
+      session.endSession();
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * What a gate does when spend is over budget and not yet signed for.
+ *
+ * The refusal is the same everywhere, and so is the thing that must not
+ * happen: a signature collected and then thrown away with the error, which
+ * would make approving a click that achieved nothing.
+ *
+ * Written outside any transaction on purpose — recording a signature moves no
+ * money and touches one document, and doing it inside one widened the window
+ * on a lock the transaction already held until approvals began failing under
+ * load with a Mongo lock message instead of an answer.
+ *
+ * Returns true when it has answered the request.
+ */
+async function parkOverBudget(res, voucher, clearance) {
+  if (clearance.signatureError || !clearance.signatures?.length) {
+    res.status(409).json(clearance.payload);
+    return true;
+  }
+  await Acc_Voucher.updateOne(
+    { _id: voucher._id },
+    {
+      $set: {
+        "budgetOverride.required": true,
+        "budgetOverride.status": clearance.check?.overallStatus,
+        "budgetOverride.signatures": clearance.signatures,
+      },
+    },
+  );
+  const fresh = await Acc_Voucher.findById(voucher._id).lean();
+  res.status(202).json({ ...clearance.payload, voucher: fresh });
+  return true;
+}
+
 const VOUCHER_TYPES = [
   "sales",
   "purchase",
@@ -2455,7 +2528,9 @@ router.post("/", auth, async (req, res) => {
      * mean anything, and storing it would let a project report more spend than
      * the ledger recorded. Entries carrying no allocations — which is every
      * voucher written before this — pass untouched. */
-    const allocationProblems = budgetControl.validateCostCentreAllocations(body.ledgerEntries);
+    const allocationProblems = budgetControl.validateCostCentreAllocations(
+      body.ledgerEntries,
+    );
     if (allocationProblems.length) {
       return res.status(400).json({
         error: allocationProblems.join(" "),
@@ -2609,13 +2684,57 @@ router.post("/", auth, async (req, res) => {
     // rule, callable before the first save.
     const willPost =
       body.autoPost && Acc_Voucher.balanceOf(voucher.ledgerEntries).isBalanced;
+    let escalated = false;
     if (willPost) {
-      const clearance = await budgetControl.clearanceFor({ voucher, overrideReason: body.budgetOverrideReason, department: body.department, user: req.user });
-      if (clearance.blocked) return res.status(409).json(clearance.payload);
-      if (clearance.override) voucher.budgetOverride = clearance.override;
+      const clearance = await budgetControl.clearanceFor({
+        voucher,
+        overrideReason: body.budgetOverrideReason,
+        department: body.department,
+        user: req.user,
+      });
+      if (clearance.blocked) {
+        /* ── OVER BUDGET IS NOT A REFUSAL ANY MORE, IT IS A QUEUE ───────────
+           This used to 409 and write nothing, which was right while a reason
+           was enough to clear it: give the reason, post it. Now an overspend
+           needs finance and the CEO, and throwing the voucher away would mean
+           the accountant had to re-key it once they had signed.
+
+           So it is kept, not posted, and it carries the case that was made for
+           it. The signatures land on it as they come in, and the second one
+           posts it. */
+        if (!body.budgetOverrideReason) {
+          return res.status(409).json(clearance.payload);
+        }
+        escalated = true;
+        voucher.status = "pending_approval";
+        voucher.submittedBy = req.user?.id;
+        voucher.submittedByName = req.user?.name || "";
+        voucher.submittedAt = new Date();
+        voucher.budgetOverride = {
+          required: true,
+          status: clearance.check?.overallStatus,
+          reason: String(body.budgetOverrideReason).trim(),
+          signatures: clearance.signatures || [],
+        };
+      } else if (clearance.override) {
+        voucher.budgetOverride = clearance.override;
+      }
     }
 
     await voucher.save();
+
+    if (escalated) {
+      return res.status(202).json({
+        voucher: voucher.toObject(),
+        escalation: {
+          required: true,
+          code: "BUDGET_ESCALATION_REQUIRED",
+          waitingOn: "finance",
+          message:
+            "Raised. It needs finance and then the CEO before it can post.",
+        },
+      });
+    }
 
     // Auto-post if requested and balanced (owners / approvers only reach here)
     if (willPost) {
@@ -2689,7 +2808,9 @@ router.put("/:id", auth, async (req, res) => {
     if (Array.isArray(body.ledgerEntries)) {
       /* Same rule as create — an edit is another way to write the same
        * impossible allocation. */
-      const allocationProblems = budgetControl.validateCostCentreAllocations(body.ledgerEntries);
+      const allocationProblems = budgetControl.validateCostCentreAllocations(
+        body.ledgerEntries,
+      );
       if (allocationProblems.length) {
         return res.status(400).json({
           error: allocationProblems.join(" "),
@@ -2817,8 +2938,14 @@ router.put("/:id", auth, async (req, res) => {
         overrideReason: body.budgetOverrideReason,
         department: body.department,
         user: req.user,
+        signatures: existing.budgetOverride?.signatures || [],
+        signing: true,
       });
-      if (clearance.blocked) return res.status(409).json(clearance.payload);
+      if (clearance.blocked) {
+        /* An edit that pushes a posted voucher past its budget is spending
+           past it, and needs the same two signatures. */
+        return parkOverBudget(res, existing, clearance);
+      }
       if (clearance.override) body.budgetOverride = clearance.override;
     }
     /* Not a schema field — mongoose would drop it silently, but leaving it on
@@ -2858,41 +2985,56 @@ router.put("/:id", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 
 router.post("/:id/post", auth, async (req, res) => {
-  const session = await mongoose.startSession();
+  /* ── THE CHECK RUNS BEFORE THE TRANSACTION, NOT INSIDE IT ─────────────────
+     The budget check is several aggregations, and it used to run with a
+     transaction already open — so the transaction held its locks across all
+     of them. Under any concurrency that is long enough to lose the race, and
+     the caller got "Unable to acquire IX lock within 5ms" instead of an
+     answer. It is a READ; nothing it looks at belongs in the write's
+     transaction, and a refusal now returns before one is ever opened. */
+  const pre = await Acc_Voucher.findById(req.params.id);
+  if (!pre) return res.status(400).json({ error: "Voucher not found" });
+  if (pre.status !== "draft")
+    return res.status(400).json({ error: `Voucher already ${pre.status}` });
+  if (!pre.isBalanced)
+    return res
+      .status(400)
+      .json({ error: "Voucher Dr/Cr totals do not balance — cannot post" });
+
+  /* Posting IS spending, so posting an overspend is signing for it — the same
+     as approving one, and one signature is not two. */
+  const clearance = await budgetControl.clearanceFor({
+    voucher: pre,
+    overrideReason: req.body?.budgetOverrideReason,
+    department: req.body?.department,
+    user: req.user,
+    signing: true,
+  });
+  if (clearance.blocked) return parkOverBudget(res, pre, clearance);
+
   try {
-    session.startTransaction();
-    const voucher = await Acc_Voucher.findById(req.params.id).session(session);
-    if (!voucher) throw new Error("Voucher not found");
-    if (voucher.status !== "draft")
-      throw new Error(`Voucher already ${voucher.status}`);
-    if (!voucher.isBalanced)
-      throw new Error("Voucher Dr/Cr totals do not balance — cannot post");
+    const voucher = await inTransaction(async (session) => {
+      const voucher = await Acc_Voucher.findById(req.params.id).session(
+        session,
+      );
+      if (!voucher) throw new Error("Voucher not found");
+      if (voucher.status !== "draft")
+        throw new Error(`Voucher already ${voucher.status}`);
+      if (clearance.override) voucher.budgetOverride = clearance.override;
 
-    /* This is the moment the draft becomes money. Checked inside the
-     * transaction and before any balance is applied, so a refusal aborts
-     * cleanly and the voucher stays a draft. */
-    const clearance = await budgetControl.clearanceFor({ voucher, overrideReason: req.body?.budgetOverrideReason, department: req.body?.department, user: req.user });
-    if (clearance.blocked) {
-      await session.abortTransaction();
-      return res.status(409).json(clearance.payload);
-    }
-    if (clearance.override) voucher.budgetOverride = clearance.override;
+      voucher.status = "posted";
+      voucher.updatedBy = req.user?.id;
+      await voucher.save({ session });
+      await applyLedgerBalances(voucher, +1, session);
+      return voucher;
+    });
 
-    voucher.status = "posted";
-    voucher.updatedBy = req.user?.id;
-    await voucher.save({ session });
-    await applyLedgerBalances(voucher, +1, session);
-
-    await session.commitTransaction();
     await writePaymentToPO(voucher).catch((e) =>
       console.error("[PO payment writeback]", e.message),
     );
     res.json(voucher);
   } catch (e) {
-    await session.abortTransaction();
     res.status(400).json({ error: e.message });
-  } finally {
-    session.endSession();
   }
 });
 
@@ -3060,34 +3202,48 @@ router.post("/:id/void", auth, async (req, res) => {
 /* ------------------------------------------------------------------ */
 
 router.post("/:id/approve", auth, async (req, res) => {
-  const session = await mongoose.startSession();
-  try {
-    const perms = req.user?.permissions || {};
-    if (!perms.canApprove) {
-      session.endSession();
-      return res
-        .status(403)
-        .json({ error: "Only an approver or owner can approve vouchers." });
-    }
+  const perms = req.user?.permissions || {};
+  if (!perms.canApprove) {
+    return res
+      .status(403)
+      .json({ error: "Only an approver or owner can approve vouchers." });
+  }
 
-    session.startTransaction();
+  /* Read and check first, transact second — see the note on /post. */
+  const pre = await Acc_Voucher.findById(req.params.id);
+  if (!pre) return res.status(400).json({ error: "Voucher not found" });
+  if (pre.status !== "pending_approval")
+    return res.status(400).json({
+      error: `Only vouchers awaiting approval can be approved (this one is '${pre.status}').`,
+    });
+  if (!pre.isBalanced)
+    return res
+      .status(400)
+      .json({ error: "Voucher Dr/Cr totals do not balance — cannot approve." });
+
+  /* ── APPROVING IS SIGNING, AND ONE SIGNATURE IS NOT TWO ──────────────────
+     An overspend needs finance AND the CEO. If this approver's signature
+     completes the set, the clearance comes back clear and it posts below. If
+     it does not, their signature is KEPT — the voucher stays where it is, now
+     waiting on the other one — rather than thrown away with the refusal,
+     which would make approving a click that achieved nothing. */
+  const clearance = await budgetControl.clearanceFor({
+    voucher: pre,
+    overrideReason: req.body?.budgetOverrideReason,
+    department: req.body?.department,
+    user: req.user,
+    signing: true,
+  });
+  if (clearance.blocked) return parkOverBudget(res, pre, clearance);
+
+  try {
+    const voucher = await inTransaction(async (session) => {
     const voucher = await Acc_Voucher.findById(req.params.id).session(session);
     if (!voucher) throw new Error("Voucher not found");
     if (voucher.status !== "pending_approval")
       throw new Error(
         `Only vouchers awaiting approval can be approved (this one is '${voucher.status}').`,
       );
-    if (!voucher.isBalanced)
-      throw new Error("Voucher Dr/Cr totals do not balance — cannot approve.");
-
-    /* Approving posts it, so the same gate applies. The approver is the one
-     * who answers for the overspend here, which is the right person to ask —
-     * they are the one with the authority the submitter lacked. */
-    const clearance = await budgetControl.clearanceFor({ voucher, overrideReason: req.body?.budgetOverrideReason, department: req.body?.department, user: req.user });
-    if (clearance.blocked) {
-      await session.abortTransaction();
-      return res.status(409).json(clearance.payload);
-    }
     if (clearance.override) voucher.budgetOverride = clearance.override;
 
     voucher.status = "posted";
@@ -3100,18 +3256,15 @@ router.post("/:id/approve", auth, async (req, res) => {
     await voucher.save({ session });
     await applyLedgerBalances(voucher, +1, session);
 
-    await session.commitTransaction();
+      return voucher;
+    });
+
     await writePaymentToPO(voucher).catch((e) =>
       console.error("[PO payment writeback]", e.message),
     );
     res.json(voucher);
   } catch (e) {
-    try {
-      await session.abortTransaction();
-    } catch (_) {}
     res.status(400).json({ error: e.message });
-  } finally {
-    session.endSession();
   }
 });
 
