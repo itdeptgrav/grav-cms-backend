@@ -849,7 +849,23 @@ router.get("/direct-message/:convId/messages", verifyCoworkToken, verifyEmployee
 });
 
 // ── Meets ─────────────────────────────────────────────────
-router.post("/schedule-meet/create", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+/**
+ * Scheduling a meeting is open to any employee.
+ *
+ * It was `verifyCeoOrTL`, which refused an ordinary employee with "CEO or TL
+ * only" — and refused them at the END, after they had written a title, an
+ * agenda, picked a time and chosen participants, because the app has no way to
+ * know the rule before the engine states it. Calling a meeting is not an
+ * authority over anyone else; it is a request for people's time, which they
+ * accept by turning up.
+ *
+ * The lifecycle routes below stay restricted, but by AUTHORSHIP rather than
+ * rank: `cancelCoworkMeet`, `updateCoworkMeet` and `setCoworkMeetStatus` each
+ * refuse anybody who is not `createdBy`. That check already existed and is what
+ * makes opening this safe — an employee gets their own meeting to run and no
+ * reach at all over anybody else's.
+ */
+router.post("/schedule-meet/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { title, description, participants, dateTime, googleMeetLink, endsAt, agenda, taskId } = req.body;
     if (!title || !dateTime)
@@ -887,8 +903,14 @@ router.get("/schedule-meet/:meetId/events", verifyCoworkToken, verifyEmployeeTok
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Lifecycle beyond cancel (organiser only; enforced in the service) ─────
-router.patch("/schedule-meet/:meetId/status", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+/* ── Lifecycle beyond cancel (organiser only; enforced in the service) ─────
+ *
+ * `verifyEmployeeToken`, not `verifyCeoOrTL`: the gate here is AUTHORSHIP, and
+ * `setCoworkMeetStatus` already refuses anybody who is not `createdBy`. Ranking
+ * it as well was what left an employee able to schedule a meeting and then
+ * unable to run it — the rank check fired before the ownership check could say
+ * it was their own. */
+router.patch("/schedule-meet/:meetId/status", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { employeeId, name } = req.coworkUser;
     const result = await svc.setCoworkMeetStatus({
@@ -917,8 +939,8 @@ router.post("/schedule-meet/:meetId/presence", verifyCoworkToken, verifyEmployee
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ── Edit / Update Meeting (CEO or TL who created it) ─────────
-router.patch("/schedule-meet/:meetId/edit", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+// ── Edit / Update Meeting (the organiser; enforced in the service) ─────────
+router.patch("/schedule-meet/:meetId/edit", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { meetId } = req.params;
     const { employeeId } = req.coworkUser;
@@ -932,8 +954,8 @@ router.patch("/schedule-meet/:meetId/edit", verifyCoworkToken, verifyCeoOrTL, as
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// ── Cancel Meeting (CEO or TL who created it) ─────────────
-router.patch("/schedule-meet/:meetId/cancel", verifyCoworkToken, verifyCeoOrTL, async (req, res) => {
+// ── Cancel Meeting (the organiser; enforced in the service) ─────────────
+router.patch("/schedule-meet/:meetId/cancel", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { meetId } = req.params;
     const { employeeId, name } = req.coworkUser;
