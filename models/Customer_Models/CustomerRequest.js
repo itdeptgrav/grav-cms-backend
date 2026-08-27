@@ -273,6 +273,18 @@ const quotationItemSchema = new mongoose.Schema(
 
       min: 0,
     },
+    // The target price this item was raised at — set once, at request
+    // creation or when the item is first added to the PI, and never lowered
+    // after (26 Aug 2026: "they can change the price just by increase the
+    // price ok not decrease... that changed price also need to keep the
+    // record"). unitPrice - basePrice is the increase a sales person sold
+    // above target; preparedBy + updatedAt on the quotation say who and
+    // when. Falls back to unitPrice itself for quotations saved before this
+    // field existed — see quotationRoutes.js.
+    basePrice: {
+      type: Number,
+      min: 0,
+    },
     discountPercentage: {
       type: Number,
       default: 0,

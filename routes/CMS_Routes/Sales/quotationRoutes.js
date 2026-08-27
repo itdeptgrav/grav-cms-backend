@@ -991,7 +991,16 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
     const itemsWithCalculations = await Promise.all(quotationData.items.map(async (item) => {
       let stockItem = null;
       if (item.stockItemId) stockItem = await StockItem.findById(item.stockItemId);
-      const unitPrice = parseFloat(item.unitPrice) || 0;
+      // The floor a price can never go below — a sales person can price up
+      // from the target, never down (26 Aug 2026, explicit request). basePrice
+      // is echoed back by the client from what it was first shown; when a
+      // caller sends none (an older client, or a manually-added line with no
+      // prior price), the submitted unitPrice IS the floor, same as if it had
+      // never moved. Enforced here, not just in the popup's UI, since the UI
+      // clamp alone would be trivially bypassable.
+      const submittedPrice = parseFloat(item.unitPrice) || 0;
+      const basePrice = item.basePrice != null ? parseFloat(item.basePrice) || 0 : submittedPrice;
+      const unitPrice = Math.max(submittedPrice, basePrice);
       const gstPercentage = getGSTPercentage(unitPrice);
       const quantity = parseFloat(item.quantity) || 0;
       const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(quantity, unitPrice, gstPercentage);
@@ -1001,7 +1010,7 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       const discountedGST = discountedBase * (gstPercentage / 100);
       const discountedTotal = discountedBase + discountedGST;
       return {
-        ...item, gstPercentage,
+        ...item, unitPrice, basePrice, gstPercentage,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
         priceIncludingGST: discountPercentage > 0 ? parseFloat(discountedTotal.toFixed(2)) : priceIncludingGST,
@@ -1910,6 +1919,7 @@ async function recalcQuotationFromRequestItems(request) {
       description: "",
       quantity: item.totalQuantity || 0,
       unitPrice,
+      basePrice: unitPrice,
       discountPercentage: 0,
       discountAmount: 0,
       gstPercentage: getGSTPercentage(unitPrice),

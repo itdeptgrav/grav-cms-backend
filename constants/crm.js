@@ -981,7 +981,13 @@ const SAMPLE_SAMPLING_TRANSITIONS = {
   in_progress: ["submitted"],
   submitted: ["approved", "rejected"],
   rejected: ["in_progress"],
-  approved: [],
+  // approved -> rejected (26 Aug 2026, bug fix: "Can't move sampling from
+  // 'approved' to 'rejected'"). Sales approving the sample internally is no
+  // longer the end of the road — the customer can still reject it at their
+  // own approval step (StyleSampleStage.js's SampleCustomerApprovalChat),
+  // and "Send to R&D for Rework" reuses this same reject action to route it
+  // back. Was `[]` (terminal) from when Sales' approval was the only gate.
+  approved: ["rejected"],
 };
 // How one round was judged. Deliberately separate from SAMPLE_SAMPLING_STATUSES:
 // that is where the STYLE is, this is what happened to a single sample. Round 2

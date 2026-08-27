@@ -16,6 +16,13 @@ const whatsAppMessageSchema = new mongoose.Schema(
     conversationId: { type: mongoose.Schema.Types.ObjectId, ref: "WhatsAppConversation", index: true, required: true },
     waId: { type: String, index: true },              // denormalized customer id
     waMessageId: { type: String, index: true },       // Meta's message id (wamid.*)
+    // The message THIS one is replying to — Meta's `context.id` on an
+    // inbound message, carried on both a template quick-reply button tap
+    // and a plain in-thread reply. Lets a business feature (e.g. sample
+    // approval) match a reply back to the exact outbound message it sent,
+    // not just "the latest message in this conversation" (26 Aug 2026 —
+    // see services/sampleWhatsapp.js).
+    contextId: { type: String, index: true },
 
     direction: { type: String, enum: ["incoming", "outgoing"], required: true },
     type: { type: String, enum: MESSAGE_TYPES, default: "text" },

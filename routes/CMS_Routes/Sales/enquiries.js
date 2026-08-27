@@ -196,19 +196,33 @@ function leadEstimateSnapshot(lead) {
   return snap;
 }
 
-// Seed enquiry products from the lead's structured requirement. `requirementItems`
-// is the [{ product, quantity }] captured at lead stage; `productInterest` is the
-// flat name list — fall back to it when items weren't structured.
-function productsFromLead(lead) {
-  if (!lead) return [];
+// The lead's requirement, as ONE readable line for the enquiry's summary.
+//
+// It used to be seeded straight into `enquiry.products[]` (26 Aug 2026,
+// explicit request to stop: "the product requirement form which is asking in
+// the lead shouldn't be auto create as an enquiry product in the pipeline
+// section... that just need to ask for a record"). What a lead captured is a
+// stated interest — a name and a rough quantity, typed before anyone knew
+// whether it maps to a registered product. A pipeline product row is a
+// different, heavier thing: it carries the full spec, the register link, and
+// the SampleStyle raised from it. Promoting one to the other automatically
+// created half-formed rows the salesperson then had to correct or delete.
+//
+// So the requirement stays on the Lead as the record it always was, and it is
+// carried here only as TEXT the salesperson reads while registering the real
+// products themselves.
+function requirementSummaryFromLead(lead) {
+  if (!lead) return "";
   const items = Array.isArray(lead.requirementItems) ? lead.requirementItems : [];
-  if (items.length) {
-    return items
-      .filter((it) => it && String(it.product || "").trim())
-      .map((it) => ({ product: String(it.product).trim(), quantity: it.quantity != null ? Number(it.quantity) : undefined }));
-  }
+  const fromItems = items
+    .filter((it) => it && String(it.product || "").trim())
+    .map((it) => {
+      const name = String(it.product).trim();
+      return it.quantity != null ? `${name} (${Number(it.quantity)} pcs)` : name;
+    });
+  if (fromItems.length) return fromItems.join(", ");
   const names = Array.isArray(lead.productInterest) ? lead.productInterest : [];
-  return names.filter((n) => String(n || "").trim()).map((n) => ({ product: String(n).trim() }));
+  return names.map((n) => String(n || "").trim()).filter(Boolean).join(", ");
 }
 
 // Free-text spec fields carried through verbatim (trimmed). Kept in one list so
@@ -478,8 +492,16 @@ router.get("/by-journey/:journeyRef", salesAuth, async (req, res) => {
         sourceLeadId: lead?._id || undefined,
         title: journey.name,
         source: enquirySourceFromLead(lead),
-        summary: lead?.requirements || undefined,
-        products: productsFromLead(lead),
+        // The lead's own requirement note, plus what it said it wanted — kept
+        // as readable text so nothing the lead established is lost now that
+        // products are no longer auto-created from it (see
+        // requirementSummaryFromLead).
+        summary: [lead?.requirements, requirementSummaryFromLead(lead) && `Requirement from lead: ${requirementSummaryFromLead(lead)}`]
+          .filter(Boolean).join("\n\n") || undefined,
+        // Deliberately empty — the salesperson registers the real products in
+        // the Enquiry stage, where the register link and full spec are
+        // captured. See requirementSummaryFromLead above.
+        products: [],
         // Seed our indicative estimate from the lead's researched unit price —
         // a starting point the salesperson refines. The customer's target is
         // left blank for them to capture.
@@ -2123,6 +2145,25 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
       summary: `${who.name || "Sales"} recorded that the customer ${req.body.approved ? "approved" : "rejected"} "${productName}"${note ? ` — ${note}` : ""}`,
     }).catch(() => {});
 
+    // Denormalize onto every matching SampleStyle (26 Aug 2026, explicit
+    // request: "everywhere in both sales, r&d and all other where the tag
+    // need to showcase ki customer rejected this product") so R&D's already
+    // existing history/status rendering shows this with zero new R&D-side
+    // code. A product can have more than one SampleStyle — one per
+    // variantKey — so every match is updated, not just the first.
+    (async () => {
+      const styles = await SampleStyle.find({ journeyId: enquiry.journeyId, productName });
+      for (const style of styles) {
+        style.customerRejected = !req.body.approved;
+        if (!req.body.approved) {
+          style.history = style.history || [];
+          style.history.push({ kind: "customer_rejected_at_costing", note, by: who, at: now });
+        }
+        style.updatedBy = who;
+        await style.save();
+      }
+    })().catch((err) => console.error("[enquiries] customer-approval → SampleStyle sync failed:", err.message));
+
     (async () => {
       const product = (enquiry.products || []).find((p) => p.product === productName);
       const customerName = await customerNameFor(enquiry);
@@ -2145,6 +2186,70 @@ router.post("/:id/products/:productName/customer-approval", salesAuth, async (re
     return res.json({ success: true, enquiry: await decorate(enquiry, req) });
   } catch (err) {
     console.error("[enquiries] POST /:id/products/:productName/customer-approval", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/enquiries/:id/products/:productName/remove
+// "Change Product Design" → "Remove & Create New Version of this product"
+// (26 Aug 2026, explicit request). Removes ONLY this product's row from the
+// enquiry — never the underlying StockItem catalog document, per "unlink
+// that product from the customer" — and keeps the full removed row (spec,
+// photos, everything) recoverable via the shared ChangeLog, same mechanism
+// already used throughout this file (recordChange/historyFor), so a later
+// "why isn't this product here anymore" always has an answer: what it was,
+// who removed it, and why (the customer's own rejection reason, carried
+// over from costingLifecycle).
+router.post("/:id/products/:productName/remove", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const enquiry = await Enquiry.findOne({ _id: req.params.id, isActive: true });
+    if (!enquiry) return res.status(404).json({ success: false, message: "Enquiry not found." });
+    const productName = decodeURIComponent(req.params.productName);
+    const row = (enquiry.products || []).find((p) => p.product === productName);
+    if (!row) return res.status(404).json({ success: false, message: "No product with that name on this enquiry." });
+
+    const snapshot = row.toObject();
+    enquiry.products = (enquiry.products || []).filter((p) => p.product !== productName);
+    const who = actor(req);
+    enquiry.updatedBy = who;
+    await enquiry.save();
+
+    const lifecycleEntry = (enquiry.costingLifecycle || []).find((c) => c.productName === productName);
+    const rejectionNote = lifecycleEntry?.customerDecisionNote || "";
+
+    recordChange(req, {
+      departmentSlug: "sales",
+      entity: "crm-enquiry-product",
+      entityId: enquiry._id,
+      entityLabel: productName,
+      action: "delete",
+      summary: `${who.name || "Sales"} removed "${productName}"${rejectionNote ? ` — customer rejected: ${rejectionNote}` : ""}`,
+      before: snapshot,
+      after: {},
+    }).catch(() => {});
+
+    return res.json({ success: true, enquiry: await decorate(enquiry, req) });
+  } catch (err) {
+    console.error("[enquiries] POST /:id/products/:productName/remove", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /api/cms/crm/enquiries/:id/products/:productName/removed-snapshot
+// The read side of "Remove & Create New Version" — the last snapshot of a
+// removed product row (name/description/category/photos/specs), read back
+// out of the same ChangeLog entry the remove route above writes, so the new
+// product registration form can be pre-filled from it (26 Aug 2026).
+router.get("/:id/products/:productName/removed-snapshot", salesAuth, async (req, res) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ success: false, message: "Invalid enquiry reference." });
+    const productName = decodeURIComponent(req.params.productName);
+    const entries = await historyFor("crm-enquiry-product", req.params.id, 50);
+    const match = entries.find((e) => e.action === "delete" && e.before?.product === productName);
+    return res.json({ success: true, snapshot: match?.before || null });
+  } catch (err) {
+    console.error("[enquiries] GET /:id/products/:productName/removed-snapshot", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });

@@ -260,6 +260,10 @@ router.get("/:id", salesAuth, async (req, res) => {
 
     const { password, ...customer } = rawCustomer;
     customer.hasPassword = !!password;
+    // Same dangling-reference filter as /assigned-items above — a deleted
+    // product populates to null here too, and anything mapping over this list
+    // would hit the same id-less row (26 Aug 2026).
+    customer.assignedStockItems = (customer.assignedStockItems || []).filter((a) => a?.stockItemId);
 
     res.json({ success: true, customer });
   } catch (err) {
@@ -508,9 +512,30 @@ router.get("/:id/assigned-items", salesAuth, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Customer not found" });
 
+    // Drop assignments whose product no longer exists (26 Aug 2026, bug fix).
+    // `populate` resolves a dangling reference to `null`, not to the raw id,
+    // so a deleted StockItem arrives here as `{ stockItemId: null }`. Served
+    // as-is, each one became a product row with no id — un-orderable, and
+    // (when a customer had more than one) sharing a null React key, which is
+    // the "Encountered two children with the same key, `null`" crash in the
+    // size-wise bulk order slider. Two customers in the live data had EVERY
+    // assignment in this state.
+    //
+    // Filtered rather than repaired: this is a read, and a GET must not
+    // write. The delete route now unassigns properly, and
+    // scripts/cleanup_dangling_assignments.js clears the historic rows.
+    const assignedItems = (customer.assignedStockItems || []).filter((a) => a?.stockItemId);
+    const dropped = (customer.assignedStockItems || []).length - assignedItems.length;
+    if (dropped) {
+      console.warn(`[salesCustomers] customer ${customer.customerId || customer._id}: hid ${dropped} assignment(s) whose product was deleted.`);
+    }
+
     res.json({
       success: true,
-      assignedItems: customer.assignedStockItems || [],
+      assignedItems,
+      // Named so the UI can say "3 assigned products are no longer in the
+      // register" rather than silently showing a shorter list.
+      unavailableCount: dropped,
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -556,11 +581,16 @@ router.post("/:id/assign-items", salesAuth, async (req, res) => {
     if (mode === "replace") {
       customer.assignedStockItems = newAssignments;
     } else {
+      // Null-guarded (26 Aug 2026): an assignment row with no stockItemId
+      // would throw here and fail the whole assign action. This route reads
+      // the customer unpopulated, so today the id is always the raw ObjectId
+      // and present — but that is a property of this one query, not of the
+      // data, and it is one `.populate()` away from being false.
       const existingIds = new Set(
-        customer.assignedStockItems.map((a) => a.stockItemId.toString()),
+        (customer.assignedStockItems || []).map((a) => (a?.stockItemId ? String(a.stockItemId) : null)).filter(Boolean),
       );
       const toAdd = newAssignments.filter(
-        (a) => !existingIds.has(a.stockItemId.toString()),
+        (a) => a?.stockItemId && !existingIds.has(String(a.stockItemId)),
       );
       customer.assignedStockItems.push(...toAdd);
     }

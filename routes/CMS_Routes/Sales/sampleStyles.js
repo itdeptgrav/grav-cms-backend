@@ -44,6 +44,7 @@ const salesAuthBase = require("../../../Middlewear/SalesAuthMiddlewear");
 const salesAuth = salesAuthBase.withRoles(salesAuthBase.RND_ROLES);
 const { isSalesManager, bypassesApproval } = require("../../../services/salesAccess");
 const { provisionJourneyStyles } = require("../../../services/sampleStyleProvision");
+const { isSampleSettled } = require("../../../services/sampleReadiness");
 const { createWithRef } = require("../../../services/sampleStyleRef");
 const {
   variantKeyFrom,
@@ -416,6 +417,59 @@ function sanitizeMaterialsRawItems(input) {
 // (sanitizeMaterialsRawItems throws without one), which is the only reason
 // the local copy existed: processVariantRawItems drops rows with no
 // positive quantity.
+/**
+ * A StockItem's bill of materials, flattened and de-duped for display.
+ *
+ * THERE IS NO `StockItem.rawItems` — the BOM hangs off each variant
+ * (`variants[].rawItems`), so anything reading `stockItem.rawItems` silently
+ * gets `undefined`. Variants differ by size, not by what the garment is made
+ * of, so the same raw item appears once per variant; this merges those into
+ * one row and records which variants carried it, rather than showing the same
+ * fabric five times.
+ *
+ * Quantities are the variant rows' own `quantity`, which is already the
+ * post-allowance effective figure (see StockItem's variantRawItemSchema) —
+ * `allowancePercent` is carried through for display only and must NOT be
+ * applied again on top.
+ *
+ * @param {object|null} stockItem A lean StockItem with `variants[].rawItems`.
+ * @returns {Array} `[{ rawItemId, rawItemName, rawItemSku, quantity, unit, allowancePercent, unitCost, totalCost, variantLabels[] }]`
+ */
+function stockItemBom(stockItem) {
+  const variants = Array.isArray(stockItem?.variants) ? stockItem.variants : [];
+  const byKey = new Map();
+  for (const v of variants) {
+    const label = Array.isArray(v.attributes)
+      ? v.attributes.map((a) => a?.value).filter(Boolean).join(" / ")
+      : "";
+    for (const r of Array.isArray(v.rawItems) ? v.rawItems : []) {
+      if (!r?.rawItemId) continue;
+      // Same raw item in a different raw-item variant (a different colourway
+      // of the same fabric) is a genuinely different line, so the key carries
+      // both ids.
+      const key = `${String(r.rawItemId)}::${String(r.variantId || "")}`;
+      const existing = byKey.get(key);
+      if (existing) {
+        if (label && !existing.variantLabels.includes(label)) existing.variantLabels.push(label);
+        continue;
+      }
+      byKey.set(key, {
+        rawItemId: String(r.rawItemId),
+        rawItemName: r.rawItemName || "",
+        rawItemSku: r.rawItemSku || "",
+        variantCombination: r.variantCombination || [],
+        quantity: r.quantity ?? null,
+        unit: r.unit || "",
+        allowancePercent: r.allowancePercent ?? 0,
+        unitCost: r.unitCost ?? null,
+        totalCost: r.totalCost ?? null,
+        variantLabels: label ? [label] : [],
+      });
+    }
+  }
+  return [...byKey.values()];
+}
+
 async function syncMaterialsRawItems(style, picks) {
   if (!Array.isArray(picks) || !picks.length) return;
   const targetStockItemId = style.production?.stockItemId || style.sourceStockItemId;
@@ -474,11 +528,16 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
       ? req.body.items.map((x) => String(x).trim()).filter(Boolean)
       : [];
     const rawItems = sanitizeMaterialsRawItems(req.body.rawItems);
+    // No raw items required (26 Aug 2026, explicit request: "don't make the
+    // restriction for filling the raw items over here... the sales person
+    // can also skip this part") — an explicit skip resolves materials as
+    // done-with-nothing-picked, distinct from a form nobody has touched.
+    const skip = req.body.skip === true;
 
     if (!bypassesApproval(req.user)) {
       style.materialsChangeLog = [
         ...(style.materialsChangeLog || []),
-        { items, rawItems, status: "pending", submittedBy: actor(req), submittedAt: new Date() },
+        { items, rawItems, skip, status: "pending", submittedBy: actor(req), submittedAt: new Date() },
       ];
       await style.save();
 
@@ -508,7 +567,7 @@ router.patch("/:id/materials", salesAuth, async (req, res) => {
     }
 
     const prevItems = style.materials.items || [];
-    style.materials.status = items.length ? "selected" : "pending";
+    style.materials.status = (items.length || skip) ? "selected" : "pending";
     style.materials.items = items;
     style.materials.rawItems = rawItems;
     style.materials.selectedBy = actor(req);
@@ -552,7 +611,7 @@ router.post("/:id/materials/change/:changeId/decide", salesAuth, async (req, res
 
     if (decision === "approve") {
       const prevItems = style.materials.items || [];
-      style.materials.status = entry.items.length ? "selected" : "pending";
+      style.materials.status = (entry.items.length || entry.skip) ? "selected" : "pending";
       style.materials.items = entry.items;
       style.materials.rawItems = entry.rawItems || [];
       style.materials.selectedBy = actor(req);
@@ -654,7 +713,15 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
     const invalid = (next) => res.status(400).json({ success: false, message: `Can't move the tech sheet from "${cur}" to "${next}".` });
 
     if (action === "start") {
-      if (style.materials.status !== "selected") return res.status(400).json({ success: false, message: "Materials must be selected before starting the tech sheet." });
+      // The "materials must be selected first" precondition is GONE (26 Aug
+      // 2026). It guarded a step that no longer exists: raw items used to be
+      // picked in Sales' Style & Sample stage, and that form was removed when
+      // raw items became read-only there, maintained on the finished good
+      // instead. Leaving the check in place would have stranded every style
+      // permanently — `materials.status` can no longer reach "selected" from
+      // the pipeline, so the tech sheet could never start and nothing could
+      // move past it. The bill of materials is R&D's to read off the stock
+      // item now, not a gate Sales has to clear on their behalf.
       if (!can("in_progress")) return invalid("in_progress");
       style.techSheet.status = "in_progress";
       if (!style.techSheet.startedAt) style.techSheet.startedAt = new Date();
@@ -906,12 +973,17 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
     } else if (action === "reject") {
       if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can reject the sample." });
       if (!can("rejected")) return invalid("rejected");
+      // Reason required server-side, not just client-side (26 Aug 2026,
+      // explicit request: "make sure to ask for the reason" — this is
+      // "serious/sensitive data" and the rework log downstream is only as
+      // good as the reasons actually captured here).
+      const note = (req.body.note || "").trim();
+      if (!note) return res.status(400).json({ success: false, message: "A rejection reason is required." });
       style.sample.status = "rejected";
       // Rejecting the style rejects the sample in front of them — the latest
       // round. Naming it turns two parallel lists into one readable ladder:
       // the revision now has a subject instead of only a timestamp.
       const latest = (style.sample.rounds || [])[style.sample.rounds.length - 1];
-      const note = (req.body.note || "").trim();
       if (latest) {
         latest.outcome = "rejected";
         latest.feedback = note;
@@ -968,6 +1040,25 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
       })().catch(() => {});
     }
 
+    // Auto-send the WhatsApp approval request the moment Sales approves the
+    // sample internally (26 Aug 2026, explicit request: "this approval
+    // request need to auto sent to that customer ok in whatsapp... so that
+    // will auto trigger here in our website"). Fire-and-forget, same as the
+    // notification block above — a WhatsApp outage or missing template
+    // config must never fail the approval action itself; the result is only
+    // ever visible via style.customerApproval.whatsapp on the next read.
+    if (action === "approve") {
+      (async () => {
+        const [customerName, j] = await Promise.all([
+          customerNameFor(style),
+          SalesJourney.findById(style.journeyId).select("journeyId").lean(),
+        ]);
+        const { sendApprovalRequest } = require("../../../services/sampleWhatsapp");
+        const result = await sendApprovalRequest(style, { customerName, enquiryRef: j?.journeyId, preparedBy: actor(req).name });
+        if (!result.sent) console.warn(`[sampleStyles] WhatsApp approval request not sent for ${style.sampleStyleId || style._id}: ${result.reason}`);
+      })().catch((err) => console.error("[sampleStyles] WhatsApp auto-send failed:", err.message));
+    }
+
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample", err);
@@ -1008,6 +1099,88 @@ router.post("/:id/sample/discussion", salesAuth, async (req, res) => {
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/sample/discussion", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/sample-styles/:id/sample/send-whatsapp-approval
+//
+// Manual (re)send — the same call the "approve" action already fires
+// automatically (26 Aug 2026), exposed here for when that auto-send failed
+// (no phone on file yet at approval time, WhatsApp briefly down, template
+// not configured yet when this style was first approved) and Sales needs a
+// retry button rather than re-approving the sample just to trigger it again.
+router.post("/:id/sample/send-whatsapp-approval", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can send the approval request." });
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    if (!isSampleSettled(style)) {
+      return res.status(400).json({ success: false, message: "Sales must approve the sample internally first." });
+    }
+    const [customerName, j] = await Promise.all([
+      customerNameFor(style),
+      SalesJourney.findById(style.journeyId).select("journeyId").lean(),
+    ]);
+    const { sendApprovalRequest } = require("../../../services/sampleWhatsapp");
+    const result = await sendApprovalRequest(style, { customerName, enquiryRef: j?.journeyId, preparedBy: actor(req).name });
+    if (!result.sent) return res.status(502).json({ success: false, message: result.reason });
+    return res.json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/sample/send-whatsapp-approval", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/sample-styles/:id/sample/customer-decision
+// Body: { approved: boolean, note?: string }
+//
+// The customer's verdict on the finished sample (26 Aug 2026 — replaces the
+// old Cost & Invoicing customer-approval step, moved here since the decision
+// belongs with the sample, before any pricing happens: "once after sample
+// approval from the sales team, then next step will be that sent to
+// customer for Sample approval"). Sales records the customer's answer —
+// there is no customer login here to do it themselves, same as
+// costingLifecycle's customerApprovalLog did. Only meaningful once Sales has
+// already approved the sample internally; APPENDS to `log`, never
+// overwrites, same append-only discipline as every other decision log in
+// this codebase.
+router.post("/:id/sample/customer-decision", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) return res.status(403).json({ success: false, message: "Only Sales can record the customer's decision." });
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    if (!isSampleSettled(style)) {
+      return res.status(400).json({ success: false, message: "Sales must approve the sample internally before asking the customer." });
+    }
+    if (typeof req.body?.approved !== "boolean") {
+      return res.status(400).json({ success: false, message: "approved (true/false) is required." });
+    }
+    const approved = req.body.approved;
+    const note = String(req.body?.note || "").trim();
+    if (!approved && !note) {
+      return res.status(400).json({ success: false, message: "A reason is required when the customer rejects the sample." });
+    }
+
+    const who = actor(req);
+    const now = new Date();
+    style.customerApproval = style.customerApproval || {};
+    style.customerApproval.log = style.customerApproval.log || [];
+    style.customerApproval.log.push({ approved, decidedAt: now, decidedBy: who, note });
+    style.customerApproval.approved = approved;
+    style.customerApproval.decidedAt = now;
+    style.customerApproval.decidedBy = who;
+    style.customerApproval.note = note;
+    style.customerRejected = !approved;
+
+    logHistory(style, { kind: approved ? "customer_sample_approved" : "customer_sample_rejected", note }, req);
+    style.updatedBy = who;
+    await style.save();
+
+    return res.json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/sample/customer-decision", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1068,9 +1241,19 @@ router.get("/:id/production", salesAuth, async (req, res) => {
       }
     }
 
+    // `sourceStockItemId` is the FALLBACK, not an alternative — same order
+    // syncMaterialsRawItems and the sample-approval sync already use
+    // (`production?.stockItemId || sourceStockItemId`), and this route was the
+    // one place that didn't (26 Aug 2026 bug fix). `sourceStockItemId` is set
+    // once at style creation and never backfilled, while
+    // `production.stockItemId` is set later and is cleared outright by
+    // POST /:id/production/reset — so consulting only the latter left styles
+    // whose product IS registered reporting no stock item at all: an empty
+    // product-variant dropdown, and no bill of materials to show.
+    const linkedStockItemId = style.production.stockItemId || style.sourceStockItemId;
     let stockItem = null;
-    if (style.production.stockItemId) {
-      stockItem = await StockItem.findById(style.production.stockItemId).select("name reference category variants operations").lean();
+    if (linkedStockItemId) {
+      stockItem = await StockItem.findById(linkedStockItemId).select("name reference category variants operations").lean();
     }
 
     let workOrders = [];
@@ -1097,6 +1280,21 @@ router.get("/:id/production", salesAuth, async (req, res) => {
         // against `undefined` never matched a real variant server-side, so
         // "Set a quantity for at least one variant" fired even with one set).
         stockItem: stockItem ? { id: stockItem._id, name: stockItem.name, reference: stockItem.reference, category: stockItem.category, variants: (stockItem.variants || []).map((v) => ({ ...v, id: v._id })), operations: stockItem.operations } : null,
+        // The bill of materials, already de-duped across variants and ready
+        // to render (26 Aug 2026, explicit request: the Sales pipeline shows
+        // "whatever the raw items defined on that corresponding stock item"
+        // and no longer defines its own). Rolled up HERE rather than in the
+        // browser because a StockItem has no top-level `rawItems` — the BOM
+        // hangs off each variant and has to be walked and merged, which is
+        // exactly the step every previous consumer got wrong or skipped.
+        bom: stockItemBom(stockItem),
+        // Set by Sales, read-only to R&D (26 Aug 2026) — see the
+        // order-quantities route.
+        orderVariants: (style.production.orderVariants || []).map((v) => ({
+          variantId: String(v.variantId), variantLabel: v.variantLabel, sku: v.sku, quantity: v.quantity,
+        })),
+        orderVariantsSetAt: style.production.orderVariantsSetAt || null,
+        orderVariantsSetBy: style.production.orderVariantsSetBy || null,
         customerRequest,
         workOrderIds: style.production.workOrderIds || [],
         workOrders,
@@ -1324,6 +1522,92 @@ router.post("/:id/production/stock-item", salesAuth, async (req, res) => {
   }
 });
 
+// POST /api/cms/crm/sample-styles/:id/production/order-quantities
+// Body: { variants: [{ variantId, quantity }] }
+//
+// SALES sets how many of each variant to make; R&D only reads it back (26 Aug
+// 2026, explicit request: "Sales person will set the qty of the corresponding
+// product-variant wise... so that the r&d team can't set the qty as per there
+// own ok, only they can see the qty").
+//
+// Gated on `canApprove` — the SAME gate as the tech-sheet and customer
+// decisions, not the wide `salesAuth` the rest of this production section
+// uses (that one is deliberately widened to include R&D so they can drive
+// their own wizard). Order quantity is a commercial decision, so it takes the
+// commercial gate.
+//
+// Gated on the tech sheet being settled, too: before that the spec can still
+// change, and a quantity typed against a variant list that may not survive
+// review is a number nobody should rely on. `notApplicable` counts as settled
+// — a style raised from a registered product never gets a tech sheet at all,
+// and waiting for one would mean its quantities could never be set.
+router.post("/:id/production/order-quantities", salesAuth, async (req, res) => {
+  try {
+    if (!(await canApprove(req.user))) {
+      return res.status(403).json({ success: false, message: "Only Sales can set order quantities." });
+    }
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const techStatus = style.techSheet?.status;
+    if (techStatus !== "approved" && techStatus !== "notApplicable") {
+      return res.status(400).json({ success: false, message: "Approve the tech sheet before setting order quantities." });
+    }
+    if (style.production?.status === "submitted") {
+      return res.status(400).json({ success: false, message: "This style has already been sent to production." });
+    }
+
+    const stockItemId = style.production?.stockItemId || style.sourceStockItemId;
+    if (!stockItemId) return res.status(400).json({ success: false, message: "Register the product before setting quantities." });
+    const stockItem = await StockItem.findById(stockItemId).select("variants").lean();
+    if (!stockItem) return res.status(404).json({ success: false, message: "The linked product no longer exists." });
+
+    // Resolve every row against the REAL variant list rather than trusting the
+    // body — the same discipline /production/submit already applies, and the
+    // reason its own quantities were reliable even though nothing persisted
+    // them.
+    const byId = new Map((stockItem.variants || []).map((v) => [String(v._id), v]));
+    const rows = Array.isArray(req.body?.variants) ? req.body.variants : [];
+    const orderVariants = [];
+    for (const row of rows) {
+      const v = row?.variantId ? byId.get(String(row.variantId)) : null;
+      const qty = Number(row?.quantity);
+      if (!v || !Number.isFinite(qty) || qty <= 0) continue; // a zero/blank row means "not ordering this variant"
+      orderVariants.push({
+        variantId: v._id,
+        variantLabel: (v.attributes || []).map((a) => a?.value).filter(Boolean).join(" / "),
+        sku: v.sku || "",
+        quantity: qty,
+      });
+    }
+    if (!orderVariants.length) {
+      return res.status(400).json({ success: false, message: "Set a quantity against at least one variant." });
+    }
+
+    const who = actor(req);
+    const total = orderVariants.reduce((n, v) => n + v.quantity, 0);
+    if (!style.production) style.production = {};
+    style.production.orderVariants = orderVariants;
+    style.production.orderVariantsSetAt = new Date();
+    style.production.orderVariantsSetBy = who;
+    style.production.log = style.production.log || [];
+    style.production.log.push({
+      kind: "order_quantities_set",
+      note: `${orderVariants.length} variant(s), ${total} pcs total.`,
+      by: who,
+      at: new Date(),
+    });
+    logHistory(style, { kind: "order_quantities_set", note: `${total} pcs across ${orderVariants.length} variant(s).` }, req);
+    style.updatedBy = who;
+    await style.save();
+
+    return res.json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/production/order-quantities", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // POST /:id/production/submit  { variants: [{variantId, quantity}], priority?, deliveryDeadline? }
 //
 // `variants` is an ARRAY keyed by variantId, not a map — and the caller
@@ -1346,16 +1630,29 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
     const customer = await Customer.findById(style.production.customerId).select("name email phone profile").lean();
     if (!customer) return res.status(404).json({ success: false, message: "The linked customer could not be found." });
 
+    // QUANTITIES COME FROM WHAT SALES SET, NOT FROM THE REQUEST BODY (26 Aug
+    // 2026). This route is reachable by R&D — `salesAuth` here is deliberately
+    // widened to the R&D roles so they can drive their own production wizard —
+    // so honouring `req.body.variants` let R&D send any quantity it liked,
+    // which is exactly what the request to move this decision to Sales was
+    // about. The body is now ignored for quantities; the persisted
+    // `production.orderVariants` is the only source.
     const variantsById = new Map((stockItem.variants || []).map((v) => [String(v._id), v]));
-    const variantsInput = Array.isArray(req.body?.variants) ? req.body.variants : [];
+    const ordered = style.production?.orderVariants || [];
+    if (!ordered.length) {
+      return res.status(400).json({ success: false, message: "Sales hasn't set the order quantities for this style yet." });
+    }
     const variants = [];
-    for (const row of variantsInput) {
+    for (const row of ordered) {
       const qty = Number(row?.quantity) || 0;
       const v = row?.variantId ? variantsById.get(String(row.variantId)) : null;
+      // A variant deleted from the register after Sales set its quantity is
+      // skipped rather than failing the whole submission — the remaining
+      // lines are still a valid order.
       if (qty <= 0 || !v) continue;
       variants.push({ variantId: String(v._id), attributes: v.attributes || [], quantity: qty, specialInstructions: [], estimatedPrice: (v.salesPrice || 0) * qty });
     }
-    if (!variants.length) return res.status(400).json({ success: false, message: "Set a quantity for at least one variant." });
+    if (!variants.length) return res.status(400).json({ success: false, message: "None of the ordered variants still exist on the product — ask Sales to set the quantities again." });
     const totalQuantity = variants.reduce((s, v) => s + v.quantity, 0);
 
     const priority = ["low", "medium", "high", "urgent"].includes(req.body?.priority) ? req.body.priority : "medium";
@@ -1434,6 +1731,13 @@ router.post("/:id/production/reset", salesAuth, async (req, res) => {
     }
     style.production.customerId = undefined;
     style.production.stockItemId = undefined;
+    // The order quantities go too: they are variant ids belonging to the
+    // stock item just unlinked, so keeping them would leave figures pointing
+    // at variants this style no longer has (26 Aug 2026). Sales sets them
+    // again once the product is re-registered.
+    style.production.orderVariants = [];
+    style.production.orderVariantsSetAt = null;
+    style.production.orderVariantsSetBy = undefined;
     style.production.status = "not_started";
     style.production.log = style.production.log || [];
     style.production.log.push({ kind: "reset", note: "", by: actor(req), at: new Date() });

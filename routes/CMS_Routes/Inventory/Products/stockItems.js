@@ -703,7 +703,7 @@ router.get("/data/create", async (req, res) => {
 
     const [registeredOperations, registeredGroups] = await Promise.all([
       Operation.find().sort({ name: 1 }),
-      OperationGroup.find().populate("operations", "name operationCode totalSam durationSeconds machineType").sort({ name: 1 })
+      OperationGroup.find().populate("operations", "name operationCode totalSam durationSeconds machineType salaryDept salaryDesig").sort({ name: 1 })
     ]);
 
     res.json({
@@ -714,7 +714,7 @@ router.get("/data/create", async (req, res) => {
         rawItems: processedRawItems,
         machines: machines.map(m => ({ id: m._id, name: m.name, type: m.type, model: m.model, serialNumber: m.serialNumber })),
         averageOperatorSalary: Math.round(averageSalary),
-        registeredOperations: registeredOperations.map(op => ({ _id: op._id, name: op.name, operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType })),
+        registeredOperations: registeredOperations.map(op => ({ _id: op._id, name: op.name, operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType, salaryDept: op.salaryDept || "", salaryDesig: op.salaryDesig || "" })),
         registeredGroups: registeredGroups.map(grp => ({ _id: grp._id, name: grp.name, operations: grp.operations })),
         unitConversions: unitConversionsMap
       }
@@ -775,9 +775,9 @@ router.get("/:id/tab/:tabName", async (req, res) => {
     if (tabName === "operations") {
       const [registeredOperations, registeredGroups] = await Promise.all([
         Operation.find().sort({ name: 1 }),
-        OperationGroup.find().populate("operations", "name operationCode totalSam durationSeconds machineType").sort({ name: 1 })
+        OperationGroup.find().populate("operations", "name operationCode totalSam durationSeconds machineType salaryDept salaryDesig").sort({ name: 1 })
       ]);
-      response.registeredOperations = registeredOperations.map(op => ({ _id: op._id, name: op.name, operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType }));
+      response.registeredOperations = registeredOperations.map(op => ({ _id: op._id, name: op.name, operationCode: op.operationCode || op.code || "", totalSam: op.totalSam, durationSeconds: op.durationSeconds, machineType: op.machineType, salaryDept: op.salaryDept || "", salaryDesig: op.salaryDesig || "" }));
       response.registeredGroups = registeredGroups.map(grp => ({ _id: grp._id, name: grp.name, operations: grp.operations }));
     }
 
@@ -1461,6 +1461,33 @@ router.delete("/:id", async (req, res) => {
     const stockItem = await StockItem.findById(req.params.id);
     if (!stockItem) return res.status(404).json({ success: false, message: "Stock item not found" });
     await stockItem.deleteOne();
+
+    // Drop the product from every customer it was assigned to (26 Aug 2026,
+    // bug fix). Deleting the StockItem used to leave those assignment rows
+    // pointing at a document that no longer exists, and Mongoose `populate`
+    // resolves a dangling reference to `null` rather than leaving the raw id
+    // — so the bulk-order product list rendered one nameless, un-orderable
+    // row per deleted product, all sharing a null React key ("Encountered two
+    // children with the same key, `null`"). The duplicate key was the visible
+    // symptom; the real defect is that an assignment outlived its product.
+    //
+    // Best-effort: the stock item is already gone, so failing the response
+    // here would report a delete that actually happened as an error. The
+    // read side filters dangling rows out regardless, so a missed sweep
+    // degrades to stale data, never to a broken list.
+    try {
+      const Customer = require("../../../../models/Customer_Models/Customer");
+      const { modifiedCount } = await Customer.updateMany(
+        { "assignedStockItems.stockItemId": stockItem._id },
+        { $pull: { assignedStockItems: { stockItemId: stockItem._id } } },
+      );
+      if (modifiedCount) {
+        console.log(`[stockItems] unassigned deleted product ${stockItem._id} from ${modifiedCount} customer(s).`);
+      }
+    } catch (cleanupErr) {
+      console.error("[stockItems] customer-assignment cleanup failed:", cleanupErr.message);
+    }
+
     res.json({ success: true, message: "Stock item deleted successfully" });
   } catch (error) {
     console.error("Error deleting stock item:", error);

@@ -43,9 +43,10 @@ async function provisionJourneyStyles({
    * `(product) => Promise<{proven: boolean}>` — has this garment actually been
    * made before? Injected so this service stays DB-free and unit-testable.
    *
-   * OMITTED MEANS NOTHING IS WAIVED, deliberately. Failing closed costs a
-   * sample nobody needed; failing open sends an unmade garment to a customer
-   * with no sample and no tech sheet, which costs an order.
+   * NO LONGER DECIDES THE WAIVER (26 Aug 2026) — picking a registered product
+   * does, on its own. This now only sharpens the HISTORY WORDING, so a waiver
+   * backed by a real production record is distinguishable from one backed
+   * only by the register link. Omitting it costs nothing but that detail.
    */
   assessDevelopment = null,
 }) {
@@ -97,23 +98,39 @@ async function provisionJourneyStyles({
     // Applied only where the style is CREATED. Re-provisioning must never reach
     // into a style already being sampled and cancel it.
     //
-    // BEING REGISTERED IS NOT ENOUGH (22 Aug 2026, corrected same day).
+    // PICKING AN EXISTING PRODUCT IS THE WAIVER (26 Aug 2026, explicit
+    // request, reversing the 22 Aug narrowing below).
     //
-    // The first cut of this waived the step on `Boolean(p.stockItemId)` alone.
-    // That is too loose: a stock item is created the moment someone types a
-    // name, so a garment nobody has ever cut would skip both the tech sheet and
-    // the sample on the strength of existing in a dropdown.
+    // History, because this has now moved twice. The first cut waived on
+    // `Boolean(p.stockItemId)`. On 22 Aug that was judged too loose — a stock
+    // item exists the moment someone types a name, so a garment nobody had cut
+    // could skip both steps on the strength of appearing in a dropdown — and
+    // the test was narrowed to whether it had actually BEEN MADE (a prior
+    // approved sample, or operations with measured times; see
+    // services/developmentRecord.js).
     //
-    // The test is now whether it has actually BEEN MADE — a prior approved
-    // sample, or operations with measured times. See services/developmentRecord
-    // .js for why a bill of materials does not count.
+    // That is now reversed by an explicit product decision: "at the time of
+    // creating the product in the enquiry stage, if the user just select for
+    // any existing one product then no need to ask for the sampling process
+    // and all... no need to sent to the r&d team and all, approvals and all".
+    // Selecting off the register is the salesperson SAYING this is a known
+    // garment; the system takes them at their word.
     //
-    // A registered-but-unproven product still gets its register link recorded,
-    // so the stage can show what IS known while asking for the sample anyway.
+    // The 22 Aug concern is real and is not dismissed — it is handled by
+    // recording WHICH of the two grounds applied, so "why was this never
+    // sampled" still has a truthful answer six months later, and by leaving
+    // the waiver reversible (both notApplicable statuses transition back into
+    // in_progress — see SAMPLE_TECHSHEET_TRANSITIONS / SAMPLE_SAMPLING_
+    // TRANSITIONS in constants/crm.js) so a known garment in an unknown fabric
+    // can still be sampled on request.
+    //
+    // Applied only where the style is CREATED. Re-provisioning must never
+    // reach into a style already being sampled and cancel it.
     const registered = Boolean(p.stockItemId);
     const proven = registered && assessDevelopment
       ? Boolean((await assessDevelopment(p))?.proven)
       : false;
+    const waive = registered;
 
     if (!style) {
       try {
@@ -151,14 +168,19 @@ async function provisionJourneyStyles({
               }],
             }
             : undefined,
-          techSheet: proven ? { status: "notApplicable", revisions: [] } : undefined,
-          sample: proven ? { status: "notApplicable", rounds: [], revisions: [] } : undefined,
+          techSheet: waive ? { status: "notApplicable", revisions: [] } : undefined,
+          sample: waive ? { status: "notApplicable", rounds: [], revisions: [] } : undefined,
           // Recorded in the shared timeline, because "why was this never
-          // sampled" is exactly the question somebody asks six months later.
-          history: proven
+          // sampled" is exactly the question somebody asks six months later —
+          // and it names WHICH ground applied, so a waiver backed by a real
+          // production record reads differently from one backed only by the
+          // salesperson picking a registered product.
+          history: waive
             ? [{
               kind: "development_waived",
-              note: `Already made before${p.stockItemReference ? ` (${p.stockItemReference})` : ""} — no tech sheet or sample needed.`,
+              note: proven
+                ? `Already made before${p.stockItemReference ? ` (${p.stockItemReference})` : ""} — no tech sheet or sample needed.`
+                : `Raised from an existing registered product${p.stockItemReference ? ` (${p.stockItemReference})` : ""} — no tech sheet or sample needed. Not previously made through this system.`,
               by: actor,
               at: new Date(),
             }]
@@ -167,7 +189,7 @@ async function provisionJourneyStyles({
           updatedBy: actor,
         });
         created += 1;
-        if (proven) waived += 1;
+        if (waive) waived += 1;
       } catch (err) {
         // Two callers racing to provision the same journey (React StrictMode's
         // double effect-invoke, or Sales and R&D opening it within

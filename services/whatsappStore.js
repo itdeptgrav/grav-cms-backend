@@ -54,8 +54,17 @@ async function upsertConversation({ waId, phone, name, at, inbound }) {
 }
 
 // Map a raw Meta message object to our stored shape.
+//
+// `contextId` (Meta's `m.context.id`) is captured for every type, not just
+// button/interactive — carried through unconditionally is simpler than
+// gating it per-type, and costs nothing when a caller doesn't use it.
 function parseInbound(m) {
-  const base = { waMessageId: m.id, type: m.type || "text", timestamp: m.timestamp ? new Date(Number(m.timestamp) * 1000) : new Date() };
+  const base = {
+    waMessageId: m.id,
+    type: m.type || "text",
+    timestamp: m.timestamp ? new Date(Number(m.timestamp) * 1000) : new Date(),
+    contextId: m.context?.id || undefined,
+  };
   switch (m.type) {
     case "text":
       return { ...base, text: m.text?.body || "" };
@@ -65,8 +74,15 @@ function parseInbound(m) {
     }
     case "location":
       return { ...base, text: `📍 ${m.location?.latitude}, ${m.location?.longitude}${m.location?.name ? ` (${m.location.name})` : ""}` };
+    // A tap on a TEMPLATE's quick-reply button — `m.button.text` is the
+    // button's own label (what sampleWhatsapp.js's applyDecisionFromButtonReply
+    // matches "approve"/"reject" against); `m.button.payload` also exists but
+    // is only meaningful for buttons that declared a custom payload at
+    // template-creation time, which an Approve/Reject pair doesn't need to.
     case "button":
       return { ...base, type: "interactive", text: m.button?.text || "" };
+    // A tap on a FREE-STANDING interactive message's button/list (not a
+    // template reply) — same shape, different Meta envelope.
     case "interactive":
       return { ...base, text: m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || "" };
     case "reaction":
@@ -106,6 +122,22 @@ async function ingestWebhook(body) {
         conv.lastDirection = "incoming";
         await conv.save();
         result.messages += 1;
+
+        // A button tap replying to a message we sent — see if it's a
+        // sample-approval request waiting on exactly this reply. Guarded so
+        // a business-feature bug can never take down webhook ingestion for
+        // every other inbound message in the same batch (this loop still
+        // has more messages/entries to process after it).
+        if (parsed.type === "interactive" && parsed.contextId) {
+          try {
+            await require("./sampleWhatsapp").applyDecisionFromButtonReply({
+              contextMessageId: parsed.contextId,
+              buttonText: parsed.text,
+            });
+          } catch (err) {
+            console.error("[whatsapp] sample-approval button match failed:", err.message);
+          }
+        }
       }
 
       // Outbound delivery/read/failed status updates.

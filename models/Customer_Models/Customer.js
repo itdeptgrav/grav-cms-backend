@@ -40,6 +40,20 @@ const businessInfoSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ── Payment T&C (26 Aug 2026, "the payment breakdown... bydefault it is
+// selecting 60 40... now i want to make it dynamic... set in the profile
+// page") ─────────────────────────────────────────────────────────────────
+// One step of the payment schedule a new PI/quotation for this customer
+// pre-fills with, instead of every new document defaulting to a hardcoded
+// 60/40 split — see QuotationPopup.js's init() effect, which reads this.
+const paymentTermStepSchema = new mongoose.Schema(
+  {
+    name:       { type: String, trim: true, required: true },
+    percentage: { type: Number, min: 0, max: 100, required: true },
+  },
+  { _id: false }
+);
+
 const customerSchema = new mongoose.Schema(
   {
     // ── Auto ID ─────────────────────────────────────────────────────────
@@ -100,6 +114,15 @@ const customerSchema = new mongoose.Schema(
 
     // ── Business info (new) ───────────────────────────────────────────────
     businessInfo: { type: businessInfoSchema, default: () => ({}) },
+
+    // ── Payment T&C (new) — the default payment schedule and free-text
+    // terms a new PI/quotation for this customer should start from. An
+    // empty schedule means "no override yet" — QuotationPopup.js falls
+    // back to the standard 60/40 split when this is empty.
+    paymentTerms: {
+      schedule: { type: [paymentTermStepSchema], default: [] },
+      notes:    { type: String, trim: true, default: "" },
+    },
 
     // ── Sales-side control ────────────────────────────────────────────────
     assignedStockItems: [assignedStockItemSchema],
