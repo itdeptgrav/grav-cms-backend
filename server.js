@@ -1483,6 +1483,10 @@ app.use("/api/hr/payroll", payrollRoutes);
 
 const attendanceRouter = require("./routes/HrRoutes/Attendance_section");
 app.use("/hr/attendance", attendanceRouter);
+// Shift swaps — required AFTER the attendance router because it reaches into
+// it for syncDayForce; requiring it first would hand it a half-built module.
+const shiftSwapRouter = require("./routes/HrRoutes/ShiftSwap_section");
+app.use("/hr/shift-swaps", shiftSwapRouter);
 
 const hrLeaveRoutes = require("./routes/HrRoutes/Leave_section");
 app.use("/api/hr/leaves", hrLeaveRoutes);
