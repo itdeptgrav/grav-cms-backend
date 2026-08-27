@@ -75,10 +75,35 @@ router.get("/", salesAuth, async (req, res) => {
       .select("+password -cart -favorites -orders -__v")
       .lean();
 
+    // Which assigned products still exist (26 Aug 2026, bug fix). This list's
+    // "Products" badge used to be `assignedStockItems.length` — a raw count
+    // that includes rows whose StockItem was since deleted (see the delete
+    // route's own cleanup, and the /assigned-items and /:id routes' filters,
+    // added the same day). That desynced this list from reality: a customer
+    // showed e.g. "4 products" here while the Bulk Request panel — which DOES
+    // filter — correctly showed none available, with no way to tell from this
+    // list why. One batched query across every customer on the page, not one
+    // query per customer, since a list can be up to `limit` (default 30) rows.
+    const allStockItemIds = [
+      ...new Set(
+        rawCustomers.flatMap((c) => (c.assignedStockItems || []).map((a) => a.stockItemId)).filter(Boolean).map(String),
+      ),
+    ];
+    const aliveIds = allStockItemIds.length
+      ? new Set((await StockItem.find({ _id: { $in: allStockItemIds } }).select("_id").lean()).map((s) => String(s._id)))
+      : new Set();
+
     // Strip raw password, replace with boolean flag
     const customers = rawCustomers.map(({ password, ...c }) => ({
       ...c,
       hasPassword: !!password,
+      // The count the "Products" badge should show — assigned AND still in
+      // the register. `assignedStockItems` itself is left exactly as stored;
+      // only this derived count changes, so nothing else reading the raw
+      // array (e.g. the customer detail page, which does its own filtering)
+      // is affected.
+      productCount: (c.assignedStockItems || []).filter((a) => a.stockItemId && aliveIds.has(String(a.stockItemId))).length,
+      unavailableProductCount: (c.assignedStockItems || []).filter((a) => !a.stockItemId || !aliveIds.has(String(a.stockItemId))).length,
     }));
 
     const [total_all, active, withPassword, createdBySales] = await Promise.all(

@@ -13,6 +13,7 @@ const { WhatsAppMessage } = require("../../../models/CMS_Models/Sales/WhatsAppMe
 const { cfg, canSend, canReceive, graphBase } = require("../../../config/whatsapp");
 const { sendText, sendTemplate, WhatsAppError } = require("../../../services/whatsappSend");
 const { findOrCreateByPhone } = require("../../../services/whatsappStore");
+const { identityFor } = require("../../../services/customerIdentityLookup.service");
 
 router.use(salesAuth);
 
@@ -20,6 +21,8 @@ const windowOpen = (c) => Boolean(c?.windowExpiresAt && new Date(c.windowExpires
 const withWindow = (c) => ({ ...c, windowOpen: windowOpen(c) });
 const POP_ACCOUNT = ["accountId", "companyName accountId"];
 const POP_LEAD = ["leadId", "leadId firstName lastName company"];
+const digits = (v) => String(v || "").replace(/\D/g, "");
+const last10 = (v) => digits(v).slice(-10);
 
 // GET /config — lets the UI show a "not configured yet" state instead of failing.
 router.get("/config", (req, res) => res.json({ success: true, canSend: canSend() }));
@@ -257,6 +260,45 @@ router.get("/stats", async (req, res) => {
   } catch (err) {
     console.error("[crm/whatsapp] stats failed:", err);
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /for-lead?leadId=… | ?accountId=… | ?customerId=…
+//
+// Read-only WhatsApp view for the Active Lead workspace's "log this message"
+// suggestion — same shape and same identity lookup as call-events.js's
+// GET / (27 Aug 2026, explicit request: the Call action was already switched
+// to suggest real CallEvent rows instead of a manual form, and the same is
+// wanted for Message now that WhatsApp messages sync for real via the Meta
+// webhook — "we already setup the meta... this manual log message also need
+// to remove ok as it will need to track from that meta"). Matches on the
+// last 10 digits, since a WhatsApp waId is digits-only/country-coded while
+// Lead/Contact/Account phones are stored in whatever format was typed in.
+// Read-only on purpose: unlike POST /start, this never creates a
+// conversation — just looking at a lead must never write a WhatsApp row.
+router.get("/for-lead", async (req, res) => {
+  try {
+    const { leadId, accountId, customerId } = req.query;
+    if (!leadId && !accountId && !customerId) {
+      return res.status(400).json({ success: false, message: "leadId, accountId or customerId is required" });
+    }
+    const identity = await identityFor({ leadId, accountId, customerId });
+    if (!identity) return res.status(404).json({ success: false, message: leadId ? "Lead not found" : "Customer not found" });
+
+    const tails = [...new Set((identity.phones || []).map(last10).filter((t) => t.length === 10))];
+    if (!tails.length) return res.json({ success: true, messages: [], conversationId: null });
+
+    const conv = await WhatsAppConversation.findOne({ waId: { $in: tails.map((t) => new RegExp(`${t}$`)) } }).lean();
+    if (!conv) return res.json({ success: true, messages: [], conversationId: null });
+
+    const messages = await WhatsAppMessage.find({ conversationId: conv._id })
+      .sort({ timestamp: -1, createdAt: -1 })
+      .limit(20)
+      .lean();
+    return res.json({ success: true, conversationId: conv._id, messages });
+  } catch (err) {
+    console.error("[crm/whatsapp] for-lead failed:", err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 

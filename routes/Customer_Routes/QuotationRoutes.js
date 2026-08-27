@@ -235,19 +235,33 @@ router.post('/requests/:requestId/quotation/reject', verifyCustomerToken, async 
     }
 
     // Update quotation with rejection
+    const now = new Date();
     quotation.status = 'rejected';
-    quotation.updatedAt = new Date();
+    quotation.updatedAt = now;
+    // Structured, matching the sales-side reject route (26 Aug 2026) — same
+    // fields, `rejectedByRole: "customer"` is the only difference, so the
+    // Sales CRM's detail view can show a real reason regardless of which
+    // side actually rejected it.
+    quotation.rejectedAt = now;
+    quotation.rejectedBy = customerId;
+    quotation.rejectedByName = req.customer?.name || "Customer";
+    quotation.rejectedByRole = 'customer';
+    quotation.rejectionReason = reason.trim();
 
-    // Update request status
-    request.status = 'in_progress'; // Go back to processing
-    request.updatedAt = new Date();
+    // Update request status — "rejected" itself now, not a bare "in_progress"
+    // indistinguishable from a PI simply being priced normally (26 Aug 2026,
+    // explicit request — mirrors the enum's own comment on the model). Not a
+    // dead end: sending a fresh quotation moves it forward again the same
+    // way it always did.
+    request.status = 'rejected';
+    request.updatedAt = now;
 
     // Add note
     request.notes.push({
       text: `Customer rejected quotation ${quotation.quotationNumber}. Reason: ${reason}`,
       addedBy: customerId,
       addedByModel: 'Customer',
-      createdAt: new Date()
+      createdAt: now
     });
 
     await request.save();
