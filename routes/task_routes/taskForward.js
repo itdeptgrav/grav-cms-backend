@@ -142,7 +142,7 @@ async function postSystemChatMessage(taskId, text, senderId = "system", senderNa
 // ── 1. CREATE TASK ────────────────────────────────────────────────────────────
 router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { title, description, notes, requirements, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs, isGoldTask, c2Config, etcHours } = req.body;
+    const { title, description, notes, requirements, assigneeIds, priority, parentTaskId, groupId, createdByTl, isFolder, isImportant, isRepeat, repeatConfig, isThirdParty, thirdPartyConfig, isGoal, goalConfig, hasTimer, fixedDeadline, isSelfAssigned, visibleTo, approverId, approverName, senderTimerWindowSecs, isGoldTask, c2Config, etcHours } = req.body;
     const dueDate = null; // Deadline is always set by employee after assignment
     console.log("[task/create] isFolder:", isFolder, typeof isFolder, "| assigneeIds:", assigneeIds);
     if (!title?.trim()) return res.status(400).json({ error: "title required" });
@@ -375,6 +375,8 @@ router.post("/task/create", verifyCoworkToken, verifyEmployeeToken, async (req, 
       pendingAssigneeName: departmentApprovalGate?.pendingAssigneeName || null,
       departmentApprovals: departmentApprovalGate?.approvals || null,
       isFolder: folderFlag,
+      // A label only — stored, never read by the engine.
+      isImportant: isImportant === true || isImportant === "true",
       isRepeat: repeatFlag,
       repeatConfig: (repeatFlag && repeatConfig) ? repeatConfig : null,
       isThirdParty: thirdPartyFlag,
@@ -1593,7 +1595,7 @@ router.post("/task/:taskId/daily-report", verifyCoworkToken, verifyEmployeeToken
 // ── 8. TASK CHAT — SEND ───────────────────────────────────────────────────────
 router.post("/task/:taskId/chat", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
-    const { text, attachments, messageType, mention } = req.body;
+    const { text, attachments, messageType, mention, replyTo } = req.body;
     if (!text?.trim() && (!attachments || !attachments.length)) return res.status(400).json({ error: "text or attachments required" });
     const msg = await svc.sendTaskChat({
       taskId: req.params.taskId,
@@ -1603,6 +1605,10 @@ router.post("/task/:taskId/chat", verifyCoworkToken, verifyEmployeeToken, async 
       attachments: attachments || [],
       messageType: messageType || "text",
       mention: mention || null,
+      // The message this one answers, quoted onto it — same shape the direct
+      // threads use. Optional: a client that does not send it is unaffected,
+      // and a message without one simply has no quote.
+      replyTo: replyTo || null,
     });
     res.status(201).json({ success: true, message: msg });
   } catch (e) { res.status(400).json({ error: e.message }); }

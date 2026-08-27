@@ -2650,6 +2650,19 @@ if (attendanceRouter.startHourlyAttendanceSync) {
   console.warn("⚠️ Hourly attendance sync not available");
 }
 
+// Close out CoWork sessions left online by somebody who has already punched
+// out on the biometric device. Runs at 23:30 IST, after the hourly attendance
+// sync above has brought the evening's punches in — it reads that data rather
+// than calling eTimeOffice again.
+try {
+  const {
+    startCoworkPunchOutOfflineSync,
+  } = require("./services/coworkPunchOutOffline.service");
+  startCoworkPunchOutOfflineSync();
+} catch (e) {
+  console.warn("⚠️ Cowork punch-out offline sync not available:", e.message);
+}
+
 // Start persistent OT reminder notifications (random 5-20 min intervals)
 overtimeRoutes.startOvertimeReminders(io);
 console.log("✅ Overtime reminder cron initialized");

@@ -310,7 +310,7 @@ async function assigneePrioritiesFor(db, assigneeIds) {
   return map;
 }
 
-async function createTask({ title, description, notes, requirements = [], satisfiesRequirementIds = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
+async function createTask({ title, description, notes, requirements = [], satisfiesRequirementIds = [], assignedBy, assignedByName, assignedByRole, createdBy = null, assigneeIds, dueDate, priority = 5, parentTaskId = null, groupId = null, createdByTl = false, createdByCeo = false, rootCreatedByRole = null, isFolder = false, isImportant = false, isRepeat = false, repeatConfig = null, isThirdParty = false, thirdPartyConfig = null, isGoal = false, goalConfig = null, hasTimer = true, fixedDeadline = null, status = "open", isSelfAssigned = false, visibleTo = [], approverId = null, approverName = null, senderTimerWindowSecs = 0,
   pendingAssigneeId = null, pendingAssigneeName = null, departmentApprovals = null,
   isGoldTask = false,
   c2Config = null,
@@ -385,6 +385,9 @@ async function createTask({ title, description, notes, requirements = [], satisf
     status: status || "open",
     groupId: groupId || null,
     isFolder: isFolder || false,
+    // A label only — nothing in the engine reads it. Stored so the client can
+    // show a tag; it affects no ordering, deadline, score or permission.
+    isImportant: isImportant === true,
     isRepeat: isRepeat || false,
     repeatConfig: isRepeat && repeatConfig ? repeatConfig : null,
     isThirdParty: isThirdParty || false,
