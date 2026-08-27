@@ -5,15 +5,24 @@
 
 const express = require("express");
 const router = express.Router();
+const mongoose = require("mongoose");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+const creditTerms = require("../../services/creditTerms.service");
 const {
   Acc_Company,
   Acc_Group,
   ACC_DEFAULT_GROUPS,
 } = require("../../models/Accountant_model/Acc_MasterModels");
 
+// `/:id/default-credit-days` self-protects with `accountantAuth` +
+// `creditTerms.canEditTerms` below — the SAME permission the party-level
+// credit-terms editor and C0-F's backfill apply already require, not
+// owner-only. It is excluded from the owner-only gate rather than folded
+// into it, because the rest of this router (company CRUD, group reseeding)
+// is deliberately more restrictive than this one field.
 router.use((req, res, next) => {
   if (req.method === "GET") return next();
+  if (req.path.endsWith("/default-credit-days")) return next();
   const isOwner =
     req.user?.role === "owner" || req.user?.isLegacy || req.user?.isDev;
   if (!isOwner) {
@@ -323,6 +332,111 @@ router.post("/:id/reseed-groups", async (req, res) => {
   } catch (err) {
     console.error("Reseed groups:", err);
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/accountant/tally/companies/:id/default-credit-days
+//
+// The ONLY writer of `Acc_Company.defaultCreditDays` — a dedicated, narrowly
+// scoped endpoint rather than a field smuggled through the broad `PUT /:id`
+// above, for the same reason the party-level credit-terms editor
+// (Acc_parties.js `PATCH /:ledgerId/credit-terms`) is its own route and not
+// a field on a general ledger-update endpoint: a number that will later date
+// real obligations deserves its own validated, whitelisted, audited path.
+//
+//   - Validation reuses `creditTerms.parseCreditDays` — the exact same rule
+//     C0-B's party-level editor enforces: "", null, undefined and 0 all mean
+//     "cleared" (stored as `null`, never as 0 — `defaultCreditDays` has no
+//     schema default to fall back to, so `null` is the only spelling of
+//     "unset"); 1..365 stores that number; anything else (negative,
+//     fractional, >365, boolean, object, array, non-numeric string) is
+//     REJECTED, not coerced.
+//   - Whitelist-only body: `defaultCreditDays` is the only accepted key. No
+//     `req.body` spreading anywhere in this handler.
+//   - `creditTerms.canEditTerms` gates this write — see the router-level
+//     comment above for why this route is carved out of the owner-only gate.
+//   - Provenance (`defaultCreditDaysUpdatedAt/By/ByName`) is written from the
+//     authenticated user and the clock, never trusted from the body.
+router.patch("/:id/default-credit-days", accountantAuth, async (req, res) => {
+  try {
+    if (!creditTerms.canEditTerms(req.user)) {
+      return res.status(403).json({
+        error: "Your accounting role is read-only, so this change was not saved.",
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid company id." });
+    }
+
+    const body = req.body || {};
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return res.status(400).json({ error: "Expected an object body.", code: "INVALID_BODY" });
+    }
+    const unknown = Object.keys(body).filter((k) => k !== "defaultCreditDays");
+    if (unknown.length > 0) {
+      return res.status(400).json({
+        error: `This endpoint only updates defaultCreditDays. Refused: ${unknown.join(", ")}.`,
+        code: "UNSUPPORTED_FIELD",
+      });
+    }
+    if (!Object.prototype.hasOwnProperty.call(body, "defaultCreditDays")) {
+      return res.status(400).json({ error: "defaultCreditDays required.", code: "NOTHING_TO_UPDATE" });
+    }
+
+    let days;
+    try {
+      days = creditTerms.parseCreditDays(body.defaultCreditDays);
+    } catch (e) {
+      if (e instanceof creditTerms.CreditTermsError) {
+        return res.status(400).json({ error: e.message, code: e.code });
+      }
+      throw e;
+    }
+
+    // Scoped by `_id` — for `Acc_Company` itself, the company IS the tenant
+    // boundary, so matching `:id` exactly is the whole of "scope by company
+    // id" here (there is no separate parent-company field to also check, the
+    // way a ledger checks `{ _id, companyId }` together).
+    const company = await Acc_Company.findByIdAndUpdate(
+      req.params.id,
+      {
+        $set: {
+          defaultCreditDays: days, // null when cleared — never 0, there is no schema default to fall back to
+          defaultCreditDaysUpdatedAt: new Date(),
+          defaultCreditDaysUpdatedBy: req.user?.id || null,
+          defaultCreditDaysUpdatedByName: req.user?.name || req.user?.email || null,
+        },
+      },
+      {
+        new: true,
+        runValidators: true,
+        // Belt and braces: only these keys can reach the response, whatever
+        // this handler's `$set` might grow to include later.
+        fields:
+          "_id companyName defaultCreditDays defaultCreditDaysUpdatedAt defaultCreditDaysUpdatedByName",
+      },
+    ).lean();
+
+    if (!company) {
+      return res.status(404).json({ error: "Company not found." });
+    }
+
+    res.json({
+      ok: true,
+      company: {
+        _id: company._id,
+        companyName: company.companyName,
+        defaultCreditDays: company.defaultCreditDays ?? null,
+        defaultCreditDaysSet: creditTerms.isTermSet(company.defaultCreditDays),
+        defaultCreditDaysUpdatedAt: company.defaultCreditDaysUpdatedAt || null,
+        defaultCreditDaysUpdatedByName: company.defaultCreditDaysUpdatedByName || null,
+      },
+    });
+  } catch (e) {
+    console.error("[companies/default-credit-days]", e);
+    res.status(500).json({ error: e.message });
   }
 });
 

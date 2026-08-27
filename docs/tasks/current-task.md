@@ -1,13 +1,25 @@
-> **Status:** Paused by new request.
+> **Status:** Active planning.
 >
-> **Current requested work:** Redesign the full Accounting app in
+> **Current requested work:** Study the Sales Accounts app in
+> `/Users/risheeray/grav-cms` and `/Users/risheeray/grav-cms-backend`, then
+> scope a proper customer/account budget feature for the Account workspace.
+> The active planning brief is
+> `docs/tasks/sales-account-budget-feature.md`.
+>
+> **Important:** This is a product/architecture planning task. Do not change
+> application code for the Account Budget feature until an implementation slice
+> is explicitly requested.
+>
+> ---
+>
+> **Previous paused work:** Redesign the full Accounting app in
 > `/Users/risheeray/grav-cms` so it follows the current Sales app design
 > language. The active planning brief is
 > `docs/tasks/accountant-sales-design-redesign.md`.
 >
 > **Important:** The Sales lead/journey scope below remains durable context, but
-> it is not the active implementation target while the Accounting redesign is
-> being planned or executed.
+> it is not the active implementation target while the Account Budget feature is
+> being planned.
 
 > **Previous status before pause:** Active
 >

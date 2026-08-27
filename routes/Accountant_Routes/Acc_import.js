@@ -43,6 +43,10 @@ const tallyParser = require("../../services/tallyParser.service");
 const tallyMapper = require("../../services/tallyMapper.service");
 const bSheetImporter = require("../../services/tallyBSheetImporter.service");
 const mastersImporter = require("../../services/tallyMastersImporter.service");
+const {
+  defaultDueDateOnVoucherBody,
+  defaultDueDateSync,
+} = require("../../services/voucherDueDateDefault.service");
 // Tiny top-level "Balance Sheet" summary export — used ONLY to verify an
 // import is accurate against Tally's own totals (never to create data).
 const bSheetSummary = require("../../services/TallyBsheetsummary.service");
@@ -783,7 +787,7 @@ async function commitOne(prepared, session, mapping, accountantId) {
         }
       }
 
-      const voucher = await Acc_Voucher.create({
+      const voucherBody = {
         companyId,
         voucherType: vchType,
         voucherTypeName: data.voucherTypeName || vchType,
@@ -805,7 +809,14 @@ async function commitOne(prepared, session, mapping, accountantId) {
         enteredBy: accountantId,
         postedBy: accountantId,
         postedAt: new Date(),
-      });
+      };
+      // C0-C — this route never set dueDate at all before this change, on
+      // ANY voucher type. Defaulting is a fresh lookup by partyLedgerId
+      // (rather than trusting tallyMapper's own ledger projection to carry
+      // creditPeriodDays) because this is a per-voucher create, not the tight
+      // insertMany loops below — the extra lookup cost here is negligible.
+      await defaultDueDateOnVoucherBody(voucherBody);
+      const voucher = await Acc_Voucher.create(voucherBody);
 
       return {
         kind: "vouchers",
@@ -1283,8 +1294,11 @@ router.post("/bsheet/commit", async (req, res) => {
     // Pre-fetch all existing ledgers for this company in one query, then
     // build the batch of new ledgers to insert.
 
+    // `creditPeriodDays` added (C0-C) so the sales/purchase vouchers built
+    // below from this map can default a due date synchronously, without an
+    // extra per-voucher database round trip in the insertMany loop.
     const existingLedgers = await Acc_Ledger.find({ companyId })
-      .select("_id name groupName nature")
+      .select("_id name groupName nature creditPeriodDays companyId")
       .lean();
     const ledgerByName = new Map(
       existingLedgers.map((l) => [l.name.trim().toLowerCase(), l]),
@@ -1413,7 +1427,7 @@ router.post("/bsheet/commit", async (req, res) => {
           companyId,
           name: { $in: names },
         })
-          .select("_id name groupName nature")
+          .select("_id name groupName nature creditPeriodDays companyId")
           .lean();
         for (const led of inserted) {
           if (!ledgerByName.has(led.name.trim().toLowerCase())) {
@@ -1495,7 +1509,7 @@ router.post("/bsheet/commit", async (req, res) => {
         )?.led;
       }
 
-      vouchersToInsert.push({
+      const voucherToInsert = {
         companyId,
         voucherType: v.voucherType,
         voucherTypeName: v.voucherType,
@@ -1534,7 +1548,15 @@ router.post("/bsheet/commit", async (req, res) => {
         sourceReference: `Tally B-Sheet import session ${session._id}`,
         importedAt: new Date(),
         importSession: session._id,
-      });
+      };
+      // C0-C — this route confirmed to set NEITHER dueDate NOR
+      // creditPeriodDays anywhere before this change (§C1.3.1 of the cash-
+      // flow forecast plan). Synchronous variant: `partyLedger` is already
+      // resolved in memory (see the widened `.select()` above), so this adds
+      // no extra database round trip inside a loop that can run hundreds of
+      // times per import.
+      defaultDueDateSync(voucherToInsert, partyLedger);
+      vouchersToInsert.push(voucherToInsert);
     }
 
     // Batch insert vouchers
@@ -2759,8 +2781,11 @@ router.post("/combined/commit", async (req, res) => {
     }
 
     // ══ PHASE 2: LEDGERS (from masters — correct groups) ══════════════
+    // `creditPeriodDays` added (C0-C) so the sales/purchase vouchers built
+    // below from this map can default a due date synchronously, without an
+    // extra per-voucher database round trip in the insertMany loop.
     const existingLedgers = await Acc_Ledger.find({ companyId })
-      .select("_id name groupName nature")
+      .select("_id name groupName nature creditPeriodDays companyId")
       .lean();
     const ledgerByName = new Map(
       existingLedgers.map((l) => [l.name.trim().toLowerCase(), l]),
@@ -2999,7 +3024,7 @@ router.post("/combined/commit", async (req, res) => {
           companyId,
           name: { $in: names },
         })
-          .select("_id name groupName nature")
+          .select("_id name groupName nature creditPeriodDays companyId")
           .lean();
         for (const b of back) {
           if (!ledgerByName.has(b.name.trim().toLowerCase())) {
@@ -3086,7 +3111,7 @@ router.post("/combined/commit", async (req, res) => {
           companyId,
           name: { $in: names },
         })
-          .select("_id name groupName nature")
+          .select("_id name groupName nature creditPeriodDays companyId")
           .lean();
         for (const b of back) ledgerByName.set(b.name.trim().toLowerCase(), b);
       }
@@ -3148,7 +3173,7 @@ router.post("/combined/commit", async (req, res) => {
         )?.led;
       }
 
-      vouchersToInsert.push({
+      const voucherToInsert = {
         companyId,
         voucherType: v.voucherType,
         voucherTypeName: v.voucherType,
@@ -3187,7 +3212,12 @@ router.post("/combined/commit", async (req, res) => {
         sourceReference: `Combined import session ${session._id}`,
         importedAt: new Date(),
         importSession: session._id,
-      });
+      };
+      // C0-C — same reasoning as the B-Sheet import path above: synchronous,
+      // reuses the `partyLedger` already resolved in memory, no extra query
+      // inside this loop.
+      defaultDueDateSync(voucherToInsert, partyLedger);
+      vouchersToInsert.push(voucherToInsert);
     }
     for (let i = 0; i < vouchersToInsert.length; i += BATCH) {
       const chunk = vouchersToInsert.slice(i, i + BATCH);

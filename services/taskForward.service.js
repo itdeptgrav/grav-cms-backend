@@ -1086,7 +1086,7 @@ async function _syncParentProgress(parentTaskId) {
 // ═════════════════════════════════════════════════════════
 //  6. TASK CHAT — completely isolated per task
 // ═════════════════════════════════════════════════════════
-async function sendTaskChat({ taskId, senderId, senderName, text, attachments = [], messageType = "text", mention = null }) {
+async function sendTaskChat({ taskId, senderId, senderName, text, attachments = [], messageType = "text", mention = null, replyTo = null }) {
   const taskDoc = await db.collection("cowork_tasks").doc(taskId).get();
   if (!taskDoc.exists) throw new Error("Task not found.");
   const task = taskDoc.data();
@@ -1100,6 +1100,9 @@ async function sendTaskChat({ taskId, senderId, senderName, text, attachments = 
     messageId, taskId, senderId, senderName,
     text: text || "", attachments, messageType,
     mention: mention || null,
+    // Denormalised quote, so a reply renders without a second read. Written
+    // only when present, so nothing already stored gains an empty field.
+    ...(replyTo ? { replyTo } : {}),
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
@@ -2793,6 +2796,52 @@ async function reviewOutput({ taskId, outputId, reviewerId, reviewerName, approv
   });
 
   if (approved) await _releaseOutputDependents(outputId, output.label, reviewerId, reviewerName);
+
+  /**
+   * **C1 is credited here too, or a task finished through its outputs earns
+   * nothing.**
+   *
+   * `reviewCompletion` scores a task when its COMPLETION SUBMISSION is
+   * approved. A task with outputs never makes one: it is finished a piece at a
+   * time through this route, and the branch above marks it `done` /
+   * `tl_final_approved` without ever passing through that path.
+   *
+   * So the two halves disagreed on screen. The task read Completed with every
+   * output Approved, the flow showed Created → Assigned → Work → Approved, and
+   * the score panel still said "1.0 of 1.0 points PROJECTED" — projected being
+   * the honest word, because nothing had ever been written. The person had
+   * finished the work and been paid nothing for it.
+   *
+   * The same call, the same arguments and the same `setImmediate` as the
+   * completion path, so the two credit identically. `submittedAt` comes from
+   * the LAST output handed over rather than from `completionSubmission`, which
+   * does not exist here — that instant is what lateness is measured against.
+   *
+   * Guarded on `allApproved`, so approving the first of three outputs credits
+   * nothing: the task is not done until every one of them is.
+   */
+  if (allApproved) {
+    const primaryEmployee = (task.assigneeIds || [])[0] || null;
+    const submissions = Object.values(task.outputSubmissions || {});
+    const lastHandover = submissions
+      .map((s) => s && s.submittedAt)
+      .filter(Boolean)
+      .sort()
+      .pop();
+    const submittedAt =
+      lastHandover || review.submittedAt || task.completionSubmission?.submittedAt || null;
+    setImmediate(() => {
+      c1Svc
+        .computeAndStoreTaskScore({
+          taskId,
+          taskData: { ...task, ...updates },
+          employeeId: primaryEmployee,
+          isRejected: false,
+          submittedAt,
+        })
+        .catch((e) => console.error("[C1 score on output approval]", e.message));
+    });
+  }
 
   if (allApproved) {
     const allIds = [...new Set([...(task.assigneeIds || []), task.assignedBy].filter((id) => id && id !== reviewerId))];

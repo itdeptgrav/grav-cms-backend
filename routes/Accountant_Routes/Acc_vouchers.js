@@ -19,8 +19,26 @@ const {
   Acc_StockItem,
 } = require("../../models/Accountant_model/Acc_MasterModels");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
+const {
+  defaultDueDateOnVoucherBody,
+} = require("../../services/voucherDueDateDefault.service");
 
 const auth = accountantAuth;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * BUDGET CONTROL (Chunk 6)
+ *
+ * Spend is checked at the moment it BECOMES POSTED, not when it is drafted.
+ * A draft is a note to self; posting is money leaving the budget, and it is
+ * the only moment at which refusing is both meaningful and fair.
+ *
+ * There are FIVE such moments in this app — create-with-autoPost, /post and
+ * /approve here, plus create-with-autoPost and /approve in Acc_expenses.js —
+ * and all five call the same `clearanceFor` in budgetControl.service.js.
+ * Gating the one place a reviewer happens to look is how four holes get left
+ * open.
+ * ────────────────────────────────────────────────────────────────────────── */
+const budgetControl = require("../../services/budgetControl.service");
 
 const VOUCHER_TYPES = [
   "sales",
@@ -2449,6 +2467,19 @@ router.post("/", auth, async (req, res) => {
         .status(400)
         .json({ error: "At least one ledger entry required" });
 
+    /* Cost-centre allocations must be arithmetically possible. Refused rather
+     * than clamped: allocating more of a line than the line holds does not
+     * mean anything, and storing it would let a project report more spend than
+     * the ledger recorded. Entries carrying no allocations — which is every
+     * voucher written before this — pass untouched. */
+    const allocationProblems = budgetControl.validateCostCentreAllocations(body.ledgerEntries);
+    if (allocationProblems.length) {
+      return res.status(400).json({
+        error: allocationProblems.join(" "),
+        costCentreAllocationErrors: allocationProblems,
+      });
+    }
+
     // Auto-number if not provided
     if (!body.voucherNumber) {
       body.voucherNumber = await Acc_Voucher.nextVoucherNumber(
@@ -2496,6 +2527,12 @@ router.post("/", auth, async (req, res) => {
       }
     }
     delete body.partyLedger; // canonicalise — only partyLedgerId is saved
+
+    // C0-C — default dueDate from the party's credit terms for sales/purchase
+    // vouchers, IF the caller didn't already supply one. Every other voucher
+    // type, and any voucher with an explicit dueDate already on `body`, is
+    // returned untouched by this call.
+    await defaultDueDateOnVoucherBody(body);
 
     // Resolve / canonicalise ledger entries (ids, names, auto-create by name).
     await resolveLedgerEntries(body.ledgerEntries, body.companyId);
@@ -2579,10 +2616,26 @@ router.post("/", auth, async (req, res) => {
         .json({ ...voucher.toObject(), _pendingApproval: true });
     }
 
+    // Budget control runs BEFORE the first save when this request would post
+    // immediately, so a refused voucher leaves nothing behind. A plain draft
+    // is saved unchecked — drafting is not spending.
+    //
+    // `voucher.isBalanced` is written by a pre-save hook, so on a document
+    // that has never been saved it still reads false — gating on it here
+    // meant the check silently never ran. Acc_Voucher.balanceOf is the same
+    // rule, callable before the first save.
+    const willPost =
+      body.autoPost && Acc_Voucher.balanceOf(voucher.ledgerEntries).isBalanced;
+    if (willPost) {
+      const clearance = await budgetControl.clearanceFor({ voucher, overrideReason: body.budgetOverrideReason, department: body.department, user: req.user });
+      if (clearance.blocked) return res.status(409).json(clearance.payload);
+      if (clearance.override) voucher.budgetOverride = clearance.override;
+    }
+
     await voucher.save();
 
     // Auto-post if requested and balanced (owners / approvers only reach here)
-    if (body.autoPost && voucher.isBalanced) {
+    if (willPost) {
       voucher.status = "posted";
       voucher.postedBy = req.user?.id;
       voucher.postedAt = new Date();
@@ -2651,6 +2704,15 @@ router.put("/:id", auth, async (req, res) => {
 
     // Resolve / canonicalise ledger entries when provided.
     if (Array.isArray(body.ledgerEntries)) {
+      /* Same rule as create — an edit is another way to write the same
+       * impossible allocation. */
+      const allocationProblems = budgetControl.validateCostCentreAllocations(body.ledgerEntries);
+      if (allocationProblems.length) {
+        return res.status(400).json({
+          error: allocationProblems.join(" "),
+          costCentreAllocationErrors: allocationProblems,
+        });
+      }
       await resolveLedgerEntries(body.ledgerEntries, existing.companyId);
     }
 
@@ -2749,6 +2811,37 @@ router.put("/:id", auth, async (req, res) => {
       }
     }
 
+    /* ── BUDGET CONTROL ON THE EDIT (Chunk 6A) ──────────────────────────────
+     * Chunk 6 gated every point at which a voucher BECOMES posted, which left
+     * one way round it: post ₹10,000 within budget, then edit the posted
+     * voucher up to ₹10,00,000. The ledger moves either way, so the same
+     * question has to be asked here.
+     *
+     * Checked BEFORE the old balances are reversed, so a refusal leaves the
+     * ledger exactly as it was — reversing first and refusing after would
+     * unpost a voucher nobody asked to unpost.
+     *
+     * `proposedVoucher` checks what the edit will BECOME while excluding this
+     * voucher's own current movement from the actuals; without that exclusion
+     * an edit reads as its old amount plus its new one.
+     *
+     * Only when it is already posted, and only when the edit can actually
+     * move a budget — a narration change on a posted voucher does not deserve
+     * two aggregations to confirm nothing happened. */
+    if (wasPosted && budgetControl.affectsBudget(body)) {
+      const clearance = await budgetControl.clearanceFor({
+        voucher: budgetControl.proposedVoucher(existing, body),
+        overrideReason: body.budgetOverrideReason,
+        department: body.department,
+        user: req.user,
+      });
+      if (clearance.blocked) return res.status(409).json(clearance.payload);
+      if (clearance.override) body.budgetOverride = clearance.override;
+    }
+    /* Not a schema field — mongoose would drop it silently, but leaving it on
+       the body invites someone to think it persists. */
+    delete body.budgetOverrideReason;
+
     // For a posted voucher, reverse the OLD balances before mutating entries.
     if (wasPosted) {
       await applyLedgerBalances(existing, -1);
@@ -2791,6 +2884,16 @@ router.post("/:id/post", auth, async (req, res) => {
       throw new Error(`Voucher already ${voucher.status}`);
     if (!voucher.isBalanced)
       throw new Error("Voucher Dr/Cr totals do not balance — cannot post");
+
+    /* This is the moment the draft becomes money. Checked inside the
+     * transaction and before any balance is applied, so a refusal aborts
+     * cleanly and the voucher stays a draft. */
+    const clearance = await budgetControl.clearanceFor({ voucher, overrideReason: req.body?.budgetOverrideReason, department: req.body?.department, user: req.user });
+    if (clearance.blocked) {
+      await session.abortTransaction();
+      return res.status(409).json(clearance.payload);
+    }
+    if (clearance.override) voucher.budgetOverride = clearance.override;
 
     voucher.status = "posted";
     voucher.updatedBy = req.user?.id;
@@ -2993,6 +3096,16 @@ router.post("/:id/approve", auth, async (req, res) => {
       );
     if (!voucher.isBalanced)
       throw new Error("Voucher Dr/Cr totals do not balance — cannot approve.");
+
+    /* Approving posts it, so the same gate applies. The approver is the one
+     * who answers for the overspend here, which is the right person to ask —
+     * they are the one with the authority the submitter lacked. */
+    const clearance = await budgetControl.clearanceFor({ voucher, overrideReason: req.body?.budgetOverrideReason, department: req.body?.department, user: req.user });
+    if (clearance.blocked) {
+      await session.abortTransaction();
+      return res.status(409).json(clearance.payload);
+    }
+    if (clearance.override) voucher.budgetOverride = clearance.override;
 
     voucher.status = "posted";
     voucher.approvedBy = req.user?.id;
