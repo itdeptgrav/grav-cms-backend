@@ -346,6 +346,68 @@ function summarizeCostingSheetChange(before, after) {
   return parts.join(" · ");
 }
 
+/**
+ * Undo `enquiry.products[]`'s own product→customer auto-link (see the PATCH
+ * handler below) for products that no longer belong on the enquiry — a row
+ * removed outright, or unpicked back to free text (26 Aug 2026, explicit
+ * request: "if the sales person remove the product from here means the
+ * linked product id get removed form that customer ok, means that product
+ * id need to dis link form that customer").
+ *
+ * Two safety checks, both required, so this can never remove a link it
+ * didn't create:
+ *
+ *  1. ONLY entries this auto-link mechanism itself created. A salesperson can
+ *     independently assign a product to a customer from the Customer detail
+ *     page's own Products tab (POST /:id/assign-items) — those entries carry
+ *     no `notes`, only an enquiry-created one does (`"From <ref>'s
+ *     requirement."`, set below). Removing a product from an enquiry must
+ *     never silently undo a link someone set up by hand, somewhere else.
+ *
+ *  2. ONLY when no OTHER active enquiry for the same account still
+ *     references the stock item. The same product can legitimately be asked
+ *     for across more than one enquiry for a repeat customer; the link
+ *     belongs to the RELATIONSHIP; removing it from one enquiry must not
+ *     sever a need a different, still-open enquiry has for it.
+ *
+ * Best-effort and never awaited by its caller for the same reason the
+ * forward link isn't: a product row saving must never fail on this.
+ */
+async function unlinkRemovedEnquiryProducts({ accountId, removedStockItemIds, excludeEnquiryId }) {
+  if (!accountId || !removedStockItemIds?.length) return;
+  try {
+    const account = await Account.findById(accountId).select("linkedCustomer");
+    if (!account?.linkedCustomer) return;
+
+    const stillNeeded = new Set(
+      (
+        await Enquiry.find({
+          accountId,
+          isActive: true,
+          _id: { $ne: excludeEnquiryId },
+          "products.stockItemId": { $in: removedStockItemIds },
+        })
+          .select("products.stockItemId")
+          .lean()
+      ).flatMap((e) => (e.products || []).map((p) => p.stockItemId && String(p.stockItemId))),
+    );
+
+    const toUnlink = removedStockItemIds.filter((id) => !stillNeeded.has(String(id)));
+    if (!toUnlink.length) return;
+
+    const customer = await Customer.findById(account.linkedCustomer).select("assignedStockItems");
+    if (!customer) return;
+    const unlinkSet = new Set(toUnlink.map(String));
+    const before = customer.assignedStockItems.length;
+    customer.assignedStockItems = customer.assignedStockItems.filter(
+      (a) => !(a.stockItemId && unlinkSet.has(String(a.stockItemId)) && /^From .+'s requirement\.$/.test(a.notes || "")),
+    );
+    if (customer.assignedStockItems.length !== before) await customer.save();
+  } catch (e) {
+    console.error("[enquiries] product unlink failed:", e.message);
+  }
+}
+
 // A client-supplied products array, cleaned to what the schema accepts: drop
 // blank rows, coerce quantity to a non-negative number, validate the gender
 // enum, and carry the garment-spec fields through trimmed.
@@ -358,10 +420,16 @@ function sanitizeProducts(input) {
       // A picked row carries its master id; a typed one does not, and both are
       // valid. Validated rather than trusted — this arrives from the client.
       const sid = String(p.stockItemId || "").trim();
+      const validSid = mongoose.Types.ObjectId.isValid(sid) ? sid : undefined;
       const out = {
         product: String(p.product).trim(),
-        stockItemId: mongoose.Types.ObjectId.isValid(sid) ? sid : undefined,
+        stockItemId: validSid,
         stockItemReference: String(p.stockItemReference || "").trim() || undefined,
+        // Only meaningful alongside a real stockItemId (26 Aug 2026, bug fix)
+        // — see the model's own comment on this field. Forced false whenever
+        // there is no id at all, so a stray true can never survive a save
+        // with nothing for it to describe.
+        pickedFromRegister: validSid ? Boolean(p.pickedFromRegister) : false,
         quantity: Number.isFinite(qty) && qty >= 0 ? qty : undefined,
         gender: GARMENT_GENDER_CODES.includes(p.gender) ? p.gender : undefined,
         logo: Boolean(p.logo),
@@ -814,18 +882,28 @@ router.patch("/:id", salesAuth, async (req, res) => {
     // stock-item) (24 Aug 2026, explicit request: "we are storing the
     // product id in the customer schema... here also need to do the same").
     // Non-blocking — a product row saving must never fail on this.
+    //
+    // The REVERSE also has to happen (26 Aug 2026, explicit request): a row
+    // deleted outright, or unpicked back to free text via the register field's
+    // own ✕ (both arrive here as `products` simply no longer containing that
+    // stockItemId — this route has no separate "delete" signal), removes the
+    // customer link the same way. `before` (captured pre-mutation, above)
+    // is what makes the diff possible.
     if ("products" in body && enquiry.accountId) {
-      const stockItemIds = [...new Set(
-        (enquiry.products || []).filter((p) => p.stockItemId).map((p) => String(p.stockItemId)),
-      )];
-      if (stockItemIds.length) {
+      const beforeIds = new Set((before.products || []).filter((p) => p.stockItemId).map((p) => String(p.stockItemId)));
+      const afterIds = new Set((enquiry.products || []).filter((p) => p.stockItemId).map((p) => String(p.stockItemId)));
+      const toAddIds = [...afterIds].filter((id) => !beforeIds.has(id));
+      const removedIds = [...beforeIds].filter((id) => !afterIds.has(id));
+
+      if (toAddIds.length) {
         (async () => {
           const account = await Account.findById(enquiry.accountId).select("linkedCustomer");
           if (!account?.linkedCustomer) return;
           const customer = await Customer.findById(account.linkedCustomer).select("assignedStockItems");
           if (!customer) return;
           const already = new Set((customer.assignedStockItems || []).map((a) => String(a.stockItemId)));
-          const toAdd = enquiry.products.filter((p) => p.stockItemId && !already.has(String(p.stockItemId)));
+          const addSet = new Set(toAddIds);
+          const toAdd = enquiry.products.filter((p) => p.stockItemId && addSet.has(String(p.stockItemId)) && !already.has(String(p.stockItemId)));
           if (!toAdd.length) return;
           for (const p of toAdd) {
             customer.assignedStockItems.push({
@@ -836,6 +914,11 @@ router.patch("/:id", salesAuth, async (req, res) => {
           }
           await customer.save();
         })().catch((e) => console.error("[enquiries] product→customer link failed:", e.message));
+      }
+
+      if (removedIds.length) {
+        unlinkRemovedEnquiryProducts({ accountId: enquiry.accountId, removedStockItemIds: removedIds, excludeEnquiryId: enquiry._id })
+          .catch((e) => console.error("[enquiries] product unlink (PATCH) failed:", e.message));
       }
     }
 
@@ -2214,6 +2297,14 @@ router.post("/:id/products/:productName/remove", salesAuth, async (req, res) => 
     const who = actor(req);
     enquiry.updatedBy = who;
     await enquiry.save();
+
+    // The comment above this route has claimed "unlink that product from the
+    // customer" since it was written — this call is what actually makes that
+    // true (26 Aug 2026, bug fix: it was never implemented).
+    if (snapshot.stockItemId && enquiry.accountId) {
+      unlinkRemovedEnquiryProducts({ accountId: enquiry.accountId, removedStockItemIds: [snapshot.stockItemId], excludeEnquiryId: enquiry._id })
+        .catch((e) => console.error("[enquiries] product unlink (remove route) failed:", e.message));
+    }
 
     const lifecycleEntry = (enquiry.costingLifecycle || []).find((c) => c.productName === productName);
     const rejectionNote = lifecycleEntry?.customerDecisionNote || "";

@@ -103,6 +103,26 @@ const enquirySchema = new mongoose.Schema(
           stockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem", index: true, sparse: true },
           /** The master's own code, kept for display without a populate. */
           stockItemReference: { type: String, trim: true },
+          /**
+           * Was `stockItemId` set by PICKING an already-existing item-master
+           * entry, as opposed to registering a brand-new one right here?
+           * (26 Aug 2026, bug fix.)
+           *
+           * `stockItemId` alone can't answer that: the frontend's
+           * RegisterProductForm sets it too, the moment a fresh product is
+           * created for THIS enquiry — deliberately, so every other
+           * downstream consumer (the customer's assignedStockItems link,
+           * production linking) can treat "just registered" and "already
+           * existed" identically, because for those purposes they are.
+           *
+           * Style provisioning's sampling waiver is the one consumer that
+           * must NOT: "pick an existing product, skip the sample" only means
+           * something for a product that already existed before this
+           * enquiry. A freshly registered one is exactly the new-garment case
+           * sampling exists for. This field is that distinction, set true
+           * only by the frontend's MasterCombo `onPick`.
+           */
+          pickedFromRegister: { type: Boolean, default: false },
           quantity: { type: Number, min: 0 },
           note: { type: String, trim: true },
 
