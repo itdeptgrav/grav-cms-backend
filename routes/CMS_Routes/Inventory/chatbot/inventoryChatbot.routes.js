@@ -36,12 +36,16 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 router.use(EmployeeAuthMiddleware);
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
-const MODELS_TO_TRY = [
-  "gemini-3-flash-preview",
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.0-flash",
-];
+/* Set GEMINI_MODELS in .env to change this without a deploy. Removed
+   28 Aug 2026: gemini-2.0-flash (retired) and gemini-2.5-flash /
+   gemini-2.5-flash-lite ("no longer available to new users") — three of the
+   four names here were returning 404 against this project's key. */
+const MODELS_TO_TRY = (
+  process.env.GEMINI_MODELS || "gemini-3.6-flash,gemini-3-flash-preview"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 const STOPWORDS = new Set([
   "a", "an", "the", "is", "are", "was", "were", "be", "been", "of", "for", "to", "in", "on",

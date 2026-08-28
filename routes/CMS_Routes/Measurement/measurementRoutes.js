@@ -891,12 +891,16 @@ router.put("/:measurementId", async (req, res) => {
 // hallucinated identifier from the model can't reach the frontend.
 // ─────────────────────────────────────────────────────────────────────────────
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
-const AI_IMPORT_MODELS = [
-  "gemini-3-flash-preview",
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.0-flash",
-];
+/* Set GEMINI_MODELS in .env to change this without a deploy. Removed
+   28 Aug 2026: gemini-2.0-flash (retired) and gemini-2.5-flash /
+   gemini-2.5-flash-lite ("no longer available to new users") — three of the
+   four names here were returning 404 against this project's key. */
+const AI_IMPORT_MODELS = (
+  process.env.GEMINI_MODELS || "gemini-3.6-flash,gemini-3-flash-preview"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const MAX_AI_IMPORT_TARGETS = 800;
 
 async function callGeminiJson(apiKey, prompt) {
