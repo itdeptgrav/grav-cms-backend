@@ -1362,6 +1362,14 @@ app.use("/api/cms/size-configs", sizeConfigRoutes);
 const measurementRoutes = require("./routes/CMS_Routes/Measurement/measurementRoutes");
 app.use("/api/cms/measurements", measurementRoutes);
 
+// QC's checkpoints and their roster. Mounted on the LONGER prefix and BEFORE
+// the inspection router, so /qc/team can never fall through to a /qc handler —
+// qcRoutes has no /team route today, but a future one would silently shadow
+// this if the order were reversed. Its auth lives inside the router: unlike the
+// inspection endpoints, every one of these needs to know who is asking.
+const qcTeamRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcTeamRoutes");
+app.use("/api/cms/manufacturing/qc/team", qcTeamRoutes);
+
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
 
