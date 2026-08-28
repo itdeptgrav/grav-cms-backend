@@ -14,6 +14,32 @@ const Customer = require("../models/Customer_Models/Customer");
 const Lead = require("../models/CMS_Models/Sales/Lead");
 
 /**
+ * Normalise a list of email addresses into match keys (27 Aug 2026, for Gmail
+ * thread matching).
+ *
+ * Lowercased and de-duplicated, because the same address is stored with
+ * whatever capitalisation somebody typed, while Gmail reports its own. The
+ * `Name <addr@x.com>` form is unwrapped too — that shape reaches us from mail
+ * headers, and comparing a display-name-wrapped address against a bare one
+ * silently never matches.
+ *
+ * Deliberately NOT doing gmail-style dot/plus normalisation: that is correct
+ * for @gmail.com and wrong for most corporate domains, so applying it
+ * everywhere would merge two genuinely different people at the same company.
+ */
+const emailsOf = (list) => [
+  ...new Set(
+    (list || [])
+      .map((e) => {
+        const raw = String(e || "").trim().toLowerCase();
+        const angled = raw.match(/<([^>]+)>/);
+        return (angled ? angled[1] : raw).trim();
+      })
+      .filter((e) => e.includes("@")),
+  ),
+];
+
+/**
  * Collect every phone number and name that identifies a customer, from any
  * of the three "customer" models Sales runs on:
  *
@@ -31,7 +57,7 @@ const Lead = require("../models/CMS_Models/Sales/Lead");
 async function identityFor({ accountId, customerId, leadId }) {
   if (leadId) {
     const lead = await Lead.findById(leadId)
-      .select("company firstName lastName phone whatsapp contacts")
+      .select("company firstName lastName phone whatsapp email contacts")
       .lean();
     if (!lead) return null;
 
@@ -43,6 +69,12 @@ async function identityFor({ accountId, customerId, leadId }) {
         lead.whatsapp,
         ...(lead.contacts || []).map((c) => c.phone),
       ],
+      // Added 27 Aug 2026 for Gmail matching, alongside the phones this has
+      // always returned. Same principle: the lead's own address PLUS every
+      // stakeholder's, because a thread usually runs with a person at the
+      // company rather than a generic company mailbox. Normalised and
+      // de-duplicated by emailsOf() below, so callers get clean match keys.
+      emails: emailsOf([lead.email, ...(lead.contacts || []).map((c) => c.email)]),
       names: [lead.company],
       // "whole phrase only" — a stakeholder's first name alone is not a safe match key.
       personNames: [personName, ...(lead.contacts || []).map((c) => c.name)],
@@ -51,12 +83,12 @@ async function identityFor({ accountId, customerId, leadId }) {
 
   if (accountId) {
     const account = await Account.findById(accountId)
-      .select("companyName displayName legalName brandName primaryPhone alternatePhone")
+      .select("companyName displayName legalName brandName primaryPhone alternatePhone primaryEmail")
       .lean();
     if (!account) return null;
 
     const contacts = await Contact.find({ accountId })
-      .select("firstName lastName phone mobile whatsapp alternatePhone")
+      .select("firstName lastName phone mobile whatsapp alternatePhone email")
       .lean();
 
     return {
@@ -66,6 +98,7 @@ async function identityFor({ accountId, customerId, leadId }) {
         account.alternatePhone,
         ...contacts.flatMap((c) => [c.phone, c.mobile, c.whatsapp, c.alternatePhone]),
       ],
+      emails: emailsOf([account.primaryEmail, ...contacts.map((c) => c.email)]),
       names: [account.companyName, account.displayName, account.legalName, account.brandName],
       // Kept apart from the org names: a person's name is matched only as a
       // whole phrase, never by its leading word. "Rahul" is not an identity.
@@ -74,16 +107,17 @@ async function identityFor({ accountId, customerId, leadId }) {
   }
 
   const customer = await Customer.findById(customerId)
-    .select("name phone alternatePhone profile.companyName")
+    .select("name phone alternatePhone email profile.companyName")
     .lean();
   if (!customer) return null;
 
   return {
     label: customer.name,
     phones: [customer.phone, customer.alternatePhone],
+    emails: emailsOf([customer.email]),
     names: [customer.name, customer.profile?.companyName],
     personNames: [],
   };
 }
 
-module.exports = { identityFor };
+module.exports = { identityFor, emailsOf };

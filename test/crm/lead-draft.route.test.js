@@ -339,18 +339,29 @@ describe("Legacy records (no captureStatus field) and pipeline stats", () => {
     expect(body.leads.some((l) => l.leadId === "LEAD-2020-9999")).toBe(true);
   });
 
+  // `?stats=1` since 27 Aug 2026: pipelineStats is opt-in. It used to be
+  // computed on EVERY list load by reading the whole Lead collection into
+  // Node, which no caller wanted — see the route's own comment. The rule under
+  // test (which leads count) is unchanged; only who asks for it is.
   test("pipeline stats exclude drafts", async () => {
     await createDraft();
     await call("/", { method: "POST", body: { firstName: "Active One" } });
-    const { body } = await call("/");
+    const { body } = await call("/?stats=1");
     expect(body.pipelineStats.total).toBe(1);
   });
 
   test("pipeline stats exclude archived drafts too", async () => {
     await createArchivedDraft();
     await call("/", { method: "POST", body: { firstName: "Active One" } });
-    const { body } = await call("/");
+    const { body } = await call("/?stats=1");
     expect(body.pipelineStats.total).toBe(1);
+  });
+
+  test("pipeline stats are omitted unless asked for", async () => {
+    await call("/", { method: "POST", body: { firstName: "Active One" } });
+    const { body } = await call("/");
+    expect(body.pipelineStats).toBeUndefined();
+    expect(body.leads.length).toBeGreaterThan(0);
   });
 
   test("a legacy doc with no captureStatus DOES count in pipeline stats (treated as active)", async () => {

@@ -359,13 +359,25 @@ router.get("/requests", async (req, res) => {
             };
         });
 
-        const total = await CustomerRequest.countDocuments(filter);
+        // Six counts that used to be awaited ONE AT A TIME — the page paid every
+        // latency end to end (27 Aug 2026, explicit performance request). The
+        // four status tallies are now a single $group pass instead of four
+        // separate full counts, and it runs alongside the filtered total rather
+        // than after it. Same numbers, one round trip.
+        const [total, grouped] = await Promise.all([
+            CustomerRequest.countDocuments(filter),
+            CustomerRequest.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+        ]);
+        // `stats` is deliberately UNFILTERED — it always described the whole
+        // order book, not the current filter, and the tabs that read it depend
+        // on that. Preserved exactly.
+        const byStatus = Object.fromEntries(grouped.map((g) => [g._id, g.count]));
         const stats = {
-            total: await CustomerRequest.countDocuments(),
-            pending: await CustomerRequest.countDocuments({ status: 'pending' }),
-            inProgress: await CustomerRequest.countDocuments({ status: 'in_progress' }),
-            completed: await CustomerRequest.countDocuments({ status: 'completed' }),
-            cancelled: await CustomerRequest.countDocuments({ status: 'cancelled' })
+            total: grouped.reduce((n, g) => n + g.count, 0),
+            pending: byStatus.pending || 0,
+            inProgress: byStatus.in_progress || 0,
+            completed: byStatus.completed || 0,
+            cancelled: byStatus.cancelled || 0
         };
 
         res.json({
@@ -419,7 +431,17 @@ router.get("/requests/:requestId", async (req, res) => {
     try {
         const request = await CustomerRequest.findById(req.params.requestId)
             .populate('salesPersonAssigned', 'name email phone')
-            .populate('items.stockItemId', 'name reference category images genderCategory')
+            // `variants.images` as well as `images` (27 Aug 2026). A StockItem
+            // carries photos in TWO places — a top-level `images` array and a
+            // per-variant one — and in the live register only 9 of 119 products
+            // use the top-level field while 99 have their photo on a variant
+            // alone. Selecting `images` by itself therefore returned nothing
+            // for 83% of products, which is why the Order Items list appeared
+            // to have no photos. Only the variant IMAGES are pulled, not whole
+            // variant documents, so this stays cheap.
+            // `variants.attributes` too, so the frontend can pick the photo for
+            // the SIZE/COLOUR actually ordered rather than any variant's.
+            .populate('items.stockItemId', 'name reference category images variants.images variants.attributes genderCategory')
             .select('-__v');
 
         if (!request) {
@@ -781,7 +803,13 @@ router.get("/requests/:requestId/production", async (req, res) => {
 
         const workOrders = await WorkOrder.find({ customerRequestId: requestId })
             .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity status "
-                  + "assignedDeadline productionCompletion customerName")
+                  + "assignedDeadline productionCompletion customerName stockItemId variantId")
+            // Product identity for the style rail — a photo, the reference code
+            // and the gender, so a style can be RECOGNISED and not just named
+            // (27 Aug 2026). `variants.images` matters as much as `images`:
+            // most products in the live register carry their photo only on a
+            // variant, so selecting the top-level array alone finds nothing.
+            .populate("stockItemId", "name reference category genderCategory images variants.images")
             .lean();
 
         if (!workOrders.length) {
@@ -807,7 +835,9 @@ router.get("/requests/:requestId/shipment", async (req, res) => {
         const [workOrders, challans, enquiry] = await Promise.all([
             WorkOrder.find({ customerRequestId: requestId })
                 .select("workOrderNumber stockItemName stockItemReference variantAttributes quantity status "
-                      + "assignedDeadline dispatchedQuantity productionCompletion.operationCompletion")
+                      + "assignedDeadline dispatchedQuantity productionCompletion.operationCompletion "
+                      + "stockItemId variantId")
+                .populate("stockItemId", "name reference category genderCategory images variants.images")
                 .lean(),
             DispatchChallan.find({ manufacturingOrderId: requestId })
                 .select("challanNumber dispatchType totalUnits totalPersons persons.employeeName persons.employeeUIN "

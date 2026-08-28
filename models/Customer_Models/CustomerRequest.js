@@ -1051,4 +1051,22 @@ const customerRequestSchema = new mongoose.Schema(
   },
 );
 
+// ── Indexes ──────────────────────────────────────────────────────────────────
+// This model had NONE until 27 Aug 2026 (explicit performance request: the
+// Order Book "takes too much time to load"). Every list query was a full
+// collection scan followed by an in-memory sort, which is invisible at 30 rows
+// and gets linearly worse for the life of the business.
+//
+// Matched to what routes/CMS_Routes/Sales/customerRequests.js actually does:
+//   • The list route filters on `status` and sorts `{ createdAt: -1 }` — a
+//     compound index in that order serves filter-then-sort in one pass, and
+//     also serves the unfiltered sort via its prefix.
+//   • `createdAt` alone covers the no-filter case cleanly.
+//   • `customerId` is the customer-scoped lookup (a customer's own orders).
+//   • `requestId` is the human-facing reference searched by exact match.
+customerRequestSchema.index({ status: 1, createdAt: -1 });
+customerRequestSchema.index({ createdAt: -1 });
+customerRequestSchema.index({ customerId: 1, createdAt: -1 });
+customerRequestSchema.index({ requestId: 1 });
+
 module.exports = mongoose.model("CustomerRequest", customerRequestSchema);

@@ -15,7 +15,14 @@ function buildOAuth2Client(gmailToken) {
     return client;
 }
 
-function getEmployeeAuthUrl(employeeId) {
+// `returnTo` is an app-relative path to land on after consent (27 Aug 2026).
+// Without it the callback always sent people to /coworking/settings, which is
+// wrong for anyone who started somewhere else — a salesperson connecting from
+// Sales Settings was dropped on the CoWork app's settings screen with no
+// explanation. Encoded into `state` alongside the employee id, because that is
+// the only value Google hands back to us. Optional, and the old single-value
+// state still parses, so existing CoWork callers are unaffected.
+function getEmployeeAuthUrl(employeeId, returnTo) {
     const client = new google.auth.OAuth2(
         process.env.GOOGLE_CLIENT_ID,
         process.env.GOOGLE_CLIENT_SECRET,
@@ -31,8 +38,28 @@ function getEmployeeAuthUrl(employeeId) {
             "https://www.googleapis.com/auth/userinfo.email",
             "https://www.googleapis.com/auth/userinfo.profile",
         ],
-        state: employeeId,
+        state: returnTo ? `${employeeId}::${returnTo}` : employeeId,
     });
+}
+
+/**
+ * Split a `state` back into its parts.
+ *
+ * `returnTo` is only ever accepted as a SAME-SITE PATH — it must start with a
+ * single "/" and must not start with "//". Anything else is discarded. That
+ * check is the whole point: `state` round-trips through Google and comes back
+ * as untrusted input, so echoing it into a redirect without validation would
+ * turn this callback into an open redirect that an attacker could use to bounce
+ * a victim to their own site carrying the appearance of your domain.
+ */
+function parseOAuthState(state) {
+    const raw = String(state || "");
+    const sep = raw.indexOf("::");
+    if (sep === -1) return { employeeId: raw, returnTo: null };
+    const employeeId = raw.slice(0, sep);
+    const candidate = raw.slice(sep + 2);
+    const safe = /^\/(?!\/)/.test(candidate) ? candidate : null;
+    return { employeeId, returnTo: safe };
 }
 
 async function saveEmployeeGmailToken(employeeId, code) {
@@ -414,6 +441,7 @@ async function getThread(employeeId, threadId) {
 
 module.exports = {
     getEmployeeAuthUrl,
+    parseOAuthState,
     saveEmployeeGmailToken,
     getEmployeeGmailToken,
     disconnectEmployeeGmail,

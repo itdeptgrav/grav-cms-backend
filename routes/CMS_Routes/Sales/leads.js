@@ -245,13 +245,85 @@ async function authorizeOwnerSourceChange(req, data) {
   return isSalesManager(req.user);
 }
 
+/* ── Real, unfalsifiable contact evidence ────────────────────────────────────
+   Added 27 Aug 2026 on explicit request: the Contacting / Contacted gates were
+   satisfied ONLY by a CRM Activity, which is a salesperson typing "I called
+   them". These read the actual channel records instead — the device call log
+   and the Meta WhatsApp thread — so the stage reflects what demonstrably
+   happened, not what somebody said happened.
+
+   BOTH SOURCES ARE IN MONGO, so this stays a couple of cheap indexed queries on
+   a transition that already does several. Gmail is deliberately NOT consulted
+   here: those messages live in the salesperson's own mailbox behind their
+   personal OAuth token, which this server-side transition has no access to (and
+   reaching out to Google mid-transition would make advancing a lead depend on a
+   third-party API being up). Email evidence still counts — the Leads workspace
+   surfaces it and one tap logs it as an Activity, which the gate above already
+   accepts.
+
+   Every lookup is wrapped: a matching failure must never block a legitimate
+   transition, so evidence that cannot be read is treated as absent, and the
+   logged-Activity path still stands. */
+
+/** Every CallEvent that matches this lead's numbers/names. */
+async function matchedCallEvents(lead) {
+  try {
+    const { identityFor } = require("../../../services/customerIdentityLookup.service");
+    const { buildRecordingFilter } = require("../../../services/callRecordingMatch.service");
+    const CallEvent = require("../../../models/CallEvent");
+    const identity = await identityFor({ leadId: lead._id });
+    if (!identity) return [];
+    const filter = buildRecordingFilter(identity);
+    if (!filter) return [];
+    return await CallEvent.find(filter).select("received rejected startTime durationSec driveFileId direction").lean();
+  } catch (e) {
+    console.error("[leads] call evidence lookup failed:", e.message);
+    return [];
+  }
+}
+
+/** The WhatsApp conversation for this lead's number, if there is one. */
+async function matchedWhatsAppMessages(lead) {
+  try {
+    const WhatsAppConversation = require("../../../models/CMS_Models/Sales/WhatsAppConversation");
+    const { WhatsAppMessage } = require("../../../models/CMS_Models/Sales/WhatsAppMessage");
+    const tails = [lead.phone, lead.whatsapp, ...((lead.contacts || []).map((c) => c.phone))]
+      .map((p) => String(p || "").replace(/\D/g, "").slice(-10))
+      .filter((t) => t.length === 10);
+    if (!tails.length) return [];
+    const conv = await WhatsAppConversation.findOne({
+      waId: { $in: [...new Set(tails)].map((t) => new RegExp(`${t}$`)) },
+    }).select("_id").lean();
+    if (!conv) return [];
+    return await WhatsAppMessage.find({ conversationId: conv._id }).select("direction timestamp").lean();
+  } catch (e) {
+    console.error("[leads] whatsapp evidence lookup failed:", e.message);
+    return [];
+  }
+}
+
+/** Did anyone actually try to reach this lead? Any call, or any message we sent. */
+async function hasRealOutreachEvidence(lead) {
+  const [calls, msgs] = await Promise.all([matchedCallEvents(lead), matchedWhatsAppMessages(lead)]);
+  // A call that rang counts as an attempt whether or not it connected — that is
+  // exactly what "attempted" means.
+  return calls.length > 0 || msgs.some((m) => m.direction === "outgoing");
+}
+
+/** Did the customer actually respond? A connected call, or a message FROM them. */
+async function hasRealTwoWayEvidence(lead) {
+  const [calls, msgs] = await Promise.all([matchedCallEvents(lead), matchedWhatsAppMessages(lead)]);
+  // `received` is the device's own call-log truth, not a duration guess.
+  return calls.some((c) => c.received === true) || msgs.some((m) => m.direction === "incoming");
+}
+
 // Lead correction chunk — the per-target facts services/leadQualification.js
 // needs but cannot look up itself (it stays pure/DB-free by design). Only
 // queries what the specific target actually requires.
 async function computeTransitionContext(lead, targetState, body = {}) {
   const context = {};
   if (targetState === "contactAttempted") {
-    context.hasOutreachAttempt = Boolean(
+    const logged = Boolean(
       await Activity.exists({
         leadId: lead._id,
         isActive: true,
@@ -259,9 +331,16 @@ async function computeTransitionContext(lead, targetState, body = {}) {
         activityType: { $in: OUTREACH_ATTEMPT_ACTIVITY_TYPES },
       }),
     );
+    // A LOGGED activity is a salesperson's own claim. Real device/channel
+    // evidence is not. Either satisfies the gate (27 Aug 2026, explicit
+    // request that these stages "are needed to make it genuine upon fetching
+    // the call event schema... so accordingly enable that button"), so a
+    // salesperson who actually rang the customer is not blocked merely for
+    // not having typed it in afterwards.
+    context.hasOutreachAttempt = logged || (await hasRealOutreachEvidence(lead));
   }
   if (targetState === "contacted") {
-    context.hasSuccessfulContact = Boolean(
+    const logged = Boolean(
       await Activity.exists({
         leadId: lead._id,
         isActive: true,
@@ -269,6 +348,7 @@ async function computeTransitionContext(lead, targetState, body = {}) {
         outcome: { $in: Array.from(SUCCESSFUL_CONTACT_OUTCOMES) },
       }),
     );
+    context.hasSuccessfulContact = logged || (await hasRealTwoWayEvidence(lead));
   }
   if (targetState === "duplicate" && body.duplicateOf?.id) {
     const type = body.duplicateOf.type === "account" ? "account" : "lead";
@@ -457,7 +537,6 @@ router.get("/", salesAuth, async (req, res) => {
     const sort = {};
     sort[sortBy] = sortOrder === "asc" ? 1 : -1;
 
-    const total = await Lead.countDocuments(filter);
     let leadsQuery = Lead.find(filter)
       .sort(sort)
       .skip((page - 1) * limit)
@@ -466,45 +545,82 @@ router.get("/", salesAuth, async (req, res) => {
     // History rows need the human Journey reference to link to it — populated
     // only here (not on every list load) since it's the one view that needs it.
     if (isHistoryView) leadsQuery = leadsQuery.populate("conversion.journeyId", "journeyId name");
-    const leads = await leadsQuery.lean();
 
-    // Pipeline stats — NEITHER drafts NOR archived drafts count (Draft Lead
-    // chunk: "must not affect existing pipeline statistics", extended to
-    // exclude archived too). `$nin` still matches a pre-chunk record with no
-    // captureStatus at all, so legacy Leads keep counting as active.
-    const allLeads = await Lead.find({ isActive: true, captureStatus: { $nin: LEAD_INACTIVE_CAPTURE_STATUSES } })
-      .select("stage estimatedValue probability")
-      .lean();
+    // Count and page run TOGETHER (27 Aug 2026). They were sequential, so every
+    // list load paid both latencies end to end for no reason — neither depends
+    // on the other.
+    const [total, leads] = await Promise.all([
+      Lead.countDocuments(filter),
+      leadsQuery.lean(),
+    ]);
 
-    const pipelineStats = {
-      new: 0,
-      contacted: 0,
-      qualified: 0,
-      proposal_sent: 0,
-      negotiation: 0,
-      won: 0,
-      lost: 0,
-      totalPipelineValue: 0,
-      weightedValue: 0,
-    };
-    allLeads.forEach((l) => {
-      pipelineStats[l.stage] = (pipelineStats[l.stage] || 0) + 1;
-      if (!["won", "lost"].includes(l.stage)) {
-        pipelineStats.totalPipelineValue += l.estimatedValue || 0;
-        pipelineStats.weightedValue +=
-          ((l.estimatedValue || 0) * (l.probability || 0)) / 100;
+    // Pipeline stats — OPT-IN via ?stats=1 (27 Aug 2026, explicit performance
+    // request: "currently it is taking too much time to load the page of
+    // prospects, leads, pipeline, order book").
+    //
+    // This used to run unconditionally on every single list load: an unbounded
+    // `Lead.find({...}).lean()` over the WHOLE collection, pulling every active
+    // lead into Node just to tally it in a forEach. Nothing in the frontend has
+    // ever read the `pipelineStats` key (grepped across grav-clothing: zero
+    // hits) — Prospects and Leads both throw it away — so the most expensive
+    // query on the page was pure waste, and it got worse with every lead added.
+    //
+    // Kept rather than deleted, because the response shape is a public contract
+    // this repo can't see all the consumers of. Two changes: it only runs when
+    // asked for, and when it does run it's a $group aggregation, so the tallying
+    // happens in Mongo and only ~7 rows cross the wire instead of the entire
+    // collection.
+    let pipelineStats;
+    if (String(req.query.stats || "") === "1") {
+      // NEITHER drafts NOR archived drafts count (Draft Lead chunk: "must not
+      // affect existing pipeline statistics", extended to exclude archived
+      // too). `$nin` still matches a pre-chunk record with no captureStatus at
+      // all, so legacy Leads keep counting as active.
+      const grouped = await Lead.aggregate([
+        { $match: { isActive: true, captureStatus: { $nin: LEAD_INACTIVE_CAPTURE_STATUSES } } },
+        {
+          $group: {
+            _id: "$stage",
+            count: { $sum: 1 },
+            value: { $sum: { $ifNull: ["$estimatedValue", 0] } },
+            weighted: {
+              $sum: {
+                $divide: [
+                  { $multiply: [{ $ifNull: ["$estimatedValue", 0] }, { $ifNull: ["$probability", 0] }] },
+                  100,
+                ],
+              },
+            },
+          },
+        },
+      ]);
+
+      pipelineStats = {
+        new: 0, contacted: 0, qualified: 0, proposal_sent: 0,
+        negotiation: 0, won: 0, lost: 0,
+        totalPipelineValue: 0, weightedValue: 0, total: 0,
+      };
+      for (const g of grouped) {
+        pipelineStats[g._id] = (pipelineStats[g._id] || 0) + g.count;
+        pipelineStats.total += g.count;
+        // Won/lost are settled — they are not still "in the pipeline", so they
+        // contribute to the counts but never to the value totals. Same rule the
+        // forEach this replaced applied.
+        if (!["won", "lost"].includes(g._id)) {
+          pipelineStats.totalPipelineValue += g.value;
+          pipelineStats.weightedValue += g.weighted;
+        }
       }
-    });
-    pipelineStats.total = allLeads.length;
-    pipelineStats.conversionRate =
-      pipelineStats.total > 0
-        ? Math.round((pipelineStats.won / pipelineStats.total) * 100)
-        : 0;
+      pipelineStats.conversionRate =
+        pipelineStats.total > 0
+          ? Math.round((pipelineStats.won / pipelineStats.total) * 100)
+          : 0;
+    }
 
     res.json({
       success: true,
       leads,
-      pipelineStats,
+      ...(pipelineStats ? { pipelineStats } : {}),
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),

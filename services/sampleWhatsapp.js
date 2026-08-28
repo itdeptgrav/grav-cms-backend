@@ -134,6 +134,13 @@ async function sendApprovalRequest(style, { customerName, enquiryRef, preparedBy
         name: templateName,
         language: process.env.WHATSAPP_APPROVAL_TEMPLATE_LANG || "en",
         components: [{ type: "header", parameters: [{ type: "document", document: { id: mediaId, filename } }] }],
+        // Without this, whatsappSend's renderTemplateText falls back to the
+        // literal string "[template: product_approval]" — and that is what got
+        // stored and then SHOWN to salespeople in the message log (reported
+        // 27 Aug 2026 with a screenshot). This template's body has no {{n}}
+        // variables, so a plain sentence is the whole rendering. Frontends also
+        // translate the old placeholder for rows already stored this way.
+        bodyText: `Sample approval request for "${style.productName || "your product"}" — the sample PDF is attached, with Approve and Reject buttons.`,
       },
       WHATSAPP_ACTOR,
     );

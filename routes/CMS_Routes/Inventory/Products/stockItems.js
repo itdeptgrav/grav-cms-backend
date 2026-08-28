@@ -1039,6 +1039,35 @@ router.get("/", async (req, res) => {
     if (category) filter.category = category;
     if (status) filter.status = status;
 
+    // ── ?sampledOnly=1 — only products whose sampling is SETTLED ─────────────
+    // Added 27 Aug 2026 on explicit request: at the Enquiry stage, the "pick an
+    // existing product" dropdown "only those products need to suggest whose
+    // sampling is approved by the sales team". Picking an unapproved product
+    // there would waive development on something nobody has actually signed off
+    // — the exact thing the pickedFromRegister waiver is meant to be safe for.
+    //
+    // OPT-IN, not the default: this is a general Inventory endpoint that also
+    // feeds stock lists, the product register and reporting, none of which
+    // should suddenly hide products. Only the Sales product picker sends it.
+    //
+    // "Settled" is `approved` OR `notApplicable`, which is exactly what
+    // services/sampleReadiness.js's SETTLED_SAMPLE_STATUSES already means —
+    // a product legitimately waived from sampling counts as cleared, since
+    // there was never a sample for Sales to approve. Kept in step with that
+    // constant deliberately; if the vocabulary changes, both must move.
+    if (String(req.query.sampledOnly || "") === "1") {
+      const { SETTLED_SAMPLE_STATUSES } = require("../../../../services/sampleReadiness");
+      const SampleStyle = require("../../../../models/CMS_Models/Sales/SampleStyle");
+      const approvedIds = await SampleStyle.distinct("sourceStockItemId", {
+        isActive: true,
+        "sample.status": { $in: SETTLED_SAMPLE_STATUSES },
+      });
+      // `sourceStockItemId` is sparse — styles for never-registered products
+      // have none — so distinct() can return nulls. Filtered out, or an $in
+      // carrying null would match documents by accident.
+      filter._id = { $in: approvedIds.filter(Boolean) };
+    }
+
     // ── Merchandiser/Production work-queue alerts (26 Aug 2026) ──────────────
     // "showcase the alerts... for which product or like how many products are
     // there which are not assigned any raw items" / "which product is having

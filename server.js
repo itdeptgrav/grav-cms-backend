@@ -1223,6 +1223,10 @@ app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callR
 // Every call (answered/missed/rejected, recorded or not) for the Active Lead
 // workspace's outreach-attempt suggestion — see that route file's own header.
 app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
+// Emails exchanged with a customer, read live from the salesperson's own
+// connected Gmail — the email sibling of call-events and crm/whatsapp. Scoped
+// to the caller's own mailbox via the JWT; see that route file's header.
+app.use("/api/cms/crm/email", require("./routes/CMS_Routes/Sales/crmEmail"));
 
 // Sales Journey — the connected commercial lifecycle record (Account →
 // Retention). Same Sales role + approval guard as the rest of CRM: an editor's

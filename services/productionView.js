@@ -28,6 +28,55 @@
 // rollup would make it real later.
 "use strict";
 
+/**
+ * A work order's human label.
+ *
+ * `workOrderNumber` is declared on the model but NOTHING GENERATES IT — as of
+ * 27 Aug 2026 all 138 work orders in the live database have it unset, so every
+ * view that showed it rendered a blank cell and the lists read as broken or
+ * empty. Falling back to the id's last 8 characters matches both the existing
+ * convention in routes/CEO_Routes/commandCenter.js and, more usefully, the
+ * barcode format production actually prints (`WO-<shortId>-<unit>`), so the
+ * label on screen is the one a person can match against a physical ticket.
+ *
+ * A display fallback, not a fix: the real repair is generating the number on
+ * creation. This stops the gap being invisible in the meantime.
+ */
+const woLabel = (wo) => wo.workOrderNumber || (wo._id ? `WO-${String(wo._id).slice(-8)}` : "—");
+
+
+/**
+ * The product's identity, for the views that show a style rather than a number.
+ *
+ * Added 27 Aug 2026: the production and shipment screens named a style and
+ * nothing else — no photo, no reference code, no gender — so a salesperson
+ * looking at "Front Office Shirt" could not tell WHICH shirt, and the screens
+ * read as missing data even when the counts were right.
+ *
+ * The photo needs both image homes: a StockItem carries `images` at the top
+ * level AND per variant, and in the live register 99 of 119 products have one
+ * only on a variant. Reading `images` alone therefore finds nothing for most
+ * of the catalogue. Requires the caller to have populated `stockItemId` —
+ * absent, every field is simply null and the UI falls back to a placeholder.
+ */
+function productIdentity(wo) {
+  const si = wo.stockItemId && typeof wo.stockItemId === "object" ? wo.stockItemId : null;
+  const variants = si?.variants || [];
+  let image = null;
+  if (wo.variantId) {
+    const v = variants.find((v) => String(v._id) === String(wo.variantId));
+    if (v?.images?.[0]) image = v.images[0];
+  }
+  if (!image) for (const v of variants) if (v?.images?.[0]) { image = v.images[0]; break; }
+  if (!image) image = si?.images?.[0] || null;
+  return {
+    image,
+    reference: si?.reference || wo.stockItemReference || null,
+    gender: si?.genderCategory || null,
+    category: si?.category || null,
+  };
+}
+
 const SECONDS_PER_HOUR = 3600;
 
 
@@ -41,6 +90,7 @@ const HOURS_PER_DAY = 8;
 const WORKS_ON_SUNDAY = false;
 
 /** Add `n` working days to a date, skipping Sundays. */
+
 function addWorkingDays(from, n) {
   const d = new Date(from);
   let left = Math.ceil(n);
@@ -98,13 +148,36 @@ function project({ constraintSeconds, remaining, now, deadline }) {
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
 /** A work order's size, read off its variant attributes. */
+/**
+ * The work order's real SIZE, or null when it genuinely has none.
+ *
+ * Returning null matters (fixed 27 Aug 2026). This used to fall back to "any
+ * attribute value" so a column always had something in it — which meant a work
+ * order whose only attribute was `Colour: Green` reported its SIZE as "Green",
+ * and the by-size matrix grew a column headed GREEN sitting next to XS. Two
+ * different axes were being pivoted as one, so every cell was meaningless.
+ *
+ * Attribute names are inconsistent in the live data (`Size` 79, `size` 30,
+ * `SIZE` 10), hence the case-insensitive test; 21 of 140 work orders carry no
+ * size attribute at all, which is why "none" has to be representable.
+ */
 function sizeOf(wo) {
   const attrs = wo.variantAttributes || [];
   const size = attrs.find((a) => /size/i.test(a?.name || ""));
-  if (size?.value) return String(size.value);
-  // No attribute named "size" — show whatever does distinguish this variant
-  // rather than an empty column.
-  return attrs.map((a) => a?.value).filter(Boolean).join(" / ") || "—";
+  return size?.value ? String(size.value) : null;
+}
+
+/**
+ * How this variant is described to a person — every attribute it has, named.
+ *
+ * "XS", "Green", or "XS · Green". Used wherever a line has to be identified
+ * rather than pivoted, so a colour-only product is still labelled honestly
+ * instead of being forced into a size-shaped hole.
+ */
+function variantOf(wo) {
+  const attrs = (wo.variantAttributes || []).filter((a) => a?.value);
+  if (!attrs.length) return "—";
+  return attrs.map((a) => String(a.value)).join(" · ");
 }
 
 /**
@@ -215,9 +288,15 @@ function buildProductionView(workOrders = [], now = new Date()) {
     const firstReached = cells.length ? cells[0] : 0;
     return {
       workOrderId: String(wo._id || ""),
-      workOrderNumber: wo.workOrderNumber || "",
+      workOrderNumber: woLabel(wo),
       style: wo.stockItemName || wo.stockItemReference || "—",
+      // Product identity, so a line can be recognised rather than just named.
+      ...productIdentity(wo),
+      // `size` is null when the product genuinely has no size — the by-size
+      // matrix must be able to tell that apart from a size it simply doesn't
+      // know. `variant` always says something, for labelling.
       size: sizeOf(wo),
+      variant: variantOf(wo),
       quantity: qty,
       status: wo.status || "pending",
       deadline: wo.assignedDeadline || null,
@@ -228,7 +307,7 @@ function buildProductionView(workOrders = [], now = new Date()) {
       queue: Math.max(0, qty - firstReached),
       lastSyncedAt: comp.lastSyncedAt || null,
     };
-  }).sort((a, b) => a.style.localeCompare(b.style) || a.size.localeCompare(b.size));
+  }).sort((a, b) => a.style.localeCompare(b.style) || String(a.size ?? "").localeCompare(String(b.size ?? "")));
 
   // ── Exceptions, from the scan ledger rather than from anyone's judgement ──
   const reasons = new Map();
@@ -267,6 +346,9 @@ function buildProductionView(workOrders = [], now = new Date()) {
       styleMap.set(l.style, {
         style: l.style, quantity: 0, cells: operations.map(() => 0),
         queue: 0, sizes: [], deadline: l.deadline || null,
+        // Every size of a style is the same product, so the first line's
+        // identity describes the group.
+        image: l.image, reference: l.reference, gender: l.gender, category: l.category,
       });
     }
     const st = styleMap.get(l.style);
@@ -336,4 +418,4 @@ function buildProductionView(workOrders = [], now = new Date()) {
   };
 }
 
-module.exports = { buildProductionView, sizeOf };
+module.exports = { buildProductionView, sizeOf, variantOf, productIdentity };

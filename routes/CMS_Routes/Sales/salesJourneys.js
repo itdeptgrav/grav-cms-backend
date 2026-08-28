@@ -471,6 +471,43 @@ router.get("/", salesAuth, async (req, res) => {
   }
 });
 
+/* ── GET /api/cms/crm/sales-journeys/owners ──────────────────────────────────
+   The distinct owners with at least one live journey — just what the Pipeline's
+   owner filter dropdown needs to render.
+
+   Added 27 Aug 2026 (explicit performance request). The dropdown used to be
+   populated by a SECOND full `loadHubSummaries({view:"team"})` on every mount:
+   200 fully-hydrated journey rows, every populate the list route does, fetched
+   purely to read two fields off each and throw the rest away — so the Pipeline
+   paid for its own list twice on every single load.
+
+   MUST stay declared ABOVE `GET /:journeyId` — Express matches in order, and a
+   param route directly below would otherwise capture "owners" as a journey
+   reference and answer 404. */
+
+router.get("/owners", salesAuth, async (req, res) => {
+  try {
+    // Mirrors the list route's own scoping: "mine" narrows to the caller.
+    const match = { isActive: true, ownerId: { $ne: null } };
+    if (req.query.scope === "mine" && req.user?.id) {
+      match.ownerId = new mongoose.Types.ObjectId(String(req.user.id));
+    }
+    const rows = await SalesJourney.aggregate([
+      { $match: match },
+      // $last, not $first: if a person's display name was corrected at some
+      // point, the most recent journey carries the corrected spelling.
+      { $group: { _id: "$ownerId", name: { $last: "$ownerName" } } },
+      { $sort: { name: 1 } },
+    ]);
+    res.json({
+      success: true,
+      owners: rows.map((r) => ({ id: String(r._id), name: r.name || String(r._id) })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 /* ── GET /api/cms/crm/sales-journeys/:journeyId ──────────────────────────────
    Keyed on the HUMAN reference. A Mongo id in this URL would end up in a
    breadcrumb, which the frontend spec forbids outright. */
