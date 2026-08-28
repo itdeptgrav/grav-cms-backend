@@ -1749,7 +1749,7 @@ const EDIT_PASSED_DRAFT_STATUSES = ["confirmed", "in_progress", "done", "submitt
 router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { title, description, requirements, etAdjustSecs, etAdjustReason } = req.body;
+    const { title, description, requirements, etAdjustSecs, etAdjustReason, changeSummary, changeEventType, changePayload } = req.body;
 
     const taskRef = db.collection("cowork_tasks").doc(taskId);
     const snap = await taskRef.get();
@@ -1830,6 +1830,47 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
 
     await taskRef.update(updates);
 
+    // ── The change, written where people will look for it ────────────────────
+    //
+    // The client sends ONE sentence (changeSummary) built by
+    // lib/rules/tasks/taskChangeLog.ts, so the History tab, the Task Chat and
+    // the notification below all tell the same story. The who and when are the
+    // ENGINE's — attributed to the verified caller and stamped by the server —
+    // never the body's. Absent (a plain title/description edit, or an old
+    // client) nothing here runs and the route behaves as it always did.
+    if (typeof changeSummary === "string" && changeSummary.trim()) {
+      const summary = changeSummary.trim().slice(0, 2000);
+
+      // Task Chat — a system line in the thread people actually watch.
+      await postSystemChatMessage(taskId, summary, req.coworkUser.employeeId, req.coworkUser.name);
+
+      // History tab — one append-only row per task in an events subcollection.
+      // listTaskEvents (frontend) reads exactly this shape; it used to refuse
+      // because this store did not exist.
+      try {
+        const eventsRef = taskRef.collection("events");
+        const existing = await eventsRef.get();
+        const seq = existing.size + 1;
+        await eventsRef.doc(require("crypto").randomUUID()).set({
+          sequence: seq,
+          // A value TaskEventType already carries, so the panel's per-type
+          // rendering keeps working; defaults to the generic edit type.
+          type: typeof changeEventType === "string" ? changeEventType : "edited",
+          actorId: req.coworkUser.employeeId,
+          actorLabel: req.coworkUser.name,
+          summary,
+          // Structured numbers kept beside the sentence for anything that later
+          // wants them without parsing prose. Trusted only as data.
+          payload: changePayload && typeof changePayload === "object" ? changePayload : {},
+          occurredAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) {
+        // A history write must never fail the edit itself — the requirement and
+        // the ET are already saved. Losing one history row is the smaller wrong.
+        console.error("[edit-details] event log write failed:", e.message);
+      }
+    }
+
     // ── Tell whoever has to DO it ────────────────────────────────────────────
     // Editing a task that has already started rewrites the brief of work
     // somebody is part-way through, and they had no way of knowing. Naming
@@ -1841,12 +1882,16 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
       requirements !== undefined && "the requirements",
       etApplied && "the time estimate",
     ].filter(Boolean);
+    const notifyBody =
+      typeof changeSummary === "string" && changeSummary.trim()
+        ? `${req.coworkUser.name}: ${changeSummary.trim()}`
+        : `${req.coworkUser.name} changed ${changed.join(", ") || "the details"} of "${updates.title || task.title}"${hasPassedDraft ? " — you have already started this one, so read it again before you carry on." : "."}`;
     await _notify({
       recipientIds: (task.assigneeIds || []).filter(id => id && id !== req.coworkUser.employeeId),
       type: "task_details_edited",
       title: "✏️ Task details changed",
-      body: `${req.coworkUser.name} changed ${changed.join(", ") || "the details"} of "${updates.title || task.title}"${hasPassedDraft ? " — you have already started this one, so read it again before you carry on." : "."}`,
-      data: { taskId, changed, hasPassedDraft },
+      body: notifyBody,
+      data: { taskId, changed, hasPassedDraft, etAdjusted: etApplied },
       senderId: req.coworkUser.employeeId,
       senderName: req.coworkUser.name,
     });
