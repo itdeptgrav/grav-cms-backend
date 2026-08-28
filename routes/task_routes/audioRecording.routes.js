@@ -373,17 +373,80 @@ module.exports = function (io) {
     verifyCoworkToken,
     verifyEmployeeToken,
     async (req, res) => {
+      /* Declared out here so the `catch` can put the audio back. A `const`
+         inside the `try` is not visible to its sibling `catch`, which would
+         make the restore below dead code — and a failed finalize would then
+         leave the recording under a name nothing ever looks for. */
+      let claimedDir = null;
       try {
         const { meetId, firstName, mimeType: clientMimeType } = req.body;
         const { employeeId, name } = req.coworkUser;
 
         if (!meetId) return res.status(400).json({ error: "meetId required" });
 
-        const chunkDir = getChunkDir(meetId, employeeId);
+        /**
+         * **Claim the directory before merging it.**
+         *
+         * Finalize can arrive from three places at once for one recording: the
+         * page-hide keepalive as a tab closes, the browser's own drain replaying
+         * the IndexedDB marker afterwards, and the room unmounting. Each of them
+         * merged whatever was in the directory and wrote its own Drive file, and
+         * the directory is only cleared on SUCCESS — so two that overlapped both
+         * merged the same audio and the folder ended up holding the same voice
+         * two and three times. Seen on M058: three files for one person, five
+         * seconds apart.
+         *
+         * `renameSync` is the whole lock. It is atomic on every filesystem this
+         * runs on, and it fails when the source is gone — so the first caller
+         * takes the audio and everybody after it finds nothing and is answered
+         * `skipped`, which is exactly what "somebody already finalized this"
+         * should look like.
+         */
+        const liveDir = getChunkDir(meetId, employeeId);
+        /**
+         * A name only THIS call can be holding.
+         *
+         * The first version of this renamed to a fixed `<dir>.merging` and
+         * guarded with `if (fs.existsSync(liveDir))`. That has a hole big
+         * enough to drive the original bug through: when the directory is
+         * already claimed, `existsSync` is false, so no rename is attempted, no
+         * error is thrown, and the caller falls straight through to merging
+         * `<dir>.merging` — which is the directory the FIRST caller is using.
+         * The second finalize merged the first one's audio and wrote a second
+         * Drive file. Observed as two 32 KB files two seconds apart.
+         *
+         * Unique-per-call plus an unguarded rename fixes both halves: the
+         * rename THROWS when there is nothing to claim, so "already taken" and
+         * "nothing here" both land in the catch, and no two callers can ever
+         * name the same directory.
+         */
+        const chunkDir = `${liveDir}.merging-${process.pid}-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
+        try {
+          /* Deliberately NOT guarded by `existsSync`: the throw IS the lock. */
+          fs.renameSync(liveDir, chunkDir);
+          claimedDir = chunkDir;
+        } catch {
+          /* Either another finalize holds the audio, or there is none. Both
+             mean the same thing to this caller: there is nothing here to
+             upload, and saying so is the honest answer. */
+          console.log(
+            `[AudioFinalize] nothing to claim for ${employeeId} — already finalized or empty`,
+          );
+          cleanupChunkDir(meetId, employeeId);
+          return res.json({
+            success: true,
+            skipped: true,
+            message: "Already finalized, or no audio captured",
+          });
+        }
+
         const merged = mergeChunks(chunkDir);
 
         if (!merged || merged.length === 0) {
           // No audio was recorded for this user (e.g. joined but never unmuted)
+          fs.rmSync(chunkDir, { recursive: true, force: true });
           cleanupChunkDir(meetId, employeeId);
           return res.json({
             success: true,
@@ -452,7 +515,10 @@ module.exports = function (io) {
           .doc(docId)
           .set(firestoreData);
 
-        // Cleanup temp chunks
+        /* The claimed copy, and the live directory in case a late chunk landed
+           while this was uploading. Both, because the claim renamed the audio
+           out of the way rather than deleting it — see the note above. */
+        fs.rmSync(chunkDir, { recursive: true, force: true });
         cleanupChunkDir(meetId, employeeId);
 
         console.log(
@@ -479,6 +545,38 @@ module.exports = function (io) {
           isRejoin,
         });
       } catch (e) {
+        /**
+         * **Put the audio back where the retry will look for it.**
+         *
+         * The claim above renamed the chunk directory aside so a concurrent
+         * finalize could not merge the same audio twice. If THIS one then fails
+         * — Drive refusing, a network fault — the recording is sitting under a
+         * name nothing else knows, and the browser's own retry would find an
+         * empty directory and conclude there was nothing to upload. The claim
+         * would have turned a temporary failure into a lost recording.
+         *
+         * So the failure path gives it back. Merging into an existing live
+         * directory is safe: chunks are keyed by index, so a chunk that arrived
+         * meanwhile keeps its own name.
+         */
+        try {
+          const live = getChunkDir(meetId, employeeId);
+          /* `chunkDir` is this call's own unique claim — the only directory it
+             is entitled to give back. Guessing a fixed name here would either
+             miss it or, worse, hand back a directory another finalize is
+             actively merging. */
+          if (claimedDir && fs.existsSync(claimedDir) && !fs.existsSync(live)) {
+            fs.renameSync(claimedDir, live);
+            console.warn(
+              `[AudioFinalize] restored ${employeeId}'s chunks after a failed finalize`,
+            );
+          }
+        } catch (restoreError) {
+          console.error(
+            "[AudioFinalize] could not restore chunks:",
+            restoreError.message,
+          );
+        }
         console.error("[AudioFinalize] Error:", e.message);
         res.status(500).json({ error: e.message });
       }
