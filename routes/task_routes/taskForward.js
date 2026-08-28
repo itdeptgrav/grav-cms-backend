@@ -1749,7 +1749,7 @@ const EDIT_PASSED_DRAFT_STATUSES = ["confirmed", "in_progress", "done", "submitt
 router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { title, description, requirements } = req.body;
+    const { title, description, requirements, etAdjustSecs, etAdjustReason } = req.body;
 
     const taskRef = db.collection("cowork_tasks").doc(taskId);
     const snap = await taskRef.get();
@@ -1770,6 +1770,64 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
     if (description !== undefined) updates.description = description;
     if (requirements !== undefined) updates.requirements = Array.isArray(requirements) ? requirements : [];
 
+    // ── The estimate, moved with the requirement that changed ────────────────
+    //
+    // A SIGNED DELTA, never a total. The client says "ninety minutes more than
+    // whatever this task has"; the current window is read here and the delta
+    // applied to it, so a stale page cannot overwrite a budget somebody else
+    // changed while it was open. Absent or zero, nothing below runs and this
+    // route behaves exactly as it always has — which is what keeps the existing
+    // callers (updateTask, addRequirements) untouched.
+    //
+    // The fields written are the same ones department-tl-set-hours writes, for
+    // the same reason: a window changed without recomputing dueDate leaves the
+    // task carrying a deadline derived from the OLD budget, and every figure
+    // built on it — expected completion, remaining time, the overdue mark —
+    // silently disagrees with the hours on screen.
+    let etApplied = null;
+    const rawDelta = Math.round(Number(etAdjustSecs) || 0);
+    if (rawDelta !== 0) {
+      // The window actually in effect, in the precedence the client reads it:
+      // an agreed figure outranks a proposed one, and adjusting anything other
+      // than the one in effect changes a number nobody is looking at.
+      // The two fields the DOCUMENT actually carries. agreedWindowSecs and
+      // senderWindowSecs are client-side names the mapper derives from these
+      // (lib/legacy/tasks.ts) and do not exist here — reading them would be two
+      // guaranteed-undefined terms in a chain that only worked by falling
+      // through them. deadlineWindowSecs is the agreed figure and outranks the
+      // sender's opening offer, which is the same precedence resolveTimeBudget
+      // applies on the client.
+      const currentSecs =
+        Number(task.deadlineWindowSecs) ||
+        Number(task.senderTimerWindowSecs) ||
+        0;
+
+      // Floored at zero. A negative budget is not a smaller estimate — it is a
+      // number computeWorkingDeadline would turn into a date before now.
+      const nextSecs = Math.max(0, currentSecs + rawDelta);
+
+      const { computeWorkingDeadline } = require("../../services/officeDeadline.service");
+      const anchorMs = Date.now();
+      const dueDate = await computeWorkingDeadline({ startMs: anchorMs, windowSecs: nextSecs });
+
+      updates.deadlineWindowSecs = nextSecs;
+      updates.senderTimerWindowSecs = nextSecs;
+      // originalWindowSecs is the assignor's ceiling and is NOT rewritten —
+      // adjustBudget checks against it, and moving it would quietly raise the
+      // bar an assignee-side manager is measured against.
+      updates.etcHours = nextSecs / 3600;
+      updates.dueDate = dueDate;
+      // A fixedDeadline left over from create outranks everything computed
+      // above (fixedDeadline ?? deadline ?? dueDate), so the new window could
+      // never move the date anybody sees. The same clearing set-hours does.
+      updates.fixedDeadline = null;
+      updates.etAdjustedBy = req.coworkUser.employeeId;
+      updates.etAdjustedAtMs = anchorMs;
+      updates.etAdjustedReason = typeof etAdjustReason === "string" ? etAdjustReason : null;
+
+      etApplied = { fromSecs: currentSecs, toSecs: nextSecs, deltaSecs: nextSecs - currentSecs };
+    }
+
     await taskRef.update(updates);
 
     // ── Tell whoever has to DO it ────────────────────────────────────────────
@@ -1781,6 +1839,7 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
       title !== undefined && "the title",
       description !== undefined && "the description",
       requirements !== undefined && "the requirements",
+      etApplied && "the time estimate",
     ].filter(Boolean);
     await _notify({
       recipientIds: (task.assigneeIds || []).filter(id => id && id !== req.coworkUser.employeeId),
@@ -1792,7 +1851,7 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
       senderName: req.coworkUser.name,
     });
 
-    res.json({ success: true, taskId, title: updates.title, description: updates.description, requirements: updates.requirements });
+    res.json({ success: true, taskId, title: updates.title, description: updates.description, requirements: updates.requirements, etAdjusted: etApplied });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
