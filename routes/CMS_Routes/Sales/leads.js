@@ -265,6 +265,46 @@ async function authorizeOwnerSourceChange(req, data) {
    transition, so evidence that cannot be read is treated as absent, and the
    logged-Activity path still stands. */
 
+/**
+ * Is this lead's phone genuinely THEIRS, or could a matched call/message
+ * actually belong to a different lead that happens to share the number?
+ *
+ * 28 Aug 2026, explicit report with a real example: a lead's own email was
+ * found to be shared by THREE different Leads in this database (a dev-data
+ * artifact, but the ambiguity it exposes is a real one — the same failure
+ * mode would occur with a shared company switchboard number in production).
+ * Automatic evidence matched on a number/address that more than one lead
+ * claims cannot honestly be credited to any single one of them; it could be a
+ * call to the OTHER lead.
+ *
+ * Reuses findLeadDuplicates (services/crmDuplicates.js) rather than a second
+ * matching implementation — it already computes exactly this ("does another
+ * active Lead share this email/phone") for the duplicate-review flow, so this
+ * is one fewer place the rule could drift.
+ *
+ * Fails CLOSED: a lookup error is treated as ambiguous (evidence suppressed),
+ * not as clear. The failure mode of wrongly WITHHOLDING a real gate credit is
+ * "log it by hand" — mildly annoying. The failure mode of wrongly GRANTING one
+ * is a stage advanced on someone else's contact record — which is the exact
+ * bug being fixed here.
+ */
+async function ambiguousContactChannels(lead) {
+  try {
+    const matches = await findLeadDuplicates(
+      Lead,
+      { company: lead.company, email: lead.email, phone: lead.phone, website: lead.website },
+      lead._id,
+    );
+    return {
+      email: matches.some((m) => m.matchedOn.includes("email")),
+      phone: matches.some((m) => m.matchedOn.includes("phone")),
+    };
+  } catch (e) {
+    console.error("[leads] ambiguity check failed:", e.message);
+    return { email: true, phone: true };
+  }
+}
+
 /** Every CallEvent that matches this lead's numbers/names. */
 async function matchedCallEvents(lead) {
   try {
@@ -304,7 +344,12 @@ async function matchedWhatsAppMessages(lead) {
 
 /** Did anyone actually try to reach this lead? Any call, or any message we sent. */
 async function hasRealOutreachEvidence(lead) {
-  const [calls, msgs] = await Promise.all([matchedCallEvents(lead), matchedWhatsAppMessages(lead)]);
+  const [calls, msgs, ambiguous] = await Promise.all([
+    matchedCallEvents(lead), matchedWhatsAppMessages(lead), ambiguousContactChannels(lead),
+  ]);
+  // Both channels are matched by phone, so both are withheld together when the
+  // phone itself is ambiguous — see ambiguousContactChannels's own comment.
+  if (ambiguous.phone) return false;
   // A call that rang counts as an attempt whether or not it connected — that is
   // exactly what "attempted" means.
   return calls.length > 0 || msgs.some((m) => m.direction === "outgoing");
@@ -312,7 +357,10 @@ async function hasRealOutreachEvidence(lead) {
 
 /** Did the customer actually respond? A connected call, or a message FROM them. */
 async function hasRealTwoWayEvidence(lead) {
-  const [calls, msgs] = await Promise.all([matchedCallEvents(lead), matchedWhatsAppMessages(lead)]);
+  const [calls, msgs, ambiguous] = await Promise.all([
+    matchedCallEvents(lead), matchedWhatsAppMessages(lead), ambiguousContactChannels(lead),
+  ]);
+  if (ambiguous.phone) return false;
   // `received` is the device's own call-log truth, not a duration guess.
   return calls.some((c) => c.received === true) || msgs.some((m) => m.direction === "incoming");
 }
