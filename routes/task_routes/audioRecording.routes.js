@@ -373,17 +373,80 @@ module.exports = function (io) {
     verifyCoworkToken,
     verifyEmployeeToken,
     async (req, res) => {
+      /* Declared out here so the `catch` can put the audio back. A `const`
+         inside the `try` is not visible to its sibling `catch`, which would
+         make the restore below dead code — and a failed finalize would then
+         leave the recording under a name nothing ever looks for. */
+      let claimedDir = null;
       try {
         const { meetId, firstName, mimeType: clientMimeType } = req.body;
         const { employeeId, name } = req.coworkUser;
 
         if (!meetId) return res.status(400).json({ error: "meetId required" });
 
-        const chunkDir = getChunkDir(meetId, employeeId);
+        /**
+         * **Claim the directory before merging it.**
+         *
+         * Finalize can arrive from three places at once for one recording: the
+         * page-hide keepalive as a tab closes, the browser's own drain replaying
+         * the IndexedDB marker afterwards, and the room unmounting. Each of them
+         * merged whatever was in the directory and wrote its own Drive file, and
+         * the directory is only cleared on SUCCESS — so two that overlapped both
+         * merged the same audio and the folder ended up holding the same voice
+         * two and three times. Seen on M058: three files for one person, five
+         * seconds apart.
+         *
+         * `renameSync` is the whole lock. It is atomic on every filesystem this
+         * runs on, and it fails when the source is gone — so the first caller
+         * takes the audio and everybody after it finds nothing and is answered
+         * `skipped`, which is exactly what "somebody already finalized this"
+         * should look like.
+         */
+        const liveDir = getChunkDir(meetId, employeeId);
+        /**
+         * A name only THIS call can be holding.
+         *
+         * The first version of this renamed to a fixed `<dir>.merging` and
+         * guarded with `if (fs.existsSync(liveDir))`. That has a hole big
+         * enough to drive the original bug through: when the directory is
+         * already claimed, `existsSync` is false, so no rename is attempted, no
+         * error is thrown, and the caller falls straight through to merging
+         * `<dir>.merging` — which is the directory the FIRST caller is using.
+         * The second finalize merged the first one's audio and wrote a second
+         * Drive file. Observed as two 32 KB files two seconds apart.
+         *
+         * Unique-per-call plus an unguarded rename fixes both halves: the
+         * rename THROWS when there is nothing to claim, so "already taken" and
+         * "nothing here" both land in the catch, and no two callers can ever
+         * name the same directory.
+         */
+        const chunkDir = `${liveDir}.merging-${process.pid}-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
+        try {
+          /* Deliberately NOT guarded by `existsSync`: the throw IS the lock. */
+          fs.renameSync(liveDir, chunkDir);
+          claimedDir = chunkDir;
+        } catch {
+          /* Either another finalize holds the audio, or there is none. Both
+             mean the same thing to this caller: there is nothing here to
+             upload, and saying so is the honest answer. */
+          console.log(
+            `[AudioFinalize] nothing to claim for ${employeeId} — already finalized or empty`,
+          );
+          cleanupChunkDir(meetId, employeeId);
+          return res.json({
+            success: true,
+            skipped: true,
+            message: "Already finalized, or no audio captured",
+          });
+        }
+
         const merged = mergeChunks(chunkDir);
 
         if (!merged || merged.length === 0) {
           // No audio was recorded for this user (e.g. joined but never unmuted)
+          fs.rmSync(chunkDir, { recursive: true, force: true });
           cleanupChunkDir(meetId, employeeId);
           return res.json({
             success: true,
@@ -452,7 +515,10 @@ module.exports = function (io) {
           .doc(docId)
           .set(firestoreData);
 
-        // Cleanup temp chunks
+        /* The claimed copy, and the live directory in case a late chunk landed
+           while this was uploading. Both, because the claim renamed the audio
+           out of the way rather than deleting it — see the note above. */
+        fs.rmSync(chunkDir, { recursive: true, force: true });
         cleanupChunkDir(meetId, employeeId);
 
         console.log(
@@ -479,7 +545,310 @@ module.exports = function (io) {
           isRejoin,
         });
       } catch (e) {
+        /**
+         * **Put the audio back where the retry will look for it.**
+         *
+         * The claim above renamed the chunk directory aside so a concurrent
+         * finalize could not merge the same audio twice. If THIS one then fails
+         * — Drive refusing, a network fault — the recording is sitting under a
+         * name nothing else knows, and the browser's own retry would find an
+         * empty directory and conclude there was nothing to upload. The claim
+         * would have turned a temporary failure into a lost recording.
+         *
+         * So the failure path gives it back. Merging into an existing live
+         * directory is safe: chunks are keyed by index, so a chunk that arrived
+         * meanwhile keeps its own name.
+         */
+        try {
+          const live = getChunkDir(meetId, employeeId);
+          /* `chunkDir` is this call's own unique claim — the only directory it
+             is entitled to give back. Guessing a fixed name here would either
+             miss it or, worse, hand back a directory another finalize is
+             actively merging. */
+          if (claimedDir && fs.existsSync(claimedDir) && !fs.existsSync(live)) {
+            fs.renameSync(claimedDir, live);
+            console.warn(
+              `[AudioFinalize] restored ${employeeId}'s chunks after a failed finalize`,
+            );
+          }
+        } catch (restoreError) {
+          console.error(
+            "[AudioFinalize] could not restore chunks:",
+            restoreError.message,
+          );
+        }
         console.error("[AudioFinalize] Error:", e.message);
+        res.status(500).json({ error: e.message });
+      }
+    },
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BACKUP RECORDINGS — a second copy of somebody else's voice, kept by the
+  // host's browser and uploaded ONLY when that person's own file never arrived.
+  //
+  // Why this exists: a participant's audio is written to their own browser's
+  // disk before it is uploaded, so a dropped connection never loses it. But if
+  // that person never opens Cowork again — laptop gone, left the company,
+  // browser cleared — nothing ever sends it, and after seven days it expires.
+  // The host hears them over WebRTC anyway, so the host's browser can hold a
+  // copy against exactly that case.
+  //
+  // It is a SECOND-GENERATION copy: already compressed by their browser, sent
+  // over the network, and decoded. Lower quality than their own recording, and
+  // whatever their connection lost is baked into it permanently. So it is never
+  // preferred — only used where the alternative is nothing at all.
+  //
+  // Three routes, and the ORDER matters: claim, then chunk, then finalize.
+  // Nothing reaches Drive until `backup-claim` has said the original is missing
+  // AND handed this caller the exclusive right to supply it.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** Where a backup's chunks live — never the directory the real one uses. */
+  function getBackupChunkDir(meetId, forEmployeeId) {
+    return path.join(TMP_BASE, meetId, `backup__${forEmployeeId}`);
+  }
+
+  /** Their own recording, if it landed. A backup row never counts as one. */
+  async function realRecordingExists(meetId, forEmployeeId) {
+    const own = await db
+      .collection("meeting_audio_recordings")
+      .where("meetId", "==", meetId)
+      .where("employeeId", "==", forEmployeeId)
+      .limit(5)
+      .get();
+    return own.docs.some((d) => d.data().isBackup !== true);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // POST /cowork/audio/backup-claim
+  // Body: { meetId, forEmployeeId }
+  // → { needed: false }                 their own recording arrived; discard
+  // → { needed: true, claimed: true }   upload yours
+  // → { needed: true, claimed: false }  somebody else is already uploading
+  // ─────────────────────────────────────────────────────────────────────────
+  router.post(
+    "/audio/backup-claim",
+    verifyCoworkToken,
+    verifyEmployeeToken,
+    async (req, res) => {
+      try {
+        const { meetId, forEmployeeId } = req.body;
+        const { employeeId: claimedBy } = req.coworkUser;
+        if (!meetId || !forEmployeeId)
+          return res
+            .status(400)
+            .json({ error: "meetId and forEmployeeId required" });
+
+        /* Checked first, so the common case costs one query and writes
+           nothing at all. A backup exists to cover the absence of the real
+           recording, so its presence ends the matter. */
+        if (await realRecordingExists(meetId, forEmployeeId))
+          return res.json({ needed: false });
+
+        /**
+         * **The lock, and why it is a transaction.**
+         *
+         * In a five-person meeting every participant may hold a backup of the
+         * same voice. Without this they would all see "their file is missing"
+         * at the same moment and all upload, and the meeting would end with
+         * five identical recordings of one person. The transaction makes the
+         * claim atomic: exactly one caller is told `claimed: true`.
+         *
+         * A claim goes stale after ten minutes, so a host who claims and then
+         * shuts their laptop does not lock the recording out forever.
+         */
+        const claimRef = db
+          .collection("meeting_audio_backup_claims")
+          .doc(`${meetId}__${forEmployeeId}`);
+        const STALE_MS = 10 * 60 * 1000;
+
+        const claimed = await db.runTransaction(async (tx) => {
+          const snap = await tx.get(claimRef);
+          const now = Date.now();
+          if (snap.exists) {
+            const d = snap.data();
+            const age = now - (d.claimedAtMs ?? 0);
+            if (d.claimedBy !== claimedBy && age < STALE_MS) return false;
+          }
+          tx.set(claimRef, {
+            meetId,
+            forEmployeeId,
+            claimedBy,
+            claimedAtMs: now,
+            claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          return true;
+        });
+
+        console.log(
+          `[AudioBackup] claim meet=${meetId} for=${forEmployeeId} by=${claimedBy} -> ${claimed}`,
+        );
+        res.json({ needed: true, claimed });
+      } catch (e) {
+        console.error("[AudioBackup] claim error:", e.message);
+        res.status(500).json({ error: e.message });
+      }
+    },
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // POST /cowork/audio/backup-chunk — the shape of /audio/chunk, except the
+  // audio belongs to `forEmployeeId` and is kept in its own directory.
+  // ─────────────────────────────────────────────────────────────────────────
+  router.post(
+    "/audio/backup-chunk",
+    verifyCoworkToken,
+    verifyEmployeeToken,
+    upload.single("chunk"),
+    async (req, res) => {
+      try {
+        const { meetId, forEmployeeId, chunkIndex, mimeType } = req.body;
+        if (!req.file)
+          return res.status(400).json({ error: "No chunk data received" });
+        if (!meetId || !forEmployeeId)
+          return res
+            .status(400)
+            .json({ error: "meetId and forEmployeeId required" });
+
+        const chunkDir = getBackupChunkDir(meetId, forEmployeeId);
+        fs.mkdirSync(chunkDir, { recursive: true });
+
+        const numericIndex =
+          chunkIndex !== undefined && chunkIndex !== null && chunkIndex !== ""
+            ? Number(chunkIndex)
+            : getNextChunkIndex(chunkDir);
+        const idx = String(numericIndex).padStart(4, "0");
+        const ext = mimeType?.includes("mp4")
+          ? "mp4"
+          : mimeType?.includes("ogg")
+            ? "ogg"
+            : "webm";
+        fs.writeFileSync(
+          path.join(chunkDir, `chunk_${idx}.${ext}`),
+          req.file.buffer,
+        );
+
+        console.log(
+          `[AudioBackup] chunk meet=${meetId} for=${forEmployeeId} idx=${idx} size=${req.file.size}B`,
+        );
+        res.json({ success: true, chunkIndex: idx });
+      } catch (e) {
+        console.error("[AudioBackup] chunk error:", e.message);
+        res.status(500).json({ error: e.message });
+      }
+    },
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // POST /cowork/audio/backup-finalize
+  // Body: { meetId, forEmployeeId, forName, mimeType }
+  // ─────────────────────────────────────────────────────────────────────────
+  router.post(
+    "/audio/backup-finalize",
+    verifyCoworkToken,
+    verifyEmployeeToken,
+    async (req, res) => {
+      try {
+        const {
+          meetId,
+          forEmployeeId,
+          forName,
+          mimeType: clientMime,
+        } = req.body;
+        const { employeeId: recordedBy, name: recordedByName } = req.coworkUser;
+        if (!meetId || !forEmployeeId)
+          return res
+            .status(400)
+            .json({ error: "meetId and forEmployeeId required" });
+
+        const chunkDir = getBackupChunkDir(meetId, forEmployeeId);
+        const merged = mergeChunks(chunkDir);
+        if (!merged || merged.length === 0) {
+          fs.rmSync(chunkDir, { recursive: true, force: true });
+          return res.json({
+            success: true,
+            skipped: true,
+            message: "No backup audio captured",
+          });
+        }
+
+        /* Checked AGAIN, immediately before writing. The claim was taken when
+           the meeting ended; their own upload may have completed in the minutes
+           since — a slow connection finishing, or the drain on another page
+           catching up. Uploading now would put the same voice in the folder
+           twice, which is the one outcome this feature must never cause. */
+        if (await realRecordingExists(meetId, forEmployeeId)) {
+          fs.rmSync(chunkDir, { recursive: true, force: true });
+          console.log(
+            `[AudioBackup] their own file arrived first — discarding backup for ${forEmployeeId}`,
+          );
+          return res.json({
+            success: true,
+            skipped: true,
+            message: "Their own recording arrived; backup discarded",
+          });
+        }
+
+        const mimeType = clientMime || "audio/webm";
+        const ext = mimeType.includes("mp4")
+          ? "mp4"
+          : mimeType.includes("ogg")
+            ? "ogg"
+            : "webm";
+        const safeName =
+          (forName || forEmployeeId)
+            .replace(/[^a-zA-Z0-9]/g, "")
+            .slice(0, 20) || forEmployeeId;
+        /* Named so nobody mistakes it for the real thing in the Drive folder. */
+        const baseFileName = `${safeName}_audio_${meetId}_backup.${ext}`;
+
+        const driveResult = await uploadAudioToDrive(
+          merged,
+          baseFileName,
+          mimeType,
+          meetId,
+        );
+
+        await db
+          .collection("meeting_audio_recordings")
+          .doc(`${meetId}_${forEmployeeId}_backup_${Date.now()}`)
+          .set({
+            meetId,
+            employeeId: forEmployeeId,
+            employeeName: forName || forEmployeeId,
+            firstName: (forName || "").split(" ")[0],
+            fileName: driveResult.fileName,
+            mimeType,
+            fileSize: merged.length,
+            driveFileId: driveResult.fileId,
+            driveViewUrl: driveResult.viewUrl,
+            driveDownloadUrl: driveResult.downloadUrl,
+            uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
+            status: "uploaded",
+            isRejoin: false,
+            /* The three fields that keep it honest wherever it is read: what it
+               is, who captured it, and under whose name. */
+            isBackup: true,
+            recordedBy,
+            recordedByName: recordedByName || recordedBy,
+          });
+
+        fs.rmSync(chunkDir, { recursive: true, force: true });
+        console.log(
+          `[AudioBackup] ✅ ${driveResult.fileName} (backup for ${forEmployeeId}, recorded by ${recordedBy})`,
+        );
+
+        res.json({
+          success: true,
+          isBackup: true,
+          fileName: driveResult.fileName,
+          driveViewUrl: driveResult.viewUrl,
+          driveFileId: driveResult.fileId,
+          fileSize: merged.length,
+        });
+      } catch (e) {
+        console.error("[AudioBackup] finalize error:", e.message);
         res.status(500).json({ error: e.message });
       }
     },

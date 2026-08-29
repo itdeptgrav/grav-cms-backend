@@ -34,13 +34,39 @@ const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_UPLOAD_BASE =
   "https://generativelanguage.googleapis.com/upload/v1beta";
 
-// Models to try in order — verified against official Gemini API docs (April 2026)
-const MODELS_TO_TRY = [
-  "gemini-3-flash-preview", // Gemini 3 Flash — latest, best free quota
-  "gemini-2.5-flash", // Stable — best price/performance in 2.5 family
-  "gemini-2.5-flash-lite", // Fastest + most budget friendly fallback
-  "gemini-2.0-flash", // Last resort fallback
-];
+/**
+ * Models to try in order.
+ *
+ * **Set GEMINI_MODELS in .env to change this without a deploy.** That is the
+ * point of the env var: three of the four names hardcoded here previously were
+ * retired by Google between April and August 2026, and every one of them was a
+ * code edit in four separate files to fix. Google retires model names on its
+ * own schedule, so the list is configuration, not logic.
+ *
+ * The defaults below were verified against THIS project's API key on
+ * 28 August 2026 by listing `/v1beta/models` and sending each one a request:
+ *
+ *   gemini-3.6-flash        ✅  Google's own named replacement for 2.0-flash
+ *   gemini-3-flash-preview  ✅  works, but it is a PREVIEW name — first to go
+ *   gemini-3.5-transcribe   ✅  purpose-built for transcription
+ *
+ * Order is deliberate. `3.6-flash` leads because it is a stable name with a
+ * 1M-token input window, and `callGemini` serves the summary as well as the
+ * transcript. `3.5-transcribe` is last despite being the better transcriber:
+ * its input window is 98k tokens, about a tenth of the others', so a long
+ * meeting would not fit — it is a good fallback and a bad default.
+ *
+ * Retired and removed: gemini-2.0-flash (gone), gemini-2.5-flash and
+ * gemini-2.5-flash-lite (both "no longer available to new users" — Google
+ * grandfathered existing callers and this key was not one).
+ */
+const MODELS_TO_TRY = (
+  process.env.GEMINI_MODELS ||
+  "gemini-3.6-flash,gemini-3-flash-preview,gemini-3.5-transcribe"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // In-memory lock to prevent duplicate simultaneous requests for same meetId
 const processingLocks = new Set();
@@ -73,6 +99,90 @@ function getDriveClient() {
       scopes: ["https://www.googleapis.com/auth/drive"],
     }),
   });
+}
+
+/**
+ * Refuse a recording the model cannot parse, before it can spoil the rest.
+ *
+ * **One bad file among seven loses the whole meeting.** `generateContent` takes
+ * every audio file in a single request, so an unparseable one is not a missing
+ * participant — it is a 400 for the entire transcript, and the message Google
+ * returns is the unimprovable "Request contains an invalid argument." with no
+ * `error.details` naming which file. That is a very expensive way to find out
+ * that one upload went wrong.
+ *
+ * The check is the container's magic number, which is four bytes and certain.
+ * A WebM file begins `1A 45 DF A3` — the EBML header. Recordings have been
+ * arriving with that first `0x1A` missing, starting `45 DF A3 9F` instead: one
+ * byte short at the front, everything else intact, the file still 1MB of real
+ * Opus audio and still perfectly ACTIVE in Gemini's storage. Nothing upstream
+ * notices, because nothing upstream looks.
+ *
+ * Throwing here rather than repairing is deliberate. The per-file `try` in the
+ * upload loop already skips a failure and carries on, so the meeting gets a
+ * transcript from the recordings that ARE sound, and the log names the one that
+ * is not. Silently prepending the missing byte would hide a corruption whose
+ * cause is not yet understood — and a transcript built from a file we quietly
+ * patched is not evidence of anything.
+ */
+function assertPlayableContainer(buffer, mime, displayName) {
+  const base = (mime || "").split(";")[0].trim().toLowerCase();
+  if (base !== "audio/webm" && base !== "video/webm") return;
+
+  const magic = buffer.subarray(0, 4).toString("hex");
+  if (magic === "1a45dfa3") return;
+
+  /* Named precisely, because the whole point is that this used to be invisible.
+     The `45dfa39f` case is the one seen in the wild; anything else that is not
+     a WebM header is reported the same way. */
+  const hint =
+    magic === "45dfa39f"
+      ? "the leading 0x1A of the EBML header is missing — the upload lost its first byte"
+      : `expected an EBML header (1a45dfa3), found ${magic}`;
+  throw new Error(
+    `Corrupt WebM in ${displayName}: ${hint}. Skipping this recording so the rest of the meeting can still be transcribed.`,
+  );
+}
+
+/**
+ * A MIME type Gemini will actually accept for a recording.
+ *
+ * Drive reports whatever the file was uploaded as, and that is not always
+ * something the model takes. Two cases, both verified against the live API on
+ * 28 August 2026:
+ *
+ *   application/octet-stream → 400 "Unsupported MIME type". Drive's fallback
+ *     when it cannot identify a file, and one such file among seven poisons
+ *     the whole request — every participant's transcript lost to one bad row.
+ *   video/webm → the upload is accepted but the file never reaches ACTIVE, and
+ *     the request then fails with "not in an ACTIVE state". A browser that
+ *     records with a video container reports this even for audio-only.
+ *
+ * Both become `audio/webm`, which is what the recorder actually produces — the
+ * frontend's MediaRecorder writes a WebM/Opus container. `audio/webm;codecs=opus`
+ * is left alone: it was tested and is accepted as-is, and narrowing it would
+ * throw away a true description for no gain.
+ */
+function normaliseAudioMime(mime) {
+  const raw = (mime || "").trim();
+  if (!raw) return "audio/webm";
+
+  const base = raw.split(";")[0].trim().toLowerCase();
+
+  /* Anything Gemini documents for audio passes through untouched, codecs and
+     all — the parameter is legal and carries real information. */
+  if (base.startsWith("audio/")) return raw;
+
+  if (base === "video/webm") return "audio/webm";
+  if (base === "video/mp4") return "audio/mp4";
+
+  /* Everything else — octet-stream, an empty string, something Drive invented
+     — is a recording this pipeline uploaded, so it is WebM/Opus whatever Drive
+     believes. Guessing right beats a 400 that loses the whole meeting. */
+  console.warn(
+    `[Pipeline] Drive reported '${raw}' for a recording — sending it as audio/webm`,
+  );
+  return "audio/webm";
 }
 
 // ── STEP 1: Get Google Drive file metadata ────────────────────────────────────
@@ -117,7 +227,7 @@ async function streamDriveToGeminiFileAPI(
     );
   }
   // Use detected mimeType from Drive if not overridden
-  const resolvedMime = mimeType || meta.mimeType || "audio/webm";
+  const resolvedMime = normaliseAudioMime(mimeType || meta.mimeType);
 
   console.log(
     `[Pipeline] File size: ${meta.size > 0 ? (meta.size / 1024 / 1024).toFixed(2) + " MB" : "unknown"}`,
@@ -181,6 +291,8 @@ async function streamDriveToGeminiFileAPI(
       `Downloaded file too small (${fullBuffer.length} bytes) — skipping`,
     );
   }
+
+  assertPlayableContainer(fullBuffer, resolvedMime, displayName);
 
   // ── Phase C: Upload buffer to Gemini (single resumable upload call) ───────
   const uploadRes = await fetch(uploadUrl, {
@@ -276,7 +388,8 @@ async function callGemini(apiKey, geminiFiles, prompt) {
     { text: prompt },
   ];
 
-  let lastError = null;
+  /* Every failure, not just the last one — see `summariseFailures`. */
+  const failures = [];
 
   for (const modelName of MODELS_TO_TRY) {
     // Each model gets up to 2 attempts (1 retry on quota error)
@@ -303,7 +416,14 @@ async function callGemini(apiKey, geminiFiles, prompt) {
 
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
-          const msg = err?.error?.message || `HTTP ${res.status}`;
+          /* `error.details` is where Google names the offending field on a 400.
+             Dropping it is what made "Request contains an invalid argument."
+             the whole of what anybody ever saw — a sentence that says a request
+             was wrong without saying which part. */
+          const extra = Array.isArray(err?.error?.details)
+            ? ` | details: ${JSON.stringify(err.error.details).slice(0, 800)}`
+            : "";
+          const msg = (err?.error?.message || `HTTP ${res.status}`) + extra;
 
           // 429 = quota/rate limit — wait and retry same model once
           if (res.status === 429 && attempts < MAX_ATTEMPTS) {
@@ -324,12 +444,12 @@ async function callGemini(apiKey, geminiFiles, prompt) {
             console.warn(
               `[Gemini] ${modelName} not found on v1beta — skipping`,
             );
-            lastError = new Error(msg);
+            recordFailure(failures, modelName, res.status, msg);
             break; // exit while loop, try next model
           }
 
           console.warn(`[Gemini] ${modelName} failed (${res.status}): ${msg}`);
-          lastError = new Error(msg);
+          recordFailure(failures, modelName, res.status, msg);
           break; // exit while loop, try next model
         }
 
@@ -338,7 +458,7 @@ async function callGemini(apiKey, geminiFiles, prompt) {
 
         if (!text) {
           console.warn(`[Gemini] ${modelName} returned empty content`);
-          lastError = new Error("Empty response from Gemini");
+          recordFailure(failures, modelName, 200, "Empty response from Gemini");
           break;
         }
 
@@ -348,13 +468,62 @@ async function callGemini(apiKey, geminiFiles, prompt) {
         return text; // ← success
       } catch (e) {
         console.warn(`[Gemini] ${modelName} error:`, e.message);
-        lastError = e;
+        recordFailure(failures, modelName, 0, e.message);
         break; // network error — move to next model
       }
     }
   }
 
-  throw lastError || new Error("All Gemini models failed");
+  throw new Error(summariseFailures(failures));
+}
+
+/**
+ * How informative a failure is, for deciding which one to report.
+ *
+ * This exists because of a real afternoon. Four models were tried; the FIRST
+ * returned 400 "Request contains an invalid argument" — a fault in the request
+ * we were sending — and the other three returned 404 because their names had
+ * been retired. The old code kept `lastError`, so the message that reached the
+ * screen was "models/gemini-2.0-flash is no longer available", and the actual
+ * blocker was invisible. Fixing every model name would have changed nothing
+ * and the same 400 would have come back wearing a different name.
+ *
+ * So: a request-shaped failure outranks a name-shaped one. A 404 says the LIST
+ * is stale, which is worth knowing and is never the reason a good request
+ * failed.
+ */
+function failureRank(status) {
+  if (status === 400) return 5; // the request itself is wrong — most actionable
+  if (status === 403) return 4; // key, billing or permission
+  if (status === 429) return 3; // quota
+  if (status === 0 || status >= 500) return 2; // network or Google's end
+  if (status === 404) return 1; // this model name is gone — least actionable
+  return 2;
+}
+
+function recordFailure(failures, model, status, message) {
+  failures.push({ model, status, message });
+}
+
+/**
+ * One sentence leading with the failure worth acting on, then all of them.
+ *
+ * Every model is still listed, because "three of your model names are dead" is
+ * a real finding even when it is not today's blocker — it is simply reported
+ * behind the thing that is.
+ */
+function summariseFailures(failures) {
+  if (failures.length === 0) return "All Gemini models failed";
+
+  const ranked = [...failures].sort(
+    (a, b) => failureRank(b.status) - failureRank(a.status),
+  );
+  const worst = ranked[0];
+  const rest = failures
+    .map((f) => `${f.model} (${f.status || "network"}): ${f.message}`)
+    .join(" | ");
+
+  return `${worst.model} failed with ${worst.status || "a network error"}: ${worst.message} — all ${failures.length} models tried: ${rest}`;
 }
 
 function buildPrompt(participantNames, timeline) {
@@ -1629,6 +1798,11 @@ router.helpers = {
   waitForFileActive,
   deleteGeminiFile,
   callGemini,
+  /* Pure, and exported so they can be checked without a network or a key. */
+  assertPlayableContainer,
+  normaliseAudioMime,
+  failureRank,
+  summariseFailures,
 };
 
 module.exports = router;

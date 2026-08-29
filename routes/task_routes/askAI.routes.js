@@ -31,13 +31,20 @@ const { verifyCoworkToken, verifyEmployeeToken } = require("../../Middlewear/cow
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta";
 
-// Models to try in order — verified against official Gemini API docs (April 2026)
-const MODELS_TO_TRY = [
-    "gemini-3-flash-preview",   // Gemini 3 Flash — latest, best free quota
-    "gemini-2.5-flash",         // Stable — best price/performance in 2.5 family
-    "gemini-2.5-flash-lite",    // Fastest + most budget friendly fallback
-    "gemini-2.0-flash",         // Last resort fallback
-];
+/* Models to try in order. **Set GEMINI_MODELS in .env to change this without a
+   deploy** — Google retires names on its own schedule and this list was four
+   copies in four files.
+
+   Removed 28 Aug 2026, all verified against this project's key: gemini-2.0-flash
+   is gone, and gemini-2.5-flash / gemini-2.5-flash-lite are "no longer available
+   to new users" — Google grandfathered existing callers and this key was not
+   one. Three of the four names here were returning 404. */
+const MODELS_TO_TRY = (
+    process.env.GEMINI_MODELS || "gemini-3.6-flash,gemini-3-flash-preview"
+)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 function sleep(ms) {
