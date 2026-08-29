@@ -405,6 +405,12 @@ const tallyVoucherSchema = new mongoose.Schema(
     budgetOverride: {
       required: { type: Boolean },
       reason: { type: String, trim: true },
+      /* TRUE when no human answered for this and the ACC_BUDGET_ENFORCEMENT
+       * switch (services/budgetControl.service.js) waved it through while the
+       * budgets were still being seeded. Absent on every override a person
+       * actually gave a reason for. Query it to list what got through while
+       * the control was relaxed. Remove with the switch. */
+      auto: { type: Boolean },
       status: { type: String }, // the overall status at the moment of posting
       checkedAt: { type: Date },
       overriddenBy: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_User" },
