@@ -1749,7 +1749,7 @@ const EDIT_PASSED_DRAFT_STATUSES = ["confirmed", "in_progress", "done", "submitt
 router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToken, async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { title, description, requirements } = req.body;
+    const { title, description, requirements, etAdjustSecs, etAdjustReason, changeSummary, changeEventType, changePayload } = req.body;
 
     const taskRef = db.collection("cowork_tasks").doc(taskId);
     const snap = await taskRef.get();
@@ -1770,7 +1770,106 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
     if (description !== undefined) updates.description = description;
     if (requirements !== undefined) updates.requirements = Array.isArray(requirements) ? requirements : [];
 
+    // ── The estimate, moved with the requirement that changed ────────────────
+    //
+    // A SIGNED DELTA, never a total. The client says "ninety minutes more than
+    // whatever this task has"; the current window is read here and the delta
+    // applied to it, so a stale page cannot overwrite a budget somebody else
+    // changed while it was open. Absent or zero, nothing below runs and this
+    // route behaves exactly as it always has — which is what keeps the existing
+    // callers (updateTask, addRequirements) untouched.
+    //
+    // The fields written are the same ones department-tl-set-hours writes, for
+    // the same reason: a window changed without recomputing dueDate leaves the
+    // task carrying a deadline derived from the OLD budget, and every figure
+    // built on it — expected completion, remaining time, the overdue mark —
+    // silently disagrees with the hours on screen.
+    let etApplied = null;
+    const rawDelta = Math.round(Number(etAdjustSecs) || 0);
+    if (rawDelta !== 0) {
+      // The window actually in effect, in the precedence the client reads it:
+      // an agreed figure outranks a proposed one, and adjusting anything other
+      // than the one in effect changes a number nobody is looking at.
+      // The two fields the DOCUMENT actually carries. agreedWindowSecs and
+      // senderWindowSecs are client-side names the mapper derives from these
+      // (lib/legacy/tasks.ts) and do not exist here — reading them would be two
+      // guaranteed-undefined terms in a chain that only worked by falling
+      // through them. deadlineWindowSecs is the agreed figure and outranks the
+      // sender's opening offer, which is the same precedence resolveTimeBudget
+      // applies on the client.
+      const currentSecs =
+        Number(task.deadlineWindowSecs) ||
+        Number(task.senderTimerWindowSecs) ||
+        0;
+
+      // Floored at zero. A negative budget is not a smaller estimate — it is a
+      // number computeWorkingDeadline would turn into a date before now.
+      const nextSecs = Math.max(0, currentSecs + rawDelta);
+
+      const { computeWorkingDeadline } = require("../../services/officeDeadline.service");
+      const anchorMs = Date.now();
+      const dueDate = await computeWorkingDeadline({ startMs: anchorMs, windowSecs: nextSecs });
+
+      updates.deadlineWindowSecs = nextSecs;
+      updates.senderTimerWindowSecs = nextSecs;
+      // originalWindowSecs is the assignor's ceiling and is NOT rewritten —
+      // adjustBudget checks against it, and moving it would quietly raise the
+      // bar an assignee-side manager is measured against.
+      updates.etcHours = nextSecs / 3600;
+      updates.dueDate = dueDate;
+      // A fixedDeadline left over from create outranks everything computed
+      // above (fixedDeadline ?? deadline ?? dueDate), so the new window could
+      // never move the date anybody sees. The same clearing set-hours does.
+      updates.fixedDeadline = null;
+      updates.etAdjustedBy = req.coworkUser.employeeId;
+      updates.etAdjustedAtMs = anchorMs;
+      updates.etAdjustedReason = typeof etAdjustReason === "string" ? etAdjustReason : null;
+
+      etApplied = { fromSecs: currentSecs, toSecs: nextSecs, deltaSecs: nextSecs - currentSecs };
+    }
+
     await taskRef.update(updates);
+
+    // ── The change, written where people will look for it ────────────────────
+    //
+    // The client sends ONE sentence (changeSummary) built by
+    // lib/rules/tasks/taskChangeLog.ts, so the History tab, the Task Chat and
+    // the notification below all tell the same story. The who and when are the
+    // ENGINE's — attributed to the verified caller and stamped by the server —
+    // never the body's. Absent (a plain title/description edit, or an old
+    // client) nothing here runs and the route behaves as it always did.
+    if (typeof changeSummary === "string" && changeSummary.trim()) {
+      const summary = changeSummary.trim().slice(0, 2000);
+
+      // Task Chat — a system line in the thread people actually watch.
+      await postSystemChatMessage(taskId, summary, req.coworkUser.employeeId, req.coworkUser.name);
+
+      // History tab — one append-only row per task in an events subcollection.
+      // listTaskEvents (frontend) reads exactly this shape; it used to refuse
+      // because this store did not exist.
+      try {
+        const eventsRef = taskRef.collection("events");
+        const existing = await eventsRef.get();
+        const seq = existing.size + 1;
+        await eventsRef.doc(require("crypto").randomUUID()).set({
+          sequence: seq,
+          // A value TaskEventType already carries, so the panel's per-type
+          // rendering keeps working; defaults to the generic edit type.
+          type: typeof changeEventType === "string" ? changeEventType : "edited",
+          actorId: req.coworkUser.employeeId,
+          actorLabel: req.coworkUser.name,
+          summary,
+          // Structured numbers kept beside the sentence for anything that later
+          // wants them without parsing prose. Trusted only as data.
+          payload: changePayload && typeof changePayload === "object" ? changePayload : {},
+          occurredAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) {
+        // A history write must never fail the edit itself — the requirement and
+        // the ET are already saved. Losing one history row is the smaller wrong.
+        console.error("[edit-details] event log write failed:", e.message);
+      }
+    }
 
     // ── Tell whoever has to DO it ────────────────────────────────────────────
     // Editing a task that has already started rewrites the brief of work
@@ -1781,18 +1880,23 @@ router.patch("/task/:taskId/edit-details", verifyCoworkToken, verifyEmployeeToke
       title !== undefined && "the title",
       description !== undefined && "the description",
       requirements !== undefined && "the requirements",
+      etApplied && "the time estimate",
     ].filter(Boolean);
+    const notifyBody =
+      typeof changeSummary === "string" && changeSummary.trim()
+        ? `${req.coworkUser.name}: ${changeSummary.trim()}`
+        : `${req.coworkUser.name} changed ${changed.join(", ") || "the details"} of "${updates.title || task.title}"${hasPassedDraft ? " — you have already started this one, so read it again before you carry on." : "."}`;
     await _notify({
       recipientIds: (task.assigneeIds || []).filter(id => id && id !== req.coworkUser.employeeId),
       type: "task_details_edited",
       title: "✏️ Task details changed",
-      body: `${req.coworkUser.name} changed ${changed.join(", ") || "the details"} of "${updates.title || task.title}"${hasPassedDraft ? " — you have already started this one, so read it again before you carry on." : "."}`,
-      data: { taskId, changed, hasPassedDraft },
+      body: notifyBody,
+      data: { taskId, changed, hasPassedDraft, etAdjusted: etApplied },
       senderId: req.coworkUser.employeeId,
       senderName: req.coworkUser.name,
     });
 
-    res.json({ success: true, taskId, title: updates.title, description: updates.description, requirements: updates.requirements });
+    res.json({ success: true, taskId, title: updates.title, description: updates.description, requirements: updates.requirements, etAdjusted: etApplied });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

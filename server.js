@@ -309,6 +309,10 @@ io.on("connection", (socket) => {
           startedByName: info.startedByName,
           startedAt: info.startedAt,
           lateJoin: true,
+          /* Somebody arriving DURING a pause must not start capturing: the
+             room is recording, but nothing is being kept, and a late joiner
+             who ignored this would be the only voice in the paused stretch. */
+          paused: info.paused === true,
         });
         console.log(
           `[Recording] Late joiner auto-notified for meeting_${meetId}`,
@@ -352,6 +356,43 @@ io.on("connection", (socket) => {
       });
     },
   );
+
+  /**
+   * CEO/TL pauses the recording → broadcast to all in the meeting room.
+   *
+   * **Its own event, deliberately not a flag on stop.** Stopping finalises
+   * every participant's audio to Drive and cannot be resumed, so a pause that
+   * arrived as a stop would end everybody's recording irreversibly.
+   *
+   * The paused flag is kept on the live-recording entry as well as broadcast,
+   * so somebody joining DURING a pause is told the recording is paused rather
+   * than being started into a room that is not capturing — see the late-joiner
+   * notice in `join_meeting_room`.
+   */
+  socket.on("recording_pause", ({ meetId, pausedBy, pausedByName }) => {
+    if (!meetId) return;
+    const info = activeMeetingRecordings.get(meetId);
+    if (info) info.paused = true;
+    io.to(`meeting_${meetId}`).emit("recording_paused", {
+      meetId,
+      pausedBy,
+      pausedByName,
+      pausedAt: new Date().toISOString(),
+    });
+  });
+
+  // CEO/TL resumes a paused recording → broadcast to all in meeting room
+  socket.on("recording_resume", ({ meetId, resumedBy, resumedByName }) => {
+    if (!meetId) return;
+    const info = activeMeetingRecordings.get(meetId);
+    if (info) info.paused = false;
+    io.to(`meeting_${meetId}`).emit("recording_resumed", {
+      meetId,
+      resumedBy,
+      resumedByName,
+      resumedAt: new Date().toISOString(),
+    });
+  });
 
   // CEO/TL stops recording → broadcast to all in meeting room
   socket.on("recording_stop", ({ meetId, stoppedBy, stoppedByName }) => {
@@ -1426,6 +1467,12 @@ app.use("/api/cms/measurements", measurementRoutes);
 // inspection endpoints, every one of these needs to know who is asking.
 const qcTeamRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcTeamRoutes");
 app.use("/api/cms/manufacturing/qc/team", qcTeamRoutes);
+
+// Mounted BEFORE the main qc router for the same reason /team is: the
+// assistant owns /assistant and /assistant/report, and a future qcRoutes route
+// on that prefix would otherwise shadow it silently.
+const qcAssistantRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcAssistantRoutes");
+app.use("/api/cms/manufacturing/qc", qcAssistantRoutes);
 
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
