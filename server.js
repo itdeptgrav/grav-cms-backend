@@ -1370,6 +1370,12 @@ app.use("/api/cms/measurements", measurementRoutes);
 const qcTeamRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcTeamRoutes");
 app.use("/api/cms/manufacturing/qc/team", qcTeamRoutes);
 
+// Mounted BEFORE the main qc router for the same reason /team is: the
+// assistant owns /assistant and /assistant/report, and a future qcRoutes route
+// on that prefix would otherwise shadow it silently.
+const qcAssistantRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcAssistantRoutes");
+app.use("/api/cms/manufacturing/qc", qcAssistantRoutes);
+
 const qcRoutes = require("./routes/CMS_Routes/Manufacturing/QC/qcRoutes");
 app.use("/api/cms/manufacturing/qc", qcRoutes);
 

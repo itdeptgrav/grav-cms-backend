@@ -137,6 +137,12 @@ const defectRecordSchema = new mongoose.Schema(
     inspectedByEmail:         { type: String, default: "", lowercase: true, trim: true },
 
     inspectedAt: { type: Date, default: Date.now, index: true },
+
+    // Taken with no network — the piece's own details were never fetched, so
+    // this scan carries only a barcode, a verdict and (for a fault) one OTHER
+    // note rather than the usual per-operation breakdown. A flag, not a
+    // different shape: everything above still means what it always means.
+    recordedOffline: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -155,5 +161,24 @@ defectRecordSchema.index({ barcodeId: 1, stageId: 1, inspectedAt: -1 });
 // type has ever been used.
 defectRecordSchema.index({ "defectTypes.code": 1 });
 defectRecordSchema.index({ "defects.types.code": 1 });
+
+// ── Added 29 Aug 2026, chasing QC dashboard load time ────────────────────────
+// Every index below covers a query shape the dashboard actually issues that was
+// previously a collection scan.
+//
+// workOrderShortId: the order screens resolve a work order's garments through
+// this and nothing else ({ workOrderShortId: { $in: [...] } }). It had no index
+// at all.
+defectRecordSchema.index({ workOrderShortId: 1 });
+// The viewer scope clause is an $or over email and biometric id. Mongo can only
+// use an index for an $or when EVERY branch is indexed — the biometric branch
+// was, the email branch was not, so every scoped read fell back to a scan. Both
+// are compounded with `date` because the scope is always asked together with a
+// day or a range.
+defectRecordSchema.index({ inspectedByEmail: 1, date: 1 });
+defectRecordSchema.index({ inspectedByBiometricId: 1, date: 1 });
+// `{ date: ... }` sorted by inspectedAt — the overview's and the report's main
+// read. Without the compound, Mongo sorted the matched set in memory.
+defectRecordSchema.index({ date: 1, inspectedAt: -1 });
 
 module.exports = mongoose.model("QCInspection", defectRecordSchema);

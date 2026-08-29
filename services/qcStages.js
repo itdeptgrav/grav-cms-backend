@@ -283,6 +283,95 @@ async function pieceProgressMany(barcodeIds = [], stages = null) {
   return out;
 }
 
+/**
+ * Every barcode CURRENTLY stuck in rework, right now — the live count the
+ * overview's "Pending rework" tile and the export's summary block both read
+ * (explicit request, 29 Aug 2026: "how many products are sent for rework...
+ * once that rework product get approved again then the rework count get
+ * reduce").
+ *
+ * NOT the same thing as `reworkCount` (the all-time TALLY of every time a
+ * piece was ever sent back, on any of its stages). A piece that failed and has
+ * SINCE been re-inspected clean is not pending anything — that is what rework
+ * IS, per buildPieceProgress's own "latest wins" rule — and a piece that was
+ * scrapped after failing is not pending either, because it will never be
+ * re-inspected. "Pending" means exactly `openRework.length > 0` and not
+ * rejected: the same definition the piece lookup station and the overview
+ * table already use per-row, just rolled up across every barcode instead of
+ * one.
+ *
+ * DELIBERATELY NOT DATE-SCOPED. A piece sent to rework on Monday and still
+ * uncleared on Friday is still pending on Friday — this answers "how many
+ * garments are stuck right now", not "how many were sent back on this
+ * particular day" (that second question is what the day's inspection rows,
+ * grouped by piece, already answer on the overview's Rework tab).
+ *
+ * Fetches and folds in memory, the same style pieceProgressMany already uses
+ * for "many pieces at once" — reasonable at today's inspection volumes (a
+ * department doing QC by hand, not e-commerce scale). If this ever needs to
+ * scale past what fits in memory, an aggregation pipeline grouping by
+ * (barcodeId, stageId) and taking the latest status per group would answer
+ * the same question without loading every inspection ever recorded.
+ *
+ * @param {object} [matchFilter]  an additional Mongo filter — pass the viewer
+ *   scope clause from qcViewer so an ordinary inspector's tile counts only
+ *   their own open rework, and the owner's counts the whole department's.
+ */
+async function pendingReworkSnapshot(matchFilter = {}) {
+  const stages = await listStages();
+
+  // NOTHING CAN BE PENDING AT A CHECKPOINT THAT DOES NOT EXIST (29 Aug 2026,
+  // performance). "Open rework" is defined per stage — with no stages
+  // configured, buildPieceProgress returns an empty stage list and every piece
+  // comes back with `openRework: []`, so the answer is provably zero. Reading
+  // the whole collection to compute that zero is pure waste, and it was the
+  // single most expensive query on the overview.
+  if (!stages.length) return { count: 0, pieces: [] };
+
+  // TWO STEPS, NOT ONE, AND DELIBERATELY SO. The old single find() pulled every
+  // inspection ever recorded — no date bound, no limit — to answer a question
+  // about a handful of pieces. The first pass below asks Mongo for the only
+  // thing that can possibly matter: the barcodes that have a `defective`
+  // verdict at all. A piece that has never failed cannot be pending rework, so
+  // the vast majority of the collection can be excluded before any of it is
+  // fetched. The second pass then reads the full scan history for just those
+  // barcodes, which is what buildPieceProgress needs to decide whether the
+  // failure was since cleared.
+  const failedBarcodes = await QCInspection.distinct("barcodeId", {
+    ...matchFilter,
+    status: "defective",
+  });
+  if (!failedBarcodes.length) return { count: 0, pieces: [] };
+
+  const inspections = await QCInspection.find({
+    ...matchFilter,
+    barcodeId: { $in: failedBarcodes },
+  })
+    .select("barcodeId stageId status inspectedAt inspectedByQCName inspectedByBiometricId")
+    .lean();
+
+  const byBarcode = new Map();
+  for (const insp of inspections) {
+    if (!byBarcode.has(insp.barcodeId)) byBarcode.set(insp.barcodeId, []);
+    byBarcode.get(insp.barcodeId).push(insp);
+  }
+
+  const pieces = [];
+  for (const [barcodeId, records] of byBarcode) {
+    const progress = buildPieceProgress(records, stages);
+    if (!progress.rejected && progress.openRework.length > 0) {
+      pieces.push({
+        barcodeId,
+        openRework: progress.openRework,
+        reworkCount: progress.reworkCount,
+        currentStage: progress.currentStage,
+      });
+    }
+  }
+
+  return { count: pieces.length, pieces };
+}
+
 /* ------------------------------------------------------------------ */
 /* The scan guard                                                      */
 /* ------------------------------------------------------------------ */
@@ -514,6 +603,7 @@ module.exports = {
   buildPieceProgress,
   pieceProgress,
   pieceProgressMany,
+  pendingReworkSnapshot,
   judgeScan,
   stageGuardsForPiece,
   evaluateScan,
