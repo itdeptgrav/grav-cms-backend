@@ -3,7 +3,18 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
+
+/* Bandwidth metering. Both calls here are order-sensitive:
+   - instrumentOutbound() patches http/https.request, so it has to land before
+     any client library caches a reference to them.
+   - mongoMeter() registers a global mongoose plugin, and a plugin only applies
+     to schemas compiled after it is registered - productionSyncService below
+     compiles three, so this cannot move down. */
+const bw = require("./middleware/bandwidthTracker");
+bw.instrumentOutbound();
+bw.mongoMeter(mongoose);
 const cookieParser = require("cookie-parser");
+const compression = require("compression");
 const bcrypt = require("bcryptjs");
 
 const http = require("http");
@@ -78,6 +89,12 @@ const allowedOrigins = [
 ];
 const transcriptModule = require("./routes/task_routes/transcript.routes");
 
+/* The original Firestore document-operation meter, untouched. It stays mounted
+   and keeps serving GET /cowork/admin/bandwidth-stats; anything already reading
+   that endpoint is unaffected. bandwidthTracker below runs alongside it and
+   measures a different thing (wire bytes, not document counts) - the two use
+   separate instrumentation flags so both wrap the Firestore prototypes rather
+   than one silently cancelling the other. */
 const {
   instrumentFirestore,
   bandwidthMiddleware,
@@ -85,6 +102,7 @@ const {
 } = require("./middleware/firestoreBandwidth");
 const { db, admin } = require("./config/firebaseAdmin");
 instrumentFirestore(admin, db);
+bw.instrumentFirestore(admin, db);
 
 app.use(
   cors({
@@ -98,6 +116,33 @@ app.use(
     credentials: true,
   }),
 );
+
+app.use(bw.middleware);
+
+/* gzip - OFF by default, and deliberately so.
+
+   Every JSON response in this service is currently sent uncompressed, and
+   measurement says compressing them removes ~90% of the bytes. But that is a
+   change to what every client receives, and this deployment wants to observe
+   before it changes anything. So it ships inert: set BANDWIDTH_ENABLE_GZIP=1
+   to turn it on, unset it to go straight back. Nothing else in the file
+   depends on it either way.
+
+   When it is enabled, filter() delegates to compression's own shouldCompress,
+   which already skips images, video and anything already encoded - so the
+   Drive proxy routes keep streaming untouched rather than burning CPU
+   re-compressing a JPEG. The 1 KB threshold keeps tiny bodies off the CPU for
+   a saving that would be inside the noise. */
+if (process.env.BANDWIDTH_ENABLE_GZIP === "1") {
+  app.use(
+    compression({
+      threshold: 1024,
+      filter: (req, res) =>
+        req.headers["x-no-compression"] ? false : compression.filter(req, res),
+    }),
+  );
+  console.log("🗜️  gzip enabled (BANDWIDTH_ENABLE_GZIP=1)");
+}
 
 // `verify` stashes the raw request body so the WhatsApp webhook can validate
 // Meta's X-Hub-Signature-256 HMAC (which must be computed over the exact bytes
@@ -170,6 +215,8 @@ const { initDocumentCollaboration } = require("./services/documentCollab.service
 initDocumentCollaboration(io);
 
 
+
+bw.attachSocketMeter(io);
 
 // Make io accessible to routes
 app.set("io", io);
@@ -519,11 +566,9 @@ io.on("connection", (socket) => {
   });
 });
 
-// 1. At the top with your other requires:
 app.use(bandwidthMiddleware);
 app.get("/cowork/admin/bandwidth-stats", bandwidthStatsHandler);
 
-// 2. With your other app.use() route registrations:
 app.use("/cowork", transcriptModule.router);
 
 // ─── Database Connection ──────────────────────────────────────────────────────
@@ -533,6 +578,11 @@ const connectDB = async () => {
       process.env.MONGODB_URI || "mongodb://localhost:27017/grav_clothing",
     );
     console.log("✅ MongoDB connected successfully");
+
+    // Folds the in-memory counters into hourly buckets once a minute. Started
+    // here rather than at boot because the first flush would otherwise fire
+    // against a disconnected connection and log a failure on every restart.
+    bw.startFlusher(mongoose);
 
     // INITIALIZE PRODUCTION SYNC SERVICE AFTER DB CONNECTION
     // productionSyncService.initialize();
@@ -1021,6 +1071,11 @@ app.use("/api/auth", passwordResetRoutes);
 
 const requirePlatformAdmin = require("./Middlewear/requirePlatformAdmin");
 const accessAdminRoutes = require("./routes/Admin/accessAdmin");
+/* Mounted BEFORE the broader /api/admin router. Express walks mounts in order,
+   so with accessAdminRoutes first every bandwidth request would fall through
+   it - matching nothing, but paying for a second requirePlatformAdmin pass (a
+   database read) on the way. The ordering is the whole point. */
+app.use("/api/admin/bandwidth", requirePlatformAdmin, require("./routes/Admin/bandwidth"));
 app.use("/api/admin", requirePlatformAdmin, accessAdminRoutes);
 
 // The approval queue: an editor's held changes, and the approver's decision on
