@@ -88,6 +88,16 @@ const ENFORCEMENT = String(process.env.ACC_BUDGET_ENFORCEMENT || "on")
 const AUTO_CLEAR_REASON =
   "Auto-cleared: budget control not yet in force (ACC_BUDGET_ENFORCEMENT).";
 
+/* Says at boot which way the switch is set. Without this the only way to tell
+ * a relaxed server from a strict one is to try to post a voucher and read the
+ * error — and an `.env` edited without a restart looks identical to one that
+ * was never edited at all. Silent on "on" so normal boots stay quiet. */
+if (ENFORCEMENT !== "on") {
+  console.log(
+    `[budgetControl] ACC_BUDGET_ENFORCEMENT=${ENFORCEMENT} — budget refusals are being auto-cleared. Set it to "on" to enforce.`,
+  );
+}
+
 /** Is this the switch's business, or a refusal that must still stand? */
 function autoClearable(status) {
   if (ENFORCEMENT === "off") return needsOverride(status);

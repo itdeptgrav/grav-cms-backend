@@ -1023,6 +1023,8 @@ app.use("/api/ai", gravAssistantRoutes);
 app.use("/api/recordings", require("./routes/callRecordings"));
 // PersonalCallRecorder Android app → every call's outcome (received/missed) → Mongo callevents
 app.use("/api/call-events", require("./routes/callEvents"));
+// Grav Employee Tracker Android app → field location tracking (duty sessions + GPS pings)
+app.use("/api/field-tracking", require("./routes/fieldTracking"));
 
 app.use("/hr/performance", require("./routes/HrRoutes/Performance_section"));
 
