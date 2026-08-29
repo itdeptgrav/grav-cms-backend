@@ -11,7 +11,8 @@ const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddl
 const Operation = require("../../../../models/CMS_Models/Inventory/Configurations/Operation");
 const OperationGroup = require("../../../../models/CMS_Models/Inventory/Configurations/OperationGroup");
 const { recordChange, historyFor } = require("../../../../services/changeLog");
-const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../../services/departmentNotify.service");
+// departmentNotify is no longer imported here — the two product-creation
+// emails it used to send were removed 28 Aug 2026 (see the note in POST /).
 
 const STOCK_ITEM_CATEGORIES = [
   "T-Shirts", "Shirts", "Jeans", "Bottoms", "Ethnic Wear",
@@ -27,11 +28,8 @@ const OPERATION_TYPES = [
 
 router.use(EmployeeAuthMiddleware);
 
-function escapeHtml(s) {
-  return String(s || "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
-  );
-}
+// escapeHtml lived here only to build the two product-creation notification
+// emails, and went with them (28 Aug 2026).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Build a map of unitName → { baseUnit, conversions: [{toUnit, factor}] }
@@ -1039,6 +1037,35 @@ router.get("/", async (req, res) => {
     if (category) filter.category = category;
     if (status) filter.status = status;
 
+    // ── ?sampledOnly=1 — only products whose sampling is SETTLED ─────────────
+    // Added 27 Aug 2026 on explicit request: at the Enquiry stage, the "pick an
+    // existing product" dropdown "only those products need to suggest whose
+    // sampling is approved by the sales team". Picking an unapproved product
+    // there would waive development on something nobody has actually signed off
+    // — the exact thing the pickedFromRegister waiver is meant to be safe for.
+    //
+    // OPT-IN, not the default: this is a general Inventory endpoint that also
+    // feeds stock lists, the product register and reporting, none of which
+    // should suddenly hide products. Only the Sales product picker sends it.
+    //
+    // "Settled" is `approved` OR `notApplicable`, which is exactly what
+    // services/sampleReadiness.js's SETTLED_SAMPLE_STATUSES already means —
+    // a product legitimately waived from sampling counts as cleared, since
+    // there was never a sample for Sales to approve. Kept in step with that
+    // constant deliberately; if the vocabulary changes, both must move.
+    if (String(req.query.sampledOnly || "") === "1") {
+      const { SETTLED_SAMPLE_STATUSES } = require("../../../../services/sampleReadiness");
+      const SampleStyle = require("../../../../models/CMS_Models/Sales/SampleStyle");
+      const approvedIds = await SampleStyle.distinct("sourceStockItemId", {
+        isActive: true,
+        "sample.status": { $in: SETTLED_SAMPLE_STATUSES },
+      });
+      // `sourceStockItemId` is sparse — styles for never-registered products
+      // have none — so distinct() can return nulls. Filtered out, or an $in
+      // carrying null would match documents by accident.
+      filter._id = { $in: approvedIds.filter(Boolean) };
+    }
+
     // ── Merchandiser/Production work-queue alerts (26 Aug 2026) ──────────────
     // "showcase the alerts... for which product or like how many products are
     // there which are not assigned any raw items" / "which product is having
@@ -1239,56 +1266,28 @@ router.post("/", async (req, res) => {
 
     res.status(201).json({ success: true, message: "Stock item created successfully", stockItem: newStockItem });
 
-    // ── Notify Merchandiser + Production of the new product (26 Aug 2026,
-    // explicit request: "while an new product(stock item) is goona created,
-    // then notify to the merchantiser and the production manager... u can
-    // track the email id form the access control"). Recipients are resolved
-    // from Access Control (AccessDepartment/Employee grants), same as every
-    // other departmentNotify event — nothing new to maintain per person.
-    // Fired AFTER the response is sent and never awaited: a Brevo outage must
-    // never slow down or fail product creation. notifyEvent() itself never
-    // throws, but the whole block is still wrapped so a bug in building ctx
-    // can't surface as an unhandled rejection either. ────────────────────────
-    (async () => {
-      const attributeSummary = (processedAttributes || [])
-        .map((a) => `${a.name}: ${a.values.join(", ")}`).join(" · ");
-      const priceRange = (newStockItem.variants || []).length
-        ? `₹${Math.min(...newStockItem.variants.map((v) => v.salesPrice))} – ₹${Math.max(...newStockItem.variants.map((v) => v.salesPrice))}`
-        : undefined;
-      const creatorName = req.user?.name || "A team member";
-      const imageUrl = newStockItem.images?.[0];
-      const ctaUrl = `${DEPT_NOTIFY_APP_URL}/merchandiser/products/new-stock-item/${newStockItem._id}`;
-      const sharedDetails = [
-        ["Reference", newStockItem.reference],
-        ["Category", newStockItem.category],
-        ["Gender", newStockItem.genderCategory || undefined],
-        ["Attributes", attributeSummary || undefined],
-        ["Variants", `${(newStockItem.variants || []).length} variant(s)`],
-        ["Price range", priceRange],
-        ["Created by", creatorName],
-      ];
-
-      await Promise.all([
-        notifyEvent("stock_item_created_merchandiser", {
-          heading: `New product created: ${escapeHtml(newStockItem.name)}`,
-          bodyHtml: `<p><strong>${escapeHtml(creatorName)}</strong> just created this product. Your task now is to <strong>fill in the pricing and build the BOM (raw items)</strong> for each variant so it's ready to manufacture.</p>`,
-          details: sharedDetails,
-          imageUrl,
-          bodyText: `${creatorName} just created "${newStockItem.name}" (${newStockItem.reference}). Your task: fill in pricing and build the BOM (raw items) for each variant.`,
-          ctaLabel: "Open product",
-          ctaUrl,
-        }),
-        notifyEvent("stock_item_created_production", {
-          heading: `New product created: ${escapeHtml(newStockItem.name)}`,
-          bodyHtml: `<p><strong>${escapeHtml(creatorName)}</strong> just created this product. Your task now is to <strong>put in the manufacturing operations, measurement parameters, company costing and CMP costing</strong> for it.</p>`,
-          details: sharedDetails,
-          imageUrl,
-          bodyText: `${creatorName} just created "${newStockItem.name}" (${newStockItem.reference}). Your task: add operations, measurement parameters, company costing and CMP costing.`,
-          ctaLabel: "Open product",
-          ctaUrl: `${DEPT_NOTIFY_APP_URL}/production-supervisor/products/new-stock-item/${newStockItem._id}`,
-        }),
-      ]);
-    })().catch((err) => console.error("[stockItems] new-product notify failed:", err.message));
+    // ── NO EMAIL ON PRODUCT CREATION (28 Aug 2026, explicit request: "don't
+    // sent the mail to the IE and the merchantiser at the time of creating an
+    // product").
+    //
+    // Creating a product from an Enquiry/RFQ used to fire two notifications
+    // from right here — `stock_item_created_merchandiser` ("fill in the
+    // pricing and build the BOM") and `stock_item_created_production` ("add
+    // operations, measurement parameters, costing"), added 26 Aug 2026.
+    //
+    // They were removed because product creation is not the moment either
+    // department actually has work to do. The real hand-off happens later, in
+    // the journey's Style & Sample stage, where Sales explicitly routes a
+    // style: "Send to Merchandiser" now carries the BOM request
+    // (`sample_sent_to_merchandiser`), and the Project Manager is asked for
+    // BOM sign-off from step 2 (`sample_bom_approval_requested`) — both in
+    // routes/CMS_Routes/Sales/sampleStyles.js. Firing here as well meant a
+    // merchandiser was told to build a BOM for every product the moment it was
+    // registered, whether or not any style had been routed to them.
+    //
+    // The two event keys stay in departmentNotify.service.js's registry so
+    // history and the Sales Settings toggles keep resolving; nothing calls
+    // them any more.
   } catch (error) {
     console.error("Error creating stock item:", error);
     if (error.code === 11000) return res.status(400).json({ success: false, message: "Product with this reference already exists" });

@@ -65,13 +65,19 @@ const POST_QUOTATION_STATUSES = [
   "production", "shipping", "delivered", "completed", "cancelled",
 ];
 
-// Project quotation.status onto request.status. `rejected` / `expired` have no
-// forward projection: the request falls back to in_progress so sales can
-// re-issue, unless production already owns the request.
+// Project quotation.status onto request.status. `expired` has no forward
+// projection: the request falls back to in_progress so sales can re-issue.
+// `rejected` gets its OWN status now (26 Aug 2026, explicit request — see
+// the enum's own comment on the model) rather than sharing that same
+// in_progress fallback, which made a rejected PI indistinguishable from one
+// simply being priced normally. Neither happens once production already
+// owns the request.
 function syncRequestStatusFromQuotation(request, quotation) {
   if (POST_QUOTATION_STATUSES.includes(request.status)) return request.status;
 
-  if (quotation.status === "rejected" || quotation.status === "expired") {
+  if (quotation.status === "rejected") {
+    request.status = "rejected";
+  } else if (quotation.status === "expired") {
     request.status = "in_progress";
   } else {
     const mapped = REQUEST_STATUS_FOR_QUOTATION[quotation.status];
@@ -3500,9 +3506,20 @@ router.get('/:measurementId/po-persons-export', async (req, res) => {
 });
 
 
+// A reason is now REQUIRED (26 Aug 2026, explicit request: "there is no
+// proper handler for the rejection of the pi... upon click on the reject
+// button then it is needed to properly ask for the reason"). It used to be
+// entirely optional server-side — a bare window.prompt() on the frontend was
+// the only thing standing between an empty string and a saved rejection with
+// no reason anywhere on it. Matches the validation the customer-portal's own
+// reject route already had (Customer_Routes/QuotationRoutes.js) — sales
+// rejecting should not be held to a lower bar than a customer rejecting.
 router.post("/requests/:requestId/quotation/reject", async (req, res) => {
   try {
-    const { reason } = req.body;
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      return res.status(400).json({ success: false, message: "A reason is required to reject a PI." });
+    }
     const request = await CustomerRequest.findById(req.params.requestId);
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found" });
@@ -3511,17 +3528,25 @@ router.post("/requests/:requestId/quotation/reject", async (req, res) => {
       return res.status(400).json({ success: false, message: "A sales-approved quotation cannot be rejected — cancel the order instead" });
     }
     const wasCustomerApproved = quotation.status === 'customer_approved';
-    quotation.status = 'rejected'; quotation.updatedAt = new Date();
-    quotation.salesApproval = { approved: false, approvedAt: new Date(), approvedBy: req.user.id, notes: reason || 'Rejected by sales team' };
-    // A rejected quotation always parks the request back at in_progress so it
-    // reads the same on both portals — previously it claimed 'quotation_sent'
-    // while the quotation itself said 'rejected'.
+    const now = new Date();
+    quotation.status = 'rejected'; quotation.updatedAt = now;
+    quotation.salesApproval = { approved: false, approvedAt: now, approvedBy: req.user.id, notes: reason };
+    // Structured, so the detail view and the list can read a reason directly
+    // instead of parsing it back out of salesApproval.notes or the timeline
+    // (26 Aug 2026 — see the field's own comment on the model).
+    quotation.rejectedAt = now;
+    quotation.rejectedBy = req.user.id;
+    quotation.rejectedByName = req.user?.name || "Sales Team";
+    quotation.rejectedByRole = "sales";
+    quotation.rejectionReason = reason;
+    // request.status now becomes "rejected" itself, not "in_progress" — see
+    // syncRequestStatusFromQuotation's own comment.
     syncRequestStatusFromQuotation(request, quotation);
-    request.updatedAt = new Date();
+    request.updatedAt = now;
     request.notes = request.notes || [];
     request.notes.push({
-      text: `Quotation ${wasCustomerApproved ? "rejected after customer approval" : "rejected"} by ${req.user?.name || "Sales Team"}. Reason: ${reason || "—"}`,
-      addedBy: req.user.id, addedByModel: "SalesDepartment", createdAt: new Date(),
+      text: `Quotation ${wasCustomerApproved ? "rejected after customer approval" : "rejected"} by ${req.user?.name || "Sales Team"}. Reason: ${reason}`,
+      addedBy: req.user.id, addedByModel: "SalesDepartment", createdAt: now,
     });
     request.quotationNotifications.push({ type: 'quotation_expired', message: `Quotation rejected: ${reason}`, actionRequired: false });
     await request.save();

@@ -18,9 +18,11 @@ const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:8081",
   "http://localhost:3001",
+  "http://localhost:5000",
   "http://localhost:3002",
   "http://localhost:50787",
   "https://grav-cms.vercel.app",
+  "https://backend.grav.in",
   "http://10.119.220.161:3000",
   "https://cms.grav.in",
   "https://cowork.grav.in",
@@ -989,6 +991,28 @@ app.use("/api/hr", hrProfileRoutes);
 const deptAuthRoutes = require("./routes/auth/deptAuth");
 app.use("/api/auth", deptAuthRoutes);
 
+/* ---------------------------------------------------------------------------
+ * PUBLIC (UNAUTHENTICATED) ROUTES — everything under /api/public.
+ *
+ * Mounted HERE, up with the auth routes, and NOT under /api/cms, for a
+ * concrete reason: `app.use("/api/cms", productOperations)` further down
+ * attaches EmployeeAuthMiddleware to every path beneath /api/cms (that router
+ * does `router.use(EmployeeAuthMiddleware)` at its top), so anything mounted
+ * below it inherits a login requirement no matter what its own file says. A
+ * first pass put bom-approval at /api/cms/crm/bom-approval and every link in
+ * every email 401'd.
+ *
+ * The BOM approval link is opened by the Project Manager from their inbox,
+ * without signing in. It is token-gated, single-use, and writes exactly one
+ * field on one style — see routes/CMS_Routes/Sales/sampleBomApproval.js's
+ * header for what stands in for a login. Anything added under /api/public must
+ * clear that same bar.
+ * ------------------------------------------------------------------------ */
+app.use(
+  "/api/public/bom-approval",
+  require("./routes/CMS_Routes/Sales/sampleBomApproval"),
+);
+
 // Self-service "forgot password" for the same login this replaces — request a
 // 4-digit email OTP, verify it, then set a new password. Reuses deptAuth's own
 // identity resolution, so it covers every account /login can authenticate.
@@ -1223,6 +1247,10 @@ app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callR
 // Every call (answered/missed/rejected, recorded or not) for the Active Lead
 // workspace's outreach-attempt suggestion — see that route file's own header.
 app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
+// Emails exchanged with a customer, read live from the salesperson's own
+// connected Gmail — the email sibling of call-events and crm/whatsapp. Scoped
+// to the caller's own mailbox via the JWT; see that route file's header.
+app.use("/api/cms/crm/email", require("./routes/CMS_Routes/Sales/crmEmail"));
 
 // Sales Journey — the connected commercial lifecycle record (Account →
 // Retention). Same Sales role + approval guard as the rest of CRM: an editor's
@@ -1251,6 +1279,9 @@ app.use(
   "/api/cms/crm/sample-styles",
   require("./routes/CMS_Routes/Sales/sampleStyles"),
 );
+
+// The Project Manager's BOM approve/reject lives at /api/public/bom-approval
+// — see its mount much earlier in this file, above the /api/cms guard.
 
 // The Sales-wide inbox of pending costing/materials submissions across every
 // journey — read-only aggregation over what enquiries.js and sampleStyles.js

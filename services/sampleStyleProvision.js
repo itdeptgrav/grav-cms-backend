@@ -126,11 +126,22 @@ async function provisionJourneyStyles({
     //
     // Applied only where the style is CREATED. Re-provisioning must never
     // reach into a style already being sampled and cancel it.
+    //
+    // "SELECTING" MEANS PICKING ONE THAT ALREADY EXISTED, NOT REGISTERING A
+    // NEW ONE HERE (26 Aug 2026, bug fix — the waiver's own intent, stated
+    // two paragraphs up, was never actually enforced). `p.stockItemId` is set
+    // in BOTH cases: picking an existing register entry, and registering a
+    // brand-new one for this exact enquiry via RegisterProductForm. A
+    // freshly-registered product is precisely the new-garment case sampling
+    // exists for — it had no waiver until this fix, having a `stockItemId`
+    // was enough to skip R&D and sampling entirely for a garment nobody had
+    // ever made. `p.pickedFromRegister` (set only by the frontend's
+    // MasterCombo `onPick`, never by registration) is the actual signal.
     const registered = Boolean(p.stockItemId);
     const proven = registered && assessDevelopment
       ? Boolean((await assessDevelopment(p))?.proven)
       : false;
-    const waive = registered;
+    const waive = registered && Boolean(p.pickedFromRegister);
 
     if (!style) {
       try {

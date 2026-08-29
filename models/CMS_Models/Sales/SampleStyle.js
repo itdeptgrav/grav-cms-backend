@@ -268,6 +268,57 @@ const sampleStyleSchema = new mongoose.Schema(
       rawItems: [rawItemPickSchema],
       selectedBy: actorRef(),
       selectedAt: { type: Date },
+      // Optional target date Sales sets when routing to the Merchandiser
+      // (28 Aug 2026, explicit request: "an input need to ask for the sales
+      // while click for the sent to merchantiser... do u want to set deadline
+      // ok.. so this is optional"). Attached to the hand-off email when
+      // present; nothing enforces it — a target the Merchandiser is told, not
+      // a gate that blocks anything.
+      deadline: { type: Date },
+    },
+
+    // ── Project Manager's BOM sign-off — the gate between Materials and
+    // R&D (28 Aug 2026, explicit request: "the second step will be Take
+    // Approval From Production manager... and once approved, then only the
+    // next step means the send to R&D button will goona enable").
+    //
+    // NOT A NEW `stage`. The style stays at `materials` throughout; this is a
+    // sub-state of it. Adding a fourth stage code would have rippled into the
+    // R&D app's own queries, the kanban columns, STAGE_ORDER's backward-move
+    // arithmetic and every existing row's meaning — for a gate that only ever
+    // decides whether ONE button is enabled.
+    //
+    // The decision is made from the emailed request itself, not in the CMS
+    // (same request: "on that mail they need to approve/reject the request...
+    // don't keep manual button here for production manager approval"), so
+    // there is no logged-in actor to record — `decidedByEmail` is whichever
+    // recipient opened the link, and `decidedByName` their Access Control
+    // name. See routes/CMS_Routes/Sales/sampleBomApproval.js.
+    bomApproval: {
+      status: { type: String, enum: ["none", "pending", "approved", "rejected"], default: "none", index: true },
+      /**
+       * Rotated on every request, and the ONLY thing the emailed decision link
+       * carries besides the style id. Rotating it is what expires the previous
+       * round's email: a stale "Approve" link from a superseded request
+       * resolves to a token that no longer matches and is refused, so an
+       * approval can never be replayed against a BOM that has since changed.
+       */
+      token: { type: String, trim: true, select: false },
+      round: { type: Number, default: 0 },
+      requestedAt: { type: Date },
+      requestedBy: actorRef(),
+      /** Who the request went to, captured at send time so Sales can see it. */
+      requestedTo: [{ type: String, trim: true }],
+      decidedAt: { type: Date },
+      decidedByName: { type: String, trim: true },
+      decidedByEmail: { type: String, trim: true },
+      /** Required on a rejection — what Merchandising has to fix. */
+      note: { type: String, trim: true },
+      // Optional target date Sales sets when requesting the approval — same
+      // reasoning and same "informational, not enforced" nature as
+      // materials.deadline above. Cleared and re-set on every new request
+      // (including "Send Approval Again"), alongside token/round/requestedAt.
+      deadline: { type: Date },
     },
 
     // Staged Merchandiser/PM submissions awaiting a Sales decision — mirrors

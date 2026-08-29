@@ -18,6 +18,7 @@
 "use strict";
 
 const express = require("express");
+const crypto = require("crypto");
 const mongoose = require("mongoose");
 
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
@@ -35,6 +36,14 @@ const { processVariantRawItems, updateStockItemAggregates, recomputeVariantCosts
 const { nextRequestId } = require("../../../services/requestId");
 const { sendCustomerEmail } = require("../../../utils/salesEmailService");
 const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
+const { styleEmailContext, imageGalleryHtml, bomTableHtml, stockItemBom } = require("../../../services/sampleStyleEmail.service");
+// THIS BACKEND's own public origin — for the BOM-approval decision links,
+// which are the one thing here that must point at the API rather than at the
+// CMS: the Project Manager decides from their inbox without signing in, so
+// the link cannot go through a frontend route that would ask them to.
+// DEPT_NOTIFY_APP_URL is the CMS (cms.grav.in); this is the API host.
+// Set API_PUBLIC_URL in .env for any deploy where the two differ.
+const API_PUBLIC_URL = (process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 5000}`).replace(/\/+$/, "");
 const salesAuthBase = require("../../../Middlewear/SalesAuthMiddlewear");
 
 // R&D owns the tech sheet and the sample rounds, so R&D must be able to call
@@ -86,6 +95,27 @@ async function referenceImageFor(style) {
   const enq = await Enquiry.findById(style.enquiryId).select("products").lean();
   return enq?.products?.find((p) => p.product === style.productName)?.images?.[0] || null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Style hand-off emails — Merchandiser, Project Manager, R&D
+//
+// 28 Aug 2026, explicit request: "make sure ki properly attach the customer
+// details, product details, photo's and all ok so that it can properly
+// represent about the sampling". All three messages are built from ONE context
+// so they can never describe the same style differently, and so a field added
+// for one audience shows up for all three.
+//
+// styleEmailContext / imageGalleryHtml / bomTableHtml now live in
+// services/sampleStyleEmail.service.js — moved there the same day, once
+// routes/CMS_Routes/Sales/sampleBomApproval.js's decision PAGE needed the
+// exact same context the email that linked to it used, so the two could never
+// describe a style differently.
+//
+// The prose around this is Sales-authored (SalesSettings.samplingTemplates —
+// see departmentNotify.service.js's resolveTemplate). What is built here is
+// everything a template must NOT be able to get wrong: which customer, which
+// product, which photos, which link.
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Append one event to the style's shared timeline.
 const logHistory = (style, ev, req) => {
@@ -186,6 +216,14 @@ const decorate = (styleDoc, journey, account, enquiry) => {
   const o = styleDoc.toObject ? styleDoc.toObject() : styleDoc;
   return {
     ...o,
+    // The BOM decision secret NEVER leaves the server (28 Aug 2026). It is
+    // `select: false` on the schema, so a plain read already omits it — but
+    // the request route ASSIGNS it before saving, which puts it on the
+    // in-memory document that then gets serialised straight back to the
+    // browser. Stripped here, in the one function every style response passes
+    // through, rather than at that call site: a second route that ever touches
+    // the token would otherwise have to remember this on its own.
+    bomApproval: o.bomApproval ? { ...o.bomApproval, token: undefined } : o.bomApproval,
     // Same shape as Enquiry's pendingChanges: everyone sees it (Sales reviews
     // it; the Merchandiser/PM who submitted it sees it's still pending rather
     // than silently gone). Decided entries stay in the raw log but aren't
@@ -417,58 +455,13 @@ function sanitizeMaterialsRawItems(input) {
 // (sanitizeMaterialsRawItems throws without one), which is the only reason
 // the local copy existed: processVariantRawItems drops rows with no
 // positive quantity.
-/**
- * A StockItem's bill of materials, flattened and de-duped for display.
- *
- * THERE IS NO `StockItem.rawItems` — the BOM hangs off each variant
- * (`variants[].rawItems`), so anything reading `stockItem.rawItems` silently
- * gets `undefined`. Variants differ by size, not by what the garment is made
- * of, so the same raw item appears once per variant; this merges those into
- * one row and records which variants carried it, rather than showing the same
- * fabric five times.
- *
- * Quantities are the variant rows' own `quantity`, which is already the
- * post-allowance effective figure (see StockItem's variantRawItemSchema) —
- * `allowancePercent` is carried through for display only and must NOT be
- * applied again on top.
- *
- * @param {object|null} stockItem A lean StockItem with `variants[].rawItems`.
- * @returns {Array} `[{ rawItemId, rawItemName, rawItemSku, quantity, unit, allowancePercent, unitCost, totalCost, variantLabels[] }]`
- */
-function stockItemBom(stockItem) {
-  const variants = Array.isArray(stockItem?.variants) ? stockItem.variants : [];
-  const byKey = new Map();
-  for (const v of variants) {
-    const label = Array.isArray(v.attributes)
-      ? v.attributes.map((a) => a?.value).filter(Boolean).join(" / ")
-      : "";
-    for (const r of Array.isArray(v.rawItems) ? v.rawItems : []) {
-      if (!r?.rawItemId) continue;
-      // Same raw item in a different raw-item variant (a different colourway
-      // of the same fabric) is a genuinely different line, so the key carries
-      // both ids.
-      const key = `${String(r.rawItemId)}::${String(r.variantId || "")}`;
-      const existing = byKey.get(key);
-      if (existing) {
-        if (label && !existing.variantLabels.includes(label)) existing.variantLabels.push(label);
-        continue;
-      }
-      byKey.set(key, {
-        rawItemId: String(r.rawItemId),
-        rawItemName: r.rawItemName || "",
-        rawItemSku: r.rawItemSku || "",
-        variantCombination: r.variantCombination || [],
-        quantity: r.quantity ?? null,
-        unit: r.unit || "",
-        allowancePercent: r.allowancePercent ?? 0,
-        unitCost: r.unitCost ?? null,
-        totalCost: r.totalCost ?? null,
-        variantLabels: label ? [label] : [],
-      });
-    }
-  }
-  return [...byKey.values()];
-}
+// `stockItemBom` (a StockItem's bill of materials, flattened and de-duped
+// across variants) moved to services/sampleStyleEmail.service.js on 28 Aug
+// 2026 and is imported from there now — the BOM-approval email and decision
+// page needed the EXACT SAME computation this route's own GET /:id/production
+// already used, and a second copy is how the two silently drifted the first
+// time (the email was built against `style.materials.rawItems`, a dead field,
+// while this route was already reading the real thing from the stock item).
 
 async function syncMaterialsRawItems(style, picks) {
   if (!Array.isArray(picks) || !picks.length) return;
@@ -653,15 +646,57 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     if (from === "materials" && stage === "rnd" && !bypassesApproval(req.user)) {
       return res.status(403).json({ success: false, message: "Only Sales, an admin or the CEO can send a style to R&D." });
     }
+    // The Project Manager's BOM sign-off gates R&D (28 Aug 2026, explicit
+    // request: "once approved, then only the next step means the send to R&D
+    // button will goona enable"). Enforced here and not only by the disabled
+    // button, for the same reason the Sales-only check above is: the UI gate
+    // and the request are two different things, and only one of them is
+    // something a caller can't skip.
+    if (from === "materials" && stage === "rnd" && style.bomApproval?.status !== "approved") {
+      return res.status(400).json({
+        success: false,
+        message: style.bomApproval?.status === "pending"
+          ? "The Project Manager hasn't decided on the BOM yet."
+          : style.bomApproval?.status === "rejected"
+            ? "The Project Manager rejected this BOM — send the approval request again once it's revised."
+            : "Get the Project Manager's BOM approval before sending this style to R&D.",
+      });
+    }
     const backward = (STAGE_ORDER[stage] ?? 0) < (STAGE_ORDER[from] ?? 0);
     const reason = (req.body.reason || "").trim();
     if (backward && !reason) return res.status(400).json({ success: false, message: "A reason is required when sending a style back." });
 
+    // Optional target date for the Merchandiser to fill the BOM by (28 Aug
+    // 2026, explicit request: "an input need to ask for the sales while
+    // click for the sent to merchantiser... do u want to set deadline... this
+    // is optional"). Only meaningful on the actual Send-to-Merchandiser
+    // transition below — parsed here so a bad value 400s before anything is
+    // written.
+    let deadline;
+    if (req.body?.deadline) {
+      const d = new Date(req.body.deadline);
+      if (Number.isNaN(d.getTime())) return res.status(400).json({ success: false, message: "Invalid deadline." });
+      deadline = d;
+    }
+
     // A backward move invalidates the downstream work.
     if (backward) {
       if (stage === "materials" || stage === "brief") { resetTech(style); resetSample(style); }
-      if (stage === "brief") { style.materials.status = "pending"; }
+      if (stage === "brief") { style.materials.status = "pending"; style.materials.deadline = undefined; }
+      // Pulled back to the Brief, the BOM sign-off is void too: it approved a
+      // materials picture that is about to be rebuilt from a re-sent brief.
+      // Rotating the token kills any decision link still sitting in the
+      // Project Manager's inbox.
+      if (stage === "brief" && style.bomApproval) {
+        style.bomApproval.status = "none";
+        style.bomApproval.token = undefined;
+        style.bomApproval.decidedAt = null;
+        style.bomApproval.note = "";
+        style.bomApproval.deadline = undefined;
+      }
     }
+
+    if (stage === "materials" && from === "brief") style.materials.deadline = deadline;
 
     style.stage = stage;
     logHistory(style, { kind: backward ? "send_back" : "route", from, to: stage, note: reason }, req);
@@ -674,20 +709,56 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     // actual transition INTO rnd, never a redundant re-save at the same
     // stage. Best-effort, never awaited: an email failing must not affect
     // the routing that just succeeded.
+    // Step 1 — "Send to Merchandiser" (brief → materials). Until 28 Aug 2026
+    // this hand-off notified nobody at all: Sales pressed the button and the
+    // Merchandiser found out by opening the app and noticing. Now it carries
+    // the actual ask — fill the BOM against this product — with the customer,
+    // the full spec, the reference photos and a View button straight onto the
+    // finished good.
+    if (stage === "materials" && from === "brief") {
+      (async () => {
+        const c = await styleEmailContext(style);
+        const salesPerson = actor(req).name || "Sales";
+        await notifyEvent("sample_sent_to_merchandiser", {
+          vars: { product: style.productName || "", customer: c.customerName, salesPerson, styleCode: style.styleCode || style.sampleStyleId || "" },
+          heading: `Sampling request: ${style.productName || style.styleCode || ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(salesPerson)}</strong> raised a sampling request for this product. Please fill in the BOM / raw materials against it.</p>`,
+          details: [
+            ...c.details,
+            ["BOM needed by", style.materials?.deadline ? new Date(style.materials.deadline).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : undefined],
+          ],
+          image: c.images[0],
+          extraHtml: imageGalleryHtml(c.images),
+          bodyText: `${salesPerson} raised a sampling request for "${style.productName || "a style"}" (${c.customerName}). Please fill in the BOM / raw materials against this product.`,
+          ctaLabel: "View Product",
+          ctaUrl: c.viewUrl || `${DEPT_NOTIFY_APP_URL}/merchandiser/dashboard`,
+        });
+      })().catch(() => {});
+    }
+
+    // Step 3 — "Send to R&D" (materials → rnd), now only reachable once the
+    // Project Manager has approved the BOM above.
     if (stage === "rnd" && from !== "rnd") {
       (async () => {
-        const [customerName, image] = await Promise.all([customerNameFor(style), referenceImageFor(style)]);
+        const c = await styleEmailContext(style);
+        const salesPerson = actor(req).name || "Sales";
+        const approver = style.bomApproval?.decidedByName || style.bomApproval?.decidedByEmail || "";
         await notifyEvent("sample_sent_to_rnd", {
+          vars: {
+            product: style.productName || "", customer: c.customerName, salesPerson,
+            styleCode: style.styleCode || style.sampleStyleId || "",
+            approvedBy: approver ? ` (${approver})` : "",
+          },
           heading: `Style sent to R&D: ${style.productName || style.styleCode || ""}`,
-          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> sent this style to R&D for tech-pack / development.</p>`,
+          bodyHtml: `<p><strong>${escapeHtml(salesPerson)}</strong> sent this style to R&D for tech-pack / development.</p>`,
           details: [
-            ["Customer", customerName],
-            ["Style", style.styleCode || style.sampleStyleId],
-            ["Product", style.productName],
-            ["Materials", (style.materials?.items || []).join(", ")],
+            ...c.details,
+            ["Materials", (style.materials?.items || []).join(", ") || undefined],
+            ["BOM approved by", approver || undefined],
           ],
-          image,
-          bodyText: `${actor(req).name || "Sales"} sent "${style.productName || "a style"}" (${customerName}) to R&D for tech-pack / development.`,
+          image: c.images[0],
+          extraHtml: imageGalleryHtml(c.images),
+          bodyText: `${salesPerson} sent "${style.productName || "a style"}" (${c.customerName}) to R&D for tech-pack / development.`,
           ctaLabel: "Open in R&D",
           ctaUrl: `${DEPT_NOTIFY_APP_URL}/research-development/dashboard`,
         });
@@ -697,6 +768,196 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     return res.json({ success: true, sampleStyle: await withJourney(style) });
   } catch (err) {
     console.error("[sampleStyles] PATCH /:id/stage", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/sample-styles/:id/reset — "Reset Process" (28 Aug 2026,
+// explicit request: "keep an button for Reset Process, so that that product
+// all steps will goona reset and will goona start form step 1").
+//
+// Distinct from an ordinary backward move to Brief (PATCH /:id/stage above,
+// which the reject/send-back flows already use) in two ways:
+//   • it ALSO clears the Sales-side customer-approval decision (step 5) —
+//     a backward move to Brief never touched that, and "all steps" means the
+//     whole five-step process, not just steps 2 through 4.
+//   • it is logged under its own history kind, "reset_process", not
+//     "send_back" — the audit trail should say a deliberate full reset
+//     happened, not read like a routine correction.
+//
+// EVIDENCE IS NEVER DELETED. Same principle every other reset in this file
+// already follows (resetTech/resetSample, the backward-move block above):
+// only the STATUS fields that gate what happens next go back to their
+// starting value. Sample rounds, tech-sheet revisions, the BOM approval's own
+// history entries and customerApproval.log all stay exactly as they were —
+// what a "reset" clears is what to do next, not what already happened.
+router.post("/:id/reset", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    // Same authority as every other routing act in this file — resetting
+    // someone else's in-progress work is not a call a Merchandiser, R&D, or a
+    // plain sales editor watching the journey should be able to make alone.
+    if (!bypassesApproval(req.user)) {
+      return res.status(403).json({ success: false, message: "Only Sales, an admin or the CEO can reset this style." });
+    }
+
+    const from = style.stage;
+    resetTech(style);
+    resetSample(style);
+    style.materials.status = "pending";
+    if (style.bomApproval) {
+      style.bomApproval.status = "none";
+      style.bomApproval.token = undefined;
+      style.bomApproval.round = 0;
+      style.bomApproval.requestedAt = null;
+      style.bomApproval.requestedTo = [];
+      style.bomApproval.decidedAt = null;
+      style.bomApproval.decidedByName = "";
+      style.bomApproval.decidedByEmail = "";
+      style.bomApproval.note = "";
+    }
+    // Step 5's own decision, cleared the same way — `log` (the append-only
+    // history the chat UI reads) is left untouched.
+    if (style.customerApproval) {
+      style.customerApproval.approved = null;
+      style.customerApproval.decidedAt = null;
+      style.customerApproval.note = "";
+    }
+    style.customerRejected = false;
+    style.stage = "brief";
+
+    logHistory(style, { kind: "reset_process", from, to: "brief", note: (req.body?.reason || "").trim() }, req);
+    style.updatedBy = actor(req);
+    await style.save();
+
+    return res.json({ success: true, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/reset", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /api/cms/crm/sample-styles/:id/bom-approval/request
+//
+// Step 2 of Style & Sample — "Send Request for BOM Approval" (28 Aug 2026).
+// Emails the Project Manager the full style with Approve / Reject controls
+// they act on FROM the email; the decision lands back here through
+// routes/CMS_Routes/Sales/sampleBomApproval.js and flips the gate on its own,
+// which is why this stage has no manual "mark approved" button anywhere ("if
+// approve then it will goona auto trigger here... don't keep manual button
+// here for production manager approval").
+//
+// Re-sendable: after a rejection the stage offers "Send Approval Again", and
+// that is this same route. Each send mints a NEW token, which is what makes
+// the previous round's emailed links stop working.
+router.post("/:id/bom-approval/request", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    // Same authority as sending to R&D — this is the step immediately before
+    // it, and asking for sign-off on someone else's behalf is a routing act.
+    if (!bypassesApproval(req.user)) {
+      return res.status(403).json({ success: false, message: "Only Sales, an admin or the CEO can request BOM approval." });
+    }
+    if (style.stage !== "materials") {
+      return res.status(400).json({ success: false, message: "Send the style to the Merchandiser first." });
+    }
+    if (style.bomApproval?.status === "approved") {
+      return res.status(400).json({ success: false, message: "The BOM is already approved for this style." });
+    }
+
+    // Optional target date for the Project Manager's decision (28 Aug 2026,
+    // explicit request: "an input need to ask for the sales while click...
+    // for sent request for BOM approval... do u want to set deadline... this
+    // is optional"). Informational only — nothing here enforces it.
+    let deadline;
+    if (req.body?.deadline) {
+      const d = new Date(req.body.deadline);
+      if (Number.isNaN(d.getTime())) return res.status(400).json({ success: false, message: "Invalid deadline." });
+      deadline = d;
+    }
+
+    const token = crypto.randomBytes(24).toString("hex");
+    const prevRound = style.bomApproval?.round || 0;
+    style.bomApproval = {
+      status: "pending",
+      token,
+      round: prevRound + 1,
+      requestedAt: new Date(),
+      requestedBy: actor(req),
+      requestedTo: [],
+      decidedAt: null,
+      decidedByName: "",
+      decidedByEmail: "",
+      note: "",
+      deadline,
+    };
+
+    const c = await styleEmailContext(style);
+    const salesPerson = actor(req).name || "Sales";
+    const decideBase = `${API_PUBLIC_URL}/api/public/bom-approval/${style._id}/${token}`;
+
+    // Awaited, unlike the fire-and-forget notifications elsewhere in this file:
+    // the whole point of the button is that the request went out, so "sent to
+    // 2 people" vs "nobody holds Project Manager as their primary department"
+    // has to reach the salesperson who pressed it, not just the server log.
+    const result = await notifyEvent("sample_bom_approval_requested", {
+      vars: {
+        product: style.productName || "", customer: c.customerName, salesPerson,
+        styleCode: style.styleCode || style.sampleStyleId || "",
+      },
+      heading: `BOM approval required: ${style.productName || style.styleCode || ""}`,
+      bodyHtml: `<p><strong>${escapeHtml(salesPerson)}</strong> requests your approval of the Bill of Materials for this product.</p>`,
+      details: [
+        ...c.details,
+        ["Requested by", salesPerson],
+        ["Decision needed by", deadline ? deadline.toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : undefined],
+      ],
+      image: c.images[0],
+      // The decision pair sits ABOVE the View button on purpose: the action
+      // this email is asking for is the decision, not a visit to the CMS.
+      // The BOM table itself (28 Aug 2026, explicit request — this used to ask
+      // for a sign-off on a Bill of Materials without showing one) sits ABOVE
+      // the decision pair: read what you're deciding, then decide.
+      extraHtml: `${imageGalleryHtml(c.images)}
+${bomTableHtml(c.bom, c.variantTotal)}
+<p style="margin:20px 0 8px;font-size:13.5px;color:#0f172a"><strong>Please record your decision:</strong></p>
+<p style="margin:0 0 4px">
+  <a href="${decideBase}?d=approve" style="display:inline-block;background:#15803d;color:#fff;padding:10px 22px;border-radius:6px;text-decoration:none;font-weight:600;margin-right:8px">Approve BOM</a>
+  <a href="${decideBase}?d=reject" style="display:inline-block;background:#b91c1c;color:#fff;padding:10px 22px;border-radius:6px;text-decoration:none;font-weight:600">Reject BOM</a>
+</p>
+<p style="font-size:12px;color:#888;margin:6px 0 0">You'll be asked to confirm on the next screen — nothing is recorded by opening this link.</p>`,
+      bodyText: `${salesPerson} requests your approval of the BOM for "${style.productName || "a style"}" (${c.customerName}). Approve: ${decideBase}?d=approve — Reject: ${decideBase}?d=reject`,
+      ctaLabel: "View Product",
+      // Falls back to the Project Manager's OWN dashboard, not Merchandising's
+      // — this recipient has no reason to land on a dashboard that isn't theirs
+      // just because the style has no linked stock item yet.
+      ctaUrl: c.viewUrl || `${DEPT_NOTIFY_APP_URL}/project-manager/dashboard`,
+    });
+
+    // Nobody to ask means nothing is pending — leaving the style parked on
+    // "waiting for the Project Manager" when no email was sent is exactly
+    // the dead end this whole gate would otherwise create.
+    if (!result?.sent) {
+      style.bomApproval.status = "none";
+      style.bomApproval.token = undefined;
+      await style.save();
+      const why = result?.skipped === "no-recipients"
+        ? "Nobody has Project Manager as their primary department in Access Control, so there's no one to ask."
+        : result?.skipped === "disabled" || result?.skipped === "template-disabled"
+          ? "BOM approval emails are switched off in Sales Settings → Sampling Messages."
+          : "The approval email could not be sent.";
+      return res.status(400).json({ success: false, message: why });
+    }
+
+    logHistory(style, { kind: "bom_approval_requested", from: "materials", to: "materials", note: `Round ${style.bomApproval.round}` }, req);
+    style.updatedBy = actor(req);
+    await style.save();
+
+    return res.json({ success: true, sentTo: result.sent, sampleStyle: await withJourney(style) });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/bom-approval/request", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
