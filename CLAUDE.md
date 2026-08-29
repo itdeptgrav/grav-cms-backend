@@ -37,7 +37,7 @@ npm run dev        # nodemon server.js → http://localhost:5000
 npm start          # node server.js
 ```
 
-`npm test` runs the node:test files under `services/` and `middleware/`. Coverage is thin — a handful of pure services plus `middleware/bandwidthTracker.test.js`. **Most of the codebase has no tests.** The root-level `*_test.js`, `verify*.js`, `fix-*.js`, `backfill_*.js`, and `seed*.js` files are hand-run interactive scripts that read and write the **live dev MongoDB and Firestore**:
+`npm test` runs the node:test files under `services/` and `middleware/`. Coverage is thin — a handful of pure services plus the three `middleware/bandwidth*.test.js` suites. **Most of the codebase has no tests.** The root-level `*_test.js`, `verify*.js`, `fix-*.js`, `backfill_*.js`, and `seed*.js` files are hand-run interactive scripts that read and write the **live dev MongoDB and Firestore**:
 
 ```bash
 node -r dotenv/config c1_interactive_test.js      # C1 scoring engine tester (prompts interactively)
@@ -73,36 +73,51 @@ Firestore calls are instrumented for bandwidth accounting via `middleware/firest
 
 ## Bandwidth accounting
 
-There are **two** meters here and they answer different questions. Neither
-replaces the other:
+There are **two** meters and they answer different questions. Neither replaces
+the other:
 
 | File | Counts | Which bill |
 |---|---|---|
 | `middleware/firestoreBandwidth.js` | Firestore document reads/writes per route | the Firestore bill |
-| `middleware/bandwidthTracker.js` | bytes on the wire | the Render bill |
+| `middleware/bandwidthTracker.js` | bytes on the wire, plus distributions | the Render bill |
 
 The older one is unchanged and still serves `GET /cowork/admin/bandwidth-stats`.
 The two use separate instrumentation flags (`__bandwidthInstrumented` vs
 `__bandwidthTrackerInstrumented`) so both wrap the Firestore prototypes; giving
 them one shared flag would make whichever loaded second silently report zero.
+`middleware/coexistence.test.js` pins that.
 
-Render bills this service in three buckets, and `middleware/bandwidthTracker.js`
-measures all three under those same names so its dashboard can be read against
-the billing page without translating:
+Render bills in three buckets and the tracker measures all three under Render's
+own names, so the dashboard can be read against the billing page without
+translating:
 
-| Render bucket | Tracker scope | Means |
+| Render bucket | Scope | Means |
 |---|---|---|
 | HTTP Responses | `route` | bytes sent to browsers/apps, post-gzip |
-| Websocket Responses | `socket` | socket.io packet bytes |
+| Websocket Responses | `socket` | socket.io packet bytes, split by event name |
 | Service-Initiated | `outbound` | bytes **we** pull from Drive, googleapis, Firestore REST, biometric devices |
 
-Read it at `GET /api/admin/bandwidth/{summary,routes,outbound,consumers,timeline,insights,live}`
-(behind `requirePlatformAdmin`), or in the CMS at **/ceo/dashboard/bandwidth**.
-Counters are folded into hourly `bandwidth_samples` documents once a minute via
-`$inc`, so a deploy loses at most one interval and two instances add up rather
-than overwrite. `?hours=` selects the window; rows expire after 90 days.
+Beyond totals it records, per key: a log2 **histogram** of response size and of
+latency (so p50/p95/p99 can be computed over any window at query time, and an
+endpoint that is cheap 99 times and enormous once cannot hide behind its mean),
+**peaks** merged with `$max`, the **status mix**, the **content-type mix**, and
+**duplicate responses** — each JSON body is hashed and compared with the previous
+response on the same route to the same class of caller, so "this endpoint
+re-sent 6.2 GB the client already had" is measured rather than inferred from a
+polling interval.
 
-Three wiring constraints, all in the first 120 lines of `server.js`:
+Read it at `GET /api/admin/bandwidth/{summary,routes,route,outbound,consumers,sockets,timeline,heatmap,insights,live}`
+(behind `requirePlatformAdmin`), or in the CMS at **/ceo/dashboard/bandwidth**.
+`?hours=` selects the window. Counters are folded into hourly `bandwidth_samples`
+documents once a minute via `$inc`/`$max`, so a deploy loses at most one interval
+and two instances add up rather than overwrite; rows expire after 90 days.
+
+Percentiles are approximate — a log2 bucket knows a value only to within a
+factor of two — and every surface that shows them says so. `maxBytes`/`maxMs`
+are exact, and are what to reach for when the question is "how bad did it ever
+get".
+
+Four wiring constraints, all in the first 120 lines of `server.js`:
 
 - `instrumentOutbound()` patches `http/https.request`, so it must run before any
   client library caches a reference to them. That module-level patch is what
@@ -116,19 +131,23 @@ Three wiring constraints, all in the first 120 lines of `server.js`:
   ordering is what makes the meter see post-gzip bytes. It reads request size
   from `Content-Length` rather than counting chunks, deliberately: consuming the
   request stream above the body parser would silently truncate every POST.
+- The `/api/admin/bandwidth` mount comes **before** the broader `/api/admin` one,
+  or every request falls through `accessAdminRoutes` first and pays for a second
+  `requirePlatformAdmin` database read.
 
 MongoDB is the one thing not measured. The driver speaks raw TCP, so the https
 hook is blind to it even though on Atlas it is real Service-Initiated egress —
 document counts are exact, the bytes beside them are sampled and are labelled
 "estimated" wherever they surface.
 
-**This is observation only.** The tracker measures; it changes no response and
-no route. The one behaviour change it makes available — gzip, which measurement
-puts at ~90% off JSON — ships **disabled**, behind `BANDWIDTH_ENABLE_GZIP=1`,
-so responses stay byte-for-byte what they are today until someone decides
+**This is observation only.** The tracker measures; it changes no response and no
+route. The one behaviour change it makes available — gzip, which measurement
+puts at ~90% off JSON — ships **disabled**, behind `BANDWIDTH_ENABLE_GZIP=1`, so
+responses stay byte-for-byte what they are today until someone decides
 otherwise. `compression` is in package.json but inert while that is unset.
 
 `BANDWIDTH_LOG=1` prints one line per request. Leave it off in production.
+`BANDWIDTH_TZ` (default `Asia/Kolkata`) sets the timezone the heatmap buckets by.
 
 ## Three auth systems
 
