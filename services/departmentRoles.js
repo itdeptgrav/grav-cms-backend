@@ -17,6 +17,25 @@ const { ROLES, ROLE_KEYS, roleAtLeast } = DepartmentRole;
 
 const ACCOUNTING = "accountant";
 
+/**
+ * Clear any per-department identity cache a role change invalidates.
+ *
+ * QC caches "which role does this email hold" for a minute to keep its
+ * dashboard off nine redundant lookups per page load (see services/qcViewer.js).
+ * That is fine for a role that has not changed and visibly wrong for one that
+ * just did — granting somebody owner and having them still be refused for the
+ * next sixty seconds reads as a broken grant. Required lazily so qcViewer can
+ * keep requiring this module without a cycle.
+ */
+function dropRoleCaches(slug, email) {
+  if (slug !== "qc") return;
+  try {
+    require("./qcViewer").invalidateViewer(email);
+  } catch (e) {
+    console.warn("[departmentRoles] qc viewer cache invalidation skipped:", e.message);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Reading                                                             */
 /* ------------------------------------------------------------------ */
@@ -102,6 +121,7 @@ async function setRole({ departmentSlug, email, name, role, password, actor }) {
       { $set: { isActive: false } },
       { new: true },
     );
+    dropRoleCaches(slug, mail);
     return { role: null, revoked: Boolean(res) };
   }
 
@@ -130,6 +150,10 @@ async function setRole({ departmentSlug, email, name, role, password, actor }) {
     },
     { new: true, upsert: true, setDefaultsOnInsert: true },
   );
+
+  // Whole-department, not just this email: promoting an owner demotes the
+  // incumbent above, so somebody else's cached role is stale too.
+  dropRoleCaches(slug, null);
 
   return { role: row.role, created: !before, previous: before?.role || null };
 }

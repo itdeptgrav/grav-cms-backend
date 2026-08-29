@@ -387,4 +387,11 @@ const workOrderSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
+// ── Indexes (added 29 Aug 2026, chasing QC dashboard load time) ──────────────
+// The collection carries ~9 KB per document, so a scan here is expensive well
+// before the row count looks alarming. Both shapes below are issued by the QC
+// order screens on every load and neither was indexed.
+workOrderSchema.index({ status: 1, createdAt: -1 });
+workOrderSchema.index({ customerRequestId: 1, status: 1 });
+
 module.exports = mongoose.model("WorkOrder", workOrderSchema);

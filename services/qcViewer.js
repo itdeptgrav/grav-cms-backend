@@ -120,6 +120,47 @@ async function emailFromId(id) {
  * Never throws — a lookup failure downgrades to "unidentified", which sees
  * nothing rather than everything.
  */
+/* ── Identity cache ───────────────────────────────────────────────────────────
+ *
+ * WHY THIS EXISTS (29 Aug 2026, chasing QC dashboard load time). Resolving a
+ * viewer costs three round-trips — the department role, the Employee record for
+ * the biometric id, and (separately) `departmentConfigured`'s role list. The
+ * overview loads three endpoints at once and each one resolved the viewer from
+ * scratch, so a single page load spent nine queries answering the same question
+ * about the same person nine times.
+ *
+ * Keyed on email, 60 seconds, in-process. The same shape and lifetime rationale
+ * as `getMasterOperations`'s cache in qcRoutes and `coworkAuth`'s employee
+ * cache: role changes are rare and administrative, and a minute of staleness on
+ * "which QC role does this person hold" is the same exposure the CoWork side
+ * already accepts at five. `invalidateViewer()` is exported so the team screen
+ * can clear it the moment it grants or revokes a role, which is the one case
+ * where waiting a minute would be visibly wrong.
+ */
+const VIEWER_TTL_MS = 60 * 1000;
+const viewerCache = new Map();
+
+function cacheGet(key) {
+  const hit = viewerCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > VIEWER_TTL_MS) { viewerCache.delete(key); return null; }
+  return hit.value;
+}
+
+function cacheSet(key, value) {
+  // Bounded so a long-running process cannot accumulate an entry per person
+  // seen since boot.
+  if (viewerCache.size > 500) viewerCache.clear();
+  viewerCache.set(key, { at: Date.now(), value });
+}
+
+/** Drop cached identity — all of it, or one person's. */
+function invalidateViewer(email) {
+  if (email) viewerCache.delete(`v:${String(email).toLowerCase()}`);
+  else viewerCache.clear();
+  viewerCache.delete("configured");
+}
+
 async function resolveViewer(req) {
   const caller = decodeCaller(req);
   if (!caller) {
@@ -145,22 +186,29 @@ async function resolveViewer(req) {
     };
   }
 
-  let role = null;
-  try {
-    role = await getRole(SLUG, caller.email);
-  } catch (e) {
-    console.warn("[qc viewer] role lookup failed:", e.message);
-  }
+  // The two lookups below are what the cache is for — see its note above.
+  const cacheKey = `v:${String(caller.email || "").toLowerCase()}`;
+  const cached = caller.email ? cacheGet(cacheKey) : null;
 
-  let biometricId = "";
-  try {
-    if (caller.email) {
-      const emp = await Employee.findOne({ email: caller.email })
-        .select("biometricId").lean();
-      biometricId = emp?.biometricId || "";
-    }
-  } catch (e) {
-    console.warn("[qc viewer] employee lookup failed:", e.message);
+  let role = cached ? cached.role : null;
+  let biometricId = cached ? cached.biometricId : "";
+
+  if (!cached) {
+    // Both are independent reads, so they go together rather than in sequence.
+    const [roleResult, empResult] = await Promise.allSettled([
+      getRole(SLUG, caller.email),
+      caller.email
+        ? Employee.findOne({ email: caller.email }).select("biometricId").lean()
+        : Promise.resolve(null),
+    ]);
+
+    if (roleResult.status === "fulfilled") role = roleResult.value;
+    else console.warn("[qc viewer] role lookup failed:", roleResult.reason?.message);
+
+    if (empResult.status === "fulfilled") biometricId = empResult.value?.biometricId || "";
+    else console.warn("[qc viewer] employee lookup failed:", empResult.reason?.message);
+
+    if (caller.email) cacheSet(cacheKey, { role, biometricId });
   }
 
   return {
@@ -223,12 +271,18 @@ function applyViewerFilter(filter, clause) {
 
 /** Has anybody been granted a QC role yet? Decides the unconfigured case above. */
 async function departmentConfigured() {
+  const cached = cacheGet("configured");
+  if (cached !== null) return cached.value;
   try {
     const { listRoles } = require("./departmentRoles");
     const rows = await listRoles(SLUG);
-    return rows.length > 0;
+    const value = rows.length > 0;
+    cacheSet("configured", { value });
+    return value;
   } catch {
-    // Unknown — assume configured, which is the more restrictive answer.
+    // Unknown — assume configured, which is the more restrictive answer. Not
+    // cached: a transient failure should not pin the restrictive answer for a
+    // minute.
     return true;
   }
 }
@@ -238,4 +292,5 @@ module.exports = {
   viewerFilter,
   applyViewerFilter,
   departmentConfigured,
+  invalidateViewer,
 };

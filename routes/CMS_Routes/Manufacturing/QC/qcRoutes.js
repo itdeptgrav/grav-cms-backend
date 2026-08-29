@@ -145,24 +145,66 @@ router.post("/refresh-operations-cache", (_req, res) => {
 });
 
 // ─── POST /signin ──────────────────────────────────────────────────────────────
+// 28 Aug 2026, explicit request: "don't ask for the scan id card ok, it is
+// not needed ok, because we can track from the corresponding signed in
+// employee ok". `biometricId` in the body is now OPTIONAL — an ID-card scan
+// still works if a caller sends one (kept for any station that still wants
+// per-scan attribution independent of who is logged in), but the ordinary
+// path is an empty body, which resolves the inspector straight from the
+// authenticated CMS login (`req.user.email`, set by EmployeeAuthMiddleware
+// ahead of this router) instead of asking them to badge in a second time.
+// Same email→Employee resolution routes/CEO_Routes and services/qcViewer.js
+// already use elsewhere for the identical "CMS knows email, QC knows
+// biometric id" join.
 router.post("/signin", async (req, res) => {
   try {
-    const { biometricId } = req.body;
-    if (!biometricId || !String(biometricId).trim())
-      return res.status(400).json({ success: false, message: "Biometric ID is required" });
+    const scanned = req.body?.biometricId ? String(req.body.biometricId).trim() : "";
 
-    const trimmedId = String(biometricId).trim();
-    const employee  = await Employee.findOne({ biometricId: trimmedId })
-      .select("firstName middleName lastName biometricId identityId email department designation isActive status").lean();
+    let employee = null;
+    if (scanned) {
+      employee = await Employee.findOne({ biometricId: scanned })
+        .select("firstName middleName lastName biometricId identityId email department designation isActive status").lean();
+      if (!employee)
+        return res.status(404).json({ success: false, message: "No employee found with this ID." });
+      if (employee.isActive === false || employee.status === "inactive")
+        return res.status(403).json({ success: false, message: "This employee account is inactive." });
+    } else {
+      const loginEmail = String(req.user?.email || "").trim().toLowerCase();
+      if (!loginEmail)
+        return res.status(401).json({ success: false, message: "Your session has expired — please sign in again." });
+      employee = await Employee.findOne({ email: loginEmail })
+        .select("firstName middleName lastName biometricId identityId email department designation isActive status").lean();
+      if (employee && (employee.isActive === false || employee.status === "inactive"))
+        employee = null; // fall through to the CMS-identity path below, same as "no record at all"
+    }
 
-    if (!employee)
-      return res.status(404).json({ success: false, message: "No employee found with this ID." });
-
-    if (employee.isActive === false || employee.status === "inactive")
-      return res.status(403).json({ success: false, message: "This employee account is inactive." });
+    // No Employee record is linked to this CMS login (or it's inactive) — the
+    // common case is a QC login that predates HR linking it up, or a shared
+    // department account with no individual Employee behind it at all. Only
+    // reachable via the no-scan path above (the scanned path already returned
+    // 404/403 on its own if the card didn't resolve). Falls back to the CMS
+    // identity itself rather than BLOCKING the inspector from working: a
+    // named, traceable identity with no biometric id is still real
+    // attribution (see save-inspection's own qcSession fallback further down,
+    // which already anticipated exactly this — `serverUser.name`/`.email`),
+    // and refusing to let someone inspect because HR hasn't linked their
+    // record yet would be strictly worse than any gap in checkpoint rostering.
+    if (!employee) {
+      return res.json({
+        success: true,
+        name: req.user?.name || "QC Inspector",
+        biometricId: "",
+        identityId: "",
+        department: "",
+        designation: "",
+        email: String(req.user?.email || ""),
+        stageEnforced: false,
+        stages: [],
+      });
+    }
 
     const name = [employee.firstName, employee.middleName, employee.lastName]
-      .filter(Boolean).join(" ").trim() || trimmedId;
+      .filter(Boolean).join(" ").trim() || employee.biometricId || employee.email || "QC Inspector";
 
     // The checkpoints this person is rostered on RIGHT NOW. Returned with the
     // session rather than fetched separately because the station needs it
@@ -203,7 +245,11 @@ router.post("/lookup-piece", async (req, res) => {
     // `biometricId` is the station's day-session identity. Optional: a lookup
     // without one still returns the piece and its progress, it simply cannot
     // say which checkpoints THIS person may act at.
-    const { barcode, biometricId } = req.body;
+    //
+    // `knownWorkOrderId` / `hasDefectCatalog` are the client saying "I already
+    // have the last work order's operations, and I already have a defect
+    // catalogue from this tab" — see the two `Unchanged` short-circuits below.
+    const { barcode, biometricId, knownWorkOrderId, hasDefectCatalog } = req.body;
     if (!barcode) return res.status(400).json({ success: false, message: "barcode is required" });
 
     const trimmed = barcode.trim();
@@ -239,7 +285,7 @@ router.post("/lookup-piece", async (req, res) => {
     if (unitNumber > workOrder.quantity)
       return res.status(400).json({ success: false, message: `Unit ${unitNumber} out of range (1–${workOrder.quantity})` });
 
-    const [customerRequest, empProgress, productOps] = await Promise.all([
+    const [customerRequest, empProgress, productOps, stockItemForImage] = await Promise.all([
       workOrder.customerRequestId
         ? CustomerRequest.findById(workOrder.customerRequestId).lean()
         : Promise.resolve(null),
@@ -247,7 +293,21 @@ router.post("/lookup-piece", async (req, res) => {
         workOrderId: workOrder._id, unitStart: { $lte: unitNumber }, unitEnd: { $gte: unitNumber },
       }).lean(),
       getProductOperations(workOrder.stockItemId),
+      // Only the fields resolveProductImage needs — this product's own images
+      // run to full-size URLs across many variants, so fetching the rest of
+      // the StockItem document here would be its own bandwidth mistake.
+      workOrder.stockItemId
+        ? StockItem.findById(workOrder.stockItemId).select("images variants.attributes variants.images").lean().catch(() => null)
+        : Promise.resolve(null),
     ]);
+
+    // The garment's own photo, next to its name — an inspector holding the
+    // piece used to see only text. Omitted (not merely null) when the client
+    // already has it cached for this same work order, same reasoning as the
+    // operations catalogue below.
+    const productImage = stockItemForImage
+      ? resolveProductImage(workOrder, new Map([[String(workOrder.stockItemId), stockItemForImage]]))
+      : null;
 
     const isMeasurementConversion =
       customerRequest?.requestType === "measurement_conversion" || !!empProgress?.measurementId;
@@ -434,6 +494,26 @@ router.post("/lookup-piece", async (req, res) => {
      */
     const previousDefectCodes = [];
 
+    /**
+     * BANDWIDTH: don't re-send what this same tab already has.
+     *
+     * `operations` (up to 259 rows), `categories` and `operationScope` are a
+     * pure function of the work order — identical on every one of its units —
+     * and `defectTypes` / `operationDefectMap` are a global catalogue, the
+     * same for every barcode in the factory. An inspector scans dozens of
+     * pieces off the same work order in a row, so the common case was paying
+     * for that whole payload again on every single scan.
+     *
+     * The client says what it already has (`knownWorkOrderId`, the last work
+     * order's `_id`; `hasDefectCatalog`, a flag it sets after the first
+     * catalogue it receives this tab) and, when it matches, this returns an
+     * `Unchanged: true` sentinel instead of the array — the frontend keeps
+     * what it cached. Still computed above regardless (unitNumber/count
+     * validation and `totalOperations` need it), so this only ever saves
+     * response bytes, never a query.
+     */
+    const sameWorkOrder = !!knownWorkOrderId && String(knownWorkOrderId) === String(workOrder._id);
+
     return res.json({
       success: true, barcode: trimmed, unitNumber,
       workOrder: {
@@ -447,7 +527,10 @@ router.post("/lookup-piece", async (req, res) => {
         customerName: customerRequest.customerInfo?.name, customerPhone: customerRequest.customerInfo?.phone,
         status: customerRequest.status,
       } : null,
-      isMeasurementConversion, pieceOwner, operations, categories, operationScope,
+      isMeasurementConversion, pieceOwner,
+      ...(sameWorkOrder
+        ? { operationsUnchanged: true }
+        : { productImage, operations, categories, operationScope }),
       totalScans, totalOperations: operations.length,
       existingInspections, previousDefectCodes,
 
@@ -467,11 +550,16 @@ router.post("/lookup-piece", async (req, res) => {
       // The defect catalogue, with the piece — one request instead of two, and
       // it cannot go stale between the lookup and the verdict. Never fatal: a
       // station whose catalogue fails to load can still flag operations.
-      defectTypes: defectCatalogue,
-      // Per-operation shortlists, where anybody has set one. A REORDERING of
-      // the picker, never a restriction — see the model's header for why that
-      // distinction is load-bearing.
-      operationDefectMap: defectSuggestions,
+      //
+      // Sent once per tab, not once per scan: it is a global, rarely-changing
+      // list (the QC owner edits it from Team, not per shift), so a repeat
+      // scan that already has one gets `defectTypesUnchanged` instead — the
+      // one real cost is a catalogue edit not reaching an open tab until its
+      // next reload, which is the same staleness window the rest of the CMS
+      // already accepts for reference data.
+      ...(hasDefectCatalog
+        ? { defectTypesUnchanged: true }
+        : { defectTypes: defectCatalogue, operationDefectMap: defectSuggestions }),
     });
   } catch (err) {
     console.error("[QC lookup-piece] error:", err);
@@ -633,6 +721,123 @@ router.post("/save-inspection", async (req, res) => {
   }
 });
 
+/**
+ * ─── POST /save-inspection-offline ──────────────────────────────────────────
+ *
+ * THE THIN PATH. An inspector whose network is down cannot reach `/lookup-piece`
+ * at all — no work order, no operations catalogue, nothing to cross-check
+ * against. What they still have is the barcode in front of them and a verdict.
+ * This endpoint accepts exactly that: `{barcodeId, status, note}`, and resolves
+ * the work order itself the same way `/lookup-piece` does, from the barcode
+ * alone (`parseBarcode` + `findWorkOrderByShortId`) — nothing here is trusted
+ * from a stale client-side lookup, because there wasn't one.
+ *
+ * No `operationCode` — there was no catalogue on screen to pick one from — so a
+ * fault is always recorded as a single OTHER defect type carrying the
+ * inspector's note. That note is REQUIRED for a defect/reject exactly as the
+ * online form requires picking at least one defect type.
+ *
+ * THE SAME GUARD, NOT A WEAKER ONE. `qcStages.evaluateScan` re-reads this
+ * piece's live state at write time regardless of how old the offline record
+ * is — a piece another inspector already passed or rejected in the meantime is
+ * refused here exactly as it would be from the live station, 409 either way.
+ * The queued record's `stageId` is whatever the inspector's device captured at
+ * scan time (their own cached checkpoint, from the day-session, not a lookup);
+ * if none was captured and the factory enforces checkpoints, this returns
+ * `STAGE_REQUIRED` rather than guessing one — the frontend surfaces that as a
+ * sync failure the inspector must resolve with a normal, online scan.
+ */
+router.post("/save-inspection-offline", async (req, res) => {
+  try {
+    const { barcodeId, status, note, qcSession, stageId } = req.body;
+
+    if (!barcodeId || !["passed", "defective", "rejected"].includes(status))
+      return res.status(400).json({ success: false, message: "barcodeId and a valid verdict are required" });
+
+    const isFault = status === "defective" || status === "rejected";
+    const trimmedNote = String(note || "").trim().slice(0, 300);
+    if (isFault && !trimmedNote)
+      return res.status(400).json({
+        success: false,
+        code: "OTHER_NEEDS_NOTE",
+        message: status === "rejected"
+          ? "Say why this piece is being scrapped — a note is required."
+          : "Say what was wrong — a note is required for an offline defect.",
+      });
+
+    const parsed = parseBarcode(barcodeId);
+    if (!parsed.success)
+      return res.status(400).json({ success: false, message: "Invalid barcode format. Expected WO-<shortId>-<unit>" });
+
+    const workOrder = await findWorkOrderByShortId(parsed.workOrderShortId);
+    if (!workOrder)
+      return res.status(404).json({ success: false, message: `Work order "${parsed.workOrderShortId}" not found` });
+    if (parsed.unitNumber > workOrder.quantity)
+      return res.status(400).json({ success: false, message: `Unit ${parsed.unitNumber} out of range (1–${workOrder.quantity})` });
+
+    let moRequestId = null;
+    if (workOrder.customerRequestId) {
+      const cr = await CustomerRequest.findById(workOrder.customerRequestId).select("requestId").lean().catch(() => null);
+      moRequestId = cr?.requestId || null;
+    }
+
+    const serverUser = req.session?.user || req.user || {};
+    const qcName  = qcSession?.name        || serverUser.name || "QC";
+    const qcBioId = qcSession?.biometricId || "";
+    const qcId    = qcSession?.biometricId || serverUser.qcId || serverUser._id || "";
+    const qcEmail = String(qcSession?.email || serverUser.email || "").toLowerCase();
+
+    const verdict = await qcStages.evaluateScan({
+      barcodeId, stageId: stageId || null, status,
+      person: { biometricId: qcBioId, email: qcEmail },
+    });
+
+    if (!verdict.allowed) {
+      const conflict = verdict.code === "STAGE_ALREADY_PASSED"
+        || verdict.code === "BLOCKED_BY_REWORK"
+        || verdict.code === "PIECE_REJECTED";
+      return res.status(conflict ? 409 : 400).json({
+        success: false,
+        code: verdict.code,
+        message: verdict.message,
+        passedBy: verdict.passedBy || null,
+        blockedBy: verdict.blockedBy || null,
+        rejectedBy: verdict.rejectedBy || null,
+        pieceProgress: verdict.progress || null,
+      });
+    }
+
+    const stage = verdict.stage || null;
+    const reworkRound = verdict.reworkRound || 0;
+
+    const record = await QCInspection.create({
+      date: istDateString(), barcodeId, workOrderShortId: parsed.workOrderShortId,
+      workOrderId: workOrder._id, moRequestId, manufacturingOrderId: workOrder.customerRequestId || null,
+      status,
+      defects: [],
+      defectTypes: isFault ? [{ code: "OTHER", name: "Other", category: "", note: trimmedNote }] : [],
+      stageId:     stage?._id    || null,
+      stageCode:   stage?.code   || "",
+      stageName:   stage?.name   || "",
+      stageSerial: stage?.serial ?? null,
+      reworkRound,
+      isRework: reworkRound > 0,
+      inspectedByQCName: qcName, inspectedByBiometricId: qcBioId, inspectedByQCId: qcId,
+      inspectedByEmail: qcEmail,
+      recordedOffline: true,
+    });
+
+    const progress = stage
+      ? await qcStages.pieceProgress(barcodeId).catch(() => null)
+      : null;
+
+    res.json({ success: true, record, pieceProgress: progress });
+  } catch (err) {
+    console.error("[QC save-inspection-offline] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ─── GET /piece-operators ──────────────────────────────────────────────────────
 // On-demand: given a barcode, returns every operator + machine + scan time
 // from ProductionTracking. Used by the QC overview "Fetch Operator" button.
@@ -739,34 +944,55 @@ router.get("/trend", async (req, res) => {
       qcViewer.viewerFilter(viewer, { departmentConfigured: deptConfigured }),
     );
 
-    // Fetch only status + defects (minimal projection)
+    // Fetch status + defects + barcodeId (minimal projection)
     const records = await QCInspection.find(trendFilter)
-      .select("date status defects").lean();
+      .select("date status defects barcodeId").lean();
 
-    // Initialise buckets for every date (so days with zero data still appear)
+    /**
+     * COUNTED BY GARMENT, NOT BY SCAN (29 Aug 2026, same request as
+     * /inspections' `productCounts` — one figure the whole page should agree
+     * on). A garment re-inspected twice at one checkpoint, or inspected at
+     * three, used to add two or three to a single day's bucket; it adds one
+     * now, however many scans it took. `scans` is kept alongside as the raw
+     * event count — still useful context, just not what DHU is computed from.
+     *
+     * MUTUALLY EXCLUSIVE, same rule as /inspections' productCounts: a garment
+     * is `passed` only if every scan it collected that day passed, and
+     * `defective` otherwise — never both. `rejected` is a detail of
+     * `defective` (a scrapped garment is also a defective one), reported
+     * separately rather than as a third bucket that would need to add up too.
+     */
     const grouped = {};
     for (const date of dates)
-      grouped[date] = { date, total: 0, passed: 0, defective: 0, rejected: 0, defectOps: 0 };
+      grouped[date] = { date, scans: 0, defectOps: 0, byBarcode: new Map() };
 
     for (const r of records) {
-      if (!grouped[r.date]) continue;
-      grouped[r.date].total++;
-      if (r.status === "passed") grouped[r.date].passed++;
-      else {
-        if (r.status === "rejected") grouped[r.date].rejected++;
-        else grouped[r.date].defective++;
-        grouped[r.date].defectOps += (r.defects || []).length;
-      }
+      const g = grouped[r.date];
+      if (!g) continue;
+      g.scans++;
+      if (!g.byBarcode.has(r.barcodeId)) g.byBarcode.set(r.barcodeId, []);
+      g.byBarcode.get(r.barcodeId).push(r.status);
+      if (r.status !== "passed") g.defectOps += (r.defects || []).length;
     }
 
     // Build ordered trend array with DPH and a short display label (MM/DD)
     const trend = dates.map((d) => {
       const g = grouped[d];
+      const total = g.byBarcode.size;
+      let passed = 0, defective = 0, rejected = 0;
+      for (const statuses of g.byBarcode.values()) {
+        if (statuses.every((s) => s === "passed")) passed++;
+        else defective++;
+        if (statuses.includes("rejected")) rejected++;
+      }
       return {
-        ...g,
-        // The defect rate counts anything that was not good — a scrapped
-        // garment is as much a failure of the line as one sent back.
-        dph:         g.total > 0 ? +(((g.defective + g.rejected) / g.total) * 100).toFixed(1) : 0,
+        date: d, total, passed, defective, rejected,
+        defectOps: g.defectOps, scans: g.scans,
+        // `defective` already INCLUDES every rejected garment (rejected is a
+        // detail of defective, not a separate exclusive bucket — see above),
+        // so this is `defective / total`, not `(defective + rejected) /
+        // total`, which would have counted a scrapped garment twice.
+        dph:         total > 0 ? +((defective / total) * 100).toFixed(1) : 0,
         displayDate: d.slice(5).replace("-", "/"),   // "06/27"
       };
     });
@@ -817,7 +1043,15 @@ router.get("/inspections", async (req, res) => {
 
     qcViewer.applyViewerFilter(filter, scopeClause);
 
-    const inspections = await QCInspection.find(filter).sort({ inspectedAt: -1 }).lean();
+    // Every field the overview actually reads, and nothing else (29 Aug 2026,
+    // performance). This used to be an unprojected find() whose rows were then
+    // spread wholesale into the response — shipping `__v`, both timestamps and
+    // the full nested defect tree on every row, roughly half of it unread by
+    // any consumer.
+    const inspections = await QCInspection.find(filter)
+      .select("barcodeId date status defects defectTypes workOrderId workOrderShortId manufacturingOrderId moRequestId stageId stageCode stageName stageSerial inspectedAt inspectedByQCName inspectedByEmail inspectedByBiometricId isRework reworkRound")
+      .sort({ inspectedAt: -1 })
+      .lean();
 
     const woIds = [...new Set(inspections.map(i => i.workOrderId).filter(Boolean).map(String))];
     const wos   = woIds.length
@@ -828,7 +1062,7 @@ router.get("/inspections", async (req, res) => {
     const StockItem    = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
     const stockItemIds = [...new Set(wos.map(w => w.stockItemId).filter(Boolean).map(String))];
     const stockItems   = stockItemIds.length
-      ? await StockItem.find({ _id: { $in: stockItemIds } }).select("name images variants").lean()
+      ? await StockItem.find({ _id: { $in: stockItemIds } }).select("name images variants.attributes variants.images").lean()
       : [];
     const siMap = new Map(stockItems.map(si => [si._id.toString(), si]));
 
@@ -889,6 +1123,53 @@ router.get("/inspections", async (req, res) => {
     const defective      = enriched.filter(i => i.status === "defective").length;
     const rejected       = enriched.filter(i => i.status === "rejected").length;
     const totalDefectOps = enriched.reduce((sum, i) => sum + (i.defects?.length || 0), 0);
+
+    /**
+     * THE SAME DAY, COUNTED BY GARMENT INSTEAD OF BY SCAN (explicit request,
+     * 29 Aug 2026: "defects should be count as per the product ok, means even
+     * though 2-3 defects made for an single product but the count need to
+     * mark as 1... as per the product wise").
+     *
+     * `passed`/`defective`/`rejected` above are SCAN counts — a garment
+     * inspected at three checkpoints, or re-inspected twice at one after a
+     * fix, contributes three rows to the totals above even though it is one
+     * garment. These are DISTINCT-BARCODE counts for the same day instead: a
+     * garment counts once in `defective` no matter how many defect entries or
+     * how many failed scans it collected today. The two are deliberately kept
+     * side by side rather than one replacing the other — "12 defective scans"
+     * and "5 defective garments" are both true and answer different
+     * questions; the overview's headline tiles read from this block, the
+     * per-checkpoint/per-operator breakdowns still read from the scan counts
+     * above, where a per-operation tally naturally means occurrences, not
+     * garments.
+     */
+    // `passed`/`defective` are MUTUALLY EXCLUSIVE by construction — a garment
+    // counts as passed only if EVERY scan it collected today passed, and as
+    // defective if it collected even one that didn't (including a reject).
+    // That is what makes `passed + defective === total` exactly, which is
+    // what a "pass/fail" figure (and the donut this feeds — see the
+    // overview's `ring`) has to be able to promise; a garment double-counted
+    // as both because it cleared one checkpoint and failed another today
+    // would make the two numbers add up to more than the garments inspected.
+    // `rejected` is reported separately as a DETAIL of defective (a scrapped
+    // garment is also a defective one), not a third exclusive bucket.
+    const byBarcode = new Map();
+    for (const i of enriched) {
+      if (!byBarcode.has(i.barcodeId)) byBarcode.set(i.barcodeId, []);
+      byBarcode.get(i.barcodeId).push(i.status);
+    }
+    let productsPassed = 0, productsDefective = 0, productsRejected = 0;
+    for (const statuses of byBarcode.values()) {
+      if (statuses.every((s) => s === "passed")) productsPassed++;
+      else productsDefective++;
+      if (statuses.includes("rejected")) productsRejected++;
+    }
+    const productCounts = {
+      total: byBarcode.size,
+      passed: productsPassed,
+      defective: productsDefective,
+      rejected: productsRejected,
+    };
     const byOperation    = {};
     const byOperator     = {};
     const byQCPerson     = {};
@@ -926,9 +1207,24 @@ router.get("/inspections", async (req, res) => {
     // rather than hidden, so a strip that looks empty has a stated reason.
     const unstaged = enriched.filter(i => !i.stageId).length;
 
+    // ── Pending rework — LIVE, not scoped to the date filter above ──────────
+    // "how many products are sent for rework right now" is a today-independent
+    // question: a piece sent back on Monday and still uncleared on Friday is
+    // still pending on Friday, whichever date this page happens to be looking
+    // at. Scoped to the SAME viewer clause as everything else on this route
+    // (an inspector's tile counts their own open rework; the owner's counts
+    // the department's) — see qcStages.pendingReworkSnapshot's own header for
+    // why this is a distinct question from `totalRework` above (a same-day
+    // SCAN count) and from `reworkCount` (an all-time TALLY).
+    const pendingRework = await qcStages
+      .pendingReworkSnapshot(scopeClause || {})
+      .catch((e) => { console.warn("[QC inspections] pending-rework snapshot skipped:", e.message); return { count: 0, pieces: [] }; });
+
     res.json({
       success: true, inspections: enriched,
       total: enriched.length, passed, defective, rejected, totalDefectOps,
+      productCounts,
+      pendingRework: { count: pendingRework.count },
       byOperation, byOperator, byQCPerson,
       stages: stages.map(st => ({ _id: st._id, code: st.code, name: st.name, serial: st.serial })),
       byStage, unstaged,
@@ -1022,7 +1318,7 @@ router.get("/customer-summary", async (req, res) => {
 
     const siIds = [...new Set(wos.map(w => w.stockItemId).filter(Boolean).map(String))];
     const sis   = siIds.length
-      ? await StockItem.find({ _id: { $in: siIds } }).select("name images variants").lean()
+      ? await StockItem.find({ _id: { $in: siIds } }).select("name images variants.attributes variants.images").lean()
       : [];
     const siMap = new Map(sis.map(si => [si._id.toString(), si]));
 
@@ -1230,19 +1526,25 @@ function buildPeriod(period, anchorISO) {
   const [ay, am, ad] = anchorISO.split("-").map(Number);
 
   if (period === "hourly") {
-    // One day, split by hour — the form's own layout. Eight columns like the
-    // paper version, starting at the shift hour, extended if the floor worked
-    // longer. Never fewer than eight: a half-empty grid is still the grid
-    // everybody recognises, whereas a three-column one is a different document.
+    // One day, split by hour — the form's own layout. Anchored to the floor's
+    // actual shift, 9:30 AM to 6:30 PM IST, not to whatever hour the data
+    // happens to start at: a single stray record (a scan logged just after
+    // midnight IST, a backfilled entry) used to pull the whole grid's start
+    // hour down with it, so a normal shift's data could render as "H1 00:00"
+    // with nine empty columns before the first real one. The window still
+    // extends outward for a genuine early start or a late-running shift — it
+    // just no longer collapses toward one outlier.
+    const OFFICE_START_HOUR = 9;  // 9:30 AM IST — the H1 column covers 9:00-9:59
+    const OFFICE_END_HOUR = 18;   // 6:30 PM IST — the last column covers 18:00-18:59
     return {
       kind: "hourly",
       dates: [anchorISO],
       spanLabel: anchorISO,
       makeBuckets: (inspections) => {
         const hours = inspections.map((i) => istParts(i.inspectedAt).h);
-        const start = hours.length ? Math.min(...hours) : 8;
-        const end = hours.length ? Math.max(...hours) : 15;
-        const count = Math.max(8, end - start + 1);
+        const start = Math.min(OFFICE_START_HOUR, ...hours);
+        const end = Math.max(OFFICE_END_HOUR, ...hours);
+        const count = end - start + 1;
         return Array.from({ length: count }, (_, i) => ({
           key: `H${i + 1}`,
           label: `H${i + 1}`,
@@ -1479,6 +1781,26 @@ router.get("/report", async (req, res) => {
       }
     }
 
+    // ── Pending rework — a LIVE snapshot, independent of the reporting period
+    // (29 Aug 2026, explicit request: same "how many products are sent for
+    // rework right now" question the overview's tile answers, wanted here
+    // too). Computed once, scoped the same way as the rest of this report,
+    // then split per checkpoint below — a piece stuck at end-line belongs on
+    // the end-line sheet's summary, not folded into a department-wide figure
+    // that would tell an individual checkpoint nothing about its own floor.
+    const viewerOnlyFilter = qcViewer.applyViewerFilter(
+      {}, qcViewer.viewerFilter(viewer, { departmentConfigured: deptConfigured }),
+    );
+    const pendingSnapshot = await qcStages
+      .pendingReworkSnapshot(viewerOnlyFilter)
+      .catch((e) => { console.warn("[QC report] pending-rework snapshot skipped:", e.message); return { count: 0, pieces: [] }; });
+    const pendingByStage = new Map();
+    for (const piece of pendingSnapshot.pieces) {
+      for (const open of piece.openRework) {
+        pendingByStage.set(open.stageId, (pendingByStage.get(open.stageId) || 0) + 1);
+      }
+    }
+
     const out = sheetOrder
       .map((key) => sheets.get(key))
       .sort((a, b) => a.serial - b.serial)
@@ -1493,11 +1815,21 @@ router.get("/report", async (req, res) => {
         const reject = pieceVerdicts.filter(
           (v) => v.includes("rejected") || v[v.length - 1] === "defective",
         ).length;
-        // Times a garment was sent back to be fixed. Deliberately excludes
-        // scrap: it was never sent back, and counting it would inflate the one
-        // figure that measures redone work.
-        const rework = sh.defectiveScans - sh.rejectedScans;
+        /**
+         * GARMENTS SENT BACK, NOT SCANS TAKEN OF THEM (29 Aug 2026, explicit
+         * request: "defects should be count as per the product ok, means even
+         * though 2-3 defects made for an single product but the count need to
+         * mark as 1"). This used to be `sh.defectiveScans - sh.rejectedScans`
+         * — a raw scan-event count, sitting inside a block every OTHER figure
+         * (RFT, REJECT, INSPECTED) already counts by garment. A piece failed
+         * twice in this period, or failed at a re-inspection after a fix that
+         * didn't hold, counted twice; it counts once now, matching RFT/REJECT.
+         */
+        const rework = pieceVerdicts.filter((v) => v.includes("defective")).length;
         const inspected = pieceVerdicts.length;
+        // Currently stuck at THIS checkpoint, as of right now — not a period
+        // total, a snapshot. See pendingSnapshot above.
+        const pendingRework = pendingByStage.get(sh.stageId) || 0;
 
         const rows = [...sh.defectRows.values()].sort(
           (a, b) => a.category.localeCompare(b.category) || a.code.localeCompare(b.code),
@@ -1513,7 +1845,7 @@ router.get("/report", async (req, res) => {
           rows,
           bucketTotals: buckets.map((_, i) => rows.reduce((n, r) => n + r.counts[i], 0)),
           defectTotal: rows.reduce((n, r) => n + r.total, 0),
-          inspected, rft, rework, reject,
+          inspected, rft, rework, reject, pendingRework,
           scans: sh.scans, passedScans: sh.passedScans, defectiveScans: sh.defectiveScans,
           rejectedScans: sh.rejectedScans,
           rftPct:    inspected ? +((rft / inspected) * 100).toFixed(1) : 0,
@@ -1538,6 +1870,8 @@ router.get("/report", async (req, res) => {
         rejectedScans: inspections.filter(i => i.status === "rejected").length,
         defects: inspections.reduce((n, i) => n + (i.defects || []).length, 0),
         checkpoints: out.length,
+        // Live, not period-scoped — see pendingSnapshot above.
+        pendingRework: pendingSnapshot.count,
       },
       viewer: {
         name: viewer.name,
@@ -1551,5 +1885,461 @@ router.get("/report", async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+// ─── GET /orders, GET /orders/:moId ────────────────────────────────────────────
+//
+// THE DEPARTMENT'S BOOK OF ORDERS, MO FIRST (explicit request, 29 Aug 2026:
+// "the qc person who got the full access... can see the orders also...
+// showcase as like showing in the production manager page or like in the
+// cutting dashboard page... first is mo which is need to showcase in card,
+// and upon click on that then the corresponding wo"). Mirrors the cutting
+// master's `/manufacturing-orders` → `/manufacturing-orders/:moId` shape:
+// a card per Manufacturing Order (== CustomerRequest, `WorkOrder.customerRequestId`
+// is the FK), each rolling up every work order under it; clicking one drills
+// into that MO's own work orders, each with the same five-bucket breakdown
+// the flat list used to show for everything at once.
+//
+// Five buckets, one garment counted in exactly one of them, derived from
+// `qcStages.pieceProgressMany` — the same primitive the checkpoint page and
+// piece tracker use for "0/2 cleared", so a garment's status here always
+// agrees with what it says everywhere else it is shown:
+//   REJECTED     progress.rejected — scrapped, terminal, checked first.
+//   COMPLETED    progress.complete — every checkpoint cleared.
+//   IN REWORK    progress.openRework.length > 0 — sent back, not yet cleared.
+//   IN PROGRESS  inspected at least once, still short of the above three —
+//                cleared some checkpoints, mid-pipeline.
+//   PENDING      never scanned at all — total ordered minus every barcode QC
+//                has ever seen for this work order. Not a piece state (no scan
+//                exists to hold one), so it is the one bucket not sourced from
+//                pieceProgressMany.
+//
+// A work order with no `customerRequestId` (recorded before an MO was tied to
+// it, or genuinely stand-alone) is not dropped — it collects under a synthetic
+// "unassigned" card, same convention the overview's "By customer" panel
+// already uses for the same situation.
+
+/** Every non-cancelled work order matching `extraQuery`, with its QC bucket
+ *  counts attached — the one query pair (scans, then piece progress) this
+ *  whole file's /orders routes are built from.
+ *
+ *  `withDetail: true` additionally resolves each work order's photo and
+ *  gender, the same way `/inspections` does (`resolveProductImage`) — worth
+ *  the extra StockItem batch only where a card actually shows a photo (the
+ *  per-MO work-order list), not the MO rollup, which never does. */
+async function computeWorkOrderQcStats(extraQuery = {}, { withDetail = false } = {}) {
+  const workOrders = await WorkOrder.find({ status: { $ne: "cancelled" }, ...extraQuery })
+    .select("workOrderNumber quantity stockItemName stockItemReference stockItemId variantAttributes customerName status createdAt customerRequestId assignedDeadline")
+    .sort({ createdAt: -1 })
+    .lean();
+
+  if (!workOrders.length) return [];
+
+  let siMap = new Map();
+  if (withDetail) {
+    const stockItemIds = [...new Set(workOrders.map((wo) => wo.stockItemId?.toString()).filter(Boolean))];
+    const stockItems = stockItemIds.length
+      ? await StockItem.find({ _id: { $in: stockItemIds } })
+        .select("images genderCategory variants.images variants.attributes").lean()
+      : [];
+    siMap = new Map(stockItems.map((si) => [si._id.toString(), si]));
+  }
+
+  // The short id is never stored — every other reader of it (parseBarcode,
+  // findWorkOrderByShortId) derives it the same way, from the last 8 hex
+  // characters of the ObjectId, so this has to match them exactly.
+  const shortIdOf = (id) => id.toString().slice(-8);
+  const shortIds = workOrders.map((wo) => shortIdOf(wo._id));
+
+  const scans = await QCInspection.find({ workOrderShortId: { $in: shortIds } })
+    .select("workOrderShortId barcodeId")
+    .lean();
+
+  const barcodesByShortId = new Map();
+  for (const s of scans) {
+    if (!barcodesByShortId.has(s.workOrderShortId)) barcodesByShortId.set(s.workOrderShortId, new Set());
+    barcodesByShortId.get(s.workOrderShortId).add(s.barcodeId);
+  }
+
+  const allBarcodes = [...new Set(scans.map((s) => s.barcodeId))];
+  const progressByBarcode = await qcStages.pieceProgressMany(allBarcodes);
+
+  return workOrders.map((wo) => {
+    const shortId = shortIdOf(wo._id);
+    const barcodes = [...(barcodesByShortId.get(shortId) || [])];
+
+    let completed = 0, inProgress = 0, inRework = 0, rejected = 0;
+    for (const bc of barcodes) {
+      const p = progressByBarcode[bc];
+      if (!p) continue;
+      if (p.rejected) rejected++;
+      else if (p.complete) completed++;
+      else if (p.openRework.length > 0) inRework++;
+      else inProgress++;
+    }
+
+    const total = wo.quantity || 0;
+    const inspected = barcodes.length;
+    const pending = Math.max(0, total - inspected);
+
+    return {
+      workOrderId: String(wo._id),
+      workOrderNumber: wo.workOrderNumber,
+      shortId,
+      customerRequestId: wo.customerRequestId ? String(wo.customerRequestId) : null,
+      productName: wo.stockItemName || "—",
+      customerName: wo.customerName || "—",
+      status: wo.status,
+      assignedDeadline: wo.assignedDeadline || null,
+      total,
+      inspected,
+      completed,
+      inProgress,
+      inRework,
+      rejected,
+      pending,
+      ...(withDetail ? {
+        stockItemReference: wo.stockItemReference || null,
+        variantAttributes: wo.variantAttributes || [],
+        productImage: resolveProductImage(wo, siMap),
+        genderCategory: (wo.stockItemId && siMap.get(wo.stockItemId.toString())?.genderCategory) || null,
+      } : {}),
+    };
+  });
+}
+
+const ZERO_BUCKETS = { total: 0, inspected: 0, completed: 0, inProgress: 0, inRework: 0, rejected: 0, pending: 0 };
+
+async function requireQcOwnerViewer(req, res) {
+  const viewer = await qcViewer.resolveViewer(req);
+  if (!viewer.canSeeEveryone) {
+    res.status(403).json({
+      success: false,
+      message: "Only the QC owner can see the department's orders.",
+    });
+    return null;
+  }
+  return viewer;
+}
+
+// GET /orders — one card per Manufacturing Order, QC progress rolled up
+// across every work order under it.
+router.get("/orders", async (req, res) => {
+  try {
+    if (!(await requireQcOwnerViewer(req, res))) return;
+
+    const perWo = await computeWorkOrderQcStats();
+    if (!perWo.length) return res.json({ success: true, manufacturingOrders: [] });
+
+    const moIds = [...new Set(perWo.map((o) => o.customerRequestId).filter(Boolean))];
+    const mos = await CustomerRequest.find({ _id: { $in: moIds } })
+      .select("requestId customerInfo requestType measurementName status createdAt deliveryDeadline estimatedCompletion finalOrderPrice")
+      .lean();
+    const moMap = new Map(mos.map((m) => [String(m._id), m]));
+
+    const rollups = new Map();
+    for (const o of perWo) {
+      const key = o.customerRequestId || "unassigned";
+      if (!rollups.has(key)) rollups.set(key, { ...ZERO_BUCKETS, workOrdersCount: 0, latestWoAt: null });
+      const r = rollups.get(key);
+      r.workOrdersCount++;
+      for (const b of Object.keys(ZERO_BUCKETS)) r[b] += o[b];
+    }
+
+    const manufacturingOrders = [...rollups.entries()].map(([key, r]) => {
+      const mo = key === "unassigned" ? null : moMap.get(key);
+      return {
+        manufacturingOrderId: key,
+        requestId: mo?.requestId || (key === "unassigned" ? "Unassigned" : `MO-${key.slice(-6)}`),
+        customerName: mo?.customerInfo?.name || "—",
+        customerEmail: mo?.customerInfo?.email || null,
+        requestType: mo?.requestType || null,
+        measurementName: mo?.measurementName || null,
+        status: mo?.status || null,
+        createdAt: mo?.createdAt || null,
+        deadline: mo?.deliveryDeadline || mo?.estimatedCompletion || null,
+        orderValue: mo?.finalOrderPrice || 0,
+        ...r,
+      };
+    }).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    res.json({ success: true, manufacturingOrders });
+  } catch (err) {
+    console.error("[QC orders] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /orders/:moId — the work orders under one Manufacturing Order, each
+// with its own five-bucket breakdown. `moId` is "unassigned" for the
+// synthetic card, otherwise a CustomerRequest _id.
+router.get("/orders/:moId", async (req, res) => {
+  try {
+    if (!(await requireQcOwnerViewer(req, res))) return;
+
+    const { moId } = req.params;
+    const isUnassigned = moId === "unassigned";
+    if (!isUnassigned && !/^[0-9a-fA-F]{24}$/.test(moId)) {
+      return res.status(400).json({ success: false, message: "That is not a valid order id." });
+    }
+
+    const [orders, mo] = await Promise.all([
+      computeWorkOrderQcStats(isUnassigned
+        ? { $or: [{ customerRequestId: null }, { customerRequestId: { $exists: false } }] }
+        : { customerRequestId: moId }, { withDetail: true }),
+      isUnassigned ? null : CustomerRequest.findById(moId)
+        .select("requestId customerInfo requestType measurementName status createdAt deliveryDeadline estimatedCompletion finalOrderPrice")
+        .lean(),
+    ]);
+
+    if (!isUnassigned && !mo) {
+      return res.status(404).json({ success: false, message: "That manufacturing order no longer exists." });
+    }
+
+    res.json({
+      success: true,
+      manufacturingOrder: isUnassigned
+        ? { manufacturingOrderId: "unassigned", requestId: "Unassigned", customerName: "—", customerEmail: null, requestType: null, measurementName: null, status: null, createdAt: null, deadline: null, orderValue: 0 }
+        : {
+            manufacturingOrderId: String(mo._id),
+            requestId: mo.requestId,
+            customerName: mo.customerInfo?.name || "—",
+            customerEmail: mo.customerInfo?.email || null,
+            requestType: mo.requestType || null,
+            measurementName: mo.measurementName || null,
+            status: mo.status || null,
+            createdAt: mo.createdAt || null,
+            deadline: mo.deliveryDeadline || mo.estimatedCompletion || null,
+            orderValue: mo.finalOrderPrice || 0,
+          },
+      orders,
+    });
+  } catch (err) {
+    console.error("[QC orders detail] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /orders/:moId/analytics ──────────────────────────────────────────────
+//
+// EVERYTHING QC KNOWS ABOUT ONE ORDER, IN ONE PAYLOAD (explicit request, 29 Aug
+// 2026: "so that they can do there analysis like an certain period defect rate,
+// DHU rates as per the order wise, defects rates, rework rates, most common
+// defect faced and all... don't make it lack of data").
+//
+// Served SEPARATELY from /orders/:moId so the order page can paint its work-order
+// cards immediately and fill the analysis panels in behind them — the cards are
+// what the page is for, and making them wait on a full defect rollup is what
+// made this screen feel slow.
+//
+// EVERY RATE HERE IS DEFINED ON THE WAY OUT, in `definitions`, and the UI prints
+// those definitions next to the figures. Two of them genuinely disagree by
+// design and always will:
+//   DHU counts DEFECTS (a garment with 3 faults contributes 3) — it can exceed
+//        100%, and that is what the metric means.
+//   Defect rate counts GARMENTS (that same garment contributes 1) — it cannot.
+// A reader who sees "DHU 140%, defect rate 60%" and has not been told this
+// assumes one of them is broken, so they are never shown without their formula.
+router.get("/orders/:moId/analytics", async (req, res) => {
+  try {
+    if (!(await requireQcOwnerViewer(req, res))) return;
+
+    const { moId } = req.params;
+    const isUnassigned = moId === "unassigned";
+    if (!isUnassigned && !/^[0-9a-fA-F]{24}$/.test(moId)) {
+      return res.status(400).json({ success: false, message: "That is not a valid order id." });
+    }
+
+    // Optional period window — the "certain period defect rate" half of the ask.
+    // Absent, the whole life of the order.
+    const { from, to } = req.query;
+    const dateFilter = {};
+    if (/^\d{4}-\d{2}-\d{2}$/.test(from || "")) dateFilter.$gte = from;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(to || "")) dateFilter.$lte = to;
+
+    const workOrders = await WorkOrder.find(isUnassigned
+      ? { status: { $ne: "cancelled" }, $or: [{ customerRequestId: null }, { customerRequestId: { $exists: false } }] }
+      : { status: { $ne: "cancelled" }, customerRequestId: moId })
+      .select("_id quantity stockItemName").lean();
+
+    const orderedQty = workOrders.reduce((n, wo) => n + (wo.quantity || 0), 0);
+    const shortIds = workOrders.map((wo) => wo._id.toString().slice(-8));
+    const woNameByShortId = new Map(workOrders.map((wo) => [wo._id.toString().slice(-8), wo.stockItemName || "—"]));
+
+    if (!shortIds.length) {
+      return res.json({ success: true, analytics: emptyOrderAnalytics(orderedQty) });
+    }
+
+    const scanFilter = { workOrderShortId: { $in: shortIds } };
+    if (Object.keys(dateFilter).length) scanFilter.date = dateFilter;
+
+    const scans = await QCInspection.find(scanFilter)
+      .select("barcodeId workOrderShortId date status defects defectTypes stageName stageSerial inspectedByQCName inspectedAt reworkRound")
+      .sort({ inspectedAt: 1 })
+      .lean();
+
+    res.json({ success: true, analytics: buildOrderAnalytics(scans, orderedQty, woNameByShortId, { from, to }) });
+  } catch (err) {
+    console.error("[QC order analytics] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+const ANALYTIC_DEFINITIONS = {
+  dhu: "Defects per Hundred Units. Total individual defects recorded ÷ garments inspected × 100. Counts DEFECTS, so one garment with three faults adds three — this is why DHU can exceed 100%.",
+  defectRate: "Garments that failed at least once ÷ garments inspected × 100. Counts GARMENTS, so a garment with three faults still adds one. Always ≤ 100%.",
+  reworkRate: "Garments sent back to be fixed at least once ÷ garments inspected × 100. A garment failed twice still counts once.",
+  rft: "Right First Time. Garments that passed every checkpoint on the first presentation, with no failure on record ÷ garments inspected × 100.",
+  rejectRate: "Garments scrapped outright ÷ garments inspected × 100. These cannot be reworked and will not ship.",
+  coverage: "Garments QC has inspected at least once ÷ garments ordered × 100. How much of the order QC has actually seen — not how much passed.",
+  avgDefectsPerFailed: "Total defects ÷ garments that failed. How bad a failure typically is, as opposed to how often one happens.",
+};
+
+function emptyOrderAnalytics(orderedQty) {
+  return {
+    definitions: ANALYTIC_DEFINITIONS,
+    period: { from: null, to: null, firstScan: null, lastScan: null },
+    headline: {
+      orderedQty, inspected: 0, scans: 0, defects: 0,
+      dhu: 0, defectRate: 0, reworkRate: 0, rft: 0, rejectRate: 0, coverage: 0, avgDefectsPerFailed: 0,
+      passedGarments: 0, failedGarments: 0, reworkGarments: 0, rejectedGarments: 0,
+    },
+    topDefectTypes: [], topOperations: [], byCheckpoint: [], byInspector: [], byProduct: [], daily: [], recent: [],
+  };
+}
+
+/** All the rollups the order page draws, from one pass over that order's scans. */
+function buildOrderAnalytics(scans, orderedQty, woNameByShortId, window) {
+  const pct = (n, d) => (d ? +((n / d) * 100).toFixed(1) : 0);
+
+  // ── Garment-level truth. Every "rate" below counts garments, except DHU. ──
+  const byGarment = new Map();
+  for (const s of scans) {
+    if (!byGarment.has(s.barcodeId)) {
+      byGarment.set(s.barcodeId, { scans: [], failed: false, rejected: false, rework: false, shortId: s.workOrderShortId });
+    }
+    const g = byGarment.get(s.barcodeId);
+    g.scans.push(s);
+    if (s.status === "rejected") { g.rejected = true; g.failed = true; }
+    else if (s.status === "defective") { g.failed = true; g.rework = true; }
+  }
+
+  const inspected = byGarment.size;
+  const garments = [...byGarment.values()];
+  const failedGarments = garments.filter((g) => g.failed).length;
+  const rejectedGarments = garments.filter((g) => g.rejected).length;
+  const reworkGarments = garments.filter((g) => g.rework).length;
+  const passedGarments = inspected - failedGarments;
+
+  // ── Defect-level tallies. Types nest under the operation that caused them,
+  // and also stand alone when no operation was named — both are real defects. ──
+  const typeMap = new Map(), opMap = new Map();
+  let defectCount = 0;
+  const addType = (t, opName) => {
+    const code = t.code || t.name;
+    if (!code) return;
+    const key = String(code).toUpperCase();
+    if (!typeMap.has(key)) typeMap.set(key, { code: t.code || "", name: t.name || t.code || "", category: t.category || "", count: 0, operations: new Set() });
+    const row = typeMap.get(key);
+    row.count++;
+    if (opName) row.operations.add(opName);
+  };
+
+  for (const s of scans) {
+    for (const d of (s.defects || [])) {
+      const opKey = (d.operationCode || "").trim() || "—";
+      if (!opMap.has(opKey)) opMap.set(opKey, { code: opKey, name: d.operationName || opKey, count: 0, types: new Map(), operators: new Set() });
+      const op = opMap.get(opKey);
+      op.count++;
+      for (const o of (d.operators || [])) if (o.operatorName) op.operators.add(o.operatorName);
+      if ((d.types || []).length) {
+        for (const t of d.types) {
+          defectCount++;
+          addType(t, d.operationName || opKey);
+          const tk = String(t.code || t.name || "").toUpperCase();
+          op.types.set(tk, (op.types.get(tk) || 0) + 1);
+        }
+      } else {
+        // An operation flagged with no type named is still one defect.
+        defectCount++;
+      }
+    }
+    for (const t of (s.defectTypes || [])) { defectCount++; addType(t, null); }
+  }
+
+  // ── Per-checkpoint, per-inspector, per-product, per-day. ──
+  const group = (keyFn, labelFn) => {
+    const m = new Map();
+    for (const s of scans) {
+      const k = keyFn(s);
+      if (k == null) continue;
+      if (!m.has(k)) m.set(k, { key: k, label: labelFn(s), scans: 0, passed: 0, defective: 0, rejected: 0, garments: new Set(), defects: 0 });
+      const row = m.get(k);
+      row.scans++;
+      row.garments.add(s.barcodeId);
+      row[s.status === "passed" ? "passed" : s.status === "rejected" ? "rejected" : "defective"]++;
+      row.defects += (s.defects || []).reduce((n, d) => n + Math.max(1, (d.types || []).length), 0) + (s.defectTypes || []).length;
+    }
+    return [...m.values()].map((r) => {
+      const g = r.garments.size;
+      return {
+        ...r, garments: g,
+        passRate: pct(r.passed, r.scans),
+        dhu: pct(r.defects, g),
+      };
+    }).sort((a, b) => b.scans - a.scans);
+  };
+
+  const daily = group((s) => s.date, (s) => s.date).sort((a, b) => a.key.localeCompare(b.key))
+    .map((d) => ({ ...d, defectRate: pct(d.defective + d.rejected, d.scans) }));
+
+  const dates = scans.map((s) => s.date).filter(Boolean).sort();
+
+  return {
+    definitions: ANALYTIC_DEFINITIONS,
+    period: {
+      from: window.from || null, to: window.to || null,
+      firstScan: dates[0] || null, lastScan: dates[dates.length - 1] || null,
+    },
+    headline: {
+      orderedQty,
+      inspected,
+      scans: scans.length,
+      defects: defectCount,
+      dhu: pct(defectCount, inspected),
+      defectRate: pct(failedGarments, inspected),
+      reworkRate: pct(reworkGarments, inspected),
+      rft: pct(passedGarments, inspected),
+      rejectRate: pct(rejectedGarments, inspected),
+      coverage: pct(inspected, orderedQty),
+      avgDefectsPerFailed: failedGarments ? +(defectCount / failedGarments).toFixed(1) : 0,
+      passedGarments, failedGarments, reworkGarments, rejectedGarments,
+    },
+    topDefectTypes: [...typeMap.values()]
+      .map((t) => ({ ...t, operations: [...t.operations].slice(0, 4), share: pct(t.count, defectCount) }))
+      .sort((a, b) => b.count - a.count).slice(0, 12),
+    topOperations: [...opMap.values()]
+      .map((o) => ({
+        code: o.code, name: o.name, count: o.count, share: pct(o.count, defectCount),
+        operators: [...o.operators].slice(0, 4),
+        types: [...o.types.entries()].map(([code, count]) => ({ code, count })).sort((a, b) => b.count - a.count).slice(0, 5),
+      }))
+      .sort((a, b) => b.count - a.count).slice(0, 12),
+    byCheckpoint: group((s) => s.stageName || null, (s) => s.stageName || "No checkpoint"),
+    byInspector: group((s) => s.inspectedByQCName || null, (s) => s.inspectedByQCName || "—"),
+    byProduct: group((s) => s.workOrderShortId || null, (s) => woNameByShortId.get(s.workOrderShortId) || s.workOrderShortId),
+    daily,
+    recent: scans.slice(-40).reverse().map((s) => ({
+      barcodeId: s.barcodeId, date: s.date, at: s.inspectedAt, status: s.status,
+      stageName: s.stageName || "", by: s.inspectedByQCName || "",
+      reworkRound: s.reworkRound || 0,
+      defects: (s.defects || []).map((d) => ({
+        operationCode: d.operationCode, operationName: d.operationName,
+        types: (d.types || []).map((t) => ({ code: t.code, name: t.name, note: t.note })),
+        operators: (d.operators || []).map((o) => o.operatorName).filter(Boolean),
+      })),
+      defectTypes: (s.defectTypes || []).map((t) => ({ code: t.code, name: t.name, note: t.note })),
+    })),
+  };
+}
 
 module.exports = router;
